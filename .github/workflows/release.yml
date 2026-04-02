@@ -71,7 +71,7 @@ jobs:
           echo "TARBALL=${name}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.target }}
           path: ${{ env.TARBALL }}
@@ -99,7 +99,7 @@ jobs:
           subject-path: "coop-*.tar.gz"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@b25b93d384199fc0fc8c2e126b2d937a0cbeb2ae # v2.5.2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           generate_release_notes: true
           files: |
