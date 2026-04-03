@@ -135,7 +135,7 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
     }
     drop(ssh_stdin);
 
-    let local_hash = format!("{:x}", hasher.finalize());
+    let local_hash = hex::encode(hasher.finalize());
 
     let output = ssh_child
         .wait_with_output()
@@ -446,7 +446,7 @@ fn tar_pipe_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()
     }
     drop(tar_stdin);
 
-    let local_hash = format!("{:x}", hasher.finalize());
+    let local_hash = hex::encode(hasher.finalize());
 
     let tar_status = tar_child.wait().context("Failed to wait for tar")?;
     if !tar_status.success() {
