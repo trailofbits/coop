@@ -1051,8 +1051,58 @@ test_restart_stopped() {
         fail "rejects start of already-running instance" "should have failed"
     fi
 
+    # Stop again for subsequent phases
+    coop stop "$INSTANCE" || true
+}
+
+test_restart_rejects_ignored_flags() {
+    echo ""
+    echo "=== Phase: restart rejects ignored flags ==="
+
+    # Instance is stopped from previous phase. Restarting with creation-time
+    # flags (--mount, --workspace, --git-repo, --disk) should fail with a
+    # clear error instead of silently ignoring them.
+
+    local mount_dir
+    mount_dir=$(mktemp -d)
+
+    if moat_fails start "$INSTANCE" --no-claude --mount "$mount_dir"; then
+        pass "restart with --mount rejected"
+    else
+        fail "restart with --mount rejected" "should have failed"
+        coop stop "$INSTANCE" 2>/dev/null || true
+    fi
+
+    if echo "$HARNESS_ERR" | grep -qi "already exists\|ignored on restart\|destroy"; then
+        pass "error message suggests destroy first"
+    else
+        fail "error message suggests destroy first" "stderr: $HARNESS_ERR"
+    fi
+
+    if moat_fails start "$INSTANCE" --no-claude --workspace "$mount_dir"; then
+        pass "restart with --workspace rejected"
+    else
+        fail "restart with --workspace rejected" "should have failed"
+        coop stop "$INSTANCE" 2>/dev/null || true
+    fi
+
+    if moat_fails start "$INSTANCE" --no-claude --disk 20; then
+        pass "restart with --disk rejected"
+    else
+        fail "restart with --disk rejected" "should have failed"
+        coop stop "$INSTANCE" 2>/dev/null || true
+    fi
+
+    # Plain restart (no conflicting flags) should still work
+    if coop start "$INSTANCE" --no-claude; then
+        pass "restart without flags still works"
+    else
+        fail "restart without flags still works" "exit code: $?"
+    fi
+
     # Stop again for the destroy phase
     coop stop "$INSTANCE" || true
+    rm -rf "$mount_dir"
 }
 
 test_destroy() {
@@ -2212,6 +2262,7 @@ main() {
     test_status_stopped
     test_resize_status
     test_restart_stopped
+    test_restart_rejects_ignored_flags
     test_destroy
     test_auto_resolve_no_instances
 

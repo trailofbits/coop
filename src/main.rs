@@ -477,6 +477,23 @@ fn cmd_start(
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     if let Some(inst) = find_stopped_instance(be, cfg, opts.name)? {
+        let has_ignored_flags = !opts.mounts.is_empty()
+            || opts.workspace_dir.is_some()
+            || opts.git_repo.is_some()
+            || opts.disk.is_some();
+
+        if has_ignored_flags {
+            bail!(
+                "Instance '{}' already exists (stopped). The flags \
+                 --mount, --workspace, --git-repo, and --disk are only \
+                 applied at creation time and would be silently ignored \
+                 on restart.\n\
+                 To apply new options, destroy the instance first:\n  \
+                 coop destroy {0}\n  coop start {0} [options]",
+                inst.name,
+            );
+        }
+
         return restart_instance(be, cfg, &inst, opts.no_claude);
     }
 
