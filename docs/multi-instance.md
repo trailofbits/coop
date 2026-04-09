@@ -35,15 +35,15 @@ Most commands accept an optional instance name. Resolution follows three cases:
 
 ```
 # With one instance, these are equivalent:
-coop ssh
-coop ssh my-project
+coop shell
+coop shell my-project
 
 # With multiple instances, you must specify:
-coop ssh my-project
-coop ssh another-project
+coop shell my-project
+coop shell another-project
 ```
 
-This applies to `ssh`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`, and `claude`.
+This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`, and `claude`.
 
 ## Checking status
 

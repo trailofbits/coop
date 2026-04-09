@@ -4,7 +4,7 @@ Isolated VM environment for running Claude Code — Firecracker on Linux, Lima o
 
 ## Architecture
 
-Rust CLI that orchestrates VM lifecycle: setup, start, ssh, stop, destroy, status, logs.
+Rust CLI that orchestrates VM lifecycle: setup, start, shell, stop, destroy, status, logs.
 
 Two backends, auto-detected by platform:
 - **Linux**: Firecracker microVMs with KVM. Cross-compiled from arm64 macOS (`x86_64-unknown-linux-musl` via `musl-cross`).
@@ -54,7 +54,7 @@ You can also run the test script directly if you already have a binary:
 ./tests/integration.sh --binary /path/to/coop --full
 ```
 
-When adding new features, consider whether they should be covered by the integration test. The test exercises the full VM lifecycle (setup → start → status → ssh → guest environment → docker → stop → destroy). New commands or guest-visible changes are good candidates for new test phases.
+When adding new features, consider whether they should be covered by the integration test. The test exercises the full VM lifecycle (setup → start → status → shell → guest environment → docker → stop → destroy). New commands or guest-visible changes are good candidates for new test phases.
 
 ## Known workarounds (revisit later)
 

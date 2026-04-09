@@ -39,7 +39,7 @@ If GUEST_PATH is omitted, defaults to `/workspace`. Conflicts with `--workspace`
 ### Manual via SSH
 
 ```bash
-coop ssh
+coop shell
 # then use git clone, scp, or any other tool inside the guest
 ```
 

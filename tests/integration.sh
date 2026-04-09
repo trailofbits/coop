@@ -115,11 +115,11 @@ moat_fails() {
     fi
 }
 
-# Run a command in the guest VM via `coop ssh -- <cmd>`.
+# Run a command in the guest VM via `coop shell -- <cmd>`.
 # RUST_LOG=off suppresses tracing output that would mix with command output.
 guest_exec() {
     local inst="${GUEST_INSTANCE:-$INSTANCE}"
-    RUST_LOG=off "$BINARY" ssh "$inst" -- "$@" 2>/dev/null
+    RUST_LOG=off "$BINARY" shell "$inst" -- "$@" 2>/dev/null
 }
 
 # Run the exec subcommand (captures stdout, propagates exit code).
@@ -346,22 +346,22 @@ test_auto_resolve_running() {
     running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
 
     if [[ "$running_count" -ne 1 ]]; then
-        skip "ssh auto-resolves single running instance" "$running_count running (need exactly 1)"
+        skip "shell auto-resolves single running instance" "$running_count running (need exactly 1)"
         skip "exec auto-resolves single running instance" "skipped (need exactly 1 running)"
         return
     fi
 
-    # ssh without name should auto-select the single running instance
+    # shell without name should auto-select the single running instance
     local output
-    if output=$(RUST_LOG=off "$BINARY" ssh -- echo "auto-resolve-works" 2>/dev/null); then
-        pass "ssh auto-resolves single running instance"
+    if output=$(RUST_LOG=off "$BINARY" shell -- echo "auto-resolve-works" 2>/dev/null); then
+        pass "shell auto-resolves single running instance"
         if echo "$output" | grep -q "auto-resolve-works"; then
-            pass "ssh auto-resolve returns correct output"
+            pass "shell auto-resolve returns correct output"
         else
-            fail "ssh auto-resolve returns correct output" "got: $output"
+            fail "shell auto-resolve returns correct output" "got: $output"
         fi
     else
-        fail "ssh auto-resolves single running instance" "exit code: $?"
+        fail "shell auto-resolves single running instance" "exit code: $?"
     fi
 
     # exec without --name should also auto-select
@@ -377,22 +377,55 @@ test_auto_resolve_running() {
     fi
 }
 
-test_ssh_connectivity() {
+test_shell_connectivity() {
     echo ""
-    echo "=== Phase: ssh connectivity ==="
+    echo "=== Phase: shell connectivity ==="
 
     local output
     if output=$(guest_exec echo "hello-from-guest" 2>/dev/null); then
-        pass "ssh connects to guest"
+        pass "shell connects to guest"
     else
-        fail "ssh connects to guest"
+        fail "shell connects to guest"
         return
     fi
 
     if echo "$output" | grep -q "hello-from-guest"; then
-        pass "ssh command output correct"
+        pass "shell command output correct"
     else
-        fail "ssh command output correct" "got: $output"
+        fail "shell command output correct" "got: $output"
+    fi
+}
+
+test_ssh_alias() {
+    echo ""
+    echo "=== Phase: ssh alias (backward compat) ==="
+
+    local output
+    if output=$(RUST_LOG=off "$BINARY" ssh "$INSTANCE" -- echo "alias-ok" 2>/dev/null); then
+        if echo "$output" | grep -q "alias-ok"; then
+            pass "ssh alias works as shell"
+        else
+            fail "ssh alias works as shell" "got: $output"
+        fi
+    else
+        fail "ssh alias works as shell" "exit code: $?"
+    fi
+}
+
+test_session_conflict() {
+    echo ""
+    echo "=== Phase: --session / --no-tmux conflict ==="
+
+    if moat_fails shell "$INSTANCE" --session main --no-tmux -- echo nope; then
+        pass "--session and --no-tmux conflict (shell)"
+    else
+        fail "--session and --no-tmux conflict (shell)" "should have failed"
+    fi
+
+    if moat_fails claude "$INSTANCE" --session main --no-tmux; then
+        pass "--session and --no-tmux conflict (claude)"
+    else
+        fail "--session and --no-tmux conflict (claude)" "should have failed"
     fi
 }
 
@@ -529,7 +562,7 @@ test_term_handling() {
     # Modern terminals (Ghostty, Kitty) set TERM values that don't exist
     # in a stock Ubuntu install. The guest_term() function in ssh.rs remaps
     # unknown TERM values to xterm-256color for interactive sessions
-    # (coop ssh, coop claude). Non-interactive SSH (-- cmd) doesn't
+    # (coop shell, coop claude). Non-interactive SSH (-- cmd) doesn't
     # allocate a PTY, so TERM doesn't matter there.
     #
     # This test verifies:
@@ -537,7 +570,7 @@ test_term_handling() {
     # 2. The coop binary doesn't crash or reject exotic TERM values
     local output
     if output=$(env TERM=xterm-ghostty RUST_LOG=off \
-        "$BINARY" ssh "$INSTANCE" -- echo term-ok 2>/dev/null); then
+        "$BINARY" shell "$INSTANCE" -- echo term-ok 2>/dev/null); then
         if echo "$output" | grep -q "term-ok"; then
             pass "SSH works with TERM=xterm-ghostty"
         else
@@ -919,19 +952,19 @@ test_auto_resolve_stopped() {
     running_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -c "running" || true)
 
     if [[ "$running_count" -gt 0 ]]; then
-        skip "ssh rejects when only stopped instances exist" "$running_count still running"
+        skip "shell rejects when only stopped instances exist" "$running_count still running"
         return
     fi
 
-    if moat_fails ssh -- echo "should-not-work"; then
-        pass "ssh rejects when only stopped instances exist"
+    if moat_fails shell -- echo "should-not-work"; then
+        pass "shell rejects when only stopped instances exist"
         if echo "$HARNESS_ERR" | grep -qi "stopped"; then
-            pass "ssh error mentions instance is stopped"
+            pass "shell error mentions instance is stopped"
         else
-            fail "ssh error mentions instance is stopped" "stderr: $HARNESS_ERR"
+            fail "shell error mentions instance is stopped" "stderr: $HARNESS_ERR"
         fi
     else
-        fail "ssh rejects when only stopped instances exist" "should have failed"
+        fail "shell rejects when only stopped instances exist" "should have failed"
     fi
 }
 
@@ -1140,19 +1173,19 @@ test_auto_resolve_no_instances() {
     instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
 
     if [[ "$instance_count" -gt 0 ]]; then
-        skip "ssh rejects when no instances exist" "$instance_count instances still present"
+        skip "shell rejects when no instances exist" "$instance_count instances still present"
         return
     fi
 
-    if moat_fails ssh -- echo "should-not-work"; then
-        pass "ssh rejects when no instances exist"
+    if moat_fails shell -- echo "should-not-work"; then
+        pass "shell rejects when no instances exist"
         if echo "$HARNESS_ERR" | grep -qi "no instances"; then
-            pass "ssh error mentions no instances"
+            pass "shell error mentions no instances"
         else
-            fail "ssh error mentions no instances" "stderr: $HARNESS_ERR"
+            fail "shell error mentions no instances" "stderr: $HARNESS_ERR"
         fi
     else
-        fail "ssh rejects when no instances exist" "should have failed"
+        fail "shell rejects when no instances exist" "should have failed"
     fi
 }
 
@@ -1351,22 +1384,22 @@ test_multi_instance() {
     fi
 
     # Auto-resolve should fail when multiple instances are running
-    if moat_fails ssh -- echo "should-not-work"; then
-        pass "ssh rejects auto-resolve with multiple running"
+    if moat_fails shell -- echo "should-not-work"; then
+        pass "shell rejects auto-resolve with multiple running"
         if echo "$HARNESS_ERR" | grep -qi "multiple"; then
             pass "error mentions multiple running instances"
         else
             fail "error mentions multiple running instances" "stderr: $HARNESS_ERR"
         fi
     else
-        fail "ssh rejects auto-resolve with multiple running" "should have failed"
+        fail "shell rejects auto-resolve with multiple running" "should have failed"
     fi
 
     # Explicit name should still work with multiple instances
-    if RUST_LOG=off "$BINARY" ssh "$inst_a" -- echo "explicit-ok" 2>/dev/null | grep -q "explicit-ok"; then
-        pass "ssh with explicit name works among multiple"
+    if RUST_LOG=off "$BINARY" shell "$inst_a" -- echo "explicit-ok" 2>/dev/null | grep -q "explicit-ok"; then
+        pass "shell with explicit name works among multiple"
     else
-        fail "ssh with explicit name works among multiple"
+        fail "shell with explicit name works among multiple"
     fi
 
     # Both should be independently accessible via SSH
@@ -2242,7 +2275,9 @@ main() {
     test_duplicate_name
     test_status_running
     test_auto_resolve_running
-    test_ssh_connectivity
+    test_shell_connectivity
+    test_ssh_alias
+    test_session_conflict
     test_exec
     test_claude_bin_path
     test_github_token_forwarding

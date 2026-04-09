@@ -94,26 +94,30 @@ coop start --image ml-dev --no-claude
 coop start --mount ~/data:/mnt/data
 ```
 
-### `ssh`
+### `shell`
 
-Open an interactive SSH session to a running VM, or run a single command.
+Open an interactive shell in the VM, or run a single command non-interactively.
 
 ```
-coop ssh [NAME] [FLAGS] [-- COMMAND...]
+coop shell [NAME] [FLAGS] [-- COMMAND...]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH) |
+| `--session <name>` | tmux session name (default: `main`) |
+| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
-Without a trailing command, `ssh` drops you into a tmux session named `main`. With a trailing command, it executes the command and returns its exit code.
+Without a trailing command, `shell` drops you into a tmux session named `main` (or the name given by `--session`). With a trailing command, it executes the command and returns its exit code.
+
+`--session` and `--no-tmux` are mutually exclusive.
 
 ```
-coop ssh
-coop ssh my-project --no-tmux
-coop ssh my-project -- cat /etc/os-release
+coop shell
+coop shell my-project --no-tmux
+coop shell my-project --session work
+coop shell my-project -- cat /etc/os-release
 ```
 
 ### `claude`
@@ -128,10 +132,11 @@ coop claude [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Prompt for permissions instead of skipping them |
-| `--no-tmux` | Skip tmux session persistence (raw SSH) |
+| `--session <name>` | tmux session name (default: `claude`) |
+| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `claude` |
 
-The session runs inside tmux under the name `claude`.
+The session runs inside tmux under the name `claude` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
 
 ```
 coop claude
@@ -141,7 +146,7 @@ coop claude my-project -- --model sonnet
 
 ### `exec`
 
-Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `ssh` for interactive work.
+Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `shell` for interactive work.
 
 ```
 coop exec [--name NAME] COMMAND...

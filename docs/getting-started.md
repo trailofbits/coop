@@ -171,18 +171,18 @@ Pass extra arguments through to `claude`:
 coop claude -- --model opus
 ```
 
-**SSH into the VM:**
+**Open a shell in the VM:**
 
 ```
-coop ssh
+coop shell
 ```
 
-Both `coop ssh` and `coop claude` attach to a persistent tmux session. Use `--no-tmux` for a raw SSH connection.
+Both `coop shell` and `coop claude` attach to a persistent tmux session. Use `--no-tmux` for a raw SSH connection, or `--session <name>` to pick a named session.
 
 **Run a command non-interactively:**
 
 ```
-coop ssh -- ls /workspace
+coop shell -- ls /workspace
 coop exec -- docker ps
 ```
 

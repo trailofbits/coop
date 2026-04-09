@@ -55,6 +55,27 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(clap::Args)]
+struct SessionArgs {
+    /// Instance name (required if multiple instances exist)
+    name: Option<String>,
+    /// tmux session name
+    #[arg(long, conflicts_with = "no_tmux")]
+    session: Option<String>,
+    /// Skip tmux session persistence (raw SSH connection)
+    #[arg(long)]
+    no_tmux: bool,
+}
+
+impl SessionArgs {
+    fn tmux_session<'a>(&'a self, default: &'a str) -> Option<&'a str> {
+        if self.no_tmux {
+            return None;
+        }
+        Some(self.session.as_deref().unwrap_or(default))
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
@@ -118,27 +139,22 @@ enum Commands {
         #[arg(long, default_value = config::DEFAULT_IMAGE)]
         image: String,
     },
-    /// SSH into running VM (or run a command non-interactively)
-    Ssh {
-        /// Instance name (required if multiple instances exist)
-        name: Option<String>,
-        /// Skip tmux session persistence (raw SSH)
-        #[arg(long)]
-        no_tmux: bool,
+    /// Open an interactive shell in the VM (or run a command non-interactively)
+    #[command(alias = "ssh")]
+    Shell {
+        #[command(flatten)]
+        session: SessionArgs,
         /// Command to run (non-interactive, no PTY)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, last = true)]
+        #[arg(allow_hyphen_values = true, last = true)]
         command: Vec<String>,
     },
     /// Launch Claude Code inside the VM (skips permissions by default)
     Claude {
-        /// Instance name (required if multiple instances exist)
-        name: Option<String>,
+        #[command(flatten)]
+        session: SessionArgs,
         /// Prompt for permissions instead of skipping them
         #[arg(long)]
         ask: bool,
-        /// Skip tmux session persistence (raw SSH)
-        #[arg(long)]
-        no_tmux: bool,
         /// Extra arguments passed to `claude`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -328,28 +344,26 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Commands::Ssh {
-            name,
-            no_tmux,
-            command,
-        } => cmd_ssh(&be, &cfg, name.as_deref(), &command, no_tmux),
+        Commands::Shell { session, command } => {
+            let tmux = session.tmux_session("main");
+            cmd_shell(&be, &cfg, session.name.as_deref(), &command, tmux)
+        }
         Commands::Claude {
-            name,
+            session,
             ask,
-            no_tmux,
             mut args,
         } => {
-            let running = resolve_running(&be, &cfg, name.as_deref())?;
+            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
             let env_vars = backend::prepare_env_forwarding(&cfg);
-            let session = backend::SshSession {
+            let sess = backend::SshSession {
                 target: &running.target,
                 env: &env_vars,
             };
             if !ask {
                 args.insert(0, "--dangerously-skip-permissions".to_string());
             }
-            let tmux = if no_tmux { None } else { Some("claude") };
-            ssh::run_interactive(&session, crate::guest::CLAUDE_BIN, &args, tmux)
+            let tmux = session.tmux_session("claude");
+            ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_deref())?;
@@ -537,7 +551,7 @@ fn find_stopped_instance(
         if be.is_running(&inst) {
             bail!(
                 "Instance '{name}' is already running.\n\
-                 Use `coop ssh {name}` to connect, or \
+                 Use `coop shell {name}` to connect, or \
                  `coop stop {name}` first."
             );
         }
@@ -760,12 +774,12 @@ fn resolve_running(
     }
 }
 
-fn cmd_ssh(
+fn cmd_shell(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&str>,
     command: &[String],
-    no_tmux: bool,
+    tmux_session: Option<&str>,
 ) -> Result<()> {
     let running = resolve_running(be, cfg, name)?;
     let env_vars = backend::prepare_env_forwarding(cfg);
@@ -774,8 +788,7 @@ fn cmd_ssh(
         env: &env_vars,
     };
     if command.is_empty() {
-        let tmux = if no_tmux { None } else { Some("main") };
-        ssh::connect(&session, tmux)
+        ssh::connect(&session, tmux_session)
     } else {
         ssh::run_command(&session, command)
     }
@@ -984,4 +997,97 @@ fn dir_size_display(dir: &std::path::Path) -> String {
     #[expect(clippy::cast_precision_loss, reason = "file sizes fit in f64")]
     let gib = total as f64 / (1024.0 * 1024.0 * 1024.0);
     format!("{gib:.1} GiB")
+}
+
+#[cfg(test)]
+#[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("coop").chain(args.iter().copied()))
+    }
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())) {
+            Err(e) => e,
+            Ok(_) => panic!("expected parse failure"),
+        }
+    }
+
+    #[test]
+    fn shell_subcommand_parses() {
+        let cli = parse(&["shell"]);
+        assert!(matches!(cli.command, super::Commands::Shell { .. }));
+    }
+
+    #[test]
+    fn ssh_alias_parses_as_shell() {
+        let cli = parse(&["ssh"]);
+        assert!(matches!(cli.command, super::Commands::Shell { .. }));
+    }
+
+    #[test]
+    fn shell_session_flag_parses() {
+        let cli = parse(&["shell", "--session", "work"]);
+        let super::Commands::Shell { session, .. } = cli.command else {
+            panic!("expected Shell variant");
+        };
+        assert_eq!(session.session.as_deref(), Some("work"));
+        assert_eq!(session.tmux_session("main"), Some("work"));
+    }
+
+    #[test]
+    fn shell_default_no_session() {
+        let cli = parse(&["shell"]);
+        let super::Commands::Shell { session, .. } = cli.command else {
+            panic!("expected Shell variant");
+        };
+        assert!(session.session.is_none());
+        assert_eq!(session.tmux_session("main"), Some("main"));
+    }
+
+    #[test]
+    fn shell_session_and_no_tmux_conflict() {
+        let err = parse_err(&["shell", "--session", "x", "--no-tmux"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn claude_session_flag_parses() {
+        let cli = parse(&["claude", "--session", "dev"]);
+        let super::Commands::Claude { session, .. } = cli.command else {
+            panic!("expected Claude variant");
+        };
+        assert_eq!(session.session.as_deref(), Some("dev"));
+        assert_eq!(session.tmux_session("claude"), Some("dev"));
+    }
+
+    #[test]
+    fn claude_session_and_no_tmux_conflict() {
+        let err = parse_err(&["claude", "--session", "x", "--no-tmux"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn claude_name_and_trailing_args_parse() {
+        let cli = parse(&["claude", "myvm", "--", "--model", "opus"]);
+        let super::Commands::Claude { session, args, .. } = cli.command else {
+            panic!("expected Claude variant");
+        };
+        assert_eq!(session.name.as_deref(), Some("myvm"));
+        assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn shell_no_tmux_without_session() {
+        let cli = parse(&["shell", "--no-tmux"]);
+        let super::Commands::Shell { session, .. } = cli.command else {
+            panic!("expected Shell variant");
+        };
+        assert!(session.no_tmux);
+        assert!(session.tmux_session("main").is_none());
+    }
 }

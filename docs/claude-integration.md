@@ -58,7 +58,7 @@ Every field is optional. An empty `[claude]` section (or omitting it entirely) s
 
 ### API key forwarding
 
-coop forwards `ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session: `coop claude`, `coop ssh`, and `coop exec` alike. The key is never written to disk inside the guest.
+coop forwards `ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session: `coop claude`, `coop shell`, and `coop exec` alike. The key is never written to disk inside the guest.
 
 Resolution order:
 

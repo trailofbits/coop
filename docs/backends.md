@@ -146,7 +146,7 @@ Both backends support the same CLI commands and guest capabilities:
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
-| `coop ssh` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
+| `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
 | `coop resize` | Truncates Lima diffdisk | Truncates + resize2fs on rootfs |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |

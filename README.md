@@ -57,7 +57,7 @@ That gives you a Claude Code session running inside an isolated VM with your pro
 | `start` | Launch a new VM instance |
 | `stop` | Stop a running VM (preserves disk) |
 | `destroy` | Stop and remove a VM instance |
-| `ssh` | Interactive SSH session to a running VM |
+| `shell` | Interactive shell session in a running VM |
 | `claude` | Launch Claude Code inside the VM |
 | `exec` | Run a command in the VM non-interactively |
 | `push` | Sync local directory into the VM |
