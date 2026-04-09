@@ -496,7 +496,7 @@ except ImportError:
 try:
     with open('$cfg_path', 'rb') as f:
         cfg = tomllib.load(f)
-    print(cfg.get('claude', {}).get('github', 'off'))
+    print(cfg.get('github', 'off'))
 except Exception:
     print('off')
 " 2>/dev/null || echo "off")
