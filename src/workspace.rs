@@ -52,15 +52,17 @@ impl WorkspaceState {
         Ok(())
     }
 
-    pub fn load(inst: &Instance) -> Result<Self> {
+    fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
-        let content = fs::read_to_string(&path).with_context(|| {
-            format!(
-                "No workspace.json found at {}. Was the VM started with --workspace or --git-repo?",
-                path.display()
-            )
-        })?;
-        serde_json::from_str(&content).context("Failed to parse workspace.json")
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let state =
+                    serde_json::from_str(&content).context("Failed to parse workspace.json")?;
+                Ok(Some(state))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))),
+        }
     }
 }
 
@@ -167,9 +169,27 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
+    if let Some(state) = WorkspaceState::try_load(inst)? {
+        return Ok(state);
+    }
+    if dir.is_some() {
+        return Ok(WorkspaceState {
+            host_path: None,
+            guest_path: GUEST_WORKSPACE.to_string(),
+            source: WorkspaceSource::Workspace,
+        });
+    }
+    bail!(
+        "No workspace.json found and no directory argument given.\n\
+         Either start the VM with --workspace or provide a path: \
+         coop {cmd} ./my-project"
+    )
+}
+
 /// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
 pub fn push(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool) -> Result<()> {
-    let state = WorkspaceState::load(inst)?;
+    let state = load_or_default(inst, dir, "push")?;
     let source_dir = resolve_host_dir(dir, &state)?;
 
     if !source_dir.is_dir() {
@@ -199,7 +219,7 @@ pub fn push(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool)
 
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
 pub fn pull(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool) -> Result<()> {
-    let state = WorkspaceState::load(inst)?;
+    let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir_for_pull(dir, &state)?;
 
     if !force && dest_dir.exists() {
@@ -756,8 +776,88 @@ fn launch_editor(inst: &Instance, remote_path: &str, editor: Option<&str>) -> Re
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::config::{InstanceIndex, InstanceName};
+
+    fn temp_instance(dir: &Path) -> Instance {
+        Instance {
+            name: InstanceName::new("test").expect("valid name"),
+            index: InstanceIndex::new(0),
+            dir: dir.to_path_buf(),
+            image: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn try_load_returns_none_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let result = WorkspaceState::try_load(&inst).expect("no IO error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_load_returns_state_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let state = WorkspaceState {
+            host_path: Some(PathBuf::from("/tmp/project")),
+            guest_path: "/workspace".to_string(),
+            source: WorkspaceSource::Workspace,
+        };
+        state.save(&inst).expect("save");
+        let loaded = WorkspaceState::try_load(&inst)
+            .expect("no IO error")
+            .expect("should be Some");
+        assert_eq!(loaded.guest_path, "/workspace");
+        assert_eq!(loaded.host_path.as_deref(), Some(Path::new("/tmp/project")));
+    }
+
+    #[test]
+    fn try_load_errors_on_invalid_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        fs::write(inst.workspace_state_path(), "not json").expect("write");
+        let result = WorkspaceState::try_load(&inst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_or_default_uses_saved_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let state = WorkspaceState {
+            host_path: Some(PathBuf::from("/host/dir")),
+            guest_path: "/custom".to_string(),
+            source: WorkspaceSource::GitRepo,
+        };
+        state.save(&inst).expect("save");
+        let loaded = load_or_default(&inst, None, "push").expect("load");
+        assert_eq!(loaded.guest_path, "/custom");
+    }
+
+    #[test]
+    fn load_or_default_falls_back_with_dir_arg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        // No workspace.json exists
+        let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
+        assert_eq!(loaded.guest_path, GUEST_WORKSPACE);
+        assert!(loaded.host_path.is_none());
+    }
+
+    #[test]
+    fn load_or_default_errors_without_dir_or_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let result = load_or_default(&inst, None, "pull");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("No workspace.json found"), "unexpected: {msg}");
+        assert!(msg.contains("coop pull"), "should mention command: {msg}");
+    }
 
     #[test]
     fn remove_all_blocks() {

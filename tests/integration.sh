@@ -1341,6 +1341,76 @@ test_workspace_sync() {
     ws_tmpdir=""
 }
 
+# ── Push/pull without --workspace (--full only) ──────────────
+
+test_push_pull_no_workspace() {
+    echo ""
+    echo "=== Phase: push/pull without --workspace ==="
+
+    local nw_instance="${INSTANCE}-nw"
+
+    # Start instance WITHOUT --workspace, --git-repo, or --mount
+    if coop start "$nw_instance" --no-claude; then
+        STARTED_INSTANCES+=("$nw_instance")
+        pass "start without --workspace exits 0"
+    else
+        fail "start without --workspace exits 0" "exit code: $?"
+        echo "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    GUEST_INSTANCE="$nw_instance"
+
+    # Pull with explicit dir should work (no workspace.json exists)
+    local pull_dir
+    pull_dir=$(mktemp -d)
+    if coop pull --name "$nw_instance" --force "$pull_dir"; then
+        pass "pull with explicit dir (no workspace.json)"
+    else
+        fail "pull with explicit dir (no workspace.json)" "exit code: $?"
+    fi
+    rm -rf "$pull_dir"
+
+    # Push with explicit dir should work
+    local push_dir
+    push_dir=$(mktemp -d)
+    echo "no-workspace-push-test" > "$push_dir/marker.txt"
+    if coop push --name "$nw_instance" --force "$push_dir"; then
+        pass "push with explicit dir (no workspace.json)"
+
+        # Verify the file arrived in guest at /workspace
+        local content
+        content=$(guest_exec cat /workspace/marker.txt 2>/dev/null) || content=""
+        if echo "$content" | grep -q "no-workspace-push-test"; then
+            pass "push defaulted to guest:/workspace"
+        else
+            fail "push defaulted to guest:/workspace" "got: '$content'"
+        fi
+    else
+        fail "push with explicit dir (no workspace.json)" "exit code: $?"
+    fi
+    rm -rf "$push_dir"
+
+    # Pull without dir and without workspace.json should fail
+    if moat_fails pull --name "$nw_instance"; then
+        pass "pull without dir or workspace.json fails"
+    else
+        fail "pull without dir or workspace.json fails" "should have failed"
+    fi
+
+    # Push without dir and without workspace.json should fail
+    if moat_fails push --name "$nw_instance"; then
+        pass "push without dir or workspace.json fails"
+    else
+        fail "push without dir or workspace.json fails" "should have failed"
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop destroy "$nw_instance" 2>/dev/null || true
+    untrack_instance "$nw_instance"
+}
+
 # ── Multi-instance tests (--full only) ────────────────────────
 
 test_multi_instance() {
@@ -2309,6 +2379,7 @@ main() {
         test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
+        test_push_pull_no_workspace
         test_workspace_sync
         test_multi_instance
         test_named_images
