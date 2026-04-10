@@ -977,20 +977,20 @@ fn write_profiles_list(
     out: &mut impl std::io::Write,
     cfg: &config::CoopConfig,
 ) -> std::io::Result<()> {
-    let builtin = guest::builtin_profile_entries();
     let mut custom_names: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
     custom_names.sort_unstable();
 
-    let width = builtin
+    let width = guest::BUILTIN_PROFILES
         .iter()
-        .map(|(n, _)| n.len())
+        .map(|bp| bp.name.len())
         .chain(custom_names.iter().map(|n| n.len()))
         .max()
         .unwrap_or(0);
 
     writeln!(out, "Builtin:")?;
-    for (name, desc) in builtin {
-        writeln!(out, "  {name:<width$} {desc}")?;
+    for bp in guest::BUILTIN_PROFILES {
+        let summary = builtin_summary(bp);
+        writeln!(out, "  {:<width$} {summary}", bp.name)?;
     }
 
     if !custom_names.is_empty() {
@@ -1003,6 +1003,27 @@ fn write_profiles_list(
         }
     }
     Ok(())
+}
+
+fn builtin_summary(bp: &guest::BuiltinProfile) -> String {
+    let mut parts = Vec::new();
+    if !bp.apt_packages.is_empty() {
+        parts.push(bp.apt_packages.join(", "));
+    }
+    if bp.pre_install.is_some() {
+        parts.push("pre-install script".to_owned());
+    }
+    if bp.post_install.is_some() {
+        parts.push("post-install script".to_owned());
+    }
+    if !bp.plugins.is_empty() {
+        parts.push(format!("plugins: {}", bp.plugins.join(", ")));
+    }
+    if parts.is_empty() {
+        "(empty)".to_owned()
+    } else {
+        parts.join("; ")
+    }
 }
 
 fn write_profile_show(

@@ -232,7 +232,7 @@ test_profiles_cli() {
         fail "profiles list exits 0" "exit code: $?"
     fi
 
-    for name in python node c fuzz rust go full; do
+    for name in python node c fuzz rust go; do
         if echo "$HARNESS_OUT" | grep -q "$name"; then
             pass "profiles list includes $name"
         else

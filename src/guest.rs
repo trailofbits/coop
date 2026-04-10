@@ -63,6 +63,20 @@ pub const DOCKER_PACKAGES: &[&str] = &[
 
 // ── Profile definitions ───────────────────────────────────────
 
+/// Compile-time profile definition. Single source of truth for all
+/// builtin profiles — name, packages, scripts, and plugins are
+/// colocated in `BUILTIN_PROFILES`.
+pub struct BuiltinProfile {
+    pub name: &'static str,
+    pub apt_packages: &'static [&'static str],
+    pub pre_install: Option<&'static str>,
+    pub post_install: Option<&'static str>,
+    pub marketplaces: &'static [&'static str],
+    pub plugins: &'static [&'static str],
+}
+
+/// Owned profile definition produced by `lookup_profile`. Handles both
+/// builtin (converted from static data) and custom (cloned from config).
 pub struct ProfileDef {
     pub apt_packages: Vec<String>,
     pub pre_install: Option<String>,
@@ -71,86 +85,75 @@ pub struct ProfileDef {
     pub plugins: Vec<String>,
 }
 
-/// Single source of truth for builtin profile names and descriptions.
-/// `lookup_builtin` must have a matching arm for every non-"full" entry;
-/// the `builtin_profile_entries_match_lookup` test enforces this.
-const BUILTIN_PROFILES: &[(&str, &str)] = &[
-    ("python", "Python 3 with pip and venv"),
-    ("node", "Node.js 22 via NodeSource"),
-    ("c", "Clang, LLVM, GDB, Valgrind, CMake"),
-    ("fuzz", "Clang, LLVM, AFL++, lcov"),
-    ("rust", "Rust via rustup"),
-    ("go", "Go"),
-    ("full", "python + node + c + fuzz + rust + go"),
-];
-
-/// Returns `(name, description)` for each builtin profile.
-pub fn builtin_profile_entries() -> &'static [(&'static str, &'static str)] {
-    BUILTIN_PROFILES
-}
-
-fn lookup_builtin(name: &str) -> Option<ProfileDef> {
-    match name {
-        "python" => Some(ProfileDef {
-            apt_packages: vec![
-                "python3".into(),
-                "python3-pip".into(),
-                "python3-venv".into(),
-            ],
-            pre_install: None,
-            post_install: None,
-            marketplaces: vec![],
-            plugins: vec![],
-        }),
-        "node" => Some(ProfileDef {
-            apt_packages: vec!["nodejs".into()],
-            pre_install: Some(include_str!("../scripts/guest/profiles/node-pre.sh").into()),
-            post_install: None,
-            marketplaces: vec![],
-            plugins: vec![],
-        }),
-        "c" => Some(ProfileDef {
-            apt_packages: vec![
-                "clang".into(),
-                "llvm".into(),
-                "gdb".into(),
-                "valgrind".into(),
-                "cmake".into(),
-            ],
-            pre_install: None,
-            post_install: None,
-            marketplaces: vec![],
-            plugins: vec!["clangd-lsp@claude-plugins-official".into()],
-        }),
-        "fuzz" => Some(ProfileDef {
-            apt_packages: vec!["clang".into(), "llvm".into(), "afl++".into(), "lcov".into()],
-            pre_install: None,
-            post_install: None,
-            marketplaces: vec![],
-            plugins: vec![],
-        }),
-        "rust" => Some(ProfileDef {
-            apt_packages: vec![],
-            pre_install: None,
-            post_install: Some(include_str!("../scripts/guest/profiles/rust-post.sh").into()),
-            marketplaces: vec![],
-            plugins: vec!["rust-analyzer-lsp@claude-plugins-official".into()],
-        }),
-        "go" => Some(ProfileDef {
-            apt_packages: vec!["golang".into()],
-            pre_install: None,
-            post_install: None,
-            marketplaces: vec![],
-            plugins: vec![],
-        }),
-        _ => None,
+impl From<&BuiltinProfile> for ProfileDef {
+    fn from(bp: &BuiltinProfile) -> Self {
+        Self {
+            apt_packages: bp.apt_packages.iter().map(|s| (*s).to_owned()).collect(),
+            pre_install: bp.pre_install.map(str::to_owned),
+            post_install: bp.post_install.map(str::to_owned),
+            marketplaces: bp.marketplaces.iter().map(|s| (*s).to_owned()).collect(),
+            plugins: bp.plugins.iter().map(|s| (*s).to_owned()).collect(),
+        }
     }
 }
 
-/// Look up a profile by name. Checks custom profiles first, then
-/// built-in ones. The `full` meta-profile expands all built-in profiles.
+pub const BUILTIN_PROFILES: &[BuiltinProfile] = &[
+    BuiltinProfile {
+        name: "python",
+        apt_packages: &["python3", "python3-pip", "python3-venv"],
+        pre_install: None,
+        post_install: None,
+        marketplaces: &[],
+        plugins: &[],
+    },
+    BuiltinProfile {
+        name: "node",
+        apt_packages: &["nodejs"],
+        pre_install: Some(include_str!("../scripts/guest/profiles/node-pre.sh")),
+        post_install: None,
+        marketplaces: &[],
+        plugins: &[],
+    },
+    BuiltinProfile {
+        name: "c",
+        apt_packages: &["clang", "llvm", "gdb", "valgrind", "cmake"],
+        pre_install: None,
+        post_install: None,
+        marketplaces: &[],
+        plugins: &["clangd-lsp@claude-plugins-official"],
+    },
+    BuiltinProfile {
+        name: "fuzz",
+        apt_packages: &["clang", "llvm", "afl++", "lcov"],
+        pre_install: None,
+        post_install: None,
+        marketplaces: &[],
+        plugins: &[],
+    },
+    BuiltinProfile {
+        name: "rust",
+        apt_packages: &[],
+        pre_install: None,
+        post_install: Some(include_str!("../scripts/guest/profiles/rust-post.sh")),
+        marketplaces: &[],
+        plugins: &["rust-analyzer-lsp@claude-plugins-official"],
+    },
+    BuiltinProfile {
+        name: "go",
+        apt_packages: &["golang"],
+        pre_install: None,
+        post_install: None,
+        marketplaces: &[],
+        plugins: &[],
+    },
+];
+
+fn lookup_builtin(name: &str) -> Option<&'static BuiltinProfile> {
+    BUILTIN_PROFILES.iter().find(|bp| bp.name == name)
+}
+
+/// Look up a profile by name. Checks custom profiles first, then builtins.
 pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Result<ProfileDef> {
-    // Custom profiles take precedence
     if let Some(cp) = custom.get(name) {
         return Ok(ProfileDef {
             apt_packages: cp.apt_packages.clone(),
@@ -161,55 +164,11 @@ pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Re
         });
     }
 
-    if name == "full" {
-        let all = ["python", "node", "c", "fuzz", "rust", "go"];
-        let mut apt_packages = Vec::new();
-        let mut pre_parts = Vec::new();
-        let mut post_parts = Vec::new();
-        let mut marketplaces = Vec::new();
-        let mut plugins = Vec::new();
-        for sub in all {
-            let Some(def) = lookup_builtin(sub) else {
-                bail!("BUG: built-in profile '{sub}' missing from full expansion");
-            };
-            apt_packages.extend(def.apt_packages);
-            if let Some(s) = def.pre_install {
-                pre_parts.push(s);
-            }
-            if let Some(s) = def.post_install {
-                post_parts.push(s);
-            }
-            marketplaces.extend(def.marketplaces);
-            plugins.extend(def.plugins);
-        }
-        apt_packages.sort_unstable();
-        apt_packages.dedup();
-        marketplaces.sort_unstable();
-        marketplaces.dedup();
-        plugins.sort_unstable();
-        plugins.dedup();
-        return Ok(ProfileDef {
-            apt_packages,
-            pre_install: if pre_parts.is_empty() {
-                None
-            } else {
-                Some(pre_parts.join("\n"))
-            },
-            post_install: if post_parts.is_empty() {
-                None
-            } else {
-                Some(post_parts.join("\n"))
-            },
-            marketplaces,
-            plugins,
-        });
+    if let Some(bp) = lookup_builtin(name) {
+        return Ok(ProfileDef::from(bp));
     }
 
-    if let Some(def) = lookup_builtin(name) {
-        return Ok(def);
-    }
-
-    let mut available: Vec<&str> = BUILTIN_PROFILES.iter().map(|(n, _)| *n).collect();
+    let mut available: Vec<&str> = BUILTIN_PROFILES.iter().map(|bp| bp.name).collect();
     let mut custom_names: Vec<&str> = custom.keys().map(String::as_str).collect();
     custom_names.sort_unstable();
     available.extend(custom_names);
@@ -245,33 +204,41 @@ pub fn collect_baked_lists(
 }
 
 #[cfg(test)]
+#[expect(clippy::panic, reason = "tests use panic for assertion failures")]
+#[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
 mod tests {
     use super::*;
 
     #[test]
-    fn builtin_profile_entries_lists_all() {
-        let entries = builtin_profile_entries();
-        let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
-        assert_eq!(
-            names,
-            vec!["python", "node", "c", "fuzz", "rust", "go", "full"]
-        );
-        for &(name, desc) in entries {
-            assert!(
-                !desc.is_empty(),
-                "builtin profile '{name}' has empty description"
-            );
+    fn all_builtins_resolve() {
+        let custom = HashMap::new();
+        for bp in BUILTIN_PROFILES {
+            let def = lookup_profile(bp.name, &custom)
+                .unwrap_or_else(|_| panic!("builtin '{}' failed to resolve", bp.name));
+            assert_eq!(def.apt_packages.len(), bp.apt_packages.len());
         }
     }
 
     #[test]
-    fn builtin_profile_entries_match_lookup() {
+    fn unknown_profile_fails() {
         let custom = HashMap::new();
-        for &(name, _) in builtin_profile_entries() {
-            assert!(
-                lookup_profile(name, &custom).is_ok(),
-                "builtin_profile_entries lists '{name}' but lookup_profile rejects it"
-            );
-        }
+        assert!(lookup_profile("nonexistent", &custom).is_err());
+    }
+
+    #[test]
+    fn custom_overrides_builtin() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "python".to_owned(),
+            CustomProfile {
+                apt_packages: vec!["custom-python".to_owned()],
+                pre_install: None,
+                post_install: None,
+                marketplaces: vec![],
+                plugins: vec![],
+            },
+        );
+        let def = lookup_profile("python", &custom).unwrap();
+        assert_eq!(def.apt_packages, vec!["custom-python"]);
     }
 }
