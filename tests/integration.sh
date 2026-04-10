@@ -2352,8 +2352,8 @@ test_provision_failure() {
     # appends 'exit 1' to the provision script before cleanup.
     # setup --rebuild should fail with a clear error message.
     local rc=0
-    local out err
-    out=$(COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" setup -y --rebuild 2>"$tmpdir/pf-stderr") || rc=$?
+    local err
+    COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" setup -y --rebuild >/dev/null 2>"$tmpdir/pf-stderr" || rc=$?
     err=$(cat "$tmpdir/pf-stderr")
 
     if [[ $rc -ne 0 ]]; then
