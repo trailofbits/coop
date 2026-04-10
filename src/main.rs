@@ -244,10 +244,26 @@ enum Commands {
         #[arg(long, required = true)]
         size: String,
     },
+    /// List or inspect available profiles
+    Profiles {
+        #[command(subcommand)]
+        action: Option<ProfilesAction>,
+    },
     /// Validate configuration and check prerequisites
     Validate,
     /// Generate a starter config file at ~/.coop/config.toml
     Init,
+}
+
+#[derive(Subcommand)]
+enum ProfilesAction {
+    /// List all available profiles (builtin and custom)
+    List,
+    /// Show the full definition of a profile
+    Show {
+        /// Profile name to inspect
+        name: String,
+    },
 }
 
 fn init_tracing(verbosity: u8) {
@@ -409,6 +425,9 @@ fn main() -> Result<()> {
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_deref()),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_deref(), &size),
+        Commands::Profiles { action } => {
+            cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
+        }
         Commands::Validate => cmd_validate(&cfg, &be),
         Commands::Init => unreachable!("handled before config loading"),
     }
@@ -942,6 +961,141 @@ fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> R
     Ok(gib)
 }
 
+fn cmd_profiles(cfg: &config::CoopConfig, action: &ProfilesAction) -> Result<()> {
+    let out = &mut std::io::stdout();
+    let write_result = match action {
+        ProfilesAction::List => write_profiles_list(out, cfg),
+        ProfilesAction::Show { name } => {
+            let def = guest::lookup_profile(name, &cfg.profiles)?;
+            write_profile_show(out, cfg, name, &def)
+        }
+    };
+    write_result.context("failed to write profile output")
+}
+
+fn write_profiles_list(
+    out: &mut impl std::io::Write,
+    cfg: &config::CoopConfig,
+) -> std::io::Result<()> {
+    let builtin = guest::builtin_profile_entries();
+    let mut custom_names: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+    custom_names.sort_unstable();
+
+    let width = builtin
+        .iter()
+        .map(|(n, _)| n.len())
+        .chain(custom_names.iter().map(|n| n.len()))
+        .max()
+        .unwrap_or(0);
+
+    writeln!(out, "Builtin:")?;
+    for (name, desc) in builtin {
+        writeln!(out, "  {name:<width$} {desc}")?;
+    }
+
+    if !custom_names.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Custom:")?;
+        for name in custom_names {
+            let cp = &cfg.profiles[name];
+            let detail = format_custom_summary(cp);
+            writeln!(out, "  {name:<width$} {detail}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_profile_show(
+    out: &mut impl std::io::Write,
+    cfg: &config::CoopConfig,
+    name: &str,
+    def: &guest::ProfileDef,
+) -> std::io::Result<()> {
+    let origin = if cfg.profiles.contains_key(name) {
+        "custom"
+    } else {
+        "builtin"
+    };
+    writeln!(out, "Profile: {name} ({origin})")?;
+    writeln!(
+        out,
+        "  apt_packages: {}",
+        if def.apt_packages.is_empty() {
+            "(none)".to_string()
+        } else {
+            def.apt_packages.join(", ")
+        }
+    )?;
+    writeln!(
+        out,
+        "  pre_install:  {}",
+        script_summary(def.pre_install.as_deref())
+    )?;
+    writeln!(
+        out,
+        "  post_install: {}",
+        script_summary(def.post_install.as_deref())
+    )?;
+    writeln!(
+        out,
+        "  marketplaces: {}",
+        if def.marketplaces.is_empty() {
+            "(none)".to_string()
+        } else {
+            def.marketplaces.join(", ")
+        }
+    )?;
+    writeln!(
+        out,
+        "  plugins:      {}",
+        if def.plugins.is_empty() {
+            "(none)".to_string()
+        } else {
+            def.plugins.join(", ")
+        }
+    )?;
+    Ok(())
+}
+
+fn format_custom_summary(cp: &config::CustomProfile) -> String {
+    let mut parts = Vec::new();
+    if !cp.apt_packages.is_empty() {
+        parts.push(format!("{} apt packages", cp.apt_packages.len()));
+    }
+    if cp.pre_install.is_some() {
+        parts.push("pre-install script".to_string());
+    }
+    if cp.post_install.is_some() {
+        parts.push("post-install script".to_string());
+    }
+    if !cp.marketplaces.is_empty() {
+        parts.push(format!("{} marketplaces", cp.marketplaces.len()));
+    }
+    if !cp.plugins.is_empty() {
+        parts.push(format!("{} plugins", cp.plugins.len()));
+    }
+    if parts.is_empty() {
+        "(empty)".to_string()
+    } else {
+        format!("({})", parts.join(", "))
+    }
+}
+
+fn script_summary(script: Option<&str>) -> String {
+    match script {
+        None | Some("") => "(none)".to_string(),
+        Some(s) => {
+            let lines = s.lines().count();
+            let first = s.lines().next().unwrap_or("");
+            if lines <= 1 {
+                first.to_string()
+            } else {
+                format!("{first} ... ({lines} lines)")
+            }
+        }
+    }
+}
+
 fn cmd_images(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1089,5 +1243,44 @@ mod tests {
         };
         assert!(session.no_tmux);
         assert!(session.tmux_session("main").is_none());
+    }
+
+    #[test]
+    fn profiles_list_parses() {
+        let cli = parse(&["profiles", "list"]);
+        let super::Commands::Profiles { action } = cli.command else {
+            panic!("expected Profiles variant");
+        };
+        assert!(matches!(action, Some(super::ProfilesAction::List)));
+    }
+
+    #[test]
+    fn profiles_bare_defaults_to_list() {
+        let cli = parse(&["profiles"]);
+        let super::Commands::Profiles { action } = cli.command else {
+            panic!("expected Profiles variant");
+        };
+        assert!(
+            action.is_none(),
+            "bare `profiles` should have no action (defaults to List at dispatch)"
+        );
+    }
+
+    #[test]
+    fn profiles_show_parses() {
+        let cli = parse(&["profiles", "show", "rust"]);
+        let super::Commands::Profiles { action } = cli.command else {
+            panic!("expected Profiles variant");
+        };
+        let Some(super::ProfilesAction::Show { name }) = action else {
+            panic!("expected Show variant");
+        };
+        assert_eq!(name, "rust");
+    }
+
+    #[test]
+    fn profiles_show_requires_name() {
+        let err = parse_err(&["profiles", "show"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }

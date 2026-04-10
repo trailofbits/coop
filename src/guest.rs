@@ -71,7 +71,23 @@ pub struct ProfileDef {
     pub plugins: Vec<String>,
 }
 
-const BUILTIN_PROFILES: &[&str] = &["python", "node", "c", "fuzz", "rust", "go", "full"];
+/// Single source of truth for builtin profile names and descriptions.
+/// `lookup_builtin` must have a matching arm for every non-"full" entry;
+/// the `builtin_profile_entries_match_lookup` test enforces this.
+const BUILTIN_PROFILES: &[(&str, &str)] = &[
+    ("python", "Python 3 with pip and venv"),
+    ("node", "Node.js 22 via NodeSource"),
+    ("c", "Clang, LLVM, GDB, Valgrind, CMake"),
+    ("fuzz", "Clang, LLVM, AFL++, lcov"),
+    ("rust", "Rust via rustup"),
+    ("go", "Go"),
+    ("full", "python + node + c + fuzz + rust + go"),
+];
+
+/// Returns `(name, description)` for each builtin profile.
+pub fn builtin_profile_entries() -> &'static [(&'static str, &'static str)] {
+    BUILTIN_PROFILES
+}
 
 fn lookup_builtin(name: &str) -> Option<ProfileDef> {
     match name {
@@ -193,7 +209,7 @@ pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Re
         return Ok(def);
     }
 
-    let mut available: Vec<&str> = BUILTIN_PROFILES.to_vec();
+    let mut available: Vec<&str> = BUILTIN_PROFILES.iter().map(|(n, _)| *n).collect();
     let mut custom_names: Vec<&str> = custom.keys().map(String::as_str).collect();
     custom_names.sort_unstable();
     available.extend(custom_names);
@@ -226,4 +242,36 @@ pub fn collect_baked_lists(
     plugins.dedup();
 
     Ok((marketplaces, plugins))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_profile_entries_lists_all() {
+        let entries = builtin_profile_entries();
+        let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec!["python", "node", "c", "fuzz", "rust", "go", "full"]
+        );
+        for &(name, desc) in entries {
+            assert!(
+                !desc.is_empty(),
+                "builtin profile '{name}' has empty description"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_profile_entries_match_lookup() {
+        let custom = HashMap::new();
+        for &(name, _) in builtin_profile_entries() {
+            assert!(
+                lookup_profile(name, &custom).is_ok(),
+                "builtin_profile_entries lists '{name}' but lookup_profile rejects it"
+            );
+        }
+    }
 }

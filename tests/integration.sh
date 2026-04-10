@@ -219,6 +219,69 @@ test_invalid_names() {
     fi
 }
 
+# ── Profiles list/show ────────────────────────────────────────
+
+test_profiles_cli() {
+    echo ""
+    echo "=== Phase: profiles list/show ==="
+
+    # `profiles list` exits 0 and includes builtin names
+    if coop profiles list; then
+        pass "profiles list exits 0"
+    else
+        fail "profiles list exits 0" "exit code: $?"
+    fi
+
+    for name in python node c fuzz rust go full; do
+        if echo "$HARNESS_OUT" | grep -q "$name"; then
+            pass "profiles list includes $name"
+        else
+            fail "profiles list includes $name" "output: $HARNESS_OUT"
+        fi
+    done
+
+    # Bare `profiles` defaults to list
+    if coop profiles; then
+        pass "bare profiles exits 0"
+    else
+        fail "bare profiles exits 0" "exit code: $?"
+    fi
+
+    if echo "$HARNESS_OUT" | grep -q "Builtin:"; then
+        pass "bare profiles shows Builtin header"
+    else
+        fail "bare profiles shows Builtin header" "output: $HARNESS_OUT"
+    fi
+
+    # `profiles show <name>` exits 0 and prints profile details
+    if coop profiles show rust; then
+        pass "profiles show rust exits 0"
+    else
+        fail "profiles show rust exits 0" "exit code: $?"
+    fi
+
+    if echo "$HARNESS_OUT" | grep -q "Profile: rust (builtin)"; then
+        pass "profiles show rust reports builtin origin"
+    else
+        fail "profiles show rust reports builtin origin" "output: $HARNESS_OUT"
+    fi
+
+    for field in apt_packages pre_install post_install marketplaces plugins; do
+        if echo "$HARNESS_OUT" | grep -q "$field"; then
+            pass "profiles show rust includes $field"
+        else
+            fail "profiles show rust includes $field" "output: $HARNESS_OUT"
+        fi
+    done
+
+    # `profiles show <unknown>` fails
+    if moat_fails profiles show nonexistent-profile; then
+        pass "profiles show rejects unknown profile"
+    else
+        fail "profiles show rejects unknown profile" "should have failed"
+    fi
+}
+
 # ── Setup ─────────────────────────────────────────────────────
 
 test_setup() {
@@ -2338,6 +2401,7 @@ main() {
     # Pre-VM tests
     test_validate
     test_invalid_names
+    test_profiles_cli
 
     # Setup + primary instance
     test_setup
