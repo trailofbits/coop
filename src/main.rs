@@ -509,7 +509,8 @@ fn cmd_start(
     cfg: &config::CoopConfig,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
-    if let Some(inst) = find_stopped_instance(be, cfg, opts.name)? {
+    let ws_path = opts.workspace_dir.map(Path::new);
+    if let Some(inst) = find_stopped_instance(be, cfg, opts.name, ws_path)? {
         let has_ignored_flags = !opts.mounts.is_empty()
             || opts.workspace_dir.is_some()
             || opts.git_repo.is_some()
@@ -530,7 +531,7 @@ fn cmd_start(
         return restart_instance(be, cfg, &inst, opts.no_claude);
     }
 
-    let inst = cfg.allocate_instance(opts.name, opts.image)?;
+    let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
@@ -553,15 +554,22 @@ fn cmd_start(
 ///
 /// With a name: returns the instance if it exists and is stopped,
 /// errors if it's running, returns None if it doesn't exist.
-/// Without a name: returns the single stopped instance if exactly one
+///
+/// With a workspace path (no name): looks up instances by their stored
+/// workspace `host_path`. If a match is found and running, errors with
+/// a helpful message. If stopped, returns it for restart. If no match,
+/// returns None so a new instance is allocated.
+///
+/// With neither: returns the single stopped instance if exactly one
 /// exists, errors if multiple stopped instances exist, returns None
 /// if none exist.
 fn find_stopped_instance(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&str>,
+    workspace_dir: Option<&Path>,
 ) -> Result<Option<config::Instance>> {
-    let instances = cfg.list_instances()?;
+    let mut instances = cfg.list_instances()?;
 
     if let Some(name) = name {
         let Some(inst) = instances.into_iter().find(|i| i.name.as_str() == name) else {
@@ -575,6 +583,56 @@ fn find_stopped_instance(
             );
         }
         return Ok(Some(inst));
+    }
+
+    // Workspace affinity: find instance by stored workspace path
+    if let Some(ws_dir) = workspace_dir {
+        let canonical = ws_dir
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve workspace path {}", ws_dir.display()))?;
+
+        let matching: Vec<usize> = instances
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| {
+                workspace::WorkspaceState::try_load(inst)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.host_path)
+                    .is_some_and(|hp| hp == canonical)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        match matching.len() {
+            0 => {} // No match — fall through to allocate new instance
+            1 => {
+                let idx = matching[0];
+                if be.is_running(&instances[idx]) {
+                    let name = &instances[idx].name;
+                    bail!(
+                        "Instance '{name}' is already running with this workspace.\n\
+                         Use `coop shell {name}` to connect."
+                    );
+                }
+                return Ok(Some(instances.swap_remove(idx)));
+            }
+            _ => {
+                let names: Vec<_> = matching
+                    .iter()
+                    .map(|&i| instances[i].name.as_str())
+                    .collect();
+                bail!(
+                    "Multiple instances share workspace {}:\n  {}\n\
+                     Specify which to restart: coop start <name>",
+                    canonical.display(),
+                    names.join(", "),
+                );
+            }
+        }
+
+        // No existing instance for this workspace — return None to allocate new
+        return Ok(None);
     }
 
     let stopped: Vec<_> = instances

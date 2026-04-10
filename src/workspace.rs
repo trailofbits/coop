@@ -52,7 +52,7 @@ impl WorkspaceState {
         Ok(())
     }
 
-    fn try_load(inst: &Instance) -> Result<Option<Self>> {
+    pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
         match fs::read_to_string(&path) {
             Ok(content) => {

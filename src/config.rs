@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::net::Ipv4Addr;
@@ -471,6 +472,43 @@ fn lock_dir(dir: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Sanitize a directory basename for use as an instance name.
+///
+/// Replaces characters outside `[a-zA-Z0-9_-]` with `-`.
+/// Returns `"workspace"` if the result would be empty.
+/// Truncates to 60 characters to leave room for collision suffixes.
+fn sanitize_basename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        return "workspace".to_string();
+    }
+    let max = 60.min(sanitized.len());
+    sanitized[..max].to_string()
+}
+
+/// Find a unique instance name by appending `-2`, `-3`, etc. on collision.
+fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceName> {
+    if !instances.iter().any(|i| i.name.as_str() == base) {
+        return InstanceName::new(base);
+    }
+    for n in 2..=99 {
+        let candidate = format!("{base}-{n}");
+        if !instances.iter().any(|i| i.name.as_str() == candidate) {
+            return InstanceName::new(&candidate);
+        }
+    }
+    bail!("Could not find unique instance name for '{base}'")
+}
+
 impl CoopConfig {
     /// Default config path: `~/.coop/config.toml`.
     pub fn default_path() -> PathBuf {
@@ -744,9 +782,19 @@ impl CoopConfig {
     /// Valid indices are 0..=252, mapping to guest IPs 172.16.0.2-254.
     /// (172.16.0.0 = network, .1 = host, .255 = broadcast — all unusable.)
     ///
+    /// When `workspace_path` is provided and no explicit name is given,
+    /// the instance name is derived from the workspace directory basename
+    /// (e.g. `/home/user/projects/myapp` → `myapp`). Collisions are
+    /// resolved by appending `-2`, `-3`, etc.
+    ///
     /// Uses flock on the instances directory to prevent races between
     /// concurrent allocations.
-    pub fn allocate_instance(&self, name: Option<&str>, image: &str) -> Result<Instance> {
+    pub fn allocate_instance(
+        &self,
+        name: Option<&str>,
+        image: &str,
+        workspace_path: Option<&Path>,
+    ) -> Result<Instance> {
         const MAX_INDEX: u16 = 252;
 
         let _lock = lock_dir(&self.instances_dir())?;
@@ -766,6 +814,13 @@ impl CoopConfig {
 
         let name = if let Some(n) = name {
             InstanceName::new(n)?
+        } else if let Some(ws) = workspace_path {
+            let basename = ws
+                .file_name()
+                .unwrap_or(OsStr::new("workspace"))
+                .to_string_lossy();
+            let base = sanitize_basename(&basename);
+            unique_instance_name(&base, &instances)?
         } else {
             let s = index.to_string();
             InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
@@ -1185,7 +1240,7 @@ mod tests {
     fn allocate_first_instance_gets_index_zero() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE).unwrap();
+        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
         assert_eq!(inst.index, InstanceIndex::new(0));
         assert_eq!(inst.name, *"0");
     }
@@ -1195,9 +1250,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        let a = cfg.allocate_instance(None, DEFAULT_IMAGE).unwrap();
-        let b = cfg.allocate_instance(None, DEFAULT_IMAGE).unwrap();
-        let c = cfg.allocate_instance(None, DEFAULT_IMAGE).unwrap();
+        let a = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let b = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let c = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
 
         assert_eq!(a.index, InstanceIndex::new(0));
         assert_eq!(b.index, InstanceIndex::new(1));
@@ -1210,7 +1265,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let inst = cfg
-            .allocate_instance(Some("my-project"), DEFAULT_IMAGE)
+            .allocate_instance(Some("my-project"), DEFAULT_IMAGE, None)
             .unwrap();
         assert_eq!(inst.name, *"my-project");
         assert_eq!(inst.index, InstanceIndex::new(0));
@@ -1221,9 +1276,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        cfg.allocate_instance(Some("dupe"), DEFAULT_IMAGE).unwrap();
+        cfg.allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
+            .unwrap();
         let err = cfg
-            .allocate_instance(Some("dupe"), DEFAULT_IMAGE)
+            .allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -1234,16 +1290,22 @@ mod tests {
         let cfg = test_config(&tmp);
 
         // Create instance at index 0, then remove it, then create at 1
-        let inst0 = cfg.allocate_instance(Some("a"), DEFAULT_IMAGE).unwrap();
+        let inst0 = cfg
+            .allocate_instance(Some("a"), DEFAULT_IMAGE, None)
+            .unwrap();
         assert_eq!(inst0.index, InstanceIndex::new(0));
-        let inst1 = cfg.allocate_instance(Some("b"), DEFAULT_IMAGE).unwrap();
+        let inst1 = cfg
+            .allocate_instance(Some("b"), DEFAULT_IMAGE, None)
+            .unwrap();
         assert_eq!(inst1.index, InstanceIndex::new(1));
 
         // Remove instance 0 by deleting its dir
         fs::remove_dir_all(&inst0.dir).unwrap();
 
         // Next allocation should be index 2 (highest + 1), not 0 (gap)
-        let inst2 = cfg.allocate_instance(Some("c"), DEFAULT_IMAGE).unwrap();
+        let inst2 = cfg
+            .allocate_instance(Some("c"), DEFAULT_IMAGE, None)
+            .unwrap();
         assert_eq!(inst2.index, InstanceIndex::new(2));
     }
 
@@ -1262,7 +1324,9 @@ mod tests {
         fs::remove_dir_all(tmp.path().join("instances/zero")).unwrap();
 
         // Next should fill gap at 0 since highest (252) is at ceiling
-        let inst = cfg.allocate_instance(Some("fill"), DEFAULT_IMAGE).unwrap();
+        let inst = cfg
+            .allocate_instance(Some("fill"), DEFAULT_IMAGE, None)
+            .unwrap();
         assert_eq!(inst.index, InstanceIndex::new(0));
     }
 
@@ -1316,7 +1380,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let err = cfg
-            .allocate_instance(Some("../evil"), DEFAULT_IMAGE)
+            .allocate_instance(Some("../evil"), DEFAULT_IMAGE, None)
             .unwrap_err();
         assert!(err.to_string().contains("invalid character"));
     }
@@ -1994,7 +2058,7 @@ mod tests {
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
         // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE).unwrap();
+        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
         assert_eq!(inst.index, InstanceIndex::new(0));
     }
 
@@ -2238,5 +2302,121 @@ mod tests {
             "should preserve path suffix, got: {}",
             p.display()
         );
+    }
+
+    // ── Workspace-derived instance names ─────────────────────
+
+    #[test]
+    fn sanitize_basename_simple() {
+        assert_eq!(sanitize_basename("myproject"), "myproject");
+    }
+
+    #[test]
+    fn sanitize_basename_replaces_dots_and_spaces() {
+        assert_eq!(sanitize_basename("my.project"), "my-project");
+        assert_eq!(sanitize_basename("my project"), "my-project");
+    }
+
+    #[test]
+    fn sanitize_basename_empty_returns_workspace() {
+        assert_eq!(sanitize_basename(""), "workspace");
+    }
+
+    #[test]
+    fn sanitize_basename_all_invalid_returns_dashes() {
+        assert_eq!(sanitize_basename("..."), "---");
+    }
+
+    #[test]
+    fn sanitize_basename_truncates_long_names() {
+        let long = "a".repeat(100);
+        let result = sanitize_basename(&long);
+        assert_eq!(result.len(), 60);
+    }
+
+    #[test]
+    fn sanitize_basename_preserves_hyphens_and_underscores() {
+        assert_eq!(sanitize_basename("my-project_v2"), "my-project_v2");
+    }
+
+    #[test]
+    fn unique_name_no_collision() {
+        let instances = vec![];
+        let name = unique_instance_name("foo", &instances).unwrap();
+        assert_eq!(name, *"foo");
+    }
+
+    #[test]
+    fn unique_name_with_collision() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(tmp.path(), "foo", 0);
+        let name = unique_instance_name("foo", &[inst]).unwrap();
+        assert_eq!(name, *"foo-2");
+    }
+
+    #[test]
+    fn unique_name_multiple_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let i1 = make_instance(tmp.path(), "foo", 0);
+        let i2 = make_instance(tmp.path(), "foo-2", 1);
+        let name = unique_instance_name("foo", &[i1, i2]).unwrap();
+        assert_eq!(name, *"foo-3");
+    }
+
+    #[test]
+    fn allocate_with_workspace_derives_basename() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+
+        let ws = tmp.path().join("my-app");
+        fs::create_dir(&ws).unwrap();
+
+        let inst = cfg
+            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .unwrap();
+        assert_eq!(inst.name, *"my-app");
+    }
+
+    #[test]
+    fn allocate_with_workspace_collision_appends_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+
+        let ws = tmp.path().join("dupe");
+        fs::create_dir(&ws).unwrap();
+
+        // First allocation takes the basename
+        let inst1 = cfg
+            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .unwrap();
+        assert_eq!(inst1.name, *"dupe");
+
+        // Second allocation with same basename gets -2 suffix
+        let inst2 = cfg
+            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .unwrap();
+        assert_eq!(inst2.name, *"dupe-2");
+    }
+
+    #[test]
+    fn allocate_explicit_name_overrides_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+
+        let ws = tmp.path().join("my-app");
+        fs::create_dir(&ws).unwrap();
+
+        let inst = cfg
+            .allocate_instance(Some("custom"), DEFAULT_IMAGE, Some(&ws))
+            .unwrap();
+        assert_eq!(inst.name, *"custom");
+    }
+
+    #[test]
+    fn allocate_without_name_or_workspace_uses_index() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        assert_eq!(inst.name, *"0");
     }
 }
