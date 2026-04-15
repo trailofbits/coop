@@ -6,6 +6,8 @@ use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -13,6 +15,88 @@ use serde::{Deserialize, Serialize};
 use crate::cmd::Cmd;
 
 pub const DEFAULT_IMAGE: &str = "default";
+
+// ── Command substitution for secrets ─────────────────────────
+
+const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve a config value that may use `cmd:` prefix for secret
+/// manager integration.
+///
+/// If the value starts with `cmd:`, the remainder is executed as
+/// a shell command and its trimmed stdout is returned. Plain values
+/// pass through unchanged. Commands that fail, timeout, or produce
+/// empty output return an error.
+pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
+    let cmd_str = match value.strip_prefix("cmd:") {
+        Some(cmd) => cmd.trim(),
+        None => return Ok(value.to_string()),
+    };
+
+    if cmd_str.is_empty() {
+        bail!("Empty command after 'cmd:' prefix");
+    }
+
+    tracing::debug!("Resolving secret via command");
+
+    let mut child = Command::new("sh")
+        .args(["-c", cmd_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to spawn secret command: {cmd_str}"))?;
+
+    let start = Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .context("Failed to check command status")?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("Failed to read output: {cmd_str}"))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let code = output
+                    .status
+                    .code()
+                    .map_or_else(|| "signal".to_string(), |c| c.to_string());
+                bail!(
+                    "Secret command failed (exit {code}): {cmd_str}\n\
+                     stderr: {stderr}"
+                );
+            }
+
+            let stdout = String::from_utf8(output.stdout)
+                .context("Secret command output is not valid UTF-8")?;
+            let resolved = stdout.trim().to_string();
+
+            if resolved.is_empty() {
+                bail!(
+                    "Secret command produced empty output: {cmd_str}\n\
+                     The command succeeded but stdout was empty after trimming."
+                );
+            }
+
+            return Ok(resolved);
+        }
+
+        if start.elapsed() >= CMD_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "Secret command timed out after {}s: {cmd_str}\n\
+                 Ensure the command runs non-interactively.",
+                CMD_TIMEOUT.as_secs(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 // ── Newtypes ─────────────────────────────────────────────────
 
@@ -270,7 +354,7 @@ pub enum GitHubAuth {
     Off,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerDef {
     /// Command for stdio servers
     pub command: Option<String>,
@@ -2418,5 +2502,106 @@ mod tests {
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
         assert_eq!(inst.name, *"0");
+    }
+
+    // ── cmd: prefix resolution ───────────────────────────────
+
+    #[test]
+    fn resolve_cmd_value_passthrough_plain() {
+        let plain = "sk-ant-plain-value";
+        assert_eq!(resolve_cmd_value(plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn resolve_cmd_value_passthrough_empty_string() {
+        // Empty value (not cmd:) passes through; emptiness check
+        // only applies to resolved cmd: output.
+        assert_eq!(resolve_cmd_value("").unwrap(), "");
+    }
+
+    #[test]
+    fn resolve_cmd_value_executes_command() {
+        let resolved = resolve_cmd_value("cmd:echo hello").unwrap();
+        assert_eq!(resolved, "hello");
+    }
+
+    #[test]
+    fn resolve_cmd_value_trims_whitespace() {
+        let resolved = resolve_cmd_value("cmd:printf '  padded  \\n\\n'").unwrap();
+        assert_eq!(resolved, "padded");
+    }
+
+    #[test]
+    fn resolve_cmd_value_trims_leading_space_in_prefix() {
+        // `cmd: echo foo` (with space after colon) should still work
+        let resolved = resolve_cmd_value("cmd: echo foo").unwrap();
+        assert_eq!(resolved, "foo");
+    }
+
+    #[test]
+    fn resolve_cmd_value_preserves_internal_whitespace() {
+        let resolved = resolve_cmd_value("cmd:echo 'sk-ant token with spaces'").unwrap();
+        assert_eq!(resolved, "sk-ant token with spaces");
+    }
+
+    #[test]
+    fn resolve_cmd_value_supports_pipes() {
+        // Verifies we run via `sh -c`, not direct exec
+        let resolved = resolve_cmd_value("cmd:echo 'abc' | tr a-z A-Z").unwrap();
+        assert_eq!(resolved, "ABC");
+    }
+
+    #[test]
+    fn resolve_cmd_value_fails_on_nonzero_exit() {
+        let err = resolve_cmd_value("cmd:false").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Secret command failed"),
+            "expected failure message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_value_includes_stderr_on_failure() {
+        let err = resolve_cmd_value("cmd:echo oops 1>&2; exit 1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("oops"), "expected stderr in error, got: {msg}");
+    }
+
+    #[test]
+    fn resolve_cmd_value_fails_on_empty_output() {
+        let err = resolve_cmd_value("cmd:true").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty output"),
+            "expected empty output error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_value_fails_on_empty_command() {
+        let err = resolve_cmd_value("cmd:").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Empty command"),
+            "expected empty command error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_value_fails_on_whitespace_only_command() {
+        let err = resolve_cmd_value("cmd:   ").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Empty command"),
+            "expected empty command error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cmd_value_does_not_match_cmd_without_colon() {
+        // `cmd` (no colon) is a plain value, not a command substitution
+        assert_eq!(resolve_cmd_value("cmd").unwrap(), "cmd");
+        assert_eq!(resolve_cmd_value("cmdline").unwrap(), "cmdline");
     }
 }

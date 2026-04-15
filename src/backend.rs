@@ -848,13 +848,19 @@ pub type PlatformBackend = FirecrackerBackend;
 ///
 /// Collects values from config and the process environment into an
 /// `EnvForward` struct. No process-global env mutation.
-pub fn prepare_env_forwarding(cfg: &CoopConfig) -> EnvForward {
+///
+/// `claude.api_key` values that use the `cmd:` prefix are resolved
+/// here (at VM start time, not config parse time) so that secret
+/// manager calls only happen when actually needed.
+pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let mut env = EnvForward::default();
 
     // ANTHROPIC_API_KEY: prefer config, fall back to process env
     if let Some(key) = &claude.api_key {
-        env.set("ANTHROPIC_API_KEY", key.as_str());
+        let resolved =
+            crate::config::resolve_cmd_value(key).context("Failed to resolve claude.api_key")?;
+        env.set("ANTHROPIC_API_KEY", resolved);
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         env.set("ANTHROPIC_API_KEY", key);
     }
@@ -873,7 +879,7 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> EnvForward {
         }
     }
 
-    env
+    Ok(env)
 }
 
 /// Bootstrap Claude Code in the guest declaratively.
@@ -1208,8 +1214,20 @@ fn register_mcp_servers(
 ) -> Result<()> {
     for (name, def) in servers {
         tracing::info!("Registering MCP server: {name}");
-        let json =
-            serde_json::to_string(def).context("Failed to serialize MCP server definition")?;
+
+        // Resolve any `cmd:` prefixed header values before sending the
+        // definition to the guest. Headers are the only secret-bearing
+        // field in McpServerDef (`env` values are host env var names,
+        // not secrets).
+        let mut resolved = def.clone();
+        for (header_key, header_value) in &mut resolved.headers {
+            *header_value = crate::config::resolve_cmd_value(header_value).with_context(|| {
+                format!("Failed to resolve header '{header_key}' for MCP server '{name}'")
+            })?;
+        }
+
+        let json = serde_json::to_string(&resolved)
+            .context("Failed to serialize MCP server definition")?;
         let cmd = format!(
             "{} mcp add-json -s user {} {}",
             crate::guest::CLAUDE_BIN,

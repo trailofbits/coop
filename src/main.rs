@@ -370,7 +370,7 @@ fn main() -> Result<()> {
             mut args,
         } => {
             let running = resolve_running(&be, &cfg, session.name.as_deref())?;
-            let env_vars = backend::prepare_env_forwarding(&cfg);
+            let env_vars = backend::prepare_env_forwarding(&cfg)?;
             let sess = backend::SshSession {
                 target: &running.target,
                 env: &env_vars,
@@ -679,7 +679,7 @@ fn restart_instance(
     if no_claude {
         tracing::info!("Skipping Claude Code bootstrap (--no-claude)");
     } else {
-        let env_vars = backend::prepare_env_forwarding(cfg);
+        let env_vars = backend::prepare_env_forwarding(cfg)?;
         let session = backend::SshSession {
             target: &target,
             env: &env_vars,
@@ -713,7 +713,7 @@ fn start_instance(
 
     signal::check_shutdown()?;
 
-    let env_vars = backend::prepare_env_forwarding(cfg);
+    let env_vars = backend::prepare_env_forwarding(cfg)?;
 
     if opts.no_claude {
         tracing::info!("Skipping Claude Code bootstrap (--no-claude)");
@@ -859,7 +859,7 @@ fn cmd_shell(
     tmux_session: Option<&str>,
 ) -> Result<()> {
     let running = resolve_running(be, cfg, name)?;
-    let env_vars = backend::prepare_env_forwarding(cfg);
+    let env_vars = backend::prepare_env_forwarding(cfg)?;
     let session = backend::SshSession {
         target: &running.target,
         env: &env_vars,
@@ -878,7 +878,7 @@ fn cmd_exec(
     command: &[String],
 ) -> Result<()> {
     let running = resolve_running(be, cfg, name)?;
-    let env_vars = backend::prepare_env_forwarding(cfg);
+    let env_vars = backend::prepare_env_forwarding(cfg)?;
     let session = backend::SshSession {
         target: &running.target,
         env: &env_vars,

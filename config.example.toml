@@ -25,11 +25,21 @@
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["https://github.com/anthropics/claude-plugins-official"]
 # plugins = ["rust-analyzer-lsp@claude-plugins-official"]
+#
+# Secrets: any field below that holds a secret accepts a "cmd:" prefix.
+# The remainder is run via `sh -c` at VM start time and its trimmed
+# stdout is used as the value. Examples for api_key:
+#   api_key = "cmd:op read op://Private/Anthropic/credential"  # 1Password
+#   api_key = "cmd:security find-generic-password -s anthropic -w"  # macOS Keychain
+#   api_key = "cmd:pass show anthropic/api-key"  # pass
+#   api_key = "sk-ant-..."  # Plain value also works
 
 # [claude.mcp_servers.my-server]
 # command = "/usr/bin/my-mcp-server"
 # args = ["--verbose"]
 # env = { API_KEY = "MY_HOST_ENV_VAR" }
+# # Header values also accept the "cmd:" prefix:
+# # headers = { Authorization = "cmd:op read op://Private/Sentry/token" }
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]
