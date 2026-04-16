@@ -239,22 +239,22 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
 /// Resize the disk of a stopped Lima instance.
 ///
-/// Truncates the diffdisk to the new size. Cloud-init's `growpart`
+/// Truncates the disk to the new size. Cloud-init's `growpart`
 /// will expand the partition and filesystem on next boot.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
-    let diffdisk = diffdisk_path(inst)?;
+    let disk = disk_path(inst)?;
 
-    if !diffdisk.exists() {
+    if !disk.exists() {
         bail!(
             "Lima disk not found at {}.\n\
              Is instance '{}' created?",
-            diffdisk.display(),
+            disk.display(),
             inst.name,
         );
     }
 
-    let current_bytes = std::fs::metadata(&diffdisk)
-        .with_context(|| format!("Failed to stat {}", diffdisk.display()))?
+    let current_bytes = std::fs::metadata(&disk)
+        .with_context(|| format!("Failed to stat {}", disk.display()))?
         .len();
     let current_gib = current_bytes / (1024 * 1024 * 1024);
     let new_gib = u64::from(new_size.as_u32());
@@ -277,12 +277,12 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     let status = Command::new("truncate")
         .arg("-s")
         .arg(format!("{new_size}G"))
-        .arg(&diffdisk)
+        .arg(&disk)
         .status()
         .context("Failed to run truncate")?;
 
     if !status.success() {
-        bail!("truncate failed for {}", diffdisk.display());
+        bail!("truncate failed for {}", disk.display());
     }
 
     tracing::info!(
@@ -292,10 +292,18 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     Ok(())
 }
 
-/// Path to the diffdisk for a Lima instance.
-pub fn diffdisk_path(inst: &Instance) -> Result<PathBuf> {
+/// Path to the VM disk for a Lima instance.
+///
+/// Lima v2.1.0 renamed `diffdisk` to `disk`. We try `disk` first
+/// (new layout) and fall back to `diffdisk` (pre-v2.1.0).
+pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
     let name = lima_name(inst);
-    Ok(lima_home()?.join(name).join("diffdisk"))
+    let dir = lima_home()?.join(name);
+    let new_path = dir.join("disk");
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+    Ok(dir.join("diffdisk"))
 }
 
 /// Check if a Lima instance is running.
@@ -317,7 +325,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let cpus = info["cpus"].as_u64().unwrap_or(0);
     let memory_bytes = info["memory"].as_u64().unwrap_or(0);
     let memory_mib = memory_bytes / (1024 * 1024);
-    let disk_gib = diffdisk_path(inst)
+    let disk_gib = disk_path(inst)
         .and_then(|p| {
             std::fs::metadata(&p).with_context(|| format!("Failed to stat {}", p.display()))
         })
@@ -658,17 +666,25 @@ fn run_builder_vm(
         bail!("Failed to stop builder VM");
     }
 
-    // Extract the disk image
+    // Extract the disk image.
+    // Lima v2.1.0 renamed "diffdisk" to "disk"; try new name first.
     eprintln!("  Extracting disk image...");
     let lima_dir = lima_home()?.join(BUILDER_NAME);
-    let src_disk = lima_dir.join("diffdisk");
-    if !src_disk.exists() {
-        bail!(
-            "Builder disk not found at {}.\n\
-             Lima may use a different disk layout.",
-            src_disk.display()
-        );
-    }
+    let src_disk = lima_dir.join("disk");
+    let src_disk = if src_disk.exists() {
+        src_disk
+    } else {
+        let legacy = lima_dir.join("diffdisk");
+        if !legacy.exists() {
+            bail!(
+                "Builder disk not found at {} or {}.\n\
+                 Lima may use a different disk layout.",
+                lima_dir.join("disk").display(),
+                legacy.display(),
+            );
+        }
+        legacy
+    };
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)

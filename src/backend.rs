@@ -826,7 +826,7 @@ impl VmBackend for LimaBackend {
     }
 
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf> {
-        crate::lima::diffdisk_path(inst)
+        crate::lima::disk_path(inst)
     }
 
     fn mounts_are_live(&self) -> bool {

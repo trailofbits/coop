@@ -26,14 +26,14 @@ Setup verifies that `limactl --version` is reachable. If it is not, setup fails 
 2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
 3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
 4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
-5. Stops the builder VM and extracts its diffdisk as the golden image.
+5. Stops the builder VM and extracts its disk as the golden image.
 6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
 
 The builder VM is deleted after extraction, whether the build succeeds or fails.
 
 ### How instances work
 
-Each instance is a Lima VM created with `limactl start` using the fast-start template. Lima names are prefixed with `coop-` (e.g., `coop-my-instance`). The instance gets its own diffdisk, a copy-on-write layer over the golden image. Lima handles SSH port allocation automatically; coop reads the assigned port from `limactl list --json`.
+Each instance is a Lima VM created with `limactl start` using the fast-start template. Lima names are prefixed with `coop-` (e.g., `coop-my-instance`). The instance gets its own disk, a copy-on-write layer over the golden image. Lima handles SSH port allocation automatically; coop reads the assigned port from `limactl list --json`.
 
 The Lima template configures:
 - `vmType: "vz"` (Virtualization.framework, not QEMU)
@@ -43,7 +43,7 @@ The Lima template configures:
 
 ### Disk resize
 
-Resizing a stopped instance truncates the Lima diffdisk to the new size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
+Resizing a stopped instance truncates the Lima disk to the new size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
 
 ### Resource ownership
 
@@ -147,7 +147,7 @@ Both backends support the same CLI commands and guest capabilities:
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
-| `coop resize` | Truncates Lima diffdisk | Truncates + resize2fs on rootfs |
+| `coop resize` | Truncates Lima disk | Truncates + resize2fs on rootfs |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |
 | `--mount` host mounts | Live virtiofs (changes visible immediately) | One-time rsync sync (use `push`/`pull` to re-sync) |
