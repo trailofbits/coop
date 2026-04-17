@@ -117,15 +117,21 @@ moat_fails() {
 
 # Run a command in the guest VM via `coop shell -- <cmd>`.
 # RUST_LOG=off suppresses tracing output that would mix with command output.
+# Stderr is captured in $tmpdir/guest_stderr for diagnostics on failure.
 guest_exec() {
     local inst="${GUEST_INSTANCE:-$INSTANCE}"
-    RUST_LOG=off "$BINARY" shell "$inst" -- "$@" 2>/dev/null
+    RUST_LOG=off "$BINARY" shell "$inst" -- "$@" 2>"$tmpdir/guest_stderr"
 }
 
 # Run the exec subcommand (captures stdout, propagates exit code).
 moat_exec() {
     local inst="${GUEST_INSTANCE:-$INSTANCE}"
-    RUST_LOG=off "$BINARY" exec --name "$inst" "$@" 2>/dev/null
+    RUST_LOG=off "$BINARY" exec --name "$inst" "$@" 2>"$tmpdir/guest_stderr"
+}
+
+# Return captured stderr from the last guest_exec/moat_exec call.
+guest_stderr() {
+    cat "$tmpdir/guest_stderr" 2>/dev/null
 }
 
 # Remove an instance from the tracked list.
@@ -445,10 +451,10 @@ test_shell_connectivity() {
     echo "=== Phase: shell connectivity ==="
 
     local output
-    if output=$(guest_exec echo "hello-from-guest" 2>/dev/null); then
+    if output=$(guest_exec echo "hello-from-guest"); then
         pass "shell connects to guest"
     else
-        fail "shell connects to guest"
+        fail "shell connects to guest" "stderr: $(guest_stderr)"
         return
     fi
 
@@ -527,7 +533,7 @@ test_claude_bin_path() {
     # The Claude Code binary is installed at /home/ubuntu/.local/bin/claude.
     # Non-interactive SSH sessions don't source .bashrc/.profile, so bare
     # `claude` won't work. Verify the full path is reachable via coop exec.
-    if guest_exec test -x /home/ubuntu/.local/bin/claude 2>/dev/null; then
+    if guest_exec test -x /home/ubuntu/.local/bin/claude; then
         pass "claude binary exists at CLAUDE_BIN path"
     else
         # Image was built with --no-claude or without profiles — skip
@@ -536,7 +542,7 @@ test_claude_bin_path() {
     fi
 
     # Verify coop exec can invoke it by full path
-    if moat_exec /home/ubuntu/.local/bin/claude --version >/dev/null 2>/dev/null; then
+    if moat_exec /home/ubuntu/.local/bin/claude --version >/dev/null; then
         pass "claude binary invocable via full path"
     else
         # --version may fail without auth, but any output means the binary ran
@@ -545,7 +551,7 @@ test_claude_bin_path() {
 
     # Verify /usr/local/bin/claude symlink exists and points to the real binary
     local link_target
-    if link_target=$(guest_exec readlink /usr/local/bin/claude 2>/dev/null); then
+    if link_target=$(guest_exec readlink /usr/local/bin/claude); then
         if [[ "$link_target" == "/home/ubuntu/.local/bin/claude" ]]; then
             pass "claude symlink in /usr/local/bin"
         else
@@ -556,15 +562,15 @@ test_claude_bin_path() {
     fi
 
     # Verify claude-yolo shortcut exists and is executable
-    if guest_exec test -x /usr/local/bin/claude-yolo 2>/dev/null; then
+    if guest_exec test -x /usr/local/bin/claude-yolo; then
         pass "claude-yolo shortcut exists"
     else
-        fail "claude-yolo shortcut exists"
+        fail "claude-yolo shortcut exists" "stderr: $(guest_stderr)"
     fi
 
     # Verify claude-yolo passes --dangerously-skip-permissions
     local yolo_content
-    if yolo_content=$(guest_exec cat /usr/local/bin/claude-yolo 2>/dev/null); then
+    if yolo_content=$(guest_exec cat /usr/local/bin/claude-yolo); then
         if echo "$yolo_content" | grep -q "dangerously-skip-permissions"; then
             pass "claude-yolo includes --dangerously-skip-permissions"
         else
@@ -650,26 +656,26 @@ test_guest_environment() {
 
     # Check user is 'ubuntu' (both backends reuse the base image's ubuntu user)
     local whoami_out
-    if whoami_out=$(guest_exec whoami 2>/dev/null); then
+    if whoami_out=$(guest_exec whoami); then
         if [[ "$whoami_out" == "ubuntu" ]]; then
             pass "guest user is 'ubuntu'"
         else
             fail "guest user is 'ubuntu'" "got: $whoami_out"
         fi
     else
-        fail "guest user is 'ubuntu'" "ssh failed"
+        fail "guest user is 'ubuntu'" "ssh failed; stderr: $(guest_stderr)"
     fi
 
     # Check /workspace exists
-    if guest_exec test -d /workspace 2>/dev/null; then
+    if guest_exec test -d /workspace; then
         pass "/workspace directory exists"
     else
-        fail "/workspace directory exists"
+        fail "/workspace directory exists" "stderr: $(guest_stderr)"
     fi
 
     # Check /workspace is owned by ubuntu
     local ws_owner
-    if ws_owner=$(guest_exec stat -c '%U' /workspace 2>/dev/null); then
+    if ws_owner=$(guest_exec stat -c '%U' /workspace); then
         if [[ "$ws_owner" == "ubuntu" ]]; then
             pass "/workspace owned by ubuntu"
         else
@@ -685,13 +691,13 @@ test_guest_environment() {
         if guest_exec which "$tool" >/dev/null; then
             pass "$tool is installed"
         else
-            fail "$tool is installed"
+            fail "$tool is installed" "stderr: $(guest_stderr)"
         fi
     done
 
     # Check home directory
     local home
-    if home=$(guest_exec printenv HOME 2>/dev/null); then
+    if home=$(guest_exec printenv HOME); then
         if [[ "$home" == "/home/ubuntu" ]]; then
             pass "HOME is /home/ubuntu"
         else
@@ -708,22 +714,22 @@ test_sudo() {
 
     # Sudo should work without a password
     local sudo_out
-    if sudo_out=$(guest_exec sudo whoami 2>/dev/null); then
+    if sudo_out=$(guest_exec sudo whoami); then
         if [[ "$sudo_out" == "root" ]]; then
             pass "sudo works without password"
         else
             fail "sudo works without password" "got: $sudo_out"
         fi
     else
-        fail "sudo works without password" "sudo command failed"
+        fail "sudo works without password" "sudo command failed; stderr: $(guest_stderr)"
     fi
 
     # Sudo should be able to write to root-owned locations
-    if guest_exec sudo touch /root/test-sudo-write 2>/dev/null; then
+    if guest_exec sudo touch /root/test-sudo-write; then
         pass "sudo can write to /root"
-        guest_exec sudo rm -f /root/test-sudo-write 2>/dev/null || true
+        guest_exec sudo rm -f /root/test-sudo-write || true
     else
-        fail "sudo can write to /root"
+        fail "sudo can write to /root" "stderr: $(guest_stderr)"
     fi
 }
 
@@ -732,17 +738,17 @@ test_network() {
     echo "=== Phase: network connectivity ==="
 
     # DNS resolution
-    if guest_exec nslookup github.com >/dev/null 2>/dev/null || \
-       guest_exec host github.com >/dev/null 2>/dev/null || \
-       guest_exec getent hosts github.com >/dev/null 2>/dev/null; then
+    if guest_exec nslookup github.com >/dev/null || \
+       guest_exec host github.com >/dev/null || \
+       guest_exec getent hosts github.com >/dev/null; then
         pass "DNS resolution works"
     else
-        fail "DNS resolution works" "all resolution methods failed"
+        fail "DNS resolution works" "all resolution methods failed; stderr: $(guest_stderr)"
     fi
 
     # HTTP connectivity (use a reliable endpoint)
     local http_code
-    if http_code=$(guest_exec curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com 2>/dev/null); then
+    if http_code=$(guest_exec curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com); then
         if [[ "$http_code" =~ ^[23] ]]; then
             pass "HTTPS connectivity works (HTTP $http_code)"
         else
@@ -761,76 +767,76 @@ test_tmux() {
     if guest_exec which tmux >/dev/null; then
         pass "tmux is installed"
     else
-        fail "tmux is installed"
+        fail "tmux is installed" "stderr: $(guest_stderr)"
         return
     fi
 
     # Create a detached tmux session running sleep (no quoting issues)
-    guest_exec tmux new-session -d -s test-persist sleep 300 2>/dev/null
-    if guest_exec tmux has-session -t test-persist 2>/dev/null; then
+    guest_exec tmux new-session -d -s test-persist sleep 300
+    if guest_exec tmux has-session -t test-persist; then
         pass "tmux session created and persists"
     else
-        fail "tmux session created and persists"
-        guest_exec tmux kill-session -t test-persist 2>/dev/null || true
+        fail "tmux session created and persists" "stderr: $(guest_stderr)"
+        guest_exec tmux kill-session -t test-persist || true
         return
     fi
 
     # Clean up
-    guest_exec tmux kill-session -t test-persist 2>/dev/null || true
+    guest_exec tmux kill-session -t test-persist || true
 }
 
 test_docker() {
     echo ""
     echo "=== Phase: docker ==="
 
-    if guest_exec docker info 2>/dev/null 1>/dev/null; then
+    if guest_exec docker info >/dev/null; then
         pass "docker daemon is running"
     else
-        fail "docker daemon is running"
+        fail "docker daemon is running" "stderr: $(guest_stderr)"
         return
     fi
 
     # User should be in docker group (no sudo needed)
     local groups_out
-    if groups_out=$(guest_exec groups 2>/dev/null); then
+    if groups_out=$(guest_exec groups); then
         if echo "$groups_out" | grep -q "docker"; then
             pass "ubuntu user in docker group"
         else
             fail "ubuntu user in docker group" "groups: $groups_out"
         fi
     else
-        fail "ubuntu user in docker group" "groups command failed"
+        fail "ubuntu user in docker group" "groups command failed; stderr: $(guest_stderr)"
     fi
 
     local docker_out
-    if docker_out=$(guest_exec docker run --rm hello-world 2>/dev/null); then
+    if docker_out=$(guest_exec docker run --rm hello-world); then
         if echo "$docker_out" | grep -q "Hello from Docker"; then
             pass "docker run hello-world works"
         else
-            fail "docker run hello-world works" "unexpected output"
+            fail "docker run hello-world works" "unexpected stdout: $docker_out"
         fi
     else
-        fail "docker run hello-world works" "docker run failed"
+        fail "docker run hello-world works" "docker run failed; stderr: $(guest_stderr)"
     fi
 
     # Docker port mapping (verifies bridge networking + iptables)
     local port_test_ok=false
-    if guest_exec docker run -d --name port-test -p 8080:80 nginx:alpine 2>/dev/null >/dev/null; then
+    if guest_exec docker run -d --name port-test -p 8080:80 nginx:alpine >/dev/null; then
         # Give nginx a moment to start
         sleep 2
         local port_out
-        if port_out=$(guest_exec curl -s --max-time 5 http://localhost:8080 2>/dev/null); then
+        if port_out=$(guest_exec curl -s --max-time 5 http://localhost:8080); then
             if echo "$port_out" | grep -qi "nginx\|welcome"; then
                 pass "docker port mapping works"
                 port_test_ok=true
             fi
         fi
         if ! $port_test_ok; then
-            fail "docker port mapping works" "curl to mapped port failed"
+            fail "docker port mapping works" "curl to mapped port failed; stderr: $(guest_stderr)"
         fi
-        guest_exec docker rm -f port-test >/dev/null 2>/dev/null || true
+        guest_exec docker rm -f port-test >/dev/null || true
     else
-        fail "docker port mapping works" "failed to start nginx container"
+        fail "docker port mapping works" "failed to start nginx container; stderr: $(guest_stderr)"
     fi
 }
 
@@ -876,46 +882,46 @@ test_profiles() {
     for profile in "${profiles_arr[@]}"; do
         case "$profile" in
             python)
-                if guest_exec python3 --version >/dev/null 2>/dev/null; then
+                if guest_exec python3 --version >/dev/null; then
                     pass "python3 installed (profile: python)"
                 else
-                    fail "python3 installed (profile: python)"
+                    fail "python3 installed (profile: python)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             node)
-                if guest_exec node --version >/dev/null 2>/dev/null; then
+                if guest_exec node --version >/dev/null; then
                     pass "node installed (profile: node)"
                 else
-                    fail "node installed (profile: node)"
+                    fail "node installed (profile: node)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             rust)
                 # Rust is installed for the ubuntu user via rustup
-                if guest_exec rustc --version >/dev/null 2>/dev/null; then
+                if guest_exec rustc --version >/dev/null; then
                     pass "rustc installed (profile: rust)"
                 else
-                    fail "rustc installed (profile: rust)"
+                    fail "rustc installed (profile: rust)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             go)
-                if guest_exec go version >/dev/null 2>/dev/null; then
+                if guest_exec go version >/dev/null; then
                     pass "go installed (profile: go)"
                 else
-                    fail "go installed (profile: go)"
+                    fail "go installed (profile: go)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             c)
-                if guest_exec clang --version >/dev/null 2>/dev/null; then
+                if guest_exec clang --version >/dev/null; then
                     pass "clang installed (profile: c)"
                 else
-                    fail "clang installed (profile: c)"
+                    fail "clang installed (profile: c)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             fuzz)
-                if guest_exec which afl-fuzz >/dev/null 2>/dev/null; then
+                if guest_exec which afl-fuzz >/dev/null; then
                     pass "afl-fuzz installed (profile: fuzz)"
                 else
-                    fail "afl-fuzz installed (profile: fuzz)"
+                    fail "afl-fuzz installed (profile: fuzz)" "stderr: $(guest_stderr)"
                 fi
                 ;;
             *)
@@ -937,31 +943,31 @@ test_guest_fingerprint() {
     local val
 
     # OS release
-    val=$(guest_exec lsb_release -ds 2>/dev/null) || val="unknown"
+    val=$(guest_exec lsb_release -ds) || val="unknown"
     echo "os=$val" >> "$fp"
 
     # Architecture
-    val=$(guest_exec uname -m 2>/dev/null) || val="unknown"
+    val=$(guest_exec uname -m) || val="unknown"
     echo "arch=$val" >> "$fp"
 
     # User and groups
-    val=$(guest_exec id 2>/dev/null) || val="unknown"
+    val=$(guest_exec id) || val="unknown"
     echo "id=$val" >> "$fp"
 
     # Base tool versions
     local tool
     for tool in git curl docker node python3 rustc go; do
-        val=$(guest_exec "$tool" --version 2>/dev/null | head -1) || val="not installed"
+        val=$(guest_exec "$tool" --version | head -1) || val="not installed"
         echo "${tool}=$val" >> "$fp"
     done
 
     # Docker info: storage driver and iptables mode
-    val=$(guest_exec docker info --format '{{.Driver}}' 2>/dev/null) || val="unknown"
+    val=$(guest_exec docker info --format '{{.Driver}}') || val="unknown"
     echo "docker_storage=$val" >> "$fp"
 
     # DNS resolver
-    if guest_exec test -f /etc/resolv.conf 2>/dev/null; then
-        val=$(guest_exec grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null) || val="none"
+    if guest_exec test -f /etc/resolv.conf; then
+        val=$(guest_exec grep -m1 '^nameserver' /etc/resolv.conf) || val="none"
     else
         val="no resolv.conf"
     fi
@@ -969,9 +975,9 @@ test_guest_fingerprint() {
 
     # Directory layout
     for dir in /workspace /home/ubuntu /home/ubuntu/.ssh; do
-        if guest_exec test -d "$dir" 2>/dev/null; then
+        if guest_exec test -d "$dir"; then
             local owner
-            owner=$(guest_exec stat -c '%U:%G' "$dir" 2>/dev/null) || owner="unknown"
+            owner=$(guest_exec stat -c '%U:%G' "$dir") || owner="unknown"
             echo "dir:${dir}=$owner" >> "$fp"
         else
             echo "dir:${dir}=missing" >> "$fp"
@@ -1337,7 +1343,7 @@ test_workspace_sync() {
     local file_content
     GUEST_INSTANCE="$ws_instance"
 
-    if file_content=$(guest_exec cat /workspace/hello.txt 2>/dev/null); then
+    if file_content=$(guest_exec cat /workspace/hello.txt); then
         if [[ "$file_content" == "workspace-test-content" ]]; then
             pass "workspace file synced to guest"
         else
@@ -1348,7 +1354,7 @@ test_workspace_sync() {
     fi
 
     # Verify nested directory was synced
-    if file_content=$(guest_exec cat /workspace/subdir/nested.txt 2>/dev/null); then
+    if file_content=$(guest_exec cat /workspace/subdir/nested.txt); then
         if echo "$file_content" | grep -q "nested"; then
             pass "nested workspace files synced"
         else
@@ -1359,7 +1365,7 @@ test_workspace_sync() {
     fi
 
     # Modify file in guest, then pull
-    moat_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' 2>/dev/null || true
+    moat_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' || true
 
     local pull_dir
     pull_dir=$(mktemp -d)
@@ -1384,7 +1390,7 @@ test_workspace_sync() {
         pass "push exits 0"
 
         local pushed_content
-        pushed_content=$(guest_exec cat /workspace/hello.txt 2>/dev/null)
+        pushed_content=$(guest_exec cat /workspace/hello.txt)
         if echo "$pushed_content" | grep -q "pushed-from-host"; then
             pass "push delivers host changes to guest"
         else
@@ -1443,7 +1449,7 @@ test_push_pull_no_workspace() {
 
         # Verify the file arrived in guest at /workspace
         local content
-        content=$(guest_exec cat /workspace/marker.txt 2>/dev/null) || content=""
+        content=$(guest_exec cat /workspace/marker.txt) || content=""
         if echo "$content" | grep -q "no-workspace-push-test"; then
             pass "push defaulted to guest:/workspace"
         else
@@ -1538,9 +1544,9 @@ test_multi_instance() {
     # Both should be independently accessible via SSH
     GUEST_INSTANCE="$inst_a"
     local hostname_a hostname_b
-    hostname_a=$(guest_exec hostname 2>/dev/null) || hostname_a=""
+    hostname_a=$(guest_exec hostname) || hostname_a=""
     GUEST_INSTANCE="$inst_b"
-    hostname_b=$(guest_exec hostname 2>/dev/null) || hostname_b=""
+    hostname_b=$(guest_exec hostname) || hostname_b=""
     unset GUEST_INSTANCE
 
     if [[ -n "$hostname_a" && -n "$hostname_b" ]]; then
@@ -1620,7 +1626,7 @@ test_named_images() {
     # Guest should be functional
     GUEST_INSTANCE="$inst_name"
     local hostname
-    hostname=$(guest_exec hostname 2>/dev/null) || hostname=""
+    hostname=$(guest_exec hostname) || hostname=""
     unset GUEST_INSTANCE
 
     if [[ -n "$hostname" ]]; then
@@ -1692,7 +1698,7 @@ CFGEOF
     # Verify custom profile effects in guest
     GUEST_INSTANCE="$inst_name"
     local marker
-    marker=$(guest_exec cat /etc/custom-profile-installed 2>/dev/null) || marker=""
+    marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
     unset GUEST_INSTANCE
 
     if echo "$marker" | grep -q "custom-profile-marker"; then
@@ -1740,13 +1746,13 @@ test_builtin_profiles() {
 
     # Verify python profile
     local py_ver
-    if py_ver=$(guest_exec python3 --version 2>/dev/null); then
+    if py_ver=$(guest_exec python3 --version); then
         pass "python3 installed ($py_ver)"
     else
         fail "python3 installed (profile: python)"
     fi
 
-    if guest_exec python3 -c 'import venv' >/dev/null 2>/dev/null; then
+    if guest_exec python3 -c 'import venv' >/dev/null; then
         pass "python3-venv available"
     else
         fail "python3-venv available"
@@ -1754,13 +1760,13 @@ test_builtin_profiles() {
 
     # Verify node profile
     local node_ver
-    if node_ver=$(guest_exec node --version 2>/dev/null); then
+    if node_ver=$(guest_exec node --version); then
         pass "node installed ($node_ver)"
     else
         fail "node installed (profile: node)"
     fi
 
-    if guest_exec npm --version >/dev/null 2>/dev/null; then
+    if guest_exec npm --version >/dev/null; then
         pass "npm installed"
     else
         fail "npm installed"
@@ -1805,7 +1811,7 @@ test_host_mount() {
 
     # Verify host files are visible in guest at /workspace
     local content
-    if content=$(guest_exec cat /workspace/sentinel.txt 2>/dev/null); then
+    if content=$(guest_exec cat /workspace/sentinel.txt); then
         if [[ "$content" == "mount-test-content" ]]; then
             pass "mounted file readable in guest"
         else
@@ -1816,7 +1822,7 @@ test_host_mount() {
     fi
 
     # Verify nested directory
-    if content=$(guest_exec cat /workspace/subdir/deep.txt 2>/dev/null); then
+    if content=$(guest_exec cat /workspace/subdir/deep.txt); then
         if echo "$content" | grep -q "nested-mount"; then
             pass "nested mounted file readable"
         else
@@ -1829,7 +1835,7 @@ test_host_mount() {
     # Live sync tests: only on Lima (virtiofs provides bidirectional live access)
     if [[ "$(uname -s)" == "Darwin" ]]; then
         # Verify writes from guest are visible on host (bidirectional)
-        if guest_exec sh -c 'echo "written-by-guest" > /workspace/from-guest.txt' 2>/dev/null; then
+        if guest_exec sh -c 'echo "written-by-guest" > /workspace/from-guest.txt'; then
             local host_content
             host_content=$(cat "$mount_dir/from-guest.txt" 2>/dev/null) || host_content=""
             if [[ "$host_content" == "written-by-guest" ]]; then
@@ -1843,7 +1849,7 @@ test_host_mount() {
 
         # Verify host writes after boot are visible in guest (live sync)
         echo "live-update" > "$mount_dir/live.txt"
-        if content=$(guest_exec cat /workspace/live.txt 2>/dev/null); then
+        if content=$(guest_exec cat /workspace/live.txt); then
             if [[ "$content" == "live-update" ]]; then
                 pass "host writes after boot visible in guest (live)"
             else
@@ -1887,7 +1893,7 @@ test_host_mount_custom_guest_path() {
     GUEST_INSTANCE="$mount_instance"
 
     local content
-    if content=$(guest_exec cat /data/project/marker.txt 2>/dev/null); then
+    if content=$(guest_exec cat /data/project/marker.txt); then
         if [[ "$content" == "custom-path-test" ]]; then
             pass "mount at custom guest path works"
         else
@@ -2085,7 +2091,7 @@ CFGEOF
     # empty at start time — check the template config instead. On Firecracker
     # (Linux), marketplaces are installed at start time via the stub claude.
     local claude_log
-    claude_log=$(guest_exec cat /tmp/claude-calls.log 2>/dev/null) || claude_log=""
+    claude_log=$(guest_exec cat /tmp/claude-calls.log) || claude_log=""
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
         # Lima: marketplace baked into golden image during setup
@@ -2121,7 +2127,7 @@ CFGEOF
 
     # Verify `coop claude --help` invokes the binary at CLAUDE_BIN path.
     # The stub claude will log the args, so we can verify it was called.
-    guest_exec truncate -s 0 /tmp/claude-calls.log 2>/dev/null || true
+    guest_exec truncate -s 0 /tmp/claude-calls.log || true
     # coop claude uses run_interactive which needs a PTY — use exec instead
     # to verify the binary path is correct by invoking it directly.
     env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY RUST_LOG=off \
@@ -2129,7 +2135,7 @@ CFGEOF
         /home/ubuntu/.local/bin/claude --help >/dev/null 2>/dev/null || true
 
     local post_log
-    post_log=$(guest_exec cat /tmp/claude-calls.log 2>/dev/null) || post_log=""
+    post_log=$(guest_exec cat /tmp/claude-calls.log) || post_log=""
     if echo "$post_log" | grep -q "\-\-help"; then
         pass "coop exec invokes claude at CLAUDE_BIN path"
     else
@@ -2193,7 +2199,7 @@ CFGEOF
     GUEST_INSTANCE="$inst_name"
 
     local guest_claude
-    guest_claude=$(guest_exec cat /home/ubuntu/.claude/CLAUDE.md 2>/dev/null) || guest_claude=""
+    guest_claude=$(guest_exec cat /home/ubuntu/.claude/CLAUDE.md) || guest_claude=""
     if echo "$guest_claude" | grep -q "host-claude-marker"; then
         pass "CLAUDE.md copied to guest ~/.claude/CLAUDE.md"
     else
@@ -2201,7 +2207,7 @@ CFGEOF
     fi
 
     local guest_rule
-    guest_rule=$(guest_exec cat /home/ubuntu/.claude/rules/safety.md 2>/dev/null) || guest_rule=""
+    guest_rule=$(guest_exec cat /home/ubuntu/.claude/rules/safety.md) || guest_rule=""
     if echo "$guest_rule" | grep -q "host-rule-marker"; then
         pass "rules file copied to guest ~/.claude/rules/"
     else
@@ -2209,7 +2215,7 @@ CFGEOF
     fi
 
     local guest_cmd
-    guest_cmd=$(guest_exec cat /home/ubuntu/.claude/commands/deploy.md 2>/dev/null) || guest_cmd=""
+    guest_cmd=$(guest_exec cat /home/ubuntu/.claude/commands/deploy.md) || guest_cmd=""
     if echo "$guest_cmd" | grep -q "host-cmd-marker"; then
         pass "commands file copied to guest ~/.claude/commands/"
     else
@@ -2220,7 +2226,7 @@ CFGEOF
     # The guest may have its own settings.json from Claude Code init,
     # so check for the specific marker content from our test file.
     local guest_settings
-    guest_settings=$(guest_exec cat /home/ubuntu/.claude/settings.json 2>/dev/null) || guest_settings=""
+    guest_settings=$(guest_exec cat /home/ubuntu/.claude/settings.json) || guest_settings=""
     if echo "$guest_settings" | grep -q "should-not-copy"; then
         fail "settings.json NOT copied (allowlist)" "host content leaked to guest"
     else
@@ -2229,7 +2235,7 @@ CFGEOF
 
     # ── 2. Modify guest CLAUDE.md, restart → re-synced from host ──
 
-    guest_exec sh -c "'echo guest-modified > /home/ubuntu/.claude/CLAUDE.md'" 2>/dev/null || true
+    guest_exec sh -c "'echo guest-modified > /home/ubuntu/.claude/CLAUDE.md'" || true
     unset GUEST_INSTANCE
 
     cs stop "$inst_name" || true
@@ -2245,7 +2251,7 @@ CFGEOF
     fi
 
     GUEST_INSTANCE="$inst_name"
-    guest_claude=$(guest_exec cat /home/ubuntu/.claude/CLAUDE.md 2>/dev/null) || guest_claude=""
+    guest_claude=$(guest_exec cat /home/ubuntu/.claude/CLAUDE.md) || guest_claude=""
     if echo "$guest_claude" | grep -q "host-claude-marker"; then
         pass "restart re-syncs CLAUDE.md from host"
     else
@@ -2328,7 +2334,7 @@ test_interrupted_setup() {
 
     GUEST_INSTANCE="$inst_name"
     local reply
-    if reply=$(guest_exec echo ok 2>/dev/null) && [[ "$reply" == *ok* ]]; then
+    if reply=$(guest_exec echo ok) && [[ "$reply" == *ok* ]]; then
         pass "guest SSH works after recovery"
     else
         fail "guest SSH works after recovery" "reply: '$reply'"
