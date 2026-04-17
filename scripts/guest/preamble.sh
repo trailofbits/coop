@@ -14,5 +14,13 @@ chmod +x /usr/sbin/policy-rc.d
 dpkg-divert --local --rename --add /sbin/initctl 2>/dev/null || true
 ln -sf /bin/true /sbin/initctl 2>/dev/null || true
 
+# Switch apt sources from HTTP to HTTPS. Some networks block outbound port 80
+# to Canonical's archive servers while port 443 works fine. HTTPS is also
+# better practice (integrity + privacy of package metadata). The squashfs
+# ships with http:// URIs; rewrite them before the first apt-get update.
+echo '  [guest] Switching apt sources to HTTPS...'
+sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+sed -i 's|http://|https://|g' /etc/apt/sources.list 2>/dev/null || true
+
 echo '  [guest] Updating package lists...'
 apt-get update -qq
