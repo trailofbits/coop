@@ -226,6 +226,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_script_installs_extracted_binary_not_archive() {
+        assert!(
+            SCRIPT_CODEX.contains("BIN=\"$TMPDIR/${ASSET%.tar.gz}\""),
+            "Codex installer should target the extracted binary path directly",
+        );
+    }
+
+    #[test]
     fn all_builtins_resolve() {
         let custom = HashMap::new();
         for bp in BUILTIN_PROFILES {

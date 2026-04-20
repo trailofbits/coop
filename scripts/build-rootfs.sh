@@ -176,9 +176,10 @@ chroot "$MOUNT_DIR" bash -c '
     tmpdir=$(mktemp -d)
     trap "rm -rf \"$tmpdir\"" EXIT
     archive="$tmpdir/$asset"
+    bin="$tmpdir/${asset%.tar.gz}"
     curl -fsSL -o "$archive" "https://github.com/openai/codex/releases/latest/download/$asset"
     tar -xzf "$archive" -C "$tmpdir"
-    bin=$(find "$tmpdir" -maxdepth 1 -type f -name "codex-*" | head -n 1)
+    test -x "$bin"
     install -m 755 "$bin" /usr/local/bin/codex
 '
 

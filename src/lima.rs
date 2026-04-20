@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use crate::backend::SshTarget;
 use crate::config::{CoopConfig, CustomProfile, GiB, Instance};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_DOCKER_REPO,
-    SCRIPT_GH_REPO, lookup_profile,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, lookup_profile,
 };
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, hash_string, utc_timestamp};
 
@@ -1170,6 +1170,10 @@ fn compose_provision_script(
     s.push_str(SCRIPT_CLAUDE_CODE);
     s.push('\n');
 
+    // Codex CLI (standalone binary under /usr/local/bin)
+    s.push_str(SCRIPT_CODEX);
+    s.push('\n');
+
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
     if std::env::var("COOP_TEST_INJECT_PROVISION_FAILURE").is_ok() {
@@ -1596,6 +1600,17 @@ mod tests {
                 "two post_install scripts concatenated on one line",
             );
         }
+    }
+
+    #[test]
+    fn provision_script_installs_codex() {
+        let custom = HashMap::new();
+        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &[], &custom);
+
+        assert!(
+            script.contains("Installing Codex CLI"),
+            "Lima provision script should install Codex CLI",
+        );
     }
 
     // ── inject_mounts ───────────────────────────────────────────

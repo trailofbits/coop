@@ -23,6 +23,7 @@ esac
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 ARCHIVE="$TMPDIR/$ASSET"
+BIN="$TMPDIR/${ASSET%.tar.gz}"
 
 MAX_RETRIES=4
 RETRY_DELAY=5
@@ -45,8 +46,7 @@ for attempt in $(seq 1 "$MAX_RETRIES"); do
 done
 
 tar -xzf "$ARCHIVE" -C "$TMPDIR"
-BIN=$(find "$TMPDIR" -maxdepth 1 -type f -name 'codex-*' | head -n 1)
-if [ -z "$BIN" ]; then
+if [ ! -x "$BIN" ]; then
     echo '  [guest] ERROR: Codex archive did not contain the expected binary.' >&2
     exit 1
 fi
