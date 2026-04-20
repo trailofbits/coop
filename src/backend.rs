@@ -1098,8 +1098,7 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
         return Ok(());
     };
 
-    let staged = stage_selected_files(&source_dir, &["CLAUDE.md"], &["rules", "commands"])
-        .context("Failed to stage Claude config files")?;
+    let staged = stage_allowed_files(&source_dir).context("Failed to stage Claude config files")?;
 
     let staging_path = staged.path();
     let has_entries = staging_path
