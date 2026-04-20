@@ -103,6 +103,13 @@ exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
 
+echo '  [guest] Installing codex-yolo shortcut...'
+cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
+#!/bin/bash
+exec codex --dangerously-bypass-approvals-and-sandbox "$@"
+YOLOEOF
+chmod 755 /usr/local/bin/codex-yolo
+
 echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace
 chown ubuntu:ubuntu /workspace
