@@ -104,8 +104,22 @@ jobs:
         with:
           subject-path: "coop-*.tar.gz"
 
+      - name: Extract release notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v tag="## $TAG" '
+            $0 == tag { found=1; next }
+            found && /^## / { exit }
+            found
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG entry found for $TAG" >&2
+            exit 1
+          fi
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes coop-*.tar.gz SHA256SUMS
+        run: gh release create "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS

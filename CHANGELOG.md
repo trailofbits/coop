@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.1
+
+Re-release of v0.3.0. The v0.3.0 release artifacts failed to publish because
+the release workflow conflicted with a pre-created GitHub release. Release
+notes are now sourced from `CHANGELOG.md` so the workflow owns the full
+release end-to-end.
+
+No functional changes since v0.3.0.
+
 ## v0.3.0
 
 ### Breaking changes
