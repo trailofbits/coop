@@ -20,14 +20,22 @@ pub const GUEST_USER: &str = "ubuntu";
 /// `.bashrc`/`.profile`).
 pub const CLAUDE_BIN: &str = "/home/ubuntu/.local/bin/claude";
 
+/// Absolute path to the Codex CLI binary in the guest.
+///
+/// The installer places a standalone binary in `/usr/local/bin`, so
+/// both bootstrap and verification can rely on a stable path.
+pub const CODEX_BIN: &str = "/usr/local/bin/codex";
+
 /// Binaries that must exist in the guest image after provisioning.
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
-pub const REQUIRED_GUEST_BINARIES: &[&str] = &["/usr/bin/docker", "/usr/bin/gh", CLAUDE_BIN];
+pub const REQUIRED_GUEST_BINARIES: &[&str] =
+    &["/usr/bin/docker", "/usr/bin/gh", CLAUDE_BIN, CODEX_BIN];
 
 pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh");
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
+pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 
 pub const BASE_PACKAGES: &[&str] = &[
     "openssh-server",
@@ -208,6 +216,14 @@ pub fn collect_baked_lists(
 #[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_guest_binaries_include_codex() {
+        assert!(
+            REQUIRED_GUEST_BINARIES.contains(&"/usr/local/bin/codex"),
+            "guest image should include codex in the default PATH",
+        );
+    }
 
     #[test]
     fn all_builtins_resolve() {

@@ -285,6 +285,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub claude: ClaudeConfig,
 
+    /// Codex config forwarding settings
+    #[serde(default)]
+    pub codex: CodexConfig,
+
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
@@ -462,6 +466,24 @@ pub struct ClaudeConfig {
     pub config_dir: ConfigDir,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodexConfig {
+    /// OpenAI API key (forwarded via `SendEnv`, never written to disk)
+    pub api_key: Option<String>,
+
+    /// Additional env var names to forward from host to guest via SSH
+    #[serde(default)]
+    pub env_forward: Vec<String>,
+
+    /// MCP servers to register in `~/.codex/config.toml`
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerDef>,
+
+    /// Source directory for Codex config files (config.toml, AGENTS.md, prompts/)
+    #[serde(default)]
+    pub config_dir: ConfigDir,
+}
+
 const MAX_INSTANCE_NAME_LEN: usize = 64;
 
 fn validate_instance_name(name: &str) -> Result<()> {
@@ -616,6 +638,11 @@ impl CoopConfig {
         {
             cfg.claude.config_dir = ConfigDir::Custom(crate::shell::expand_tilde(path));
         }
+        if let ConfigDir::Custom(ref path) = cfg.codex.config_dir
+            && path.starts_with("~")
+        {
+            cfg.codex.config_dir = ConfigDir::Custom(crate::shell::expand_tilde(path));
+        }
         cfg.claude.marketplaces = cfg
             .claude
             .marketplaces
@@ -697,6 +724,15 @@ impl CoopConfig {
         {
             errors.push(format!(
                 "claude.config_dir '{}' does not exist or is not a directory",
+                path.display()
+            ));
+        }
+
+        if let ConfigDir::Custom(ref path) = self.codex.config_dir
+            && !path.is_dir()
+        {
+            errors.push(format!(
+                "codex.config_dir '{}' does not exist or is not a directory",
                 path.display()
             ));
         }
@@ -947,6 +983,7 @@ impl Default for CoopConfig {
             firecracker_bin: default_firecracker_bin(),
             github: None,
             claude: ClaudeConfig::default(),
+            codex: CodexConfig::default(),
             profiles: HashMap::new(),
         }
     }
@@ -981,6 +1018,17 @@ impl Default for ClaudeConfig {
             env_forward: Vec::new(),
             marketplaces: Vec::new(),
             plugins: Vec::new(),
+            mcp_servers: HashMap::new(),
+            config_dir: ConfigDir::Default,
+        }
+    }
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            env_forward: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
         }
@@ -1592,6 +1640,35 @@ mod tests {
         assert!(cfg.marketplaces.is_empty());
         assert!(cfg.plugins.is_empty());
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn codex_config_all_fields() {
+        let json = r#"{
+            "api_key": "sk-openai-test",
+            "env_forward": ["MYORG_KEY"],
+            "mcp_servers": {
+                "sentry": {
+                    "type": "http",
+                    "url": "https://mcp.sentry.dev/mcp"
+                }
+            }
+        }"#;
+        let cfg: CodexConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-openai-test"));
+        assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert!(cfg.mcp_servers.contains_key("sentry"));
+    }
+
+    #[test]
+    fn codex_config_all_defaults() {
+        let json = "{}";
+        let cfg: CodexConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.env_forward.is_empty());
+        assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(cfg.config_dir, ConfigDir::Default);
     }
 
     #[test]
@@ -2301,6 +2378,16 @@ mod tests {
     }
 
     #[test]
+    fn codex_config_dir_deserializes_custom_path() {
+        let json = r#"{"codex": {"config_dir": "/custom/path"}}"#;
+        let cfg: CoopConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.codex.config_dir,
+            ConfigDir::Custom(PathBuf::from("/custom/path"))
+        );
+    }
+
+    #[test]
     fn config_dir_deserializes_disabled() {
         let json = r#"{"claude": {"config_dir": false}}"#;
         let cfg: CoopConfig = serde_json::from_str(json).unwrap();
@@ -2347,6 +2434,14 @@ mod tests {
     }
 
     #[test]
+    fn validate_passes_with_existing_codex_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = CoopConfig::default();
+        cfg.codex.config_dir = ConfigDir::Custom(tmp.path().to_path_buf());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn validate_rejects_nonexistent_config_dir() {
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir = ConfigDir::Custom(PathBuf::from("/nonexistent/config"));
@@ -2354,6 +2449,17 @@ mod tests {
         assert!(
             err.to_string().contains("config_dir"),
             "expected config_dir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nonexistent_codex_config_dir() {
+        let mut cfg = CoopConfig::default();
+        cfg.codex.config_dir = ConfigDir::Custom(PathBuf::from("/nonexistent/config"));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("codex.config_dir"),
+            "expected codex config_dir error, got: {err}"
         );
     }
 
@@ -2375,6 +2481,28 @@ mod tests {
         let cfg = CoopConfig::load(&path).unwrap();
         let ConfigDir::Custom(ref p) = cfg.claude.config_dir else {
             unreachable!("expected Custom, got: {:?}", cfg.claude.config_dir);
+        };
+        assert!(
+            !p.starts_with("~"),
+            "tilde should be expanded, got: {}",
+            p.display()
+        );
+        assert!(
+            p.to_string_lossy().contains("/foo"),
+            "should preserve path suffix, got: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_codex_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[codex]\nconfig_dir = \"~/foo\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        let ConfigDir::Custom(ref p) = cfg.codex.config_dir else {
+            unreachable!("expected Custom, got: {:?}", cfg.codex.config_dir);
         };
         assert!(
             !p.starts_with("~"),

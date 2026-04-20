@@ -41,7 +41,7 @@ use cmd::Cmd;
 
 #[derive(Parser)]
 #[command(name = "coop", version)]
-#[command(about = "Isolated VM environment for running Claude Code")]
+#[command(about = "Isolated VM environment for running Claude Code and Codex")]
 struct Cli {
     /// Path to coop config file
     #[arg(long, default_value_os_t = config::CoopConfig::default_path())]
@@ -129,7 +129,7 @@ enum Commands {
         /// Instance disk size in GiB (grows from template size if larger)
         #[arg(long)]
         disk: Option<u32>,
-        /// Skip injecting Claude Code credentials/config into the VM
+        /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long)]
         no_claude: bool,
         /// Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
@@ -156,6 +156,14 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `claude`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch Codex inside the VM
+    Codex {
+        #[command(flatten)]
+        session: SessionArgs,
+        /// Extra arguments passed to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -380,6 +388,16 @@ fn main() -> Result<()> {
             }
             let tmux = session.tmux_session("claude");
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
+        }
+        Commands::Codex { session, args } => {
+            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
+            let env_vars = backend::prepare_env_forwarding(&cfg)?;
+            let sess = backend::SshSession {
+                target: &running.target,
+                env: &env_vars,
+            };
+            let tmux = session.tmux_session("codex");
+            ssh::run_interactive(&sess, crate::guest::CODEX_BIN, &args, tmux)
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_deref())?;
@@ -654,7 +672,7 @@ fn find_stopped_instance(
     }
 }
 
-/// Restart a stopped instance: boot VM, wait for SSH, re-bootstrap Claude.
+/// Restart a stopped instance: boot VM, wait for SSH, re-bootstrap guest tools.
 fn restart_instance(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -677,14 +695,14 @@ fn restart_instance(
     signal::check_shutdown()?;
 
     if no_claude {
-        tracing::info!("Skipping Claude Code bootstrap (--no-claude)");
+        tracing::info!("Skipping guest agent bootstrap (--no-claude)");
     } else {
         let env_vars = backend::prepare_env_forwarding(cfg)?;
         let session = backend::SshSession {
             target: &target,
             env: &env_vars,
         };
-        backend::bootstrap_claude(&session, cfg, inst, true)?;
+        backend::bootstrap_agents(&session, cfg, inst, true)?;
     }
 
     tracing::info!(
@@ -716,13 +734,13 @@ fn start_instance(
     let env_vars = backend::prepare_env_forwarding(cfg)?;
 
     if opts.no_claude {
-        tracing::info!("Skipping Claude Code bootstrap (--no-claude)");
+        tracing::info!("Skipping guest agent bootstrap (--no-claude)");
     } else {
         let session = backend::SshSession {
             target: &target,
             env: &env_vars,
         };
-        backend::bootstrap_claude(&session, cfg, inst, false)?;
+        backend::bootstrap_agents(&session, cfg, inst, false)?;
     }
 
     signal::check_shutdown()?;
@@ -1312,6 +1330,32 @@ mod tests {
         };
         assert_eq!(session.name.as_deref(), Some("myvm"));
         assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn codex_session_flag_parses() {
+        let cli = parse(&["codex", "--session", "dev"]);
+        let super::Commands::Codex { session, .. } = cli.command else {
+            panic!("expected Codex variant");
+        };
+        assert_eq!(session.session.as_deref(), Some("dev"));
+        assert_eq!(session.tmux_session("codex"), Some("dev"));
+    }
+
+    #[test]
+    fn codex_session_and_no_tmux_conflict() {
+        let err = parse_err(&["codex", "--session", "x", "--no-tmux"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn codex_name_and_trailing_args_parse() {
+        let cli = parse(&["codex", "myvm", "--", "--model", "gpt-5"]);
+        let super::Commands::Codex { session, args, .. } = cli.command else {
+            panic!("expected Codex variant");
+        };
+        assert_eq!(session.name.as_deref(), Some("myvm"));
+        assert_eq!(args, vec!["--model", "gpt-5"]);
     }
 
     #[test]

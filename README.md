@@ -1,8 +1,8 @@
 # coop
 
-Isolated VM environments for running Claude Code.
+Isolated VM environments for running Claude Code and Codex.
 
-coop is a Rust CLI that manages disposable virtual machines where Claude Code has full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
+coop is a Rust CLI that manages disposable virtual machines where Claude Code and Codex have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
 
 ## Quick start
 
@@ -25,16 +25,19 @@ cargo build --release
 cp target/release/coop /usr/local/bin/
 ```
 
-Set up the VM template, start an instance, and launch Claude Code:
+Set up the VM template, start an instance, and launch an agent CLI:
 
 ```
 export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-proj-...
 coop setup
 coop start my-project --workspace ~/code/my-project
 coop claude
+# or
+coop codex
 ```
 
-That gives you a Claude Code session running inside an isolated VM with your project synced in. By default, `coop claude` launches with `--dangerously-skip-permissions` since the VM is the isolation boundary. Pass `--ask` to prompt for permissions instead.
+That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. By default, `coop claude` launches with `--dangerously-skip-permissions` since the VM is the isolation boundary. Pass `--ask` to prompt for permissions instead.
 
 ## Features
 
@@ -43,6 +46,7 @@ That gives you a Claude Code session running inside an isolated VM with your pro
 - **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
+- **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
 - **VS Code remote SSH**: `coop vscode` opens VS Code connected to the guest
 - **Multi-instance**: run multiple VMs side by side, each with its own name and disk
 - **Disk resize**: grow a stopped instance's disk with `coop resize --size +20`
@@ -59,6 +63,7 @@ That gives you a Claude Code session running inside an isolated VM with your pro
 | `destroy` | Stop and remove a VM instance |
 | `shell` | Interactive shell session in a running VM |
 | `claude` | Launch Claude Code inside the VM |
+| `codex` | Launch Codex inside the VM |
 | `exec` | Run a command in the VM non-interactively |
 | `push` | Sync local directory into the VM |
 | `pull` | Sync VM workspace back to the host |
@@ -94,6 +99,7 @@ Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are a
 - [Images and profiles](docs/images-and-profiles.md)
 - [Workspace sync](docs/workspaces.md)
 - [Claude Code integration](docs/claude-integration.md)
+- [Codex integration](docs/codex-integration.md)
 - [VS Code integration](docs/vscode.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)

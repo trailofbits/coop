@@ -5,6 +5,7 @@ set -euo pipefail
 #   - Ubuntu 24.04 minimal
 #   - Docker CE
 #   - Node.js 22 LTS + Claude Code CLI
+#   - Codex CLI
 #   - Python 3.13 + uv
 #   - Git, build-essential, common dev tools
 #   - OpenSSH server
@@ -154,6 +155,31 @@ chroot "$MOUNT_DIR" bash -c '
 echo "=== Installing Claude Code CLI ==="
 chroot "$MOUNT_DIR" bash -c '
     npm install -g @anthropic-ai/claude-code
+'
+
+echo "=== Installing Codex CLI ==="
+chroot "$MOUNT_DIR" bash -c '
+    set -euo pipefail
+    case "$(uname -m)" in
+        x86_64)
+            asset="codex-x86_64-unknown-linux-musl.tar.gz"
+            ;;
+        aarch64|arm64)
+            asset="codex-aarch64-unknown-linux-musl.tar.gz"
+            ;;
+        *)
+            echo "Unsupported architecture for Codex CLI: $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+
+    tmpdir=$(mktemp -d)
+    trap "rm -rf \"$tmpdir\"" EXIT
+    archive="$tmpdir/$asset"
+    curl -fsSL -o "$archive" "https://github.com/openai/codex/releases/latest/download/$asset"
+    tar -xzf "$archive" -C "$tmpdir"
+    bin=$(find "$tmpdir" -maxdepth 1 -type f -name "codex-*" | head -n 1)
+    install -m 755 "$bin" /usr/local/bin/codex
 '
 
 echo "=== Installing Python 3.13 + uv ==="

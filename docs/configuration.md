@@ -97,6 +97,19 @@ Definition fields:
 
 Servers are registered with `claude mcp add-json` at user scope.
 
+## `codex` section
+
+Codex configuration injected into the guest VM at start time. Every field is optional.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
+| `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`) from this directory to `~/.codex/` in the guest on start. Set to `false` to disable. Supports `~` expansion. |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.codex/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+
+coop preserves any other settings already present in the staged `config.toml`, but the `mcp_servers` table is owned by coop when `codex.mcp_servers` is configured.
+
 ## `profiles` section
 
 Custom installation profiles for `coop setup --profile <name>`. Each profile declares packages and scripts that run during rootfs template creation.
@@ -171,6 +184,14 @@ plugins = ["rust-analyzer-lsp@claude-plugins-official"]
 command = "/usr/bin/my-mcp-server"
 args = ["--verbose"]
 env = { API_KEY = "MY_API_KEY" }
+
+[codex]
+config_dir = "~/.codex"
+env_forward = ["CUSTOM_TOKEN"]
+
+[codex.mcp_servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
 
 [profiles.my-tools]
 apt_packages = ["ripgrep", "fd-find"]

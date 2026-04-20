@@ -1,6 +1,6 @@
 # Command Reference
 
-coop creates isolated VM environments for running Claude Code. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
+coop creates isolated VM environments for running Claude Code and Codex. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
 
 ## Global Flags
 
@@ -81,7 +81,7 @@ coop start [NAME] [FLAGS]
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--disk <GiB>` | Instance disk size in GiB (grows from template size if larger) |
-| `--no-claude` | Skip injecting Claude Code credentials and config into the VM |
+| `--no-claude` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use (default: `default`) |
 | `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
 
@@ -142,6 +142,28 @@ The session runs inside tmux under the name `claude` (or the name given by `--se
 coop claude
 coop claude my-project --ask
 coop claude my-project -- --model sonnet
+```
+
+### `codex`
+
+Launch Codex inside the VM.
+
+```
+coop codex [NAME] [FLAGS] [ARGS...]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--session <name>` | tmux session name (default: `codex`) |
+| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
+| `ARGS...` | Extra arguments passed through to `codex` |
+
+The session runs inside tmux under the name `codex` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
+
+```
+coop codex
+coop codex my-project -- --model gpt-5
 ```
 
 ### `exec`

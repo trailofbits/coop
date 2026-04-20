@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
+use toml::Value as TomlValue;
 
 #[cfg(not(target_os = "macos"))]
 use crate::cmd::Cmd;
@@ -854,6 +855,7 @@ pub type PlatformBackend = FirecrackerBackend;
 /// manager calls only happen when actually needed.
 pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
     let claude = &cfg.claude;
+    let codex = &cfg.codex;
     let mut env = EnvForward::default();
 
     // ANTHROPIC_API_KEY: prefer config, fall back to process env
@@ -863,6 +865,15 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
         env.set("ANTHROPIC_API_KEY", resolved);
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         env.set("ANTHROPIC_API_KEY", key);
+    }
+
+    // OPENAI_API_KEY: prefer config, fall back to process env
+    if let Some(key) = &codex.api_key {
+        let resolved =
+            crate::config::resolve_cmd_value(key).context("Failed to resolve codex.api_key")?;
+        env.set("OPENAI_API_KEY", resolved);
+    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        env.set("OPENAI_API_KEY", key);
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
@@ -878,8 +889,35 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
             env.set(name.as_str(), val);
         }
     }
+    for name in &codex.env_forward {
+        if !env.contains(name)
+            && let Ok(val) = std::env::var(name)
+        {
+            env.set(name.as_str(), val);
+        }
+    }
 
     Ok(env)
+}
+
+/// Bootstrap configured guest agents in the guest declaratively.
+pub fn bootstrap_agents(
+    session: &SshSession<'_>,
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    restart: bool,
+) -> Result<()> {
+    // GitHub auth is guest-global state. Refresh it once before either
+    // agent bootstrap if a token is available.
+    if session.env.contains("GITHUB_TOKEN") {
+        tracing::info!("Configuring GitHub auth in guest");
+        setup_github_auth(session)?;
+    }
+
+    bootstrap_claude(session, cfg, inst, restart)?;
+    bootstrap_codex(session, cfg, restart)?;
+
+    Ok(())
 }
 
 /// Bootstrap Claude Code in the guest declaratively.
@@ -895,7 +933,7 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
 /// when they first run `claude` interactively in the guest.
 /// `ANTHROPIC_API_KEY` (if set) is forwarded via `SendEnv`
 /// on every SSH session automatically.
-pub fn bootstrap_claude(
+fn bootstrap_claude(
     session: &SshSession<'_>,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
@@ -922,12 +960,6 @@ pub fn bootstrap_claude(
         }
     }
 
-    // GitHub auth — ephemeral, refresh on every boot
-    if session.env.contains("GITHUB_TOKEN") {
-        tracing::info!("Configuring GitHub auth in guest");
-        setup_github_auth(session)?;
-    }
-
     // User config (CLAUDE.md, rules/, commands/) — host files may have changed
     copy_claude_config(session.target, &claude.config_dir)?;
 
@@ -952,6 +984,42 @@ pub fn bootstrap_claude(
     }
 
     tracing::info!("Claude Code bootstrap complete");
+    Ok(())
+}
+
+/// Bootstrap Codex in the guest declaratively.
+///
+/// Codex uses `~/.codex/config.toml` for MCP registration and related
+/// settings, so bootstrap writes allowlisted user config files and a
+/// managed MCP section there when configured.
+fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) -> Result<()> {
+    let codex = &cfg.codex;
+    let needs_codex = codex.config_dir != ConfigDir::Disabled || !codex.mcp_servers.is_empty();
+
+    if !needs_codex {
+        return Ok(());
+    }
+
+    if !session
+        .target
+        .exec_ok(&format!("test -x {}", crate::guest::CODEX_BIN))
+    {
+        bail!(
+            "Codex CLI is not installed in the guest.\n\
+             The golden image may have been built before Codex support \
+             was added, or the install failed silently.\n\
+             Run `coop setup --rebuild` to rebuild the image."
+        );
+    }
+
+    copy_codex_config(session.target, codex)?;
+
+    if restart {
+        tracing::info!("Codex bootstrap refreshed");
+    } else {
+        tracing::info!("Codex bootstrap complete");
+    }
+
     Ok(())
 }
 
@@ -1025,39 +1093,13 @@ fn setup_github_auth(session: &SshSession<'_>) -> Result<()> {
 /// Missing source directory or missing individual entries are silently
 /// skipped (debug-logged).
 fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
-    let source_dir = match config_dir {
-        ConfigDir::Disabled => {
-            tracing::debug!("claude.config_dir is disabled, skipping");
-            return Ok(());
-        }
-        ConfigDir::Default => {
-            let Some(home) = dirs::home_dir() else {
-                tracing::debug!("Could not determine home directory, skipping config copy");
-                return Ok(());
-            };
-            let default_dir = home.join(".claude");
-            if !default_dir.is_dir() {
-                tracing::debug!(
-                    "Default config dir {} does not exist, skipping",
-                    default_dir.display()
-                );
-                return Ok(());
-            }
-            default_dir
-        }
-        ConfigDir::Custom(path) => {
-            if !path.is_dir() {
-                tracing::warn!(
-                    "claude.config_dir '{}' does not exist, skipping",
-                    path.display()
-                );
-                return Ok(());
-            }
-            path.clone()
-        }
+    let Some(source_dir) = resolve_config_source_dir(config_dir, ".claude", "claude.config_dir")?
+    else {
+        return Ok(());
     };
 
-    let staged = stage_allowed_files(&source_dir).context("Failed to stage Claude config files")?;
+    let staged = stage_selected_files(&source_dir, &["CLAUDE.md"], &["rules", "commands"])
+        .context("Failed to stage Claude config files")?;
 
     let staging_path = staged.path();
     let has_entries = staging_path
@@ -1092,19 +1134,98 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
     Ok(())
 }
 
-/// Copy allowlisted entries from source into a temporary staging
-/// directory. Returns the `TempDir` (caller keeps it alive).
-fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
-    let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
+fn copy_codex_config(target: &SshTarget, codex: &crate::config::CodexConfig) -> Result<()> {
+    let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir")?;
+    let staged = stage_codex_files(source_dir.as_deref(), &codex.mcp_servers)
+        .context("Failed to stage Codex config files")?;
 
-    let claude_md = source_dir.join("CLAUDE.md");
-    if claude_md.is_file() {
-        std::fs::copy(&claude_md, staging.path().join("CLAUDE.md"))
-            .context("Failed to stage CLAUDE.md")?;
-        tracing::debug!("Staged CLAUDE.md");
+    let staging_path = staged.path();
+    let has_entries = staging_path
+        .read_dir()
+        .context("Failed to read staging directory")?
+        .next()
+        .is_some();
+
+    if !has_entries {
+        tracing::debug!("No Codex config content to copy");
+        return Ok(());
     }
 
-    for dir_name in &["rules", "commands"] {
+    target.exec("mkdir -p ~/.codex")?;
+
+    let guest_codex = GuestPath::new("./.codex");
+    for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
+        let entry = entry.context("Failed to read staging entry")?;
+        let path = entry.path();
+        if path.is_dir() {
+            target
+                .scp_to_recursive(&path, &guest_codex)
+                .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
+        } else {
+            target
+                .scp_to(&path, &guest_codex)
+                .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
+        }
+    }
+
+    tracing::info!("Copied Codex config into guest");
+    Ok(())
+}
+
+fn resolve_config_source_dir(
+    config_dir: &ConfigDir,
+    default_dir_name: &str,
+    label: &str,
+) -> Result<Option<PathBuf>> {
+    let path = match config_dir {
+        ConfigDir::Disabled => {
+            tracing::debug!("{label} is disabled, skipping");
+            return Ok(None);
+        }
+        ConfigDir::Default => {
+            let Some(home) = dirs::home_dir() else {
+                tracing::debug!("Could not determine home directory, skipping config copy");
+                return Ok(None);
+            };
+            home.join(default_dir_name)
+        }
+        ConfigDir::Custom(path) => path.clone(),
+    };
+
+    if !path.is_dir() {
+        if matches!(config_dir, ConfigDir::Custom(_)) {
+            tracing::warn!("{label} '{}' does not exist, skipping", path.display());
+        } else {
+            tracing::debug!(
+                "Default config dir {} does not exist, skipping",
+                path.display()
+            );
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(path))
+}
+
+/// Copy allowlisted entries from source into a temporary staging
+/// directory. Returns the `TempDir` (caller keeps it alive).
+fn stage_selected_files(
+    source_dir: &Path,
+    files: &[&str],
+    dirs: &[&str],
+) -> Result<tempfile::TempDir> {
+    let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
+
+    for file_name in files {
+        let src = source_dir.join(file_name);
+        if src.is_file() {
+            std::fs::copy(&src, staging.path().join(file_name))
+                .with_context(|| format!("Failed to stage {file_name}"))?;
+            tracing::debug!("Staged {file_name}");
+        }
+    }
+
+    for dir_name in dirs {
         let src = source_dir.join(dir_name);
         if src.is_dir() {
             copy_dir_recursive(&src, &staging.path().join(dir_name))
@@ -1114,6 +1235,79 @@ fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
     }
 
     Ok(staging)
+}
+
+fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
+    stage_selected_files(source_dir, &["CLAUDE.md"], &["rules", "commands"])
+}
+
+fn stage_codex_files(
+    source_dir: Option<&Path>,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<tempfile::TempDir> {
+    let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
+
+    let mut config = match source_dir {
+        Some(path) => {
+            let staged = stage_selected_files(path, &["AGENTS.md"], &["prompts"])?;
+            copy_dir_recursive(staged.path(), staging.path())
+                .context("Failed to stage Codex allowlisted files")?;
+
+            let config_path = path.join("config.toml");
+            if config_path.is_file() {
+                let content =
+                    std::fs::read_to_string(&config_path).context("Failed to read config.toml")?;
+                toml::from_str::<TomlValue>(&content)
+                    .context("Failed to parse Codex config.toml")?
+            } else {
+                TomlValue::Table(Default::default())
+            }
+        }
+        None => TomlValue::Table(Default::default()),
+    };
+
+    let resolved_servers = resolve_codex_mcp_servers(mcp_servers)?;
+    if !resolved_servers.is_empty() {
+        let TomlValue::Table(root) = &mut config else {
+            bail!("Codex config.toml must deserialize to a TOML table");
+        };
+        root.insert(
+            "mcp_servers".to_string(),
+            TomlValue::try_from(resolved_servers)
+                .context("Failed to serialize Codex MCP servers")?,
+        );
+    }
+
+    let should_write_config = source_dir
+        .map(|path| path.join("config.toml").is_file())
+        .unwrap_or(false)
+        || !mcp_servers.is_empty();
+
+    if should_write_config {
+        std::fs::write(
+            staging.path().join("config.toml"),
+            toml::to_string(&config).context("Failed to serialize Codex config.toml")?,
+        )
+        .context("Failed to stage Codex config.toml")?;
+    }
+
+    Ok(staging)
+}
+
+fn resolve_codex_mcp_servers(
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<std::collections::HashMap<String, McpServerDef>> {
+    let mut resolved = std::collections::HashMap::with_capacity(mcp_servers.len());
+    for (name, def) in mcp_servers {
+        let mut cloned = def.clone();
+        for (header_key, header_value) in &mut cloned.headers {
+            *header_value = crate::config::resolve_cmd_value(header_value).with_context(|| {
+                format!("Failed to resolve header '{header_key}' for Codex MCP server '{name}'")
+            })?;
+        }
+        resolved.insert(name.clone(), cloned);
+    }
+    Ok(resolved)
 }
 
 /// Recursively copy a directory tree.
@@ -1372,6 +1566,34 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let staging = stage_allowed_files(src.path()).unwrap();
         let count = std::fs::read_dir(staging.path()).unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn stage_codex_files_merges_mcp_servers_into_config() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("AGENTS.md"), "Global instructions").unwrap();
+        std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "sentry".to_string(),
+            McpServerDef {
+                command: None,
+                args: Vec::new(),
+                server_type: Some("http".to_string()),
+                url: Some("https://mcp.sentry.dev/mcp".to_string()),
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let staging = stage_codex_files(Some(src.path()), &servers).unwrap();
+        assert!(staging.path().join("AGENTS.md").is_file());
+
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(config.contains("model = \"gpt-5\""));
+        assert!(config.contains("[mcp_servers.sentry]"));
+        assert!(config.contains("url = \"https://mcp.sentry.dev/mcp\""));
     }
 
     #[test]

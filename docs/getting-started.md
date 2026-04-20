@@ -1,6 +1,6 @@
 # Getting Started
 
-coop runs Claude Code inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Claude Code never touches your host.
+coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
 
 ## Prerequisites
 
@@ -47,9 +47,9 @@ template_size_gib = 20
 
 All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
 
-### Claude Code integration
+### Claude Code and Codex integration
 
-Forward your Anthropic API key and GitHub credentials into the guest:
+Forward your API keys and GitHub credentials into the guest:
 
 ```toml
 github = "auto"
@@ -60,6 +60,9 @@ mem_size_mib = 8192
 
 [claude]
 config_dir = "~/.claude"
+
+[codex]
+config_dir = "~/.codex"
 ```
 
 The `github` field controls how coop resolves a GitHub token for the guest:
@@ -70,13 +73,13 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 
 GitHub auth is off by default. Set `github = "auto"` explicitly to enable it.
 
-coop picks up `ANTHROPIC_API_KEY` from your environment automatically. Setting it explicitly under `claude.api_key` also works, but environment variables are preferred.
+coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
 
 ## First run
 
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, tmux, and others), the GitHub CLI, and Claude Code.
+`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, tmux, and others), the GitHub CLI, Claude Code, and Codex.
 
 ```
 coop setup
@@ -104,7 +107,7 @@ Setup is idempotent. Rerunning with the same profiles skips completed work. Pass
 coop start
 ```
 
-This creates a VM instance from the template, boots it, waits for SSH, and injects Claude Code credentials. The instance gets an auto-generated name.
+This creates a VM instance from the template, boots it, waits for SSH, and injects Claude Code and Codex credentials/config. The instance gets an auto-generated name.
 
 Name it explicitly:
 
@@ -145,7 +148,7 @@ Start from a specific named image:
 coop start my-project --image python-dev
 ```
 
-Skip Claude Code credential injection for non-Claude workloads:
+Skip Claude Code and Codex credential/config injection:
 
 ```
 coop start my-project --no-claude
@@ -171,13 +174,25 @@ Pass extra arguments through to `claude`:
 coop claude -- --model opus
 ```
 
+**Launch Codex inside the VM:**
+
+```
+coop codex
+```
+
+Pass extra arguments through to `codex`:
+
+```
+coop codex -- --model gpt-5
+```
+
 **Open a shell in the VM:**
 
 ```
 coop shell
 ```
 
-Both `coop shell` and `coop claude` attach to a persistent tmux session. Use `--no-tmux` for a raw SSH connection, or `--session <name>` to pick a named session.
+`coop shell`, `coop claude`, and `coop codex` attach to persistent tmux sessions. Use `--no-tmux` for a raw SSH connection, or `--session <name>` to pick a named session.
 
 **Run a command non-interactively:**
 
@@ -285,6 +300,7 @@ coop images --delete python-dev
 - [Images and profiles](images-and-profiles.md)
 - [Workspace sync](workspaces.md)
 - [Claude Code integration](claude-integration.md)
+- [Codex integration](codex-integration.md)
 - [VS Code and editor integration](vscode.md)
 - [Running multiple instances](multi-instance.md)
 - [Platform backends](backends.md)

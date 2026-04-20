@@ -41,6 +41,19 @@
 # # Header values also accept the "cmd:" prefix:
 # # headers = { Authorization = "cmd:op read op://Private/Sentry/token" }
 
+# [codex]
+# config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml from (false to disable)
+# env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
+#
+# Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.
+#   api_key = "cmd:op read op://Private/OpenAI/credential"
+#   api_key = "sk-proj-..."
+
+# [codex.mcp_servers.my-server]
+# command = "npx"
+# args = ["-y", "@openai/some-mcp-server"]
+# env = { API_KEY = "MY_HOST_ENV_VAR" }
+
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]
 # pre_install = "curl -fsSL https://example.com/setup.sh | bash"

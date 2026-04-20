@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, CustomProfile, Instance};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_DOCKER_REPO,
-    SCRIPT_GH_REPO, lookup_profile,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, lookup_profile,
 };
 
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
@@ -426,7 +426,7 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, and profile packages");
+    eprintln!("    4. Install Docker, Claude Code, Codex, and profile packages");
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -608,10 +608,12 @@ fn compose_recipe(
         s.push_str("exit 1\n");
     }
 
-    // Guest config configures the ubuntu user — must come before claude-code
+    // Guest config configures the ubuntu user — must come before claude-code.
     s.push_str(SCRIPT_GUEST_CONFIG);
-    // Direct binary download (runs as root in chroot, installs for ubuntu user)
+    // Direct binary download (runs as root in chroot, installs for ubuntu user).
     s.push_str(SCRIPT_CLAUDE_CODE);
+    // Codex installs as a standalone binary under /usr/local/bin.
+    s.push_str(SCRIPT_CODEX);
 
     Ok(s)
 }
@@ -1090,7 +1092,7 @@ fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
 
 /// Mount the template rootfs and run the install script in a chroot.
 fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code)...");
+    eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -1331,6 +1333,10 @@ mod tests {
         assert!(result.is_ok());
         let script = result.unwrap();
         assert!(script.contains("apt-get"));
+        assert!(
+            script.contains("Installing Codex CLI"),
+            "base recipe should install Codex CLI",
+        );
         no_consecutive_concat(&script);
     }
 
