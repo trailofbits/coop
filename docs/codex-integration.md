@@ -70,7 +70,7 @@ When a token is available, coop runs `gh auth setup-git` in the guest during boo
 
 ### Config directory
 
-`config_dir` specifies a host directory from which coop copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`) into `~/.codex/` in the guest. This provides Codex's global instructions, prompt files, and baseline user configuration.
+`config_dir` specifies a host directory from which coop copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) into `~/.codex/` in the guest. This provides Codex's global instructions, prompt files, baseline user configuration, and local Codex authentication state.
 
 ```toml
 [codex]
@@ -110,7 +110,7 @@ If `config_dir` also provides a `config.toml`, coop preserves its other settings
 When `coop start` runs (without `--no-claude`), it executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
-2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`) from `config_dir` to `~/.codex/` in the guest.
+2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest.
 3. **MCP servers**: Merge configured MCP server definitions into `~/.codex/config.toml`.
 
 On restart (`coop start` of a stopped instance), the same Codex config files are refreshed so host-side updates are reflected in the guest.

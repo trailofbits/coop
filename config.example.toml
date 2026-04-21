@@ -42,7 +42,7 @@
 # # headers = { Authorization = "cmd:op read op://Private/Sentry/token" }
 
 # [codex]
-# config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml from (false to disable)
+# config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml, auth.json from (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 #
 # Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.

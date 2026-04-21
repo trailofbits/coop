@@ -1248,7 +1248,7 @@ fn stage_codex_files(
 
     let mut config = match source_dir {
         Some(path) => {
-            let staged = stage_selected_files(path, &["AGENTS.md"], &["prompts"])?;
+            let staged = stage_selected_files(path, &["AGENTS.md", "auth.json"], &["prompts"])?;
             copy_dir_recursive(staged.path(), staging.path())
                 .context("Failed to stage Codex allowlisted files")?;
 
@@ -1593,6 +1593,19 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(config.contains("model = \"gpt-5\""));
         assert!(config.contains("[mcp_servers.sentry]"));
         assert!(config.contains("url = \"https://mcp.sentry.dev/mcp\""));
+    }
+
+    #[test]
+    fn stage_codex_files_copies_auth_json() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
+
+        let staging =
+            stage_codex_files(Some(src.path()), &std::collections::HashMap::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
+            "{\"access_token\":\"test\"}"
+        );
     }
 
     #[test]
