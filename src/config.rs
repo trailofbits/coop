@@ -468,7 +468,7 @@ pub struct ClaudeConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CodexConfig {
-    /// OpenAI API key (forwarded via `SendEnv`, never written to disk)
+    /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
     pub api_key: Option<String>,
 
     /// Additional env var names to forward from host to guest via SSH

@@ -1093,7 +1093,7 @@ fn setup_github_auth(session: &SshSession<'_>) -> Result<()> {
 /// Missing source directory or missing individual entries are silently
 /// skipped (debug-logged).
 fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
-    let Some(source_dir) = resolve_config_source_dir(config_dir, ".claude", "claude.config_dir")?
+    let Some(source_dir) = resolve_config_source_dir(config_dir, ".claude", "claude.config_dir")
     else {
         return Ok(());
     };
@@ -1134,7 +1134,7 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
 }
 
 fn copy_codex_config(target: &SshTarget, codex: &crate::config::CodexConfig) -> Result<()> {
-    let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir")?;
+    let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
     let staged = stage_codex_files(source_dir.as_deref(), &codex.mcp_servers)
         .context("Failed to stage Codex config files")?;
 
@@ -1175,16 +1175,16 @@ fn resolve_config_source_dir(
     config_dir: &ConfigDir,
     default_dir_name: &str,
     label: &str,
-) -> Result<Option<PathBuf>> {
+) -> Option<PathBuf> {
     let path = match config_dir {
         ConfigDir::Disabled => {
             tracing::debug!("{label} is disabled, skipping");
-            return Ok(None);
+            return None;
         }
         ConfigDir::Default => {
             let Some(home) = dirs::home_dir() else {
                 tracing::debug!("Could not determine home directory, skipping config copy");
-                return Ok(None);
+                return None;
             };
             home.join(default_dir_name)
         }
@@ -1200,10 +1200,10 @@ fn resolve_config_source_dir(
                 path.display()
             );
         }
-        return Ok(None);
+        return None;
     }
 
-    Ok(Some(path))
+    Some(path)
 }
 
 /// Copy allowlisted entries from source into a temporary staging
@@ -1259,10 +1259,10 @@ fn stage_codex_files(
                 toml::from_str::<TomlValue>(&content)
                     .context("Failed to parse Codex config.toml")?
             } else {
-                TomlValue::Table(Default::default())
+                TomlValue::Table(toml::map::Map::default())
             }
         }
-        None => TomlValue::Table(Default::default()),
+        None => TomlValue::Table(toml::map::Map::default()),
     };
 
     let resolved_servers = resolve_codex_mcp_servers(mcp_servers)?;
@@ -1277,9 +1277,7 @@ fn stage_codex_files(
         );
     }
 
-    let should_write_config = source_dir
-        .map(|path| path.join("config.toml").is_file())
-        .unwrap_or(false)
+    let should_write_config = source_dir.is_some_and(|path| path.join("config.toml").is_file())
         || !mcp_servers.is_empty();
 
     if should_write_config {
