@@ -204,21 +204,21 @@ test_invalid_names() {
     echo "=== Phase: invalid instance names ==="
 
     # Path traversal
-    if moat_fails start "../../../tmp/evil" --no-claude; then
+    if moat_fails start "../../../tmp/evil" --no-agents; then
         pass "rejects path traversal name"
     else
         fail "rejects path traversal name" "should have failed"
     fi
 
     # Newline injection
-    if moat_fails start $'evil\nname' --no-claude; then
+    if moat_fails start $'evil\nname' --no-agents; then
         pass "rejects newline in name"
     else
         fail "rejects newline in name" "should have failed"
     fi
 
     # Empty name is fine (auto-generated), but spaces are not
-    if moat_fails start "name with spaces" --no-claude; then
+    if moat_fails start "name with spaces" --no-agents; then
         pass "rejects spaces in name"
     else
         fail "rejects spaces in name" "should have failed"
@@ -315,7 +315,7 @@ test_start() {
     echo ""
     echo "=== Phase: start ==="
 
-    local args=(start "$INSTANCE" --no-claude)
+    local args=(start "$INSTANCE" --no-agents)
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$INSTANCE")
         pass "start exits 0"
@@ -331,7 +331,7 @@ test_duplicate_name() {
     echo ""
     echo "=== Phase: duplicate instance name ==="
 
-    if moat_fails start "$INSTANCE" --no-claude; then
+    if moat_fails start "$INSTANCE" --no-agents; then
         pass "rejects duplicate instance name"
     else
         fail "rejects duplicate instance name" "should have failed"
@@ -536,7 +536,7 @@ test_claude_bin_path() {
     if guest_exec test -x /home/ubuntu/.local/bin/claude; then
         pass "claude binary exists at CLAUDE_BIN path"
     else
-        # Image was built with --no-claude or without profiles — skip
+        # Image was built with --no-agents or without profiles — skip
         skip "claude binary at CLAUDE_BIN path" "not installed in this image"
         return
     fi
@@ -579,6 +579,42 @@ test_claude_bin_path() {
         fi
     else
         fail "claude-yolo includes --dangerously-skip-permissions" "cat failed"
+    fi
+}
+
+test_codex_bin_path() {
+    echo ""
+    echo "=== Phase: codex binary path ==="
+
+    if guest_exec test -x /usr/local/bin/codex; then
+        pass "codex binary exists at /usr/local/bin/codex"
+    else
+        fail "codex binary exists at /usr/local/bin/codex" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if moat_exec /usr/local/bin/codex --version >/dev/null; then
+        pass "codex binary invocable via full path"
+    else
+        fail "codex binary invocable via full path" "stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec test -x /usr/local/bin/codex-yolo; then
+        pass "codex-yolo shortcut exists"
+    else
+        fail "codex-yolo shortcut exists" "stderr: $(guest_stderr)"
+    fi
+
+    local yolo_content
+    if yolo_content=$(guest_exec cat /usr/local/bin/codex-yolo); then
+        if echo "$yolo_content" | grep -q "dangerously-bypass-approvals-and-sandbox"; then
+            pass "codex-yolo includes dangerous full-access flag"
+        else
+            fail "codex-yolo includes dangerous full-access flag" \
+                "content: $yolo_content"
+        fi
+    else
+        fail "codex-yolo includes dangerous full-access flag" "cat failed"
     fi
 }
 
@@ -1119,7 +1155,7 @@ test_restart_stopped() {
     echo "=== Phase: restart stopped instance ==="
 
     # Restart the stopped instance (was stopped in previous phase)
-    if coop start "$INSTANCE" --no-claude; then
+    if coop start "$INSTANCE" --no-agents; then
         pass "restart stopped instance exits 0"
     else
         fail "restart stopped instance exits 0" "exit code: $?"
@@ -1147,7 +1183,7 @@ test_restart_stopped() {
     fi
 
     # Verify duplicate start of running instance is rejected
-    if moat_fails start "$INSTANCE" --no-claude; then
+    if moat_fails start "$INSTANCE" --no-agents; then
         pass "rejects start of already-running instance"
     else
         fail "rejects start of already-running instance" "should have failed"
@@ -1168,7 +1204,7 @@ test_restart_rejects_ignored_flags() {
     local mount_dir
     mount_dir=$(mktemp -d)
 
-    if moat_fails start "$INSTANCE" --no-claude --mount "$mount_dir"; then
+    if moat_fails start "$INSTANCE" --no-agents --mount "$mount_dir"; then
         pass "restart with --mount rejected"
     else
         fail "restart with --mount rejected" "should have failed"
@@ -1181,14 +1217,14 @@ test_restart_rejects_ignored_flags() {
         fail "error message suggests destroy first" "stderr: $HARNESS_ERR"
     fi
 
-    if moat_fails start "$INSTANCE" --no-claude --workspace "$mount_dir"; then
+    if moat_fails start "$INSTANCE" --no-agents --workspace "$mount_dir"; then
         pass "restart with --workspace rejected"
     else
         fail "restart with --workspace rejected" "should have failed"
         coop stop "$INSTANCE" 2>/dev/null || true
     fi
 
-    if moat_fails start "$INSTANCE" --no-claude --disk 20; then
+    if moat_fails start "$INSTANCE" --no-agents --disk 20; then
         pass "restart with --disk rejected"
     else
         fail "restart with --disk rejected" "should have failed"
@@ -1196,7 +1232,7 @@ test_restart_rejects_ignored_flags() {
     fi
 
     # Plain restart (no conflicting flags) should still work
-    if coop start "$INSTANCE" --no-claude; then
+    if coop start "$INSTANCE" --no-agents; then
         pass "restart without flags still works"
     else
         fail "restart without flags still works" "exit code: $?"
@@ -1288,7 +1324,7 @@ test_idempotency() {
 
     # stop idempotency: start an instance, stop it twice
     local inst_name="${INSTANCE}-idem"
-    if ! coop start "$inst_name" --no-claude; then
+    if ! coop start "$inst_name" --no-agents; then
         fail "start for stop-idempotency test" "exit code: $?"
         return
     fi
@@ -1329,7 +1365,7 @@ test_workspace_sync() {
     echo "nested" > "$ws_tmpdir/subdir/nested.txt"
 
     # Start instance with --workspace
-    local args=(start "$ws_instance" --no-claude --workspace "$ws_tmpdir")
+    local args=(start "$ws_instance" --no-agents --workspace "$ws_tmpdir")
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$ws_instance")
         pass "start with --workspace exits 0"
@@ -1419,7 +1455,7 @@ test_push_pull_no_workspace() {
     local nw_instance="${INSTANCE}-nw"
 
     # Start instance WITHOUT --workspace, --git-repo, or --mount
-    if coop start "$nw_instance" --no-claude; then
+    if coop start "$nw_instance" --no-agents; then
         STARTED_INSTANCES+=("$nw_instance")
         pass "start without --workspace exits 0"
     else
@@ -1490,7 +1526,7 @@ test_multi_instance() {
     local inst_b="${INSTANCE}-b"
 
     # Start two instances
-    if coop start "$inst_a" --no-claude; then
+    if coop start "$inst_a" --no-agents; then
         STARTED_INSTANCES+=("$inst_a")
         pass "start instance A ($inst_a)"
     else
@@ -1498,7 +1534,7 @@ test_multi_instance() {
         return
     fi
 
-    if coop start "$inst_b" --no-claude; then
+    if coop start "$inst_b" --no-agents; then
         STARTED_INSTANCES+=("$inst_b")
         pass "start instance B ($inst_b)"
     else
@@ -1603,7 +1639,7 @@ test_named_images() {
 
     # Start an instance from the named image
     local inst_name="${INSTANCE}-img"
-    if coop start "$inst_name" --no-claude --image "$img_name"; then
+    if coop start "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "start --image $img_name exits 0"
     else
@@ -1686,7 +1722,7 @@ CFGEOF
 
     # Start instance from custom image
     local inst_name="${INSTANCE}-custom"
-    if "$BINARY" --config "$cfg_file" start "$inst_name" --no-claude --image "$custom_img" 2>"$tmpdir/stderr"; then
+    if "$BINARY" --config "$cfg_file" start "$inst_name" --no-agents --image "$custom_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "start with custom profile image exits 0"
     else
@@ -1733,7 +1769,7 @@ test_builtin_profiles() {
 
     # Start instance from the profiled image
     local inst_name="${INSTANCE}-prof"
-    if coop start "$inst_name" --no-claude --image "$img_name"; then
+    if coop start "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "start from profiled image exits 0"
     else
@@ -1797,7 +1833,7 @@ test_host_mount() {
     echo "nested-mount" > "$mount_dir/subdir/deep.txt"
 
     # Start instance with --mount (defaults to /workspace)
-    if coop start "$mount_instance" --no-claude --mount "$mount_dir"; then
+    if coop start "$mount_instance" --no-agents --mount "$mount_dir"; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "start with --mount exits 0"
     else
@@ -1881,7 +1917,7 @@ test_host_mount_custom_guest_path() {
     echo "custom-path-test" > "$mount_dir/marker.txt"
 
     # Mount with explicit guest path
-    if coop start "$mount_instance" --no-claude --mount "$mount_dir:/data/project"; then
+    if coop start "$mount_instance" --no-agents --mount "$mount_dir:/data/project"; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "start with --mount host:guest exits 0"
     else
@@ -1918,7 +1954,7 @@ test_mount_conflicts() {
     mount_dir=$(mktemp -d)
 
     # --mount should conflict with --workspace
-    if moat_fails start "${INSTANCE}-conflict" --no-claude --mount "$mount_dir" --workspace "$mount_dir"; then
+    if moat_fails start "${INSTANCE}-conflict" --no-agents --mount "$mount_dir" --workspace "$mount_dir"; then
         pass "--mount conflicts with --workspace"
     else
         fail "--mount conflicts with --workspace" "should have failed"
@@ -1926,7 +1962,7 @@ test_mount_conflicts() {
     fi
 
     # --mount should conflict with --git-repo
-    if moat_fails start "${INSTANCE}-conflict2" --no-claude --mount "$mount_dir" --git-repo "https://example.com/repo.git"; then
+    if moat_fails start "${INSTANCE}-conflict2" --no-agents --mount "$mount_dir" --git-repo "https://example.com/repo.git"; then
         pass "--mount conflicts with --git-repo"
     else
         fail "--mount conflicts with --git-repo" "should have failed"
@@ -1946,13 +1982,13 @@ test_destroy_all() {
     local inst_x="${INSTANCE}-x"
     local inst_y="${INSTANCE}-y"
 
-    if ! coop start "$inst_x" --no-claude; then
+    if ! coop start "$inst_x" --no-agents; then
         fail "start instance for destroy --all" "exit code: $?"
         return
     fi
     STARTED_INSTANCES+=("$inst_x")
 
-    if ! coop start "$inst_y" --no-claude; then
+    if ! coop start "$inst_y" --no-agents; then
         fail "start second instance for destroy --all" "exit code: $?"
         coop destroy "$inst_x" 2>/dev/null || true
         return
@@ -2323,7 +2359,7 @@ test_interrupted_setup() {
 
     # Verify the image works: start a VM and check basic connectivity
     local inst_name="${INSTANCE}-recovery"
-    if coop start "$inst_name" --no-claude --image "$img"; then
+    if coop start "$inst_name" --no-agents --image "$img"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "start from recovered image exits 0"
     else
@@ -2420,6 +2456,7 @@ main() {
     test_session_conflict
     test_exec
     test_claude_bin_path
+    test_codex_bin_path
     test_github_token_forwarding
     test_term_handling
     test_guest_environment

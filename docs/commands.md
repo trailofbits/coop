@@ -81,7 +81,7 @@ coop start [NAME] [FLAGS]
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--disk <GiB>` | Instance disk size in GiB (grows from template size if larger) |
-| `--no-claude` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use (default: `default`) |
 | `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
 
@@ -90,9 +90,11 @@ coop start [NAME] [FLAGS]
 ```
 coop start my-project --workspace ./src --vcpus 4 --mem 8192
 coop start --git-repo https://github.com/org/repo.git --disk 50
-coop start --image ml-dev --no-claude
+coop start --image ml-dev --no-agents
 coop start --mount ~/data:/mnt/data
 ```
+
+`--no-claude` remains accepted as a backward-compatible alias for `--no-agents`.
 
 ### `shell`
 

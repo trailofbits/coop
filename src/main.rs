@@ -130,8 +130,8 @@ enum Commands {
         #[arg(long)]
         disk: Option<u32>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
-        #[arg(long)]
-        no_claude: bool,
+        #[arg(long, alias = "no-claude")]
+        no_agents: bool,
         /// Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
         #[arg(long, conflicts_with_all = ["workspace", "git_repo"])]
         mount: Vec<String>,
@@ -343,7 +343,7 @@ fn main() -> Result<()> {
             vcpus,
             mem,
             disk,
-            no_claude,
+            no_agents,
             mount,
             image,
         } => {
@@ -360,7 +360,7 @@ fn main() -> Result<()> {
                     image: &image,
                     workspace_dir: workspace.as_deref(),
                     git_repo: git_repo.as_deref(),
-                    no_claude,
+                    no_agents,
                     disk: disk
                         .map(|d| config::GiB::new(d).context("--disk must be > 0"))
                         .transpose()?,
@@ -517,7 +517,7 @@ struct StartOpts<'a> {
     image: &'a str,
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
-    no_claude: bool,
+    no_agents: bool,
     disk: Option<config::GiB>,
     mounts: Vec<config::Mount>,
 }
@@ -546,7 +546,7 @@ fn cmd_start(
             );
         }
 
-        return restart_instance(be, cfg, &inst, opts.no_claude);
+        return restart_instance(be, cfg, &inst, opts.no_agents);
     }
 
     let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
@@ -677,7 +677,7 @@ fn restart_instance(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-    no_claude: bool,
+    no_agents: bool,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
 
@@ -694,8 +694,8 @@ fn restart_instance(
 
     signal::check_shutdown()?;
 
-    if no_claude {
-        tracing::info!("Skipping guest agent bootstrap (--no-claude)");
+    if no_agents {
+        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let env_vars = backend::prepare_env_forwarding(cfg)?;
         let session = backend::SshSession {
@@ -733,8 +733,8 @@ fn start_instance(
 
     let env_vars = backend::prepare_env_forwarding(cfg)?;
 
-    if opts.no_claude {
-        tracing::info!("Skipping guest agent bootstrap (--no-claude)");
+    if opts.no_agents {
+        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let session = backend::SshSession {
             target: &target,
@@ -1356,6 +1356,24 @@ mod tests {
         };
         assert_eq!(session.name.as_deref(), Some("myvm"));
         assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn start_no_agents_flag_parses() {
+        let cli = parse(&["start", "--no-agents"]);
+        let super::Commands::Start { no_agents, .. } = cli.command else {
+            panic!("expected Start variant");
+        };
+        assert!(no_agents);
+    }
+
+    #[test]
+    fn start_no_claude_alias_parses() {
+        let cli = parse(&["start", "--no-claude"]);
+        let super::Commands::Start { no_agents, .. } = cli.command else {
+            panic!("expected Start variant");
+        };
+        assert!(no_agents);
     }
 
     #[test]

@@ -151,7 +151,7 @@ coop start my-project --image python-dev
 Skip Claude Code and Codex credential/config injection:
 
 ```
-coop start my-project --no-claude
+coop start my-project --no-agents
 ```
 
 ### 3. Connect

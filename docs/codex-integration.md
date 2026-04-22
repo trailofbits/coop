@@ -107,7 +107,7 @@ If `config_dir` also provides a `config.toml`, coop preserves its other settings
 
 ## Bootstrap sequence
 
-When `coop start` runs (without `--no-claude`), it executes the following steps after the VM boots and SSH becomes available:
+When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest.
@@ -120,7 +120,7 @@ On restart (`coop start` of a stopped instance), the same Codex config files are
 To start a VM without any Claude Code or Codex configuration:
 
 ```bash
-coop start --no-claude
+coop start --no-agents
 ```
 
 This skips the guest bootstrap sequence entirely. The VM still includes both CLIs because they are baked into the image during `coop setup`.

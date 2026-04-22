@@ -994,7 +994,8 @@ fn bootstrap_claude(
 /// managed MCP section there when configured.
 fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) -> Result<()> {
     let codex = &cfg.codex;
-    let needs_codex = codex.config_dir != ConfigDir::Disabled || !codex.mcp_servers.is_empty();
+    let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
+    let needs_codex = codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers);
 
     if !needs_codex {
         return Ok(());
@@ -1004,12 +1005,7 @@ fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) ->
         .target
         .exec_ok(&format!("test -x {}", crate::guest::CODEX_BIN))
     {
-        bail!(
-            "Codex CLI is not installed in the guest.\n\
-             The golden image may have been built before Codex support \
-             was added, or the install failed silently.\n\
-             Run `coop setup --rebuild` to rebuild the image."
-        );
+        bail!("{}", codex_missing_guest_cli_message());
     }
 
     copy_codex_config(session.target, codex)?;
@@ -1021,6 +1017,15 @@ fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) ->
     }
 
     Ok(())
+}
+
+fn codex_missing_guest_cli_message() -> &'static str {
+    "Codex CLI is not installed in the guest.\n\
+     The golden image may have been built before Codex support \
+     was added, or the install failed silently.\n\
+     If you want to skip Codex bootstrap for now, retry with \
+     `--no-agents` (or the deprecated alias `--no-claude`).\n\
+     Otherwise run `coop setup --rebuild` to rebuild the image."
 }
 
 /// Compute which marketplaces and plugins are missing from the
@@ -1206,19 +1211,17 @@ fn resolve_config_source_dir(
     Some(path)
 }
 
-/// Copy allowlisted entries from source into a temporary staging
-/// directory. Returns the `TempDir` (caller keeps it alive).
-fn stage_selected_files(
+/// Copy allowlisted entries from source into the target staging directory.
+fn stage_selected_files_into(
     source_dir: &Path,
+    staging_dir: &Path,
     files: &[&str],
     dirs: &[&str],
-) -> Result<tempfile::TempDir> {
-    let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
-
+) -> Result<()> {
     for file_name in files {
         let src = source_dir.join(file_name);
         if src.is_file() {
-            std::fs::copy(&src, staging.path().join(file_name))
+            std::fs::copy(&src, staging_dir.join(file_name))
                 .with_context(|| format!("Failed to stage {file_name}"))?;
             tracing::debug!("Staged {file_name}");
         }
@@ -1227,12 +1230,24 @@ fn stage_selected_files(
     for dir_name in dirs {
         let src = source_dir.join(dir_name);
         if src.is_dir() {
-            copy_dir_recursive(&src, &staging.path().join(dir_name))
+            copy_dir_recursive(&src, &staging_dir.join(dir_name))
                 .with_context(|| format!("Failed to stage {dir_name}/"))?;
             tracing::debug!("Staged {dir_name}/");
         }
     }
 
+    Ok(())
+}
+
+/// Copy allowlisted entries from source into a temporary staging
+/// directory. Returns the `TempDir` (caller keeps it alive).
+fn stage_selected_files(
+    source_dir: &Path,
+    files: &[&str],
+    dirs: &[&str],
+) -> Result<tempfile::TempDir> {
+    let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
+    stage_selected_files_into(source_dir, staging.path(), files, dirs)?;
     Ok(staging)
 }
 
@@ -1248,9 +1263,13 @@ fn stage_codex_files(
 
     let mut config = match source_dir {
         Some(path) => {
-            let staged = stage_selected_files(path, &["AGENTS.md", "auth.json"], &["prompts"])?;
-            copy_dir_recursive(staged.path(), staging.path())
-                .context("Failed to stage Codex allowlisted files")?;
+            stage_selected_files_into(
+                path,
+                staging.path(),
+                &["AGENTS.md", "auth.json"],
+                &["prompts"],
+            )
+            .context("Failed to stage Codex allowlisted files")?;
 
             let config_path = path.join("config.toml");
             if config_path.is_file() {
@@ -1289,6 +1308,22 @@ fn stage_codex_files(
     }
 
     Ok(staging)
+}
+
+fn codex_source_has_bootstrap_content(source_dir: Option<&Path>) -> bool {
+    source_dir.is_some_and(|path| {
+        path.join("AGENTS.md").is_file()
+            || path.join("auth.json").is_file()
+            || path.join("config.toml").is_file()
+            || path.join("prompts").is_dir()
+    })
+}
+
+fn codex_bootstrap_needed(
+    source_dir: Option<&Path>,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> bool {
+    codex_source_has_bootstrap_content(source_dir) || !mcp_servers.is_empty()
 }
 
 fn resolve_codex_mcp_servers(
@@ -1604,6 +1639,38 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
             "{\"access_token\":\"test\"}"
         );
+    }
+
+    #[test]
+    fn codex_bootstrap_needed_is_false_without_source_content_or_mcp() {
+        let src = tempfile::TempDir::new().unwrap();
+        assert!(!codex_bootstrap_needed(
+            Some(src.path()),
+            &std::collections::HashMap::new()
+        ));
+        assert!(!codex_bootstrap_needed(
+            None,
+            &std::collections::HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn codex_bootstrap_needed_is_true_with_auth_json() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
+
+        assert!(codex_bootstrap_needed(
+            Some(src.path()),
+            &std::collections::HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn codex_missing_guest_cli_message_mentions_skip_and_rebuild_paths() {
+        let msg = codex_missing_guest_cli_message();
+        assert!(msg.contains("--no-agents"));
+        assert!(msg.contains("--no-claude"));
+        assert!(msg.contains("coop setup --rebuild"));
     }
 
     #[test]

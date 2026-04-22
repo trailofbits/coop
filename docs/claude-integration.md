@@ -159,7 +159,7 @@ Server definitions can include an `env` map for environment variable name mappin
 
 ## Bootstrap sequence
 
-When `coop start` runs (without `--no-claude`), it executes the following steps after the VM boots and SSH becomes available:
+When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted entries (`CLAUDE.md`, `rules/`, `commands/`) from `config_dir` to `~/.claude/` in the guest.
@@ -174,7 +174,7 @@ On restart (`coop start` of a stopped instance), only ephemeral state is refresh
 To start a VM without any Claude Code configuration:
 
 ```bash
-coop start --no-claude
+coop start --no-agents
 ```
 
 This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. You can still run `coop claude` afterward, and that session forwards `ANTHROPIC_API_KEY` and any `env_forward` variables via SSH. Plugins and MCP servers won't be available unless you configure them manually inside the guest.
