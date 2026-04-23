@@ -1024,7 +1024,7 @@ fn codex_missing_guest_cli_message() -> &'static str {
      The golden image may have been built before Codex support \
      was added, or the install failed silently.\n\
      If you want to skip Codex bootstrap for now, retry with \
-     `--no-agents` (or the backward-compatible alias `--no-claude`).\n\
+     `--no-agents` (the `--no-claude` alias is deprecated).\n\
      Otherwise run `coop setup --rebuild` to rebuild the image."
 }
 

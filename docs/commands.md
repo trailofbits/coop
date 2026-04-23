@@ -94,7 +94,7 @@ coop start --image ml-dev --no-agents
 coop start --mount ~/data:/mnt/data
 ```
 
-`--no-claude` remains accepted as a backward-compatible alias for `--no-agents`.
+`--no-claude` is accepted as a deprecated alias for `--no-agents` and will be removed in a future release. Using it prints a deprecation warning.
 
 ### `shell`
 

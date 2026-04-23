@@ -296,6 +296,19 @@ fn load_and_validate_config(path: &Path) -> Result<config::CoopConfig> {
     Ok(cfg)
 }
 
+/// Returns true if the raw argv contains the deprecated `--no-claude`
+/// alias. Clap rewrites the alias to `--no-agents` before the `Start`
+/// variant is matched, so we inspect the raw args to emit a one-time
+/// deprecation warning.
+fn raw_args_use_deprecated_no_claude<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|a| a.as_ref() == "--no-claude" || a.as_ref().starts_with("--no-claude="))
+}
+
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -347,6 +360,11 @@ fn main() -> Result<()> {
             mount,
             image,
         } => {
+            if raw_args_use_deprecated_no_claude(std::env::args()) {
+                tracing::warn!(
+                    "--no-claude is deprecated and will be removed in a future release; use --no-agents"
+                );
+            }
             apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
             let mounts = mount
                 .iter()
@@ -1374,6 +1392,26 @@ mod tests {
             panic!("expected Start variant");
         };
         assert!(no_agents);
+    }
+
+    #[test]
+    fn detect_deprecated_no_claude_flag() {
+        assert!(super::raw_args_use_deprecated_no_claude([
+            "coop",
+            "start",
+            "--no-claude"
+        ]));
+        assert!(!super::raw_args_use_deprecated_no_claude([
+            "coop",
+            "start",
+            "--no-agents"
+        ]));
+        assert!(!super::raw_args_use_deprecated_no_claude([
+            "coop",
+            "start",
+            "--name",
+            "--no-claude-work"
+        ]));
     }
 
     #[test]
