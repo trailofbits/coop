@@ -43,7 +43,7 @@ command = "npx"
 args = ["-y", "@playwright/mcp@latest"]
 ```
 
-Every field is optional. An empty `[codex]` section (or omitting it entirely) skips all Codex-specific bootstrap steps.
+Every field is optional. Omitting `[codex]`, or leaving it empty, keeps `config_dir` at its default (`~/.codex`), so bootstrap still runs if that directory contains any allowlisted entry (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) or if `codex.mcp_servers` is set. To skip Codex-specific bootstrap entirely, set `codex.config_dir = false` and leave `codex.mcp_servers` empty.
 
 ### API key forwarding
 
