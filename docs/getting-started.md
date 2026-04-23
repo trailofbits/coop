@@ -75,6 +75,8 @@ GitHub auth is off by default. Set `github = "auto"` explicitly to enable it.
 
 coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
 
+**Codex auth note**: if `~/.codex/auth.json` exists on the host (i.e., you have run `codex login`), coop copies it into every new guest at `~/.codex/auth.json` so Codex starts already signed in. This copies an OAuth access token and a long-lived refresh token onto the guest disk. See [Codex integration: Auth handling](codex-integration.md#auth-handling) for how to opt out.
+
 ## First run
 
 ### 1. Setup

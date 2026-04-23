@@ -1176,6 +1176,12 @@ fn copy_codex_config(
     }
 
     tracing::info!("Copied Codex config into guest");
+    if staging_path.join("auth.json").is_file() {
+        tracing::info!(
+            "Copied Codex auth.json (OAuth tokens from `codex login`) to guest ~/.codex/auth.json. \
+             Set `codex.config_dir = false` to opt out."
+        );
+    }
     Ok(())
 }
 
@@ -1692,6 +1698,20 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
             "{\"access_token\":\"test\"}"
         );
+    }
+
+    #[test]
+    fn stage_codex_files_omits_auth_json_when_source_has_none() {
+        // `copy_codex_config` gates its "OAuth tokens copied" log on the
+        // presence of `auth.json` in the staging dir. This test pins the
+        // invariant that staging only contains `auth.json` when the source
+        // directory does — otherwise the log would fire spuriously.
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("AGENTS.md"), "# agents").unwrap();
+
+        let staging =
+            stage_codex_files(Some(src.path()), &std::collections::HashMap::new()).unwrap();
+        assert!(!staging.path().join("auth.json").is_file());
     }
 
     #[test]

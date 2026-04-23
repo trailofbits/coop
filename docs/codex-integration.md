@@ -79,6 +79,25 @@ config_dir = "~/.codex"
 
 The default is `~/.codex`. Set to `false` to disable config file copying entirely.
 
+### Auth handling
+
+If you have run `codex login` on the host, `~/.codex/auth.json` contains an OAuth access token and a long-lived refresh token. By default, coop copies this file into every guest at `~/.codex/auth.json` so that `codex` inside the VM starts already signed in.
+
+This is a posture difference from the Claude integration, whose allowlist (`CLAUDE.md`, `rules/`, `commands/`) intentionally contains no auth material.
+
+Each bootstrap emits a visible log line when `auth.json` is copied:
+
+```
+INFO Copied Codex auth.json (OAuth tokens from `codex login`) to guest ~/.codex/auth.json. Set `codex.config_dir = false` to opt out.
+```
+
+Trade-offs:
+
+- **Default (copy `auth.json`)**: Seamless `codex` usage inside the guest, at the cost of OAuth tokens living on the guest disk. The guest is the isolation boundary, not the tokens.
+- **Opt out (`codex.config_dir = false`)**: No Codex config or tokens are copied. You will need to run `codex login` inside each new guest, or forward `OPENAI_API_KEY` via `codex.api_key` / the host env var and skip OAuth entirely.
+
+You can also point `config_dir` at a directory that does not contain `auth.json` to keep the rest of the Codex config copy while excluding tokens.
+
 ### Environment variable forwarding
 
 `env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session, not just during bootstrap.
@@ -110,7 +129,7 @@ If `config_dir` also provides a `config.toml`, coop preserves its other settings
 When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
-2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest.
+2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest. If `auth.json` is present, a visible log line calls out that OAuth tokens were copied (see [Auth handling](#auth-handling)).
 3. **MCP servers**: Merge configured MCP server definitions into `~/.codex/config.toml`.
 
 On restart (`coop start` of a stopped instance), the same Codex config files are refreshed so host-side updates are reflected in the guest.
