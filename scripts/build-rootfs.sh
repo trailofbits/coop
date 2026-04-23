@@ -177,7 +177,27 @@ chroot "$MOUNT_DIR" bash -c '
     trap "rm -rf \"$tmpdir\"" EXIT
     archive="$tmpdir/$asset"
     bin="$tmpdir/${asset%.tar.gz}"
-    curl -fsSL -o "$archive" "https://github.com/openai/codex/releases/latest/download/$asset"
+    url="https://github.com/openai/codex/releases/latest/download/$asset"
+
+    max_retries=4
+    retry_delay=5
+    for attempt in $(seq 1 "$max_retries"); do
+        if curl -fsSL -o "$archive" "$url" 2>/tmp/codex-curl-err; then
+            break
+        fi
+        curl_exit=$?
+        curl_err=$(cat /tmp/codex-curl-err 2>/dev/null || true)
+        if [ "$attempt" -eq "$max_retries" ]; then
+            echo "ERROR: Failed to download Codex CLI archive after $max_retries attempts." >&2
+            echo "curl exit code: $curl_exit" >&2
+            echo "curl error: ${curl_err:-none}" >&2
+            exit 1
+        fi
+        echo "Download failed (attempt $attempt/$max_retries, curl exit $curl_exit), retrying in ${retry_delay}s..."
+        sleep "$retry_delay"
+        retry_delay=$((retry_delay * 2))
+    done
+
     tar -xzf "$archive" -C "$tmpdir"
     test -x "$bin"
     install -m 755 "$bin" /usr/local/bin/codex

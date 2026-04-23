@@ -1008,7 +1008,7 @@ fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) ->
         bail!("{}", codex_missing_guest_cli_message());
     }
 
-    copy_codex_config(session.target, codex)?;
+    copy_codex_config(session.target, source_dir.as_deref(), codex)?;
 
     if restart {
         tracing::info!("Codex bootstrap refreshed");
@@ -1024,7 +1024,7 @@ fn codex_missing_guest_cli_message() -> &'static str {
      The golden image may have been built before Codex support \
      was added, or the install failed silently.\n\
      If you want to skip Codex bootstrap for now, retry with \
-     `--no-agents` (or the deprecated alias `--no-claude`).\n\
+     `--no-agents` (or the backward-compatible alias `--no-claude`).\n\
      Otherwise run `coop setup --rebuild` to rebuild the image."
 }
 
@@ -1138,9 +1138,12 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
     Ok(())
 }
 
-fn copy_codex_config(target: &SshTarget, codex: &crate::config::CodexConfig) -> Result<()> {
-    let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
-    let staged = stage_codex_files(source_dir.as_deref(), &codex.mcp_servers)
+fn copy_codex_config(
+    target: &SshTarget,
+    source_dir: Option<&Path>,
+    codex: &crate::config::CodexConfig,
+) -> Result<()> {
+    let staged = stage_codex_files(source_dir, &codex.mcp_servers)
         .context("Failed to stage Codex config files")?;
 
     let staging_path = staged.path();
@@ -1255,6 +1258,15 @@ fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
     stage_selected_files(source_dir, &["CLAUDE.md"], &["rules", "commands"])
 }
 
+/// Allowlisted files copied verbatim from the host Codex config dir.
+const CODEX_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json"];
+
+/// Allowlisted directories copied recursively from the host Codex config dir.
+const CODEX_ALLOWED_DIRS: &[&str] = &["prompts"];
+
+/// Codex config file merged with managed MCP servers rather than copied verbatim.
+const CODEX_CONFIG_FILE: &str = "config.toml";
+
 fn stage_codex_files(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
@@ -1266,17 +1278,17 @@ fn stage_codex_files(
             stage_selected_files_into(
                 path,
                 staging.path(),
-                &["AGENTS.md", "auth.json"],
-                &["prompts"],
+                CODEX_ALLOWED_FILES,
+                CODEX_ALLOWED_DIRS,
             )
             .context("Failed to stage Codex allowlisted files")?;
 
-            let config_path = path.join("config.toml");
+            let config_path = path.join(CODEX_CONFIG_FILE);
             if config_path.is_file() {
-                let content =
-                    std::fs::read_to_string(&config_path).context("Failed to read config.toml")?;
+                let content = std::fs::read_to_string(&config_path)
+                    .with_context(|| format!("Failed to read {CODEX_CONFIG_FILE}"))?;
                 toml::from_str::<TomlValue>(&content)
-                    .context("Failed to parse Codex config.toml")?
+                    .with_context(|| format!("Failed to parse Codex {CODEX_CONFIG_FILE}"))?
             } else {
                 TomlValue::Table(toml::map::Map::default())
             }
@@ -1287,8 +1299,13 @@ fn stage_codex_files(
     let resolved_servers = resolve_codex_mcp_servers(mcp_servers)?;
     if !resolved_servers.is_empty() {
         let TomlValue::Table(root) = &mut config else {
-            bail!("Codex config.toml must deserialize to a TOML table");
+            bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
         };
+        if root.contains_key("mcp_servers") {
+            tracing::warn!(
+                "Replacing existing [mcp_servers] in Codex {CODEX_CONFIG_FILE} with servers from coop config"
+            );
+        }
         root.insert(
             "mcp_servers".to_string(),
             TomlValue::try_from(resolved_servers)
@@ -1296,15 +1313,16 @@ fn stage_codex_files(
         );
     }
 
-    let should_write_config = source_dir.is_some_and(|path| path.join("config.toml").is_file())
+    let should_write_config = source_dir.is_some_and(|path| path.join(CODEX_CONFIG_FILE).is_file())
         || !mcp_servers.is_empty();
 
     if should_write_config {
         std::fs::write(
-            staging.path().join("config.toml"),
-            toml::to_string(&config).context("Failed to serialize Codex config.toml")?,
+            staging.path().join(CODEX_CONFIG_FILE),
+            toml::to_string(&config)
+                .with_context(|| format!("Failed to serialize Codex {CODEX_CONFIG_FILE}"))?,
         )
-        .context("Failed to stage Codex config.toml")?;
+        .with_context(|| format!("Failed to stage Codex {CODEX_CONFIG_FILE}"))?;
     }
 
     Ok(staging)
@@ -1312,10 +1330,9 @@ fn stage_codex_files(
 
 fn codex_source_has_bootstrap_content(source_dir: Option<&Path>) -> bool {
     source_dir.is_some_and(|path| {
-        path.join("AGENTS.md").is_file()
-            || path.join("auth.json").is_file()
-            || path.join("config.toml").is_file()
-            || path.join("prompts").is_dir()
+        CODEX_ALLOWED_FILES.iter().any(|f| path.join(f).is_file())
+            || path.join(CODEX_CONFIG_FILE).is_file()
+            || CODEX_ALLOWED_DIRS.iter().any(|d| path.join(d).is_dir())
     })
 }
 
@@ -1626,6 +1643,42 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(config.contains("model = \"gpt-5\""));
         assert!(config.contains("[mcp_servers.sentry]"));
         assert!(config.contains("url = \"https://mcp.sentry.dev/mcp\""));
+    }
+
+    #[test]
+    fn stage_codex_files_replaces_existing_mcp_servers_table() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("config.toml"),
+            "model = \"gpt-5\"\n\
+             \n\
+             [mcp_servers.legacy]\n\
+             command = \"legacy-server\"\n",
+        )
+        .unwrap();
+
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "sentry".to_string(),
+            McpServerDef {
+                command: None,
+                args: Vec::new(),
+                server_type: Some("http".to_string()),
+                url: Some("https://mcp.sentry.dev/mcp".to_string()),
+                env: std::collections::HashMap::new(),
+                headers: std::collections::HashMap::new(),
+            },
+        );
+
+        let staging = stage_codex_files(Some(src.path()), &servers).unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+
+        assert!(config.contains("model = \"gpt-5\""));
+        assert!(config.contains("[mcp_servers.sentry]"));
+        assert!(
+            !config.contains("legacy"),
+            "replacement should drop pre-existing mcp_servers entries; got: {config}"
+        );
     }
 
     #[test]
