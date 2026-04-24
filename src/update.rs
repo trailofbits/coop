@@ -262,9 +262,13 @@ fn verify_attestation(tarball: &Path) -> Result<()> {
         return Ok(());
     }
     if !has_command("gh") {
-        tracing::warn!(
-            "`gh` CLI not found — skipping attestation verification. \
-             Install it for cryptographic verification of release artifacts."
+        tracing::info!(
+            "Note: `gh` not installed — skipped cryptographic attestation verification. \
+             The download was verified against the published `SHA256SUMS` checksum, which \
+             is the same assurance level as most `curl | bash` installers. For end-to-end \
+             Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
+             verify manually: `gh attestation verify <tarball> --repo {}`.",
+            REPO
         );
         return Ok(());
     }

@@ -104,6 +104,24 @@ Opt out with either:
 
 The check is also silent when `CI=true` or when stdin is not a TTY.
 
+## Verifying a release
+
+Every release tarball is published with a Sigstore build-provenance
+attestation via [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance).
+The attestation proves the artifact was built from this repository by the
+tagged release workflow.
+
+Both `install.sh` and `coop update` run this verification automatically
+when the [GitHub CLI](https://cli.github.com/) is installed. Without `gh`,
+they fall back to checksum verification against the release's `SHA256SUMS`
+and print a note explaining what was and wasn't verified.
+
+To verify a downloaded tarball manually:
+
+```sh
+gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop
+```
+
 ## Requirements
 
 Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are available but untested.

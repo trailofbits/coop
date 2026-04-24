@@ -103,6 +103,21 @@ verify_checksum() {
     fi
 }
 
+verify_attestation() {
+    local file="$1"
+    if has gh; then
+        info "Verifying attestation..."
+        gh attestation verify "$file" --repo "$REPO" \
+            || die "Attestation verification failed for $(basename "$file") — refusing to install"
+    else
+        info "Note: \`gh\` not installed — skipped cryptographic attestation verification."
+        info "The download was verified against the published \`SHA256SUMS\` checksum, which"
+        info "is the same assurance level as most \`curl | bash\` installers. For end-to-end"
+        info "Sigstore verification, install \`gh\` (https://cli.github.com) and re-run, or"
+        info "verify manually: \`gh attestation verify <tarball> --repo ${REPO}\`."
+    fi
+}
+
 # --- main -------------------------------------------------------------------
 
 need curl
@@ -126,6 +141,8 @@ info "Verifying checksum..."
 EXPECTED="$(grep "${TARBALL}" "${TMPDIR}/SHA256SUMS" | cut -d' ' -f1)"
 [ -n "$EXPECTED" ] || die "Tarball ${TARBALL} not found in SHA256SUMS"
 verify_checksum "${TMPDIR}/${TARBALL}" "$EXPECTED"
+
+verify_attestation "${TMPDIR}/${TARBALL}"
 
 info "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
