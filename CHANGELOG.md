@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+- **`coop update`** (#34) — Self-update the coop binary from GitHub Releases.
+  Downloads the tarball matching the host triple, verifies SHA-256 via the
+  release's `SHA256SUMS`, and optionally checks provenance with `gh
+  attestation verify` before atomically replacing the running binary. Flags:
+  `--check` (probe only), `--force` (reinstall same version), `--version
+  <tag>` (pin), and `-y`/`--yes` (skip confirmation). Dev builds refuse to
+  self-update — re-run `install.sh` to replace them.
+
+- **Background update-check notifications** — On every command, coop checks
+  the persisted state in `$XDG_STATE_HOME/coop/update-check.json`; if a newer
+  release is known, a one-line notice is printed on stderr. The refresh runs
+  in a detached thread and never blocks the command. Disable globally with
+  `updates.mode = "off"` in `config.toml`, or per-invocation with
+  `COOP_NO_UPDATE_CHECK=1`. The check is also silent when `CI=true` or when
+  stdin is not a TTY.
+
+- **`coop --version` includes git metadata** — Release builds display the
+  short commit sha (e.g. `coop 0.3.1 (a1b2c3d)`); dev builds add `-dev` and a
+  `+dirty` suffix when the working tree has uncommitted changes.
+
+### Dependencies
+
+- New: `semver` 1
+
 ## v0.3.1
 
 Re-release of v0.3.0. The v0.3.0 release artifacts failed to publish because

@@ -58,3 +58,7 @@
 # apt_packages = ["ripgrep", "fd-find", "jq"]
 # pre_install = "curl -fsSL https://example.com/setup.sh | bash"
 # post_install = "echo 'done'"
+
+# [updates]
+# mode = "notify"                # off | notify (default: notify)
+# check_interval_hours = 24      # minimum age before background re-check

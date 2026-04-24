@@ -73,6 +73,36 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `images` | List or delete template images |
 | `resize` | Grow a stopped instance's disk |
 | `validate` | Check config and prerequisites |
+| `update` | Self-update coop to the latest GitHub release |
+
+## Updating
+
+`coop update` replaces the running binary with the latest release from
+`github.com/trailofbits/coop`. It downloads the tarball matching the current
+host triple, verifies the SHA-256 against the release's `SHA256SUMS`, and
+(when `gh` is installed) verifies the GitHub build-provenance attestation
+before swapping the binary atomically.
+
+```sh
+coop update --check             # report whether a newer release exists
+coop update                     # prompt, then install the latest release
+coop update --yes               # skip confirmation
+coop update --version v0.3.2    # pin to a specific release
+coop update --force             # reinstall the current version
+```
+
+If coop is installed in a protected directory (e.g. `/usr/local/bin`), run
+with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to
+self-update — use `install.sh` to replace them.
+
+By default, coop checks for a newer release in the background at most once
+per day and prints a one-line notice on stderr when an update is available.
+Opt out with either:
+
+- `updates.mode = "off"` in `~/.coop/config.toml`, or
+- `COOP_NO_UPDATE_CHECK=1` in the environment.
+
+The check is also silent when `CI=true` or when stdin is not a TTY.
 
 ## Requirements
 

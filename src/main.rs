@@ -26,6 +26,7 @@ mod signal;
 mod setup;
 mod shell;
 mod ssh;
+mod update;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
 mod workspace;
@@ -40,7 +41,7 @@ use backend::VmBackend as _;
 use cmd::Cmd;
 
 #[derive(Parser)]
-#[command(name = "coop", version)]
+#[command(name = "coop", version = env!("COOP_VERSION_STR"))]
 #[command(about = "Isolated VM environment for running Claude Code and Codex")]
 struct Cli {
     /// Path to coop config file
@@ -261,6 +262,21 @@ enum Commands {
     Validate,
     /// Generate a starter config file at ~/.coop/config.toml
     Init,
+    /// Replace the running coop binary with the latest GitHub release
+    Update {
+        /// Only check for an available update — do not download or install
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even if the current binary is already up to date
+        #[arg(long)]
+        force: bool,
+        /// Install a specific version (e.g. `v0.3.2` or `0.3.2`)
+        #[arg(long = "version", value_name = "VERSION")]
+        target_version: Option<String>,
+        /// Skip the interactive confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -317,8 +333,24 @@ fn main() -> Result<()> {
     if matches!(cli.command, Commands::Init) {
         return cmd_init(&cli.config);
     }
+    if let Commands::Update {
+        check,
+        force,
+        target_version,
+        yes,
+    } = cli.command
+    {
+        return update::run(&update::UpdateOpts {
+            check_only: check,
+            force,
+            pinned_version: target_version,
+            skip_confirm: yes,
+        });
+    }
 
     let mut cfg = load_and_validate_config(&cli.config)?;
+    update::maybe_print_notify(&cfg.updates);
+    update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
     tracing::debug!("Using backend: {be}");
 
@@ -465,7 +497,9 @@ fn main() -> Result<()> {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
         Commands::Validate => cmd_validate(&cfg, &be),
-        Commands::Init => unreachable!("handled before config loading"),
+        Commands::Init | Commands::Update { .. } => {
+            unreachable!("handled before config loading")
+        }
     }
 }
 

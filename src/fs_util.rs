@@ -1,8 +1,25 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+
+/// Build a writer-unique sibling temp path. Including pid + a nanosecond
+/// counter keeps concurrent writers (across threads or processes) from
+/// clobbering each other's tmp files before the final rename.
+fn unique_tmp_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target.file_name().map_or_else(
+        || "coop-atomic".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    parent.join(format!(".{stem}.{}.{nanos}.tmp", std::process::id()))
+}
 
 /// Write JSON content to a file atomically via temp file + rename.
 ///
@@ -24,7 +41,7 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
         fs::Permissions::from_mode(0o644)
     };
 
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = unique_tmp_path(path);
     fs::write(&tmp_path, json)
         .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
     fs::set_permissions(&tmp_path, perms)
@@ -43,10 +60,6 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
 /// Write content to a file atomically, preserving SSH-appropriate
 /// permissions (0o600 default).
 pub fn atomic_write_ssh(path: &Path, content: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("Cannot determine parent directory for atomic write")?;
-
     let perms = if path.exists() {
         fs::metadata(path)
             .context("Failed to read file metadata")?
@@ -55,7 +68,7 @@ pub fn atomic_write_ssh(path: &Path, content: &str) -> Result<()> {
         fs::Permissions::from_mode(0o600)
     };
 
-    let tmp_path = parent.join(".coop-ssh-config.tmp");
+    let tmp_path = unique_tmp_path(path);
     fs::write(&tmp_path, content)
         .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
     fs::set_permissions(&tmp_path, perms)
@@ -82,8 +95,25 @@ mod tests {
         let path = dir.path().join("test.json");
         atomic_write_json(&path, r#"{"key": "value"}"#).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"key": "value"}"#);
-        // No temp file left behind
-        assert!(!path.with_extension("tmp").exists());
+        // No sibling .tmp files left behind
+        let siblings: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(siblings.is_empty(), "stray tmp file remains");
+    }
+
+    #[test]
+    fn unique_tmp_path_differs_per_call() {
+        let target = Path::new("/tmp/coop/test.json");
+        let a = unique_tmp_path(target);
+        std::thread::sleep(std::time::Duration::from_nanos(1));
+        let b = unique_tmp_path(target);
+        // Same pid but different nanosecond stamps.
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+        assert_eq!(a.parent(), target.parent());
     }
 
     #[test]

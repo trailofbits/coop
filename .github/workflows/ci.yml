@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Integration test — coop update
+        run: ./tests/integration-update.sh
+
   deny:
     runs-on: ubuntu-latest
     steps:

@@ -150,6 +150,7 @@ dependencies = [
  "hex",
  "indexmap",
  "libc",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

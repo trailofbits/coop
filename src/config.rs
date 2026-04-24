@@ -292,6 +292,10 @@ pub struct CoopConfig {
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
+
+    /// Self-update behaviour
+    #[serde(default)]
+    pub updates: crate::update::UpdateConfig,
 }
 
 /// User-defined profile in `config.toml`.
@@ -985,6 +989,7 @@ impl Default for CoopConfig {
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
             profiles: HashMap::new(),
+            updates: crate::update::UpdateConfig::default(),
         }
     }
 }

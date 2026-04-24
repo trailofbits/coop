@@ -1,0 +1,809 @@
+//! Self-update for the coop binary.
+//!
+//! Fetches the latest release metadata from GitHub, downloads the matching
+//! tarball and `SHA256SUMS`, verifies the checksum (and optionally the
+//! attestation via `gh`), then atomically replaces the running binary.
+//!
+//! Also provides a background update-check path used by every invocation
+//! to nudge users when a newer release is available.
+
+use std::env;
+use std::fs;
+use std::io::{IsTerminal as _, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail, ensure};
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::cmd::Cmd;
+use crate::fs_util::atomic_write_json;
+
+const REPO: &str = "trailofbits/coop";
+const DEFAULT_API_BASE: &str = "https://api.github.com";
+const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
+
+// ── Configuration ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    /// Do not check for updates or display notifications.
+    Off,
+    /// Check in the background and print a banner when a newer release is known.
+    #[default]
+    Notify,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default)]
+    pub mode: UpdateMode,
+    #[serde(default = "default_check_interval_hours")]
+    pub check_interval_hours: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            mode: UpdateMode::default(),
+            check_interval_hours: DEFAULT_CHECK_INTERVAL_HOURS,
+        }
+    }
+}
+
+fn default_check_interval_hours() -> u64 {
+    DEFAULT_CHECK_INTERVAL_HOURS
+}
+
+// ── Command-line options ─────────────────────────────────────────────────────
+
+/// Options for the `coop update` subcommand.
+#[derive(Debug, Default)]
+pub struct UpdateOpts {
+    /// Probe latest release but do not download or install.
+    pub check_only: bool,
+    /// Reinstall even if the target version is not newer.
+    pub force: bool,
+    /// Pin to a specific version (with or without leading `v`).
+    pub pinned_version: Option<String>,
+    /// Skip the interactive confirmation prompt.
+    pub skip_confirm: bool,
+}
+
+// ── Build metadata (from build.rs) ───────────────────────────────────────────
+
+fn current_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[must_use]
+pub fn is_dev_build() -> bool {
+    env!("COOP_BUILD_KIND") == "dev"
+}
+
+// ── Platform + URL helpers ───────────────────────────────────────────────────
+
+pub fn target_triple() -> Result<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok("aarch64-apple-darwin")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Ok("x86_64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Ok("aarch64-unknown-linux-musl")
+    } else {
+        bail!(
+            "No prebuilt coop binary for {}-{}; build from source.",
+            env::consts::OS,
+            env::consts::ARCH
+        )
+    }
+}
+
+#[must_use]
+pub fn asset_name(tag: &str, triple: &str) -> String {
+    format!("coop-{tag}-{triple}.tar.gz")
+}
+
+fn api_base() -> String {
+    env::var("COOP_UPDATE_API_BASE_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
+}
+
+fn api_base_overridden() -> bool {
+    env::var("COOP_UPDATE_API_BASE_URL").is_ok()
+}
+
+fn warn_if_api_base_overridden() {
+    if api_base_overridden() {
+        tracing::warn!(
+            "COOP_UPDATE_API_BASE_URL is set — attestation verification is DISABLED. \
+             This is a test-only mode; do not use with untrusted URLs."
+        );
+    }
+}
+
+/// Normalize a user-supplied version to a `v`-prefixed semver tag.
+///
+/// Rejects any input that does not parse as semver once the optional `v`
+/// prefix is stripped. This is the security boundary for `coop update
+/// --version <tag>`: the tag string is interpolated into the GitHub API
+/// URL path, so admitting only semver-like values prevents path traversal
+/// (e.g. `../other-user/repo/releases/latest`).
+fn normalize_tag(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let body = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    Version::parse(body)
+        .with_context(|| format!("--version {trimmed:?} is not a valid semver tag"))?;
+    Ok(format!("v{body}"))
+}
+
+fn strip_v(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+// ── GitHub release metadata ──────────────────────────────────────────────────
+
+/// Minimal subset of the GitHub release JSON schema.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Release {
+    #[serde(rename = "tag_name")]
+    pub tag: String,
+    #[serde(default)]
+    pub assets: Vec<Asset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Asset {
+    pub name: String,
+    #[serde(rename = "browser_download_url")]
+    pub url: String,
+}
+
+impl Release {
+    fn find_asset(&self, name: &str) -> Option<&Asset> {
+        self.assets.iter().find(|a| a.name == name)
+    }
+}
+
+pub fn fetch_latest() -> Result<Release> {
+    let url = format!("{}/repos/{REPO}/releases/latest", api_base());
+    fetch_release(&url).context("Failed to fetch latest release metadata")
+}
+
+pub fn fetch_by_tag(tag: &str) -> Result<Release> {
+    let url = format!("{}/repos/{REPO}/releases/tags/{tag}", api_base());
+    fetch_release(&url).with_context(|| format!("Failed to fetch release metadata for {tag}"))
+}
+
+fn fetch_release(url: &str) -> Result<Release> {
+    let body = curl_capture(url)?;
+    serde_json::from_str(&body).context("Failed to parse GitHub release JSON")
+}
+
+// ── Network I/O (shell-out to curl) ──────────────────────────────────────────
+
+fn curl_capture(url: &str) -> Result<String> {
+    Cmd::new("curl")
+        .arg("-fsSL")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .arg(url)
+        .capture()
+        .with_context(|| format!("curl GET {url} failed"))
+}
+
+fn download_to(url: &str, dest: &Path) -> Result<()> {
+    Cmd::new("curl")
+        .arg("-fsSL")
+        .arg(url)
+        .arg("-o")
+        .arg(dest)
+        .run()
+        .with_context(|| format!("curl download from {url} failed"))
+}
+
+// ── Checksum verification ────────────────────────────────────────────────────
+
+/// Parse a `sha256sum`-style `SHA256SUMS` file and return the hex digest for
+/// `target_filename`. Handles both `<hash>  <file>` (binary mode) and
+/// `<hash> *<file>` variants; tolerates blank lines and `#` comments.
+#[must_use]
+pub fn parse_sha256sums(content: &str, target_filename: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (hash, rest) = line.split_once(|c: char| c.is_ascii_whitespace())?;
+        let file = rest.trim_start().trim_start_matches('*');
+        if file == target_filename
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn verify_sha256(file: &Path, expected_hex: &str) -> Result<()> {
+    let bytes = fs::read(file)
+        .with_context(|| format!("Failed to read {} for checksum", file.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let actual = hex::encode(digest);
+    ensure!(
+        actual.eq_ignore_ascii_case(expected_hex),
+        "SHA-256 mismatch for {}: expected {expected_hex}, got {actual}",
+        file.display()
+    );
+    Ok(())
+}
+
+// ── Attestation verification (best-effort) ───────────────────────────────────
+
+fn has_command(prog: &str) -> bool {
+    Cmd::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {prog} >/dev/null 2>&1"))
+        .status_ok()
+}
+
+fn verify_attestation(tarball: &Path) -> Result<()> {
+    // Skip when the API base is overridden — the local test fixture serves
+    // synthetic artifacts that have no provenance in GitHub's attestation
+    // API. `warn_if_api_base_overridden` has already surfaced this to the
+    // user as a visible stderr warning.
+    if api_base_overridden() {
+        return Ok(());
+    }
+    if !has_command("gh") {
+        tracing::warn!(
+            "`gh` CLI not found — skipping attestation verification. \
+             Install it for cryptographic verification of release artifacts."
+        );
+        return Ok(());
+    }
+    Cmd::new("gh")
+        .arg("attestation")
+        .arg("verify")
+        .arg(tarball)
+        .arg("--repo")
+        .arg(REPO)
+        .run()
+        .with_context(|| {
+            format!(
+                "Attestation verification failed for {} — refusing to install",
+                tarball.display()
+            )
+        })
+}
+
+// ── Atomic self-replace ──────────────────────────────────────────────────────
+
+fn check_parent_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".coop-update-probe-{}", std::process::id()));
+    match fs::File::create(&probe) {
+        Ok(_) => {
+            if let Err(e) = fs::remove_file(&probe) {
+                tracing::debug!("Failed to remove probe file {}: {e}", probe.display());
+            }
+            Ok(())
+        }
+        Err(e) => bail!(
+            "Cannot write to {}: {e}.\n\
+             Try `sudo coop update` if coop is installed in a protected directory.",
+            dir.display()
+        ),
+    }
+}
+
+fn atomic_replace_self(new_binary: &Path) -> Result<()> {
+    let current = env::current_exe().context("Failed to resolve current executable path")?;
+    let dir = current
+        .parent()
+        .context("Current executable has no parent directory")?;
+    check_parent_writable(dir)?;
+
+    let tmp = dir.join(format!(".coop-update-{}", std::process::id()));
+    fs::copy(new_binary, &tmp)
+        .with_context(|| format!("Failed to stage update at {}", tmp.display()))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("Failed to chmod staged binary {}", tmp.display()))?;
+
+    fs::File::open(&tmp)
+        .with_context(|| format!("Failed to reopen staged binary {}", tmp.display()))?
+        .sync_all()
+        .with_context(|| format!("Failed to fsync staged binary {}", tmp.display()))?;
+
+    fs::rename(&tmp, &current).with_context(|| {
+        format!(
+            "Failed to swap {} over {}",
+            tmp.display(),
+            current.display()
+        )
+    })?;
+    Ok(())
+}
+
+// ── Interactive confirmation ─────────────────────────────────────────────────
+
+fn confirm(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        // Non-interactive: caller must pass --yes explicitly.
+        return Ok(false);
+    }
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{prompt} [y/N] ").context("Failed to write confirmation prompt")?;
+    stderr.flush().context("Failed to flush stderr")?;
+    let mut response = String::new();
+    std::io::stdin()
+        .read_line(&mut response)
+        .context("Failed to read confirmation")?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+// ── Main update flow ─────────────────────────────────────────────────────────
+
+pub fn run(opts: &UpdateOpts) -> Result<()> {
+    if is_dev_build() {
+        bail!(
+            "This is a dev build ({}); `coop update` only replaces release binaries.\n\
+             Re-run install.sh (or build from source) to replace a dev build.",
+            env!("COOP_VERSION_STR")
+        );
+    }
+
+    warn_if_api_base_overridden();
+
+    let triple = target_triple()?;
+    let current = Version::parse(current_version())
+        .with_context(|| format!("Current version {} is not valid semver", current_version()))?;
+
+    let release = match &opts.pinned_version {
+        Some(v) => fetch_by_tag(&normalize_tag(v)?)?,
+        None => fetch_latest()?,
+    };
+    let target = Version::parse(strip_v(&release.tag))
+        .with_context(|| format!("Release tag {} is not valid semver", release.tag))?;
+
+    let newer = target > current;
+    if opts.check_only {
+        if newer {
+            tracing::info!("Update available: {current} -> {target}");
+        } else {
+            tracing::info!("Up to date: coop {current}");
+        }
+        return Ok(());
+    }
+
+    if !newer && !opts.force && opts.pinned_version.is_none() {
+        tracing::info!("Already on latest: coop {current}");
+        return Ok(());
+    }
+
+    if !opts.skip_confirm && !confirm(&format!("Update coop from {current} to {target}?"))? {
+        tracing::info!("Update cancelled");
+        return Ok(());
+    }
+
+    perform_update(&release, triple)?;
+    tracing::info!("coop updated to {target}");
+    persist_state(Some(&release.tag));
+    Ok(())
+}
+
+fn perform_update(release: &Release, triple: &str) -> Result<()> {
+    let tmp = tempfile::tempdir().context("Failed to create temporary working directory")?;
+    let tarball_name = asset_name(&release.tag, triple);
+
+    let tarball_asset = release.find_asset(&tarball_name).with_context(|| {
+        format!(
+            "Release {} has no asset {tarball_name}; \
+             this platform may not be supported by that release.",
+            release.tag
+        )
+    })?;
+    let sums_asset = release
+        .find_asset("SHA256SUMS")
+        .context("Release has no SHA256SUMS asset; refusing to install unverified binary")?;
+
+    let tarball_path = tmp.path().join(&tarball_name);
+    let sums_path = tmp.path().join("SHA256SUMS");
+
+    tracing::info!("Downloading {tarball_name}");
+    download_to(&tarball_asset.url, &tarball_path)?;
+    download_to(&sums_asset.url, &sums_path)?;
+
+    let sums_content = fs::read_to_string(&sums_path)
+        .with_context(|| format!("Failed to read {}", sums_path.display()))?;
+    let expected = parse_sha256sums(&sums_content, &tarball_name)
+        .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
+    verify_sha256(&tarball_path, &expected)?;
+
+    verify_attestation(&tarball_path)?;
+
+    // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
+    // `-C <tempdir>` plus modern tar's default refusal of `..`-segmented and absolute
+    // paths keep extraction inside the tempdir even if the archive is malicious.
+    Cmd::new("tar")
+        .arg("-xzf")
+        .arg(&tarball_path)
+        .arg("--no-same-owner")
+        .arg("--no-same-permissions")
+        .arg("-C")
+        .arg(tmp.path())
+        .run()
+        .context("Failed to extract release tarball")?;
+
+    let extracted = tmp
+        .path()
+        .join(format!("coop-{}-{triple}", release.tag))
+        .join("coop");
+    ensure!(
+        extracted.exists(),
+        "Extracted binary not found at {}",
+        extracted.display()
+    );
+
+    atomic_replace_self(&extracted)
+}
+
+// ── Background update-check state ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct UpdateState {
+    #[serde(default)]
+    last_checked_at: u64,
+    #[serde(default)]
+    latest_known_version: Option<String>,
+}
+
+fn state_path() -> Option<PathBuf> {
+    let base = dirs::state_dir().or_else(dirs::data_local_dir)?;
+    Some(base.join("coop").join("update-check.json"))
+}
+
+fn read_state() -> Option<UpdateState> {
+    let path = state_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_state(state: &UpdateState) -> Result<()> {
+    let path = state_path().context("Cannot determine state directory")?;
+    let json = serde_json::to_string_pretty(state).context("Failed to serialize update state")?;
+    atomic_write_json(&path, &json)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Persist the update-check state, swallowing I/O failures.
+///
+/// State writes are best-effort — if XDG dirs are unavailable or the filesystem
+/// is read-only we silently skip, letting the background check retry next run.
+fn persist_state(tag: Option<&str>) {
+    let state = UpdateState {
+        last_checked_at: now_unix(),
+        latest_known_version: tag.map(str::to_string),
+    };
+    if let Err(e) = write_state(&state) {
+        tracing::debug!("Failed to persist update-check state: {e}");
+    }
+}
+
+// ── Disable sources (env + TTY + dev) ────────────────────────────────────────
+
+fn background_check_disabled() -> bool {
+    if is_dev_build() {
+        return true;
+    }
+    if env::var("COOP_NO_UPDATE_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if env::var("CI").map(|v| v == "true").unwrap_or(false) {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        return true;
+    }
+    false
+}
+
+// ── Public notify + check entrypoints ────────────────────────────────────────
+
+/// Print a one-line notice on stderr if a newer release is known from the
+/// last successful background check. Silent otherwise.
+pub fn maybe_print_notify(cfg: &UpdateConfig) {
+    if cfg.mode == UpdateMode::Off || background_check_disabled() {
+        return;
+    }
+    let Ok(current) = Version::parse(current_version()) else {
+        return;
+    };
+    let Some(latest) = read_state()
+        .as_ref()
+        .and_then(|s| s.latest_known_version.as_deref())
+        .and_then(|t| Version::parse(strip_v(t)).ok())
+    else {
+        return;
+    };
+    if notify_is_due(&current, &latest) {
+        tracing::warn!("A newer coop ({latest}) is available. Run `coop update` to install it.");
+    }
+}
+
+/// Pure comparison used by [`maybe_print_notify`]. Extracted for testability —
+/// the state-I/O seam in `maybe_print_notify` is not easily mocked without
+/// dependency injection.
+fn notify_is_due(current: &Version, latest: &Version) -> bool {
+    latest > current
+}
+
+/// Kick off a non-blocking background refresh of release metadata if the
+/// persisted state is older than `check_interval_hours`. Safe to call on
+/// every command: honours all disable sources and never blocks the caller.
+///
+/// The `last_checked_at` stamp is written synchronously **before** the thread
+/// is spawned — short-lived commands (`coop status`, `coop stop`) often exit
+/// before the HTTPS round-trip completes, so without the pre-spawn stamp the
+/// interval gate would retrigger on every invocation.
+pub fn maybe_run_background_check(cfg: &UpdateConfig) {
+    if cfg.mode == UpdateMode::Off || background_check_disabled() {
+        return;
+    }
+    let state = read_state().unwrap_or_default();
+    if !interval_elapsed(now_unix(), state.last_checked_at, cfg.check_interval_hours) {
+        return;
+    }
+    persist_state(state.latest_known_version.as_deref());
+    std::thread::spawn(|| match fetch_latest() {
+        Ok(release) => persist_state(Some(&release.tag)),
+        Err(e) => tracing::debug!("background update-check failed: {e}"),
+    });
+}
+
+/// Pure interval check used by [`maybe_run_background_check`]. Returns `true`
+/// when `now - last_checked_at >= interval_hours * 3600`.
+fn interval_elapsed(now: u64, last_checked_at: u64, interval_hours: u64) -> bool {
+    let interval_secs = interval_hours.saturating_mul(3600);
+    now.saturating_sub(last_checked_at) >= interval_secs
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_v_removes_leading_v() {
+        assert_eq!(strip_v("v0.3.1"), "0.3.1");
+        assert_eq!(strip_v("0.3.1"), "0.3.1");
+        assert_eq!(strip_v("v"), "");
+    }
+
+    #[test]
+    fn normalize_tag_adds_v_when_missing() {
+        assert_eq!(normalize_tag("0.3.1").unwrap(), "v0.3.1");
+        assert_eq!(normalize_tag("v0.3.1").unwrap(), "v0.3.1");
+        assert_eq!(normalize_tag(" 0.3.1 ").unwrap(), "v0.3.1");
+        assert_eq!(normalize_tag("0.3.1-rc.1").unwrap(), "v0.3.1-rc.1");
+    }
+
+    #[test]
+    fn normalize_tag_rejects_non_semver_inputs() {
+        // Prevents path traversal via the tag segment of the GitHub API URL.
+        for bad in [
+            "../attacker/evil/releases/latest",
+            "latest",
+            "0.3.1/../evil",
+            "",
+            "v",
+            "not-a-version",
+        ] {
+            assert!(
+                normalize_tag(bad).is_err(),
+                "normalize_tag should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_name_matches_release_workflow_naming() {
+        assert_eq!(
+            asset_name("v0.3.1", "x86_64-unknown-linux-musl"),
+            "coop-v0.3.1-x86_64-unknown-linux-musl.tar.gz"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_finds_matching_entry() {
+        let content = concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other.tar.gz\n",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  coop-v1.tar.gz\n",
+        );
+        let got = parse_sha256sums(content, "coop-v1.tar.gz").unwrap();
+        assert_eq!(
+            got,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_handles_binary_asterisk_form() {
+        let content =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc *coop.tar.gz\n";
+        assert_eq!(
+            parse_sha256sums(content, "coop.tar.gz"),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_skips_blank_and_comment_lines() {
+        let content = concat!(
+            "\n",
+            "# generated by release.yml\n",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  x.tar.gz\n",
+        );
+        assert_eq!(
+            parse_sha256sums(content, "x.tar.gz"),
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_returns_none_for_missing_entry() {
+        let content =
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee  other.tar.gz\n";
+        assert!(parse_sha256sums(content, "coop.tar.gz").is_none());
+    }
+
+    #[test]
+    fn parse_sha256sums_rejects_malformed_hash() {
+        let short = "abcd  x.tar.gz\n";
+        assert!(parse_sha256sums(short, "x.tar.gz").is_none());
+        let nonhex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  x.tar.gz\n";
+        assert!(parse_sha256sums(nonhex, "x.tar.gz").is_none());
+    }
+
+    #[test]
+    fn semver_ordering_tracks_expectations() {
+        let a = Version::parse("0.3.1").unwrap();
+        let b = Version::parse("0.3.2").unwrap();
+        let pre = Version::parse("0.4.0-rc.1").unwrap();
+        let rel = Version::parse("0.4.0").unwrap();
+        assert!(b > a);
+        assert!(rel > pre, "pre-release must sort below its release");
+        assert!(pre > b);
+    }
+
+    #[test]
+    fn target_triple_resolves_on_this_host() {
+        // Should succeed on every host CI runs on; the function only bails
+        // on truly unsupported targets (e.g. x86_64-apple-darwin).
+        let triple = target_triple();
+        if cfg!(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+        )) {
+            assert!(triple.is_ok());
+        }
+    }
+
+    #[test]
+    fn update_mode_default_is_notify() {
+        assert_eq!(UpdateMode::default(), UpdateMode::Notify);
+    }
+
+    #[test]
+    fn update_config_default_interval_is_24_hours() {
+        let cfg = UpdateConfig::default();
+        assert_eq!(cfg.check_interval_hours, 24);
+        assert_eq!(cfg.mode, UpdateMode::Notify);
+    }
+
+    #[test]
+    fn update_config_deserializes_snake_case_modes() {
+        let cfg: UpdateConfig = toml::from_str(r#"mode = "off""#).unwrap();
+        assert_eq!(cfg.mode, UpdateMode::Off);
+        let cfg: UpdateConfig = toml::from_str(r#"mode = "notify""#).unwrap();
+        assert_eq!(cfg.mode, UpdateMode::Notify);
+    }
+
+    #[test]
+    fn verify_sha256_accepts_correct_hash_and_rejects_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        fs::write(&path, b"hello world").unwrap();
+
+        // sha256("hello world") = b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        let correct = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        verify_sha256(&path, correct).unwrap();
+        verify_sha256(&path, &"0".repeat(64)).unwrap_err();
+    }
+
+    #[test]
+    fn parse_sha256sums_returns_first_of_duplicates() {
+        let content = concat!(
+            "1111111111111111111111111111111111111111111111111111111111111111  x.tar.gz\n",
+            "2222222222222222222222222222222222222222222222222222222222222222  x.tar.gz\n",
+        );
+        assert_eq!(
+            parse_sha256sums(content, "x.tar.gz"),
+            Some("1111111111111111111111111111111111111111111111111111111111111111".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_tolerates_crlf_line_endings() {
+        let content =
+            "3333333333333333333333333333333333333333333333333333333333333333  x.tar.gz\r\n";
+        assert_eq!(
+            parse_sha256sums(content, "x.tar.gz"),
+            Some("3333333333333333333333333333333333333333333333333333333333333333".to_string())
+        );
+    }
+
+    #[test]
+    fn notify_is_due_tracks_strict_newer() {
+        let current = Version::parse("0.3.1").unwrap();
+        assert!(notify_is_due(&current, &Version::parse("0.3.2").unwrap()));
+        assert!(notify_is_due(&current, &Version::parse("1.0.0").unwrap()));
+        assert!(!notify_is_due(&current, &current));
+        assert!(!notify_is_due(&current, &Version::parse("0.3.0").unwrap()));
+        // Pre-release of a future minor still sorts below the release but above current.
+        assert!(notify_is_due(
+            &current,
+            &Version::parse("0.4.0-rc.1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn interval_elapsed_behaviour() {
+        let one_hour = 3600;
+        // Zero last_checked_at means "never" — always elapsed.
+        assert!(interval_elapsed(100_000, 0, 24));
+        // Freshly checked — not elapsed.
+        assert!(!interval_elapsed(100_000, 99_999, 1));
+        // Exactly at the boundary counts as elapsed.
+        assert!(interval_elapsed(100_000 + one_hour, 100_000, 1));
+        // One second before the boundary does not.
+        assert!(!interval_elapsed(100_000 + one_hour - 1, 100_000, 1));
+        // Saturating arithmetic: now earlier than last_checked_at must not panic.
+        assert!(!interval_elapsed(0, 100_000, 24));
+    }
+
+    #[test]
+    fn serde_deserializes_release_from_github_shape() {
+        let json = r#"{
+            "tag_name": "v9.9.9",
+            "assets": [
+                {"name": "x.tar.gz", "browser_download_url": "https://example.com/x.tar.gz"}
+            ]
+        }"#;
+        let release: Release = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag, "v9.9.9");
+        assert_eq!(release.assets.len(), 1);
+        assert_eq!(release.assets[0].name, "x.tar.gz");
+        assert_eq!(release.assets[0].url, "https://example.com/x.tar.gz");
+    }
+}
