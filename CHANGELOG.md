@@ -1,32 +1,57 @@
 # Changelog
 
-## Unreleased
+## v0.4.0
 
 ### New features
 
-- **`coop update`** (#34) — Self-update the coop binary from GitHub Releases.
-  Downloads the tarball matching the host triple, verifies SHA-256 via the
-  release's `SHA256SUMS`, and optionally checks provenance with `gh
-  attestation verify` before atomically replacing the running binary. Flags:
-  `--check` (probe only), `--force` (reinstall same version), `--version
-  <tag>` (pin), and `-y`/`--yes` (skip confirmation). Dev builds refuse to
-  self-update — re-run `install.sh` to replace them.
+- **Codex CLI support** (#44, #49) — `coop codex` launches OpenAI's Codex
+  inside the guest, alongside Claude Code. `~/.codex` config and auth are
+  staged into the VM, `OPENAI_API_KEY` is forwarded, and MCP servers
+  configured under `[codex.mcp_servers]` are merged into the guest's
+  `~/.codex/config.toml`. A `codex-yolo` guest alias mirrors the existing
+  `claude-yolo` shortcut.
 
-- **Background update-check notifications** — On every command, coop checks
-  the persisted state in `$XDG_STATE_HOME/coop/update-check.json`; if a newer
-  release is known, a one-line notice is printed on stderr. The refresh runs
-  in a detached thread and never blocks the command. Disable globally with
-  `updates.mode = "off"` in `config.toml`, or per-invocation with
-  `COOP_NO_UPDATE_CHECK=1`. The check is also silent when `CI=true` or when
-  stdin is not a TTY.
+- **`coop update`** (#34, #55) — Self-updates the coop binary from GitHub
+  Releases. Downloads the tarball matching the host triple, verifies
+  SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed)
+  verifies the build-provenance attestation before atomically replacing
+  the running binary. Flags: `--check` (probe only), `--force` (reinstall
+  same version), `--version <tag>` (pin), and `-y`/`--yes` (skip
+  confirmation). Dev builds refuse to self-update; re-run `install.sh`
+  to replace them.
 
-- **`coop --version` includes git metadata** — Release builds display the
-  short commit sha (e.g. `coop 0.3.1 (a1b2c3d)`); dev builds add `-dev` and a
-  `+dirty` suffix when the working tree has uncommitted changes.
+- **Background update-check notifications** (#55) — On every command,
+  coop reads the persisted state in `$XDG_STATE_HOME/coop/update-check.json`;
+  if a newer release is known, coop prints a one-line notice to stderr.
+  The refresh runs in a detached thread and never blocks the command.
+  Disable globally with `updates.mode = "off"` in `config.toml`, or
+  per-invocation with `COOP_NO_UPDATE_CHECK=1`. The check stays silent
+  when `CI=true` or when stdin is not a TTY.
+
+- **`install.sh` verifies build-provenance attestations** (#56) — When
+  `gh` is installed, the installer runs `gh attestation verify` after
+  the SHA-256 check, matching `coop update`. Without `gh`, both paths
+  fall back to checksum verification and print a note describing what
+  the checksum covers and what attestation verification would add.
+  README documents the manual `gh attestation verify` one-liner.
+
+- **`coop --version` includes git metadata** (#55) — Release builds
+  display the short commit sha (e.g. `coop 0.3.1 (a1b2c3d)`); dev builds
+  add `-dev` and a `+dirty` suffix when the working tree has
+  uncommitted changes.
+
+### Deprecations
+
+- **`--no-claude` is deprecated** (#49) — Use `--no-agents` instead.
+  The old flag still works as a hidden alias and emits a runtime
+  warning. A future release will remove it.
 
 ### Dependencies
 
 - New: `semver` 1
+- Cargo dependency updates (`clap`, `indexmap`, `libc`)
+- GitHub Actions bumps (`actions/cache`, `actions/upload-artifact`,
+  `cargo-bins/cargo-binstall`, `zizmorcore/zizmor-action`)
 
 ## v0.3.1
 
