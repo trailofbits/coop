@@ -93,7 +93,7 @@ coop update --force             # reinstall the current version
 
 If coop is installed in a protected directory (e.g. `/usr/local/bin`), run
 with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to
-self-update — use `install.sh` to replace them.
+self-update; use `install.sh` to replace them.
 
 By default, coop checks for a newer release in the background at most once
 per day and prints a one-line notice on stderr when an update is available.

@@ -44,7 +44,7 @@ coop setup [FLAGS]
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
-| `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`, `full` |
+| `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
 | `--extra-packages <list>` | Comma-separated extra apt packages to install |
 | `--post-install <path>` | Path to a post-install script to run in the chroot |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
@@ -352,6 +352,54 @@ Absolute values set the disk to that exact size. A `+` prefix adds to the curren
 coop resize my-project --size 150G
 coop resize --size +20
 ```
+
+### `profiles`
+
+List or inspect available profiles. With no subcommand, lists every profile (builtin and custom).
+
+```
+coop profiles [SUBCOMMAND]
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List builtin and custom profiles with a one-line summary each (default) |
+| `show <name>` | Print the full definition of a profile: apt packages, pre/post-install scripts, marketplaces, plugins |
+
+```
+coop profiles
+coop profiles list
+coop profiles show rust
+```
+
+`list` groups builtin and custom profiles separately. `show` resolves the name against custom profiles first, then builtins, and prints `(custom)` or `(builtin)` next to the name.
+
+### `update`
+
+Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+
+```
+coop update [FLAGS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--check` | Report whether a newer release exists. Do not download or install. |
+| `--force` | Reinstall even if the current binary is already at the target version. |
+| `--version <VERSION>` | Install a specific release tag (e.g. `v0.3.2` or `0.3.2`). |
+| `-y`, `--yes` | Skip the interactive confirmation prompt. |
+
+If coop is installed in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to self-update; use `install.sh` to replace them.
+
+```
+coop update --check
+coop update
+coop update --yes
+coop update --version v0.3.2
+coop update --force
+```
+
+See also the [`updates` section](configuration.md#updates-section) of the configuration reference for the background-notification settings.
 
 ### `validate`
 

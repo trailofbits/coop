@@ -1,6 +1,6 @@
 # coop
 
-Isolated VM environment for running Claude Code — Firecracker on Linux, Lima on macOS.
+Isolated VM environment for running Claude Code and Codex — Firecracker on Linux, Lima on macOS.
 
 ## Architecture
 

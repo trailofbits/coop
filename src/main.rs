@@ -93,7 +93,7 @@ enum Commands {
         /// Force rebuild of template rootfs
         #[arg(long)]
         rebuild: bool,
-        /// Install profiles (comma-separated: python,node,c,fuzz,rust,go,full)
+        /// Install profiles (comma-separated: python,node,c,fuzz,rust,go)
         #[arg(long, value_delimiter = ',')]
         profile: Vec<String>,
         /// Extra apt packages to install (comma-separated)

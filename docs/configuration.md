@@ -131,7 +131,23 @@ plugins = ["rust-analyzer-lsp@claude-plugins-official"]
 | `marketplaces` | array of strings | `[]` | Plugin marketplace sources for this profile. Same format as `claude.marketplaces`. |
 | `plugins` | array of strings | `[]` | Plugins to install for this profile. Same format as `claude.plugins`. |
 
-Custom profiles compose with built-in ones (`python`, `node`, `c`, `fuzz`, `rust`, `go`, `full`). Combine them with commas: `coop setup --profile python,node,my-tools`.
+Custom profiles compose with built-in ones (`python`, `node`, `c`, `fuzz`, `rust`, `go`). Combine them with commas: `coop setup --profile python,node,my-tools`.
+
+## `updates` section
+
+Background update-check behavior for `coop update`. Defaults are safe; most users do not need to set anything here.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `"notify"` or `"off"` | `"notify"` | `"notify"` runs a background check at most once per `check_interval_hours` and prints a one-line stderr notice when a newer release is known. `"off"` disables both the check and the notice. |
+| `check_interval_hours` | integer | `24` | Minimum hours between background release-metadata fetches. |
+
+The background check is also silent when `COOP_NO_UPDATE_CHECK=1`, when `CI=true`, or when stdin is not a TTY. Dev builds (untagged or dirty trees) never run the check or notice.
+
+```toml
+[updates]
+mode = "off"
+```
 
 ## CLI overrides
 

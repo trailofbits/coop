@@ -13,7 +13,7 @@ coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it s
 **Linux (Firecracker backend)**
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
-- x86_64 architecture
+- x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but less exercised)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
 
@@ -91,7 +91,7 @@ Install language toolchains into the template with `--profile`:
 coop setup --profile python,node
 ```
 
-Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`, `full` (all of the above).
+Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`. Combine them with commas (e.g. `--profile python,node,rust`). Use `coop profiles list` to inspect what each one installs.
 
 Skip confirmation prompts with `-y`:
 
@@ -262,7 +262,7 @@ Build multiple template images with different profiles:
 
 ```
 coop setup --image python-dev --profile python
-coop setup --image full-dev --profile full
+coop setup --image polyglot --profile python,node,rust
 ```
 
 Start an instance from a specific image:

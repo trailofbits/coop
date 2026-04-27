@@ -45,9 +45,6 @@ coop setup --profile python,node,rust
 | `fuzz` | `clang`, `llvm`, `afl++`, `lcov` |
 | `rust` | Rust toolchain via post-install script (not apt). Installs plugin: `rust-analyzer-lsp@claude-plugins-official` |
 | `go` | `golang` |
-| `full` | All of the above, combined and deduplicated |
-
-The `full` meta-profile expands every built-in profile into a single template. Duplicate packages are removed automatically.
 
 Plugins listed above are baked into the golden image during `coop setup` and do not need to be listed separately in config.
 
@@ -107,10 +104,10 @@ By default, coop builds an image called `default`. Build multiple images with di
 
 ```bash
 coop setup --profile python --image py-dev
-coop setup --profile full --image full-dev
+coop setup --profile python,node,rust --image polyglot
 
 coop start --image py-dev
-coop start --image full-dev
+coop start --image polyglot
 ```
 
 Each named image lives in its own directory under `~/.coop/images/<name>/` with independent versioning and staleness tracking.
@@ -122,7 +119,7 @@ List all images:
 ```
 $ coop images
 default              profiles: python, node              created: 2026-03-20T14:30:00Z     size: 4.2 GiB
-full-dev             profiles: full                      created: 2026-03-22T09:15:00Z     size: 6.1 GiB
+polyglot             profiles: python, node, rust        created: 2026-03-22T09:15:00Z     size: 6.1 GiB
 ```
 
 Output includes the image name, installed profiles, creation timestamp, and disk size.
@@ -130,7 +127,7 @@ Output includes the image name, installed profiles, creation timestamp, and disk
 Delete a named image:
 
 ```bash
-coop images --delete full-dev
+coop images --delete polyglot
 ```
 
 ## Template versioning and staleness

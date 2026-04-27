@@ -2,7 +2,7 @@
 
 coop selects its VM backend at compile time. macOS builds use Lima. Linux builds use Firecracker. The binary determines the backend; there is no runtime override.
 
-Both backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, and Claude Code pre-installed. The backends differ in how they create and manage the VM underneath.
+Both backends expose the same CLI commands and produce the same guest environment: Ubuntu with Docker, GitHub CLI, Claude Code, and Codex pre-installed. The backends differ in how they create and manage the VM underneath.
 
 ## macOS / Lima
 
@@ -24,7 +24,7 @@ Setup verifies that `limactl --version` is reachable. If it is not, setup fails 
 
 1. Generates an ed25519 SSH key pair, stored in the coop data directory.
 2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
-3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
+3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
 4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
 5. Stops the builder VM and extracts its disk as the golden image.
 6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
@@ -56,7 +56,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 ### Prerequisites
 
 - **KVM access**: `/dev/kvm` must exist and be readable/writable by the current user. Setup checks this and offers to fix permissions via `setfacl` or by adding the user to the `kvm` group.
-- **x86_64 architecture**: The Firecracker backend targets x86_64 Linux hosts.
+- **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
 - **curl**: Required for downloading the Firecracker binary and kernel.
 - **System packages**: Setup installs `squashfs-tools` and `e2fsprogs` (for rootfs manipulation) via `apt-get` if they are missing.
 
@@ -66,7 +66,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
-3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
+3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
 
 All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
 

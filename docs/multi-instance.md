@@ -43,7 +43,7 @@ coop shell my-project
 coop shell another-project
 ```
 
-This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`, and `claude`.
+This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`, `claude`, and `codex`.
 
 ## Checking status
 
