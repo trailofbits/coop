@@ -9,7 +9,8 @@
   staged into the VM, `OPENAI_API_KEY` is forwarded, and MCP servers
   configured under `[codex.mcp_servers]` are merged into the guest's
   `~/.codex/config.toml`. A `codex-yolo` guest alias mirrors the existing
-  `claude-yolo` shortcut.
+  `claude-yolo` shortcut. Thanks to Artem Dinaburg for contributing the
+  initial Codex integration.
 
 - **`coop update`** (#34, #55) — Self-updates the coop binary from GitHub
   Releases. Downloads the tarball matching the host triple, verifies
