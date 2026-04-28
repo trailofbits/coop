@@ -19,8 +19,9 @@ fn main() {
     for path in git_rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    // Build-time test hook: allows the integration test to produce a "release" binary from
-    // an untagged branch. Runtime behaviour is unaffected — the override only influences
+    // Build-time test hook: lets the integration test pin `COOP_BUILD_KIND` to either
+    // "release" (from an untagged branch) or "dev" (from a tagged commit), independent
+    // of git state. Runtime behaviour is unaffected — the override only influences
     // what build.rs bakes into `COOP_BUILD_KIND`.
     println!("cargo:rerun-if-env-changed=COOP_FORCE_BUILD_KIND");
 

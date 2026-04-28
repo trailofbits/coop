@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1
+
+Re-release of v0.4.0. The v0.4.0 tag did not produce release artifacts
+because `tests/integration-update.sh` Test 4 ("dev build refusal") fails
+whenever CI runs on a commit tagged `v{cargo_version}` — `build.rs`
+correctly bakes `COOP_BUILD_KIND=release` for that commit, so the test's
+unset-override path produced a release binary instead of a dev one. Test 4
+now sets `COOP_FORCE_BUILD_KIND=dev` explicitly, mirroring Test 1's
+`=release` override. No functional changes to `coop` itself since v0.4.0.
+
 ## v0.4.0
 
 ### New features

@@ -221,10 +221,12 @@ fi
 # ── Test 4: dev build refuses to self-update ─────────────────────────────────
 
 echo "==> Building dev binary..."
+# Force kind=dev rather than relying on git state. When CI runs on a tag
+# matching the Cargo version (the release workflow's normal trigger),
+# build.rs correctly bakes kind=release, which would defeat this test.
 (
     cd "$PROJECT_DIR"
-    unset COOP_FORCE_BUILD_KIND
-    cargo build --release --quiet
+    COOP_FORCE_BUILD_KIND=dev cargo build --release --quiet
 )
 cp "$PROJECT_DIR/target/release/coop" "$TMPDIR/bin/coop-dev"
 
