@@ -203,16 +203,18 @@ else
     fail "update --yes returned non-zero" "$(tail -5 "$TMPDIR/t1.log")"
 fi
 
-# Confirm the update-check state file landed inside the redirected
-# $HOME — anywhere outside means a future code change has introduced a
-# state path that bypasses HOME/XDG and would leak the synthetic v9.9.9
-# tag into the user's real home, surfacing as a bogus update warning.
-leaked_in_home="$(find "$HOME" -name update-check.json -print -quit 2> /dev/null)"
-if [[ -n "$leaked_in_home" ]]; then
-    pass "update-check state file confined to redirected HOME"
+# Confirm the update-check state file landed inside the test's tempdir,
+# not somewhere under the developer's real home. Searching $TMPDIR (not
+# $HOME) is deliberate: if a future edit accidentally drops the HOME
+# export above, $HOME would point back at the real home and a leak there
+# would still be "found" — the assertion would silently pass on the leak
+# it was meant to catch. $TMPDIR is the known-isolated boundary.
+state_under_tmpdir="$(find "$TMPDIR" -name update-check.json -print -quit 2> /dev/null)"
+if [[ -n "$state_under_tmpdir" ]]; then
+    pass "update-check state file confined to tempdir"
 else
-    fail "no update-check state file written under redirected HOME" \
-        "expected one under $HOME"
+    fail "no update-check state file written under tempdir" \
+        "either HOME redirection broke or persist_state did not run"
 fi
 
 # ── Test 2: --check when already up to date ──────────────────────────────────
