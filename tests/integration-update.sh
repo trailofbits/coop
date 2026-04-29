@@ -107,16 +107,50 @@ full_assets_block() {
 JSON
 }
 
-# ── Build the real coop binary (release kind, for success tests) ─────────────
+# ── Build both coop binaries (real HOME, before isolation) ───────────────────
+#
+# Both `cargo build` invocations must run before HOME is redirected — cargo
+# uses $HOME for its registry and toolchain caches.
 
 echo "==> Building release binary..."
 (
     cd "$PROJECT_DIR"
     COOP_FORCE_BUILD_KIND=release cargo build --release --quiet
 )
-RELEASE_BIN="$PROJECT_DIR/target/release/coop"
+# Stash the release binary at a stable path. The dev build below shares
+# `target/release/coop`, so we can't keep referring to that path after
+# `cargo build` runs again.
+RELEASE_BIN="$TMPDIR/bin/coop-release"
+cp "$PROJECT_DIR/target/release/coop" "$RELEASE_BIN"
 cp "$RELEASE_BIN" "$TMPDIR/bin/coop"
 export COOP_BIN="$TMPDIR/bin/coop"
+
+echo "==> Building dev binary..."
+# Force kind=dev rather than relying on git state. When CI runs on a tag
+# matching the Cargo version (the release workflow's normal trigger),
+# build.rs correctly bakes kind=release, which would defeat test 4.
+(
+    cd "$PROJECT_DIR"
+    COOP_FORCE_BUILD_KIND=dev cargo build --release --quiet
+)
+cp "$PROJECT_DIR/target/release/coop" "$TMPDIR/bin/coop-dev"
+
+# ── Isolate test invocations from the real user environment ──────────────────
+#
+# `coop update --yes` writes an "update-check" bookkeeping file recording the
+# latest release it learned about. Pointed at our local fixture, that file
+# would record the synthetic v9.9.9 tag — and `dirs::state_dir()` /
+# `dirs::data_local_dir()` resolve under $HOME on every supported platform
+# (`$HOME/.local/state` on Linux, `$HOME/Library/Application Support` on
+# macOS), so without redirection the file lands in the user's real home and
+# triggers a bogus "newer version available" warning on every later run.
+#
+# Redirecting $HOME (and the XDG vars, for completeness on Linux) is enough:
+# the update path doesn't read from anywhere else under the user's home.
+export HOME="$TMPDIR/home"
+export XDG_STATE_HOME="$HOME/.local/state"
+export XDG_DATA_HOME="$HOME/.local/share"
+mkdir -p "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 
 # ── Fabricate a "newer" release tarball ──────────────────────────────────────
 
@@ -169,6 +203,18 @@ else
     fail "update --yes returned non-zero" "$(tail -5 "$TMPDIR/t1.log")"
 fi
 
+# Confirm the update-check state file landed inside the redirected
+# $HOME — anywhere outside means a future code change has introduced a
+# state path that bypasses HOME/XDG and would leak the synthetic v9.9.9
+# tag into the user's real home, surfacing as a bogus update warning.
+leaked_in_home="$(find "$HOME" -name update-check.json -print -quit 2> /dev/null)"
+if [[ -n "$leaked_in_home" ]]; then
+    pass "update-check state file confined to redirected HOME"
+else
+    fail "no update-check state file written under redirected HOME" \
+        "expected one under $HOME"
+fi
+
 # ── Test 2: --check when already up to date ──────────────────────────────────
 
 # Restore the real binary; point "latest" at its version.
@@ -219,16 +265,6 @@ fi
 (cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
 
 # ── Test 4: dev build refuses to self-update ─────────────────────────────────
-
-echo "==> Building dev binary..."
-# Force kind=dev rather than relying on git state. When CI runs on a tag
-# matching the Cargo version (the release workflow's normal trigger),
-# build.rs correctly bakes kind=release, which would defeat this test.
-(
-    cd "$PROJECT_DIR"
-    COOP_FORCE_BUILD_KIND=dev cargo build --release --quiet
-)
-cp "$PROJECT_DIR/target/release/coop" "$TMPDIR/bin/coop-dev"
 
 echo "==> Test 4: dev build refusal"
 if "$TMPDIR/bin/coop-dev" update --yes > "$TMPDIR/t4.log" 2>&1; then
