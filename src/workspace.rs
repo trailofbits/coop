@@ -98,6 +98,10 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
         .stdout
         .take()
         .context("Failed to get tar stdout")?;
+    let tar_stderr = tar_child
+        .stderr
+        .take()
+        .context("Failed to get tar stderr")?;
 
     let extract_cmd = format!("tar xf - -C {GUEST_WORKSPACE}");
     let mut ssh_args = target.ssh_opts();
@@ -118,12 +122,14 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
         .take()
         .context("Failed to get SSH stderr")?;
 
-    // Drain SSH stderr in a background thread. Remote tar streams
-    // warnings ("Cannot change ownership", etc.) to stderr while
-    // the main write loop is still feeding stdin; if we don't drain
-    // concurrently the ~64K pipe buffer fills and remote tar blocks
-    // forever, deadlocking the whole pipeline.
-    let stderr_thread = drain_to_vec(ssh_stderr, "SSH stderr");
+    // Drain both stderr streams in background threads. Remote tar
+    // emits warnings ("Cannot change ownership", future timestamps)
+    // during extraction; local tar can emit "file changed as we read
+    // it" / "permission denied" on a busy workspace. Either side
+    // filling its ~64K pipe buffer would block the producer and
+    // deadlock the pipeline.
+    let ssh_err_thread = drain_to_vec(ssh_stderr, "SSH stderr");
+    let tar_err_thread = drain_to_vec(tar_stderr, "local tar stderr");
 
     // Stream tar output to SSH stdin.
     //
@@ -156,23 +162,27 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
 
     let ssh_status = ssh_child.wait().context("Failed to wait for SSH")?;
     let tar_status = tar_child.wait().context("Failed to wait for tar")?;
-    let stderr_buf = join_drainer(stderr_thread)?;
+    let ssh_stderr_buf = join_drainer(ssh_err_thread)?;
+    let tar_stderr_buf = join_drainer(tar_err_thread)?;
 
     // If the streaming loop failed (typically EPIPE), surface the
     // remote stderr — that's where "No space left on device" and
     // similar root-cause errors appear.
     if let Some(err) = transfer_err {
-        return Err(err.context(format_remote_failure(&stderr_buf)));
+        return Err(err.context(format_remote_failure(&ssh_stderr_buf)));
     }
 
     if !tar_status.success() {
-        bail!("Local tar archive creation failed");
+        bail!(
+            "Local tar archive creation failed.\n{}",
+            format_failure("Local tar stderr", &tar_stderr_buf, None)
+        );
     }
 
     if !ssh_status.success() {
         bail!(
             "tar-pipe transfer to guest failed: {}",
-            format_remote_failure(&stderr_buf)
+            format_remote_failure(&ssh_stderr_buf)
         );
     }
 
@@ -203,27 +213,62 @@ fn join_drainer(handle: std::thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<
         .map_err(|_| anyhow::anyhow!("stderr drainer thread panicked"))?
 }
 
-/// Build a user-facing message from the remote command's stderr.
-///
-/// The SSH-side tar only writes to stderr when something fails
-/// (extraction error, disk full, permission denied, etc.). When
-/// stderr is empty or indicates ENOSPC, append a hint pointing at
-/// the most common cause — the guest disk being too small for the
-/// workspace.
-fn format_remote_failure(stderr: &[u8]) -> String {
-    const DISK_HINT: &str = "The guest disk is likely too small for this \
-        workspace. Retry with a larger disk: `coop start --disk <GiB> ...`.";
+const GUEST_DISK_HINT: &str = "The guest disk is likely too small for this \
+    workspace. Retry with a larger disk: `coop start --disk <GiB> ...`.";
 
+/// Build a user-facing message from a captured stderr buffer.
+///
+/// `label` prefixes the body ("Remote stderr", "Local tar stderr", …).
+/// When `disk_hint` is supplied, an empty buffer or ENOSPC/quota-style
+/// content triggers the hint — ENOSPC is the most common silent
+/// failure mode for tar pipelines and the underlying error message is
+/// often unhelpful on its own.
+fn format_failure(label: &str, stderr: &[u8], disk_hint: Option<&str>) -> String {
     let stderr = String::from_utf8_lossy(stderr);
     let stderr = stderr.trim();
     if stderr.is_empty() {
-        return format!("Remote SSH command exited without diagnostic output. {DISK_HINT}");
+        return match disk_hint {
+            Some(hint) => format!("{label} empty (command exited with no diagnostic). {hint}"),
+            None => format!("{label} empty (command exited with no diagnostic)."),
+        };
     }
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
-        return format!("Remote stderr:\n{stderr}\n\n{DISK_HINT}");
+    let is_enospc =
+        lower.contains("no space left on device") || lower.contains("disk quota exceeded");
+    match disk_hint.filter(|_| is_enospc) {
+        Some(hint) => format!("{label}:\n{stderr}\n\n{hint}"),
+        None => format!("{label}:\n{stderr}"),
     }
-    format!("Remote stderr:\n{stderr}")
+}
+
+/// Format the SSH-side stderr for a tar-pipe transfer failure.
+///
+/// Adds the guest-disk hint because the most common silent failure
+/// of `tar_pipe_transfer` is the guest filesystem running out of
+/// space mid-extraction.
+fn format_remote_failure(stderr: &[u8]) -> String {
+    format_failure("Remote stderr", stderr, Some(GUEST_DISK_HINT))
+}
+
+/// Combine SSH and local-tar stderr into a single user-facing block.
+///
+/// Used by `tar_pipe_pull`'s error paths so a cascade (remote tar
+/// dies → SSH closes stdout truncated → local tar errors on the
+/// truncated archive) reports both root cause and downstream effect.
+/// Either side may be empty; in that case we emit only what we have.
+fn format_pull_failure(ssh_stderr: &[u8], tar_stderr: &[u8]) -> String {
+    let ssh_trim = String::from_utf8_lossy(ssh_stderr);
+    let tar_trim = String::from_utf8_lossy(tar_stderr);
+    match (ssh_trim.trim().is_empty(), tar_trim.trim().is_empty()) {
+        (true, true) => "No diagnostic output from either side.".to_string(),
+        (false, true) => format_failure("Remote stderr", ssh_stderr, None),
+        (true, false) => format_failure("Local tar stderr", tar_stderr, None),
+        (false, false) => format!(
+            "{}\n{}",
+            format_failure("Remote stderr", ssh_stderr, None),
+            format_failure("Local tar stderr", tar_stderr, None),
+        ),
+    }
 }
 
 fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
@@ -530,23 +575,25 @@ fn tar_pipe_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()
     let tar_stderr_buf = join_drainer(tar_err_thread)?;
 
     if let Some(err) = transfer_err {
-        let ssh_stderr = String::from_utf8_lossy(&ssh_stderr_buf);
-        let tar_stderr = String::from_utf8_lossy(&tar_stderr_buf);
-        return Err(err.context(format!(
-            "Remote stderr:\n{}\nLocal tar stderr:\n{}",
-            ssh_stderr.trim(),
-            tar_stderr.trim()
-        )));
+        return Err(err.context(format_pull_failure(&ssh_stderr_buf, &tar_stderr_buf)));
+    }
+
+    // Check SSH first: if the remote tar dies mid-archive, SSH closes
+    // stdout truncated and local tar then errors on the malformed
+    // record. Reporting tar's "Unexpected EOF" would hide the actual
+    // root cause in ssh_stderr_buf.
+    if !ssh_status.success() {
+        bail!(
+            "tar-pipe pull from guest failed.\n{}",
+            format_pull_failure(&ssh_stderr_buf, &tar_stderr_buf)
+        );
     }
 
     if !tar_status.success() {
-        let stderr = String::from_utf8_lossy(&tar_stderr_buf);
-        bail!("tar extraction failed during pull: {}", stderr.trim());
-    }
-
-    if !ssh_status.success() {
-        let stderr = String::from_utf8_lossy(&ssh_stderr_buf);
-        bail!("tar-pipe pull from guest failed: {}", stderr.trim());
+        bail!(
+            "tar extraction failed during pull.\n{}",
+            format_failure("Local tar stderr", &tar_stderr_buf, None)
+        );
     }
 
     Ok(())
@@ -871,6 +918,58 @@ mod tests {
         let msg = format_remote_failure(b"   \n\nactual error\n\n");
         assert!(msg.contains("actual error"));
         assert!(!msg.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_remote_failure_disk_quota_triggers_hint() {
+        let msg = format_remote_failure(b"tar: write error: Disk quota exceeded\n");
+        assert!(msg.contains("Disk quota exceeded"));
+        assert!(
+            msg.contains("--disk"),
+            "quota should also trigger hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_failure_without_hint_omits_hint_when_empty() {
+        let msg = format_failure("Local tar stderr", b"", None);
+        assert!(msg.starts_with("Local tar stderr empty"));
+        assert!(!msg.contains("--disk"));
+    }
+
+    #[test]
+    fn format_failure_without_hint_skips_enospc_hint() {
+        let msg = format_failure("Local tar stderr", b"No space left on device", None);
+        assert!(msg.contains("No space left on device"));
+        assert!(
+            !msg.contains("--disk"),
+            "no hint configured, must not invent one: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_pull_failure_combines_both_when_present() {
+        let msg = format_pull_failure(b"remote boom", b"local boom");
+        assert!(msg.contains("Remote stderr:"));
+        assert!(msg.contains("remote boom"));
+        assert!(msg.contains("Local tar stderr:"));
+        assert!(msg.contains("local boom"));
+    }
+
+    #[test]
+    fn format_pull_failure_omits_empty_side() {
+        let msg = format_pull_failure(b"remote boom", b"");
+        assert!(msg.contains("Remote stderr:"));
+        assert!(
+            !msg.contains("Local tar stderr"),
+            "should not mention empty side: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_pull_failure_handles_both_empty() {
+        let msg = format_pull_failure(b"", b"   \n");
+        assert!(msg.contains("No diagnostic output"));
     }
 
     #[test]
