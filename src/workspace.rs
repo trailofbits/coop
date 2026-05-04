@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::backend::SshTarget;
 use crate::config::Instance;
@@ -68,9 +67,10 @@ impl WorkspaceState {
 
 /// Transfer a local directory to the guest via tar-pipe over SSH.
 ///
-/// Streams the tar archive through a SHA-256 hasher locally while
-/// the remote independently hashes and extracts. Checksums are
-/// compared after transfer to detect corruption.
+/// Streams `tar cf -` straight into a guest-side `tar xf - -C /workspace`.
+/// No staging file on either side, so peak disk usage on the guest is
+/// just the extracted tree. Integrity relies on SSH's MAC over the
+/// localhost transport plus tar's per-header checksums.
 pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
     tracing::info!(
         "Transferring {} to guest:{GUEST_WORKSPACE} via tar-pipe",
@@ -99,13 +99,7 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
         .take()
         .context("Failed to get tar stdout")?;
 
-    // Remote: save stream, hash it, then extract
-    let extract_cmd = format!(
-        "t=$(mktemp) && cat >\"$t\" && \
-         h=$(sha256sum \"$t\" | cut -d' ' -f1) && \
-         tar xf \"$t\" -C {GUEST_WORKSPACE} && \
-         echo \"$h\" && rm -f \"$t\""
-    );
+    let extract_cmd = format!("tar xf - -C {GUEST_WORKSPACE}");
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
     ssh_args.push(extract_cmd);
@@ -113,60 +107,123 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
     let mut ssh_child = Command::new("ssh")
         .args(&ssh_args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start SSH for tar-pipe transfer")?;
 
     let mut ssh_stdin = ssh_child.stdin.take().context("Failed to get SSH stdin")?;
+    let ssh_stderr = ssh_child
+        .stderr
+        .take()
+        .context("Failed to get SSH stderr")?;
 
-    // Stream tar output through SHA-256 hasher to SSH stdin
-    let mut hasher = Sha256::new();
+    // Drain SSH stderr in a background thread. Remote tar streams
+    // warnings ("Cannot change ownership", etc.) to stderr while
+    // the main write loop is still feeding stdin; if we don't drain
+    // concurrently the ~64K pipe buffer fills and remote tar blocks
+    // forever, deadlocking the whole pipeline.
+    let stderr_thread = drain_to_vec(ssh_stderr, "SSH stderr");
+
+    // Stream tar output to SSH stdin.
+    //
+    // IO errors here (typically EPIPE when the remote tar exits early —
+    // e.g. /workspace not writable, disk full) are *captured* rather
+    // than propagated immediately so we can drain SSH's stderr below
+    // and surface the actual root-cause to the user.
     let mut buf = vec![0u8; 64 * 1024];
+    let mut transfer_err: Option<anyhow::Error> = None;
     loop {
-        let n = tar_stdout
-            .read(&mut buf)
-            .context("Failed to read tar output")?;
+        let n = match tar_stdout.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                transfer_err = Some(anyhow::Error::new(e).context("Failed to read tar output"));
+                break;
+            }
+        };
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        ssh_stdin
-            .write_all(&buf[..n])
-            .context("Failed to write to SSH stdin")?;
+        if let Err(e) = ssh_stdin.write_all(&buf[..n]) {
+            transfer_err = Some(anyhow::Error::new(e).context("Failed to write to SSH stdin"));
+            break;
+        }
     }
     drop(ssh_stdin);
+    // Drop the tar stdout reader so any further tar writes get SIGPIPE
+    // and tar can exit promptly instead of blocking on a full pipe.
+    drop(tar_stdout);
 
-    let local_hash = hex::encode(hasher.finalize());
-
-    let output = ssh_child
-        .wait_with_output()
-        .context("Failed to wait for SSH transfer")?;
-
+    let ssh_status = ssh_child.wait().context("Failed to wait for SSH")?;
     let tar_status = tar_child.wait().context("Failed to wait for tar")?;
+    let stderr_buf = join_drainer(stderr_thread)?;
+
+    // If the streaming loop failed (typically EPIPE), surface the
+    // remote stderr — that's where "No space left on device" and
+    // similar root-cause errors appear.
+    if let Some(err) = transfer_err {
+        return Err(err.context(format_remote_failure(&stderr_buf)));
+    }
+
     if !tar_status.success() {
         bail!("Local tar archive creation failed");
     }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("tar-pipe transfer to guest failed: {stderr}");
-    }
-
-    let remote_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if local_hash != remote_hash {
+    if !ssh_status.success() {
         bail!(
-            "Checksum mismatch after tar-pipe transfer\n  \
-             local:  {local_hash}\n  \
-             remote: {remote_hash}\n\
-             The workspace may be corrupted — retry the transfer"
+            "tar-pipe transfer to guest failed: {}",
+            format_remote_failure(&stderr_buf)
         );
     }
 
-    tracing::debug!("Transfer checksum verified: {local_hash}");
     tracing::info!("Workspace transferred to guest");
     Ok(())
+}
+
+/// Spawn a background thread that reads `r` to EOF and returns the bytes.
+///
+/// Used to drain a child's stderr (or stdout) concurrently with the
+/// main IO loop, avoiding deadlocks when the child writes more than
+/// the pipe buffer can hold before the main thread is ready to read.
+fn drain_to_vec<R: std::io::Read + Send + 'static>(
+    mut r: R,
+    label: &'static str,
+) -> std::thread::JoinHandle<Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf)
+            .with_context(|| format!("Failed to drain {label}"))?;
+        Ok(buf)
+    })
+}
+
+fn join_drainer(handle: std::thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drainer thread panicked"))?
+}
+
+/// Build a user-facing message from the remote command's stderr.
+///
+/// The SSH-side tar only writes to stderr when something fails
+/// (extraction error, disk full, permission denied, etc.). When
+/// stderr is empty or indicates ENOSPC, append a hint pointing at
+/// the most common cause — the guest disk being too small for the
+/// workspace.
+fn format_remote_failure(stderr: &[u8]) -> String {
+    const DISK_HINT: &str = "The guest disk is likely too small for this \
+        workspace. Retry with a larger disk: `coop start --disk <GiB> ...`.";
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return format!("Remote SSH command exited without diagnostic output. {DISK_HINT}");
+    }
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+        return format!("Remote stderr:\n{stderr}\n\n{DISK_HINT}");
+    }
+    format!("Remote stderr:\n{stderr}")
 }
 
 fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
@@ -400,13 +457,7 @@ fn tar_pipe_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()
         .collect();
     let exclude_str = excludes.join(" ");
 
-    // Remote: tar to temp, hash to stderr, stream to stdout
-    let remote_cmd = format!(
-        "t=$(mktemp) && \
-         tar cf - -C {guest_path} {exclude_str} . >\"$t\" && \
-         sha256sum \"$t\" | cut -d' ' -f1 >&2 && \
-         cat \"$t\" && rm -f \"$t\""
-    );
+    let remote_cmd = format!("tar cf - -C {guest_path} {exclude_str} .");
 
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
@@ -428,72 +479,76 @@ fn tar_pipe_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()
         .take()
         .context("Failed to get SSH stderr")?;
 
-    // Collect stderr in background (contains remote hash)
-    let stderr_handle = std::thread::spawn(move || {
-        let mut stderr = ssh_stderr;
-        let mut buf = String::new();
-        stderr
-            .read_to_string(&mut buf)
-            .context("Failed to read SSH stderr")?;
-        Ok::<_, anyhow::Error>(buf)
-    });
-
     let mut tar_child = Command::new("tar")
         .arg("xf")
         .arg("-")
         .arg("-C")
         .arg(dest)
         .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start local tar extraction")?;
 
     let mut tar_stdin = tar_child.stdin.take().context("Failed to get tar stdin")?;
+    let tar_stderr = tar_child
+        .stderr
+        .take()
+        .context("Failed to get tar stderr")?;
 
-    // Stream SSH stdout through SHA-256 hasher to tar stdin
-    let mut hasher = Sha256::new();
+    // Drain both stderr streams in background threads. Either side
+    // can emit warnings during streaming and stall the pipeline if
+    // its 64K pipe buffer fills before someone reads.
+    let ssh_err_thread = drain_to_vec(ssh_stderr, "SSH stderr");
+    let tar_err_thread = drain_to_vec(tar_stderr, "local tar stderr");
+
+    // Stream SSH stdout to tar stdin. Capture IO errors instead of
+    // propagating immediately so we can drain stderr below.
     let mut buf = vec![0u8; 64 * 1024];
+    let mut transfer_err: Option<anyhow::Error> = None;
     loop {
-        let n = ssh_stdout
-            .read(&mut buf)
-            .context("Failed to read SSH output")?;
+        let n = match ssh_stdout.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                transfer_err = Some(anyhow::Error::new(e).context("Failed to read SSH output"));
+                break;
+            }
+        };
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        tar_stdin
-            .write_all(&buf[..n])
-            .context("Failed to write to tar stdin")?;
+        if let Err(e) = tar_stdin.write_all(&buf[..n]) {
+            transfer_err = Some(anyhow::Error::new(e).context("Failed to write to tar stdin"));
+            break;
+        }
     }
     drop(tar_stdin);
-
-    let local_hash = hex::encode(hasher.finalize());
-
-    let tar_status = tar_child.wait().context("Failed to wait for tar")?;
-    if !tar_status.success() {
-        bail!("tar extraction failed during pull");
-    }
+    drop(ssh_stdout);
 
     let ssh_status = ssh_child.wait().context("Failed to wait for SSH")?;
+    let tar_status = tar_child.wait().context("Failed to wait for tar")?;
+    let ssh_stderr_buf = join_drainer(ssh_err_thread)?;
+    let tar_stderr_buf = join_drainer(tar_err_thread)?;
+
+    if let Some(err) = transfer_err {
+        let ssh_stderr = String::from_utf8_lossy(&ssh_stderr_buf);
+        let tar_stderr = String::from_utf8_lossy(&tar_stderr_buf);
+        return Err(err.context(format!(
+            "Remote stderr:\n{}\nLocal tar stderr:\n{}",
+            ssh_stderr.trim(),
+            tar_stderr.trim()
+        )));
+    }
+
+    if !tar_status.success() {
+        let stderr = String::from_utf8_lossy(&tar_stderr_buf);
+        bail!("tar extraction failed during pull: {}", stderr.trim());
+    }
+
     if !ssh_status.success() {
-        bail!("tar-pipe pull from guest failed");
+        let stderr = String::from_utf8_lossy(&ssh_stderr_buf);
+        bail!("tar-pipe pull from guest failed: {}", stderr.trim());
     }
 
-    let remote_stderr = stderr_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr reader panicked"))?
-        .context("Failed to read remote checksum")?;
-    let remote_hash = remote_stderr.trim().to_string();
-
-    if local_hash != remote_hash {
-        bail!(
-            "Checksum mismatch after tar-pipe pull\n  \
-             local:  {local_hash}\n  \
-             remote: {remote_hash}\n\
-             The workspace may be corrupted — retry the transfer"
-        );
-    }
-
-    tracing::debug!("Pull checksum verified: {local_hash}");
     Ok(())
 }
 
@@ -788,6 +843,34 @@ mod tests {
             dir: dir.to_path_buf(),
             image: "default".to_string(),
         }
+    }
+
+    #[test]
+    fn format_remote_failure_empty_stderr_hints_disk() {
+        let msg = format_remote_failure(b"");
+        assert!(msg.contains("disk"), "should hint at disk full: {msg}");
+        assert!(msg.contains("--disk"), "should suggest --disk flag: {msg}");
+    }
+
+    #[test]
+    fn format_remote_failure_passes_through_stderr() {
+        let stderr = b"cat: write error: No space left on device\n";
+        let msg = format_remote_failure(stderr);
+        assert!(
+            msg.contains("No space left on device"),
+            "should surface remote stderr: {msg}"
+        );
+        assert!(
+            msg.starts_with("Remote stderr:"),
+            "should prefix with label: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_remote_failure_trims_whitespace() {
+        let msg = format_remote_failure(b"   \n\nactual error\n\n");
+        assert!(msg.contains("actual error"));
+        assert!(!msg.ends_with('\n'));
     }
 
     #[test]
