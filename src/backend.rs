@@ -144,6 +144,8 @@ impl SshTarget {
             "-o".into(),
             "UserKnownHostsFile=/dev/null".into(),
             "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
             "LogLevel=ERROR".into(),
             "-i".into(),
             self.key_path.display().to_string(),
@@ -179,6 +181,8 @@ impl SshTarget {
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
             "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
             "-o".into(),
             "LogLevel=ERROR".into(),
             "-i".into(),
@@ -309,7 +313,7 @@ impl SshTarget {
     pub fn rsync_ssh_cmd(&self) -> String {
         format!(
             "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o LogLevel=ERROR -i {} -p {}",
+             -o IdentitiesOnly=yes -o LogLevel=ERROR -i {} -p {}",
             self.key_path.display(),
             self.port,
         )
