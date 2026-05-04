@@ -706,6 +706,7 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   Port {}\n\
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
+         \x20   IdentitiesOnly yes\n\
          \x20   StrictHostKeyChecking no\n\
          \x20   UserKnownHostsFile /dev/null\n\
          \x20   LogLevel ERROR\n\
