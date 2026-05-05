@@ -169,40 +169,164 @@ impl Release {
 }
 
 pub fn fetch_latest() -> Result<Release> {
-    let url = format!("{}/repos/{REPO}/releases/latest", api_base());
-    fetch_release(&url).context("Failed to fetch latest release metadata")
+    fetch_release_metadata("latest").context("Failed to fetch latest release metadata")
 }
 
 pub fn fetch_by_tag(tag: &str) -> Result<Release> {
-    let url = format!("{}/repos/{REPO}/releases/tags/{tag}", api_base());
-    fetch_release(&url).with_context(|| format!("Failed to fetch release metadata for {tag}"))
+    fetch_release_metadata(&format!("tags/{tag}"))
+        .with_context(|| format!("Failed to fetch release metadata for {tag}"))
 }
 
-fn fetch_release(url: &str) -> Result<Release> {
-    let body = curl_capture(url)?;
+/// Fetch release JSON for the given API path suffix (`latest` or `tags/<tag>`).
+///
+/// Selects an auth strategy at call time so changes to `GITHUB_TOKEN` /
+/// `gh auth` between invocations take effect.
+fn fetch_release_metadata(path_suffix: &str) -> Result<Release> {
+    let body = match select_auth_strategy_from_env() {
+        AuthStrategy::Gh => gh_api_capture(&format!("repos/{REPO}/releases/{path_suffix}"))?,
+        AuthStrategy::CurlBearer(token) => {
+            let url = format!("{}/repos/{REPO}/releases/{path_suffix}", api_base());
+            curl_capture(&url, Some(&token))?
+        }
+        AuthStrategy::CurlBare => {
+            let url = format!("{}/repos/{REPO}/releases/{path_suffix}", api_base());
+            curl_capture(&url, None)?
+        }
+    };
     serde_json::from_str(&body).context("Failed to parse GitHub release JSON")
 }
 
-// ── Network I/O (shell-out to curl) ──────────────────────────────────────────
+// ── Auth strategy selection ──────────────────────────────────────────────────
 
-fn curl_capture(url: &str) -> Result<String> {
-    Cmd::new("curl")
+/// How to authenticate against GitHub for release metadata and asset downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthStrategy {
+    /// Use the `gh` CLI (already authenticated to github.com).
+    Gh,
+    /// Use curl with a bearer token from `GITHUB_TOKEN`.
+    CurlBearer(String),
+    /// Use curl without authentication (public repo or test fixture).
+    CurlBare,
+}
+
+/// Pure strategy picker. Extracted from I/O so it is unit-testable.
+///
+/// When `api_base_overridden` is true, the integration test fixture is in use
+/// and we must not consult `gh` or `GITHUB_TOKEN` — the local server speaks
+/// neither.
+fn select_auth_strategy(
+    api_base_overridden: bool,
+    has_gh: bool,
+    gh_authed: bool,
+    github_token: Option<&str>,
+) -> AuthStrategy {
+    if api_base_overridden {
+        return AuthStrategy::CurlBare;
+    }
+    if has_gh && gh_authed {
+        return AuthStrategy::Gh;
+    }
+    match github_token.filter(|t| !t.is_empty()) {
+        Some(token) => AuthStrategy::CurlBearer(token.to_string()),
+        None => AuthStrategy::CurlBare,
+    }
+}
+
+fn select_auth_strategy_from_env() -> AuthStrategy {
+    let overridden = api_base_overridden();
+    let has_gh = !overridden && has_command("gh");
+    let gh_authed = has_gh && gh_authenticated();
+    let token = env::var("GITHUB_TOKEN").ok();
+    select_auth_strategy(overridden, has_gh, gh_authed, token.as_deref())
+}
+
+fn gh_authenticated() -> bool {
+    Cmd::new("gh")
+        .arg("auth")
+        .arg("status")
+        .arg("--hostname")
+        .arg("github.com")
+        .status_ok()
+}
+
+// ── Network I/O (shell-out to curl / gh) ─────────────────────────────────────
+
+fn curl_capture(url: &str, bearer_token: Option<&str>) -> Result<String> {
+    let mut cmd = Cmd::new("curl")
         .arg("-fsSL")
         .arg("-H")
-        .arg("Accept: application/vnd.github+json")
-        .arg(url)
+        .arg("Accept: application/vnd.github+json");
+    if let Some(token) = bearer_token {
+        // Pass the auth header on stdin via curl's `-H @-` so the secret
+        // never touches argv (visible in /proc and `Cmd::describe` logs).
+        cmd = cmd
+            .arg("-H")
+            .arg("@-")
+            .stdin_input(format!("Authorization: token {token}\n"));
+    }
+    cmd.arg(url)
         .capture()
         .with_context(|| format!("curl GET {url} failed"))
 }
 
-fn download_to(url: &str, dest: &Path) -> Result<()> {
-    Cmd::new("curl")
-        .arg("-fsSL")
-        .arg(url)
+fn gh_api_capture(path: &str) -> Result<String> {
+    Cmd::new("gh")
+        .arg("api")
+        .arg(path)
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .capture()
+        .with_context(|| format!("gh api {path} failed"))
+}
+
+/// Download a release asset, choosing auth strategy at call time.
+///
+/// `tag` and `asset_name` are required for the `gh release download` path;
+/// `url` is the `browser_download_url` used by the curl fallbacks.
+fn download_asset(tag: &str, asset_name: &str, url: &str, dest: &Path) -> Result<()> {
+    match select_auth_strategy_from_env() {
+        AuthStrategy::Gh => gh_release_download(tag, asset_name, dest),
+        AuthStrategy::CurlBearer(token) => curl_download(url, dest, Some(&token)),
+        AuthStrategy::CurlBare => curl_download(url, dest, None),
+    }
+}
+
+fn curl_download(url: &str, dest: &Path, bearer_token: Option<&str>) -> Result<()> {
+    let mut cmd = Cmd::new("curl").arg("-fsSL");
+    if let Some(token) = bearer_token {
+        // Pass the auth header on stdin via curl's `-H @-` so the secret
+        // never touches argv (visible in /proc and `Cmd::describe` logs).
+        cmd = cmd
+            .arg("-H")
+            .arg("@-")
+            .stdin_input(format!("Authorization: token {token}\n"));
+    }
+    cmd.arg(url)
         .arg("-o")
         .arg(dest)
         .run()
         .with_context(|| format!("curl download from {url} failed"))
+}
+
+fn gh_release_download(tag: &str, asset_name: &str, dest: &Path) -> Result<()> {
+    Cmd::new("gh")
+        .arg("release")
+        .arg("download")
+        .arg(tag)
+        .arg("--repo")
+        .arg(REPO)
+        .arg("--pattern")
+        .arg(asset_name)
+        .arg("--output")
+        .arg(dest)
+        .arg("--clobber")
+        .run()
+        .with_context(|| {
+            format!(
+                "gh release download {tag} --pattern {asset_name} -> {} failed",
+                dest.display()
+            )
+        })
 }
 
 // ── Checksum verification ────────────────────────────────────────────────────
@@ -423,8 +547,13 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
     let sums_path = tmp.path().join("SHA256SUMS");
 
     tracing::info!("Downloading {tarball_name}");
-    download_to(&tarball_asset.url, &tarball_path)?;
-    download_to(&sums_asset.url, &sums_path)?;
+    download_asset(
+        &release.tag,
+        &tarball_name,
+        &tarball_asset.url,
+        &tarball_path,
+    )?;
+    download_asset(&release.tag, "SHA256SUMS", &sums_asset.url, &sums_path)?;
 
     let sums_content = fs::read_to_string(&sums_path)
         .with_context(|| format!("Failed to read {}", sums_path.display()))?;
@@ -794,6 +923,52 @@ mod tests {
         assert!(!interval_elapsed(100_000 + one_hour - 1, 100_000, 1));
         // Saturating arithmetic: now earlier than last_checked_at must not panic.
         assert!(!interval_elapsed(0, 100_000, 24));
+    }
+
+    #[test]
+    fn select_auth_strategy_prefers_bare_when_api_base_overridden() {
+        // Even with gh authed and a token present, the local fixture forces bare curl.
+        let strat = select_auth_strategy(true, true, true, Some("ghp_xyz"));
+        assert_eq!(strat, AuthStrategy::CurlBare);
+    }
+
+    #[test]
+    fn select_auth_strategy_prefers_gh_when_authed() {
+        let strat = select_auth_strategy(false, true, true, Some("ghp_xyz"));
+        assert_eq!(strat, AuthStrategy::Gh);
+    }
+
+    #[test]
+    fn select_auth_strategy_falls_back_to_token_when_gh_unauthed() {
+        // gh installed but not authed -> use token if available.
+        let strat = select_auth_strategy(false, true, false, Some("ghp_abc"));
+        assert_eq!(strat, AuthStrategy::CurlBearer("ghp_abc".to_string()));
+    }
+
+    #[test]
+    fn select_auth_strategy_falls_back_to_token_when_gh_missing() {
+        let strat = select_auth_strategy(false, false, false, Some("ghp_abc"));
+        assert_eq!(strat, AuthStrategy::CurlBearer("ghp_abc".to_string()));
+    }
+
+    #[test]
+    fn select_auth_strategy_uses_bare_when_no_auth_available() {
+        let strat = select_auth_strategy(false, false, false, None);
+        assert_eq!(strat, AuthStrategy::CurlBare);
+    }
+
+    #[test]
+    fn select_auth_strategy_treats_empty_token_as_absent() {
+        // GITHUB_TOKEN="" should not produce a bogus Authorization header.
+        let strat = select_auth_strategy(false, false, false, Some(""));
+        assert_eq!(strat, AuthStrategy::CurlBare);
+    }
+
+    #[test]
+    fn select_auth_strategy_ignores_token_when_gh_authed() {
+        // gh wins over token when both are available — no need to leak the token.
+        let strat = select_auth_strategy(false, true, true, Some("ghp_xyz"));
+        assert_eq!(strat, AuthStrategy::Gh);
     }
 
     #[test]

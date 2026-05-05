@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +13,7 @@ pub struct Cmd {
     program: OsString,
     args: Vec<OsString>,
     sudo: bool,
+    stdin: Option<Vec<u8>>,
 }
 
 impl Cmd {
@@ -20,6 +22,7 @@ impl Cmd {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
             sudo: false,
+            stdin: None,
         }
     }
 
@@ -41,6 +44,19 @@ impl Cmd {
     /// Run the command under `sudo`.
     pub fn sudo(mut self) -> Self {
         self.sudo = true;
+        self
+    }
+
+    /// Pipe `bytes` to the child's stdin instead of inheriting the parent's.
+    ///
+    /// Use this for any data that must NOT appear on argv — secrets, tokens,
+    /// or large payloads. The bytes are written and stdin is closed before
+    /// the child exits, so the child sees EOF without further input.
+    ///
+    /// Compatible with [`Cmd::run`] and [`Cmd::capture`]; the existing
+    /// [`Cmd::stdin_write`] takes its data per-call instead.
+    pub fn stdin_input(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
         self
     }
 
@@ -74,10 +90,23 @@ impl Cmd {
     pub fn run(&self) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running: {desc}");
-        let status = self
-            .build()
-            .status()
-            .with_context(|| format!("Failed to execute {desc}"))?;
+        let status = match self.stdin.as_deref() {
+            None => self
+                .build()
+                .status()
+                .with_context(|| format!("Failed to execute {desc}"))?,
+            Some(bytes) => {
+                let mut child = self
+                    .build()
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("Failed to start {desc}"))?;
+                write_stdin_and_close(&mut child, bytes, &desc)?;
+                child
+                    .wait()
+                    .with_context(|| format!("Failed to wait for {desc}"))?
+            }
+        };
         if !status.success() {
             bail!("{desc} exited with {status}");
         }
@@ -86,8 +115,6 @@ impl Cmd {
 
     /// Pipe `data` into stdin, suppress stdout, and check exit status.
     pub fn stdin_write(&self, data: &[u8]) -> Result<()> {
-        use std::io::Write as _;
-
         let desc = self.describe();
         tracing::debug!("Running (stdin pipe): {desc}");
         let mut child = self
@@ -96,12 +123,7 @@ impl Cmd {
             .stdout(Stdio::null())
             .spawn()
             .with_context(|| format!("Failed to start {desc}"))?;
-
-        if let Some(ref mut stdin) = child.stdin {
-            stdin
-                .write_all(data)
-                .with_context(|| format!("Failed to write stdin for {desc}"))?;
-        }
+        write_stdin_and_close(&mut child, data, &desc)?;
         let status = child
             .wait()
             .with_context(|| format!("Failed to wait for {desc}"))?;
@@ -127,11 +149,26 @@ impl Cmd {
     pub fn capture(&self) -> Result<String> {
         let desc = self.describe();
         tracing::debug!("Running (capture): {desc}");
-        let output = self
-            .build()
-            .stderr(Stdio::null())
-            .output()
-            .with_context(|| format!("Failed to execute {desc}"))?;
+        let output = match self.stdin.as_deref() {
+            None => self
+                .build()
+                .stderr(Stdio::null())
+                .output()
+                .with_context(|| format!("Failed to execute {desc}"))?,
+            Some(bytes) => {
+                let mut child = self
+                    .build()
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .with_context(|| format!("Failed to start {desc}"))?;
+                write_stdin_and_close(&mut child, bytes, &desc)?;
+                child
+                    .wait_with_output()
+                    .with_context(|| format!("Failed to wait for {desc}"))?
+            }
+        };
         if !output.status.success() {
             bail!("{desc} exited with {}", output.status);
         }
@@ -141,6 +178,9 @@ impl Cmd {
 
     /// Run the command with stdout and stderr suppressed.
     /// Returns `true` if the exit status is success.
+    ///
+    /// `stdin_input` is ignored here — `status_ok` is used for probes
+    /// (`command -v gh`, `gh auth status`) that take no input.
     pub fn status_ok(&self) -> bool {
         let desc = self.describe();
         tracing::debug!("Running (status_ok): {desc}");
@@ -150,6 +190,24 @@ impl Cmd {
             .status()
             .is_ok_and(|s| s.success())
     }
+}
+
+/// Write `bytes` to the child's stdin, then close it so the child sees EOF.
+///
+/// Used by [`Cmd::run`] and [`Cmd::capture`] when [`Cmd::stdin_input`] was
+/// configured. Closing the handle is what curl `-H @-` and similar idioms
+/// rely on to know the input is complete.
+fn write_stdin_and_close(child: &mut std::process::Child, bytes: &[u8], desc: &str) -> Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .with_context(|| format!("stdin pipe missing for {desc}"))?;
+    stdin
+        .write_all(bytes)
+        .with_context(|| format!("Failed to write stdin for {desc}"))?;
+    // Dropping `stdin` closes the pipe so the child sees EOF.
+    drop(stdin);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,6 +287,23 @@ mod tests {
     fn cmd_describe_no_args() {
         let cmd = Cmd::new("ls");
         assert_eq!(cmd.describe(), "ls");
+    }
+
+    #[test]
+    fn stdin_input_round_trips_through_capture() {
+        // `cat` echoes stdin to stdout — verifies the pipe is wired and closed.
+        let out = Cmd::new("cat").stdin_input(b"hello".to_vec()).capture();
+        assert_eq!(out.expect("cat capture"), "hello");
+    }
+
+    #[test]
+    fn stdin_input_run_succeeds_for_consumer_command() {
+        // `cat` exits 0 after consuming stdin; closing the pipe must signal EOF
+        // so it does not hang.
+        Cmd::new("cat")
+            .stdin_input(b"data".to_vec())
+            .run()
+            .expect("cat run");
     }
 
     #[test]
