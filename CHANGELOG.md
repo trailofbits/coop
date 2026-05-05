@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.4.2
+
+### Fixes
+
+- **SSH connections respect `IdentitiesOnly`** (#68) — When `ssh-agent`
+  holds many keys, ssh offered all of them before the explicit `-i` key,
+  hitting sshd's default `MaxAuthTries=6` and producing "SSH not ready"
+  on `coop start`. SSH/SCP/rsync invocations and the generated
+  `~/.ssh/config` block now set `IdentitiesOnly=yes`, matching Lima's
+  own probes.
+
+- **Workspace tar-pipe transfer** (#66, #67) — Surface SSH stderr (with
+  a `coop start --disk` hint when the message mentions "no space left
+  on device") instead of a generic "tar archive truncated" error. Peak
+  guest disk usage during transfer is now the extracted tree, not 2× —
+  the temp-file/SHA-256 dance was redundant since SSH already MACs the
+  channel. Dedicated background threads drain remote and local tar
+  stderr to prevent deadlocks when warnings fill the 64K pipe buffer
+  during extraction.
+
+- **Integration test no longer pollutes user state** (#63, #64) —
+  `tests/integration-update.sh` redirects `$HOME` and XDG vars to a
+  tempdir before invoking coop, so the synthetic `v9.9.9` release
+  served by the test fixture no longer lands in
+  `~/.local/state/coop/update-check.json` and surfaces as a bogus
+  update notification on later runs.
+
+### Dependencies
+
+- `libc` 0.2.185 → 0.2.186, `semver` 1.0.27 → 1.0.28 (#65)
+
 ## v0.4.1
 
 Re-release of v0.4.0. The v0.4.0 tag did not produce release artifacts
