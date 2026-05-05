@@ -83,6 +83,11 @@ host triple, verifies the SHA-256 against the release's `SHA256SUMS`, and
 (when `gh` is installed) verifies the GitHub build-provenance attestation
 before swapping the binary atomically.
 
+While `trailofbits/coop` is private, `coop update` requires either
+[`gh`](https://cli.github.com/) authenticated against `github.com` or
+`GITHUB_TOKEN` in the environment to reach the API and download release
+assets. Once the repository is public, no auth is needed.
+
 ```sh
 coop update --check             # report whether a newer release exists
 coop update                     # prompt, then install the latest release
