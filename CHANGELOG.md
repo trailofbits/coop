@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.3
+
+### Fixes
+
+- **`coop update` works on the private/internal `trailofbits/coop` repo**
+  (#70, #71) — Previously the in-binary update shelled out to bare
+  `curl`, which the GitHub API answers with 404 for unauthenticated
+  requests against private repos, surfacing as `curl exited with exit
+  status: 22`. The update path now authenticates the same way
+  `install.sh` already did: prefer `gh` (when installed and authenticated
+  against `github.com`), fall back to `GITHUB_TOKEN`, then bare curl
+  (which works once the repo is public).
+
+- **GitHub token no longer appears on argv** (#71) — Both `src/update.rs`
+  and `install.sh` now feed the `Authorization` header to curl on stdin
+  (`curl -H @-`) instead of as a command-line argument, so
+  `$GITHUB_TOKEN` is no longer visible in `/proc/<pid>/cmdline` or in
+  `coop -v update`'s tracing debug log.
+
+### Documentation
+
+- README and `docs/commands.md` note that `coop update` requires `gh` or
+  `GITHUB_TOKEN` while the repository is private (#71).
+
 ## v0.4.2
 
 ### Fixes
