@@ -22,6 +22,8 @@ coop start --git-repo https://github.com/org/repo.git
 
 Clones the repository inside the guest at `/workspace/repo`. Nothing transfers from the host. The resulting `workspace.json` has a null `host_path`, so `push` and `pull` require an explicit directory argument.
 
+For private GitHub repositories, coop resolves a host-side token (`gh auth token` first, then `GITHUB_TOKEN`) and forwards it to git in the guest via a one-shot credential helper for this clone only. The token never appears on argv and never persists in the guest. Without a token, the clone runs unauthenticated and will fail for private repos.
+
 ### Host mount (`--mount`)
 
 ```bash

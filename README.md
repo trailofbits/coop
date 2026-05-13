@@ -42,7 +42,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 ## Features
 
 - **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
-- **Workspace sync**: push a local directory into the VM, or clone a git repo directly with `--git-repo`
+- **Workspace sync**: push a local directory into the VM, or clone a git repo directly with `--git-repo` (private GitHub repos use `gh auth token` or `GITHUB_TOKEN` on the host)
 - **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration

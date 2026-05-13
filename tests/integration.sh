@@ -1446,6 +1446,90 @@ test_workspace_sync() {
     ws_tmpdir=""
 }
 
+# ── Private GitHub clone (--full only) ────────────────────────
+#
+# Exercises the `--git-repo` auth path against the (private) trailofbits/coop
+# repo. Skipped if the host has neither a usable `gh` token nor `GITHUB_TOKEN`,
+# so the test can run on machines that don't have GitHub credentials wired up.
+test_git_repo_private_clone() {
+    echo ""
+    echo "=== Phase: --git-repo against private GitHub repo ==="
+
+    if ! command -v gh >/dev/null 2>&1 || ! gh auth token >/dev/null 2>&1; then
+        if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+            skip "--git-repo clones private trailofbits/coop" \
+                "no gh auth token and GITHUB_TOKEN unset"
+            return
+        fi
+    fi
+
+    local repo_instance="${INSTANCE}-gitrepo"
+    local repo_url="https://github.com/trailofbits/coop.git"
+
+    if coop start "$repo_instance" --no-agents --git-repo "$repo_url"; then
+        STARTED_INSTANCES+=("$repo_instance")
+        pass "start with --git-repo against private repo exits 0"
+    else
+        fail "start with --git-repo against private repo exits 0" "exit code: $?"
+        echo "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    GUEST_INSTANCE="$repo_instance"
+
+    # Verify the clone landed: a few files we know exist in this repo.
+    if guest_exec test -f /workspace/repo/Cargo.toml; then
+        pass "/workspace/repo/Cargo.toml present after private clone"
+    else
+        fail "/workspace/repo/Cargo.toml present after private clone" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec test -f /workspace/repo/src/backend.rs; then
+        pass "/workspace/repo/src/backend.rs present after private clone"
+    else
+        fail "/workspace/repo/src/backend.rs present after private clone" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    # Token must not persist in the cloned repo's git config (remote URL,
+    # credential helper, or otherwise). The clone uses a one-shot
+    # `-c credential.helper=...` which is not written to .git/config.
+    local git_config
+    if git_config=$(guest_exec cat /workspace/repo/.git/config); then
+        if echo "$git_config" | grep -Eq '(x-access-token|ghp_|gho_|ghu_|ghs_|github_pat_|credential\.helper)'; then
+            fail "no token or credential helper persisted in .git/config" \
+                "config contained sensitive markers"
+        else
+            pass "no token or credential helper persisted in .git/config"
+        fi
+    else
+        fail "no token or credential helper persisted in .git/config" \
+            "could not read .git/config: $(guest_stderr)"
+    fi
+
+    # The user's global gitconfig in the guest should not have been written
+    # with a credential helper by this code path (--no-agents skips the
+    # separate `gh auth setup-git` flow).
+    if guest_exec test -f /home/coop/.gitconfig; then
+        local global_config
+        global_config=$(guest_exec cat /home/coop/.gitconfig 2>/dev/null || echo "")
+        if echo "$global_config" | grep -q 'credential.helper'; then
+            fail "no global git credential helper installed" \
+                "found credential.helper in /home/coop/.gitconfig"
+        else
+            pass "no global git credential helper installed"
+        fi
+    else
+        pass "no global git credential helper installed"
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop destroy "$repo_instance" 2>/dev/null || true
+    untrack_instance "$repo_instance"
+}
+
 # ── Push/pull without --workspace (--full only) ──────────────
 
 test_push_pull_no_workspace() {
@@ -2488,6 +2572,7 @@ main() {
         test_host_mount_custom_guest_path
         test_push_pull_no_workspace
         test_workspace_sync
+        test_git_repo_private_clone
         test_multi_instance
         test_named_images
         test_custom_profiles

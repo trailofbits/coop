@@ -87,6 +87,8 @@ coop start [NAME] [FLAGS]
 
 `--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
 
+For private GitHub repos, `--git-repo` resolves a host-side token (`gh auth token` first, then `GITHUB_TOKEN`) and hands it to git in the guest via a one-shot credential helper. Without a token, the clone runs unauthenticated and will fail for private repos.
+
 ```
 coop start my-project --workspace ./src --vcpus 4 --mem 8192
 coop start --git-repo https://github.com/org/repo.git --disk 50

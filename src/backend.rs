@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
-#[cfg(not(target_os = "macos"))]
 use crate::cmd::Cmd;
 use crate::config::{ConfigDir, CoopConfig, GitHubAuth, Instance, McpServerDef};
 use crate::setup::SetupOptions;
@@ -212,6 +211,22 @@ impl SshTarget {
             bail!("SSH command failed: {cmd}");
         }
         Ok(())
+    }
+
+    /// Run a command on the guest via SSH, piping `stdin` to the remote shell.
+    ///
+    /// The bytes are written to ssh's stdin and forwarded to the remote shell.
+    /// Use this when the command needs to consume secrets that must not appear
+    /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
+    pub fn exec_with_stdin(&self, cmd: &str, stdin: Vec<u8>) -> Result<()> {
+        let mut args = self.ssh_opts();
+        args.push(self.addr());
+        args.push(cmd.to_string());
+        Cmd::new("ssh")
+            .args(args)
+            .stdin_input(stdin)
+            .run()
+            .with_context(|| format!("SSH command failed: {cmd}"))
     }
 
     /// Check if a command succeeds on the guest.
@@ -1066,15 +1081,7 @@ fn resolve_github_token(strategy: Option<&GitHubAuth>) -> Option<String> {
         GitHubAuth::Auto => std::env::var("GITHUB_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
-            .or_else(|| {
-                Command::new("gh")
-                    .args(["auth", "token"])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .filter(|t| !t.is_empty())
-            }),
+            .or_else(gh_auth_token),
         GitHubAuth::Env => {
             let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
             if token.is_none() {
@@ -1489,9 +1496,44 @@ fn register_mcp_servers(
 }
 
 /// Clone a git repository inside the guest VM via SSH.
+///
+/// For GitHub HTTPS URLs, opportunistically resolves a token on the host
+/// (`gh auth token` then `GITHUB_TOKEN`) and forwards it to git in the guest
+/// via stdin and a one-shot credential helper. The token never appears on
+/// argv, so it stays out of `/proc/<pid>/cmdline` and the ssh debug log.
+/// If no token is available, falls back to an unauthenticated clone (which
+/// works for public repos).
 pub fn clone_git_repo(target: &SshTarget, repo_url: &str) -> Result<()> {
     tracing::info!("Cloning {repo_url} into guest /workspace");
 
+    let is_github = is_github_https_url(repo_url);
+    let token = is_github.then(host_github_token).flatten();
+
+    let result = match token.as_deref() {
+        Some(t) => clone_with_token(target, repo_url, t),
+        None => clone_without_auth(target, repo_url),
+    };
+
+    let token_attempted = token.is_some();
+    result.with_context(|| {
+        if token_attempted {
+            format!("Failed to clone {repo_url} in guest (host-resolved token rejected)")
+        } else if is_github {
+            format!(
+                "Failed to clone {repo_url} in guest. \
+                 If this is a private repo, run `gh auth login` or set \
+                 `GITHUB_TOKEN` on the host before `coop start --git-repo`."
+            )
+        } else {
+            format!("Failed to clone {repo_url} in guest")
+        }
+    })?;
+
+    tracing::info!("Repository cloned to /workspace/repo");
+    Ok(())
+}
+
+fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
     let cmd = format!(
         "sudo mkdir -p /workspace && \
          sudo chown $(whoami):$(whoami) /workspace && \
@@ -1499,13 +1541,89 @@ pub fn clone_git_repo(target: &SshTarget, repo_url: &str) -> Result<()> {
          echo 'Repository cloned to /workspace/repo'",
         shell_escape(repo_url),
     );
+    target.exec(&cmd)
+}
 
-    target
-        .exec(&cmd)
-        .context("Failed to clone git repo in guest")?;
+fn clone_with_token(target: &SshTarget, repo_url: &str, token: &str) -> Result<()> {
+    let mut stdin = Vec::with_capacity(token.len() + 1);
+    stdin.extend_from_slice(token.as_bytes());
+    stdin.push(b'\n');
+    target.exec_with_stdin(&build_clone_with_token_script(repo_url), stdin)
+}
 
-    tracing::info!("Repository cloned to /workspace/repo");
-    Ok(())
+/// Build the remote shell script that reads a GitHub token from stdin and
+/// uses it via a one-shot git credential helper to clone `repo_url`.
+///
+/// Separated from `clone_with_token` so the script template can be
+/// unit-tested without spawning ssh.
+fn build_clone_with_token_script(repo_url: &str) -> String {
+    // The remote shell reads the token from stdin into GH_TOKEN, exports it
+    // so the credential helper subshell inherits it, then clones with a
+    // one-shot helper that returns the token to git. The single quotes
+    // around the helper preserve `$GH_TOKEN` for expansion inside the
+    // helper's subshell (not at script-parse time).
+    format!(
+        "set -eu\n\
+         IFS= read -r GH_TOKEN\n\
+         export GH_TOKEN\n\
+         sudo mkdir -p /workspace\n\
+         sudo chown \"$(whoami):$(whoami)\" /workspace\n\
+         git -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GH_TOKEN\"; }}; f' clone {url} /workspace/repo\n\
+         echo 'Repository cloned to /workspace/repo'\n",
+        url = shell_escape(repo_url),
+    )
+}
+
+/// Returns true when `url` is an `https://github.com/...` URL with no userinfo.
+///
+/// Userinfo (`https://user:pass@github.com/...`) means the caller is supplying
+/// their own credentials, so we leave the URL alone.
+fn is_github_https_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    matches!(rest.split_once('/'), Some((host, _)) if host == "github.com")
+}
+
+/// Best-effort host-side GitHub token resolution for `git clone`.
+///
+/// Prefers `gh auth token` (uses the user's configured GitHub login),
+/// falls back to `GITHUB_TOKEN`. Returns `None` when neither is available.
+///
+/// Note: this intentionally bypasses the [`GitHubAuth`] config gate that
+/// [`resolve_github_token`] honours. That gate exists to control whether a
+/// token is forwarded into the **guest environment** (where it persists for
+/// the lifetime of the VM and is visible to every guest process). This path
+/// is different: the token is consumed once via stdin in a one-shot
+/// `credential.helper`, never enters the guest env, and the in-memory copy
+/// dies with the ssh child. The threat model the gate defends against
+/// doesn't apply here, so opt-in is not required.
+fn host_github_token() -> Option<String> {
+    select_host_token(
+        gh_auth_token().as_deref(),
+        std::env::var("GITHUB_TOKEN").ok().as_deref(),
+    )
+}
+
+/// Pure picker: prefer the `gh` value, fall back to `GITHUB_TOKEN`.
+/// Both inputs are trimmed; an all-whitespace or empty string is absent.
+fn select_host_token(gh: Option<&str>, env: Option<&str>) -> Option<String> {
+    let normalize = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    gh.and_then(normalize).or_else(|| env.and_then(normalize))
+}
+
+/// Run `gh auth token` and return the trimmed stdout, if any.
+fn gh_auth_token() -> Option<String> {
+    Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1742,6 +1860,113 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert_eq!(
             std::fs::read_to_string(target.join("b/c.txt")).unwrap(),
             "nested"
+        );
+    }
+
+    #[test]
+    fn is_github_https_url_matches_canonical_https() {
+        assert!(is_github_https_url("https://github.com/owner/repo"));
+        assert!(is_github_https_url("https://github.com/owner/repo.git"));
+        assert!(is_github_https_url("https://github.com/"));
+    }
+
+    #[test]
+    fn is_github_https_url_rejects_ssh_and_git_schemes() {
+        assert!(!is_github_https_url("git@github.com:owner/repo.git"));
+        assert!(!is_github_https_url("ssh://git@github.com/owner/repo"));
+        assert!(!is_github_https_url("git://github.com/owner/repo"));
+    }
+
+    #[test]
+    fn is_github_https_url_rejects_other_hosts() {
+        assert!(!is_github_https_url("https://gitlab.com/owner/repo"));
+        assert!(!is_github_https_url("https://example.com/github.com/repo"));
+        assert!(!is_github_https_url("https://api.github.com/repos/x/y"));
+    }
+
+    #[test]
+    fn is_github_https_url_rejects_userinfo() {
+        // Caller is supplying their own credentials — leave URL alone.
+        assert!(!is_github_https_url(
+            "https://user:pass@github.com/owner/repo"
+        ));
+        assert!(!is_github_https_url("https://token@github.com/owner/repo"));
+    }
+
+    #[test]
+    fn is_github_https_url_rejects_bare_host() {
+        // No path component — not a clonable URL anyway, but make sure we
+        // don't treat a non-URL like a match.
+        assert!(!is_github_https_url("https://github.com"));
+    }
+
+    #[test]
+    fn select_host_token_prefers_gh_over_env() {
+        let pick = select_host_token(Some("gh-token"), Some("env-token"));
+        assert_eq!(pick.as_deref(), Some("gh-token"));
+    }
+
+    #[test]
+    fn select_host_token_falls_back_to_env_when_gh_absent() {
+        let pick = select_host_token(None, Some("env-token"));
+        assert_eq!(pick.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn select_host_token_falls_back_to_env_when_gh_is_blank() {
+        let pick = select_host_token(Some("   \n"), Some("env-token"));
+        assert_eq!(pick.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn select_host_token_trims_both_paths() {
+        let pick = select_host_token(Some("  gh-token\n"), None);
+        assert_eq!(pick.as_deref(), Some("gh-token"));
+        let pick = select_host_token(None, Some("\tenv-token  "));
+        assert_eq!(pick.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn select_host_token_returns_none_when_both_absent_or_blank() {
+        assert_eq!(select_host_token(None, None), None);
+        assert_eq!(select_host_token(Some(""), Some("")), None);
+        assert_eq!(select_host_token(Some(" "), Some("\n")), None);
+    }
+
+    #[test]
+    fn build_clone_with_token_script_contains_required_pieces() {
+        let script = build_clone_with_token_script("https://github.com/owner/repo.git");
+        assert!(script.starts_with("set -eu\n"), "script: {script}");
+        assert!(
+            script.contains("IFS= read -r GH_TOKEN\n"),
+            "missing read line: {script}"
+        );
+        assert!(
+            script.contains("export GH_TOKEN\n"),
+            "missing export line: {script}"
+        );
+        assert!(
+            script.contains(
+                "credential.helper='!f() { echo username=x-access-token; \
+                 echo \"password=$GH_TOKEN\"; }; f'"
+            ),
+            "credential helper malformed: {script}"
+        );
+        assert!(
+            script.contains(" clone 'https://github.com/owner/repo.git' /workspace/repo\n"),
+            "missing escaped clone target: {script}"
+        );
+    }
+
+    #[test]
+    fn build_clone_with_token_script_escapes_repo_url() {
+        // A URL with a single quote would otherwise break out of the
+        // surrounding `'...'` argument. `shell_escape` must apply.
+        let script = build_clone_with_token_script("https://github.com/o'wner/repo");
+        // Embedded quote must be escaped via the standard `'\''` trick.
+        assert!(
+            script.contains("'https://github.com/o'\\''wner/repo'"),
+            "single quote not escaped: {script}"
         );
     }
 }
