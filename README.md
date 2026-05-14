@@ -63,6 +63,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `destroy` | Stop and remove a VM instance |
 | `shell` | Interactive shell session in a running VM |
 | `claude` | Launch Claude Code inside the VM |
+| `claude-agents` (`ca`) | Open the Claude Code agent view inside the VM |
 | `codex` | Launch Codex inside the VM |
 | `exec` | Run a command in the VM non-interactively |
 | `push` | Sync local directory into the VM |

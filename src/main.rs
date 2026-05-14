@@ -75,6 +75,17 @@ impl SessionArgs {
         }
         Some(self.session.as_deref().unwrap_or(default))
     }
+
+    /// Returns a tmux session name only when explicitly requested via
+    /// `--session`. Used by commands where tmux is opt-in (the wrapped
+    /// process manages its own persistence, e.g. `claude agents` whose
+    /// background sessions live in the daemon, not the terminal).
+    fn tmux_session_opt_in(&self) -> Option<&str> {
+        if self.no_tmux {
+            return None;
+        }
+        self.session.as_deref()
+    }
 }
 
 #[derive(Subcommand)]
@@ -157,6 +168,15 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `claude`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Open the Claude Code agent view inside the VM (`claude agents`)
+    #[command(alias = "ca")]
+    ClaudeAgents {
+        #[command(flatten)]
+        session: SessionArgs,
+        /// Extra arguments passed to `claude agents`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -437,6 +457,17 @@ fn main() -> Result<()> {
                 args.insert(0, "--dangerously-skip-permissions".to_string());
             }
             let tmux = session.tmux_session("claude");
+            ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
+        }
+        Commands::ClaudeAgents { session, mut args } => {
+            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
+            let env_vars = backend::prepare_env_forwarding(&cfg)?;
+            let sess = backend::SshSession {
+                target: &running.target,
+                env: &env_vars,
+            };
+            args.insert(0, "agents".to_string());
+            let tmux = session.tmux_session_opt_in();
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
         }
         Commands::Codex { session, args } => {
@@ -1382,6 +1413,62 @@ mod tests {
         };
         assert_eq!(session.name.as_deref(), Some("myvm"));
         assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn claude_agents_subcommand_parses() {
+        let cli = parse(&["claude-agents"]);
+        assert!(matches!(cli.command, super::Commands::ClaudeAgents { .. }));
+    }
+
+    #[test]
+    fn claude_agents_ca_alias_parses() {
+        let cli = parse(&["ca"]);
+        assert!(matches!(cli.command, super::Commands::ClaudeAgents { .. }));
+    }
+
+    #[test]
+    fn claude_agents_defaults_to_no_tmux() {
+        let cli = parse(&["claude-agents"]);
+        let super::Commands::ClaudeAgents { session, .. } = cli.command else {
+            panic!("expected ClaudeAgents variant");
+        };
+        assert!(session.tmux_session_opt_in().is_none());
+    }
+
+    #[test]
+    fn claude_agents_session_flag_opts_into_tmux() {
+        let cli = parse(&["claude-agents", "--session", "dev"]);
+        let super::Commands::ClaudeAgents { session, .. } = cli.command else {
+            panic!("expected ClaudeAgents variant");
+        };
+        assert_eq!(session.tmux_session_opt_in(), Some("dev"));
+    }
+
+    #[test]
+    fn claude_agents_no_tmux_stays_off() {
+        let cli = parse(&["claude-agents", "--no-tmux"]);
+        let super::Commands::ClaudeAgents { session, .. } = cli.command else {
+            panic!("expected ClaudeAgents variant");
+        };
+        assert!(session.no_tmux);
+        assert!(session.tmux_session_opt_in().is_none());
+    }
+
+    #[test]
+    fn claude_agents_session_and_no_tmux_conflict() {
+        let err = parse_err(&["claude-agents", "--session", "x", "--no-tmux"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn claude_agents_name_and_trailing_args_parse() {
+        let cli = parse(&["ca", "myvm", "--", "--cwd", "/workspace"]);
+        let super::Commands::ClaudeAgents { session, args, .. } = cli.command else {
+            panic!("expected ClaudeAgents variant");
+        };
+        assert_eq!(session.name.as_deref(), Some("myvm"));
+        assert_eq!(args, vec!["--cwd", "/workspace"]);
     }
 
     #[test]

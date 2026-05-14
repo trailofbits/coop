@@ -32,6 +32,28 @@ To bypass tmux and get a raw SSH session:
 coop claude --no-tmux
 ```
 
+## Managing background agents
+
+```bash
+coop claude-agents [instance-name] [-- extra-args...]
+# or the short alias:
+coop ca
+```
+
+This runs `claude agents` in the guest, which opens the agent view — an interactive TUI for monitoring background agent sessions. Background sessions are managed by Claude Code (not by coop), so closing the TUI and reconnecting later with `coop ca` keeps you in sync with whatever is still running.
+
+`claude agents` accepts `--cwd <path>` (filter sessions by working directory) and `--setting-sources <sources>`; pass them after `--`:
+
+```bash
+coop ca -- --cwd /workspace
+```
+
+Unlike `coop claude`, this command does **not** run inside tmux by default — closing the TUI doesn't stop background sessions, so terminal-level persistence adds little. To opt into tmux, pass coop's `--session <name>` flag *before* the `--` separator (it's a coop flag, not a `claude agents` flag):
+
+```bash
+coop ca --session work
+```
+
 ## Configuration
 
 Claude-related settings live under the `[claude]` section in `config.toml`, except `github` which is a top-level field:
