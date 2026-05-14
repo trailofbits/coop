@@ -739,10 +739,7 @@ fn install_builder_plugins(
         env.set("GITHUB_TOKEN", token);
     }
 
-    let session = crate::backend::SshSession {
-        target: &target,
-        env: &env,
-    };
+    let session = crate::backend::SshSession { target, env };
 
     if !marketplaces.is_empty() {
         crate::backend::install_marketplaces(&session, &marketplaces)?;

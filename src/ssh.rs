@@ -28,7 +28,7 @@ fn guest_term() -> String {
 /// When `tmux_session` is `Some`, the session runs inside a named
 /// tmux session that survives SSH disconnects. Reconnecting
 /// reattaches to the existing session.
-pub fn connect(session: &SshSession<'_>, tmux_session: Option<&str>) -> Result<()> {
+pub fn connect(session: &SshSession, tmux_session: Option<&str>) -> Result<()> {
     tracing::info!(
         "Connecting via SSH to {}:{}",
         session.target.host,
@@ -64,7 +64,7 @@ pub fn connect(session: &SshSession<'_>, tmux_session: Option<&str>) -> Result<(
 /// Run a command non-interactively over SSH (no PTY).
 ///
 /// Propagates the remote command's exit code via the process exit code.
-pub fn run_command(session: &SshSession<'_>, command: &[String]) -> Result<()> {
+pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
     let remote_cmd = command
         .iter()
         .map(|a| shell_escape(a))
@@ -96,7 +96,7 @@ pub fn run_command(session: &SshSession<'_>, command: &[String]) -> Result<()> {
 /// tmux session. If the session already exists, it reattaches
 /// (the command argument is ignored by tmux on reattach).
 pub fn run_interactive(
-    session: &SshSession<'_>,
+    session: &SshSession,
     cmd: &str,
     extra_args: &[String],
     tmux_session: Option<&str>,
@@ -143,7 +143,7 @@ pub fn run_interactive(
 /// Stdout and stderr from the remote command are written to the local
 /// stdout/stderr respectively. The process exits with the remote
 /// command's exit code, making this suitable for scripting and CI.
-pub fn exec_command(session: &SshSession<'_>, command: &[String]) -> Result<()> {
+pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
     let remote_cmd = command
         .iter()
         .map(|a| shell_escape(a))

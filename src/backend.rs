@@ -101,11 +101,12 @@ pub struct SshTarget {
 // ── SSH session ───────────────────────────────────────────────
 
 /// SSH operations that combine connection details with environment
-/// forwarding. Borrows both to avoid duplication at call sites
-/// where target and env are always passed together.
-pub struct SshSession<'a> {
-    pub target: &'a SshTarget,
-    pub env: &'a EnvForward,
+/// forwarding. Owns both so call sites can construct a session once
+/// and pass it around without juggling lifetimes; `SshTarget` and
+/// `EnvForward` are cheap to clone (small string buffers).
+pub struct SshSession {
+    pub target: SshTarget,
+    pub env: EnvForward,
 }
 
 impl SshTarget {
@@ -382,7 +383,7 @@ impl SshTarget {
     }
 }
 
-impl SshSession<'_> {
+impl SshSession {
     /// SSH options with environment variable forwarding.
     pub fn ssh_opts(&self) -> Vec<String> {
         let mut opts = self.target.ssh_opts();
@@ -921,7 +922,7 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
 
 /// Bootstrap configured guest agents in the guest declaratively.
 pub fn bootstrap_agents(
-    session: &SshSession<'_>,
+    session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     restart: bool,
@@ -953,7 +954,7 @@ pub fn bootstrap_agents(
 /// `ANTHROPIC_API_KEY` (if set) is forwarded via `SendEnv`
 /// on every SSH session automatically.
 fn bootstrap_claude(
-    session: &SshSession<'_>,
+    session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     restart: bool,
@@ -980,7 +981,7 @@ fn bootstrap_claude(
     }
 
     // User config (CLAUDE.md, rules/, commands/) — host files may have changed
-    copy_claude_config(session.target, &claude.config_dir)?;
+    copy_claude_config(&session.target, &claude.config_dir)?;
 
     // Marketplaces, plugins, MCP servers — persisted on guest disk,
     // only install on first boot
@@ -1011,7 +1012,7 @@ fn bootstrap_claude(
 /// Codex uses `~/.codex/config.toml` for MCP registration and related
 /// settings, so bootstrap writes allowlisted user config files and a
 /// managed MCP section there when configured.
-fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) -> Result<()> {
+fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, restart: bool) -> Result<()> {
     let codex = &cfg.codex;
     let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
     let needs_codex = codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers);
@@ -1027,7 +1028,7 @@ fn bootstrap_codex(session: &SshSession<'_>, cfg: &CoopConfig, restart: bool) ->
         bail!("{}", codex_missing_guest_cli_message());
     }
 
-    copy_codex_config(session.target, source_dir.as_deref(), codex)?;
+    copy_codex_config(&session.target, source_dir.as_deref(), codex)?;
 
     if restart {
         tracing::info!("Codex bootstrap refreshed");
@@ -1096,7 +1097,7 @@ fn resolve_github_token(strategy: Option<&GitHubAuth>) -> Option<String> {
     }
 }
 
-fn setup_github_auth(session: &SshSession<'_>) -> Result<()> {
+fn setup_github_auth(session: &SshSession) -> Result<()> {
     session
         .exec("gh auth setup-git")
         .context("Failed to configure git credential helper in guest")
@@ -1396,10 +1397,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 const GUEST_MARKETPLACE_DIR: &str = "~/.coop/marketplaces";
 
-pub(crate) fn install_marketplaces(
-    session: &SshSession<'_>,
-    marketplaces: &[String],
-) -> Result<()> {
+pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]) -> Result<()> {
     let mut has_local = false;
 
     for source in marketplaces {
@@ -1447,7 +1445,7 @@ pub(crate) fn install_marketplaces(
     Ok(())
 }
 
-pub(crate) fn install_plugins(session: &SshSession<'_>, plugins: &[String]) -> Result<()> {
+pub(crate) fn install_plugins(session: &SshSession, plugins: &[String]) -> Result<()> {
     for plugin in plugins {
         tracing::info!("Installing plugin: {plugin}");
         let cmd = format!(
@@ -1463,7 +1461,7 @@ pub(crate) fn install_plugins(session: &SshSession<'_>, plugins: &[String]) -> R
 }
 
 fn register_mcp_servers(
-    session: &SshSession<'_>,
+    session: &SshSession,
     servers: &std::collections::HashMap<String, McpServerDef>,
 ) -> Result<()> {
     for (name, def) in servers {

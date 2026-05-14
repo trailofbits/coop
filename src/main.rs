@@ -447,12 +447,7 @@ fn main() -> Result<()> {
             ask,
             mut args,
         } => {
-            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
-            let env_vars = backend::prepare_env_forwarding(&cfg)?;
-            let sess = backend::SshSession {
-                target: &running.target,
-                env: &env_vars,
-            };
+            let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
             if !ask {
                 args.insert(0, "--dangerously-skip-permissions".to_string());
             }
@@ -460,23 +455,13 @@ fn main() -> Result<()> {
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
         }
         Commands::ClaudeAgents { session, mut args } => {
-            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
-            let env_vars = backend::prepare_env_forwarding(&cfg)?;
-            let sess = backend::SshSession {
-                target: &running.target,
-                env: &env_vars,
-            };
+            let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
             args.insert(0, "agents".to_string());
             let tmux = session.tmux_session_opt_in();
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
         }
         Commands::Codex { session, args } => {
-            let running = resolve_running(&be, &cfg, session.name.as_deref())?;
-            let env_vars = backend::prepare_env_forwarding(&cfg)?;
-            let sess = backend::SshSession {
-                target: &running.target,
-                env: &env_vars,
-            };
+            let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
             let tmux = session.tmux_session("codex");
             ssh::run_interactive(&sess, crate::guest::CODEX_BIN, &args, tmux)
         }
@@ -780,10 +765,10 @@ fn restart_instance(
     if no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let env_vars = backend::prepare_env_forwarding(cfg)?;
+        let env = backend::prepare_env_forwarding(cfg)?;
         let session = backend::SshSession {
-            target: &target,
-            env: &env_vars,
+            target: target.clone(),
+            env,
         };
         backend::bootstrap_agents(&session, cfg, inst, true)?;
     }
@@ -814,14 +799,13 @@ fn start_instance(
 
     signal::check_shutdown()?;
 
-    let env_vars = backend::prepare_env_forwarding(cfg)?;
-
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
+        let env = backend::prepare_env_forwarding(cfg)?;
         let session = backend::SshSession {
-            target: &target,
-            env: &env_vars,
+            target: target.clone(),
+            env,
         };
         backend::bootstrap_agents(&session, cfg, inst, false)?;
     }
@@ -959,12 +943,7 @@ fn cmd_shell(
     command: &[String],
     tmux_session: Option<&str>,
 ) -> Result<()> {
-    let running = resolve_running(be, cfg, name)?;
-    let env_vars = backend::prepare_env_forwarding(cfg)?;
-    let session = backend::SshSession {
-        target: &running.target,
-        env: &env_vars,
-    };
+    let session = open_ssh_session(be, cfg, name)?;
     if command.is_empty() {
         ssh::connect(&session, tmux_session)
     } else {
@@ -978,13 +957,26 @@ fn cmd_exec(
     name: Option<&str>,
     command: &[String],
 ) -> Result<()> {
-    let running = resolve_running(be, cfg, name)?;
-    let env_vars = backend::prepare_env_forwarding(cfg)?;
-    let session = backend::SshSession {
-        target: &running.target,
-        env: &env_vars,
-    };
+    let session = open_ssh_session(be, cfg, name)?;
     ssh::exec_command(&session, command)
+}
+
+/// Resolve a running instance and prepare an SSH session with env
+/// forwarding in one step. Returns an owned session ready to pass to
+/// `ssh::*` and `backend::*` helpers. Callers that also need the
+/// `Instance` (e.g. for workspace push/pull) should call
+/// `resolve_running` directly.
+fn open_ssh_session(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&str>,
+) -> Result<backend::SshSession> {
+    let running = resolve_running(be, cfg, name)?;
+    let env = backend::prepare_env_forwarding(cfg)?;
+    Ok(backend::SshSession {
+        target: running.target,
+        env,
+    })
 }
 
 fn cmd_stop(
