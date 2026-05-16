@@ -14,6 +14,9 @@ pub struct Cmd {
     args: Vec<OsString>,
     sudo: bool,
     stdin: Option<Vec<u8>>,
+    /// Indices into `args` whose values should be redacted in [`Cmd::describe`].
+    /// Use [`Cmd::redact_next`] when staging an arg that carries a secret.
+    redacted_args: Vec<usize>,
 }
 
 impl Cmd {
@@ -23,11 +26,24 @@ impl Cmd {
             args: Vec::new(),
             sudo: false,
             stdin: None,
+            redacted_args: Vec::new(),
         }
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.args.push(arg.as_ref().to_owned());
+        self
+    }
+
+    /// Add an argument that holds a secret, redacted in [`Cmd::describe`]
+    /// (and therefore in debug logs). The bytes still appear on argv —
+    /// callers should prefer [`Cmd::stdin_input`] when the tool supports
+    /// reading from stdin. Use this only for tools that have no
+    /// stdin-friendly path (e.g. macOS `security add-generic-password -w`).
+    pub fn redacted_arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        let idx = self.args.len();
+        self.args.push(arg.as_ref().to_owned());
+        self.redacted_args.push(idx);
         self
     }
 
@@ -81,7 +97,18 @@ impl Cmd {
         if self.args.is_empty() {
             format!("{prefix}{prog}")
         } else {
-            let args: Vec<_> = self.args.iter().map(|a| a.to_string_lossy()).collect();
+            let args: Vec<String> = self
+                .args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if self.redacted_args.contains(&i) {
+                        "<redacted>".to_string()
+                    } else {
+                        a.to_string_lossy().into_owned()
+                    }
+                })
+                .collect();
             format!("{prefix}{prog} {}", args.join(" "))
         }
     }

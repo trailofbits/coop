@@ -281,6 +281,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub github: Option<GitHubAuth>,
 
+    /// Setup-time UX behaviour
+    #[serde(default)]
+    pub setup: SetupConfig,
+
     /// Claude Code config forwarding settings
     #[serde(default)]
     pub claude: ClaudeConfig,
@@ -354,12 +358,179 @@ pub struct NetworkConfig {
     pub host_iface: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// GitHub authentication mode for the guest VM.
+///
+/// Accepts either a plain string (`"auto"`, `"env"`, `"off"`, `"pat"`)
+/// or a table form. The table form is required to attach per-repo PAT
+/// entries (see [`PatConfig`]):
+///
+/// ```toml
+/// [github]
+/// mode = "pat"
+/// skip = ["owner/big-repo"]
+///
+/// [github.pat."owner/repo"]
+/// token = "cmd:security find-generic-password -s coop-github-pat -a owner-repo -w"
+/// ```
+///
+/// The plain string `"pat"` form is equivalent to a table with `mode = "pat"`
+/// and no `pat` entries — lookup will fail at start-time until an entry is added.
+#[derive(Debug, Clone)]
 pub enum GitHubAuth {
     Auto,
     Env,
     Off,
+    Pat(PatConfig),
+}
+
+impl GitHubAuth {
+    /// Short, human-readable name for the configured mode.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Env => "env",
+            Self::Off => "off",
+            Self::Pat(_) => "pat",
+        }
+    }
+
+    /// Look up a `[github.pat."owner/repo"]` entry by repo slug.
+    ///
+    /// Returns `None` for non-pat modes or when no entry exists.
+    pub fn pat_entry(&self, repo: &str) -> Option<&PatEntry> {
+        match self {
+            Self::Pat(cfg) => cfg.entries.get(repo),
+            _ => None,
+        }
+    }
+}
+
+/// Top-level `[github]` table with PAT entries and skip markers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatConfig {
+    /// Per-repo PAT entries, keyed by `owner/repo`.
+    ///
+    /// Uses `BTreeMap` so TOML serialization is stable across runs.
+    #[serde(default, rename = "pat")]
+    pub entries: std::collections::BTreeMap<String, PatEntry>,
+    /// Repos for which the auto-prompt at `coop start` is suppressed.
+    #[serde(default)]
+    pub skip: Vec<String>,
+}
+
+/// One per-repo PAT entry under `[github.pat."owner/repo"]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatEntry {
+    /// Token value. Accepts a literal token or a `cmd:`-prefixed shell
+    /// command. Resolved via [`resolve_cmd_value`].
+    pub token: String,
+}
+
+/// Custom deserializer accepts either a string (legacy/simple) or a table.
+impl<'de> Deserialize<'de> for GitHubAuth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+
+        struct AuthVisitor;
+
+        impl<'de> Visitor<'de> for AuthVisitor {
+            type Value = GitHubAuth;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string (\"auto\" / \"env\" / \"off\" / \"pat\") or a table")
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "auto" => Ok(GitHubAuth::Auto),
+                    "env" => Ok(GitHubAuth::Env),
+                    "off" => Ok(GitHubAuth::Off),
+                    "pat" => Ok(GitHubAuth::Pat(PatConfig::default())),
+                    other => Err(E::custom(format!(
+                        "unknown github mode '{other}' (expected auto, env, off, or pat)"
+                    ))),
+                }
+            }
+
+            fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(field_identifier, rename_all = "snake_case")]
+                enum Field {
+                    Mode,
+                    Pat,
+                    Skip,
+                    #[serde(other)]
+                    Unknown,
+                }
+
+                let mut mode: Option<String> = None;
+                let mut entries: Option<std::collections::BTreeMap<String, PatEntry>> = None;
+                let mut skip: Option<Vec<String>> = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Mode => mode = Some(map.next_value()?),
+                        Field::Pat => entries = Some(map.next_value()?),
+                        Field::Skip => skip = Some(map.next_value()?),
+                        Field::Unknown => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                // When the table form omits `mode`, the implied mode is
+                // "pat" if any pat/skip entries are present (the user is
+                // recording per-repo intent without explicitly stating
+                // the mode); otherwise "off".
+                let has_pat_data =
+                    entries.as_ref().is_some_and(|m| !m.is_empty()) || skip.is_some();
+                let mode = mode
+                    .or_else(|| has_pat_data.then(|| "pat".to_string()))
+                    .unwrap_or_else(|| "off".to_string());
+                match mode.as_str() {
+                    "auto" => Ok(GitHubAuth::Auto),
+                    "env" => Ok(GitHubAuth::Env),
+                    "off" => Ok(GitHubAuth::Off),
+                    "pat" => Ok(GitHubAuth::Pat(PatConfig {
+                        entries: entries.unwrap_or_default(),
+                        skip: skip.unwrap_or_default(),
+                    })),
+                    other => Err(M::Error::custom(format!(
+                        "unknown github mode '{other}' (expected auto, env, off, or pat)"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(AuthVisitor)
+    }
+}
+
+/// Serialize as a string for `auto`/`env`/`off` modes, and as a table
+/// for `pat` mode (so per-repo entries round-trip).
+impl Serialize for GitHubAuth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Env => serializer.serialize_str("env"),
+            Self::Off => serializer.serialize_str("off"),
+            Self::Pat(cfg) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("mode", "pat")?;
+                if !cfg.entries.is_empty() {
+                    map.serialize_entry("pat", &cfg.entries)?;
+                }
+                if !cfg.skip.is_empty() {
+                    map.serialize_entry("skip", &cfg.skip)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +639,29 @@ pub struct ClaudeConfig {
     /// Source directory for Claude config files (CLAUDE.md, rules/, commands/)
     #[serde(default)]
     pub config_dir: ConfigDir,
+}
+
+/// `[setup]` section: controls one-time UX behaviour at `coop start`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupConfig {
+    /// Whether `coop start` prompts the user to set up a fine-grained PAT
+    /// when the resolved repo has no entry. Set to `false` to suppress
+    /// globally. The per-repo `skip` list under `[github]` suppresses
+    /// individual repos.
+    #[serde(default = "default_prompt_for_pat")]
+    pub prompt_for_pat: bool,
+}
+
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            prompt_for_pat: default_prompt_for_pat(),
+        }
+    }
+}
+
+fn default_prompt_for_pat() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -986,6 +1180,7 @@ impl Default for CoopConfig {
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
             github: None,
+            setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
             profiles: HashMap::new(),
@@ -1266,6 +1461,7 @@ fn default_firecracker_bin() -> PathBuf {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::panic, reason = "tests use panic! for unreachable arms")]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -1690,6 +1886,124 @@ mod tests {
             serde_json::from_str::<GitHubAuth>(r#""off""#).unwrap(),
             GitHubAuth::Off
         ));
+        assert!(matches!(
+            serde_json::from_str::<GitHubAuth>(r#""pat""#).unwrap(),
+            GitHubAuth::Pat(_)
+        ));
+    }
+
+    #[test]
+    fn github_auth_rejects_unknown_mode() {
+        let err = serde_json::from_str::<GitHubAuth>(r#""bogus""#).unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn github_auth_table_form_with_entries() {
+        let toml_str = r#"
+mode = "pat"
+
+[pat."trailofbits/coop"]
+token = "cmd:echo x"
+
+[pat."trailofbits/coop-plugins"]
+token = "cmd:echo y"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        assert_eq!(pat.entries.len(), 2);
+        assert_eq!(
+            pat.entries
+                .get("trailofbits/coop")
+                .map(|e| e.token.as_str()),
+            Some("cmd:echo x")
+        );
+        assert!(pat.skip.is_empty());
+    }
+
+    #[test]
+    fn github_auth_table_form_with_skip_only() {
+        // No explicit `mode`, no entries, only a skip array. Should
+        // parse as pat-mode with empty entries and the recorded skip list.
+        let toml_str = r#"
+skip = ["a/b"]
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        assert_eq!(pat.skip, vec!["a/b".to_string()]);
+        assert!(pat.entries.is_empty());
+    }
+
+    #[test]
+    fn github_auth_lookup_returns_entry() {
+        let toml_str = r#"
+mode = "pat"
+
+[pat."a/b"]
+token = "cmd:echo x"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let entry = auth.pat_entry("a/b").unwrap();
+        assert_eq!(entry.token, "cmd:echo x");
+        assert!(auth.pat_entry("c/d").is_none());
+    }
+
+    #[test]
+    fn github_auth_lookup_returns_none_for_non_pat_modes() {
+        let auth = GitHubAuth::Auto;
+        assert!(auth.pat_entry("a/b").is_none());
+        let auth = GitHubAuth::Env;
+        assert!(auth.pat_entry("a/b").is_none());
+        let auth = GitHubAuth::Off;
+        assert!(auth.pat_entry("a/b").is_none());
+    }
+
+    #[test]
+    fn github_auth_serializes_round_trip_for_pat() {
+        // pat-mode → table form; deserialize the serialized output and
+        // confirm the entries survived.
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "a/b".to_string(),
+            PatEntry {
+                token: "cmd:echo x".to_string(),
+            },
+        );
+        let auth = GitHubAuth::Pat(PatConfig {
+            entries,
+            skip: vec!["c/d".to_string()],
+        });
+        let serialized = toml::to_string(&auth).unwrap();
+        let parsed: GitHubAuth = toml::from_str(&serialized).unwrap();
+        let pat = match parsed {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant after round-trip, got {other:?}"),
+        };
+        assert_eq!(pat.skip, vec!["c/d".to_string()]);
+        assert_eq!(
+            pat.entries.get("a/b").map(|e| e.token.as_str()),
+            Some("cmd:echo x")
+        );
+    }
+
+    #[test]
+    fn github_auth_serializes_string_form_for_simple_modes() {
+        for (auth, want) in [
+            (GitHubAuth::Auto, "\"auto\""),
+            (GitHubAuth::Env, "\"env\""),
+            (GitHubAuth::Off, "\"off\""),
+        ] {
+            // serde_json gives a JSON-style scalar; sufficient to confirm
+            // the serializer chose a string, not an object.
+            let json = serde_json::to_string(&auth).unwrap();
+            assert_eq!(json, want);
+        }
     }
 
     #[test]

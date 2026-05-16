@@ -865,6 +865,30 @@ pub type PlatformBackend = FirecrackerBackend;
 
 // ── Shared guest operations ───────────────────────────────────
 
+/// Detect the GitHub `owner/repo` slug for an existing instance, if any.
+///
+/// Looks at the saved workspace state in priority order: a `git-repo`
+/// clone records the original URL (parsed for a slug); a `workspace` /
+/// `mount` source has a host path we can scan for a `.git/config`
+/// `origin`. Returns `None` when no slug can be derived — pat-mode
+/// then falls back to a clear error.
+pub fn detect_instance_repo(inst: &crate::config::Instance) -> Option<String> {
+    let state = crate::workspace::WorkspaceState::try_load(inst)
+        .ok()
+        .flatten()?;
+    if let Some(url) = state.git_repo_url.as_deref()
+        && let Some(slug) = crate::github_repo::parse_repo_slug_from_url(url)
+    {
+        return Some(slug);
+    }
+    if let Some(host) = state.host_path.as_deref()
+        && let Ok(Some(slug)) = crate::github_repo::detect_workspace_repo(host)
+    {
+        return Some(slug);
+    }
+    None
+}
+
 /// Resolve tokens and build env vars to forward via SSH `SendEnv`.
 ///
 /// Collects values from config and the process environment into an
@@ -873,7 +897,13 @@ pub type PlatformBackend = FirecrackerBackend;
 /// `claude.api_key` values that use the `cmd:` prefix are resolved
 /// here (at VM start time, not config parse time) so that secret
 /// manager calls only happen when actually needed.
-pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
+///
+/// When `github = "pat"`, `repo` selects the matching entry under
+/// `[github.pat]`. Pass the slug resolved from `--git-repo` or
+/// `git remote get-url origin` of the workspace. Pass `None` when no
+/// repo context is available; pat-mode then yields no token (the start
+/// flow surfaces a clearer error elsewhere).
+pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let codex = &cfg.codex;
     let mut env = EnvForward::default();
@@ -897,8 +927,10 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig) -> Result<EnvForward> {
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
-    if let Some(token) = resolve_github_token(cfg.github.as_ref()) {
+    if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
         env.set("GITHUB_TOKEN", token);
+    } else {
+        tracing::debug!("no GITHUB_TOKEN forwarded to guest");
     }
 
     // User-specified env_forward vars from process environment
@@ -1078,15 +1110,24 @@ fn compute_plugin_delta(cfg: &CoopConfig, image: &str) -> (Vec<String>, Vec<Stri
     }
 }
 
-fn resolve_github_token(strategy: Option<&GitHubAuth>) -> Option<String> {
+/// Resolve a GitHub token for the guest given the configured auth strategy
+/// and the resolved target repo (when known).
+///
+/// Returns `Ok(None)` when no token should be forwarded; errors when a
+/// strategy was selected but the lookup is unrecoverable (e.g. pat-mode
+/// with an entry that fails to resolve).
+fn resolve_github_token(
+    strategy: Option<&GitHubAuth>,
+    repo: Option<&str>,
+) -> Result<Option<String>> {
     // Default to Off — never forward tokens without explicit opt-in.
-    // Users must set `github = "auto"` or `github = "env"` in
+    // Users must set `github = "auto"` / `"env"` / `"pat"` in
     // config.toml to enable GitHub auth in the guest.
     match strategy.unwrap_or(&GitHubAuth::Off) {
-        GitHubAuth::Auto => std::env::var("GITHUB_TOKEN")
+        GitHubAuth::Auto => Ok(std::env::var("GITHUB_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
-            .or_else(gh_auth_token),
+            .or_else(gh_auth_token)),
         GitHubAuth::Env => {
             let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
             if token.is_none() {
@@ -1095,10 +1136,39 @@ fn resolve_github_token(strategy: Option<&GitHubAuth>) -> Option<String> {
                      Private repo access will fail."
                 );
             }
-            token
+            Ok(token)
         }
-        GitHubAuth::Off => None,
+        GitHubAuth::Off => Ok(None),
+        GitHubAuth::Pat(_) => {
+            if let Some(slug) = repo {
+                resolve_pat_token(strategy, slug).map(Some)
+            } else {
+                tracing::warn!(
+                    "github: \"pat\" requires a resolvable repo (via --git-repo or \
+                     workspace origin). No token will be forwarded."
+                );
+                Ok(None)
+            }
+        }
     }
+}
+
+/// Look up a `[github.pat."repo"]` entry and resolve its `token` via
+/// the `cmd:` indirection.
+fn resolve_pat_token(strategy: Option<&GitHubAuth>, repo: &str) -> Result<String> {
+    let entry = strategy
+        .and_then(|s| s.pat_entry(repo))
+        .with_context(|| crate::github_pat::missing_entry_error(repo))?;
+    let token = crate::config::resolve_cmd_value(&entry.token)
+        .with_context(|| format!("Failed to resolve token for [github.pat.\"{repo}\"]"))?;
+    if !token.starts_with(crate::github_pat::TOKEN_PREFIX) {
+        tracing::warn!(
+            "github.pat.\"{repo}\".token did not start with '{prefix}' — proceeding, \
+             but the FGPAT server-side scope guarantees do not apply.",
+            prefix = crate::github_pat::TOKEN_PREFIX,
+        );
+    }
+    Ok(token)
 }
 
 fn setup_github_auth(session: &SshSession) -> Result<()> {

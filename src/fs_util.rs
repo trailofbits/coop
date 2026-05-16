@@ -1,9 +1,10 @@
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Build a writer-unique sibling temp path. Including pid + a nanosecond
 /// counter keeps concurrent writers (across threads or processes) from
@@ -54,6 +55,85 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
         )
     })?;
 
+    Ok(())
+}
+
+/// RAII file lock acquired via `flock(LOCK_EX)`. Blocks until the lock
+/// is available; releases on drop.
+///
+/// Use [`lock_sibling`] to obtain a lock keyed off a target path.
+pub struct FileLock {
+    _file: File,
+}
+
+/// Acquire an exclusive flock on a sibling `.lock` file next to `target`.
+///
+/// The lock file is created if necessary and lives across calls — its
+/// purpose is purely to serialize access to `target`. Releases on drop.
+/// Returns an error if the parent directory cannot be created or the
+/// lock cannot be acquired.
+pub fn lock_sibling(target: &Path) -> Result<FileLock> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    let stem = target
+        .file_name()
+        .map_or_else(|| "coop".to_string(), |n| n.to_string_lossy().into_owned());
+    let lock_path = parent.join(format!(".{stem}.lock"));
+    let file = File::create(&lock_path)
+        .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+    // SAFETY: flock is safe on a valid fd. The File owns the fd and
+    // outlives this call.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if ret != 0 {
+        bail!(
+            "Failed to acquire lock on {}: {}",
+            lock_path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(FileLock { _file: file })
+}
+
+/// Write `content` to `path` atomically with permissions `mode`.
+///
+/// If the target file already exists with stricter permissions (any
+/// bit in `mode` not also set on the existing file), the existing
+/// permissions are preserved — we never relax a file's mode.
+pub fn atomic_write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Cannot determine parent directory for atomic write")?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    let perms = if path.exists() {
+        let existing = fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata for {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        // Pick the more restrictive of (existing, requested).
+        let combined = existing & mode;
+        fs::Permissions::from_mode(combined)
+    } else {
+        fs::Permissions::from_mode(mode)
+    };
+    let tmp_path = unique_tmp_path(path);
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
+    fs::set_permissions(&tmp_path, perms)
+        .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

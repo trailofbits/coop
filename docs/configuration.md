@@ -13,7 +13,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
-| `github` | string | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
+| `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 
 ## GitHub auth
 
@@ -24,8 +24,78 @@ The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:
 | `"auto"` | Checks `$GITHUB_TOKEN` first. Falls back to `gh auth token` if unset. |
 | `"env"` | Reads `$GITHUB_TOKEN` from the environment only. Warns if unset. |
 | `"off"` | No GitHub token forwarding. |
+| `"pat"` | Uses a per-repo fine-grained PAT recorded under `[github.pat]`. Scope is **server-enforced** to one repository. |
 
 When a token is present, coop runs `gh auth setup-git` inside the guest to wire up git credential helpers.
+
+### Fine-grained PAT (`github = "pat"`)
+
+In pat mode coop forwards a *per-repo* fine-grained personal access token: the resolved `owner/repo` at `coop start` time selects the matching entry in `[github.pat]`. Compared with `"auto"` / `"env"`, the effective reach of a leaked token is bounded by the repos and permissions GitHub recorded when it was created — GitHub rejects out-of-scope operations (REST and GraphQL) server-side, not in coop.
+
+Configure via the wizard:
+
+```sh
+coop github setup-pat --repo trailofbits/coop
+```
+
+The wizard opens the PAT-creation form in your browser, validates the token via `/user` and `/repos/<repo>`, stores the token in a secret manager you choose (macOS Keychain, Linux Secret Service, 1Password, or a `0600` file under `~/.coop/state/github-pat/`), and writes a `[github.pat."owner/repo"]` entry. The token itself is stored only in the chosen secret manager — the config file holds a `cmd:` invocation that retrieves it.
+
+Multi-repo example:
+
+```toml
+[github]
+mode = "pat"
+
+[github.pat."trailofbits/coop"]
+token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop -w"
+
+[github.pat."trailofbits/coop-plugins"]
+token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop-plugins -w"
+```
+
+Bring-your-own-token (no wizard, useful for CI/Terraform). Any `cmd:` invocation that prints the token on stdout works. Examples:
+
+```toml
+[github]
+mode = "pat"
+
+# Vault
+[github.pat."trailofbits/coop"]
+token = "cmd:vault read -field=token secret/coop/github/trailofbits-coop"
+
+# 1Password (matches what the wizard emits)
+[github.pat."trailofbits/coop-plugins"]
+token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields password --reveal"
+```
+
+Other subcommands:
+
+| Command | Effect |
+|---------|--------|
+| `coop github status` | List configured entries, storage backend, and whether each token still resolves. Never prints token material. |
+| `coop github rotate-pat --repo X/Y` | Re-run the wizard against an existing entry (PATs expire — max 1 year). |
+| `coop github forget-pat --repo X/Y` | Remove the stored secret and the `[github.pat."X/Y"]` entry. Does **not** add a skip marker; the token may still be live on GitHub. |
+| `coop validate --probe` | Resolves each entry and probes `GET /user` against api.github.com. |
+
+#### Auto-prompt at `coop start`
+
+When `coop start` runs with a resolvable repo (from `--git-repo` or the synced workspace's `origin`) and `github` is `"off"` (or `"pat"` with no matching entry), coop offers to run the wizard inline: `[y/N/never]`. Three answers:
+
+- `y` — run the wizard, then continue the start.
+- `N` (default) — start unauthenticated, ask again next time.
+- `never` — record a skip marker under `[github.skip]` so coop won't ask again for this repo.
+
+Non-interactive contexts (`CI` is set, stdin is not a TTY) skip the prompt and log a one-line tip pointing at `coop github setup-pat`. The `--no-prompt` flag skips the prompt silently. Set `[setup] prompt_for_pat = false` in `config.toml` to disable the prompt globally.
+
+#### Skip markers
+
+```toml
+[github]
+mode = "pat"
+skip = ["trailofbits/big-repo"]
+```
+
+`coop github setup-pat --repo X/Y` removes any skip marker for `X/Y` when it adds a new entry.
 
 ## `vm` section
 

@@ -6,7 +6,20 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
-# github = "auto"               # "auto", "env", or "off"
+# github = "auto"               # "auto", "env", "off", or "pat"
+#
+# Per-repo fine-grained PAT (server-enforced scope to one repo):
+# Run `coop github setup-pat --repo owner/name` to add entries via wizard.
+#
+# [github]
+# mode = "pat"
+# skip = ["owner/big-repo"]       # repos to skip the auto-prompt for
+#
+# [github.pat."trailofbits/coop"]
+# token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop -w"
+
+# [setup]
+# prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
 # [vm]
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)

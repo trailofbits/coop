@@ -98,6 +98,7 @@ The `github` field controls how coop obtains a `GITHUB_TOKEN` for the guest. Thi
 | `"auto"` | Check the `GITHUB_TOKEN` env var first. If unset, run `gh auth token` on the host to extract a token from the GitHub CLI. |
 | `"env"`  | Require `GITHUB_TOKEN` in the host environment. Warns if missing. |
 | `"off"`  | Skip GitHub token forwarding entirely. This is the default when `github` is unset. |
+| `"pat"`  | Use a per-repo fine-grained PAT from `[github.pat]`. Scope is server-enforced to one repo. Run `coop github setup-pat --repo owner/name` to add an entry; see [configuration.md](configuration.md#fine-grained-pat-github--pat) for the full reference. |
 
 When a token is available, coop runs `gh auth setup-git` in the guest during bootstrap. This configures the git credential helper so `git clone` works against private repositories without further setup.
 

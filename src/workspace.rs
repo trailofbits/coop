@@ -34,6 +34,14 @@ pub struct WorkspaceState {
     pub guest_path: String,
     /// How the workspace was created
     pub source: WorkspaceSource,
+    /// Original repo URL when source is [`WorkspaceSource::GitRepo`].
+    ///
+    /// Recorded so that follow-up commands (`coop shell`, `claude`, etc.)
+    /// can re-derive the `owner/repo` slug without re-asking — pat-mode
+    /// otherwise has no way to look up the entry for a git-repo instance
+    /// where `host_path` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -287,6 +295,7 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
             host_path: None,
             guest_path: GUEST_WORKSPACE.to_string(),
             source: WorkspaceSource::Workspace,
+            git_repo_url: None,
         });
     }
     bail!(
@@ -399,6 +408,7 @@ pub fn sync_mounts(
             host_path: Some(m.host_path.clone()),
             guest_path: m.guest_path.clone(),
             source: WorkspaceSource::Mount,
+            git_repo_url: None,
         };
         state.save(inst)?;
     }
@@ -1040,6 +1050,7 @@ mod tests {
             host_path: Some(PathBuf::from("/tmp/project")),
             guest_path: "/workspace".to_string(),
             source: WorkspaceSource::Workspace,
+            git_repo_url: None,
         };
         state.save(&inst).expect("save");
         let loaded = WorkspaceState::try_load(&inst)
@@ -1066,6 +1077,7 @@ mod tests {
             host_path: Some(PathBuf::from("/host/dir")),
             guest_path: "/custom".to_string(),
             source: WorkspaceSource::GitRepo,
+            git_repo_url: None,
         };
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
