@@ -403,6 +403,40 @@ test_status_running() {
     fi
 }
 
+test_list_running() {
+    echo ""
+    echo "=== Phase: list (running) ==="
+
+    if coop list; then
+        pass "list exits 0"
+    else
+        fail "list exits 0" "exit code: $?"
+    fi
+
+    if echo "$HARNESS_OUT" | grep -q "^NAME *STATE"; then
+        pass "list prints NAME/STATE header"
+    else
+        fail "list prints NAME/STATE header" "got: $HARNESS_OUT"
+    fi
+
+    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running\$"; then
+        pass "list shows instance as running"
+    else
+        fail "list shows instance as running" "got: $HARNESS_OUT"
+    fi
+
+    # `ls` alias resolves to the same command.
+    if coop ls; then
+        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running\$"; then
+            pass "ls alias prints same output"
+        else
+            fail "ls alias prints same output" "got: $HARNESS_OUT"
+        fi
+    else
+        fail "ls alias exits 0" "exit code: $?"
+    fi
+}
+
 test_auto_resolve_running() {
     echo ""
     echo "=== Phase: auto-resolve (single running) ==="
@@ -1070,6 +1104,38 @@ test_auto_resolve_stopped() {
         fi
     else
         fail "shell rejects when only stopped instances exist" "should have failed"
+    fi
+}
+
+test_list_stopped() {
+    echo ""
+    echo "=== Phase: list (stopped) ==="
+
+    if coop list; then
+        pass "list exits 0 after stop"
+    else
+        fail "list exits 0 after stop" "exit code: $?"
+    fi
+
+    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +stopped\$"; then
+        pass "list shows instance as stopped"
+    else
+        fail "list shows instance as stopped" "got: $HARNESS_OUT"
+    fi
+}
+
+test_list_empty() {
+    echo ""
+    echo "=== Phase: list (no instances) ==="
+
+    if coop list; then
+        if echo "$HARNESS_OUT" | grep -q "No instances found"; then
+            pass "list shows empty-state message"
+        else
+            fail "list shows empty-state message" "got: $HARNESS_OUT"
+        fi
+    else
+        fail "list exits 0 with no instances" "exit code: $?"
     fi
 }
 
@@ -2534,6 +2600,7 @@ main() {
     test_start
     test_duplicate_name
     test_status_running
+    test_list_running
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
@@ -2556,11 +2623,13 @@ main() {
     test_stop
     test_auto_resolve_stopped
     test_status_stopped
+    test_list_stopped
     test_resize_status
     test_restart_stopped
     test_restart_rejects_ignored_flags
     test_destroy
     test_auto_resolve_no_instances
+    test_list_empty
 
     # Idempotency: re-run commands that should be safe to repeat
     test_idempotency

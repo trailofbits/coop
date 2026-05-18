@@ -68,6 +68,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `exec` | Run a command in the VM non-interactively |
 | `push` | Sync local directory into the VM |
 | `pull` | Sync VM workspace back to the host |
+| `list` (`ls`) | List instances by name and state |
 | `status` | Show instance status and resource usage |
 | `logs` | Stream VM serial console output |
 | `vscode` | Open VS Code connected to the guest |

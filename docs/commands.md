@@ -223,6 +223,17 @@ coop destroy my-project
 coop destroy --all
 ```
 
+### `list`
+
+Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+
+```
+coop list
+coop ls
+```
+
+Alias: `ls`.
+
 ### `status`
 
 Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.

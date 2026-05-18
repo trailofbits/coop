@@ -14,7 +14,7 @@ coop start my-project
 coop start
 ```
 
-Named instances pay off when you have several running at once. The name appears in `coop status` output and targets commands at a specific instance.
+Named instances pay off when you have several running at once. The name appears in `coop list` / `coop status` output and targets commands at a specific instance.
 
 ### Name validation rules
 
@@ -47,9 +47,20 @@ This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pu
 
 ## Checking status
 
+### Just the names
+
+`coop list` (alias `ls`) prints a minimal name/state table. It reads from local on-disk state only, so it's fast and works even when VMs are unreachable. Use it when you just need to remember what's available:
+
+```
+$ coop list
+NAME             STATE
+another-project  stopped
+my-project       running
+```
+
 ### All instances
 
-`coop status` with no arguments lists every instance in a table:
+`coop status` with no arguments lists every instance in a richer table, including image, backend, and resource usage for running instances:
 
 ```
 $ coop status

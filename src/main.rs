@@ -201,6 +201,9 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// List instances by name and state
+    #[command(alias = "ls")]
+    List,
     /// Show VM status
     Status {
         /// Instance name (shows all if omitted)
@@ -473,6 +476,7 @@ fn main() -> Result<()> {
             let _guard = signal::install_handlers();
             cmd_destroy(&be, &cfg, name.as_deref(), all)
         }
+        Commands::List => cmd_list(&be, &cfg),
         Commands::Status { name } => cmd_status(&be, &cfg, name.as_deref()),
         Commands::Logs { name, follow } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
@@ -1044,6 +1048,29 @@ fn cmd_destroy(
     Ok(())
 }
 
+fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
+    let mut instances = cfg.list_instances()?;
+    if instances.is_empty() {
+        writeln!(std::io::stdout(), "No instances found")
+            .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+        return Ok(());
+    }
+    instances.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+
+    writeln!(std::io::stdout(), "{:<16} STATE", "NAME")
+        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+    for inst in &instances {
+        let state = if be.is_running(inst) {
+            "running"
+        } else {
+            "stopped"
+        };
+        writeln!(std::io::stdout(), "{:<16} {state}", inst.name.as_str())
+            .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+    }
+    Ok(())
+}
+
 fn cmd_status(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1535,6 +1562,18 @@ mod tests {
         };
         assert!(session.no_tmux);
         assert!(session.tmux_session("main").is_none());
+    }
+
+    #[test]
+    fn list_subcommand_parses() {
+        let cli = parse(&["list"]);
+        assert!(matches!(cli.command, super::Commands::List));
+    }
+
+    #[test]
+    fn ls_alias_parses_as_list() {
+        let cli = parse(&["ls"]);
+        assert!(matches!(cli.command, super::Commands::List));
     }
 
     #[test]
