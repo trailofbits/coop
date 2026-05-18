@@ -402,7 +402,16 @@ pub fn sync_mounts(
         }
     }
 
-    // Save state for the first mount so push/pull work
+    record_mount_state(inst, mounts)
+}
+
+/// Persist mount metadata to `workspace.json`.
+///
+/// Records the first mount's host path as the canonical workspace so
+/// that `push`/`pull` and PAT slug detection (`detect_instance_repo`)
+/// work on follow-up commands. Used by `sync_mounts` after a Firecracker
+/// rsync, and directly on Lima where mounts are live (no sync step).
+pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
     if let Some(m) = mounts.first() {
         let state = WorkspaceState {
             host_path: Some(m.host_path.clone()),
@@ -412,7 +421,6 @@ pub fn sync_mounts(
         };
         state.save(inst)?;
     }
-
     Ok(())
 }
 
@@ -1092,6 +1100,45 @@ mod tests {
         let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
         assert_eq!(loaded.guest_path, GUEST_WORKSPACE);
         assert!(loaded.host_path.is_none());
+    }
+
+    #[test]
+    fn record_mount_state_persists_first_mount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let primary = tempfile::tempdir().expect("primary");
+        let secondary = tempfile::tempdir().expect("secondary");
+        let mounts = vec![
+            crate::config::Mount {
+                host_path: primary.path().to_path_buf(),
+                guest_path: "/workspace".to_string(),
+            },
+            crate::config::Mount {
+                host_path: secondary.path().to_path_buf(),
+                guest_path: "/data".to_string(),
+            },
+        ];
+        record_mount_state(&inst, &mounts).expect("save");
+        let loaded = WorkspaceState::try_load(&inst)
+            .expect("no IO error")
+            .expect("state should exist");
+        assert!(matches!(loaded.source, WorkspaceSource::Mount));
+        assert_eq!(loaded.host_path.as_deref(), Some(primary.path()));
+        assert_eq!(loaded.guest_path, "/workspace");
+        assert!(loaded.git_repo_url.is_none());
+    }
+
+    #[test]
+    fn record_mount_state_noop_on_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        record_mount_state(&inst, &[]).expect("ok");
+        assert!(
+            WorkspaceState::try_load(&inst)
+                .expect("no IO error")
+                .is_none(),
+            "empty mounts should not write state"
+        );
     }
 
     #[test]

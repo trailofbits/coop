@@ -1094,7 +1094,13 @@ fn restart_instance(
 
 /// Best-effort GitHub repo resolution for `coop start`.
 ///
-/// Order: `--git-repo` URL → workspace `.git/config` origin → `None`.
+/// Order: `--git-repo` URL → `--workspace` `.git/config` origin → first
+/// `--mount` host path's `.git/config` origin → `None`.
+///
+/// The mount fallback matches the "first mount is the workspace"
+/// convention used by `push`/`pull`, so the slug a user sees here is the
+/// same one `detect_instance_repo` will recover on `coop shell` / `exec`
+/// / `restart`.
 fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<String>> {
     if let Some(url) = opts.git_repo
         && let Some(slug) = github_repo::parse_repo_slug_from_url(url)
@@ -1108,6 +1114,11 @@ fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<String>> {
         {
             return Ok(Some(slug));
         }
+    }
+    if let Some(m) = opts.mounts.first()
+        && let Some(slug) = github_repo::detect_workspace_repo(&m.host_path)?
+    {
+        return Ok(Some(slug));
     }
     Ok(None)
 }
@@ -1180,12 +1191,19 @@ fn start_instance(
             git_repo_url: Some(repo_url.to_string()),
         };
         state.save(inst)?;
-    } else if !opts.mounts.is_empty() && !be.mounts_are_live() {
-        workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
-        tracing::warn!(
-            "Firecracker mounts use one-time sync, not live filesystem sharing. \
-             Use `coop push` / `coop pull` to sync changes."
-        );
+    } else if !opts.mounts.is_empty() {
+        if be.mounts_are_live() {
+            // Lima: virtiofs already serves the host directory live. No
+            // sync step, but we still record state so `push`/`pull` and
+            // PAT slug detection work for follow-up commands.
+            workspace::record_mount_state(inst, &opts.mounts)?;
+        } else {
+            workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+            tracing::warn!(
+                "Firecracker mounts use one-time sync, not live filesystem sharing. \
+                 Use `coop push` / `coop pull` to sync changes."
+            );
+        }
     }
 
     tracing::info!(
@@ -1873,6 +1891,7 @@ fn dir_size_display(dir: &std::path::Path) -> String {
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+#[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use clap::Parser;
 
@@ -2406,6 +2425,95 @@ mod tests {
     fn completions_subcommand_requires_shell() {
         let err = parse_err(&["completions"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        // Clear inherited env and restore only what `git` needs. This
+        // protects against parent contexts that export GIT_DIR /
+        // GIT_WORK_TREE / GIT_INDEX_FILE (e.g. a pre-commit hook
+        // running `cargo test`), which would otherwise hijack the
+        // tempdir-scoped operations below.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git command runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn start_opts(
+        mounts: Vec<super::config::Mount>,
+        config_path: &std::path::Path,
+    ) -> super::StartOpts<'_> {
+        super::StartOpts {
+            name: None,
+            image: super::config::DEFAULT_IMAGE,
+            workspace_dir: None,
+            git_repo: None,
+            no_agents: false,
+            no_prompt: true,
+            disk: None,
+            mounts,
+            exclude_git: false,
+            config_path,
+        }
+    }
+
+    #[test]
+    fn resolve_start_repo_uses_first_mount_origin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/trailofbits/coop.git",
+            ],
+        );
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: "/workspace".to_string(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(vec![mount], &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert_eq!(slug.as_deref(), Some("trailofbits/coop"));
+    }
+
+    #[test]
+    fn resolve_start_repo_returns_none_for_non_github_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_git(tmp.path(), &["init", "-q"]);
+        run_git(
+            tmp.path(),
+            &["remote", "add", "origin", "https://gitlab.com/x/y.git"],
+        );
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: "/workspace".to_string(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(vec![mount], &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert!(slug.is_none(), "got {slug:?}");
+    }
+
+    #[test]
+    fn resolve_start_repo_returns_none_for_no_mounts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &cfg_path);
+        let slug = super::resolve_start_repo(&opts).expect("ok");
+        assert!(slug.is_none());
     }
 
     #[test]

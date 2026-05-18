@@ -79,6 +79,10 @@ fn canonicalize(path: &str) -> Option<String> {
 /// Runs `git -C <git_dir> remote get-url origin` and parses the output.
 /// Returns `Ok(None)` if `git_dir` is not a git repo, has no origin, or
 /// origin is not a GitHub URL.
+///
+/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` are stripped before
+/// invoking git so a parent hook context (e.g. a pre-commit running
+/// coop) can't redirect lookups to the wrong repository.
 pub fn detect_workspace_repo(git_dir: &Path) -> Result<Option<String>> {
     if !git_dir.exists() {
         return Ok(None);
@@ -87,6 +91,10 @@ pub fn detect_workspace_repo(git_dir: &Path) -> Result<Option<String>> {
         .arg("-C")
         .arg(git_dir)
         .args(["remote", "get-url", "origin"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .with_context(|| format!("Failed to invoke git in {}", git_dir.display()))?;
     if !output.status.success() {
