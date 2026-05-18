@@ -9,7 +9,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::cmd::Cmd;
 use crate::fs_util::atomic_write_json;
+use crate::prompt::confirm;
 
 const REPO: &str = "trailofbits/coop";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -458,26 +459,6 @@ fn atomic_replace_self(new_binary: &Path) -> Result<()> {
     Ok(())
 }
 
-// ── Interactive confirmation ─────────────────────────────────────────────────
-
-fn confirm(prompt: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        // Non-interactive: caller must pass --yes explicitly.
-        return Ok(false);
-    }
-    let mut stderr = std::io::stderr();
-    write!(stderr, "{prompt} [y/N] ").context("Failed to write confirmation prompt")?;
-    stderr.flush().context("Failed to flush stderr")?;
-    let mut response = String::new();
-    std::io::stdin()
-        .read_line(&mut response)
-        .context("Failed to read confirmation")?;
-    Ok(matches!(
-        response.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 // ── Main update flow ─────────────────────────────────────────────────────────
 
 pub fn run(opts: &UpdateOpts) -> Result<()> {
@@ -602,6 +583,27 @@ struct UpdateState {
 fn state_path() -> Option<PathBuf> {
     let base = dirs::state_dir().or_else(dirs::data_local_dir)?;
     Some(base.join("coop").join("update-check.json"))
+}
+
+/// Remove the background update-check state file (and its parent if empty).
+///
+/// Best-effort — used by `coop uninstall`. Returns `Ok` even if nothing exists.
+pub fn remove_state() -> Result<()> {
+    let Some(path) = state_path() else {
+        return Ok(());
+    };
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    if let Some(parent) = path.parent()
+        && parent.exists()
+    {
+        // remove_dir only succeeds when empty — perfect for "leave alone if shared".
+        if let Err(e) = fs::remove_dir(parent) {
+            tracing::debug!("Leaving state dir {} in place ({e})", parent.display());
+        }
+    }
+    Ok(())
 }
 
 fn read_state() -> Option<UpdateState> {

@@ -42,6 +42,9 @@ jobs:
       - name: Integration test — coop update
         run: ./tests/integration-update.sh
 
+      - name: Integration test — coop uninstall
+        run: ./tests/integration-uninstall.sh
+
   deny:
     runs-on: ubuntu-latest
     steps:

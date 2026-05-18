@@ -12,6 +12,7 @@ mod guest;
 mod lima;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod network;
+mod prompt;
 mod rootfs;
 mod signal;
 // Setup is an interactive CLI workflow — stderr output is intentional user communication.
@@ -312,6 +313,18 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Remove the coop binary and (optionally) its data directories
+    Uninstall {
+        /// Skip interactive confirmation prompts (removes data unless --keep-data)
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Remove only the binary, keep ~/.coop and update-check state
+        #[arg(long, conflicts_with = "purge")]
+        keep_data: bool,
+        /// Also remove data without prompting (pairs with --yes for CI)
+        #[arg(long, conflicts_with = "keep_data")]
+        purge: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -381,6 +394,41 @@ fn main() -> Result<()> {
             pinned_version: target_version,
             skip_confirm: yes,
         });
+    }
+    if let Commands::Uninstall {
+        yes,
+        keep_data,
+        purge,
+    } = cli.command
+    {
+        // Best-effort config load — uninstall must work even on a half-installed
+        // or partially-corrupted system. `load` already tolerates a missing file;
+        // a parse failure means we fall back to defaults, which can mask a
+        // custom `data_dir` — warn so the user can re-run with --keep-data.
+        let cfg = match config::CoopConfig::load(&cli.config) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse {} ({e}); using defaults. \
+                     A custom data_dir may not be honoured — re-run with \
+                     --keep-data if your data lives outside {}.",
+                    cli.config.display(),
+                    config::CoopConfig::default().data_dir.display(),
+                );
+                config::CoopConfig::default()
+            }
+        };
+        let be: backend::PlatformBackend = backend::PlatformBackend::new();
+        return cmd_uninstall(
+            &be,
+            &cfg,
+            &cli.config,
+            &UninstallOpts {
+                yes,
+                keep_data,
+                purge,
+            },
+        );
     }
 
     let mut cfg = load_and_validate_config(&cli.config)?;
@@ -553,7 +601,7 @@ fn main() -> Result<()> {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
         Commands::Validate => cmd_validate(&cfg, &be),
-        Commands::Init | Commands::Update { .. } => {
+        Commands::Init | Commands::Update { .. } | Commands::Uninstall { .. } => {
             unreachable!("handled before config loading")
         }
     }
@@ -1042,38 +1090,7 @@ fn cmd_destroy(
     all: bool,
 ) -> Result<()> {
     if all {
-        let instances = cfg.list_instances()?;
-        for inst in &instances {
-            tracing::info!("Destroying instance '{}'", inst.name);
-            be.destroy_instance(cfg, inst)?;
-            workspace::remove_ssh_config(inst)?;
-        }
-
-        be.destroy_shared(cfg);
-
-        let key = cfg.ssh_key_path();
-        if let Err(e) = std::fs::remove_file(&key) {
-            tracing::debug!("Failed to remove SSH private key (non-fatal): {e}");
-        }
-        if let Err(e) = std::fs::remove_file(key.with_extension("pub")) {
-            tracing::debug!("Failed to remove SSH public key (non-fatal): {e}");
-        }
-
-        let instances_dir = cfg.instances_dir();
-        if instances_dir.exists() {
-            // Instance dirs may be root-owned (Firecracker) or user-owned (Lima)
-            if let Err(e) = std::fs::remove_dir_all(&instances_dir) {
-                tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
-                if let Err(e) = Cmd::new("rm").arg("-rf").arg(&instances_dir).sudo().run() {
-                    tracing::debug!(
-                        "Failed to remove instances dir {} (non-fatal): {e}",
-                        instances_dir.display()
-                    );
-                }
-            }
-        }
-
-        workspace::remove_all_ssh_config()?;
+        purge_all_data(be, cfg)?;
         tracing::info!("All resources cleaned up");
     } else {
         let inst = cfg.resolve_instance(name)?;
@@ -1107,6 +1124,220 @@ fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<(
             .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     }
     Ok(())
+}
+
+/// Destroy every instance, delegate backend-specific shared-state cleanup
+/// (`destroy_shared`), wipe the SSH keypair and instances dir, and strip every
+/// coop block from `~/.ssh/config`.
+///
+/// Shared by `coop destroy --all` and `coop uninstall`. Does **not** remove
+/// the `data_dir` itself or the binary — uninstall handles those.
+fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
+    let instances = cfg.list_instances()?;
+    for inst in &instances {
+        tracing::info!("Destroying instance '{}'", inst.name);
+        be.destroy_instance(cfg, inst)?;
+        workspace::remove_ssh_config(inst)?;
+    }
+
+    be.destroy_shared(cfg);
+
+    let key = cfg.ssh_key_path();
+    if let Err(e) = std::fs::remove_file(&key) {
+        tracing::debug!("Failed to remove SSH private key (non-fatal): {e}");
+    }
+    if let Err(e) = std::fs::remove_file(key.with_extension("pub")) {
+        tracing::debug!("Failed to remove SSH public key (non-fatal): {e}");
+    }
+
+    let instances_dir = cfg.instances_dir();
+    if instances_dir.exists() {
+        // Instance dirs may be root-owned (Firecracker) or user-owned (Lima)
+        if let Err(e) = std::fs::remove_dir_all(&instances_dir) {
+            tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
+            if let Err(e) = Cmd::new("rm").arg("-rf").arg(&instances_dir).sudo().run() {
+                tracing::debug!(
+                    "Failed to remove instances dir {} (non-fatal): {e}",
+                    instances_dir.display()
+                );
+            }
+        }
+    }
+
+    workspace::remove_all_ssh_config()?;
+    Ok(())
+}
+
+struct UninstallOpts {
+    yes: bool,
+    keep_data: bool,
+    purge: bool,
+}
+
+fn cmd_uninstall(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    config_path: &Path,
+    opts: &UninstallOpts,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    let binary_path =
+        std::env::current_exe().context("Failed to resolve current executable path for removal")?;
+
+    // `current_exe` reads /proc/self/exe on Linux, which dereferences symlinks.
+    // Removing the resolved target leaves any PATH-level symlinks dangling —
+    // surface the resolved path so the user knows what's actually about to go.
+    tracing::debug!("Resolved binary path: {}", binary_path.display());
+
+    if !opts.yes && !std::io::stdin().is_terminal() {
+        bail!(
+            "stdin is not a TTY; pass --yes (and optionally --keep-data or --purge) \
+             for non-interactive uninstall."
+        );
+    }
+
+    print_uninstall_summary(cfg, &binary_path);
+
+    if !opts.yes && !prompt::confirm(&format!("Remove coop binary at {}?", binary_path.display()))?
+    {
+        tracing::info!("Uninstall cancelled");
+        return Ok(());
+    }
+
+    let remove_data = decide_remove_data(cfg, opts)?;
+
+    if remove_data {
+        purge_all_data(be, cfg)?;
+        wipe_data_dir(&cfg.data_dir);
+        if let Err(e) = update::remove_state() {
+            tracing::debug!("Failed to remove update-check state (non-fatal): {e}");
+        }
+        if !config_path_is_under_data_dir(config_path, &cfg.data_dir) && config_path.exists() {
+            tracing::info!(
+                "Config at {} is outside the data directory and was not removed",
+                config_path.display()
+            );
+        }
+    } else {
+        if let Err(e) = workspace::remove_all_ssh_config() {
+            tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
+        }
+        if cfg.data_dir.exists() {
+            tracing::info!(
+                "Keeping {}; reinstall coop to manage existing instances.",
+                cfg.data_dir.display()
+            );
+        }
+    }
+
+    remove_self_binary(&binary_path)?;
+    tracing::info!(
+        "coop uninstalled. To reinstall: curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | sh"
+    );
+    Ok(())
+}
+
+fn print_uninstall_summary(cfg: &config::CoopConfig, binary_path: &Path) {
+    let instance_count = cfg.list_instances().map(|v| v.len()).unwrap_or(0);
+    let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
+    tracing::info!("This will remove:");
+    tracing::info!("  binary:    {}", binary_path.display());
+    if cfg.data_dir.exists() {
+        tracing::info!(
+            "  data dir:  {} ({instance_count} instance(s), {image_count} image(s))",
+            cfg.data_dir.display()
+        );
+    } else {
+        tracing::info!("  data dir:  {} (already absent)", cfg.data_dir.display());
+    }
+}
+
+fn decide_remove_data(cfg: &config::CoopConfig, opts: &UninstallOpts) -> Result<bool> {
+    if opts.keep_data {
+        return Ok(false);
+    }
+    if opts.yes || opts.purge {
+        return Ok(true);
+    }
+    let instance_count = cfg.list_instances().map(|v| v.len()).unwrap_or(0);
+    let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
+    prompt::confirm(&format!(
+        "Also remove data directory {} ({instance_count} instance(s), {image_count} image(s))?",
+        cfg.data_dir.display()
+    ))
+}
+
+fn wipe_data_dir(data_dir: &Path) {
+    if !data_dir.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(data_dir) {
+        tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
+        if let Err(e) = Cmd::new("rm").arg("-rf").arg(data_dir).sudo().run() {
+            tracing::warn!(
+                "Failed to remove data dir {} (non-fatal): {e}",
+                data_dir.display()
+            );
+        }
+    }
+}
+
+/// True when `config_path` lives inside `data_dir`.
+///
+/// Canonicalises both sides so `./`, symlinks, and macOS `/private/var` aliases
+/// don't produce false negatives. Falls back to a lexical comparison only when
+/// *both* sides fail to canonicalise — mixing canonical with lexical produced
+/// platform-dependent wrong answers (e.g. `/private/var/.coop` vs `/var/.coop`).
+fn config_path_is_under_data_dir(config_path: &Path, data_dir: &Path) -> bool {
+    match (config_path.canonicalize(), data_dir.canonicalize()) {
+        (Ok(c), Ok(d)) => c.starts_with(&d),
+        (Err(_), Err(_)) => config_path.starts_with(data_dir),
+        // Exactly one side resolved — canonicalisation diverged from lexical
+        // form, so the comparison would be apples-to-oranges. Treat as
+        // "we can't tell" and skip the informational notice rather than print
+        // a misleading one.
+        _ => true,
+    }
+}
+
+/// Resolved path is under `cargo` build output — almost certainly a dev build
+/// being run via `cargo run -- uninstall`. Nuking the target artifact is
+/// rarely what the developer intended.
+///
+/// Matches consecutive components `target/<debug|release>` so unrelated
+/// directories named "target" or "release" do not trigger the guard
+/// (e.g. `/opt/release/target/bin/coop` or `~/target-foo/release/coop`).
+fn is_dev_target_path(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    components.windows(2).any(|w| {
+        w[0].as_os_str() == "target"
+            && matches!(w[1].as_os_str().to_str(), Some("debug" | "release"))
+    })
+}
+
+fn remove_self_binary(binary_path: &Path) -> Result<()> {
+    if is_dev_target_path(binary_path) {
+        tracing::warn!(
+            "Refusing to remove {} — looks like a cargo build artifact. \
+             Run `cargo clean` if you really want to delete it.",
+            binary_path.display()
+        );
+        return Ok(());
+    }
+    std::fs::remove_file(binary_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "Cannot remove {}: {e}. Try `sudo coop uninstall`.",
+                binary_path.display()
+            )
+        } else {
+            anyhow::Error::from(e).context(format!(
+                "Failed to remove binary at {}",
+                binary_path.display()
+            ))
+        }
+    })
 }
 
 fn cmd_status(
@@ -1392,6 +1623,7 @@ fn dir_size_display(dir: &std::path::Path) -> String {
 
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
+#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use clap::Parser;
 
@@ -1733,5 +1965,180 @@ mod tests {
     fn profiles_show_requires_name() {
         let err = parse_err(&["profiles", "show"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn uninstall_subcommand_parses() {
+        let cli = parse(&["uninstall"]);
+        let super::Commands::Uninstall {
+            yes,
+            keep_data,
+            purge,
+        } = cli.command
+        else {
+            panic!("expected Uninstall variant");
+        };
+        assert!(!yes);
+        assert!(!keep_data);
+        assert!(!purge);
+    }
+
+    #[test]
+    fn uninstall_yes_flag_parses() {
+        let cli = parse(&["uninstall", "--yes"]);
+        let super::Commands::Uninstall { yes, .. } = cli.command else {
+            panic!("expected Uninstall variant");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    fn uninstall_short_y_flag_parses() {
+        let cli = parse(&["uninstall", "-y"]);
+        let super::Commands::Uninstall { yes, .. } = cli.command else {
+            panic!("expected Uninstall variant");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    fn uninstall_keep_data_flag_parses() {
+        let cli = parse(&["uninstall", "--keep-data"]);
+        let super::Commands::Uninstall { keep_data, .. } = cli.command else {
+            panic!("expected Uninstall variant");
+        };
+        assert!(keep_data);
+    }
+
+    #[test]
+    fn uninstall_purge_flag_parses() {
+        let cli = parse(&["uninstall", "--purge"]);
+        let super::Commands::Uninstall { purge, .. } = cli.command else {
+            panic!("expected Uninstall variant");
+        };
+        assert!(purge);
+    }
+
+    #[test]
+    fn uninstall_keep_data_and_purge_conflict() {
+        let err = parse_err(&["uninstall", "--keep-data", "--purge"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn dev_target_path_requires_consecutive_components() {
+        use std::path::Path;
+        // True: target immediately followed by debug/release
+        assert!(super::is_dev_target_path(Path::new(
+            "/home/u/repo/target/debug/coop"
+        )));
+        assert!(super::is_dev_target_path(Path::new(
+            "/home/u/repo/target/release/coop"
+        )));
+        // False: real install paths
+        assert!(!super::is_dev_target_path(Path::new(
+            "/home/u/.local/bin/coop"
+        )));
+        assert!(!super::is_dev_target_path(Path::new("/usr/local/bin/coop")));
+        // False: `target` and `release`/`debug` present but not adjacent
+        assert!(!super::is_dev_target_path(Path::new(
+            "/opt/release/target/bin/coop"
+        )));
+        assert!(!super::is_dev_target_path(Path::new(
+            "/home/u/target-foo/release/coop"
+        )));
+        assert!(!super::is_dev_target_path(Path::new(
+            "/srv/debug/lib/target/coop"
+        )));
+    }
+
+    fn opts(yes: bool, keep_data: bool, purge: bool) -> super::UninstallOpts {
+        super::UninstallOpts {
+            yes,
+            keep_data,
+            purge,
+        }
+    }
+
+    fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
+        super::config::CoopConfig {
+            data_dir: dir,
+            ..super::config::CoopConfig::default()
+        }
+    }
+
+    #[test]
+    fn decide_remove_data_keeps_data_when_keep_data_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        assert!(!super::decide_remove_data(&cfg, &opts(true, true, false)).unwrap());
+        assert!(!super::decide_remove_data(&cfg, &opts(false, true, false)).unwrap());
+    }
+
+    #[test]
+    fn decide_remove_data_removes_when_yes_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        assert!(super::decide_remove_data(&cfg, &opts(true, false, false)).unwrap());
+    }
+
+    #[test]
+    fn decide_remove_data_removes_when_purge_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        assert!(super::decide_remove_data(&cfg, &opts(false, false, true)).unwrap());
+        assert!(super::decide_remove_data(&cfg, &opts(true, false, true)).unwrap());
+    }
+
+    #[test]
+    fn decide_remove_data_interactive_returns_false_without_tty() {
+        // In `cargo test` stdin is not a TTY, so `prompt::confirm` returns
+        // `Ok(false)` — exercising the interactive branch deterministically.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        assert!(!super::decide_remove_data(&cfg, &opts(false, false, false)).unwrap());
+    }
+
+    #[test]
+    fn config_path_under_data_dir_recognises_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let config = data.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        assert!(super::config_path_is_under_data_dir(&config, data));
+    }
+
+    #[test]
+    fn config_path_under_data_dir_rejects_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let other = tmp.path().join("elsewhere");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let config = other.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        assert!(!super::config_path_is_under_data_dir(&config, &data));
+    }
+
+    #[test]
+    fn config_path_under_data_dir_falls_back_lexically_when_both_missing() {
+        // Neither side exists — function falls back to lexical starts_with.
+        let config = std::path::Path::new("/nonexistent/data/config.toml");
+        let data = std::path::Path::new("/nonexistent/data");
+        assert!(super::config_path_is_under_data_dir(config, data));
+
+        let other = std::path::Path::new("/nonexistent/other/config.toml");
+        assert!(!super::config_path_is_under_data_dir(other, data));
+    }
+
+    #[test]
+    fn config_path_under_data_dir_skips_notice_on_half_canonical() {
+        // Data dir exists, config doesn't — historically this returned a wrong
+        // answer by mixing canonical/lexical forms. The function now treats it
+        // as "can't tell" and returns true to suppress the (potentially wrong)
+        // informational notice.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = std::path::Path::new("/nonexistent/path/config.toml");
+        assert!(super::config_path_is_under_data_dir(config, tmp.path()));
     }
 }
