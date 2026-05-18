@@ -21,11 +21,22 @@ use anyhow::{Context, Result};
 use crate::cmd::Cmd;
 
 /// All secret-store backends recognised by the wizard.
+///
+/// Platform-specific system keychains (`MacosKeychain`, `LinuxSecretService`)
+/// are `cfg`-gated: the variants only exist on the targets where they can be
+/// read. A binary built for Linux therefore cannot represent — let alone
+/// attempt to use — the macOS Keychain backend, and vice versa. The secret
+/// itself is always host-local, so a config entry produced by one platform's
+/// system keychain is meaningless on the other.
+///
+/// `OnePassword` and `File` are cross-platform and always present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// macOS Keychain via `/usr/bin/security`.
+    #[cfg(target_os = "macos")]
     MacosKeychain,
     /// Linux Secret Service (GNOME Keyring / `KWallet`) via `secret-tool`.
+    #[cfg(target_os = "linux")]
     LinuxSecretService,
     /// 1Password CLI (`op`) — used when explicitly chosen by the user.
     OnePassword,
@@ -36,7 +47,9 @@ pub enum Backend {
 impl Backend {
     pub fn label(self) -> &'static str {
         match self {
+            #[cfg(target_os = "macos")]
             Self::MacosKeychain => "macOS Keychain",
+            #[cfg(target_os = "linux")]
             Self::LinuxSecretService => "Linux Secret Service (GNOME Keyring / KWallet)",
             Self::OnePassword => "1Password CLI",
             Self::File => "Plain file (~/.coop/state/github-pat/<slug>.txt, mode 0600)",
@@ -44,12 +57,15 @@ impl Backend {
     }
 
     /// Probe whether this backend is usable on the current host.
+    ///
+    /// The variant's existence already proves target-OS compatibility; this
+    /// only checks the *runtime* prerequisites (binary on PATH, etc.).
     pub fn is_available(self) -> bool {
         match self {
-            Self::MacosKeychain => {
-                cfg!(target_os = "macos") && Path::new("/usr/bin/security").exists()
-            }
-            Self::LinuxSecretService => cfg!(target_os = "linux") && tool_on_path("secret-tool"),
+            #[cfg(target_os = "macos")]
+            Self::MacosKeychain => Path::new("/usr/bin/security").exists(),
+            #[cfg(target_os = "linux")]
+            Self::LinuxSecretService => tool_on_path("secret-tool"),
             Self::OnePassword => tool_on_path("op"),
             Self::File => true,
         }
@@ -77,14 +93,16 @@ fn is_safe_tool_name_char(c: char) -> bool {
 /// natural-default order. The file fallback always appears last.
 pub fn available_backends() -> Vec<Backend> {
     let mut out = Vec::new();
-    for b in [
-        Backend::MacosKeychain,
-        Backend::LinuxSecretService,
-        Backend::OnePassword,
-    ] {
-        if b.is_available() {
-            out.push(b);
-        }
+    #[cfg(target_os = "macos")]
+    if Backend::MacosKeychain.is_available() {
+        out.push(Backend::MacosKeychain);
+    }
+    #[cfg(target_os = "linux")]
+    if Backend::LinuxSecretService.is_available() {
+        out.push(Backend::LinuxSecretService);
+    }
+    if Backend::OnePassword.is_available() {
+        out.push(Backend::OnePassword);
     }
     out.push(Backend::File);
     out
@@ -103,7 +121,9 @@ pub fn store_secret(
     state_dir: &Path,
 ) -> Result<String> {
     match backend {
+        #[cfg(target_os = "macos")]
         Backend::MacosKeychain => store_keychain(service, account, token),
+        #[cfg(target_os = "linux")]
         Backend::LinuxSecretService => store_secret_service(service, account, token),
         Backend::OnePassword => store_onepassword(service, account, token),
         Backend::File => store_file(service, account, token, state_dir),
@@ -120,6 +140,7 @@ pub fn delete_secret(
     state_dir: &Path,
 ) -> Result<()> {
     match backend {
+        #[cfg(target_os = "macos")]
         Backend::MacosKeychain => {
             let _ = Cmd::new("security")
                 .arg("delete-generic-password")
@@ -130,6 +151,7 @@ pub fn delete_secret(
                 .output();
             Ok(())
         }
+        #[cfg(target_os = "linux")]
         Backend::LinuxSecretService => {
             let _ = Cmd::new("secret-tool")
                 .arg("clear")
@@ -167,18 +189,26 @@ pub fn delete_secret(
 /// Recognise a `cmd:` invocation as the backend that wrote it.
 ///
 /// Used by `coop github status` to display the storage location without
-/// reading the secret. Returns `None` for opaque commands.
+/// reading the secret. Returns `None` for opaque commands *and* for entries
+/// produced by a system keychain that the current build cannot represent
+/// (e.g. a `security find-generic-password …` entry seen by a Linux binary
+/// — the secret itself is unreachable from this host anyway, so we treat
+/// it as unknown rather than describing a variant that doesn't exist here).
 ///
 /// The File-backend match requires the path to end in `/github-pat/<name>.txt`
 /// (the canonical layout coop writes) so user-supplied `cmd:cat …` paths
 /// that don't follow that shape correctly fall through to `unknown`.
 pub fn infer_backend(cmd: &str) -> Option<Backend> {
     let cmd_str = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
+    #[cfg(target_os = "macos")]
     if cmd_str.starts_with("security find-generic-password") {
-        Some(Backend::MacosKeychain)
-    } else if cmd_str.starts_with("secret-tool lookup") {
-        Some(Backend::LinuxSecretService)
-    } else if cmd_str.starts_with("op read") || cmd_str.starts_with("op item get") {
+        return Some(Backend::MacosKeychain);
+    }
+    #[cfg(target_os = "linux")]
+    if cmd_str.starts_with("secret-tool lookup") {
+        return Some(Backend::LinuxSecretService);
+    }
+    if cmd_str.starts_with("op read") || cmd_str.starts_with("op item get") {
         Some(Backend::OnePassword)
     } else if cmd_str.starts_with("cat ")
         && cmd_str.contains("github-pat/")
@@ -192,6 +222,7 @@ pub fn infer_backend(cmd: &str) -> Option<Backend> {
 
 // ── Backend impls ──────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 fn store_keychain(service: &str, account: &str, token: &str) -> Result<String> {
     // macOS `security` lacks a stdin-driven write for generic passwords:
     // `-w <password>` reads the secret from argv. The bytes are briefly
@@ -217,6 +248,7 @@ fn store_keychain(service: &str, account: &str, token: &str) -> Result<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn store_secret_service(service: &str, account: &str, token: &str) -> Result<String> {
     // `secret-tool store` reads the password from stdin.
     Cmd::new("secret-tool")
@@ -397,16 +429,36 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn infer_backend_recognises_known_invocations() {
+    fn infer_backend_recognises_macos_keychain() {
         assert_eq!(
             infer_backend("cmd:security find-generic-password -s coop-github-pat -a x -w"),
             Some(Backend::MacosKeychain)
         );
+        // Non-target keychain invocations are opaque to this build.
+        assert_eq!(
+            infer_backend("cmd:secret-tool lookup service coop-github-pat account x"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn infer_backend_recognises_linux_secret_service() {
         assert_eq!(
             infer_backend("cmd:secret-tool lookup service coop-github-pat account x"),
             Some(Backend::LinuxSecretService)
         );
+        // Non-target keychain invocations are opaque to this build.
+        assert_eq!(
+            infer_backend("cmd:security find-generic-password -s coop-github-pat -a x -w"),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_backend_recognises_cross_platform_backends() {
         assert_eq!(
             infer_backend("cmd:op read op://Private/coop/token"),
             Some(Backend::OnePassword)
