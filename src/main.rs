@@ -575,16 +575,17 @@ fn main() -> Result<()> {
             mut args,
         } => {
             let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
-            if !ask {
-                args.insert(0, "--dangerously-skip-permissions".to_string());
+            // Guest user settings set `defaultMode: bypassPermissions`. Opting in
+            // to prompts means overriding that default explicitly.
+            if ask {
+                args.insert(0, "default".to_string());
+                args.insert(0, "--permission-mode".to_string());
             }
             let tmux = session.tmux_session("claude");
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
         }
         Commands::ClaudeAgents { session, mut args } => {
             let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
-            // Subcommand flag: defaults dispatched sessions to bypassPermissions.
-            args.insert(0, "--dangerously-skip-permissions".to_string());
             args.insert(0, "agents".to_string());
             let tmux = session.tmux_session_opt_in();
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)

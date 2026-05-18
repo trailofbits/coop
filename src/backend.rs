@@ -983,6 +983,10 @@ fn bootstrap_claude(
     // User config (CLAUDE.md, rules/, commands/) — host files may have changed
     copy_claude_config(&session.target, &claude.config_dir)?;
 
+    // Managed permissions: pre-accept bypass mode so `coop ca` and
+    // `coop claude` skip prompts without an interactive acceptance step.
+    write_managed_claude_settings(&session.target)?;
+
     // Marketplaces, plugins, MCP servers — persisted on guest disk,
     // only install on first boot
     if !restart {
@@ -1147,6 +1151,48 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
     }
 
     tracing::info!("Copied Claude config from {}", source_dir.display());
+    Ok(())
+}
+
+/// JSON body of the managed `~/.claude/settings.json` written to every guest.
+///
+/// `skipDangerousModePermissionPrompt: true` pre-accepts bypass mode so that
+/// `claude agents` and `claude --bg` honor `--permission-mode
+/// bypassPermissions`. Without it, those commands refuse the mode until
+/// it has been accepted interactively — a step that never happens on a
+/// freshly provisioned VM.
+///
+/// `defaultMode: "bypassPermissions"` makes bypass the default for every
+/// session in the VM, matching coop's design: the VM is the isolation
+/// boundary, so per-session permission prompts add no protection.
+///
+/// The setting must live in user scope (`~/.claude/settings.json`) — Claude
+/// Code ignores `skipDangerousModePermissionPrompt` from project settings
+/// to prevent untrusted repositories from auto-bypassing the prompt.
+fn managed_claude_settings_json() -> String {
+    serde_json::json!({
+        "permissions": {
+            "defaultMode": "bypassPermissions",
+            "skipDangerousModePermissionPrompt": true,
+        }
+    })
+    .to_string()
+}
+
+/// Write coop's managed `~/.claude/settings.json` to the guest.
+///
+/// Runs every `coop start`, overwriting any in-guest edits. The file
+/// is small and owned by coop; users wanting per-VM customization should
+/// extend coop's config rather than editing the guest file in place.
+fn write_managed_claude_settings(target: &SshTarget) -> Result<()> {
+    target.exec("mkdir -p ~/.claude")?;
+    target
+        .exec_with_stdin(
+            "cat > ~/.claude/settings.json",
+            managed_claude_settings_json().into_bytes(),
+        )
+        .context("Failed to write managed ~/.claude/settings.json in guest")?;
+    tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
     Ok(())
 }
 
@@ -1735,6 +1781,23 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let staging = stage_allowed_files(src.path()).unwrap();
         let count = std::fs::read_dir(staging.path()).unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn managed_claude_settings_json_has_required_keys() {
+        let body = managed_claude_settings_json();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let perms = parsed.get("permissions").unwrap();
+        assert_eq!(
+            perms.get("defaultMode").and_then(serde_json::Value::as_str),
+            Some("bypassPermissions"),
+        );
+        assert_eq!(
+            perms
+                .get("skipDangerousModePermissionPrompt")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+        );
     }
 
     #[test]
