@@ -223,9 +223,9 @@ enum Commands {
     /// Push local workspace into the running VM
     Push {
         /// Instance name (required if multiple instances exist)
-        #[arg(long)]
         name: Option<String>,
         /// Local directory to push (defaults to `workspace.json` `host_path`)
+        #[arg(long)]
         dir: Option<String>,
         /// Overwrite guest changes without confirmation
         #[arg(long)]
@@ -237,9 +237,9 @@ enum Commands {
     /// Pull guest workspace to local directory
     Pull {
         /// Instance name (required if multiple instances exist)
-        #[arg(long)]
         name: Option<String>,
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
+        #[arg(long)]
         dir: Option<String>,
         /// Overwrite local changes without confirmation
         #[arg(long)]
@@ -249,12 +249,15 @@ enum Commands {
         exclude_git: bool,
     },
     /// Run a command in the VM and return its output (non-interactive)
+    ///
+    /// The command and its arguments must follow `--` to avoid conflicting
+    /// with the optional instance name positional, e.g.
+    /// `coop exec my-vm -- ls -la` or `coop exec -- ls -la`.
     Exec {
         /// Instance name (required if multiple instances exist)
-        #[arg(long)]
         name: Option<String>,
-        /// Command and arguments to run
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Command and arguments to run (after `--`)
+        #[arg(required = true, last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Open VS Code connected to the guest VM
@@ -1587,6 +1590,88 @@ mod tests {
             "--name",
             "--no-claude-work"
         ]));
+    }
+
+    #[test]
+    fn push_positional_name_and_dir_flag_parse() {
+        let cli = parse(&["push", "myvm", "--dir", "./src", "--force"]);
+        let super::Commands::Push {
+            name, dir, force, ..
+        } = cli.command
+        else {
+            panic!("expected Push variant");
+        };
+        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(dir.as_deref(), Some("./src"));
+        assert!(force);
+    }
+
+    #[test]
+    fn push_single_positional_is_name_not_dir() {
+        let cli = parse(&["push", "myvm"]);
+        let super::Commands::Push {
+            name, dir, force, ..
+        } = cli.command
+        else {
+            panic!("expected Push variant");
+        };
+        assert_eq!(name.as_deref(), Some("myvm"));
+        assert!(dir.is_none());
+        assert!(!force);
+    }
+
+    #[test]
+    fn push_bare_parses() {
+        let cli = parse(&["push"]);
+        let super::Commands::Push {
+            name, dir, force, ..
+        } = cli.command
+        else {
+            panic!("expected Push variant");
+        };
+        assert!(name.is_none());
+        assert!(dir.is_none());
+        assert!(!force);
+    }
+
+    #[test]
+    fn pull_positional_name_and_dir_flag_parse() {
+        let cli = parse(&["pull", "myvm", "--dir", "./out", "--force"]);
+        let super::Commands::Pull {
+            name, dir, force, ..
+        } = cli.command
+        else {
+            panic!("expected Pull variant");
+        };
+        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(dir.as_deref(), Some("./out"));
+        assert!(force);
+    }
+
+    #[test]
+    fn exec_positional_name_and_command_parse() {
+        let cli = parse(&["exec", "myvm", "--", "ls", "-la"]);
+        let super::Commands::Exec { name, command } = cli.command else {
+            panic!("expected Exec variant");
+        };
+        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(command, vec!["ls", "-la"]);
+    }
+
+    #[test]
+    fn exec_without_name_parses() {
+        let cli = parse(&["exec", "--", "ls", "-la"]);
+        let super::Commands::Exec { name, command } = cli.command else {
+            panic!("expected Exec variant");
+        };
+        assert!(name.is_none());
+        assert_eq!(command, vec!["ls", "-la"]);
+    }
+
+    #[test]
+    fn exec_requires_command_after_separator() {
+        let err = parse_err(&["exec", "myvm"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

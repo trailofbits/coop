@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **`coop push` / `coop pull` / `coop exec` take the instance name as a
+  positional argument** (#90) — these three commands previously accepted
+  `--name <name>` while the other eleven subcommands took `name`
+  positionally. The flag is removed; pass the name positionally instead.
+  Because `push` and `pull` already had `[DIR]` as a positional, the
+  directory is now a `--dir` flag. Because `exec` had `COMMAND...` as a
+  positional, the command must follow `--`. Examples:
+  `coop push my-vm --dir ./src --force`,
+  `coop pull my-vm --dir ./out --force`,
+  `coop exec my-vm -- ls -la`.
+
 ## v0.4.3
 
 ### Fixes

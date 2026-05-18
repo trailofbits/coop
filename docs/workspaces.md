@@ -62,10 +62,11 @@ Starting a VM with `--workspace`, `--git-repo`, or `--mount` writes a `workspace
 ## Pushing: host to guest
 
 ```bash
-coop push                     # uses host_path from workspace.json
-coop push ./other-dir         # push a specific directory
-coop push --force             # skip guest dirty check
-coop push --name my-instance  # target a specific instance
+coop push                                    # uses host_path from workspace.json
+coop push --dir ./other-dir                  # push a specific directory
+coop push --force                            # skip guest dirty check
+coop push my-instance                        # target a specific instance
+coop push my-instance --dir ./src --force    # combined
 ```
 
 Before overwriting guest files, `push` runs `git status --porcelain` inside the guest workspace. If there are uncommitted changes, push prints them and exits. `--force` overrides this.
@@ -78,10 +79,11 @@ Transfer method selection is automatic:
 ## Pulling: guest to host
 
 ```bash
-coop pull                     # uses host_path from workspace.json
-coop pull ./local-copy        # pull into a specific directory
-coop pull --force             # skip local dirty check
-coop pull --name my-instance  # target a specific instance
+coop pull                                       # uses host_path from workspace.json
+coop pull --dir ./local-copy                    # pull into a specific directory
+coop pull --force                               # skip local dirty check
+coop pull my-instance                           # target a specific instance
+coop pull my-instance --dir ./local-copy        # combined
 ```
 
 Same dirty-check logic as push, applied to the local destination. If the local directory has a `.git` and uncommitted changes, pull refuses unless you pass `--force`.

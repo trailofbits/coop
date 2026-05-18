@@ -126,7 +126,7 @@ guest_exec() {
 # Run the exec subcommand (captures stdout, propagates exit code).
 moat_exec() {
     local inst="${GUEST_INSTANCE:-$INSTANCE}"
-    RUST_LOG=off "$BINARY" exec --name "$inst" "$@" 2>"$tmpdir/guest_stderr"
+    RUST_LOG=off "$BINARY" exec "$inst" -- "$@" 2>"$tmpdir/guest_stderr"
 }
 
 # Return captured stderr from the last guest_exec/moat_exec call.
@@ -467,8 +467,8 @@ test_auto_resolve_running() {
         fail "shell auto-resolves single running instance" "exit code: $?"
     fi
 
-    # exec without --name should also auto-select
-    if output=$(RUST_LOG=off "$BINARY" exec echo "exec-auto" 2>/dev/null); then
+    # exec without an instance name should also auto-select
+    if output=$(RUST_LOG=off "$BINARY" exec -- echo "exec-auto" 2>/dev/null); then
         pass "exec auto-resolves single running instance"
         if echo "$output" | grep -q "exec-auto"; then
             pass "exec auto-resolve returns correct output"
@@ -675,7 +675,7 @@ except Exception:
 
     local token_out
     token_out=$(env GITHUB_TOKEN=test-leak-token RUST_LOG=off \
-        "$BINARY" exec --name "$INSTANCE" printenv GITHUB_TOKEN 2>/dev/null) || true
+        "$BINARY" exec "$INSTANCE" -- printenv GITHUB_TOKEN 2>/dev/null) || true
 
     if [[ "$github_setting" == "auto" || "$github_setting" == "env" ]]; then
         # Token should be forwarded
@@ -1242,7 +1242,7 @@ test_restart_stopped() {
     fi
 
     # Verify workspace survived the stop/start cycle
-    if coop exec --name "$INSTANCE" -- test -d /workspace; then
+    if coop exec "$INSTANCE" -- test -d /workspace; then
         pass "workspace persists across restart"
     else
         fail "workspace persists across restart" "exit code: $?"
@@ -1501,7 +1501,7 @@ test_workspace_sync() {
 
     local pull_dir
     pull_dir=$(mktemp -d)
-    if coop pull --name "$ws_instance" --force "$pull_dir"; then
+    if coop pull "$ws_instance" --force --dir "$pull_dir"; then
         pass "pull exits 0"
 
         local pulled
@@ -1518,7 +1518,7 @@ test_workspace_sync() {
 
     # Push: modify locally, push to guest, verify
     echo "pushed-from-host" > "$ws_tmpdir/hello.txt"
-    if coop push --name "$ws_instance" --force "$ws_tmpdir"; then
+    if coop push "$ws_instance" --force --dir "$ws_tmpdir"; then
         pass "push exits 0"
 
         local pushed_content
@@ -1649,7 +1649,7 @@ test_push_pull_no_workspace() {
     # Pull with explicit dir should work (no workspace.json exists)
     local pull_dir
     pull_dir=$(mktemp -d)
-    if coop pull --name "$nw_instance" --force "$pull_dir"; then
+    if coop pull "$nw_instance" --force --dir "$pull_dir"; then
         pass "pull with explicit dir (no workspace.json)"
     else
         fail "pull with explicit dir (no workspace.json)" "exit code: $?"
@@ -1660,7 +1660,7 @@ test_push_pull_no_workspace() {
     local push_dir
     push_dir=$(mktemp -d)
     echo "no-workspace-push-test" > "$push_dir/marker.txt"
-    if coop push --name "$nw_instance" --force "$push_dir"; then
+    if coop push "$nw_instance" --force --dir "$push_dir"; then
         pass "push with explicit dir (no workspace.json)"
 
         # Verify the file arrived in guest at /workspace
@@ -1677,14 +1677,14 @@ test_push_pull_no_workspace() {
     rm -rf "$push_dir"
 
     # Pull without dir and without workspace.json should fail
-    if moat_fails pull --name "$nw_instance"; then
+    if moat_fails pull "$nw_instance"; then
         pass "pull without dir or workspace.json fails"
     else
         fail "pull without dir or workspace.json fails" "should have failed"
     fi
 
     # Push without dir and without workspace.json should fail
-    if moat_fails push --name "$nw_instance"; then
+    if moat_fails push "$nw_instance"; then
         pass "push without dir or workspace.json fails"
     else
         fail "push without dir or workspace.json fails" "should have failed"
@@ -2347,7 +2347,7 @@ CFGEOF
     # coop claude uses run_interactive which needs a PTY — use exec instead
     # to verify the binary path is correct by invoking it directly.
     env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY RUST_LOG=off \
-        "$BINARY" --config "$cfg_file" exec --name "$mp_instance" \
+        "$BINARY" --config "$cfg_file" exec "$mp_instance" -- \
         /home/ubuntu/.local/bin/claude --help >/dev/null 2>/dev/null || true
 
     local post_log

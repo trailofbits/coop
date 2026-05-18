@@ -229,11 +229,11 @@ Pull guest changes back to the host:
 coop pull
 ```
 
-Both commands default to the workspace path from `coop start --workspace`. Override with a positional argument:
+Both commands default to the workspace path from `coop start --workspace`. Override with `--dir`:
 
 ```
-coop push ~/other-dir
-coop pull ~/other-dir
+coop push --dir ~/other-dir
+coop pull --dir ~/other-dir
 ```
 
 ### 6. Tear down

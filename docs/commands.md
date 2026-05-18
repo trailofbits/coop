@@ -175,18 +175,20 @@ coop codex my-project -- --model gpt-5
 
 Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `shell` for interactive work.
 
+The command and its arguments must follow `--` so they are not mistaken for the instance name.
+
 ```
-coop exec [--name NAME] COMMAND...
+coop exec [NAME] -- COMMAND...
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `COMMAND...` | Command and arguments to run (required) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `COMMAND...` | Command and arguments to run after `--` (required) |
 
 ```
-coop exec uname -a
-coop exec --name my-project docker ps
+coop exec -- uname -a
+coop exec my-project -- docker ps
 ```
 
 ### `stop`
@@ -275,19 +277,19 @@ coop logs my-project -f
 Copy a local directory into the running VM at `/workspace`. Defaults to the host path recorded when the instance was started with `--workspace`.
 
 ```
-coop push [--name NAME] [DIR] [FLAGS]
+coop push [NAME] [FLAGS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `DIR` | Local directory to push (defaults to the workspace host path) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--dir <dir>` | Local directory to push (defaults to the workspace host path) |
 | `--force` | Overwrite guest changes without confirmation |
 | `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop push
-coop push --name my-project ./src --force
+coop push my-project --dir ./src --force
 ```
 
 ### `pull`
@@ -295,19 +297,19 @@ coop push --name my-project ./src --force
 Copy the VM's `/workspace` to a local directory. Defaults to the host path recorded when the instance was started with `--workspace`.
 
 ```
-coop pull [--name NAME] [DIR] [FLAGS]
+coop pull [NAME] [FLAGS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `DIR` | Local directory to pull into (defaults to the workspace host path) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--dir <dir>` | Local directory to pull into (defaults to the workspace host path) |
 | `--force` | Overwrite local changes without confirmation |
 | `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop pull
-coop pull --name my-project ./local-copy --force
+coop pull my-project --dir ./local-copy --force
 ```
 
 ### `vscode`

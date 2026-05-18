@@ -290,9 +290,9 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
         });
     }
     bail!(
-        "No workspace.json found and no directory argument given.\n\
+        "No workspace.json found and no --dir given.\n\
          Either start the VM with --workspace or provide a path: \
-         coop {cmd} ./my-project"
+         coop {cmd} --dir ./my-project"
     )
 }
 
@@ -645,8 +645,8 @@ fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState) -> Result<Pa
         return Ok(PathBuf::from(d));
     }
     state.host_path.clone().context(
-        "No host_path in workspace.json and no directory argument given.\n\
-         Provide a directory: coop push ./my-project",
+        "No host_path in workspace.json and no --dir given.\n\
+         Provide a directory: coop push --dir ./my-project",
     )
 }
 
@@ -658,8 +658,8 @@ fn resolve_host_dir_for_pull(explicit: Option<&str>, state: &WorkspaceState) -> 
         return Ok(hp.clone());
     }
     bail!(
-        "No host_path in workspace.json and no directory argument given.\n\
-         Provide a destination: coop pull ./my-project"
+        "No host_path in workspace.json and no --dir given.\n\
+         Provide a destination: coop pull --dir ./my-project"
     )
 }
 
