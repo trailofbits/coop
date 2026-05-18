@@ -583,6 +583,8 @@ fn main() -> Result<()> {
         }
         Commands::ClaudeAgents { session, mut args } => {
             let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
+            // Subcommand flag: defaults dispatched sessions to bypassPermissions.
+            args.insert(0, "--dangerously-skip-permissions".to_string());
             args.insert(0, "agents".to_string());
             let tmux = session.tmux_session_opt_in();
             ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
