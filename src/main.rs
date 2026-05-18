@@ -1,5 +1,6 @@
 mod backend;
 mod cmd;
+mod completions;
 mod config;
 mod fs_util;
 mod guest;
@@ -37,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use cmd::Cmd;
@@ -44,7 +46,7 @@ use cmd::Cmd;
 #[derive(Parser)]
 #[command(name = "coop", version = env!("COOP_VERSION_STR"))]
 #[command(about = "Isolated VM environment for running Claude Code and Codex")]
-struct Cli {
+pub(crate) struct Cli {
     /// Path to coop config file
     #[arg(long, default_value_os_t = config::CoopConfig::default_path())]
     config: PathBuf,
@@ -60,6 +62,7 @@ struct Cli {
 #[derive(clap::Args)]
 struct SessionArgs {
     /// Instance name (required if multiple instances exist)
+    #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
     name: Option<String>,
     /// tmux session name
     #[arg(long, conflicts_with = "no_tmux")]
@@ -106,7 +109,11 @@ enum Commands {
         #[arg(long)]
         rebuild: bool,
         /// Install profiles (comma-separated: python,node,c,fuzz,rust,go)
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            add = ArgValueCandidates::new(completions::profile_candidates),
+        )]
         profile: Vec<String>,
         /// Extra apt packages to install (comma-separated)
         #[arg(long, value_delimiter = ',')]
@@ -118,7 +125,11 @@ enum Commands {
         #[arg(long)]
         template_size: Option<u32>,
         /// Named image to build (default: "default")
-        #[arg(long, default_value = config::DEFAULT_IMAGE)]
+        #[arg(
+            long,
+            default_value = config::DEFAULT_IMAGE,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
         image: String,
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
@@ -149,7 +160,11 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["workspace", "git_repo"])]
         mount: Vec<String>,
         /// Named image to use (default: "default")
-        #[arg(long, default_value = config::DEFAULT_IMAGE)]
+        #[arg(
+            long,
+            default_value = config::DEFAULT_IMAGE,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
         image: String,
         /// Skip the `.git` directory when syncing the workspace
         #[arg(long, conflicts_with = "git_repo")]
@@ -195,11 +210,13 @@ enum Commands {
     /// Gracefully stop the VM
     Stop {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
     },
     /// Stop and clean up instance resources (keeps template)
     Destroy {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Also remove template, kernel, and Firecracker binary
         #[arg(long)]
@@ -211,11 +228,13 @@ enum Commands {
     /// Show VM status
     Status {
         /// Instance name (shows all if omitted)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
     },
     /// Stream VM serial console logs
     Logs {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Follow log output
         #[arg(short, long)]
@@ -224,6 +243,7 @@ enum Commands {
     /// Push local workspace into the running VM
     Push {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Local directory to push (defaults to `workspace.json` `host_path`)
         #[arg(long)]
@@ -238,6 +258,7 @@ enum Commands {
     /// Pull guest workspace to local directory
     Pull {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
         #[arg(long)]
@@ -256,6 +277,7 @@ enum Commands {
     /// `coop exec my-vm -- ls -la` or `coop exec -- ls -la`.
     Exec {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Command and arguments to run (after `--`)
         #[arg(required = true, last = true, allow_hyphen_values = true)]
@@ -264,6 +286,7 @@ enum Commands {
     /// Open VS Code connected to the guest VM
     Vscode {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// Remote path to open in VS Code
         #[arg(long, default_value = "/workspace")]
@@ -278,12 +301,13 @@ enum Commands {
     /// List or manage golden images
     Images {
         /// Delete a named image
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completions::image_candidates))]
         delete: Option<String>,
     },
     /// Resize a stopped instance's disk
     Resize {
         /// Instance name (required if multiple instances exist)
+        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
         name: Option<String>,
         /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
         #[arg(long, required = true)]
@@ -325,7 +349,35 @@ enum Commands {
         #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
     },
+    /// Print a shell completion script (run `coop completions --help` for setup)
+    #[command(after_help = COMPLETIONS_AFTER_HELP)]
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
+
+const COMPLETIONS_AFTER_HELP: &str = "\
+Examples:
+  # bash — system-wide
+  coop completions bash | sudo tee /etc/bash_completion.d/coop > /dev/null
+
+  # bash — user
+  coop completions bash > ~/.local/share/bash-completion/completions/coop
+
+  # zsh — user (ensure dir is on $fpath; restart shell)
+  coop completions zsh > ~/.zfunc/_coop
+
+  # fish — user
+  coop completions fish > ~/.config/fish/completions/coop.fish
+
+Dynamic completion (live instance / image / profile names) requires one
+extra line in your shell rc:
+
+  bash:  source <(COMPLETE=bash coop)
+  zsh:   source <(COMPLETE=zsh coop)
+  fish:  source (COMPLETE=fish coop | psub)
+";
 
 #[derive(Subcommand)]
 enum ProfilesAction {
@@ -334,6 +386,7 @@ enum ProfilesAction {
     /// Show the full definition of a profile
     Show {
         /// Profile name to inspect
+        #[arg(add = ArgValueCandidates::new(completions::profile_candidates))]
         name: String,
     },
 }
@@ -375,9 +428,18 @@ where
 
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
 fn main() -> Result<()> {
+    // Dynamic shell completion: when invoked with COMPLETE=<shell>, compute
+    // candidates and exit before doing anything else (no tracing init, no
+    // config load — completion is expected to be cheap).
+    clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command).complete();
+
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
+    if let Commands::Completions { shell } = cli.command {
+        completions::emit_static(shell);
+        return Ok(());
+    }
     if matches!(cli.command, Commands::Init) {
         return cmd_init(&cli.config);
     }
@@ -601,7 +663,10 @@ fn main() -> Result<()> {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
         Commands::Validate => cmd_validate(&cfg, &be),
-        Commands::Init | Commands::Update { .. } | Commands::Uninstall { .. } => {
+        Commands::Init
+        | Commands::Update { .. }
+        | Commands::Uninstall { .. }
+        | Commands::Completions { .. } => {
             unreachable!("handled before config loading")
         }
     }
@@ -2140,5 +2205,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = std::path::Path::new("/nonexistent/path/config.toml");
         assert!(super::config_path_is_under_data_dir(config, tmp.path()));
+    }
+
+    #[test]
+    fn completions_subcommand_parses_each_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let cli = parse(&["completions", shell]);
+            let super::Commands::Completions { shell: parsed } = cli.command else {
+                panic!("expected Completions variant for {shell}");
+            };
+            assert_eq!(parsed.to_string(), shell);
+        }
+    }
+
+    #[test]
+    fn completions_subcommand_requires_shell() {
+        let err = parse_err(&["completions"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn completions_emit_static_includes_subcommands() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cmd = <super::Cli as clap::CommandFactory>::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, name, &mut buf);
+        let Ok(script) = String::from_utf8(buf) else {
+            panic!("bash completion script is not valid utf-8");
+        };
+        for sub in ["shell", "claude", "destroy", "completions"] {
+            assert!(script.contains(sub), "completion script missing `{sub}`");
+        }
     }
 }

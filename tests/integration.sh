@@ -199,6 +199,52 @@ test_validate() {
     fi
 }
 
+test_completions() {
+    echo ""
+    echo "=== Phase: shell completions ==="
+
+    # Static script generation — must succeed for each supported shell and
+    # the bash script must reference our subcommands.
+    for shell in bash zsh fish powershell elvish; do
+        if coop completions "$shell" >/dev/null; then
+            pass "completions $shell exits 0"
+        else
+            fail "completions $shell exits 0" "exit code: $?"
+        fi
+    done
+
+    if coop completions bash; then
+        for sub in shell claude destroy completions; do
+            if echo "$HARNESS_OUT" | grep -q "coop,$sub"; then
+                pass "bash completion script references \`$sub\`"
+            else
+                fail "bash completion script references \`$sub\`" \
+                    "output (truncated): $(echo "$HARNESS_OUT" | head -c 400)"
+            fi
+        done
+    else
+        fail "bash completion script content check" \
+             "completions bash exited non-zero: $?, stderr: $HARNESS_ERR"
+    fi
+
+    # Dynamic completion: the engine must return a usable subcommand list
+    # when called via the CompleteEnv protocol.
+    local dyn_out
+    if dyn_out=$(_CLAP_COMPLETE_INDEX=1 _CLAP_IFS=$'\013' \
+                 COMPLETE=bash "$BINARY" -- coop "" 2>&1); then
+        for sub in shell claude destroy completions; do
+            if echo "$dyn_out" | tr $'\013' '\n' | grep -qx "$sub"; then
+                pass "dynamic completion offers \`$sub\`"
+            else
+                fail "dynamic completion offers \`$sub\`" \
+                    "got: $(echo "$dyn_out" | tr $'\013' '\n')"
+            fi
+        done
+    else
+        fail "dynamic completion request exits 0" "exit code: $?, output: $dyn_out"
+    fi
+}
+
 test_invalid_names() {
     echo ""
     echo "=== Phase: invalid instance names ==="
@@ -2624,6 +2670,7 @@ main() {
     test_validate
     test_invalid_names
     test_profiles_cli
+    test_completions
 
     # Setup + primary instance
     test_setup

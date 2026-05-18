@@ -76,6 +76,11 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `resize` | Grow a stopped instance's disk |
 | `validate` | Check config and prerequisites |
 | `update` | Self-update coop to the latest GitHub release |
+| `completions` | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
+
+## Shell completion
+
+`coop completions <bash|zsh|fish|powershell|elvish>` prints a static completion script. Adding `source <(COMPLETE=<shell> coop)` to your rc additionally completes instance, image, and profile names live. Full setup recipes are in [docs/shell-completion.md](docs/shell-completion.md).
 
 ## Updating
 
@@ -158,3 +163,4 @@ Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are a
 - [VS Code integration](docs/vscode.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)
+- [Shell completion](docs/shell-completion.md)
