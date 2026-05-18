@@ -84,6 +84,7 @@ coop start [NAME] [FLAGS]
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use (default: `default`) |
 | `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
+| `--exclude-git` | Skip the `.git/` directory when syncing the workspace (conflicts with `--git-repo`). |
 
 `--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
 
@@ -282,6 +283,7 @@ coop push [--name NAME] [DIR] [FLAGS]
 | `--name <name>` | Instance name (required if multiple instances exist) |
 | `DIR` | Local directory to push (defaults to the workspace host path) |
 | `--force` | Overwrite guest changes without confirmation |
+| `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop push
@@ -301,6 +303,7 @@ coop pull [--name NAME] [DIR] [FLAGS]
 | `--name <name>` | Instance name (required if multiple instances exist) |
 | `DIR` | Local directory to pull into (defaults to the workspace host path) |
 | `--force` | Overwrite local changes without confirmation |
+| `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop pull

@@ -90,22 +90,29 @@ The destination directory is created if absent. Transport selection follows the 
 
 ## Default exclusions
 
-All transfers (rsync and tar-pipe) unconditionally exclude:
+All transfers (rsync and tar-pipe) exclude these reproducible build and cache directories:
 
-- `.git/`
 - `node_modules/`
 - `target/`
 - `__pycache__/`
 - `.venv/`
 - `.coop/`
 
-These are not configurable.
+`.git/` is **included** by default so agents in the guest get full history, branches, and the ability to make commits that survive a `coop pull`. Pass `--exclude-git` to `coop start`, `coop push`, or `coop pull` to skip it on a per-transfer basis (useful for very large repos where transfer time dominates).
 
 ## .gitignore integration
 
 When rsync is available, transfers pass `--filter=':- .gitignore'`. Rsync reads `.gitignore` files at each directory level and skips matching paths.
 
 The tar-pipe fallback on Linux uses GNU tar's `--exclude-vcs-ignores` for the same effect. On macOS, BSD tar lacks this flag, so only the default exclusions above apply.
+
+### `.git/` and .gitignore
+
+A repo whose `.gitignore` lists `.git/` (rare, but legal — sometimes seen in dotfile repos or repos vendoring other repos) gets special handling so the new include-by-default behaviour is not silently undone:
+
+- **rsync**: a protective `--filter=+ /.git/***` is prepended before the per-directory `.gitignore` merge, so `.git/` and its contents are always transferred unless `--exclude-git` is passed.
+- **GNU tar (Linux)**: `--exclude-vcs-ignores` is all-or-nothing. If your `.gitignore` lists `.git/`, the tar-pipe transport will skip it. Pass `--exclude-git` explicitly if that is what you want, or remove the entry from `.gitignore`.
+- **BSD tar (macOS)**: not affected — it doesn't read `.gitignore` at all.
 
 ## Checksum verification
 

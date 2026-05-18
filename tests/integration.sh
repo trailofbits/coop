@@ -1297,6 +1297,13 @@ test_restart_rejects_ignored_flags() {
         coop stop "$INSTANCE" 2>/dev/null || true
     fi
 
+    if moat_fails start "$INSTANCE" --no-agents --exclude-git; then
+        pass "restart with --exclude-git rejected"
+    else
+        fail "restart with --exclude-git rejected" "should have failed"
+        coop stop "$INSTANCE" 2>/dev/null || true
+    fi
+
     # Plain restart (no conflicting flags) should still work
     if coop start "$INSTANCE" --no-agents; then
         pass "restart without flags still works"
@@ -1430,6 +1437,14 @@ test_workspace_sync() {
     mkdir -p "$ws_tmpdir/subdir"
     echo "nested" > "$ws_tmpdir/subdir/nested.txt"
 
+    # Initialise a git repo so the .git/ inclusion path (issue #91) is
+    # exercised end-to-end. Use a local-only commit; no remote is set up.
+    (
+        cd "$ws_tmpdir" && \
+        git init --quiet --initial-branch=main && \
+        git -c user.email=ci@test -c user.name=CI commit --allow-empty --quiet -m "init"
+    ) || fail "set up git repo in workspace tmpdir" "git init/commit failed"
+
     # Start instance with --workspace
     local args=(start "$ws_instance" --no-agents --workspace "$ws_tmpdir")
     if coop "${args[@]}"; then
@@ -1464,6 +1479,21 @@ test_workspace_sync() {
         fi
     else
         fail "nested workspace files synced" "nested file not found"
+    fi
+
+    # Issue #91: `.git/` is now included by default. Verify the guest has
+    # a usable git workspace, not just the HEAD file.
+    if guest_exec test -f /workspace/.git/HEAD; then
+        pass ".git/ directory transferred to guest"
+    else
+        fail ".git/ directory transferred to guest" "/workspace/.git/HEAD missing"
+    fi
+
+    if guest_exec git -C /workspace rev-parse HEAD >/dev/null; then
+        pass "guest git repo is functional after sync"
+    else
+        fail "guest git repo is functional after sync" \
+            "git rev-parse HEAD failed: $(guest_stderr)"
     fi
 
     # Modify file in guest, then pull

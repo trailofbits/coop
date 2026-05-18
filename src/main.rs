@@ -150,6 +150,9 @@ enum Commands {
         /// Named image to use (default: "default")
         #[arg(long, default_value = config::DEFAULT_IMAGE)]
         image: String,
+        /// Skip the `.git` directory when syncing the workspace
+        #[arg(long, conflicts_with = "git_repo")]
+        exclude_git: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -227,6 +230,9 @@ enum Commands {
         /// Overwrite guest changes without confirmation
         #[arg(long)]
         force: bool,
+        /// Skip the `.git` directory in this transfer
+        #[arg(long)]
+        exclude_git: bool,
     },
     /// Pull guest workspace to local directory
     Pull {
@@ -238,6 +244,9 @@ enum Commands {
         /// Overwrite local changes without confirmation
         #[arg(long)]
         force: bool,
+        /// Skip the `.git` directory in this transfer
+        #[arg(long)]
+        exclude_git: bool,
     },
     /// Run a command in the VM and return its output (non-interactive)
     Exec {
@@ -414,6 +423,7 @@ fn main() -> Result<()> {
             no_agents,
             mount,
             image,
+            exclude_git,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
@@ -438,6 +448,7 @@ fn main() -> Result<()> {
                         .map(|d| config::GiB::new(d).context("--disk must be > 0"))
                         .transpose()?,
                     mounts,
+                    exclude_git,
                 },
             )
         }
@@ -482,13 +493,35 @@ fn main() -> Result<()> {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
             be.stream_logs(&cfg, &running.inst, follow)
         }
-        Commands::Push { name, dir, force } => {
+        Commands::Push {
+            name,
+            dir,
+            force,
+            exclude_git,
+        } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            workspace::push(&running.target, &running.inst, dir.as_deref(), force)
+            workspace::push(
+                &running.target,
+                &running.inst,
+                dir.as_deref(),
+                force,
+                exclude_git,
+            )
         }
-        Commands::Pull { name, dir, force } => {
+        Commands::Pull {
+            name,
+            dir,
+            force,
+            exclude_git,
+        } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            workspace::pull(&running.target, &running.inst, dir.as_deref(), force)
+            workspace::pull(
+                &running.target,
+                &running.inst,
+                dir.as_deref(),
+                force,
+                exclude_git,
+            )
         }
         Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_deref(), &command),
         Commands::Vscode {
@@ -592,6 +625,7 @@ struct StartOpts<'a> {
     no_agents: bool,
     disk: Option<config::GiB>,
     mounts: Vec<config::Mount>,
+    exclude_git: bool,
 }
 
 fn cmd_start(
@@ -604,14 +638,15 @@ fn cmd_start(
         let has_ignored_flags = !opts.mounts.is_empty()
             || opts.workspace_dir.is_some()
             || opts.git_repo.is_some()
-            || opts.disk.is_some();
+            || opts.disk.is_some()
+            || opts.exclude_git;
 
         if has_ignored_flags {
             bail!(
                 "Instance '{}' already exists (stopped). The flags \
-                 --mount, --workspace, --git-repo, and --disk are only \
-                 applied at creation time and would be silently ignored \
-                 on restart.\n\
+                 --mount, --workspace, --git-repo, --disk, and --exclude-git \
+                 are only applied at creation time and would be silently \
+                 ignored on restart.\n\
                  To apply new options, destroy the instance first:\n  \
                  coop destroy {0}\n  coop start {0} [options]",
                 inst.name,
@@ -829,7 +864,7 @@ fn start_instance(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::tar_pipe_transfer(&target, &abs_path)?;
+        workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             host_path: Some(abs_path),
@@ -847,7 +882,7 @@ fn start_instance(
         };
         state.save(inst)?;
     } else if !opts.mounts.is_empty() && !be.mounts_are_live() {
-        workspace::sync_mounts(&target, inst, &opts.mounts)?;
+        workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
         tracing::warn!(
             "Firecracker mounts use one-time sync, not live filesystem sharing. \
              Use `coop push` / `coop pull` to sync changes."

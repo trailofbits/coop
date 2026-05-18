@@ -11,15 +11,19 @@ use crate::config::Instance;
 
 const GUEST_WORKSPACE: &str = "/workspace";
 
-/// Default exclusions for transfers.
+/// Default exclusions for transfers — reproducible build/cache directories
+/// only. `.git/` is intentionally absent: agents inside the guest need
+/// history, branches, and the ability to make commits that survive a
+/// `coop pull`. Opt out per-transfer with `exclude_git: true`.
 const DEFAULT_EXCLUDES: &[&str] = &[
-    ".git/",
     "node_modules/",
     "target/",
     "__pycache__/",
     ".venv/",
     ".coop/",
 ];
+
+const GIT_EXCLUDE: &str = ".git/";
 
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,7 +75,7 @@ impl WorkspaceState {
 /// No staging file on either side, so peak disk usage on the guest is
 /// just the extracted tree. Integrity relies on SSH's MAC over the
 /// localhost transport plus tar's per-header checksums.
-pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
+pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path, exclude_git: bool) -> Result<()> {
     tracing::info!(
         "Transferring {} to guest:{GUEST_WORKSPACE} via tar-pipe",
         source_dir.display()
@@ -81,6 +85,9 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path) -> Result<()> {
     tar_cmd.args(["cf", "-"]);
     for exc in DEFAULT_EXCLUDES {
         tar_cmd.arg(format!("--exclude={exc}"));
+    }
+    if exclude_git {
+        tar_cmd.arg(format!("--exclude={GIT_EXCLUDE}"));
     }
     // --exclude-vcs-ignores is GNU tar only (not available on macOS BSD tar)
     if !cfg!(target_os = "macos") {
@@ -290,7 +297,13 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
 }
 
 /// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
-pub fn push(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool) -> Result<()> {
+pub fn push(
+    target: &SshTarget,
+    inst: &Instance,
+    dir: Option<&str>,
+    force: bool,
+    exclude_git: bool,
+) -> Result<()> {
     let state = load_or_default(inst, dir, "push")?;
     let source_dir = resolve_host_dir(dir, &state)?;
 
@@ -309,10 +322,10 @@ pub fn push(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool)
     );
 
     if target.exec_ok("which rsync") {
-        rsync_push(target, &source_dir, &state.guest_path)?;
+        rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_transfer(target, &source_dir)?;
+        tar_pipe_transfer(target, &source_dir, exclude_git)?;
     }
 
     tracing::info!("Push complete");
@@ -320,7 +333,13 @@ pub fn push(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool)
 }
 
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
-pub fn pull(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool) -> Result<()> {
+pub fn pull(
+    target: &SshTarget,
+    inst: &Instance,
+    dir: Option<&str>,
+    force: bool,
+    exclude_git: bool,
+) -> Result<()> {
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir_for_pull(dir, &state)?;
 
@@ -338,10 +357,10 @@ pub fn pull(target: &SshTarget, inst: &Instance, dir: Option<&str>, force: bool)
     );
 
     if target.exec_ok("which rsync") {
-        rsync_pull(target, &state.guest_path, &dest_dir)?;
+        rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_pull(target, &state.guest_path, &dest_dir)?;
+        tar_pipe_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
     }
 
     tracing::info!("Pull complete");
@@ -356,6 +375,7 @@ pub fn sync_mounts(
     target: &SshTarget,
     inst: &Instance,
     mounts: &[crate::config::Mount],
+    exclude_git: bool,
 ) -> Result<()> {
     for m in mounts {
         let guest = &m.guest_path;
@@ -366,10 +386,10 @@ pub fn sync_mounts(
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
         if target.exec_ok("which rsync") {
-            rsync_push(target, &m.host_path, guest)?;
+            rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
-            tar_pipe_transfer(target, &m.host_path)?;
+            tar_pipe_transfer(target, &m.host_path, exclude_git)?;
         }
     }
 
@@ -447,21 +467,32 @@ pub fn remove_ssh_config(inst: &Instance) -> Result<()> {
 
 // ── Transport: rsync ──────────────────────────────────────────
 
-fn rsync_base_args(target: &SshTarget) -> Vec<String> {
-    let mut args = vec![
-        "-az".to_string(),
-        "-e".to_string(),
-        target.rsync_ssh_cmd(),
-        "--filter=:- .gitignore".to_string(),
-    ];
+fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
+    let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()];
+    // `.git/` rule must precede the per-directory `.gitignore` merge: rsync
+    // uses first-match-wins, so without this a repo whose `.gitignore`
+    // happens to list `.git/` would silently strip git state from the
+    // transfer regardless of `--exclude-git`.
+    if exclude_git {
+        args.push(format!("--exclude={GIT_EXCLUDE}"));
+    } else {
+        // `/.git/***` matches the directory itself and everything inside.
+        args.push("--filter=+ /.git/***".to_string());
+    }
+    args.push("--filter=:- .gitignore".to_string());
     for exc in DEFAULT_EXCLUDES {
         args.push(format!("--exclude={exc}"));
     }
     args
 }
 
-pub fn rsync_push(target: &SshTarget, source: &Path, guest_path: &str) -> Result<()> {
-    let mut args = rsync_base_args(target);
+pub fn rsync_push(
+    target: &SshTarget,
+    source: &Path,
+    guest_path: &str,
+    exclude_git: bool,
+) -> Result<()> {
+    let mut args = rsync_base_args(target, exclude_git);
     args.push("--delete".to_string());
     args.push(format!("{}/", source.display()));
     args.push(format!("{}:{guest_path}/", target.addr()));
@@ -477,8 +508,8 @@ pub fn rsync_push(target: &SshTarget, source: &Path, guest_path: &str) -> Result
     Ok(())
 }
 
-fn rsync_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()> {
-    let mut args = rsync_base_args(target);
+fn rsync_pull(target: &SshTarget, guest_path: &str, dest: &Path, exclude_git: bool) -> Result<()> {
+    let mut args = rsync_base_args(target, exclude_git);
     args.push(format!("{}:{guest_path}/", target.addr()));
     args.push(format!("{}/", dest.display()));
 
@@ -495,11 +526,19 @@ fn rsync_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()> {
 
 // ── Transport: tar-pipe ───────────────────────────────────────
 
-fn tar_pipe_pull(target: &SshTarget, guest_path: &str, dest: &Path) -> Result<()> {
-    let excludes: Vec<String> = DEFAULT_EXCLUDES
+fn tar_pipe_pull(
+    target: &SshTarget,
+    guest_path: &str,
+    dest: &Path,
+    exclude_git: bool,
+) -> Result<()> {
+    let mut excludes: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(|exc| format!("--exclude={exc}"))
         .collect();
+    if exclude_git {
+        excludes.push(format!("--exclude={GIT_EXCLUDE}"));
+    }
     let exclude_str = excludes.join(" ");
 
     let remote_cmd = format!("tar cf - -C {guest_path} {exclude_str} .");
@@ -625,9 +664,21 @@ fn resolve_host_dir_for_pull(explicit: Option<&str>, state: &WorkspaceState) -> 
 }
 
 fn check_guest_dirty(target: &SshTarget, guest_path: &str) -> Result<()> {
+    // Untracked files are excluded — they're almost always host-side noise
+    // (build artifacts, editor state) that was copied in at start time, not
+    // edits made inside the guest. Modified tracked files and unpushed
+    // commits are the real signal that an agent has done work the host
+    // doesn't yet know about.
     let check_cmd = format!(
         "if [ -d {guest_path}/.git ]; then \
-            cd {guest_path} && git status --porcelain; \
+            cd {guest_path} && \
+            git status --porcelain --untracked-files=no && \
+            if git rev-parse --abbrev-ref '@{{u}}' >/dev/null 2>&1; then \
+                ahead=$(git rev-list --count '@{{u}}..HEAD' 2>/dev/null); \
+                if [ \"${{ahead:-0}}\" -gt 0 ]; then \
+                    echo \"AHEAD $ahead\"; \
+                fi; \
+            fi; \
          fi"
     );
 
@@ -643,8 +694,8 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &str) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
         bail!(
-            "Guest workspace has uncommitted changes:\n{stdout}\n\
-             Use --force to overwrite"
+            "Guest workspace has changes the host does not know about:\n{stdout}\n\
+             Pull them with `coop pull`, or overwrite with `coop push --force`."
         );
     }
 
@@ -1100,5 +1151,75 @@ Host coop-0\n\
 
         let result = remove_marker_blocks(input);
         assert!(result.is_empty());
+    }
+
+    // ── exclude_git policy ────────────────────────────────────
+
+    fn fake_ssh_target() -> SshTarget {
+        SshTarget {
+            host: "127.0.0.1".to_string(),
+            port: std::num::NonZeroU16::new(2222).unwrap(),
+            user: "ubuntu".to_string(),
+            key_path: PathBuf::from("/tmp/key"),
+        }
+    }
+
+    #[test]
+    fn default_excludes_omit_git() {
+        // Issue #91: `.git/` was previously hardcoded into DEFAULT_EXCLUDES,
+        // which silently stripped git history from agents in the guest. The
+        // policy is now opt-out via --exclude-git; lock it in here so a
+        // future tidy-up doesn't accidentally re-add `.git/`.
+        assert!(
+            !DEFAULT_EXCLUDES.iter().any(|e| e.contains(".git")),
+            "DEFAULT_EXCLUDES must not contain a .git pattern; got {DEFAULT_EXCLUDES:?}"
+        );
+        assert_eq!(GIT_EXCLUDE, ".git/");
+    }
+
+    #[test]
+    fn rsync_args_include_git_by_default() {
+        let args = rsync_base_args(&fake_ssh_target(), false);
+        // The protective filter must precede the .gitignore merge so
+        // first-match-wins doesn't let a user's .gitignore strip .git/.
+        let protect_idx = args
+            .iter()
+            .position(|a| a == "--filter=+ /.git/***")
+            .expect("expected protective .git/ include filter");
+        let gitignore_idx = args
+            .iter()
+            .position(|a| a == "--filter=:- .gitignore")
+            .expect("expected .gitignore merge filter");
+        assert!(
+            protect_idx < gitignore_idx,
+            "protective filter must come before .gitignore merge: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--exclude=.git/"),
+            "default rsync must not exclude .git/: {args:?}"
+        );
+    }
+
+    #[test]
+    fn rsync_args_exclude_git_when_requested() {
+        let args = rsync_base_args(&fake_ssh_target(), true);
+        // Opt-out path: no protective filter, explicit exclude before the
+        // .gitignore merge so the exclude wins.
+        let exclude_idx = args
+            .iter()
+            .position(|a| a == "--exclude=.git/")
+            .expect("expected --exclude=.git/");
+        let gitignore_idx = args
+            .iter()
+            .position(|a| a == "--filter=:- .gitignore")
+            .expect("expected .gitignore merge filter");
+        assert!(
+            exclude_idx < gitignore_idx,
+            "explicit --exclude=.git/ must precede .gitignore merge: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--filter=+ /.git/***"),
+            "exclude_git=true must drop the protective filter: {args:?}"
+        );
     }
 }
