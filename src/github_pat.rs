@@ -399,7 +399,8 @@ fn pick_backend() -> Result<crate::secret_store::Backend> {
 /// writes.
 fn upsert_pat_entry(path: &Path, repo: &str, token_cmd: &str) -> Result<()> {
     let _lock = crate::fs_util::lock_sibling(path)?;
-    let mut doc = read_or_init_doc(path)?;
+    let original = read_or_init_doc(path)?;
+    let mut doc = original.clone();
 
     // Ensure the `github` table exists.
     let github = doc
@@ -442,6 +443,17 @@ fn upsert_pat_entry(path: &Path, repo: &str, token_cmd: &str) -> Result<()> {
         arr.retain(|v| v.as_str() != Some(repo));
     }
 
+    // Skip the rewrite when the parsed result equals what's already on disk.
+    // `rotate-pat` routinely hits this: the `cmd:` invocation produced by
+    // `store_secret` is deterministic in `(service, account)` for every
+    // backend we support, so re-storing the same repo's token through the
+    // same backend yields an entry value identical to the existing one.
+    // Without this guard each rotation would rewrite the file (bumping mtime
+    // and stripping any user-added comments via the `toml::Value` round-trip)
+    // for no observable change in coop's behaviour.
+    if doc == original {
+        return Ok(());
+    }
     write_doc(path, &doc)
 }
 
@@ -604,6 +616,24 @@ mod tests {
         upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
         let cfg = CoopConfig::load(&path).unwrap();
         assert!(matches!(cfg.github, Some(GitHubAuth::Pat(_))));
+    }
+
+    #[test]
+    fn upsert_is_noop_when_entry_unchanged() {
+        // Re-upserting the same (repo, cmd) into an already-pat config must
+        // not rewrite the file. Verified by leaving a comment in the input
+        // — `toml::Value` strips comments on round-trip, so a rewrite would
+        // be visible as comment loss.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "# user comment\n[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n";
+        std::fs::write(&path, original).unwrap();
+        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, original,
+            "no-op upsert must not rewrite the file (lost comments / formatting)"
+        );
     }
 
     #[test]
