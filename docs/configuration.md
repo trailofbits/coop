@@ -75,7 +75,7 @@ Other subcommands:
 | `coop github status` | List configured entries, storage backend, and whether each token still resolves. Never prints token material. |
 | `coop github rotate-pat --repo X/Y` | Re-run the wizard against an existing entry (PATs expire — max 1 year). |
 | `coop github forget-pat --repo X/Y` | Remove the stored secret and the `[github.pat."X/Y"]` entry. Does **not** add a skip marker; the token may still be live on GitHub. |
-| `coop validate --probe` | Resolves each entry and probes `GET /user` against api.github.com. |
+| `coop validate --probe` | Resolves each entry and probes `GET /user` against api.github.com. May trigger Keychain authorization or a 1Password Touch-ID prompt the first time per session. |
 
 #### Auto-prompt at `coop start`
 

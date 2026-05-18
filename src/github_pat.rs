@@ -255,6 +255,12 @@ fn read_token_no_echo() -> Result<String> {
 /// it on drop. Disabling fails silently if no controlling TTY exists or
 /// `stty` is unavailable (`is_active` then returns false, so the caller
 /// can skip the trailing newline).
+///
+/// `Drop` runs on normal scope exit but **not** when the process is killed
+/// by an uncaught signal (Ctrl-C / SIGTERM). Users who interrupt the
+/// wizard mid-paste can restore echo with `stty echo`. A `tcsetattr`-based
+/// implementation would let the kernel handle restoration via terminal
+/// reset, but the shell-out keeps the dependency footprint minimal.
 struct EchoGuard {
     active: bool,
 }

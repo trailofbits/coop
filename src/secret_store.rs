@@ -141,13 +141,14 @@ pub fn delete_secret(
             Ok(())
         }
         Backend::OnePassword => {
-            // 1Password CLI doesn't have a direct delete by tag — users
-            // who chose 1Password should manage entries themselves. Best
-            // effort: try `op item delete` with the canonical title.
+            // Best-effort soft-delete: `--archive` keeps the item
+            // recoverable from the 1Password trash. Manual cleanup is
+            // always available via the 1Password UI.
             let title = format!("{service} ({account})");
             let _ = Cmd::new("op")
                 .arg("item")
                 .arg("delete")
+                .arg("--archive")
                 .arg(&title)
                 .output();
             Ok(())
@@ -167,6 +168,10 @@ pub fn delete_secret(
 ///
 /// Used by `coop github status` to display the storage location without
 /// reading the secret. Returns `None` for opaque commands.
+///
+/// The File-backend match requires the path to end in `/github-pat/<name>.txt`
+/// (the canonical layout coop writes) so user-supplied `cmd:cat …` paths
+/// that don't follow that shape correctly fall through to `unknown`.
 pub fn infer_backend(cmd: &str) -> Option<Backend> {
     let cmd_str = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
     if cmd_str.starts_with("security find-generic-password") {
@@ -175,7 +180,10 @@ pub fn infer_backend(cmd: &str) -> Option<Backend> {
         Some(Backend::LinuxSecretService)
     } else if cmd_str.starts_with("op read") || cmd_str.starts_with("op item get") {
         Some(Backend::OnePassword)
-    } else if cmd_str.starts_with("cat ") && cmd_str.contains("github-pat") {
+    } else if cmd_str.starts_with("cat ")
+        && cmd_str.contains("github-pat/")
+        && cmd_str.contains(".txt")
+    {
         Some(Backend::File)
     } else {
         None
@@ -232,8 +240,16 @@ fn store_secret_service(service: &str, account: &str, token: &str) -> Result<Str
 fn store_onepassword(service: &str, account: &str, token: &str) -> Result<String> {
     // `op item create` reads field values from argv. The token is briefly
     // visible to local observers via /proc; redacted from coop's own
-    // debug log via `redacted_arg`.
+    // debug log via `redacted_arg`. 1Password rejects duplicate titles, so
+    // soft-delete any existing item with the same title first (rotate-pat
+    // calls store_onepassword on an existing entry).
     let title = format!("{service} ({account})");
+    let _ = Cmd::new("op")
+        .arg("item")
+        .arg("delete")
+        .arg("--archive")
+        .arg(&title)
+        .output();
     let password_field = format!("password={token}");
     Cmd::new("op")
         .arg("item")
@@ -396,9 +412,30 @@ mod tests {
             Some(Backend::OnePassword)
         );
         assert_eq!(
+            infer_backend("cmd:op item get 'foo' --fields password --reveal"),
+            Some(Backend::OnePassword)
+        );
+        assert_eq!(
             infer_backend("cmd:cat ~/.coop/state/github-pat/x.txt"),
             Some(Backend::File)
         );
         assert_eq!(infer_backend("cmd:echo opaque"), None);
+    }
+
+    #[test]
+    fn infer_backend_rejects_cat_without_canonical_layout() {
+        // A `cat` invocation that doesn't follow the `…/github-pat/<x>.txt`
+        // layout should not be reported as the File backend — otherwise
+        // `forget-pat` would happily try to delete a file coop never wrote.
+        assert_eq!(
+            infer_backend("cmd:cat ~/some/path/secret.txt"),
+            None,
+            "cat invocation without github-pat in the path must not match File"
+        );
+        assert_eq!(
+            infer_backend("cmd:cat ~/.coop/state/github-pat/x.bin"),
+            None,
+            "non-.txt suffix must not match File"
+        );
     }
 }

@@ -1140,15 +1140,26 @@ fn resolve_github_token(
         }
         GitHubAuth::Off => Ok(None),
         GitHubAuth::Pat(_) => {
-            if let Some(slug) = repo {
-                resolve_pat_token(strategy, slug).map(Some)
-            } else {
+            let Some(slug) = repo else {
                 tracing::warn!(
                     "github: \"pat\" requires a resolvable repo (via --git-repo or \
                      workspace origin). No token will be forwarded."
                 );
-                Ok(None)
+                return Ok(None);
+            };
+            // Missing entry is not fatal: follow-up commands (shell / exec /
+            // claude / codex / restart) must still work without a token,
+            // matching the "off" mode shape. The wizard's pre-flight prompt
+            // is the discovery path for missing entries.
+            if strategy.and_then(|s| s.pat_entry(slug)).is_none() {
+                tracing::warn!(
+                    "github: \"pat\" mode has no [github.pat.\"{slug}\"] entry. \
+                     No token forwarded. Run `coop github setup-pat --repo {slug}` \
+                     to add one."
+                );
+                return Ok(None);
             }
+            resolve_pat_token(strategy, slug).map(Some)
         }
     }
 }

@@ -945,6 +945,23 @@ impl CoopConfig {
             }
         }
 
+        if let Some(GitHubAuth::Pat(pat)) = self.github.as_ref() {
+            for key in pat.entries.keys() {
+                if let Err(e) = crate::github_repo::validate_repo_slug(key) {
+                    errors.push(format!(
+                        "github.pat.\"{key}\" key is not a valid 'owner/repo' slug: {e}"
+                    ));
+                }
+            }
+            for slug in &pat.skip {
+                if let Err(e) = crate::github_repo::validate_repo_slug(slug) {
+                    errors.push(format!(
+                        "github.skip entry '{slug}' is not a valid 'owner/repo' slug: {e}"
+                    ));
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(warnings)
         } else {

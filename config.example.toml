@@ -6,10 +6,15 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
+# GitHub auth strategy. Pick ONE of the two forms below — `github` cannot
+# be both a string and a table at the same time.
+#
+# Form A — simple string:
 # github = "auto"               # "auto", "env", "off", or "pat"
 #
-# Per-repo fine-grained PAT (server-enforced scope to one repo):
-# Run `coop github setup-pat --repo owner/name` to add entries via wizard.
+# Form B — table, required when you want per-repo PAT entries.
+# Run `coop github setup-pat --repo owner/name` to populate it via wizard.
+# Form B `mode = "pat"` is equivalent to form A `github = "pat"`.
 #
 # [github]
 # mode = "pat"

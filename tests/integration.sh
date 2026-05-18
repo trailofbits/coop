@@ -703,6 +703,8 @@ test_github_token_forwarding() {
     echo "=== Phase: github token forwarding ==="
 
     # Check the config's github auth strategy to determine expected behavior.
+    # `github` may be a plain string ("auto" / "env" / "off" / "pat") or a
+    # table — collapse the table form to its `mode` field.
     local github_setting
     local cfg_path="${HOME}/.coop/config.toml"
     github_setting=$(python3 -c "
@@ -714,7 +716,10 @@ except ImportError:
 try:
     with open('$cfg_path', 'rb') as f:
         cfg = tomllib.load(f)
-    print(cfg.get('github', 'off'))
+    raw = cfg.get('github', 'off')
+    if isinstance(raw, dict):
+        raw = raw.get('mode', 'off')
+    print(raw)
 except Exception:
     print('off')
 " 2>/dev/null || echo "off")
@@ -731,13 +736,106 @@ except Exception:
             fail "GITHUB_TOKEN forwarded to guest (github: $github_setting)" "got: ${token_out:-empty}"
         fi
     else
-        # Token should NOT be forwarded
+        # Token should NOT be forwarded (off / pat / unset)
         if [[ -z "$token_out" || "$token_out" != *"test-leak-token"* ]]; then
             pass "GITHUB_TOKEN not forwarded to guest (github: $github_setting)"
         else
             fail "GITHUB_TOKEN not forwarded to guest (github: $github_setting)" "got: $token_out"
         fi
     fi
+}
+
+# Verify that github = "pat" + a matching [github.pat] entry forwards the
+# configured token (a server-side dummy literal, never a real PAT) for an
+# instance whose `--git-repo` matches the entry. Runs in the --full bucket
+# because it boots a fresh VM.
+test_github_pat_forwarding() {
+    echo ""
+    echo "=== Phase: github pat-mode token forwarding ==="
+
+    local pat_instance="${INSTANCE}-pat"
+    local token_file="$tmpdir/pat-token.txt"
+    local cfg_file="$tmpdir/coop-pat.toml"
+    local repo_url="https://github.com/trailofbits/coop.git"
+    local repo_slug="trailofbits/coop"
+    local sentinel="github_pat_test_FORWARDED_OK"
+
+    # File-backend secret store: a 0600 file the wizard would have written.
+    printf '%s' "$sentinel" > "$token_file"
+    chmod 0600 "$token_file"
+
+    # Config inherits the default data_dir + golden image. github =/= pat
+    # mode is the only override.
+    cat > "$cfg_file" <<CFGEOF
+[github]
+mode = "pat"
+
+[github.pat."$repo_slug"]
+token = "cmd:cat $token_file"
+CFGEOF
+
+    # Step 1: `coop validate` must parse pat-mode and report the entry.
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" validate \
+            >"$tmpdir/pat-validate.out" 2>&1; then
+        if grep -q "github.pat.\"$repo_slug\": ok" "$tmpdir/pat-validate.out"; then
+            pass "pat: validate reports the configured entry"
+        else
+            fail "pat: validate reports the configured entry" \
+                "validate output: $(cat "$tmpdir/pat-validate.out")"
+        fi
+    else
+        fail "pat: validate succeeds with a [github.pat] entry" \
+            "$(cat "$tmpdir/pat-validate.out")"
+    fi
+
+    # Step 2: `coop github status` must list the entry without resolving it
+    # (no --probe).
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" github status \
+            >"$tmpdir/pat-status.out" 2>&1; then
+        if grep -q "$repo_slug" "$tmpdir/pat-status.out"; then
+            pass "pat: github status lists the entry"
+        else
+            fail "pat: github status lists the entry" \
+                "status output: $(cat "$tmpdir/pat-status.out")"
+        fi
+    else
+        fail "pat: github status runs cleanly" "$(cat "$tmpdir/pat-status.out")"
+    fi
+
+    # Step 3: boot a VM with --git-repo so workspace.json records the URL,
+    # then `exec` and read GITHUB_TOKEN out of the guest. Network access to
+    # github.com is required (same as `test_git_repo_private_clone`). Skip
+    # if we can't reach github.com from the host — keeps CI honest.
+    if ! curl -fsS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then
+        skip "pat: token forwarding via --git-repo" "github.com unreachable from host"
+        return
+    fi
+
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" start \
+            "$pat_instance" \
+            --git-repo "$repo_url" \
+            --no-prompt \
+            >"$tmpdir/pat-start.out" 2>&1; then
+        STARTED_INSTANCES+=("$pat_instance")
+        pass "pat: start with --git-repo for the configured slug"
+    else
+        fail "pat: start with --git-repo for the configured slug" \
+            "$(cat "$tmpdir/pat-start.out")"
+        env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" destroy "$pat_instance" 2>/dev/null || true
+        return
+    fi
+
+    local pat_token_out
+    pat_token_out=$(env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY RUST_LOG=off \
+        "$BINARY" --config "$cfg_file" exec "$pat_instance" -- printenv GITHUB_TOKEN 2>/dev/null) || true
+    if [[ "$pat_token_out" == *"$sentinel"* ]]; then
+        pass "pat: configured token forwarded to guest"
+    else
+        fail "pat: configured token forwarded to guest" "got: ${pat_token_out:-empty}"
+    fi
+
+    # Cleanup.
+    env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" destroy "$pat_instance" 2>/dev/null || true
 }
 
 test_term_handling() {
@@ -2726,6 +2824,9 @@ main() {
 
         # Local marketplace directory copy
         test_local_marketplace
+
+        # github = "pat" mode + per-repo token forwarding (uses a stub image)
+        test_github_pat_forwarding
 
         # Config sources: CLAUDE.md + rules copy
         test_config_dir

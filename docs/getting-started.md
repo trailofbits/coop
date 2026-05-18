@@ -70,8 +70,9 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 - `"off"` (default): disables GitHub auth forwarding
 - `"auto"`: checks `$GITHUB_TOKEN` env var first, falls back to `gh auth token` if unset
 - `"env"`: requires `GITHUB_TOKEN` in your environment
+- `"pat"`: forwards a per-repo fine-grained PAT recorded under `[github.pat."owner/repo"]`. GitHub enforces the token's scope server-side — see [GitHub auth](configuration.md#fine-grained-pat-github--pat) for the full reference.
 
-GitHub auth is off by default. Set `github = "auto"` explicitly to enable it.
+GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop start` itself offers to run the PAT wizard inline the first time you start an instance against a GitHub repo without auth configured.
 
 coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
 

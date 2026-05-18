@@ -919,7 +919,7 @@ fn cmd_start(
             );
         }
 
-        return restart_instance(be, cfg, &inst, opts.no_agents);
+        return restart_instance(be, cfg, &inst, opts);
     }
 
     let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
@@ -1048,13 +1048,18 @@ fn find_stopped_instance(
 /// Restart a stopped instance: boot VM, wait for SSH, re-bootstrap guest tools.
 fn restart_instance(
     be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
+    cfg: &mut config::CoopConfig,
     inst: &config::Instance,
-    no_agents: bool,
+    opts: &StartOpts<'_>,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
 
     let _guard = signal::install_handlers();
+
+    // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
+    // recorded workspace-state to recover the repo slug.
+    let repo = backend::detect_instance_repo(inst);
+    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
 
     be.start_existing(cfg, inst)?;
 
@@ -1067,10 +1072,9 @@ fn restart_instance(
 
     signal::check_shutdown()?;
 
-    if no_agents {
+    if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let repo = backend::detect_instance_repo(inst);
         let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
         let session = backend::SshSession {
             target: target.clone(),
