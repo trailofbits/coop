@@ -367,7 +367,13 @@ test_start() {
     echo ""
     echo "=== Phase: start ==="
 
-    local args=(start "$INSTANCE" --no-agents)
+    # `--env` exercises the guest_env CLI -> config -> SendEnv path
+    # end-to-end. `test_guest_environment` verifies the value is
+    # visible inside the guest via `printenv`.
+    local args=(
+        start "$INSTANCE" --no-agents
+        --env "COOP_TEST_GUEST_ENV=hello-from-cli"
+    )
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$INSTANCE")
         pass "start exits 0"
@@ -938,6 +944,18 @@ test_guest_environment() {
         fi
     else
         fail "HOME is /home/ubuntu" "printenv failed"
+    fi
+
+    # Verify `--env` from test_start landed in the guest process env.
+    local guest_env_val
+    if guest_env_val=$(guest_exec printenv COOP_TEST_GUEST_ENV); then
+        if [[ "$guest_env_val" == "hello-from-cli" ]]; then
+            pass "guest_env from --env reaches the guest"
+        else
+            fail "guest_env from --env reaches the guest" "got: $guest_env_val"
+        fi
+    else
+        fail "guest_env from --env reaches the guest" "printenv failed; stderr: $(guest_stderr)"
     fi
 }
 
