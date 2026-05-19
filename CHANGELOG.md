@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.4
 
 ### Breaking changes
 
@@ -14,6 +14,111 @@
   `coop push my-vm --dir ./src --force`,
   `coop pull my-vm --dir ./out --force`,
   `coop exec my-vm -- ls -la`.
+
+### New features
+
+- **`coop ca` / `coop claude-agents` shortcut** (#80, #82, #99, #100, #101) —
+  Runs `claude agents` inside the VM in one command. Defaults to no
+  tmux (Claude Code manages background-session lifetime itself);
+  `--session <name>` opts in. The guest is now bootstrapped with a
+  managed `~/.claude/settings.json` that pre-accepts
+  `bypassPermissions`, so dispatched sessions no longer prompt for
+  tool permissions; `coop claude --ask` explicitly opts back into the
+  prompting default.
+
+- **`coop github setup-pat` wizard** (#85, #88) — Walks the user
+  through creating a fine-grained personal access token scoped to one
+  repo, stores it in the user's preferred secret store (Keychain,
+  Secret Service, 1Password, or file), and forwards it to the guest as
+  `GITHUB_TOKEN` keyed off the resolved repo slug. Adds a new
+  `github = "pat"` config mode.
+
+- **`coop list` / `coop ls`** (#89, #94) — Local-only enumeration of
+  instance name + state. Reads on-disk metadata and `be.is_running`
+  without SSH probes so it stays fast even when VMs are unreachable.
+  `coop status` keeps its richer per-instance and resource-usage
+  output.
+
+- **`coop uninstall`** (#93, #96) — Reverses what `install.sh` does:
+  removes the running coop binary and, with confirmation, the data
+  directory (`~/.coop`) and XDG update-check state. Flags
+  `--yes` / `--keep-data` / `--purge`. Refuses to delete
+  `target/{debug,release}/coop` and surfaces EPERM with a
+  `sudo coop uninstall` hint. Bails on non-TTY stdin without `--yes`
+  so CI misuse fails loud.
+
+- **Shell completion** (#92, #98) — `coop completions <shell>` prints
+  a static completion script for bash, zsh, fish, powershell, and
+  elvish. Adding `source <(COMPLETE=<shell> coop)` to a shell rc
+  additionally fills in live values via clap_complete's dynamic
+  engine — instance, image, and profile names are read from `~/.coop`
+  on each TAB.
+
+- **`--git-repo` clones authenticate against private GitHub repos**
+  (#78) — On the host, resolve a token (`gh auth token` preferred,
+  then `GITHUB_TOKEN`) and forward it to git in the guest via stdin
+  and a one-shot `credential.helper`. The token never appears on
+  argv, stays out of `/proc/<pid>/cmdline` and the ssh debug log, and
+  is not persisted in the cloned repo's `.git/config`. Opportunistic:
+  GitHub HTTPS URLs only; non-GitHub and SSH-style URLs pass through
+  untouched.
+
+- **`.git/` included in workspace transfers by default** (#95) —
+  `coop start --workspace`, `coop push`, and `coop pull` previously
+  hardcoded `.git/` into the default exclusion list, breaking
+  in-guest git history and rendering `check_guest_dirty` a no-op.
+  Now transferred by default, with an `--exclude-git` opt-out on
+  `start` / `push` / `pull` for repos large enough that the transfer
+  cost dominates. `check_guest_dirty` also now detects unpushed
+  commits (`@{u}..HEAD`) so in-guest commits aren't silently
+  destroyed by a host push.
+
+### Fixes
+
+- **`integration-uninstall.sh` state path on macOS** (#106) —
+  `dirs::state_dir()` returns `None` on macOS, so `state_path()` in
+  `src/update.rs` falls back to `~/Library/Application Support/coop/`.
+  The test seeded `$XDG_STATE_HOME/coop/update-check.json` but the
+  binary never wrote there, so the `--purge` assertion failed. The
+  test now uses the same platform branching the binary does.
+
+- **SIGPIPE flake in bash completion integration check** (#105) —
+  `echo "$HARNESS_OUT" | grep -q "coop,$sub"` against the ~48 KB
+  completion script flaked under `set -o pipefail`: when `grep -q`
+  matched early it closed the pipe, bash's `echo` builtin exited 141
+  (SIGPIPE), and the pipeline status masked `grep`'s success (~60%
+  of trials on Linux 6.17 / bash 5.2.21). Replaced the pipe with a
+  here-string.
+
+- **`destroy --all` integration phase gated behind
+  `COOP_TEST_DESTRUCTIVE=1`** (#104) — `coop destroy --all` removes
+  every coop-managed instance on the host, not just the ones the
+  test created. The phase is now skipped by default; remote mode
+  forwards the opt-in env var explicitly.
+
+### Internal
+
+- **`open_ssh_session` helper extracted** (#81, #83) — The five-line
+  `resolve_running` + `prepare_env_forwarding` + `SshSession` setup
+  repeated across Claude, ClaudeAgents, Codex, plus `cmd_shell` and
+  `cmd_exec`, collapses to a single `open_ssh_session` call.
+  `SshSession` is now owned rather than borrowing target/env;
+  removing the lifetime parameter drops `SshSession<'_>` from nine
+  downstream signatures. Incidental behavior change: with
+  `--no-agents`, a misconfigured `cmd:` secret source no longer
+  fails the boot path.
+
+### Documentation
+
+- **Rust authoring + review guidance in CLAUDE.md** (#84) —
+  Project-specific patterns for using the type system to eliminate
+  error states: parse-don't-validate, smart constructors, type-state
+  for the VM lifecycle, newtypes that earn their keep, and error
+  design. Includes prioritized review and authoring checklists.
+
+### Dependencies
+
+- `cargo-bins/cargo-binstall` 1.18.1 → 1.19.1 (#86)
 
 ## v0.4.3
 
