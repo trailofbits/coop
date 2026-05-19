@@ -973,6 +973,17 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<En
         }
     }
 
+    // `guest_env` literals override anything resolved above (forwarded
+    // host env vars, `claude.api_key`, etc.) so an explicit value beats
+    // an inherited one. Warn on collision so the override is visible —
+    // values are not logged (they may be secrets).
+    for (name, value) in &cfg.guest_env {
+        if env.contains(name) {
+            tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
+        }
+        env.set(name.as_str(), value.as_str());
+    }
+
     Ok(env)
 }
 
@@ -2302,5 +2313,59 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let env = EnvForward::default();
         let debug = format!("{env:?}");
         assert!(debug.contains("EnvForward"));
+    }
+
+    // ── guest_env merge precedence ──────────────────────────
+
+    /// Build a `CoopConfig` whose env-resolving inputs are all empty
+    /// except `guest_env`. Defaults read `ANTHROPIC_API_KEY` /
+    /// `OPENAI_API_KEY` from the process environment, which would make
+    /// these tests flaky; clearing them keeps the assertions about
+    /// `guest_env` precise.
+    fn cfg_with_guest_env(entries: &[(&str, &str)]) -> CoopConfig {
+        let mut cfg = CoopConfig::default();
+        cfg.claude.api_key = None;
+        cfg.claude.env_forward = Vec::new();
+        cfg.codex.api_key = None;
+        cfg.codex.env_forward = Vec::new();
+        cfg.github = None;
+        for (k, v) in entries {
+            cfg.guest_env.insert((*k).to_string(), (*v).to_string());
+        }
+        cfg
+    }
+
+    #[test]
+    fn guest_env_entries_are_forwarded() {
+        let cfg = cfg_with_guest_env(&[("RUST_LOG", "info"), ("MY_FLAG", "1")]);
+        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        assert_eq!(
+            env.as_envs().get("RUST_LOG").map(String::as_str),
+            Some("info")
+        );
+        assert_eq!(env.as_envs().get("MY_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn guest_env_overrides_configured_api_key() {
+        // Configured claude.api_key gets inserted first; guest_env with
+        // the same name should win on conflict.
+        let mut cfg = cfg_with_guest_env(&[("ANTHROPIC_API_KEY", "guest-env-wins")]);
+        cfg.claude.api_key = Some(crate::config::Secret::new("from-claude-config".to_string()));
+
+        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        assert_eq!(
+            env.as_envs().get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("guest-env-wins"),
+        );
+    }
+
+    #[test]
+    fn guest_env_empty_value_is_preserved() {
+        // Empty string is a legitimate value — distinguish "unset" from
+        // "set to empty" so users can intentionally clear inherited vars.
+        let cfg = cfg_with_guest_env(&[("EMPTY", "")]);
+        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        assert_eq!(env.as_envs().get("EMPTY").map(String::as_str), Some(""));
     }
 }

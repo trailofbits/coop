@@ -182,6 +182,11 @@ enum Commands {
         /// not fail the start.
         #[arg(long, value_name = "CMD")]
         post_start: Option<String>,
+        /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
+        /// Overrides `guest_env` entries from config and any forwarded
+        /// values with the same name.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        guest_env: Vec<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -590,6 +595,7 @@ fn main() -> Result<()> {
             exclude_git,
             no_prompt,
             post_start,
+            guest_env,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
@@ -597,6 +603,7 @@ fn main() -> Result<()> {
                 );
             }
             apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
+            merge_cli_guest_env(&mut cfg, &guest_env)?;
             let mounts = mount
                 .iter()
                 .map(|s| config::Mount::parse(s))
@@ -874,6 +881,23 @@ fn apply_vm_overrides(
     }
     if let Some(ts) = template_size {
         cfg.vm.template_size_gib = config::GiB::new(ts).context("--template-size must be > 0")?;
+    }
+    Ok(())
+}
+
+/// Merge `--env KEY=VALUE` arguments into `cfg.guest_env`.
+///
+/// CLI values override config entries with the same key. Empty keys
+/// and values without `=` are rejected; empty values are allowed.
+fn merge_cli_guest_env(cfg: &mut config::CoopConfig, args: &[String]) -> Result<()> {
+    for entry in args {
+        let (key, value) = entry
+            .split_once('=')
+            .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
+        if key.is_empty() {
+            bail!("--env KEY must not be empty (got '{entry}')");
+        }
+        cfg.guest_env.insert(key.to_string(), value.to_string());
     }
     Ok(())
 }
@@ -2151,6 +2175,77 @@ mod tests {
             "--name",
             "--no-claude-work"
         ]));
+    }
+
+    #[test]
+    fn start_env_flag_parses_repeatable() {
+        let cli = parse(&["start", "--env", "FOO=bar", "--env", "BAZ=qux"]);
+        let super::Commands::Start { guest_env, .. } = cli.command else {
+            panic!("expected Start variant");
+        };
+        assert_eq!(
+            guest_env,
+            vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_cli_guest_env_inserts_and_overrides_config() {
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.guest_env
+            .insert("KEEP".to_string(), "from-config".to_string());
+        cfg.guest_env
+            .insert("OVERWRITE".to_string(), "from-config".to_string());
+
+        super::merge_cli_guest_env(
+            &mut cfg,
+            &["OVERWRITE=from-cli".to_string(), "NEW=cli-only".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.guest_env.get("KEEP").map(String::as_str),
+            Some("from-config")
+        );
+        assert_eq!(
+            cfg.guest_env.get("OVERWRITE").map(String::as_str),
+            Some("from-cli")
+        );
+        assert_eq!(
+            cfg.guest_env.get("NEW").map(String::as_str),
+            Some("cli-only")
+        );
+    }
+
+    #[test]
+    fn merge_cli_guest_env_allows_empty_value() {
+        let mut cfg = super::config::CoopConfig::default();
+        super::merge_cli_guest_env(&mut cfg, &["CLEAR=".to_string()]).unwrap();
+        assert_eq!(cfg.guest_env.get("CLEAR").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn merge_cli_guest_env_rejects_missing_equals() {
+        let mut cfg = super::config::CoopConfig::default();
+        let err = super::merge_cli_guest_env(&mut cfg, &["NO_EQUALS".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn merge_cli_guest_env_rejects_empty_key() {
+        let mut cfg = super::config::CoopConfig::default();
+        let err = super::merge_cli_guest_env(&mut cfg, &["=value".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("KEY"));
+    }
+
+    #[test]
+    fn merge_cli_guest_env_value_may_contain_equals() {
+        let mut cfg = super::config::CoopConfig::default();
+        super::merge_cli_guest_env(&mut cfg, &["URL=https://x?a=b&c=d".to_string()]).unwrap();
+        assert_eq!(
+            cfg.guest_env.get("URL").map(String::as_str),
+            Some("https://x?a=b&c=d"),
+        );
     }
 
     #[test]

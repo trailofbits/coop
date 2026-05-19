@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
@@ -335,6 +335,16 @@ pub struct CoopConfig {
     /// Codex config forwarding settings
     #[serde(default)]
     pub codex: CodexConfig,
+
+    /// Literal env vars to set in the guest, independent of the host
+    /// process environment. Merged with `env_forward` results during
+    /// SSH setup; entries here override forwarded values (with a
+    /// `tracing::warn!`).
+    ///
+    /// `BTreeMap` for deterministic iteration order — useful for
+    /// snapshot/diagnostic stability.
+    #[serde(default)]
+    pub guest_env: BTreeMap<String, String>,
 
     /// User-defined profiles (name -> definition)
     #[serde(default)]
@@ -1253,6 +1263,7 @@ impl Default for CoopConfig {
             setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
             post_start: None,
             updates: crate::update::UpdateConfig::default(),

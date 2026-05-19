@@ -120,6 +120,22 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 | `subnet_mask` | string (CIDR) | `/24` | Subnet mask in CIDR notation. Must be `/0` through `/32`. |
 | `host_iface` | string | `auto` | Host network interface for NAT (e.g., `eth0`, `ens5`). `auto` detects it at runtime. |
 
+## `guest_env` section
+
+Literal environment variables to set inside the guest, independent of the host process environment. Use this when you want a value that isn't (or shouldn't be) on the host — `env_forward` covers the inherit-from-host case.
+
+```toml
+[guest_env]
+RUST_LOG = "info"
+MY_FLAG = "1"
+```
+
+Keys are env var names; values are the literals to inject. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
+
+**Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
+
+Override or extend per-invocation with `coop start --env KEY=VALUE` (repeatable).
+
 ## `claude` section
 
 Claude Code configuration injected into the guest VM at start time. Every field is optional.
@@ -230,6 +246,7 @@ Several config values accept per-invocation overrides via flags:
 | `--mem <MiB>` | `setup`, `start` | `vm.mem_size_mib` |
 | `--template-size <GiB>` | `setup` | `vm.template_size_gib` |
 | `--disk <GiB>` | `start` | Per-instance disk size (grows from template if larger) |
+| `--env KEY=VALUE` | `start` | Adds or overrides a `guest_env` entry (repeatable) |
 | `--config <path>` | all commands | Config file path (default: `~/.coop/config.toml`) |
 
 ## Examples
@@ -257,6 +274,9 @@ boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
 host_ip = "172.16.0.1"
 subnet_mask = "/24"
 host_iface = "auto"
+
+[guest_env]
+RUST_LOG = "info"
 
 [claude]
 config_dir = "~/.claude"

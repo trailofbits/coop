@@ -87,6 +87,7 @@ coop start [NAME] [FLAGS]
 | `--exclude-git` | Skip the `.git/` directory when syncing the workspace (conflicts with `--git-repo`). |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
+| `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
 
 `--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
 
@@ -97,6 +98,7 @@ coop start my-project --workspace ./src --vcpus 4 --mem 8192
 coop start --git-repo https://github.com/org/repo.git --disk 50
 coop start --image ml-dev --no-agents
 coop start --mount ~/data:/mnt/data
+coop start --env RUST_LOG=info --env MY_FLAG=1
 ```
 
 `--no-claude` is accepted as a deprecated alias for `--no-agents` and will be removed in a future release. Using it prints a deprecation warning.

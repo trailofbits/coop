@@ -38,6 +38,13 @@
 # subnet_mask = "/24"
 # host_iface = "auto"           # "auto" detects at runtime
 
+# [guest_env]                   # Literal env vars to set in the guest.
+#                               # Overrides forwarded values on key
+#                               # collision (warning logged). Avoid for
+#                               # secrets — use `env_forward` instead.
+# RUST_LOG = "info"
+# MY_FLAG = "1"
+
 # [claude]
 # config_dir = "~/.claude"  # path to copy CLAUDE.md, rules/, commands/ from (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
