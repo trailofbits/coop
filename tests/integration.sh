@@ -752,9 +752,12 @@ except Exception:
 }
 
 # Verify that github = "pat" + a matching [github.pat] entry forwards the
-# configured token (a server-side dummy literal, never a real PAT) for an
-# instance whose `--git-repo` matches the entry. Runs in the --full bucket
-# because it boots a fresh VM.
+# configured token (a server-side dummy literal, never a real PAT) into
+# the guest for an instance whose workspace `origin` matches the entry.
+# Uses `--workspace` with a forged origin rather than `--git-repo` so the
+# test avoids a real network clone (post-#119 the clone path actively
+# uses the configured PAT, which a dummy literal can't satisfy). Runs in
+# the --full bucket because it boots a fresh VM.
 test_github_pat_forwarding() {
     echo ""
     echo "=== Phase: github pat-mode token forwarding ==="
@@ -808,24 +811,34 @@ CFGEOF
         fail "pat: github status runs cleanly" "$(cat "$tmpdir/pat-status.out")"
     fi
 
-    # Step 3: boot a VM with --git-repo so workspace.json records the URL,
-    # then `exec` and read GITHUB_TOKEN out of the guest. Network access to
-    # github.com is required (same as `test_git_repo_private_clone`). Skip
-    # if we can't reach github.com from the host — keeps CI honest.
-    if ! curl -fsS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then
-        skip "pat: token forwarding via --git-repo" "github.com unreachable from host"
+    # Step 3: boot a VM with --workspace pointing at a local repo whose
+    # `origin` is forged to the configured slug. `detect_instance_repo`
+    # runs `git remote get-url origin` against the host workspace path on
+    # follow-up commands, so `exec` resolves the slug, looks up the PAT
+    # entry, and forwards the sentinel as GITHUB_TOKEN — exercising the
+    # post-#119 PAT resolution without a real network clone or a real PAT.
+    local ws_dir="$tmpdir/pat-workspace"
+    mkdir -p "$ws_dir"
+    (
+        cd "$ws_dir" && \
+        git init --quiet --initial-branch=main && \
+        git -c user.email=ci@test -c user.name=CI commit --allow-empty --quiet -m "init" && \
+        git remote add origin "$repo_url"
+    ) || {
+        fail "pat: set up forged-origin workspace" "git init/remote failed"
         return
-    fi
+    }
 
     if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" start \
             "$pat_instance" \
-            --git-repo "$repo_url" \
+            --workspace "$ws_dir" \
+            --no-agents \
             --no-prompt \
             >"$tmpdir/pat-start.out" 2>&1; then
         STARTED_INSTANCES+=("$pat_instance")
-        pass "pat: start with --git-repo for the configured slug"
+        pass "pat: start with --workspace whose origin matches the configured slug"
     else
-        fail "pat: start with --git-repo for the configured slug" \
+        fail "pat: start with --workspace whose origin matches the configured slug" \
             "$(cat "$tmpdir/pat-start.out")"
         env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" destroy "$pat_instance" 2>/dev/null || true
         return
