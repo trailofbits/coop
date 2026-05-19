@@ -7,7 +7,7 @@ set -euo pipefail
 # tests never touch the developer's real ~/.coop. Verifies:
 #
 #   1. --yes --keep-data removes the binary and leaves the data dir alone.
-#   2. --yes --purge removes binary, data dir, XDG update-check state, and
+#   2. --yes --purge removes binary, data dir, update-check state, and
 #      any coop SSH config blocks.
 #   3. Non-interactive (non-TTY) without --yes exits non-zero with a hint.
 #   4. The dev-build guard refuses to remove a binary that lives under
@@ -69,11 +69,19 @@ export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_DATA_HOME="$HOME/.local/share"
 mkdir -p "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$HOME/.ssh"
 
-# Pre-populate an XDG state file so we can assert it's wiped by --purge.
+# Where coop writes the background update-check state. Must mirror
+# `state_path()` in src/update.rs, which uses `dirs::state_dir()` on Linux and
+# falls back to `dirs::data_local_dir()` (~/Library/Application Support) on
+# macOS, where `state_dir()` returns None.
+case "$(uname -s)" in
+    Darwin) STATE_FILE="$HOME/Library/Application Support/coop/update-check.json" ;;
+    *)      STATE_FILE="$XDG_STATE_HOME/coop/update-check.json" ;;
+esac
+
+# Pre-populate the state file so we can assert it's wiped by --purge.
 seed_state() {
-    local state_dir="$XDG_STATE_HOME/coop"
-    mkdir -p "$state_dir"
-    cat > "$state_dir/update-check.json" << 'JSON'
+    mkdir -p "$(dirname "$STATE_FILE")"
+    cat > "$STATE_FILE" << 'JSON'
 {"last_checked_at": 0, "latest_known_version": "v9.9.9"}
 JSON
 }
@@ -128,10 +136,10 @@ if "$TMPDIR/bin/coop" uninstall --yes --keep-data > "$TMPDIR/t1.log" 2>&1; then
     else
         fail "data directory was removed despite --keep-data"
     fi
-    if [[ -f "$XDG_STATE_HOME/coop/update-check.json" ]]; then
-        pass "XDG update-check state preserved"
+    if [[ -f "$STATE_FILE" ]]; then
+        pass "update-check state preserved"
     else
-        fail "XDG state was removed despite --keep-data"
+        fail "update-check state was removed despite --keep-data"
     fi
     if grep -q "$SSH_MARKER_BEGIN" "$HOME/.ssh/config"; then
         fail "SSH coop block not stripped" "blocks should be removed even with --keep-data"
@@ -149,7 +157,7 @@ fi
 
 # ── Test 2: --yes --purge wipes everything ───────────────────────────────────
 
-echo "==> Test 2: --yes --purge removes binary + data + XDG state"
+echo "==> Test 2: --yes --purge removes binary + data + update-check state"
 fresh_binary
 seed_data_dir
 seed_state
@@ -166,10 +174,10 @@ if "$TMPDIR/bin/coop" uninstall --yes --purge > "$TMPDIR/t2.log" 2>&1; then
     else
         pass "data directory removed"
     fi
-    if [[ -e "$XDG_STATE_HOME/coop/update-check.json" ]]; then
-        fail "XDG update-check state survived --purge"
+    if [[ -e "$STATE_FILE" ]]; then
+        fail "update-check state survived --purge" "expected $STATE_FILE to be removed"
     else
-        pass "XDG update-check state removed"
+        pass "update-check state removed"
     fi
     if grep -q "$SSH_MARKER_BEGIN" "$HOME/.ssh/config" 2> /dev/null; then
         fail "SSH coop block survived --purge"
