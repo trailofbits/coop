@@ -16,10 +16,14 @@ set -euo pipefail
 #   --full           Run extended tests (workspace sync, multi-instance)
 #
 # Environment variables (override flags):
-#   TEST_BINARY   — Path to pre-built binary
-#   TEST_PROFILES — Comma-separated profiles to install
-#   TEST_INSTANCE — Instance name prefix
-#   TEST_FULL     — Set to 1 for extended tests
+#   TEST_BINARY            — Path to pre-built binary
+#   TEST_PROFILES          — Comma-separated profiles to install
+#   TEST_INSTANCE          — Instance name prefix
+#   TEST_FULL              — Set to 1 for extended tests
+#   COOP_TEST_DESTRUCTIVE  — Set to 1 to run the `coop destroy --all` phase.
+#                            Off by default because it wipes every coop-managed
+#                            instance on the host, including ones not owned by
+#                            this test run. Enable only on clean/CI hosts.
 
 # ── Defaults ──────────────────────────────────────────────────
 
@@ -2838,12 +2842,20 @@ main() {
         # destroy --all which removes it entirely.
         test_provision_failure
 
-        # destroy --all removes the golden image, so run it last.
-        # After this test, `coop setup` must be re-run.
-        test_destroy_all
-        echo ""
-        echo "NOTE: destroy --all removed the golden image."
-        echo "      Run 'coop setup -y' before next use."
+        # destroy --all wipes every coop-managed instance on the host,
+        # not just ones this run created. Gate behind an opt-in env var
+        # so dev machines aren't silently cleared. Run last because it
+        # also removes the golden image.
+        if [[ "${COOP_TEST_DESTRUCTIVE:-0}" == "1" ]]; then
+            test_destroy_all
+            echo ""
+            echo "NOTE: destroy --all removed the golden image."
+            echo "      Run 'coop setup -y' before next use."
+        else
+            echo ""
+            echo "=== Phase: destroy --all ==="
+            skip "destroy --all (set COOP_TEST_DESTRUCTIVE=1 to enable)"
+        fi
     fi
 
     summary
