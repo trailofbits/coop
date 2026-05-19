@@ -79,6 +79,6 @@ Dynamic and static completion can coexist — static fills in subcommand and fla
 
 | Argument | Source |
 |----------|--------|
-| Instance name (`shell`, `claude`, `claude-agents`, `codex`, `stop`, `destroy`, `status`, `logs`, `push --name`, `pull --name`, `exec --name`, `vscode`, `resize`) | `~/.coop/instances/` |
+| Instance name (`shell`, `claude`, `claude-agents`, `codex`, `stop`, `destroy`, `status`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`) | `~/.coop/instances/` |
 | `--image` (`start`, `setup`), `images --delete` | `~/.coop/images/` |
 | `--profile` (`setup`), `profiles show <name>` | builtin profiles plus `[profiles.*]` from `~/.coop/config.toml` |
