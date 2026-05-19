@@ -301,6 +301,174 @@ impl Mount {
     }
 }
 
+/// A guest port to forward to the host for the lifetime of the VM.
+///
+/// Construction normalizes the spec so downstream code (SSH `-L` flags)
+/// sees a canonical `(guest, host)` pair where `host` defaults to
+/// `guest` when omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForward {
+    pub guest: NonZeroU16,
+    pub host: NonZeroU16,
+    pub label: Option<String>,
+}
+
+impl PortForward {
+    /// Parse a CLI spec in the form `GUEST[:HOST]`.
+    ///
+    /// `--forward-port 3000` ⇒ guest=3000, host=3000.
+    /// `--forward-port 3000:3001` ⇒ guest=3000, host=3001.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (guest_str, host_str) = match spec.split_once(':') {
+            Some((g, h)) => (g.trim(), Some(h.trim())),
+            None => (spec.trim(), None),
+        };
+        let guest: u16 = guest_str.parse().with_context(|| {
+            format!("Invalid forward-port spec '{spec}': guest port must be a number 1..=65535")
+        })?;
+        let guest = NonZeroU16::new(guest).with_context(|| {
+            format!("Invalid forward-port spec '{spec}': guest port must be > 0")
+        })?;
+        let host = match host_str {
+            Some(s) => {
+                let h: u16 = s.parse().with_context(|| {
+                    format!(
+                        "Invalid forward-port spec '{spec}': host port must be a number 1..=65535"
+                    )
+                })?;
+                NonZeroU16::new(h).with_context(|| {
+                    format!("Invalid forward-port spec '{spec}': host port must be > 0")
+                })?
+            }
+            None => guest,
+        };
+        Ok(Self {
+            guest,
+            host,
+            label: None,
+        })
+    }
+}
+
+/// TOML deserializer for `PortForward`. Accepts:
+///
+/// - an integer: `3000` ⇒ guest=3000, host=3000
+/// - a string: `"3000"` or `"3000:3001"` (CLI form)
+/// - a table: `{ guest = 3000, host = 3001, label = "dev" }`
+impl<'de> Deserialize<'de> for PortForward {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+
+        struct PortForwardVisitor;
+
+        impl<'de> Visitor<'de> for PortForwardVisitor {
+            type Value = PortForward;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a port number, a 'GUEST[:HOST]' string, or a { guest, host, label } table",
+                )
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+                let port: u16 = v
+                    .try_into()
+                    .map_err(|_| E::custom(format!("port {v} out of range 1..=65535")))?;
+                let port = NonZeroU16::new(port).ok_or_else(|| E::custom("port must be > 0"))?;
+                Ok(PortForward {
+                    guest: port,
+                    host: port,
+                    label: None,
+                })
+            }
+
+            fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+                let v: u64 = v
+                    .try_into()
+                    .map_err(|_| E::custom(format!("port {v} must be > 0")))?;
+                self.visit_u64(v)
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                PortForward::parse(v).map_err(E::custom)
+            }
+
+            fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(field_identifier, rename_all = "snake_case")]
+                enum Field {
+                    Guest,
+                    Host,
+                    Label,
+                    #[serde(other)]
+                    Unknown,
+                }
+
+                let mut guest: Option<NonZeroU16> = None;
+                let mut host: Option<NonZeroU16> = None;
+                let mut label: Option<String> = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Guest => guest = Some(map.next_value()?),
+                        Field::Host => host = Some(map.next_value()?),
+                        Field::Label => label = Some(map.next_value()?),
+                        Field::Unknown => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let guest =
+                    guest.ok_or_else(|| M::Error::custom("forward_ports entry missing 'guest'"))?;
+                Ok(PortForward {
+                    guest,
+                    host: host.unwrap_or(guest),
+                    label,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PortForwardVisitor)
+    }
+}
+
+impl Serialize for PortForward {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("guest", &self.guest)?;
+        if self.host != self.guest {
+            map.serialize_entry("host", &self.host)?;
+        }
+        if let Some(label) = &self.label {
+            map.serialize_entry("label", label)?;
+        }
+        map.end()
+    }
+}
+
+/// Merge `[forward_ports]` from config with the CLI's `--forward-port` flag.
+///
+/// Walks both lists in order; on a duplicate guest port, the later entry wins.
+/// CLI entries are appended after config entries, so CLI overrides config.
+pub fn merge_forward_ports(
+    config_forwards: &[PortForward],
+    cli_forwards: &[PortForward],
+) -> Vec<PortForward> {
+    let mut out: Vec<PortForward> = Vec::new();
+    for f in config_forwards.iter().chain(cli_forwards.iter()) {
+        if let Some(existing) = out.iter_mut().find(|e| e.guest == f.guest) {
+            *existing = f.clone();
+        } else {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
     /// Directory for storing VM artifacts (images, sockets, logs)
@@ -359,6 +527,13 @@ pub struct CoopConfig {
     /// Maps to `postStartCommand` from `devcontainer.json`.
     #[serde(default)]
     pub post_start: Option<String>,
+
+    /// Default host:guest port forwards applied to every `coop start`.
+    ///
+    /// CLI `--forward-port` values are appended; later entries override
+    /// earlier ones with the same guest port.
+    #[serde(default)]
+    pub forward_ports: Vec<PortForward>,
 
     /// Self-update behaviour
     #[serde(default)]
@@ -1266,6 +1441,7 @@ impl Default for CoopConfig {
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
             post_start: None,
+            forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
         }
     }
@@ -1376,6 +1552,10 @@ impl Instance {
 
     pub fn workspace_state_path(&self) -> PathBuf {
         self.dir.join("workspace.json")
+    }
+
+    pub fn forwards_state_path(&self) -> PathBuf {
+        self.dir.join("forwards.json")
     }
 
     pub fn tap_device(&self) -> String {
@@ -3246,5 +3426,138 @@ token = "cmd:echo x"
             !debug.contains("github_pat_secret"),
             "PatEntry Debug leaked token: {debug}"
         );
+    }
+
+    // ── PortForward parsing ──────────────────────────────────
+
+    #[test]
+    fn port_forward_parse_guest_only_defaults_host_to_guest() {
+        let f = PortForward::parse("3000").unwrap();
+        assert_eq!(f.guest.get(), 3000);
+        assert_eq!(f.host.get(), 3000);
+        assert!(f.label.is_none());
+    }
+
+    #[test]
+    fn port_forward_parse_guest_host() {
+        let f = PortForward::parse("3000:3001").unwrap();
+        assert_eq!(f.guest.get(), 3000);
+        assert_eq!(f.host.get(), 3001);
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_zero() {
+        assert!(PortForward::parse("0").is_err());
+        assert!(PortForward::parse("3000:0").is_err());
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_non_numeric() {
+        assert!(PortForward::parse("abc").is_err());
+        assert!(PortForward::parse("3000:abc").is_err());
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_out_of_range() {
+        assert!(PortForward::parse("70000").is_err());
+    }
+
+    #[test]
+    fn port_forward_toml_integer_form() {
+        let toml_src = "forward_ports = [3000]";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports.len(), 1);
+        assert_eq!(cfg.forward_ports[0].guest.get(), 3000);
+        assert_eq!(cfg.forward_ports[0].host.get(), 3000);
+    }
+
+    #[test]
+    fn port_forward_toml_string_form() {
+        let toml_src = r#"forward_ports = ["8080:8081"]"#;
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].guest.get(), 8080);
+        assert_eq!(cfg.forward_ports[0].host.get(), 8081);
+    }
+
+    #[test]
+    fn port_forward_toml_table_form() {
+        let toml_src = "[[forward_ports]]\nguest = 3000\nhost = 13000\nlabel = \"dev\"\n";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].guest.get(), 3000);
+        assert_eq!(cfg.forward_ports[0].host.get(), 13000);
+        assert_eq!(cfg.forward_ports[0].label.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn port_forward_toml_table_omits_host_defaults_to_guest() {
+        let toml_src = "[[forward_ports]]\nguest = 3000\n";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].host.get(), 3000);
+    }
+
+    #[test]
+    fn port_forward_toml_table_missing_guest_errors() {
+        let toml_src = "[[forward_ports]]\nhost = 3000\n";
+        let err = match toml::from_str::<CoopConfig>(toml_src) {
+            Ok(cfg) => panic!("expected error, got: {cfg:?}"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("guest"), "err = {err}");
+    }
+
+    #[test]
+    fn port_forward_default_is_empty() {
+        let cfg: CoopConfig = toml::from_str("").unwrap();
+        assert!(cfg.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn port_forward_serialize_round_trip() {
+        let original = PortForward {
+            guest: NonZeroU16::new(3000).unwrap(),
+            host: NonZeroU16::new(3001).unwrap(),
+            label: Some("dev".to_string()),
+        };
+        let toml_src = toml::to_string(&original).unwrap();
+        let parsed: PortForward = toml::from_str(&toml_src).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    // ── PortForward merge ────────────────────────────────────
+
+    fn pf(g: u16, h: u16) -> PortForward {
+        PortForward {
+            guest: NonZeroU16::new(g).unwrap(),
+            host: NonZeroU16::new(h).unwrap(),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn merge_forward_ports_appends_cli() {
+        let cfg = vec![pf(3000, 3000)];
+        let cli = vec![pf(4000, 4000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].guest.get(), 3000);
+        assert_eq!(merged[1].guest.get(), 4000);
+    }
+
+    #[test]
+    fn merge_forward_ports_cli_overrides_same_guest() {
+        let cfg = vec![pf(3000, 3000)];
+        let cli = vec![pf(3000, 13000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].host.get(), 13000);
+    }
+
+    #[test]
+    fn merge_forward_ports_later_cli_overrides_earlier_cli() {
+        let cfg: Vec<PortForward> = Vec::new();
+        let cli = vec![pf(3000, 13000), pf(3000, 14000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].host.get(), 14000);
     }
 }

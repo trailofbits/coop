@@ -220,6 +220,30 @@ plugins = ["rust-analyzer-lsp@claude-plugins-official"]
 
 Custom profiles compose with built-in ones (`python`, `node`, `c`, `fuzz`, `rust`, `go`). Combine them with commas: `coop setup --profile python,node,my-tools`.
 
+## `forward_ports` field
+
+Default host-to-guest TCP port forwards applied to every `coop start`. Forwards are established as SSH `-L` tunnels after the VM is ready and torn down on `coop stop`.
+
+Each entry accepts a bare port (host and guest match), a `"GUEST:HOST"` string, or a table.
+
+```toml
+# Bare port: host 3000 ⇒ guest 3000
+forward_ports = [3000]
+
+# String form: host 18080 ⇒ guest 8080
+forward_ports = ["8080:18080"]
+
+# Table form (also supports an optional `label` for the user's own bookkeeping)
+[[forward_ports]]
+guest = 5432
+host = 15432
+label = "postgres"
+```
+
+`--forward-port` on `coop start` appends to (or overrides on guest-port collision) the entries from config; later entries win. Each instance remembers its forward set across `coop stop` / `coop start`, so a restart without `--forward-port` re-establishes the same tunnels.
+
+Collision with an in-use host port fails fast before the VM is created. The error names the offending port and suggests a `GUEST:HOST` override.
+
 ## `updates` section
 
 Background update-check behavior for `coop update`. Defaults are safe; most users do not need to set anything here.
@@ -303,4 +327,6 @@ args = ["-y", "@playwright/mcp@latest"]
 [profiles.my-tools]
 apt_packages = ["ripgrep", "fd-find"]
 post_install = "cargo install ast-grep"
+
+forward_ports = [3000, "8080:18080"]
 ```

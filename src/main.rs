@@ -7,6 +7,7 @@ mod github_pat;
 mod github_repo;
 mod guest;
 mod pat_prompt;
+mod port_forward;
 mod secret_store;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
 #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "Lima-only"))]
@@ -163,6 +164,11 @@ enum Commands {
         /// Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
         #[arg(long, conflicts_with_all = ["workspace", "git_repo"])]
         mount: Vec<String>,
+        /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
+        /// `--forward-port 3000` forwards guest 3000 to host 3000;
+        /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
+        #[arg(long)]
+        forward_port: Vec<String>,
         /// Named image to use (default: "default")
         #[arg(
             long,
@@ -596,6 +602,7 @@ fn main() -> Result<()> {
             no_prompt,
             post_start,
             guest_env,
+            forward_port,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
@@ -607,6 +614,10 @@ fn main() -> Result<()> {
             let mounts = mount
                 .iter()
                 .map(|s| config::Mount::parse(s))
+                .collect::<Result<Vec<_>>>()?;
+            let forward_ports = forward_port
+                .iter()
+                .map(|s| config::PortForward::parse(s))
                 .collect::<Result<Vec<_>>>()?;
             cmd_start(
                 &be,
@@ -623,6 +634,7 @@ fn main() -> Result<()> {
                         .transpose()?,
                     mounts,
                     exclude_git,
+                    forward_ports,
                     config_path: &cli.config,
                     post_start_override: post_start.as_deref(),
                 },
@@ -920,6 +932,10 @@ struct StartOpts<'a> {
     disk: Option<config::GiB>,
     mounts: Vec<config::Mount>,
     exclude_git: bool,
+    /// Per-start forwards from `--forward-port`. Merged with
+    /// `cfg.forward_ports` at start time (CLI overrides on guest-port
+    /// collision).
+    forward_ports: Vec<config::PortForward>,
     /// Path to the on-disk config file. Re-read after the auto-prompt
     /// in case the wizard added a new `[github.pat."..."]` entry.
     config_path: &'a Path,
@@ -964,6 +980,9 @@ fn cmd_start(
 
     if let Err(e) = &result {
         tracing::error!("Failed to start instance '{}': {e}", inst.name);
+        if let Ok(target) = be.ssh_target(cfg, &inst) {
+            port_forward::teardown_ssh_forwards(&inst, &target);
+        }
         if let Err(cleanup_err) = be.destroy_instance(cfg, &inst) {
             tracing::debug!("Cleanup failed (non-fatal): {cleanup_err}");
         }
@@ -1095,6 +1114,15 @@ fn restart_instance(
     let repo = backend::detect_instance_repo(inst);
     pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
 
+    // Re-apply the forward set the instance was last started with.
+    // CLI `--forward-port` on a restart appends/overrides; otherwise the
+    // saved set carries forward untouched.
+    let saved = port_forward::ForwardsState::try_load(inst)?
+        .map(|s| s.forwards)
+        .unwrap_or_default();
+    let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
+    port_forward::check_host_port_collisions(&forwards)?;
+
     be.start_existing(cfg, inst)?;
 
     signal::check_shutdown()?;
@@ -1105,6 +1133,12 @@ fn restart_instance(
         .context("Guest booted but SSH is not accepting connections")?;
 
     signal::check_shutdown()?;
+
+    port_forward::ForwardsState {
+        forwards: forwards.clone(),
+    }
+    .save(inst)?;
+    port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
@@ -1173,6 +1207,12 @@ fn start_instance(
     let repo = resolve_start_repo(opts)?;
     pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
 
+    // Forwards are checked up-front so an in-use host port fails fast,
+    // before any VM cost is incurred. The actual `-L` tunnels are
+    // established after SSH is ready (below).
+    let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
+    port_forward::check_host_port_collisions(&forwards)?;
+
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
     signal::check_shutdown()?;
@@ -1183,6 +1223,12 @@ fn start_instance(
         .context("Guest booted but SSH is not accepting connections")?;
 
     signal::check_shutdown()?;
+
+    port_forward::ForwardsState {
+        forwards: forwards.clone(),
+    }
+    .save(inst)?;
+    port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
@@ -1418,6 +1464,13 @@ fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
+    // Tear down forwards before shutting down the VM so the control
+    // master can exit cleanly while SSH is still reachable.
+    if let Ok(target) = be.ssh_target(cfg, inst) {
+        port_forward::teardown_ssh_forwards(inst, &target);
+    } else {
+        tracing::debug!("Skipping forward teardown — no SSH target available");
+    }
     be.stop(cfg, inst)?;
     if let Err(e) = workspace::remove_ssh_config(inst) {
         tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
@@ -1438,6 +1491,9 @@ fn cmd_destroy(
     } else {
         let inst = cfg.resolve_instance(name)?;
         tracing::info!("Destroying instance '{}'", inst.name);
+        if let Ok(target) = be.ssh_target(cfg, &inst) {
+            port_forward::teardown_ssh_forwards(&inst, &target);
+        }
         be.destroy_instance(cfg, &inst)?;
         workspace::remove_ssh_config(&inst)?;
         tracing::info!("Instance '{}' destroyed", inst.name);
@@ -1479,6 +1535,9 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
     let instances = cfg.list_instances()?;
     for inst in &instances {
         tracing::info!("Destroying instance '{}'", inst.name);
+        if let Ok(target) = be.ssh_target(cfg, inst) {
+            port_forward::teardown_ssh_forwards(inst, &target);
+        }
         be.destroy_instance(cfg, inst)?;
         workspace::remove_ssh_config(inst)?;
     }
@@ -2618,6 +2677,7 @@ mod tests {
             disk: None,
             mounts,
             exclude_git: false,
+            forward_ports: Vec::new(),
             config_path,
             post_start_override: None,
         }

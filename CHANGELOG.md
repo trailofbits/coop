@@ -17,6 +17,14 @@
 
 ### New features
 
+- **`--forward-port` / `forward_ports` config** (#125) — Forward guest
+  TCP ports to the host for the lifetime of the VM. `coop start
+  --forward-port 3000` exposes guest 3000 on host 3000; `3000:18080`
+  remaps to a different host port. The flag is repeatable, supported
+  by a config-level `forward_ports = [...]` default, persisted across
+  `stop`/`start`, and torn down cleanly on `coop stop`. Collision with
+  an already-bound host port fails fast before the VM is created.
+
 - **`coop ca` / `coop claude-agents` shortcut** (#80, #82, #99, #100, #101) —
   Runs `claude agents` inside the VM in one command. Defaults to no
   tmux (Claude Code manages background-session lifetime itself);

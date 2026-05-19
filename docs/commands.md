@@ -84,6 +84,7 @@ coop start [NAME] [FLAGS]
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use (default: `default`) |
 | `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
+| `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
 | `--exclude-git` | Skip the `.git/` directory when syncing the workspace (conflicts with `--git-repo`). |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
@@ -99,6 +100,7 @@ coop start --git-repo https://github.com/org/repo.git --disk 50
 coop start --image ml-dev --no-agents
 coop start --mount ~/data:/mnt/data
 coop start --env RUST_LOG=info --env MY_FLAG=1
+coop start --forward-port 3000 --forward-port 8080:18080
 ```
 
 `--no-claude` is accepted as a deprecated alias for `--no-agents` and will be removed in a future release. Using it prints a deprecation warning.

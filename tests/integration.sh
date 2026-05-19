@@ -2307,6 +2307,85 @@ test_host_mount_custom_guest_path() {
     rm -rf "$mount_dir"
 }
 
+# ── Port forward tests (--full only) ─────────────────────────
+
+test_port_forwards() {
+    echo ""
+    echo "=== Phase: port forwards ==="
+
+    local fwd_instance="${INSTANCE}-fwd"
+    # Pick a likely-free host port high in the ephemeral range to avoid
+    # clashes with anything the developer is already running.
+    local host_port=14573
+    local guest_port=8765
+    local content_file
+    content_file=$(mktemp)
+    echo "forward-test-payload" > "$content_file"
+
+    if coop start "$fwd_instance" --no-agents --forward-port "${guest_port}:${host_port}"; then
+        STARTED_INSTANCES+=("$fwd_instance")
+        pass "start with --forward-port exits 0"
+    else
+        fail "start with --forward-port exits 0" "exit code: $?"
+        rm -f "$content_file"
+        return
+    fi
+
+    GUEST_INSTANCE="$fwd_instance"
+
+    # Run a one-shot HTTP listener in the guest. `nc -l -p` is in the
+    # ubuntu-minimal CI image; pipe a canned HTTP response and exit.
+    # Backgrounded via nohup so the SSH exec returns immediately.
+    local payload
+    payload=$(cat "$content_file")
+    guest_exec sh -c "nohup sh -c 'printf \"HTTP/1.1 200 OK\\r\\nContent-Length: ${#payload}\\r\\n\\r\\n${payload}\" | nc -l -p ${guest_port} -q 1 > /tmp/fwd.log 2>&1' >/dev/null 2>&1 &" || true
+    sleep 1
+
+    if curl -fsS --max-time 3 "http://127.0.0.1:${host_port}/" > "$content_file.got"; then
+        local got
+        got=$(cat "$content_file.got")
+        if [[ "$got" == "$payload" ]]; then
+            pass "host curl reaches guest via forwarded port"
+        else
+            fail "host curl reaches guest via forwarded port" "got: $got"
+        fi
+    else
+        fail "host curl reaches guest via forwarded port" "curl failed"
+    fi
+
+    # Collision: starting another forward to the same host port should error.
+    local fwd_instance2="${INSTANCE}-fwd2"
+    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}" 2>"$content_file.err"; then
+        STARTED_INSTANCES+=("$fwd_instance2")
+        fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
+        coop destroy "$fwd_instance2" 2>/dev/null || true
+        untrack_instance "$fwd_instance2"
+    else
+        if grep -q "already in use" "$content_file.err"; then
+            pass "collision detection rejects in-use host port"
+        else
+            fail "collision detection rejects in-use host port" "stderr: $(cat "$content_file.err")"
+        fi
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop stop "$fwd_instance" 2>/dev/null || true
+
+    # After stop, the host port must be free again so the next test can rebind.
+    if (exec 3<>/dev/tcp/127.0.0.1/"$host_port") 2>/dev/null; then
+        exec 3<&-
+        exec 3>&-
+        fail "host port released after stop" "still listening on $host_port"
+    else
+        pass "host port released after stop"
+    fi
+
+    coop destroy "$fwd_instance" 2>/dev/null || true
+    untrack_instance "$fwd_instance"
+    rm -f "$content_file" "$content_file.got" "$content_file.err"
+}
+
 test_mount_conflicts() {
     echo ""
     echo "=== Phase: mount CLI conflicts ==="
@@ -2898,6 +2977,7 @@ main() {
         test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
+        test_port_forwards
         test_push_pull_no_workspace
         test_workspace_sync
         test_git_repo_private_clone
