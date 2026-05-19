@@ -1622,17 +1622,36 @@ fn register_mcp_servers(
 
 /// Clone a git repository inside the guest VM via SSH.
 ///
-/// For GitHub HTTPS URLs, opportunistically resolves a token on the host
-/// (`gh auth token` then `GITHUB_TOKEN`) and forwards it to git in the guest
-/// via stdin and a one-shot credential helper. The token never appears on
-/// argv, so it stays out of `/proc/<pid>/cmdline` and the ssh debug log.
-/// If no token is available, falls back to an unauthenticated clone (which
-/// works for public repos).
-pub fn clone_git_repo(target: &SshTarget, repo_url: &str) -> Result<()> {
+/// For GitHub HTTPS URLs, resolves a token on the host and forwards it to
+/// git in the guest via stdin and a one-shot credential helper. Token
+/// resolution honours the configured GitHub strategy:
+///
+/// - `github = "pat"` with a matching `[github.pat."owner/repo"]` entry
+///   uses the configured PAT. This is the user's explicit per-repo intent,
+///   so it takes precedence over the host-side fallback. If the entry's
+///   `cmd:` resolution fails, the error is propagated rather than silently
+///   substituting a broader-scoped host token.
+/// - Every other configuration (`off`, `auto`, `env`, or `pat` with no
+///   matching entry) opportunistically uses `gh auth token` then
+///   `GITHUB_TOKEN` — see [`host_github_token`] for why the non-PAT modes
+///   don't gate this fallback.
+///
+/// The token never appears on argv, so it stays out of `/proc/<pid>/cmdline`
+/// and the ssh debug log. If no token is available, falls back to an
+/// unauthenticated clone (which works for public repos).
+pub fn clone_git_repo(
+    target: &SshTarget,
+    github: Option<&GitHubAuth>,
+    repo_url: &str,
+) -> Result<()> {
     tracing::info!("Cloning {repo_url} into guest /workspace");
 
     let is_github = is_github_https_url(repo_url);
-    let token = is_github.then(host_github_token).flatten();
+    let token = if is_github {
+        resolve_clone_token(github, repo_url)?
+    } else {
+        None
+    };
 
     let result = match token.as_deref() {
         Some(t) => clone_with_token(target, repo_url, t),
@@ -1646,8 +1665,9 @@ pub fn clone_git_repo(target: &SshTarget, repo_url: &str) -> Result<()> {
         } else if is_github {
             format!(
                 "Failed to clone {repo_url} in guest. \
-                 If this is a private repo, run `gh auth login` or set \
-                 `GITHUB_TOKEN` on the host before `coop start --git-repo`."
+                 If this is a private repo, configure a PAT with \
+                 `coop github setup-pat --repo <owner/repo>`, run `gh auth login`, \
+                 or set `GITHUB_TOKEN` on the host before `coop start --git-repo`."
             )
         } else {
             format!("Failed to clone {repo_url} in guest")
@@ -1656,6 +1676,35 @@ pub fn clone_git_repo(target: &SshTarget, repo_url: &str) -> Result<()> {
 
     tracing::info!("Repository cloned to /workspace/repo");
     Ok(())
+}
+
+/// If `strategy` is `Pat` mode and a `[github.pat."owner/repo"]` entry
+/// exists for `repo_url`, return the matching slug. Otherwise `None`.
+///
+/// This is the sole "should the clone path use a configured PAT?" check.
+/// Returning `None` directs [`resolve_clone_token`] to fall through to
+/// [`host_github_token`] — preserving the pre-PAT behaviour for `Auto`,
+/// `Env`, `Off`, and `Pat`-without-a-matching-entry.
+fn clone_pat_slug(strategy: Option<&GitHubAuth>, repo_url: &str) -> Option<String> {
+    let strategy = strategy?;
+    let GitHubAuth::Pat(_) = strategy else {
+        return None;
+    };
+    let slug = crate::github_repo::parse_repo_slug_from_url(repo_url)?;
+    strategy.pat_entry(&slug).is_some().then_some(slug)
+}
+
+/// Resolve the token to use for `git clone` of `repo_url`.
+///
+/// PAT mode with a matching entry wins — the user's per-repo intent
+/// overrides the opportunistic host lookup. Every other configuration
+/// (including `Pat` mode without a matching entry) falls back to
+/// [`host_github_token`].
+fn resolve_clone_token(strategy: Option<&GitHubAuth>, repo_url: &str) -> Result<Option<String>> {
+    if let Some(slug) = clone_pat_slug(strategy, repo_url) {
+        return resolve_pat_token(strategy, &slug).map(Some);
+    }
+    Ok(host_github_token())
 }
 
 fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
@@ -1710,19 +1759,21 @@ fn is_github_https_url(url: &str) -> bool {
     matches!(rest.split_once('/'), Some((host, _)) if host == "github.com")
 }
 
-/// Best-effort host-side GitHub token resolution for `git clone`.
+/// Best-effort host-side GitHub token fallback for `git clone`.
 ///
 /// Prefers `gh auth token` (uses the user's configured GitHub login),
 /// falls back to `GITHUB_TOKEN`. Returns `None` when neither is available.
 ///
-/// Note: this intentionally bypasses the [`GitHubAuth`] config gate that
-/// [`resolve_github_token`] honours. That gate exists to control whether a
-/// token is forwarded into the **guest environment** (where it persists for
-/// the lifetime of the VM and is visible to every guest process). This path
-/// is different: the token is consumed once via stdin in a one-shot
-/// `credential.helper`, never enters the guest env, and the in-memory copy
-/// dies with the ssh child. The threat model the gate defends against
-/// doesn't apply here, so opt-in is not required.
+/// Used by [`resolve_clone_token`] when no `[github.pat."owner/repo"]`
+/// entry matches the repo being cloned. The remaining `GitHubAuth` modes
+/// (`Auto`, `Env`, `Off`) intentionally don't gate this fallback: the
+/// token is consumed once via stdin in a one-shot `credential.helper`,
+/// never enters the guest env, and the in-memory copy dies with the ssh
+/// child — so the threat that the [`resolve_github_token`] gate defends
+/// against (a persistent in-guest token visible to every guest process)
+/// doesn't apply. `Pat` mode is the exception, handled upstream in
+/// [`resolve_clone_token`], because a configured PAT entry is an explicit
+/// per-repo intent statement and would be surprising to silently ignore.
 fn host_github_token() -> Option<String> {
     select_host_token(
         gh_auth_token().as_deref(),
@@ -2110,5 +2161,72 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             script.contains("'https://github.com/o'\\''wner/repo'"),
             "single quote not escaped: {script}"
         );
+    }
+
+    fn pat_auth_with(entries: &[(&str, &str)]) -> GitHubAuth {
+        let mut map = std::collections::BTreeMap::new();
+        for (slug, token) in entries {
+            map.insert(
+                (*slug).to_string(),
+                crate::config::PatEntry {
+                    token: (*token).to_string(),
+                },
+            );
+        }
+        GitHubAuth::Pat(crate::config::PatConfig {
+            entries: map,
+            skip: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn clone_pat_slug_matches_when_entry_exists() {
+        let auth = pat_auth_with(&[("owner/repo", "github_pat_dummy")]);
+        assert_eq!(
+            clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+    }
+
+    #[test]
+    fn clone_pat_slug_none_when_no_matching_entry() {
+        let auth = pat_auth_with(&[("other/repo", "github_pat_dummy")]);
+        assert!(clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn clone_pat_slug_none_when_not_pat_mode() {
+        // Even though the URL would parse to a slug, non-Pat modes never
+        // route through the PAT branch — the host fallback handles them.
+        for strategy in [
+            None,
+            Some(GitHubAuth::Auto),
+            Some(GitHubAuth::Env),
+            Some(GitHubAuth::Off),
+        ] {
+            assert!(
+                clone_pat_slug(strategy.as_ref(), "https://github.com/owner/repo.git").is_none(),
+                "expected None for strategy {:?}",
+                strategy.as_ref().map(GitHubAuth::mode_name)
+            );
+        }
+    }
+
+    #[test]
+    fn clone_pat_slug_none_for_non_github_url() {
+        let auth = pat_auth_with(&[("owner/repo", "github_pat_dummy")]);
+        // Non-GitHub URLs can't yield a slug, so PAT lookup never fires.
+        assert!(clone_pat_slug(Some(&auth), "https://gitlab.com/owner/repo").is_none());
+    }
+
+    #[test]
+    fn resolve_clone_token_returns_configured_pat_literal() {
+        // Literal (non-`cmd:`) tokens pass through resolve_cmd_value
+        // unchanged. The PAT is returned even if no host gh/env token
+        // exists — the test for "PAT bypassed" is that it survives
+        // independently of the host's environment.
+        let auth = pat_auth_with(&[("owner/repo", "github_pat_literal")]);
+        let token = resolve_clone_token(Some(&auth), "https://github.com/owner/repo.git").unwrap();
+        assert_eq!(token.as_deref(), Some("github_pat_literal"));
     }
 }

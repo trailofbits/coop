@@ -1174,7 +1174,7 @@ fn start_instance(
         };
         state.save(inst)?;
     } else if let Some(repo_url) = opts.git_repo {
-        backend::clone_git_repo(&target, repo_url)?;
+        backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
         let state = workspace::WorkspaceState {
             host_path: None,
