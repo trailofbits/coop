@@ -213,7 +213,6 @@ fn print_form_instructions(repo: &str) {
     eprintln!("    Contents:        Read and write");
     eprintln!("    Pull requests:   Read and write");
     eprintln!("    Issues:          Read and write");
-    eprintln!("    Checks:          Read-only");
     eprintln!("    Commit statuses: Read-only");
     eprintln!("    Metadata:        Read-only (auto-included)\n");
     eprintln!("Click \"Generate token\", then paste it below.");
