@@ -2,6 +2,7 @@ mod backend;
 mod cmd;
 mod completions;
 mod config;
+mod devcontainer;
 mod fs_util;
 mod github_pat;
 mod github_repo;
@@ -136,6 +137,21 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: String,
+        /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
+        /// When present (and `--no-devcontainer` is not set), coop offers to
+        /// apply the file's `features` and `hostRequirements` to this setup.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Explicit path to a `devcontainer.json` to use (skips discovery).
+        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
+        devcontainer: Option<String>,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+        /// Translate `devcontainer.json` and print the report, then exit
+        /// before doing any setup work.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
     Build,
@@ -193,6 +209,16 @@ enum Commands {
         /// values with the same name.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         guest_env: Vec<String>,
+        /// Explicit path to a `devcontainer.json` to use (skips discovery).
+        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
+        devcontainer: Option<String>,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+        /// Translate `devcontainer.json` and print the report, then exit
+        /// before doing any VM work.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -572,8 +598,45 @@ fn main() -> Result<()> {
             post_install,
             template_size,
             image,
+            workspace,
+            devcontainer,
+            no_devcontainer,
+            dry_run,
         } => {
+            let ws_path = workspace.as_deref().map(Path::new);
+            let inputs = devcontainer::TranslatorInputs {
+                cli_vcpus: vcpus,
+                cli_mem_mib: mem,
+                cli_profiles: profile.clone(),
+                ..devcontainer::TranslatorInputs::default()
+            };
+            let translation = resolve_devcontainer(
+                &DevcontainerOpts {
+                    explicit_path: devcontainer.as_deref(),
+                    no_devcontainer,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &[],
+                },
+                &inputs,
+                devcontainer::Stage::Setup,
+            )?;
+            if dry_run {
+                return Ok(());
+            }
+            let mut profile = profile;
+            if let Some(t) = &translation {
+                for p in &t.profiles {
+                    if !profile.contains(p) {
+                        profile.push(p.clone());
+                    }
+                }
+            }
+            // CLI flags first; translation values then fill in any blanks.
             apply_vm_overrides(&mut cfg, vcpus, mem, template_size)?;
+            if let Some(t) = &translation {
+                devcontainer::apply_to_config(&mut cfg, t)?;
+            }
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
@@ -603,22 +666,87 @@ fn main() -> Result<()> {
             post_start,
             guest_env,
             forward_port,
+            devcontainer,
+            no_devcontainer,
+            dry_run,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
-            merge_cli_guest_env(&mut cfg, &guest_env)?;
             let mounts = mount
                 .iter()
                 .map(|s| config::Mount::parse(s))
                 .collect::<Result<Vec<_>>>()?;
-            let forward_ports = forward_port
+            let mut forward_ports = forward_port
                 .iter()
                 .map(|s| config::PortForward::parse(s))
                 .collect::<Result<Vec<_>>>()?;
+
+            let cli_env_keys = guest_env
+                .iter()
+                .filter_map(|s| s.split_once('=').map(|(k, _)| k.to_string()))
+                .collect();
+            let inputs = devcontainer::TranslatorInputs {
+                cli_vcpus: vcpus,
+                cli_mem_mib: mem,
+                cli_disk_gib: disk,
+                cli_post_start: post_start.clone(),
+                cli_guest_env_keys: cli_env_keys,
+                cli_forward_ports: forward_ports.clone(),
+                cli_mounts: mounts.clone(),
+                cli_profiles: Vec::new(),
+                cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+            };
+            let ws_path = workspace.as_deref().map(Path::new);
+            let translation = resolve_devcontainer(
+                &DevcontainerOpts {
+                    explicit_path: devcontainer.as_deref(),
+                    no_devcontainer,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &mounts,
+                },
+                &inputs,
+                devcontainer::Stage::Start,
+            )?;
+            if dry_run {
+                return Ok(());
+            }
+            // CLI flags are applied first; the translation only carries
+            // values that survived the "CLI > devcontainer.json" precedence
+            // check inside `translate`, so the two cannot fight here.
+            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
+            if let Some(t) = &translation {
+                devcontainer::apply_to_config(&mut cfg, t)?;
+                forward_ports =
+                    devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
+            }
+            merge_cli_guest_env(&mut cfg, &guest_env)?;
+            let cli_disk = disk
+                .map(|d| config::GiB::new(d).context("--disk must be > 0"))
+                .transpose()?;
+            let default_translation = devcontainer::Translation::default();
+            let effective_disk = devcontainer::effective_disk(
+                cli_disk,
+                translation.as_ref().unwrap_or(&default_translation),
+            );
+            let post_start_override = post_start
+                .clone()
+                .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
+            // `--mount` and devcontainer `mounts` aren't combined: --mount is
+            // a complete replacement of the mount set (its `conflicts_with`
+            // rules with --workspace/--git-repo encode this). The CLI-wins
+            // outcome is reported by `translate`.
+            let final_mounts = if mounts.is_empty() {
+                translation
+                    .as_ref()
+                    .map(|t| t.mounts.clone())
+                    .unwrap_or_default()
+            } else {
+                mounts
+            };
             cmd_start(
                 &be,
                 &mut cfg,
@@ -629,14 +757,12 @@ fn main() -> Result<()> {
                     git_repo: git_repo.as_deref(),
                     no_agents,
                     no_prompt,
-                    disk: disk
-                        .map(|d| config::GiB::new(d).context("--disk must be > 0"))
-                        .transpose()?,
-                    mounts,
+                    disk: effective_disk,
+                    mounts: final_mounts,
                     exclude_git,
                     forward_ports,
                     config_path: &cli.config,
-                    post_start_override: post_start.as_deref(),
+                    post_start_override: post_start_override.as_deref(),
                 },
             )
         }
@@ -912,6 +1038,86 @@ fn merge_cli_guest_env(cfg: &mut config::CoopConfig, args: &[String]) -> Result<
         cfg.guest_env.insert(key.to_string(), value.to_string());
     }
     Ok(())
+}
+
+/// CLI surface controlling devcontainer.json discovery and apply.
+///
+/// `explicit_path` opts the caller in to a specific file (skips the
+/// prompt). `no_devcontainer` opts out entirely (skips discovery).
+/// `dry_run` prints the report and exits before any side effects.
+struct DevcontainerOpts<'a> {
+    explicit_path: Option<&'a str>,
+    no_devcontainer: bool,
+    dry_run: bool,
+    workspace: Option<&'a Path>,
+    mounts: &'a [config::Mount],
+}
+
+/// Discover, prompt, and translate a `devcontainer.json` for the given
+/// lifecycle `stage`.
+///
+/// Returns `None` when the user opts out, no file is found, or stdin is
+/// not a TTY with no explicit flag (in which case an error is returned
+/// instead — the issue forbids silently choosing). The report is always
+/// emitted to stderr when a file is loaded, so the user sees every key
+/// that did and didn't take effect.
+#[expect(
+    clippy::print_stderr,
+    reason = "devcontainer report is intentional user-facing CLI output"
+)]
+fn resolve_devcontainer(
+    opts: &DevcontainerOpts<'_>,
+    inputs: &devcontainer::TranslatorInputs,
+    stage: devcontainer::Stage,
+) -> Result<Option<devcontainer::Translation>> {
+    use std::io::IsTerminal as _;
+
+    if opts.no_devcontainer {
+        return Ok(None);
+    }
+
+    let (path, losers) = if let Some(p) = opts.explicit_path {
+        (PathBuf::from(p), Vec::new())
+    } else {
+        let found = devcontainer::discover(opts.workspace, opts.mounts);
+        if let Some((winner, losers)) = devcontainer::pick_winner(found) {
+            (winner.path, losers)
+        } else {
+            return Ok(None);
+        }
+    };
+
+    // When discovery (not an explicit flag) found the file, defer to the
+    // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
+    if opts.explicit_path.is_none() && !opts.dry_run {
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "Found {} but stdin is not a TTY.\n\
+                 Pass --devcontainer {} to apply it, or --no-devcontainer to ignore.\n\
+                 coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
+                path.display(),
+                path.display()
+            );
+        }
+        let answer =
+            prompt::confirm_default_yes(&format!("Use devcontainer.json at {}?", path.display()))?;
+        if !answer {
+            tracing::info!(
+                "Skipping {}. Re-run with --devcontainer {} to apply it later.",
+                path.display(),
+                path.display()
+            );
+            return Ok(None);
+        }
+    }
+
+    let parsed = devcontainer::ParsedDevcontainer::load(&path)?;
+    let mut translation = devcontainer::translate(&parsed, inputs, stage);
+    translation.report.ignored_paths = losers;
+
+    eprintln!("{}", translation.report.render());
+
+    Ok(Some(translation))
 }
 
 fn cmd_build(cfg: &config::CoopConfig) -> Result<()> {

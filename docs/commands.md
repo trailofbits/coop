@@ -49,11 +49,18 @@ coop setup [FLAGS]
 | `--post-install <path>` | Path to a post-install script to run in the chroot |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
+| `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. |
+| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json`. |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any setup work. |
 
 ```
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
+coop setup -y --workspace . --devcontainer .devcontainer/devcontainer.json
 ```
+
+See [docs/devcontainer.md](devcontainer.md) for the subset of `devcontainer.json` coop reads.
 
 ### `build`
 
@@ -89,6 +96,11 @@ coop start [NAME] [FLAGS]
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
+| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
+
+When `--workspace <dir>` contains a `.devcontainer/devcontainer.json` (or one of `--mount`'s host roots does), coop reads a subset of it and prompts before applying. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
 
 `--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
 

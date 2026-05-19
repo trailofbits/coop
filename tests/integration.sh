@@ -2823,6 +2823,160 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
+# ── devcontainer.json translator (pre-VM + --full) ────────────
+
+# Write a sample devcontainer.json into $1/.devcontainer/devcontainer.json.
+# Exercises JSONC features (comments + trailing commas) so the integration
+# run also catches parser regressions, not just the unit tests.
+_write_devcontainer() {
+    local dir="$1"
+    mkdir -p "$dir/.devcontainer"
+    cat > "$dir/.devcontainer/devcontainer.json" <<'EOF'
+{
+    // sample devcontainer.json — coop reads a subset.
+    "name": "coop-it-demo",
+    "image": "ubuntu:22.04",
+    "hostRequirements": {
+        "cpus": 2,
+        "memory": "1GiB",
+    },
+    "containerEnv": {
+        "COOP_TEST_DEVCONTAINER": "applied",
+    },
+    "forwardPorts": [3000],
+    "postStartCommand": "echo dc-hooked > /tmp/coop-dc-marker",
+    "remoteUser": "root",
+}
+EOF
+}
+
+test_devcontainer_translator() {
+    echo ""
+    echo "=== Phase: devcontainer.json translator (dry-run) ==="
+
+    local dcdir="$tmpdir/devcontainer-ws"
+    _write_devcontainer "$dcdir"
+    local dcfile="$dcdir/.devcontainer/devcontainer.json"
+
+    # --dry-run with auto-discovery: report is printed to stderr, no VM work.
+    if coop start "${INSTANCE}-dc-dry" --workspace "$dcdir" --dry-run --no-agents; then
+        pass "start --workspace ... --dry-run exits 0"
+    else
+        fail "start --workspace ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    # Report content lands on stderr (per the CLAUDE.md "tracing → stderr" rule).
+    if grep -q "hostRequirements.cpus" <<< "$HARNESS_ERR" \
+        && grep -q "applied" <<< "$HARNESS_ERR"; then
+        pass "dry-run report covers hostRequirements"
+    else
+        fail "dry-run report covers hostRequirements" "stderr: $HARNESS_ERR"
+    fi
+
+    # JSONC: the file uses //-comments and trailing commas; parser must accept.
+    if grep -q "containerEnv" <<< "$HARNESS_ERR"; then
+        pass "JSONC (comments + trailing commas) parses"
+    else
+        fail "JSONC (comments + trailing commas) parses" "stderr: $HARNESS_ERR"
+    fi
+
+    # remoteUser != ubuntu must surface as unsupported.
+    if grep -q "remoteUser" <<< "$HARNESS_ERR" \
+        && grep -q "unsupported" <<< "$HARNESS_ERR"; then
+        pass "remoteUser != ubuntu is reported unsupported"
+    else
+        fail "remoteUser != ubuntu is reported unsupported" "stderr: $HARNESS_ERR"
+    fi
+
+    # --no-devcontainer silently skips the file: the report header must NOT appear.
+    # `--dry-run` lets us exercise the discovery path without any VM work.
+    if coop start "${INSTANCE}-dc-skip" --workspace "$dcdir" \
+        --no-devcontainer --dry-run --no-agents; then
+        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
+            fail "--no-devcontainer suppresses discovery" "report header still appeared: $HARNESS_ERR"
+        else
+            pass "--no-devcontainer suppresses discovery"
+        fi
+    else
+        fail "--no-devcontainer suppresses discovery" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    # Non-interactive + discovered file + no escape hatch must error with the
+    # hint pointing at --devcontainer / --no-devcontainer.
+    if moat_fails start "${INSTANCE}-dc-noopt" --workspace "$dcdir" --no-agents; then
+        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
+            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
+            pass "non-TTY without escape hatch errors with hint"
+        else
+            fail "non-TTY without escape hatch errors with hint" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "non-TTY without escape hatch errors with hint" "expected non-zero exit"
+    fi
+
+    # CLI overrides devcontainer.json values — report should mark cpus as
+    # "overridden" with source = CLI.
+    if coop start "${INSTANCE}-dc-override" --workspace "$dcdir" \
+        --vcpus 8 --dry-run --no-agents; then
+        pass "start --dry-run with overriding CLI flag exits 0"
+    else
+        fail "start --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if grep "hostRequirements.cpus" <<< "$HARNESS_ERR" | grep -q "overridden"; then
+        pass "CLI --vcpus is reported as overriding devcontainer.json"
+    else
+        fail "CLI --vcpus is reported as overriding devcontainer.json" "stderr: $HARNESS_ERR"
+    fi
+}
+
+# ── devcontainer.json apply (--full only) ─────────────────────
+
+test_devcontainer_apply() {
+    echo ""
+    echo "=== Phase: devcontainer.json apply (--full) ==="
+
+    local dcdir="$tmpdir/devcontainer-apply-ws"
+    _write_devcontainer "$dcdir"
+    local dcfile="$dcdir/.devcontainer/devcontainer.json"
+    local inst_name="${INSTANCE}-dc-apply"
+
+    # Use explicit --devcontainer to skip the prompt in CI.
+    if coop start "$inst_name" --workspace "$dcdir" \
+        --devcontainer "$dcfile" --no-agents; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "start with --devcontainer exits 0"
+    else
+        fail "start with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+
+    # containerEnv must reach the guest as a literal env var.
+    local seen_env
+    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
+    if [[ "$seen_env" == "applied" ]]; then
+        pass "containerEnv reached the guest"
+    else
+        fail "containerEnv reached the guest" "got: '$seen_env'"
+    fi
+
+    # postStartCommand must have written the marker.
+    local seen_marker
+    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
+    if [[ "$seen_marker" == *dc-hooked* ]]; then
+        pass "postStartCommand ran in the guest"
+    else
+        fail "postStartCommand ran in the guest" "marker contents: '$seen_marker'"
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -2932,6 +3086,7 @@ main() {
     test_invalid_names
     test_profiles_cli
     test_completions
+    test_devcontainer_translator
 
     # Setup + primary instance
     test_setup
@@ -2986,6 +3141,7 @@ main() {
         test_custom_profiles
         test_builtin_profiles
         test_post_start
+        test_devcontainer_apply
 
         # Local marketplace directory copy
         test_local_marketplace
