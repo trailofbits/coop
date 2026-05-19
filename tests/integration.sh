@@ -219,11 +219,13 @@ test_completions() {
 
     if coop completions bash; then
         for sub in shell claude destroy completions; do
-            if echo "$HARNESS_OUT" | grep -q "coop,$sub"; then
+            # Here-string, not `echo | grep -q`: pipefail + early grep match
+            # SIGPIPE's bash's echo on this 48 KB script and turns matches into false misses.
+            if grep -q "coop,$sub" <<<"$HARNESS_OUT"; then
                 pass "bash completion script references \`$sub\`"
             else
                 fail "bash completion script references \`$sub\`" \
-                    "output (truncated): $(echo "$HARNESS_OUT" | head -c 400)"
+                    "output (truncated): $(head -c 400 <<<"$HARNESS_OUT")"
             fi
         done
     else
