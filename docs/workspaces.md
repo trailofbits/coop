@@ -47,10 +47,9 @@ When a `--mount` source contains a `.git` entry and the backend is a live mount 
 
 Because the mount is live, those entries appear on the host as well. After the VM exits, every host `git` invocation fails with `fatal: Invalid path '/workspace': No such file or directory`. The workaround is to remove the offending lines from `.git/config` (and `.git/worktrees/*/config`).
 
-coop prints a warning at start time when a live-mount source is a git repo. To avoid the issue:
+coop prints a warning at start time when a live-mount source is a git repo. To avoid the issue, do not run commands inside the guest that record absolute paths in `.git/config` — in particular, `git worktree add` and `prek install` (or any other tool that calls `git config core.hooksPath`).
 
-- Prefer `--workspace` over `--mount` for git repos. `--workspace` tar-pipes the contents in; guest-side writes do not propagate back.
-- If you need a live mount, avoid creating worktrees or installing hooks inside the guest.
+Switching from `--mount` to `--workspace` does not on its own fix this: `--workspace` copies the repo into the guest, but `.git/` is included by default and is brought back by `coop pull`, so corrupted config entries written inside the guest still reach the host. Either avoid the offending commands or pass `--exclude-git` on `coop pull`.
 
 ### Manual via SSH
 

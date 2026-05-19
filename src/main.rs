@@ -1216,12 +1216,13 @@ fn start_instance(
 fn warn_on_live_git_mounts(mounts: &[config::Mount]) {
     for m in mounts.iter().filter(|m| m.host_is_git_repo()) {
         tracing::warn!(
-            "Live-mounting git repo '{}' at guest path '{}'. Git operations \
-             inside the guest may write absolute '{}/...' paths into the \
-             shared .git/config (e.g. core.worktree, core.hooksPath), \
-             breaking `git` on the host after the VM exits. Prefer \
-             `--workspace` for git repos, or avoid running `git worktree \
-             add` / `prek install` inside the guest.",
+            "Live-mounting git repo '{}' at guest path '{}'. Avoid running \
+             commands inside the guest that record absolute paths in \
+             .git/config (in particular `git worktree add` and \
+             `prek install`): they write '{}/...' values for \
+             core.worktree / core.hooksPath that are visible on the host \
+             through the live mount and break host-side `git` after the \
+             VM exits.",
             m.host_path.display(),
             m.guest_path,
             m.guest_path,
