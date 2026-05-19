@@ -291,6 +291,14 @@ impl Mount {
             guest_path,
         })
     }
+
+    /// True if the mount source contains a `.git` entry (regular repo or
+    /// linked worktree). Used to warn users that live-mounting a repo
+    /// risks the guest writing absolute `/workspace` paths into the
+    /// shared `.git/config`.
+    pub fn host_is_git_repo(&self) -> bool {
+        self.host_path.join(".git").exists()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2740,6 +2748,31 @@ token = "cmd:echo x"
             err.to_string().contains("must be absolute"),
             "expected 'must be absolute', got: {err}"
         );
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_detects_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(m.host_is_git_repo());
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_detects_worktree_git_file() {
+        // Linked worktrees have `.git` as a file pointing at the main
+        // repo's gitdir, not a directory. Both should count.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(m.host_is_git_repo());
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_false_for_plain_directory() {
+        let tmp = TempDir::new().unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(!m.host_is_git_repo());
     }
 
     // ── ConfigDir deserialization ────────────────────────────
