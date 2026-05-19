@@ -177,6 +177,11 @@ enum Commands {
         /// when one is missing for the resolved repo.
         #[arg(long)]
         no_prompt: bool,
+        /// Shell command to run inside the guest after boot (overrides
+        /// `post_start` from `config.toml`). Failure is logged but does
+        /// not fail the start.
+        #[arg(long, value_name = "CMD")]
+        post_start: Option<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -584,6 +589,7 @@ fn main() -> Result<()> {
             image,
             exclude_git,
             no_prompt,
+            post_start,
         } => {
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
@@ -611,6 +617,7 @@ fn main() -> Result<()> {
                     mounts,
                     exclude_git,
                     config_path: &cli.config,
+                    post_start_override: post_start.as_deref(),
                 },
             )
         }
@@ -892,6 +899,9 @@ struct StartOpts<'a> {
     /// Path to the on-disk config file. Re-read after the auto-prompt
     /// in case the wizard added a new `[github.pat."..."]` entry.
     config_path: &'a Path,
+    /// CLI override for `post_start` from `config.toml`. `None` means
+    /// "use the configured value (if any)"; `Some` always wins.
+    post_start_override: Option<&'a str>,
 }
 
 fn cmd_start(
@@ -1072,11 +1082,19 @@ fn restart_instance(
 
     signal::check_shutdown()?;
 
-    if opts.no_agents {
+    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
+    if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
-        backend::bootstrap_agents(&session, cfg, inst, true)?;
+        if opts.no_agents {
+            tracing::info!("Skipping guest agent bootstrap (--no-agents)");
+        } else {
+            backend::bootstrap_agents(&session, cfg, inst, true)?;
+        }
+        if let Some(cmd) = post_start {
+            backend::run_post_start(&session, cmd);
+        }
     }
 
     tracing::info!(
@@ -1142,11 +1160,19 @@ fn start_instance(
 
     signal::check_shutdown()?;
 
-    if opts.no_agents {
+    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
+    if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
-        backend::bootstrap_agents(&session, cfg, inst, false)?;
+        if opts.no_agents {
+            tracing::info!("Skipping guest agent bootstrap (--no-agents)");
+        } else {
+            backend::bootstrap_agents(&session, cfg, inst, false)?;
+        }
+        if let Some(cmd) = post_start {
+            backend::run_post_start(&session, cmd);
+        }
     }
 
     signal::check_shutdown()?;
@@ -2090,6 +2116,15 @@ mod tests {
     }
 
     #[test]
+    fn start_post_start_flag_parses() {
+        let cli = parse(&["start", "--post-start", "touch /tmp/x"]);
+        let super::Commands::Start { post_start, .. } = cli.command else {
+            panic!("expected Start variant");
+        };
+        assert_eq!(post_start.as_deref(), Some("touch /tmp/x"));
+    }
+
+    #[test]
     fn start_no_claude_alias_parses() {
         let cli = parse(&["start", "--no-claude"]);
         let super::Commands::Start { no_agents, .. } = cli.command else {
@@ -2489,6 +2524,7 @@ mod tests {
             mounts,
             exclude_git: false,
             config_path,
+            post_start_override: None,
         }
     }
 

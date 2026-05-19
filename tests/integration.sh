@@ -2726,6 +2726,53 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
+# ── post_start hook (--full only) ──────────────────────────────
+
+test_post_start() {
+    echo ""
+    echo "=== Phase: post_start hook ==="
+
+    local inst_name="${INSTANCE}-poststart"
+    local marker="/tmp/coop-post-start-$$.marker"
+
+    # --post-start runs the command in the guest after SSH is ready.
+    # The marker file written by the hook is the assertion.
+    if coop start "$inst_name" --no-agents \
+        --post-start "echo hooked > $marker"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "start --post-start exits 0"
+    else
+        fail "start --post-start exits 0" "exit code: $?"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+    local seen
+    seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
+    unset GUEST_INSTANCE
+
+    if [[ "$seen" == *hooked* ]]; then
+        pass "--post-start hook ran in the guest"
+    else
+        fail "--post-start hook ran in the guest" "marker contents: '$seen'"
+    fi
+
+    # Verify a failing hook does not fail `coop start` (warn-and-continue).
+    local fail_inst="${INSTANCE}-poststart-fail"
+    if coop start "$fail_inst" --no-agents \
+        --post-start "false; exit 1"; then
+        STARTED_INSTANCES+=("$fail_inst")
+        pass "start succeeds when --post-start fails (warn-and-continue)"
+    else
+        fail "start succeeds when --post-start fails" "exit code: $?"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    coop destroy "$fail_inst" 2>/dev/null || true
+    untrack_instance "$fail_inst"
+}
+
 # ── Provision failure test (--full only) ───────────────────────
 
 test_provision_failure() {
@@ -2840,6 +2887,7 @@ main() {
         test_named_images
         test_custom_profiles
         test_builtin_profiles
+        test_post_start
 
         # Local marketplace directory copy
         test_local_marketplace

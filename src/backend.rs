@@ -976,6 +976,21 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<En
     Ok(env)
 }
 
+/// Run a user-supplied post-start hook in the guest.
+///
+/// The command is sent to SSH as-is and evaluated by the guest's login
+/// shell, so pipes, `&&`, and redirects all work. Failures are logged at
+/// `WARN` and swallowed — a transient hook failure shouldn't strand the VM.
+pub fn run_post_start(session: &SshSession, command: &str) {
+    tracing::info!("Running post_start hook in guest");
+    tracing::debug!("post_start: {command}");
+
+    match session.exec(command) {
+        Ok(()) => tracing::debug!("post_start hook completed"),
+        Err(e) => tracing::warn!("post_start hook failed (continuing): {e}"),
+    }
+}
+
 /// Bootstrap configured guest agents in the guest declaratively.
 pub fn bootstrap_agents(
     session: &SshSession,

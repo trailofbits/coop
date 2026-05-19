@@ -340,6 +340,16 @@ pub struct CoopConfig {
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
 
+    /// Shell command to run inside the guest after every successful boot.
+    ///
+    /// Executed after the VM is up and SSH is ready, before any interactive
+    /// `shell` / agent launch. A failure is logged at `WARN` and does not
+    /// fail the start — a transient hook failure shouldn't strand the VM.
+    ///
+    /// Maps to `postStartCommand` from `devcontainer.json`.
+    #[serde(default)]
+    pub post_start: Option<String>,
+
     /// Self-update behaviour
     #[serde(default)]
     pub updates: crate::update::UpdateConfig,
@@ -1244,6 +1254,7 @@ impl Default for CoopConfig {
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
             profiles: HashMap::new(),
+            post_start: None,
             updates: crate::update::UpdateConfig::default(),
         }
     }
@@ -2466,6 +2477,24 @@ token = "cmd:echo x"
     fn custom_profiles_default_empty() {
         let cfg = CoopConfig::default();
         assert!(cfg.profiles.is_empty());
+    }
+
+    // ── post_start ───────────────────────────────────────────
+
+    #[test]
+    fn post_start_deserializes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "post_start = \"touch /tmp/booted\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(cfg.post_start.as_deref(), Some("touch /tmp/booted"));
+    }
+
+    #[test]
+    fn post_start_default_none() {
+        let cfg = CoopConfig::default();
+        assert!(cfg.post_start.is_none());
     }
 
     // ── Named images ─────────────────────────────────────────
