@@ -121,12 +121,12 @@ pub fn run_status(cfg: &CoopConfig, probe: bool) {
     println!("github mode: pat");
     println!("entries ({}):", pat.entries.len());
     for (repo, entry) in &pat.entries {
-        let backend_label = infer_backend(&entry.token)
+        let backend_label = infer_backend(entry.token.expose())
             .map_or_else(|| "unknown".to_string(), |b| b.label().to_string());
         println!("  {repo}");
         println!("    storage: {backend_label}");
         if probe {
-            let validity = match resolve_cmd_value(&entry.token) {
+            let validity = match resolve_cmd_value(entry.token.expose()) {
                 Ok(token) if token.starts_with(TOKEN_PREFIX) => "resolves, format ok",
                 Ok(_) => "resolves but unexpected format",
                 Err(_) => "FAILED to resolve",
@@ -153,7 +153,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Resul
         .with_context(|| {
             format!("No PAT entry for '{repo}' — nothing to forget. Run `coop github status`.")
         })?;
-    let backend = infer_backend(&entry.token);
+    let backend = infer_backend(entry.token.expose());
     let account = account_for_repo(repo);
     let state_dir = cfg.data_dir.join("state");
     if let Some(b) = backend {
@@ -586,7 +586,7 @@ mod tests {
         let cfg = pat_config_at(&path).unwrap().unwrap();
         assert_eq!(cfg.entries.len(), 1);
         let entry = cfg.entries.get("trailofbits/coop").unwrap();
-        assert_eq!(entry.token, "cmd:cat ./t.txt");
+        assert_eq!(entry.token.expose(), "cmd:cat ./t.txt");
     }
 
     #[test]

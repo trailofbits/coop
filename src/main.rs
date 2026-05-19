@@ -788,7 +788,7 @@ fn cmd_validate(
     // Per-repo PAT validation
     if let Some(config::GitHubAuth::Pat(pat)) = cfg.github.as_ref() {
         for (repo, entry) in &pat.entries {
-            match config::resolve_cmd_value(&entry.token) {
+            match config::resolve_cmd_value(entry.token.expose()) {
                 Ok(token) => {
                     if token.starts_with(github_pat::TOKEN_PREFIX) {
                         writeln!(

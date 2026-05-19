@@ -98,6 +98,41 @@ pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
     }
 }
 
+// ── Secret wrapper ───────────────────────────────────────────
+
+/// Generic wrapper for values that must not appear in `Debug` output.
+///
+/// `Debug` always prints `<redacted>`, so types embedded in error chains,
+/// `tracing` events, panic messages, or `dbg!` never leak the value.
+/// `Display` is intentionally **not** implemented — printing the secret
+/// must be an explicit `.expose()` call, which greps cleanly during review.
+///
+/// Round-trips through serde transparently: a config file with
+/// `api_key = "sk-…"` deserializes to `Secret(String::from("sk-…"))`,
+/// and re-serializing produces the same value. If a config-dump command
+/// is added later, redaction belongs at the formatter for that command,
+/// not on this type.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret<T>(T);
+
+impl<T> Secret<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the underlying value. Named to flag every read at review time.
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
 // ── Newtypes ─────────────────────────────────────────────────
 
 /// Memory size in mebibytes. Inner `NonZeroU32` rejects zero at
@@ -423,7 +458,7 @@ pub struct PatConfig {
 pub struct PatEntry {
     /// Token value. Accepts a literal token or a `cmd:`-prefixed shell
     /// command. Resolved via [`resolve_cmd_value`].
-    pub token: String,
+    pub token: Secret<String>,
 }
 
 /// Custom deserializer accepts either a string (legacy/simple) or a table.
@@ -618,7 +653,7 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeConfig {
     /// Anthropic API key (forwarded via `SendEnv`, never written to disk)
-    pub api_key: Option<String>,
+    pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
@@ -667,7 +702,7 @@ fn default_prompt_for_pat() -> bool {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CodexConfig {
     /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
-    pub api_key: Option<String>,
+    pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
@@ -1231,7 +1266,7 @@ impl Default for NetworkConfig {
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+            api_key: std::env::var("ANTHROPIC_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
             marketplaces: Vec::new(),
             plugins: Vec::new(),
@@ -1244,7 +1279,7 @@ impl Default for ClaudeConfig {
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            api_key: std::env::var("OPENAI_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
@@ -1841,7 +1876,10 @@ mod tests {
             }
         }"#;
         let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-ant-test"));
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("sk-ant-test")
+        );
         assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
         assert_eq!(cfg.marketplaces.len(), 1);
         assert_eq!(cfg.plugins, vec!["context7"]);
@@ -1873,7 +1911,10 @@ mod tests {
             }
         }"#;
         let cfg: CodexConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-openai-test"));
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("sk-openai-test")
+        );
         assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert!(cfg.mcp_servers.contains_key("sentry"));
@@ -1935,7 +1976,7 @@ token = "cmd:echo y"
         assert_eq!(
             pat.entries
                 .get("trailofbits/coop")
-                .map(|e| e.token.as_str()),
+                .map(|e| e.token.expose().as_str()),
             Some("cmd:echo x")
         );
         assert!(pat.skip.is_empty());
@@ -1967,7 +2008,7 @@ token = "cmd:echo x"
 "#;
         let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
         let entry = auth.pat_entry("a/b").unwrap();
-        assert_eq!(entry.token, "cmd:echo x");
+        assert_eq!(entry.token.expose(), "cmd:echo x");
         assert!(auth.pat_entry("c/d").is_none());
     }
 
@@ -1989,7 +2030,7 @@ token = "cmd:echo x"
         entries.insert(
             "a/b".to_string(),
             PatEntry {
-                token: "cmd:echo x".to_string(),
+                token: Secret::new("cmd:echo x".to_string()),
             },
         );
         let auth = GitHubAuth::Pat(PatConfig {
@@ -2004,7 +2045,7 @@ token = "cmd:echo x"
         };
         assert_eq!(pat.skip, vec!["c/d".to_string()]);
         assert_eq!(
-            pat.entries.get("a/b").map(|e| e.token.as_str()),
+            pat.entries.get("a/b").map(|e| e.token.expose().as_str()),
             Some("cmd:echo x")
         );
     }
@@ -3067,5 +3108,70 @@ token = "cmd:echo x"
         // `cmd` (no colon) is a plain value, not a command substitution
         assert_eq!(resolve_cmd_value("cmd").unwrap(), "cmd");
         assert_eq!(resolve_cmd_value("cmdline").unwrap(), "cmdline");
+    }
+
+    // ── Secret redaction ─────────────────────────────────────
+
+    #[test]
+    fn secret_debug_does_not_leak_value() {
+        let s = Secret::new("real-token-value-do-not-leak".to_string());
+        let debug = format!("{s:?}");
+        assert!(
+            !debug.contains("real-token-value-do-not-leak"),
+            "Debug leaked secret value: {debug}"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "Debug should mark redaction: {debug}"
+        );
+    }
+
+    #[test]
+    fn secret_expose_returns_underlying_value() {
+        let s = Secret::new("plaintext".to_string());
+        assert_eq!(s.expose(), "plaintext");
+    }
+
+    #[test]
+    fn secret_serde_round_trip_is_transparent() {
+        let json = r#""token-xyz""#;
+        let s: Secret<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(s.expose(), "token-xyz");
+        let out = serde_json::to_string(&s).unwrap();
+        assert_eq!(out, json);
+    }
+
+    #[test]
+    fn claude_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "sk-ant-real-secret"}"#;
+        let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("sk-ant-real-secret"),
+            "ClaudeConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn codex_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "sk-openai-real-secret"}"#;
+        let cfg: CodexConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("sk-openai-real-secret"),
+            "CodexConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn pat_entry_token_debug_redacts() {
+        let entry = PatEntry {
+            token: Secret::new("github_pat_secret".to_string()),
+        };
+        let debug = format!("{entry:?}");
+        assert!(
+            !debug.contains("github_pat_secret"),
+            "PatEntry Debug leaked token: {debug}"
+        );
     }
 }

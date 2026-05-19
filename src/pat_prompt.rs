@@ -240,7 +240,7 @@ mod tests {
         pc.entries.insert(
             "a/b".to_string(),
             PatEntry {
-                token: "cmd:echo x".to_string(),
+                token: crate::config::Secret::new("cmd:echo x".to_string()),
             },
         );
         let cfg = cfg_with(Some(GitHubAuth::Pat(pc)));

@@ -45,9 +45,33 @@ impl std::fmt::Display for GuestPath {
 /// Carries both variable names (for `-o SendEnv=`) and their values
 /// (for `Command::env()` on SSH child processes), avoiding unsafe
 /// mutation of the process-global environment.
-#[derive(Debug, Clone, Default)]
+///
+/// The whole struct is secret-bearing by construction (entries are
+/// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, plus any
+/// user-configured `env_forward` values), so `Debug` redacts every
+/// value. Variable *names* are preserved because they are useful in
+/// diagnostics and are not themselves secret.
+#[derive(Clone, Default)]
 pub struct EnvForward {
     vars: IndexMap<String, String>,
+}
+
+impl std::fmt::Debug for EnvForward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut dbg = f.debug_struct("EnvForward");
+        // `debug_map` would print keys without the `vars:` prefix; using
+        // a struct field with a map matches what `derive(Debug)` produced
+        // before, minus the redaction.
+        dbg.field(
+            "vars",
+            &self
+                .vars
+                .keys()
+                .map(|k| (k.as_str(), "<redacted>"))
+                .collect::<IndexMap<&str, &str>>(),
+        );
+        dbg.finish()
+    }
 }
 
 impl EnvForward {
@@ -910,8 +934,8 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<En
 
     // ANTHROPIC_API_KEY: prefer config, fall back to process env
     if let Some(key) = &claude.api_key {
-        let resolved =
-            crate::config::resolve_cmd_value(key).context("Failed to resolve claude.api_key")?;
+        let resolved = crate::config::resolve_cmd_value(key.expose())
+            .context("Failed to resolve claude.api_key")?;
         env.set("ANTHROPIC_API_KEY", resolved);
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         env.set("ANTHROPIC_API_KEY", key);
@@ -919,8 +943,8 @@ pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<En
 
     // OPENAI_API_KEY: prefer config, fall back to process env
     if let Some(key) = &codex.api_key {
-        let resolved =
-            crate::config::resolve_cmd_value(key).context("Failed to resolve codex.api_key")?;
+        let resolved = crate::config::resolve_cmd_value(key.expose())
+            .context("Failed to resolve codex.api_key")?;
         env.set("OPENAI_API_KEY", resolved);
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         env.set("OPENAI_API_KEY", key);
@@ -1170,7 +1194,7 @@ fn resolve_pat_token(strategy: Option<&GitHubAuth>, repo: &str) -> Result<String
     let entry = strategy
         .and_then(|s| s.pat_entry(repo))
         .with_context(|| crate::github_pat::missing_entry_error(repo))?;
-    let token = crate::config::resolve_cmd_value(&entry.token)
+    let token = crate::config::resolve_cmd_value(entry.token.expose())
         .with_context(|| format!("Failed to resolve token for [github.pat.\"{repo}\"]"))?;
     if !token.starts_with(crate::github_pat::TOKEN_PREFIX) {
         tracing::warn!(
@@ -2169,7 +2193,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             map.insert(
                 (*slug).to_string(),
                 crate::config::PatEntry {
-                    token: (*token).to_string(),
+                    token: crate::config::Secret::new((*token).to_string()),
                 },
             );
         }
@@ -2228,5 +2252,40 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let auth = pat_auth_with(&[("owner/repo", "github_pat_literal")]);
         let token = resolve_clone_token(Some(&auth), "https://github.com/owner/repo.git").unwrap();
         assert_eq!(token.as_deref(), Some("github_pat_literal"));
+    }
+
+    // ── EnvForward Debug redaction ──────────────────────────
+
+    #[test]
+    fn env_forward_debug_redacts_all_values() {
+        let mut env = EnvForward::default();
+        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value");
+        env.set("GITHUB_TOKEN", "ghp_secret_value");
+        env.set("MYORG_INTERNAL", "internal-secret-blob");
+        let debug = format!("{env:?}");
+        for secret in [
+            "sk-ant-secret-value",
+            "ghp_secret_value",
+            "internal-secret-blob",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "EnvForward Debug leaked value '{secret}': {debug}"
+            );
+        }
+        // Keys are not secret — keep them in Debug output.
+        for key in ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "MYORG_INTERNAL"] {
+            assert!(
+                debug.contains(key),
+                "EnvForward Debug dropped key '{key}': {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_forward_debug_empty() {
+        let env = EnvForward::default();
+        let debug = format!("{env:?}");
+        assert!(debug.contains("EnvForward"));
     }
 }
