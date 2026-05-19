@@ -1075,11 +1075,7 @@ fn restart_instance(
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
-        let session = backend::SshSession {
-            target: target.clone(),
-            env,
-        };
+        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
         backend::bootstrap_agents(&session, cfg, inst, true)?;
     }
 
@@ -1149,11 +1145,7 @@ fn start_instance(
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
-        let session = backend::SshSession {
-            target: target.clone(),
-            env,
-        };
+        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
         backend::bootstrap_agents(&session, cfg, inst, false)?;
     }
 
@@ -1329,11 +1321,22 @@ fn open_ssh_session(
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(&running.inst);
-    let env = backend::prepare_env_forwarding(cfg, repo.as_deref())?;
-    Ok(backend::SshSession {
-        target: running.target,
-        env,
-    })
+    prepare_session_from_target(cfg, running.target, repo.as_deref())
+}
+
+/// Build an `SshSession` from an already-resolved target.
+///
+/// Symmetric with `open_ssh_session`, for paths that resolve the
+/// target without going through `resolve_running` — namely the
+/// post-boot bootstrap in fresh start and restart, where the
+/// instance isn't yet registered as running.
+fn prepare_session_from_target(
+    cfg: &config::CoopConfig,
+    target: backend::SshTarget,
+    repo: Option<&str>,
+) -> Result<backend::SshSession> {
+    let env = backend::prepare_env_forwarding(cfg, repo)?;
+    Ok(backend::SshSession { target, env })
 }
 
 fn cmd_stop(
