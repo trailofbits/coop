@@ -69,7 +69,12 @@ coop push my-instance                        # target a specific instance
 coop push my-instance --dir ./src --force    # combined
 ```
 
-Before overwriting guest files, `push` runs `git status --porcelain` inside the guest workspace. If there are uncommitted changes, push prints them and exits. `--force` overrides this.
+Before overwriting guest files, `push` checks for in-guest work the host doesn't yet know about. Two signals are inspected:
+
+- `git status --porcelain --untracked-files=no` — modifications to tracked files. Untracked files are skipped because they're usually host-side build artifacts that were copied into the guest at start time, not work done by an in-guest agent.
+- `git rev-list --count '@{u}..HEAD'` — commits on the current branch that are ahead of its upstream. Catches in-guest commits that a host push would otherwise silently overwrite.
+
+If either signal finds anything, push prints it and exits. `--force` overrides both.
 
 Transfer method selection is automatic:
 
@@ -86,7 +91,7 @@ coop pull my-instance                           # target a specific instance
 coop pull my-instance --dir ./local-copy        # combined
 ```
 
-Same dirty-check logic as push, applied to the local destination. If the local directory has a `.git` and uncommitted changes, pull refuses unless you pass `--force`.
+Before overwriting the local destination, `pull` runs `git status --porcelain` against it. If the directory has a `.git` and any uncommitted changes (tracked or untracked), pull refuses unless you pass `--force`. Unlike push's guest-side check, the local check does not inspect unpushed commits — committing your local work first is enough to satisfy it.
 
 The destination directory is created if absent. Transport selection follows the same rsync-then-tar-pipe order. The tar-pipe fallback verifies SHA-256 checksums end-to-end.
 
