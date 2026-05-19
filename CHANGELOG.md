@@ -55,13 +55,15 @@
   on each TAB.
 
 - **`--git-repo` clones authenticate against private GitHub repos**
-  (#78) — On the host, resolve a token (`gh auth token` preferred,
-  then `GITHUB_TOKEN`) and forward it to git in the guest via stdin
-  and a one-shot `credential.helper`. The token never appears on
-  argv, stays out of `/proc/<pid>/cmdline` and the ssh debug log, and
-  is not persisted in the cloned repo's `.git/config`. Opportunistic:
+  (#78, #119) — On the host, resolve a token in order: a configured
+  `[github.pat."<slug>"]` entry for the repo, then `gh auth token`,
+  then `GITHUB_TOKEN`. Forward it to git in the guest via stdin and
+  a one-shot `credential.helper`. The token never appears on argv,
+  stays out of `/proc/<pid>/cmdline` and the ssh debug log, and is
+  not persisted in the cloned repo's `.git/config`. Opportunistic:
   GitHub HTTPS URLs only; non-GitHub and SSH-style URLs pass through
-  untouched.
+  untouched. A misconfigured PAT entry fails at start time rather
+  than silently substituting a broader identity.
 
 - **`.git/` included in workspace transfers by default** (#95) —
   `coop start --workspace`, `coop push`, and `coop pull` previously
