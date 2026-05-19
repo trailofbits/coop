@@ -150,6 +150,30 @@ coop claude my-project --ask
 coop claude my-project -- --model sonnet
 ```
 
+### `claude-agents`
+
+Open the Claude Code agent view (`claude agents`) inside the VM. Unlike `coop claude`, this command does **not** wrap the session in tmux by default — Claude Code's background agents are managed by its own daemon, so a tmux layer adds no persistence. Pass `--session <name>` to opt in to tmux if you want a re-attachable terminal.
+
+```
+coop claude-agents [NAME] [FLAGS] [ARGS...]
+coop ca [NAME] [FLAGS] [ARGS...]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--session <name>` | tmux session name (opt-in; no default) |
+| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
+| `ARGS...` | Extra arguments passed through to `claude agents` |
+
+`--session` and `--no-tmux` are mutually exclusive. Alias: `ca`.
+
+```
+coop claude-agents
+coop ca my-project
+coop ca my-project --session agents-work
+```
+
 ### `codex`
 
 Launch Codex inside the VM.
@@ -421,6 +445,50 @@ coop update --force
 ```
 
 See also the [`updates` section](configuration.md#updates-section) of the configuration reference for the background-notification settings.
+
+### `uninstall`
+
+Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
+
+```
+coop uninstall [FLAGS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-y`, `--yes` | Skip interactive confirmation prompts. Removes data unless `--keep-data` is set. |
+| `--keep-data` | Remove only the binary; preserve `~/.coop` and the update-check state. Conflicts with `--purge`. |
+| `--purge` | Also remove `~/.coop` and the update-check state without prompting. Conflicts with `--keep-data`. Pairs with `--yes` for CI. |
+
+Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
+
+If the binary lives in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. A config file outside the data directory is left in place and a note is printed.
+
+```
+coop uninstall                       # interactive: prompts for binary and data
+coop uninstall --yes                 # CI: remove binary and data, no prompts
+coop uninstall --yes --keep-data     # CI: remove binary only
+coop uninstall --yes --purge         # CI: remove binary and data, explicit
+```
+
+### `completions`
+
+Print a static shell completion script. Pair with `source <(COMPLETE=<shell> coop)` in your shell rc for dynamic completion of live instance, image, and profile names. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
+
+```
+coop completions <SHELL>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `SHELL` | Target shell: `bash`, `zsh`, `fish`, `powershell`, or `elvish` |
+
+```
+coop completions bash | sudo tee /etc/bash_completion.d/coop > /dev/null
+coop completions bash > ~/.local/share/bash-completion/completions/coop
+coop completions zsh > ~/.zfunc/_coop
+coop completions fish > ~/.config/fish/completions/coop.fish
+```
 
 ### `github`
 

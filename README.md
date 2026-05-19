@@ -76,7 +76,9 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `resize` | Grow a stopped instance's disk |
 | `validate` | Check config and prerequisites |
 | `update` | Self-update coop to the latest GitHub release |
+| `uninstall` | Remove the coop binary and (optionally) its data directories |
 | `completions` | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
+| `github` | Manage GitHub fine-grained PATs (`setup-pat`, `status`, `rotate-pat`, `forget-pat`) |
 
 ## Shell completion
 
