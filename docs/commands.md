@@ -128,7 +128,7 @@ coop shell my-project -- cat /etc/os-release
 
 ### `claude`
 
-Launch Claude Code inside the VM. By default, coop passes `--dangerously-skip-permissions` because the VM itself is the isolation boundary. Use `--ask` to restore the permissions prompt.
+Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during `coop start`) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
 
 ```
 coop claude [NAME] [FLAGS] [ARGS...]

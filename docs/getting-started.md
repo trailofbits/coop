@@ -163,7 +163,7 @@ coop start my-project --no-agents
 coop claude
 ```
 
-This runs Claude Code with `--dangerously-skip-permissions` by default. The VM itself is the isolation boundary. For permission prompts:
+During `coop start`, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts by default. The VM itself is the isolation boundary. For permission prompts (coop launches `claude` with `--permission-mode default`):
 
 ```
 coop claude --ask

@@ -37,7 +37,7 @@ coop claude
 coop codex
 ```
 
-That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. By default, `coop claude` launches with `--dangerously-skip-permissions` since the VM is the isolation boundary. Pass `--ask` to prompt for permissions instead.
+That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. During `coop start`, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Pass `--ask` to `coop claude` to restore prompts for that session (`--permission-mode default`).
 
 ## Features
 
