@@ -621,6 +621,80 @@ pub struct VmConfig {
     pub template_size_gib: GiB,
 }
 
+/// CIDR prefix length in `0..=32`. Display formats as `/N` so it can be
+/// concatenated directly with an IPv4 address to form a CIDR block.
+///
+/// Deserialization accepts `"/24"`, `"24"`, or the bare integer `24`.
+/// Out-of-range or non-numeric values are rejected at parse time, so no
+/// late validation pass is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubnetMask(u8);
+
+impl SubnetMask {
+    /// Create from a runtime value. Returns `None` if `bits > 32`.
+    pub fn new(bits: u8) -> Option<Self> {
+        (bits <= 32).then_some(Self(bits))
+    }
+}
+
+impl fmt::Display for SubnetMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "/{}", self.0)
+    }
+}
+
+impl std::str::FromStr for SubnetMask {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let digits = s.strip_prefix('/').unwrap_or(s);
+        let bits: u8 = digits
+            .parse()
+            .map_err(|_| format!("'{s}' is not valid CIDR (expected /0../32)"))?;
+        Self::new(bits).ok_or_else(|| format!("'{s}' is not valid CIDR (expected /0../32)"))
+    }
+}
+
+impl Serialize for SubnetMask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubnetMask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SubnetMaskVisitor;
+
+        impl serde::de::Visitor<'_> for SubnetMaskVisitor {
+            type Value = SubnetMask;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a CIDR prefix length: \"/24\", \"24\", or integer 24")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SubnetMask, E> {
+                v.parse().map_err(E::custom)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SubnetMask, E> {
+                u8::try_from(v)
+                    .ok()
+                    .and_then(SubnetMask::new)
+                    .ok_or_else(|| E::custom(format!("{v} is not valid CIDR (expected 0..=32)")))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<SubnetMask, E> {
+                u8::try_from(v)
+                    .ok()
+                    .and_then(SubnetMask::new)
+                    .ok_or_else(|| E::custom(format!("{v} is not valid CIDR (expected 0..=32)")))
+            }
+        }
+
+        deserializer.deserialize_any(SubnetMaskVisitor)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Host IP on TAP interfaces
@@ -629,7 +703,7 @@ pub struct NetworkConfig {
 
     /// Subnet mask in CIDR notation
     #[serde(default = "default_subnet_mask")]
-    pub subnet_mask: String,
+    pub subnet_mask: SubnetMask,
 
     /// Host network interface for NAT (e.g., eth0, ens5)
     #[serde(default = "default_host_iface")]
@@ -1165,16 +1239,6 @@ impl CoopConfig {
                 "vm.mem_size_mib={} is too low (minimum 128)",
                 self.vm.mem_size_mib
             ));
-        }
-
-        // Network validation
-        let mask = self.network.subnet_mask.trim_start_matches('/');
-        match mask.parse::<u8>() {
-            Ok(bits) if bits <= 32 => {}
-            _ => errors.push(format!(
-                "network.subnet_mask='{}' is not valid CIDR (expected /0../32)",
-                self.network.subnet_mask
-            )),
         }
 
         // Path checks
@@ -1753,8 +1817,9 @@ fn default_host_ip() -> Ipv4Addr {
     Ipv4Addr::new(172, 16, 0, 1)
 }
 
-fn default_subnet_mask() -> String {
-    "/24".to_string()
+fn default_subnet_mask() -> SubnetMask {
+    #[expect(clippy::expect_used, reason = "literal 24 is in 0..=32")]
+    SubnetMask::new(24).expect("24 is in 0..=32")
 }
 
 #[mutants::skip] // equivalent: "auto" is consumed by host-interface auto-detection at runtime, not by any unit test
@@ -2627,7 +2692,7 @@ skip = ["not-a-slug"]
         assert_eq!(cfg.vm.mem_size_mib, MiB::new(4096).unwrap());
         assert_eq!(cfg.ssh_port.get(), 22);
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
-        assert_eq!(cfg.network.subnet_mask, "/24");
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
         assert_eq!(cfg.vm.template_size_gib, GiB::new(8).unwrap());
     }
 
@@ -2696,6 +2761,119 @@ skip = ["not-a-slug"]
         assert!(serde_json::from_str::<InstanceName>(json).is_err());
     }
 
+    // ── SubnetMask ────────────────────────────────────────────
+
+    #[test]
+    fn subnet_mask_new_accepts_in_range() {
+        for bits in [0_u8, 1, 24, 32] {
+            assert!(SubnetMask::new(bits).is_some());
+        }
+    }
+
+    #[test]
+    fn subnet_mask_new_rejects_out_of_range() {
+        assert!(SubnetMask::new(33).is_none());
+        assert!(SubnetMask::new(255).is_none());
+    }
+
+    #[test]
+    fn subnet_mask_display_includes_slash() {
+        assert_eq!(SubnetMask::new(24).unwrap().to_string(), "/24");
+        assert_eq!(SubnetMask::new(0).unwrap().to_string(), "/0");
+        assert_eq!(SubnetMask::new(32).unwrap().to_string(), "/32");
+    }
+
+    #[test]
+    fn subnet_mask_fromstr_accepts_slash_and_bare() {
+        assert_eq!(
+            "/24".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            "24".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            "/0".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(0).unwrap()
+        );
+        assert_eq!(
+            "/32".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(32).unwrap()
+        );
+    }
+
+    #[test]
+    fn subnet_mask_fromstr_rejects_invalid() {
+        assert!("/33".parse::<SubnetMask>().is_err());
+        assert!("33".parse::<SubnetMask>().is_err());
+        assert!("abc".parse::<SubnetMask>().is_err());
+        assert!("255.255.255.0".parse::<SubnetMask>().is_err());
+        assert!("".parse::<SubnetMask>().is_err());
+        assert!("/".parse::<SubnetMask>().is_err());
+        assert!("/-1".parse::<SubnetMask>().is_err());
+    }
+
+    #[test]
+    fn subnet_mask_roundtrip_serde_json() {
+        let mask = SubnetMask::new(24).unwrap();
+        let json = serde_json::to_string(&mask).unwrap();
+        assert_eq!(json, r#""/24""#);
+        let loaded: SubnetMask = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, mask);
+    }
+
+    #[test]
+    fn subnet_mask_deserialize_accepts_string_and_integer() {
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>(r#""/24""#).unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>(r#""24""#).unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>("24").unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+    }
+
+    #[test]
+    fn subnet_mask_deserialize_rejects_out_of_range() {
+        assert!(serde_json::from_str::<SubnetMask>(r#""/33""#).is_err());
+        assert!(serde_json::from_str::<SubnetMask>("33").is_err());
+        assert!(serde_json::from_str::<SubnetMask>("-1").is_err());
+    }
+
+    #[test]
+    fn config_load_accepts_subnet_mask_string_and_integer() {
+        let tmp = TempDir::new().unwrap();
+
+        let with_slash = tmp.path().join("slash.toml");
+        fs::write(&with_slash, "[network]\nsubnet_mask = \"/16\"\n").unwrap();
+        let cfg = CoopConfig::load(&with_slash).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+
+        let bare = tmp.path().join("bare.toml");
+        fs::write(&bare, "[network]\nsubnet_mask = \"16\"\n").unwrap();
+        let cfg = CoopConfig::load(&bare).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+
+        let int = tmp.path().join("int.toml");
+        fs::write(&int, "[network]\nsubnet_mask = 16\n").unwrap();
+        let cfg = CoopConfig::load(&int).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+    }
+
+    #[test]
+    fn config_load_rejects_invalid_subnet_mask() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[network]\nsubnet_mask = \"/33\"\n").unwrap();
+        assert!(CoopConfig::load(&path).is_err());
+    }
+
     #[test]
     fn load_valid_toml_parses() {
         let tmp = TempDir::new().unwrap();
@@ -2761,7 +2939,7 @@ skip = ["not-a-slug"]
         let cfg = CoopConfig::load(&path).unwrap();
         assert_eq!(cfg.network.host_iface, "eth0");
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
-        assert_eq!(cfg.network.subnet_mask, "/24");
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
     }
 
     #[test]
@@ -2880,22 +3058,6 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn validate_rejects_invalid_subnet_mask() {
-        let mut cfg = CoopConfig::default();
-        cfg.network.subnet_mask = "/33".into();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("not valid CIDR"));
-    }
-
-    #[test]
-    fn validate_rejects_non_cidr_subnet() {
-        let mut cfg = CoopConfig::default();
-        cfg.network.subnet_mask = "255.255.255.0".into();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("not valid CIDR"));
-    }
-
-    #[test]
     fn validate_rejects_missing_local_marketplace() {
         let mut cfg = CoopConfig::default();
         cfg.claude.marketplaces = vec!["/nonexistent/skills-dir".into()];
@@ -2960,11 +3122,14 @@ skip = ["not-a-slug"]
     fn validate_collects_multiple_errors() {
         let mut cfg = CoopConfig::default();
         cfg.vm.mem_size_mib = MiB::new(64).unwrap();
-        cfg.network.subnet_mask = "/33".into();
+        cfg.claude.config_dir = ConfigDir::Custom("/nonexistent/claude-config".into());
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("mem_size_mib"), "missing mem error: {msg}");
-        assert!(msg.contains("CIDR"), "missing subnet error: {msg}");
+        assert!(
+            msg.contains("claude.config_dir"),
+            "missing config_dir error: {msg}"
+        );
     }
 
     // ── validate() boundary pinning (issue #137) ──────────────
