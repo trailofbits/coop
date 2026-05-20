@@ -123,12 +123,42 @@ impl EnvForward {
 
 // ── Running instance ──────────────────────────────────────────
 
-/// Instance that has been verified as running. Carries the SSH
-/// target so connection details are always available without
+/// Proof that an instance is currently running. Construct via
+/// [`VmBackend::as_running`] — the constructor is the single place
+/// that probes live state, so operations taking a `RunningInstance`
+/// can rely on the precondition without re-checking. Carries the
+/// SSH target so connection details are always available without
 /// further fallible lookups.
+///
+/// Fields are private so a `RunningInstance` cannot be forged; the
+/// only way to obtain one is through a backend method that verified
+/// the instance is alive.
 pub struct RunningInstance {
-    pub inst: Instance,
-    pub target: SshTarget,
+    inst: Instance,
+    target: SshTarget,
+}
+
+impl RunningInstance {
+    /// Mint a `RunningInstance` after a successful live-state probe.
+    ///
+    /// Crate-private so only backend impls can construct one. Callers
+    /// use [`VmBackend::as_running`] (which delegates here).
+    pub(crate) fn new(inst: Instance, target: SshTarget) -> Self {
+        Self { inst, target }
+    }
+
+    pub fn instance(&self) -> &Instance {
+        &self.inst
+    }
+
+    pub fn target(&self) -> &SshTarget {
+        &self.target
+    }
+
+    /// Consume the wrapper and return the inner `Instance` and SSH target.
+    pub fn into_parts(self) -> (Instance, SshTarget) {
+        (self.inst, self.target)
+    }
 }
 
 // ── SSH target ────────────────────────────────────────────────
@@ -595,7 +625,10 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    fn stop(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
+    /// Stop a running instance. Consumes the `RunningInstance` proof
+    /// so the type system witnesses that the precondition held when
+    /// the call was made.
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &str) -> Result<()>;
@@ -606,8 +639,25 @@ pub trait VmBackend: std::fmt::Display {
         new_size: crate::config::GiB,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// Probe the live state of `inst` and return a `RunningInstance`
+    /// if it is running. This is the single chokepoint for "is this
+    /// VM alive?" — call sites that need to operate on a running VM
+    /// should ask via this method rather than open-coding the check.
+    ///
+    /// Returns `Err` when the instance is not running or when the
+    /// backend lookup itself fails (e.g. `limactl list` errors). The
+    /// `Instance` is consumed; on `Err` callers can clone before
+    /// calling if they need to keep working with it.
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance>;
     fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String>;
-    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()>;
+    /// Stream logs from a running instance.
+    ///
+    /// Takes `&RunningInstance` so the running precondition is part
+    /// of the signature — Firecracker's log streaming asserts the
+    /// PID is alive, and `--follow` only makes sense while the VM
+    /// is producing new output.
+    fn stream_logs(&self, cfg: &CoopConfig, running: &RunningInstance, mode: LogMode)
+    -> Result<()>;
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
@@ -666,12 +716,9 @@ impl VmBackend for FirecrackerBackend {
         running.wait_for_boot()
     }
 
-    fn stop(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        if !self.is_running(inst) {
-            tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
-            return Ok(());
-        }
-        let vm = crate::vm::FirecrackerVm::from_running(cfg, inst)?;
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+        let (inst, _target) = running.into_parts();
+        let vm = crate::vm::FirecrackerVm::from_running(cfg, &inst)?;
         vm.stop()
     }
 
@@ -753,13 +800,31 @@ impl VmBackend for FirecrackerBackend {
         inst.is_running()
     }
 
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance> {
+        if !inst.is_running() {
+            bail!(
+                "Instance '{}' is not running (no live Firecracker process \
+                 for PID file {})",
+                inst.name,
+                inst.pid_file_path().display(),
+            );
+        }
+        let target = self.ssh_target(cfg, &inst)?;
+        Ok(RunningInstance::new(inst, target))
+    }
+
     fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         let vm = crate::vm::FirecrackerVm::from_running(cfg, inst)?;
         vm.status()
     }
 
-    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()> {
-        let vm = crate::vm::FirecrackerVm::from_running(cfg, inst)?;
+    fn stream_logs(
+        &self,
+        cfg: &CoopConfig,
+        running: &RunningInstance,
+        mode: LogMode,
+    ) -> Result<()> {
+        let vm = crate::vm::FirecrackerVm::from_running(cfg, running.instance())?;
         vm.stream_logs(mode)
     }
 
@@ -820,8 +885,9 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        crate::lima::stop(inst)
+    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+        let (inst, _target) = running.into_parts();
+        crate::lima::stop_running(&inst)
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -878,12 +944,28 @@ impl VmBackend for LimaBackend {
         crate::lima::is_running(inst)
     }
 
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance> {
+        if !crate::lima::is_running(&inst) {
+            bail!(
+                "Instance '{}' is not running (Lima reports state != Running)",
+                inst.name,
+            );
+        }
+        let target = crate::lima::ssh_target(cfg, &inst)?;
+        Ok(RunningInstance::new(inst, target))
+    }
+
     fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         crate::lima::status(cfg, inst)
     }
 
-    fn stream_logs(&self, _cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()> {
-        crate::lima::stream_logs(inst, mode)
+    fn stream_logs(
+        &self,
+        _cfg: &CoopConfig,
+        running: &RunningInstance,
+        mode: LogMode,
+    ) -> Result<()> {
+        crate::lima::stream_logs(running.instance(), mode)
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {

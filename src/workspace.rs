@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::SshTarget;
+use crate::backend::{RunningInstance, SshTarget};
 use crate::config::Instance;
 
 const GUEST_WORKSPACE: &str = "/workspace";
@@ -329,13 +329,17 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
 }
 
 /// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
+///
+/// Takes a `RunningInstance` so the caller's proof of liveness is
+/// visible in the signature — no surprise SSH failure inside.
 pub fn push(
-    target: &SshTarget,
-    inst: &Instance,
+    running: &RunningInstance,
     dir: Option<&str>,
     force: bool,
     exclude_git: bool,
 ) -> Result<()> {
+    let inst = running.instance();
+    let target = running.target();
     let state = load_or_default(inst, dir, "push")?;
     let source_dir = resolve_host_dir(dir, &state, "push")?;
 
@@ -365,13 +369,17 @@ pub fn push(
 }
 
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
+///
+/// Takes a `RunningInstance` so the caller's proof of liveness is
+/// visible in the signature — no surprise SSH failure inside.
 pub fn pull(
-    target: &SshTarget,
-    inst: &Instance,
+    running: &RunningInstance,
     dir: Option<&str>,
     force: bool,
     exclude_git: bool,
 ) -> Result<()> {
+    let inst = running.instance();
+    let target = running.target();
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir(dir, &state, "pull")?;
 
@@ -448,12 +456,16 @@ pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> R
 }
 
 /// Generate SSH config and launch VS Code Remote SSH.
+///
+/// Takes a `RunningInstance` so the caller's proof of liveness is
+/// visible in the signature — VS Code needs a live SSH target.
 pub fn vscode(
-    target: &SshTarget,
-    inst: &Instance,
+    running: &RunningInstance,
     project: Option<&str>,
     editor: Option<&str>,
 ) -> Result<()> {
+    let inst = running.instance();
+    let target = running.target();
     let remote_path = project.unwrap_or(GUEST_WORKSPACE);
 
     update_ssh_config(target, inst)?;

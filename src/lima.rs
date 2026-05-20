@@ -180,14 +180,12 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// Stop a Lima instance.
-pub fn stop(inst: &Instance) -> Result<()> {
+/// Stop a Lima instance that has already been verified as running.
+///
+/// The caller's `RunningInstance` token proves the precondition, so
+/// this skips the live-state probe and only handles the shutdown.
+pub fn stop_running(inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
-
-    if !is_running(inst) {
-        tracing::debug!("Lima instance '{name}' is not running — nothing to stop");
-        return Ok(());
-    }
 
     tracing::info!("Stopping Lima instance '{name}'");
 

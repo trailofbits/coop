@@ -1771,7 +1771,7 @@ fn default_image_name() -> String {
     DEFAULT_IMAGE.to_string()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instance {
     pub name: InstanceName,
     pub index: InstanceIndex,

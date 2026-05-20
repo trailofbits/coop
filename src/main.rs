@@ -832,7 +832,7 @@ fn main() -> Result<()> {
             } else {
                 backend::LogMode::Snapshot
             };
-            be.stream_logs(&cfg, &running.inst, mode)
+            be.stream_logs(&cfg, &running, mode)
         }
         Commands::Push {
             name,
@@ -841,13 +841,7 @@ fn main() -> Result<()> {
             exclude_git,
         } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            workspace::push(
-                &running.target,
-                &running.inst,
-                dir.as_deref(),
-                force,
-                exclude_git,
-            )
+            workspace::push(&running, dir.as_deref(), force, exclude_git)
         }
         Commands::Pull {
             name,
@@ -856,13 +850,7 @@ fn main() -> Result<()> {
             exclude_git,
         } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            workspace::pull(
-                &running.target,
-                &running.inst,
-                dir.as_deref(),
-                force,
-                exclude_git,
-            )
+            workspace::pull(&running, dir.as_deref(), force, exclude_git)
         }
         Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_deref(), &command),
         Commands::Vscode {
@@ -878,12 +866,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            workspace::vscode(
-                &running.target,
-                &running.inst,
-                Some(&project),
-                editor.as_deref(),
-            )
+            workspace::vscode(&running, Some(&project), editor.as_deref())
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_deref()),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_deref(), &size),
@@ -1599,14 +1582,12 @@ fn resolve_running(
                      Create one with: coop start {name}"
                 )
             })?;
-        if !be.is_running(&inst) {
-            bail!(
+        return be.as_running(cfg, inst).with_context(|| {
+            format!(
                 "Instance '{name}' is not running.\n\
                  Start it with: coop start {name}"
-            );
-        }
-        let target = be.ssh_target(cfg, &inst)?;
-        return Ok(backend::RunningInstance { inst, target });
+            )
+        });
     }
 
     let (running, stopped): (Vec<_>, Vec<_>) =
@@ -1618,8 +1599,7 @@ fn resolve_running(
                 .into_iter()
                 .next()
                 .context("Instance list unexpectedly empty")?;
-            let target = be.ssh_target(cfg, &inst)?;
-            Ok(backend::RunningInstance { inst, target })
+            be.as_running(cfg, inst)
         }
         0 if stopped.len() == 1 => {
             let name = &stopped[0].name;
@@ -1690,8 +1670,9 @@ fn open_ssh_session(
     name: Option<&str>,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
-    let repo = backend::detect_instance_repo(&running.inst);
-    prepare_session_from_target(cfg, Some(&running.inst), running.target, repo.as_ref())
+    let repo = backend::detect_instance_repo(running.instance());
+    let (inst, target) = running.into_parts();
+    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
 /// Build an `SshSession` from an already-resolved target.
@@ -1732,14 +1713,22 @@ fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Tear down forwards before shutting down the VM so the control
-    // master can exit cleanly while SSH is still reachable.
-    if let Ok(target) = be.ssh_target(cfg, inst) {
-        port_forward::teardown_ssh_forwards(inst, &target);
+    // Probe live state once. The `RunningInstance` proof flows into
+    // `be.stop`, so the type system witnesses that we only ask the
+    // backend to stop something that was actually running.
+    if let Ok(running) = be.as_running(cfg, inst.clone()) {
+        // Tear down forwards before shutting down the VM so the
+        // control master can exit cleanly while SSH is still
+        // reachable.
+        port_forward::teardown_ssh_forwards(running.instance(), running.target());
+        be.stop(cfg, running)?;
     } else {
-        tracing::debug!("Skipping forward teardown — no SSH target available");
+        tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
+        // Stale forwards may still exist even when the VM is gone.
+        if let Ok(target) = be.ssh_target(cfg, inst) {
+            port_forward::teardown_ssh_forwards(inst, &target);
+        }
     }
-    be.stop(cfg, inst)?;
     if let Err(e) = workspace::remove_ssh_config(inst) {
         tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
     }
