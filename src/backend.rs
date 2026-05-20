@@ -1564,11 +1564,7 @@ fn resolve_codex_mcp_servers(
     let mut resolved = std::collections::HashMap::with_capacity(mcp_servers.len());
     for (name, def) in mcp_servers {
         let mut cloned = def.clone();
-        for (header_key, header_value) in &mut cloned.headers {
-            *header_value = crate::config::resolve_cmd_value(header_value).with_context(|| {
-                format!("Failed to resolve header '{header_key}' for Codex MCP server '{name}'")
-            })?;
-        }
+        cloned.resolve_header_secrets("Codex MCP server", name)?;
         resolved.insert(name.clone(), cloned);
     }
     Ok(resolved)
@@ -1670,16 +1666,8 @@ fn register_mcp_servers(
     for (name, def) in servers {
         tracing::info!("Registering MCP server: {name}");
 
-        // Resolve any `cmd:` prefixed header values before sending the
-        // definition to the guest. Headers are the only secret-bearing
-        // field in McpServerDef (`env` values are host env var names,
-        // not secrets).
         let mut resolved = def.clone();
-        for (header_key, header_value) in &mut resolved.headers {
-            *header_value = crate::config::resolve_cmd_value(header_value).with_context(|| {
-                format!("Failed to resolve header '{header_key}' for MCP server '{name}'")
-            })?;
-        }
+        resolved.resolve_header_secrets("MCP server", name)?;
 
         let json = serde_json::to_string(&resolved)
             .context("Failed to serialize MCP server definition")?;
@@ -2020,12 +2008,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let mut servers = std::collections::HashMap::new();
         servers.insert(
             "sentry".to_string(),
-            McpServerDef {
-                command: None,
-                args: Vec::new(),
-                server_type: Some("http".to_string()),
-                url: Some("https://mcp.sentry.dev/mcp".to_string()),
-                env: std::collections::HashMap::new(),
+            McpServerDef::Http {
+                url: url::Url::parse("https://mcp.sentry.dev/mcp").unwrap(),
                 headers: std::collections::HashMap::new(),
             },
         );
@@ -2054,12 +2038,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let mut servers = std::collections::HashMap::new();
         servers.insert(
             "sentry".to_string(),
-            McpServerDef {
-                command: None,
-                args: Vec::new(),
-                server_type: Some("http".to_string()),
-                url: Some("https://mcp.sentry.dev/mcp".to_string()),
-                env: std::collections::HashMap::new(),
+            McpServerDef::Http {
+                url: url::Url::parse("https://mcp.sentry.dev/mcp").unwrap(),
                 headers: std::collections::HashMap::new(),
             },
         );

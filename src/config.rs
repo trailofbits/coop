@@ -891,26 +891,171 @@ impl Serialize for GitHubAuth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerDef {
-    /// Command for stdio servers
-    pub command: Option<String>,
-    /// Arguments for stdio servers
-    #[serde(default)]
-    pub args: Vec<String>,
+/// Definition of an MCP server registered in the guest. The variant
+/// selects the transport — `Stdio` spawns a local process, `Http` and
+/// `Sse` connect to a remote URL. Each variant carries only the fields
+/// that are meaningful for that transport, so unrepresentable combinations
+/// (e.g. `command` + `url`) cannot be constructed or deserialized.
+#[derive(Debug, Clone)]
+pub enum McpServerDef {
+    /// Local server launched via stdin/stdout.
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Env var name mappings (key = server env name, value = host env var name).
+        env: HashMap<String, String>,
+    },
+    /// Remote server reached over HTTP.
+    Http {
+        url: url::Url,
+        headers: HashMap<String, String>,
+    },
+    /// Remote server reached over Server-Sent Events.
+    Sse {
+        url: url::Url,
+        headers: HashMap<String, String>,
+    },
+}
 
-    /// Server type ("http", "sse"); maps to `type` in Claude Code CLI
-    #[serde(rename = "type")]
-    pub server_type: Option<String>,
-    /// URL for HTTP servers
-    pub url: Option<String>,
+impl McpServerDef {
+    /// Resolve any `cmd:`-prefixed header values via [`resolve_cmd_value`].
+    /// Stdio servers carry no secret-bearing fields, so they are returned unchanged.
+    pub(crate) fn resolve_header_secrets(&mut self, label: &str, name: &str) -> Result<()> {
+        let headers = match self {
+            McpServerDef::Stdio { .. } => return Ok(()),
+            McpServerDef::Http { headers, .. } | McpServerDef::Sse { headers, .. } => headers,
+        };
+        for (key, value) in headers {
+            *value = resolve_cmd_value(value).with_context(|| {
+                format!("Failed to resolve header '{key}' for {label} '{name}'")
+            })?;
+        }
+        Ok(())
+    }
+}
 
-    /// Env var name mappings (key = server env name, value = host env var name)
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// HTTP headers
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+impl<'de> Deserialize<'de> for McpServerDef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            command: Option<String>,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(rename = "type", default)]
+            transport: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            env: HashMap<String, String>,
+            #[serde(default)]
+            headers: HashMap<String, String>,
+        }
+
+        let Raw {
+            command,
+            args,
+            transport,
+            url,
+            env,
+            headers,
+        } = Raw::deserialize(deserializer)?;
+
+        match transport.as_deref() {
+            None | Some("stdio") => {
+                if let Some(url) = url {
+                    return Err(D::Error::custom(format!(
+                        "stdio MCP server must not have a `url` field (got '{url}')"
+                    )));
+                }
+                if !headers.is_empty() {
+                    return Err(D::Error::custom(
+                        "stdio MCP server must not have a `headers` field",
+                    ));
+                }
+                let command = command.ok_or_else(|| D::Error::missing_field("command"))?;
+                Ok(McpServerDef::Stdio { command, args, env })
+            }
+            Some(kind @ ("http" | "sse")) => {
+                if command.is_some() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have a `command` field"
+                    )));
+                }
+                if !args.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have an `args` field"
+                    )));
+                }
+                if !env.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have an `env` field"
+                    )));
+                }
+                let url_str = url.ok_or_else(|| D::Error::missing_field("url"))?;
+                let url = url::Url::parse(&url_str)
+                    .map_err(|e| D::Error::custom(format!("invalid url '{url_str}': {e}")))?;
+                Ok(match kind {
+                    "http" => McpServerDef::Http { url, headers },
+                    _ => McpServerDef::Sse { url, headers },
+                })
+            }
+            Some(other) => Err(D::Error::custom(format!(
+                "unknown MCP server type '{other}' (expected 'stdio', 'http', or 'sse')"
+            ))),
+        }
+    }
+}
+
+impl Serialize for McpServerDef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        match self {
+            McpServerDef::Stdio { command, args, env } => {
+                let mut len = 1;
+                if !args.is_empty() {
+                    len += 1;
+                }
+                if !env.is_empty() {
+                    len += 1;
+                }
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("command", command)?;
+                if !args.is_empty() {
+                    map.serialize_entry("args", args)?;
+                }
+                if !env.is_empty() {
+                    map.serialize_entry("env", env)?;
+                }
+                map.end()
+            }
+            McpServerDef::Http { url, headers } => {
+                serialize_remote(serializer, "http", url, headers)
+            }
+            McpServerDef::Sse { url, headers } => serialize_remote(serializer, "sse", url, headers),
+        }
+    }
+}
+
+fn serialize_remote<S: serde::Serializer>(
+    serializer: S,
+    kind: &'static str,
+    url: &url::Url,
+    headers: &HashMap<String, String>,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let len = 2 + usize::from(!headers.is_empty());
+    let mut map = serializer.serialize_map(Some(len))?;
+    map.serialize_entry("type", kind)?;
+    map.serialize_entry("url", url)?;
+    if !headers.is_empty() {
+        map.serialize_entry("headers", headers)?;
+    }
+    map.end()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2660,14 +2805,29 @@ skip = ["not-a-slug"]
             "env": {"API_KEY": "MYORG_API_KEY"}
         }"#;
         let def: McpServerDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.command.as_deref(), Some("npx"));
-        assert_eq!(def.args, vec!["-y", "@myorg/mcp-server"]);
-        assert_eq!(
-            def.env.get("API_KEY").map(String::as_str),
-            Some("MYORG_API_KEY")
+        match def {
+            McpServerDef::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, vec!["-y", "@myorg/mcp-server"]);
+                assert_eq!(
+                    env.get("API_KEY").map(String::as_str),
+                    Some("MYORG_API_KEY")
+                );
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_stdio_def_explicit_type() {
+        let json = r#"{
+            "type": "stdio",
+            "command": "/usr/bin/my-tool"
+        }"#;
+        let def: McpServerDef = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(def, McpServerDef::Stdio { ref command, .. } if command == "/usr/bin/my-tool")
         );
-        assert!(def.server_type.is_none());
-        assert!(def.url.is_none());
     }
 
     #[test]
@@ -2677,10 +2837,130 @@ skip = ["not-a-slug"]
             "url": "https://mcp.sentry.dev/mcp"
         }"#;
         let def: McpServerDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.server_type.as_deref(), Some("http"));
-        assert_eq!(def.url.as_deref(), Some("https://mcp.sentry.dev/mcp"));
-        assert!(def.command.is_none());
-        assert!(def.args.is_empty());
+        match def {
+            McpServerDef::Http { url, headers } => {
+                assert_eq!(url.as_str(), "https://mcp.sentry.dev/mcp");
+                assert!(headers.is_empty());
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_sse_def() {
+        let json = r#"{
+            "type": "sse",
+            "url": "https://mcp.example.com/sse",
+            "headers": {"Authorization": "Bearer x"}
+        }"#;
+        let def: McpServerDef = serde_json::from_str(json).unwrap();
+        match def {
+            McpServerDef::Sse { url, headers } => {
+                assert_eq!(url.as_str(), "https://mcp.example.com/sse");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer x")
+                );
+            }
+            other => panic!("expected Sse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_rejects_stdio_with_url() {
+        let json = r#"{"command": "x", "url": "https://example.com/"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stdio MCP server must not have a `url` field")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_http_with_command() {
+        let json = r#"{"type": "http", "url": "https://x/", "command": "y"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("http MCP server must not have a `command` field")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_unknown_type() {
+        let json = r#"{"type": "websocket", "url": "wss://x/"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown MCP server type 'websocket'")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_http_missing_url() {
+        let json = r#"{"type": "http"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("missing field `url`"));
+    }
+
+    #[test]
+    fn mcp_server_rejects_stdio_missing_command() {
+        let json = "{}";
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("missing field `command`"));
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_url() {
+        let json = r#"{"type": "http", "url": "not a url"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("invalid url 'not a url'"));
+    }
+
+    #[test]
+    fn mcp_server_serializes_stdio_without_type_field() {
+        let def = McpServerDef::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string()],
+            env: HashMap::new(),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["command"], "npx");
+        assert_eq!(json["args"], serde_json::json!(["-y"]));
+        assert!(json.get("type").is_none());
+        assert!(json.get("url").is_none());
+        assert!(json.get("env").is_none(), "empty env is omitted: {json}");
+    }
+
+    #[test]
+    fn mcp_server_serializes_http_with_type_tag() {
+        let def = McpServerDef::Http {
+            url: url::Url::parse("https://mcp.sentry.dev/mcp").unwrap(),
+            headers: HashMap::new(),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["type"], "http");
+        assert_eq!(json["url"], "https://mcp.sentry.dev/mcp");
+        assert!(json.get("command").is_none());
+        assert!(
+            json.get("headers").is_none(),
+            "empty headers omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_round_trip_preserves_variant() {
+        for json in [
+            r#"{"command":"x","args":["a","b"],"env":{"K":"V"}}"#,
+            r#"{"type":"http","url":"https://x.example/","headers":{"H":"v"}}"#,
+            r#"{"type":"sse","url":"https://x.example/sse"}"#,
+        ] {
+            let def: McpServerDef = serde_json::from_str(json).unwrap();
+            let again = serde_json::to_string(&def).unwrap();
+            let def2: McpServerDef = serde_json::from_str(&again).unwrap();
+            // Re-serializing should yield identical bytes.
+            assert_eq!(serde_json::to_string(&def2).unwrap(), again);
+        }
     }
 
     // ── Config loading ────────────────────────────────────────
