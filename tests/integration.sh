@@ -1309,14 +1309,30 @@ test_list_empty() {
     echo ""
     echo "=== Phase: list (no instances) ==="
 
-    if coop list; then
-        if echo "$HARNESS_OUT" | grep -q "No instances found"; then
-            pass "list shows empty-state message"
-        else
-            fail "list shows empty-state message" "got: $HARNESS_OUT"
-        fi
-    else
+    if ! coop list; then
         fail "list exits 0 with no instances" "exit code: $?"
+        return
+    fi
+
+    # Dev/CI hosts may carry long-lived instances unrelated to this run.
+    # Assert what this phase actually owns: the just-destroyed `$INSTANCE`
+    # is gone. The empty-state message is only asserted on a clean host.
+    local instance_count
+    instance_count=$(RUST_LOG=off "$BINARY" status 2>/dev/null | grep -cE "running|stopped" || true)
+
+    if [[ "$instance_count" -gt 0 ]]; then
+        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} "; then
+            fail "destroyed instance no longer in list" "still present: $HARNESS_OUT"
+        else
+            pass "destroyed instance no longer in list ($instance_count other(s) present)"
+        fi
+        return
+    fi
+
+    if echo "$HARNESS_OUT" | grep -q "No instances found"; then
+        pass "list shows empty-state message"
+    else
+        fail "list shows empty-state message" "got: $HARNESS_OUT"
     fi
 }
 
