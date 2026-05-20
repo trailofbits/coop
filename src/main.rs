@@ -638,13 +638,15 @@ fn main() -> Result<()> {
             if let Some(t) = &translation {
                 devcontainer::apply_to_config(&mut cfg, t)?;
             }
+            // Resolve profile names once at the CLI boundary.
+            let resolved_profiles = guest::resolve_profiles(&profile, &cfg.profiles)?;
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
                 &setup::SetupOptions {
                     skip_confirm: yes,
                     rebuild,
-                    profiles: profile,
+                    profiles: resolved_profiles,
                     extra_packages,
                     post_install: post_install.map(PathBuf::from),
                     image,

@@ -6,6 +6,22 @@ use anyhow::{Result, bail};
 
 use crate::config::{CoopConfig, CustomProfile};
 
+/// Devcontainer feature ids (bare names) that map to builtin profiles.
+/// The id is the same string as the builtin name; this slice acts as the
+/// allow-list so an unknown feature returns `None` rather than silently
+/// resolving against an unrelated builtin added later.
+const FEATURE_IDS: &[&str] = &["python", "node", "c", "fuzz", "rust", "go"];
+
+/// Look up a builtin profile by its devcontainer feature id (a bare
+/// name such as `rust`, after stripping any `ghcr.io/...:tag` prefix).
+pub fn builtin_for_feature(id: &str) -> Option<&'static BuiltinProfile> {
+    if FEATURE_IDS.contains(&id) {
+        lookup_builtin(id)
+    } else {
+        None
+    }
+}
+
 /// Username for the non-root guest user. Both backends ensure this user
 /// exists at uid 1000. On Firecracker's rootfs the `ubuntu` user already
 /// exists; on Lima, cloud-init may replace it with a host-mirror user,
@@ -83,9 +99,12 @@ pub struct BuiltinProfile {
     pub plugins: &'static [&'static str],
 }
 
-/// Owned profile definition produced by `lookup_profile`. Handles both
-/// builtin (converted from static data) and custom (cloned from config).
+/// Resolved profile definition. Carries the profile name alongside its
+/// effective contents so consumers don't need to re-look-up by name.
+/// Produced once at the config boundary by [`resolve_profiles`].
+#[derive(Debug, Clone)]
 pub struct ProfileDef {
+    pub name: String,
     pub apt_packages: Vec<String>,
     pub pre_install: Option<String>,
     pub post_install: Option<String>,
@@ -96,11 +115,25 @@ pub struct ProfileDef {
 impl From<&BuiltinProfile> for ProfileDef {
     fn from(bp: &BuiltinProfile) -> Self {
         Self {
+            name: bp.name.to_owned(),
             apt_packages: bp.apt_packages.iter().map(|s| (*s).to_owned()).collect(),
             pre_install: bp.pre_install.map(str::to_owned),
             post_install: bp.post_install.map(str::to_owned),
             marketplaces: bp.marketplaces.iter().map(|s| (*s).to_owned()).collect(),
             plugins: bp.plugins.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+}
+
+impl ProfileDef {
+    fn from_custom(name: &str, cp: &CustomProfile) -> Self {
+        Self {
+            name: name.to_owned(),
+            apt_packages: cp.apt_packages.clone(),
+            pre_install: cp.pre_install.clone(),
+            post_install: cp.post_install.clone(),
+            marketplaces: cp.marketplaces.clone(),
+            plugins: cp.plugins.clone(),
         }
     }
 }
@@ -160,47 +193,73 @@ fn lookup_builtin(name: &str) -> Option<&'static BuiltinProfile> {
     BUILTIN_PROFILES.iter().find(|bp| bp.name == name)
 }
 
-/// Look up a profile by name. Checks custom profiles first, then builtins.
-pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Result<ProfileDef> {
+fn resolve_one(name: &str, custom: &HashMap<String, CustomProfile>) -> Option<ProfileDef> {
     if let Some(cp) = custom.get(name) {
-        return Ok(ProfileDef {
-            apt_packages: cp.apt_packages.clone(),
-            pre_install: cp.pre_install.clone(),
-            post_install: cp.post_install.clone(),
-            marketplaces: cp.marketplaces.clone(),
-            plugins: cp.plugins.clone(),
-        });
+        return Some(ProfileDef::from_custom(name, cp));
     }
+    lookup_builtin(name).map(ProfileDef::from)
+}
 
-    if let Some(bp) = lookup_builtin(name) {
-        return Ok(ProfileDef::from(bp));
-    }
-
+fn available_profiles(custom: &HashMap<String, CustomProfile>) -> Vec<&str> {
     let mut available: Vec<&str> = BUILTIN_PROFILES.iter().map(|bp| bp.name).collect();
     let mut custom_names: Vec<&str> = custom.keys().map(String::as_str).collect();
     custom_names.sort_unstable();
     available.extend(custom_names);
+    available
+}
 
-    bail!(
-        "Unknown profile: {name}\n\
-         Available profiles: {}",
-        available.join(", ")
-    )
+/// Resolve a list of profile names into [`ProfileDef`] values.
+///
+/// All unknown names are collected and reported in a single error so
+/// the caller sees every offender at once. Custom profiles shadow
+/// builtins with the same name.
+pub fn resolve_profiles(
+    names: &[String],
+    custom: &HashMap<String, CustomProfile>,
+) -> Result<Vec<ProfileDef>> {
+    let mut resolved = Vec::with_capacity(names.len());
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in names {
+        match resolve_one(name, custom) {
+            Some(def) => resolved.push(def),
+            None => unknown.push(name.as_str()),
+        }
+    }
+    if !unknown.is_empty() {
+        bail!(
+            "Unknown profile(s): {}\n\
+             Available profiles: {}",
+            unknown.join(", "),
+            available_profiles(custom).join(", "),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Look up a single profile by name. Convenience wrapper around
+/// [`resolve_profiles`] for the `coop profiles show <name>` path.
+pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Result<ProfileDef> {
+    resolve_one(name, custom).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown profile: {name}\n\
+             Available profiles: {}",
+            available_profiles(custom).join(", "),
+        )
+    })
 }
 
 /// Collect combined marketplace and plugin lists from global config
 /// and all active profiles. Results are sorted and deduplicated.
 pub fn collect_baked_lists(
     cfg: &CoopConfig,
-    profiles: &[String],
-) -> Result<(Vec<String>, Vec<String>)> {
+    profiles: &[ProfileDef],
+) -> (Vec<String>, Vec<String>) {
     let mut marketplaces = cfg.claude.marketplaces.clone();
     let mut plugins = cfg.claude.plugins.clone();
 
-    for name in profiles {
-        let def = lookup_profile(name, &cfg.profiles)?;
-        marketplaces.extend(def.marketplaces);
-        plugins.extend(def.plugins);
+    for def in profiles {
+        marketplaces.extend(def.marketplaces.iter().cloned());
+        plugins.extend(def.plugins.iter().cloned());
     }
 
     marketplaces.sort_unstable();
@@ -208,7 +267,7 @@ pub fn collect_baked_lists(
     plugins.sort_unstable();
     plugins.dedup();
 
-    Ok((marketplaces, plugins))
+    (marketplaces, plugins)
 }
 
 #[cfg(test)]
@@ -239,6 +298,7 @@ mod tests {
         for bp in BUILTIN_PROFILES {
             let def = lookup_profile(bp.name, &custom)
                 .unwrap_or_else(|_| panic!("builtin '{}' failed to resolve", bp.name));
+            assert_eq!(def.name, bp.name);
             assert_eq!(def.apt_packages.len(), bp.apt_packages.len());
         }
     }
@@ -263,6 +323,46 @@ mod tests {
             },
         );
         let def = lookup_profile("python", &custom).unwrap();
+        assert_eq!(def.name, "python");
         assert_eq!(def.apt_packages, vec!["custom-python"]);
+    }
+
+    #[test]
+    fn resolve_profiles_reports_all_unknowns() {
+        let custom = HashMap::new();
+        let names = vec!["rust".to_owned(), "bogus1".to_owned(), "bogus2".to_owned()];
+        let err = resolve_profiles(&names, &custom).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bogus1"), "missing bogus1 in: {msg}");
+        assert!(msg.contains("bogus2"), "missing bogus2 in: {msg}");
+    }
+
+    #[test]
+    fn resolve_profiles_preserves_order_and_resolves_all() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "data".to_owned(),
+            CustomProfile {
+                apt_packages: vec!["pandas".to_owned()],
+                pre_install: None,
+                post_install: None,
+                marketplaces: vec![],
+                plugins: vec![],
+            },
+        );
+        let names = vec!["rust".to_owned(), "data".to_owned(), "node".to_owned()];
+        let defs = resolve_profiles(&names, &custom).unwrap();
+        let resolved_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(resolved_names, vec!["rust", "data", "node"]);
+    }
+
+    #[test]
+    fn builtin_for_feature_matches_known_ids() {
+        for id in FEATURE_IDS {
+            let bp = builtin_for_feature(id)
+                .unwrap_or_else(|| panic!("feature '{id}' should resolve to a builtin"));
+            assert_eq!(bp.name, *id);
+        }
+        assert!(builtin_for_feature("nonexistent").is_none());
     }
 }

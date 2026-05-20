@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
-use crate::guest::BUILTIN_PROFILES;
+use crate::guest::{BuiltinProfile, builtin_for_feature};
 
 /// Default relative path coop looks for inside a workspace or mount root.
 pub const DEFAULT_DEVCONTAINER_REL_PATH: &str = ".devcontainer/devcontainer.json";
@@ -810,34 +810,35 @@ fn translate_features(
             );
             continue;
         };
+        let name = builtin.name;
         if stage == Stage::Start {
             t.report.push(
                 key,
                 ReportStatus::Unsupported,
                 ReportSource::Devcontainer,
-                builtin.to_string(),
+                name.to_string(),
                 "features are baked into the template at `coop setup` time, \
                  not selected per-start",
             );
             continue;
         }
-        if cli_profiles.contains(builtin) {
+        if cli_profiles.contains(&name) {
             t.report.push(
                 key,
                 ReportStatus::Overridden,
                 ReportSource::Cli,
-                builtin.to_string(),
+                name.to_string(),
                 "CLI --profile already includes this profile",
             );
             continue;
         }
-        t.profiles.push(builtin.to_string());
+        t.profiles.push(name.to_string());
         t.report.push(
             key,
             ReportStatus::Applied,
             ReportSource::Devcontainer,
-            builtin.to_string(),
-            format!("mapped to built-in profile '{builtin}'"),
+            name.to_string(),
+            format!("mapped to built-in profile '{name}'"),
         );
     }
 }
@@ -1093,10 +1094,10 @@ fn parse_mount_string(s: &str) -> Result<String> {
     Ok(format!("{source}:{target}"))
 }
 
-/// Map a devcontainer feature id (raw key) to a built-in coop profile name,
+/// Map a devcontainer feature id (raw key) to a built-in coop profile,
 /// or `None` if no match. We recognise both bare names (`rust`) and the
 /// fully-qualified registry form (`ghcr.io/devcontainers/features/rust:1`).
-fn map_feature_to_profile(raw: &str) -> Option<&'static str> {
+fn map_feature_to_profile(raw: &str) -> Option<&'static BuiltinProfile> {
     // Trim `ghcr.io/devcontainers/features/<name>[:version]` to `<name>`.
     let id = raw
         .rsplit('/')
@@ -1105,14 +1106,7 @@ fn map_feature_to_profile(raw: &str) -> Option<&'static str> {
         .split(':')
         .next()
         .unwrap_or(raw);
-    let known: &[&str] = &["python", "node", "rust", "go", "c", "fuzz"];
-    if known.contains(&id) && BUILTIN_PROFILES.iter().any(|bp| bp.name == id) {
-        return BUILTIN_PROFILES
-            .iter()
-            .find(|bp| bp.name == id)
-            .map(|bp| bp.name);
-    }
-    None
+    builtin_for_feature(id)
 }
 
 fn format_pf(p: &PortForward) -> String {

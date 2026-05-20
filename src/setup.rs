@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -9,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cmd::Cmd;
-use crate::config::{CoopConfig, CustomProfile, Instance};
+use crate::config::{CoopConfig, Instance};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
-    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, lookup_profile,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
 };
 
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
@@ -28,7 +27,7 @@ pub const TEMPLATE_VERSION: u32 = 1;
 pub struct SetupOptions {
     pub skip_confirm: bool,
     pub rebuild: bool,
-    pub profiles: Vec<String>,
+    pub profiles: Vec<ProfileDef>,
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
     pub image: String,
@@ -290,15 +289,10 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
 fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     let image = &opts.image;
     let template = cfg.template_path_for(image);
-    let (profiles, extra_packages) = resolve_template_config(cfg, opts);
-
-    // Validate all profiles upfront
-    for name in &profiles {
-        lookup_profile(name, &cfg.profiles)?;
-    }
+    let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
     // Compose recipe and compute hashes
-    let recipe = compose_recipe(&profiles, &extra_packages, &cfg.profiles)?;
+    let recipe = compose_recipe(&profiles, &extra_packages);
     let script_hash = hash_string(&recipe);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
     let post_install_hash = post_install_content.as_ref().map(|s| hash_string(s));
@@ -360,7 +354,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
         install_script_hash: script_hash,
-        profiles,
+        profiles: profile_names(&profiles),
         extra_packages,
         post_install_hash,
         marketplaces: Vec::new(),
@@ -369,6 +363,10 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
+    profiles.iter().map(|p| p.name.clone()).collect()
 }
 
 /// Returns `true` if the template needs rebuilding.
@@ -394,7 +392,7 @@ fn build_template(
     cfg: &CoopConfig,
     opts: &SetupOptions,
     image: &str,
-    profiles: &[String],
+    profiles: &[ProfileDef],
     extra_packages: &[String],
     recipe: &str,
     script_hash: &str,
@@ -410,7 +408,7 @@ fn build_template(
     eprintln!("  Found rootfs: {rootfs_name}");
     eprintln!("  URL: {rootfs_url}");
     if !profiles.is_empty() {
-        eprintln!("  Profiles: {}", profiles.join(", "));
+        eprintln!("  Profiles: {}", profile_names(profiles).join(", "));
     }
     if !extra_packages.is_empty() {
         eprintln!("  Extra packages: {}", extra_packages.join(", "));
@@ -448,7 +446,7 @@ fn build_template(
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
         install_script_hash: script_hash.to_string(),
-        profiles: profiles.to_vec(),
+        profiles: profile_names(profiles),
         extra_packages: extra_packages.to_vec(),
         post_install_hash: post_install_hash.map(String::from),
         marketplaces: Vec::new(),
@@ -479,17 +477,22 @@ fn build_template(
 /// Resolve effective profiles and extra packages.
 ///
 /// If CLI flags provide profiles or packages, use those.
-/// Otherwise, reuse the previous template config.
-fn resolve_template_config(cfg: &CoopConfig, opts: &SetupOptions) -> (Vec<String>, Vec<String>) {
+/// Otherwise, reuse the previous template config (resolving the persisted
+/// profile names against the current builtin/custom set).
+fn resolve_template_config(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+) -> Result<(Vec<ProfileDef>, Vec<String>)> {
     if !opts.profiles.is_empty() || !opts.extra_packages.is_empty() {
-        return (opts.profiles.clone(), opts.extra_packages.clone());
+        return Ok((opts.profiles.clone(), opts.extra_packages.clone()));
     }
 
     if let Ok(existing) = TemplateConfig::load_for(cfg, &opts.image) {
-        return (existing.profiles, existing.extra_packages);
+        let profiles = resolve_profiles(&existing.profiles, &cfg.profiles)?;
+        return Ok((profiles, existing.extra_packages));
     }
 
-    (Vec::new(), Vec::new())
+    Ok((Vec::new(), Vec::new()))
 }
 
 fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
@@ -509,18 +512,9 @@ fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
 ///
 /// This portion is hashed for staleness detection.
 /// Does NOT include version marker, post-install script, or cleanup.
-fn compose_recipe(
-    profiles: &[String],
-    extra_packages: &[String],
-    custom: &HashMap<String, CustomProfile>,
-) -> Result<String> {
-    let profile_defs: Vec<_> = profiles
-        .iter()
-        .map(|name| lookup_profile(name, custom))
-        .collect::<Result<_>>()?;
-
+fn compose_recipe(profiles: &[ProfileDef], extra_packages: &[String]) -> String {
     // Collect and deduplicate profile + extra apt packages
-    let mut extra_apt: Vec<&str> = profile_defs
+    let mut extra_apt: Vec<&str> = profiles
         .iter()
         .flat_map(|def| &def.apt_packages)
         .map(String::as_str)
@@ -529,11 +523,11 @@ fn compose_recipe(
     extra_apt.sort_unstable();
     extra_apt.dedup();
 
-    let pre_installs: Vec<&str> = profile_defs
+    let pre_installs: Vec<&str> = profiles
         .iter()
         .filter_map(|d| d.pre_install.as_deref())
         .collect();
-    let post_installs: Vec<&str> = profile_defs
+    let post_installs: Vec<&str> = profiles
         .iter()
         .filter_map(|d| d.post_install.as_deref())
         .collect();
@@ -615,7 +609,7 @@ fn compose_recipe(
     // Codex installs as a standalone binary under /usr/local/bin.
     s.push_str(SCRIPT_CODEX);
 
-    Ok(s)
+    s
 }
 
 /// Compose the full chroot script from recipe + marker + post-install + cleanup.
@@ -1302,12 +1296,12 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
 
-    fn custom_profile(apt: &[&str], pre: Option<&str>, post: Option<&str>) -> CustomProfile {
-        CustomProfile {
+    fn profile(name: &str, apt: &[&str], pre: Option<&str>, post: Option<&str>) -> ProfileDef {
+        ProfileDef {
+            name: name.into(),
             apt_packages: apt.iter().map(|s| (*s).into()).collect(),
             pre_install: pre.map(Into::into),
             post_install: post.map(Into::into),
@@ -1328,10 +1322,7 @@ mod tests {
 
     #[test]
     fn compose_recipe_no_profiles_succeeds() {
-        let custom = HashMap::new();
-        let result = compose_recipe(&[], &[], &custom);
-        assert!(result.is_ok());
-        let script = result.unwrap();
+        let script = compose_recipe(&[], &[]);
         assert!(script.contains("apt-get"));
         assert!(
             script.contains("Installing Codex CLI"),
@@ -1342,12 +1333,8 @@ mod tests {
 
     #[test]
     fn compose_recipe_post_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&["curl"], None, Some("echo done")),
-        );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+        let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
+        let script = compose_recipe(&profiles, &[]);
 
         // The post_install "echo done" must be on its own line
         assert!(
@@ -1359,12 +1346,13 @@ mod tests {
 
     #[test]
     fn compose_recipe_pre_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&[], Some("curl -fsSL https://example.com | bash"), None),
-        );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+        let profiles = vec![profile(
+            "test",
+            &[],
+            Some("curl -fsSL https://example.com | bash"),
+            None,
+        )];
+        let script = compose_recipe(&profiles, &[]);
 
         assert!(
             script.contains("| bash\n"),
@@ -1375,12 +1363,8 @@ mod tests {
 
     #[test]
     fn compose_recipe_scripts_with_trailing_newline_no_double() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&[], Some("pre-cmd\n"), Some("post-cmd\n")),
-        );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+        let profiles = vec![profile("test", &[], Some("pre-cmd\n"), Some("post-cmd\n"))];
+        let script = compose_recipe(&profiles, &[]);
 
         // Should not produce triple+ newlines from double-adding
         assert!(
@@ -1392,10 +1376,11 @@ mod tests {
 
     #[test]
     fn compose_recipe_multiple_profiles_separated() {
-        let mut custom = HashMap::new();
-        custom.insert("a".into(), custom_profile(&[], None, Some("echo a-done")));
-        custom.insert("b".into(), custom_profile(&[], None, Some("echo b-done")));
-        let script = compose_recipe(&["a".into(), "b".into()], &[], &custom).unwrap();
+        let profiles = vec![
+            profile("a", &[], None, Some("echo a-done")),
+            profile("b", &[], None, Some("echo b-done")),
+        ];
+        let script = compose_recipe(&profiles, &[]);
 
         // Each post_install must be on its own line
         assert!(script.contains("echo a-done\n"));

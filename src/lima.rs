@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -8,10 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::SshTarget;
-use crate::config::{CoopConfig, CustomProfile, GiB, Instance};
+use crate::config::{CoopConfig, GiB, Instance};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
-    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, lookup_profile,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
+    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
 };
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, hash_string, utc_timestamp};
 
@@ -466,10 +465,10 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     Ok(())
 }
 
-fn provision_script_hash(cfg: &CoopConfig, profiles: &[String]) -> String {
+fn provision_script_hash(cfg: &CoopConfig, profiles: &[ProfileDef]) -> String {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = fs::read_to_string(&pubkey_path).unwrap_or_default();
-    let script = compose_provision_script(pubkey.trim(), profiles, &cfg.profiles);
+    let script = compose_provision_script(pubkey.trim(), profiles);
     hash_string(&script)
 }
 
@@ -478,7 +477,7 @@ fn provision_script_hash(cfg: &CoopConfig, profiles: &[String]) -> String {
 /// A rebuild is needed when the config file is missing (orphaned
 /// image), the provision-script hash has changed, or the baked
 /// marketplace/plugin lists have changed.
-fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[String]) -> bool {
+fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[ProfileDef]) -> bool {
     let current_hash = provision_script_hash(cfg, profiles);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
@@ -489,15 +488,11 @@ fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[String]) -> bool {
         return true;
     }
 
-    // Check if marketplace/plugin lists have changed
-    let Ok((wanted_m, wanted_p)) = crate::guest::collect_baked_lists(cfg, profiles) else {
-        return true;
-    };
-
+    let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
     existing.marketplaces != wanted_m || existing.plugins != wanted_p
 }
 
-fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Result<()> {
+fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[ProfileDef]) -> Result<()> {
     eprintln!(
         "\n=> Building golden VM image \
          (this takes a few minutes on first run)"
@@ -526,7 +521,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
 
     // Generate builder template with full provisioning
     let builder_template = cfg.data_dir.join("lima-builder.yaml");
-    let provision_script = compose_provision_script(pubkey.trim(), profiles, &cfg.profiles);
+    let provision_script = compose_provision_script(pubkey.trim(), profiles);
     let yaml = compose_template_yaml(cfg, &provision_script);
     fs::write(&builder_template, &yaml).with_context(|| {
         format!(
@@ -536,7 +531,8 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
     })?;
 
     if !profiles.is_empty() {
-        eprintln!("  Profiles: {}", profiles.join(", "));
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        eprintln!("  Profiles: {}", names.join(", "));
     }
 
     // Build to staging path — old image is never touched
@@ -585,7 +581,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
         install_script_hash: provision_script_hash(cfg, profiles),
-        profiles: profiles.to_vec(),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
         marketplaces,
@@ -600,7 +596,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
 /// cloud-init, stop it, and extract the disk image to `output_path`.
 fn run_builder_vm(
     cfg: &CoopConfig,
-    profiles: &[String],
+    profiles: &[ProfileDef],
     output_path: &std::path::Path,
     builder_template: &std::path::Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
@@ -722,9 +718,9 @@ fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
 /// `TemplateConfig`).
 fn install_builder_plugins(
     cfg: &CoopConfig,
-    profiles: &[String],
+    profiles: &[ProfileDef],
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles)?;
+    let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
 
     if marketplaces.is_empty() && plugins.is_empty() {
         return Ok((marketplaces, plugins));
@@ -1083,11 +1079,7 @@ provision:
     )
 }
 
-fn compose_provision_script(
-    ssh_pubkey: &str,
-    profiles: &[String],
-    custom: &HashMap<String, CustomProfile>,
-) -> String {
+fn compose_provision_script(ssh_pubkey: &str, profiles: &[ProfileDef]) -> String {
     let mut s = String::with_capacity(8192);
 
     // Preamble
@@ -1103,23 +1095,19 @@ fn compose_provision_script(
     s.push_str(SCRIPT_DOCKER_REPO);
     s.push('\n');
 
-    // Resolve profile definitions (validates names, collects packages/scripts)
-    let mut profile_apt: Vec<String> = Vec::new();
-    let mut pre_scripts: Vec<String> = Vec::new();
-    let mut post_scripts: Vec<String> = Vec::new();
-    for name in profiles {
-        if let Ok(def) = lookup_profile(name, custom) {
-            profile_apt.extend(def.apt_packages);
-            if let Some(pre) = def.pre_install {
-                pre_scripts.push(pre);
-            }
-            if let Some(post) = def.post_install {
-                post_scripts.push(post);
-            }
-        } else {
-            tracing::warn!("Unknown profile '{name}', skipping");
-        }
-    }
+    // Collect packages/scripts from already-resolved profiles
+    let profile_apt: Vec<&str> = profiles
+        .iter()
+        .flat_map(|d| d.apt_packages.iter().map(String::as_str))
+        .collect();
+    let pre_scripts: Vec<&str> = profiles
+        .iter()
+        .filter_map(|d| d.pre_install.as_deref())
+        .collect();
+    let post_scripts: Vec<&str> = profiles
+        .iter()
+        .filter_map(|d| d.post_install.as_deref())
+        .collect();
 
     // Profile pre-scripts (may add repos, e.g. NodeSource)
     for pre in &pre_scripts {
@@ -1140,7 +1128,7 @@ fn compose_provision_script(
         .chain(GH_PACKAGES)
         .chain(DOCKER_PACKAGES)
         .copied()
-        .chain(profile_apt.iter().map(String::as_str))
+        .chain(profile_apt.iter().copied())
         .collect();
 
     s.push_str("echo '  [guest] Installing all packages...'\n");
@@ -1531,8 +1519,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn custom_profile(apt: &[&str], pre: Option<&str>, post: Option<&str>) -> CustomProfile {
-        CustomProfile {
+    fn profile(name: &str, apt: &[&str], pre: Option<&str>, post: Option<&str>) -> ProfileDef {
+        ProfileDef {
+            name: name.into(),
             apt_packages: apt.iter().map(|s| (*s).into()).collect(),
             pre_install: pre.map(Into::into),
             post_install: post.map(Into::into),
@@ -1553,13 +1542,8 @@ mod tests {
 
     #[test]
     fn provision_script_post_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&["curl"], None, Some("echo done")),
-        );
-        let script =
-            compose_provision_script("ssh-ed25519 AAAA test@test", &["test".into()], &custom);
+        let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
+        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
 
         assert!(
             script.contains("echo done\n"),
@@ -1570,13 +1554,13 @@ mod tests {
 
     #[test]
     fn provision_script_pre_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&[], Some("curl -fsSL https://example.com | bash"), None),
-        );
-        let script =
-            compose_provision_script("ssh-ed25519 AAAA test@test", &["test".into()], &custom);
+        let profiles = vec![profile(
+            "test",
+            &[],
+            Some("curl -fsSL https://example.com | bash"),
+            None,
+        )];
+        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
 
         assert!(
             script.contains("| bash\n"),
@@ -1587,14 +1571,11 @@ mod tests {
 
     #[test]
     fn provision_script_multiple_profiles_separated() {
-        let mut custom = HashMap::new();
-        custom.insert("a".into(), custom_profile(&[], None, Some("echo a-done")));
-        custom.insert("b".into(), custom_profile(&[], None, Some("echo b-done")));
-        let script = compose_provision_script(
-            "ssh-ed25519 AAAA test@test",
-            &["a".into(), "b".into()],
-            &custom,
-        );
+        let profiles = vec![
+            profile("a", &[], None, Some("echo a-done")),
+            profile("b", &[], None, Some("echo b-done")),
+        ];
+        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
 
         assert!(script.contains("echo a-done\n"));
         assert!(script.contains("echo b-done\n"));
@@ -1608,8 +1589,7 @@ mod tests {
 
     #[test]
     fn provision_script_installs_codex() {
-        let custom = HashMap::new();
-        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &[], &custom);
+        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &[]);
 
         assert!(
             script.contains("Installing Codex CLI"),
