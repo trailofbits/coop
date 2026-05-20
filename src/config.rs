@@ -2692,6 +2692,179 @@ token = "cmd:echo x"
         assert!(msg.contains("CIDR"), "missing subnet error: {msg}");
     }
 
+    // ── validate() boundary pinning (issue #137) ──────────────
+    // Each test here exists to kill a specific surviving mutant
+    // from `cargo mutants -f src/config.rs`. Do not loosen the
+    // assertions without re-running mutants first.
+
+    /// Build a `CoopConfig` with all path fields rooted in `data_dir`
+    /// so existence checks are deterministic. By default both
+    /// `kernel_path` and `firecracker_bin` point at non-existent files.
+    fn validate_fixture(data_dir: &Path) -> CoopConfig {
+        CoopConfig {
+            data_dir: data_dir.to_path_buf(),
+            vm: VmConfig {
+                kernel_path: data_dir.join("nonexistent-kernel"),
+                ..VmConfig::default()
+            },
+            firecracker_bin: data_dir.join("nonexistent-firecracker"),
+            ..CoopConfig::default()
+        }
+    }
+
+    // Pins `mem_size_mib < 128` against `<= 128`: the boundary value
+    // 128 must be accepted.
+    #[test]
+    fn validate_accepts_min_memory_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = validate_fixture(tmp.path());
+        cfg.vm.mem_size_mib = MiB::new(128).unwrap();
+        // 128 is the documented minimum; the boundary value itself must pass.
+        cfg.validate().unwrap();
+    }
+
+    // Pins both `!parent.as_os_str().is_empty()` and `!parent.exists()`:
+    // with a non-empty, non-existent parent, the warning must fire.
+    #[test]
+    fn validate_warns_when_data_dir_parent_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("absent").join("coop");
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("data_dir parent") && w.contains("does not exist")),
+            "expected data_dir parent warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!parent.exists()`: with an existing parent, the warning
+    // must NOT fire (catches the negation being deleted).
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("coop");
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "unexpected data_dir warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.vm.kernel_path.exists()` (forward direction): when
+    // the template is present and the kernel is absent, warn.
+    #[test]
+    fn validate_warns_kernel_missing_when_template_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
+
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("kernel_path") && w.contains("does not exist")),
+            "expected kernel_path warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.vm.kernel_path.exists()` (reverse direction): when
+    // the kernel is present, no warning even with the template built.
+    #[test]
+    fn validate_no_kernel_warning_when_kernel_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
+        let kernel = data_dir.join("vmlinux");
+        fs::write(&kernel, b"").unwrap();
+
+        let mut cfg = validate_fixture(&data_dir);
+        cfg.vm.kernel_path = kernel;
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("kernel_path")),
+            "unexpected kernel_path warning, got {warnings:?}"
+        );
+    }
+
+    // Pins the outer `template_path().exists()` gate: when the
+    // template is absent, the kernel check is skipped entirely.
+    #[test]
+    fn validate_no_kernel_warning_when_template_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("kernel_path")),
+            "kernel check should be gated on template existence, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.firecracker_bin.exists()` (forward) on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn validate_warns_firecracker_missing_on_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("firecracker_bin") && w.contains("does not exist")),
+            "expected firecracker_bin warning on Linux, got {warnings:?}"
+        );
+    }
+
+    // Pins `&&` between firecracker existence and the linux cfg: on
+    // Linux when firecracker IS present, no warning must fire.
+    // Mutation to `||` would always warn on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn validate_no_firecracker_warning_when_present_on_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let firecracker = data_dir.join("firecracker");
+        fs::write(&firecracker, b"").unwrap();
+
+        let mut cfg = validate_fixture(&data_dir);
+        cfg.firecracker_bin = firecracker;
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("firecracker_bin")),
+            "unexpected firecracker_bin warning, got {warnings:?}"
+        );
+    }
+
+    // Pins the linux gate on non-linux hosts: a missing firecracker
+    // binary must not warn off-Linux.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn validate_no_firecracker_warning_on_non_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("firecracker_bin")),
+            "firecracker_bin warning must be gated on Linux, got {warnings:?}"
+        );
+    }
+
     // ── Custom profiles ──────────────────────────────────────
 
     #[test]
