@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
-use crate::config::{ConfigDir, CoopConfig, GitHubAuth, Instance, McpServerDef};
+use crate::config::{ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef};
 use crate::setup::SetupOptions;
 use crate::shell::shell_escape;
 
@@ -631,7 +631,7 @@ pub trait VmBackend: std::fmt::Display {
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
-    fn destroy_image(&self, cfg: &CoopConfig, image: &str) -> Result<()>;
+    fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
@@ -763,7 +763,7 @@ impl VmBackend for FirecrackerBackend {
         }
     }
 
-    fn destroy_image(&self, cfg: &CoopConfig, image: &str) -> Result<()> {
+    fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()> {
         let dir = cfg.image_dir(image);
         if !dir.exists() {
             bail!("Image '{image}' does not exist");
@@ -912,7 +912,7 @@ impl VmBackend for LimaBackend {
         }
     }
 
-    fn destroy_image(&self, cfg: &CoopConfig, image: &str) -> Result<()> {
+    fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()> {
         let dir = cfg.image_dir(image);
         if !dir.exists() {
             bail!("Image '{image}' does not exist");
@@ -1241,7 +1241,7 @@ fn codex_missing_guest_cli_message() -> &'static str {
 
 /// Compute which marketplaces and plugins are missing from the
 /// golden image and need to be installed at start time.
-fn compute_plugin_delta(cfg: &CoopConfig, image: &str) -> (Vec<String>, Vec<String>) {
+fn compute_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
     let baked = crate::setup::TemplateConfig::load_for(cfg, image).ok();
 
     let wanted_marketplaces = &cfg.claude.marketplaces;

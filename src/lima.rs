@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{LogMode, SshTarget};
-use crate::config::{CoopConfig, GiB, Instance};
+use crate::config::{CoopConfig, GiB, ImageName, Instance};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
     SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
@@ -478,7 +478,7 @@ fn provision_script_hash(cfg: &CoopConfig, profiles: &[ProfileDef]) -> String {
 /// A rebuild is needed when the config file is missing (orphaned
 /// image), the provision-script hash has changed, or the baked
 /// marketplace/plugin lists have changed.
-fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[ProfileDef]) -> bool {
+fn needs_rebuild(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDef]) -> bool {
     let current_hash = provision_script_hash(cfg, profiles);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
@@ -493,7 +493,7 @@ fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[ProfileDef]) -> bool
     existing.marketplaces != wanted_m || existing.plugins != wanted_p
 }
 
-fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[ProfileDef]) -> Result<()> {
+fn build_golden_image(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDef]) -> Result<()> {
     eprintln!(
         "\n=> Building golden VM image \
          (this takes a few minutes on first run)"
@@ -963,7 +963,7 @@ fn verify_builder_binaries() -> Result<()> {
     Ok(())
 }
 
-fn generate_start_template(cfg: &CoopConfig, image: &str) -> Result<()> {
+fn generate_start_template(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
     eprintln!("\n=> Generating fast-start template");
 
     let base_img = cfg

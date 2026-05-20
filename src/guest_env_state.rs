@@ -199,7 +199,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{Instance, InstanceIndex, InstanceName};
+    use crate::config::{ImageName, Instance, InstanceIndex, InstanceName};
 
     fn env(s: &str) -> EnvVarName {
         EnvVarName::new(s).unwrap()
@@ -210,7 +210,7 @@ mod tests {
             name: InstanceName::new("test").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir,
-            image: "test.img".to_string(),
+            image: ImageName::new("test.img").unwrap(),
         }
     }
 

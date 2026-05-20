@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cmd::Cmd;
-use crate::config::{CoopConfig, Instance};
+use crate::config::{CoopConfig, ImageName, Instance};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
     SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
@@ -31,7 +31,7 @@ pub struct SetupOptions {
     pub profiles: Vec<ProfileDef>,
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
-    pub image: String,
+    pub image: ImageName,
 }
 
 /// Persisted template configuration (profiles, packages, hashes).
@@ -50,7 +50,7 @@ pub struct TemplateConfig {
 }
 
 impl TemplateConfig {
-    pub fn load_for(cfg: &CoopConfig, image: &str) -> Result<Self> {
+    pub fn load_for(cfg: &CoopConfig, image: &ImageName) -> Result<Self> {
         let path = cfg.template_config_path_for(image);
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -58,7 +58,7 @@ impl TemplateConfig {
             .with_context(|| format!("Failed to parse {}", path.display()))
     }
 
-    pub fn save_for(&self, cfg: &CoopConfig, image: &str) -> Result<()> {
+    pub fn save_for(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()> {
         let path = cfg.template_config_path_for(image);
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize template config")?;
@@ -376,7 +376,7 @@ fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
 /// template image) or the install-script hash has changed.
 fn needs_rebuild(
     cfg: &CoopConfig,
-    image: &str,
+    image: &ImageName,
     current_hash: &str,
     current_post_hash: Option<&str>,
 ) -> bool {
@@ -392,7 +392,7 @@ fn needs_rebuild(
 fn build_template(
     cfg: &CoopConfig,
     opts: &SetupOptions,
-    image: &str,
+    image: &ImageName,
     profiles: &[ProfileDef],
     extra_packages: &[String],
     recipe: &str,

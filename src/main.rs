@@ -135,9 +135,10 @@ enum Commands {
         #[arg(
             long,
             default_value = config::DEFAULT_IMAGE,
+            value_parser = config::ImageName::parse,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
-        image: String,
+        image: config::ImageName,
         /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
         /// When present (and `--no-devcontainer` is not set), coop offers to
         /// apply the file's `features` and `hostRequirements` to this setup.
@@ -194,9 +195,10 @@ enum Commands {
         #[arg(
             long,
             default_value = config::DEFAULT_IMAGE,
+            value_parser = config::ImageName::parse,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
-        image: String,
+        image: config::ImageName,
         /// Skip the `.git` directory when syncing the workspace
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
@@ -360,8 +362,12 @@ enum Commands {
     /// List or manage golden images
     Images {
         /// Delete a named image
-        #[arg(long, add = ArgValueCandidates::new(completions::image_candidates))]
-        delete: Option<String>,
+        #[arg(
+            long,
+            value_parser = config::ImageName::parse,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
+        delete: Option<config::ImageName>,
     },
     /// Resize a stopped instance's disk
     Resize {
@@ -868,7 +874,7 @@ fn main() -> Result<()> {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
             workspace::vscode(&running, Some(&project), editor.as_deref())
         }
-        Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_deref()),
+        Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_deref(), &size),
         Commands::Profiles { action } => {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
@@ -1119,7 +1125,7 @@ fn cmd_build(cfg: &config::CoopConfig) -> Result<()> {
 
 struct StartOpts<'a> {
     name: Option<&'a str>,
-    image: &'a str,
+    image: &'a config::ImageName,
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
     no_agents: bool,
@@ -2226,7 +2232,7 @@ fn script_summary(script: Option<&str>) -> String {
 fn cmd_images(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    delete: Option<&str>,
+    delete: Option<&config::ImageName>,
 ) -> Result<()> {
     if let Some(name) = delete {
         return be.destroy_image(cfg, name);
@@ -2547,7 +2553,8 @@ mod tests {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
-            image: super::config::DEFAULT_IMAGE.to_string(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2965,13 +2972,19 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    static TEST_IMAGE: std::sync::LazyLock<super::config::ImageName> =
+        std::sync::LazyLock::new(|| {
+            super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid")
+        });
+
     fn start_opts(
         mounts: Vec<super::config::Mount>,
         config_path: &std::path::Path,
     ) -> super::StartOpts<'_> {
         super::StartOpts {
             name: None,
-            image: super::config::DEFAULT_IMAGE,
+            image: &TEST_IMAGE,
             workspace_dir: None,
             git_repo: None,
             no_agents: false,

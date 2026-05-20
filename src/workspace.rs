@@ -979,14 +979,14 @@ fn launch_editor(inst: &Instance, remote_path: &str, editor: Option<&str>) -> Re
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::config::{InstanceIndex, InstanceName};
+    use crate::config::{ImageName, InstanceIndex, InstanceName};
 
     fn temp_instance(dir: &Path) -> Instance {
         Instance {
             name: InstanceName::new("test").expect("valid name"),
             index: InstanceIndex::new(0).expect("0 is in range"),
             dir: dir.to_path_buf(),
-            image: "default".to_string(),
+            image: ImageName::new("default").expect("valid image name"),
         }
     }
 

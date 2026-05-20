@@ -62,7 +62,7 @@ pub fn image_candidates() -> Vec<CompletionCandidate> {
     };
     images
         .into_iter()
-        .map(|i| CompletionCandidate::new(i.name))
+        .map(|i| CompletionCandidate::new(i.name.as_str()))
         .collect()
 }
 

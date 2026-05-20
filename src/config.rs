@@ -1265,6 +1265,91 @@ impl<'de> Deserialize<'de> for InstanceName {
     }
 }
 
+const MAX_IMAGE_NAME_LEN: usize = 64;
+
+fn validate_image_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Image name is empty");
+    }
+    // Banning leading '.' subsumes both '.' and '..' (the traversal cases)
+    // and also keeps stray dotfiles out of the images directory.
+    if name.starts_with('.') {
+        bail!("Image name '{name}' must not start with '.'");
+    }
+    if name.len() > MAX_IMAGE_NAME_LEN {
+        bail!(
+            "Image name too long ({} chars, max {MAX_IMAGE_NAME_LEN})",
+            name.len()
+        );
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
+    {
+        bail!(
+            "Image name contains invalid character '{c}' \
+             (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
+        );
+    }
+    Ok(())
+}
+
+/// Validated golden-image name. Construction guarantees the name matches
+/// `[a-zA-Z0-9_.-]{1,64}` and does not begin with `.`, so downstream code
+/// (path construction, lookups) can use it without re-checking and is
+/// safe from directory traversal (`.` / `..`) and stray dotfile entries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImageName(String);
+
+impl ImageName {
+    pub fn new(name: &str) -> Result<Self> {
+        validate_image_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    /// Clap `value_parser` entry point for `--image` arguments.
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ImageName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for ImageName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl Serialize for ImageName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Acquire an exclusive flock on a `.lock` file inside `dir`.
 ///
 /// Returns the open file handle — the lock is held until dropped.
@@ -1463,36 +1548,40 @@ impl CoopConfig {
     }
 
     /// Directory for a specific named image.
-    pub fn image_dir(&self, name: &str) -> PathBuf {
-        self.images_dir().join(name)
+    pub fn image_dir(&self, name: &ImageName) -> PathBuf {
+        self.images_dir().join(name.as_str())
     }
 
     /// Path to the template rootfs image for a named image.
-    pub fn template_path_for(&self, image: &str) -> PathBuf {
+    pub fn template_path_for(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("rootfs-template.ext4")
     }
 
     /// Path to the template config for a named image.
-    pub fn template_config_path_for(&self, image: &str) -> PathBuf {
+    pub fn template_config_path_for(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("template-config.json")
     }
 
     /// Path to the Lima base image for a named image.
-    pub fn lima_base_path(&self, image: &str) -> PathBuf {
+    pub fn lima_base_path(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("lima-base.img")
     }
 
     /// Path to the Lima start template for a named image.
-    pub fn lima_template_path(&self, image: &str) -> PathBuf {
+    pub fn lima_template_path(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("lima-template.yaml")
     }
 
     /// Path to the default template rootfs image (shorthand).
     pub fn template_path(&self) -> PathBuf {
-        self.template_path_for(DEFAULT_IMAGE)
+        self.template_path_for(&default_image_name())
     }
 
     /// List all available images with their metadata.
+    ///
+    /// Directories whose names don't pass [`ImageName`] validation are
+    /// skipped (with a tracing warning), so a stray dotfile or hand-edited
+    /// entry can't poison the result.
     pub fn list_images(&self) -> Result<Vec<ImageInfo>> {
         let dir = self.images_dir();
         if !dir.exists() {
@@ -1504,7 +1593,14 @@ impl CoopConfig {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
+            let raw = entry.file_name().to_string_lossy().into_owned();
+            let name = match ImageName::new(&raw) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("Skipping invalid image dir '{raw}': {e}");
+                    continue;
+                }
+            };
             let config_path = self.template_config_path_for(&name);
             let config = if config_path.exists() {
                 let content = fs::read_to_string(&config_path).ok();
@@ -1518,7 +1614,7 @@ impl CoopConfig {
                 config,
             });
         }
-        images.sort_by(|a, b| a.name.cmp(&b.name));
+        images.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         Ok(images)
     }
 
@@ -1615,7 +1711,7 @@ impl CoopConfig {
     pub fn allocate_instance(
         &self,
         name: Option<&str>,
-        image: &str,
+        image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
         let _lock = lock_dir(&self.instances_dir())?;
@@ -1663,7 +1759,7 @@ impl CoopConfig {
             name,
             index,
             dir,
-            image: image.to_string(),
+            image: image.clone(),
         };
         instance.save()?;
         Ok(instance)
@@ -1752,7 +1848,7 @@ impl Default for CodexConfig {
 
 /// Metadata about a named golden image.
 pub struct ImageInfo {
-    pub name: String,
+    pub name: ImageName,
     pub dir: PathBuf,
     pub config: Option<crate::setup::TemplateConfig>,
 }
@@ -1764,11 +1860,14 @@ struct InstanceMeta {
     name: InstanceName,
     index: InstanceIndex,
     #[serde(default = "default_image_name")]
-    image: String,
+    image: ImageName,
 }
 
-fn default_image_name() -> String {
-    DEFAULT_IMAGE.to_string()
+/// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
+/// construction (skipping `ImageName::new`) is safe here because the
+/// const is pinned by the `default_image_is_valid` test below.
+fn default_image_name() -> ImageName {
+    ImageName(DEFAULT_IMAGE.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1777,7 +1876,7 @@ pub struct Instance {
     pub index: InstanceIndex,
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
-    pub image: String,
+    pub image: ImageName,
 }
 
 impl Instance {
@@ -1997,12 +2096,16 @@ mod tests {
         }
     }
 
+    fn default_img() -> ImageName {
+        ImageName::new(DEFAULT_IMAGE).unwrap()
+    }
+
     fn make_instance(dir: &Path, name: &str, index: u16) -> Instance {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
             index: InstanceIndex::new(index).unwrap(),
             dir: dir.join("instances").join(name),
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
         inst
@@ -2013,7 +2116,7 @@ mod tests {
             name: InstanceName::new(name).unwrap(),
             index: InstanceIndex::new(index).unwrap(),
             dir,
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         }
     }
 
@@ -2138,7 +2241,7 @@ mod tests {
         assert_eq!(loaded.name, *"myinst");
         assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
-        assert_eq!(loaded.image, DEFAULT_IMAGE);
+        assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
     }
 
     // ── Instance::is_running / is_firecracker_process ────────
@@ -2276,7 +2379,7 @@ mod tests {
     fn allocate_first_instance_gets_index_zero() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
     }
@@ -2286,9 +2389,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        let a = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        let b = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        let c = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let a = cfg.allocate_instance(None, &default_img(), None).unwrap();
+        let b = cfg.allocate_instance(None, &default_img(), None).unwrap();
+        let c = cfg.allocate_instance(None, &default_img(), None).unwrap();
 
         assert_eq!(a.index.as_u16(), 0);
         assert_eq!(b.index.as_u16(), 1);
@@ -2301,7 +2404,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let inst = cfg
-            .allocate_instance(Some("my-project"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("my-project"), &default_img(), None)
             .unwrap();
         assert_eq!(inst.name, *"my-project");
         assert_eq!(inst.index.as_u16(), 0);
@@ -2312,10 +2415,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        cfg.allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
+        cfg.allocate_instance(Some("dupe"), &default_img(), None)
             .unwrap();
         let err = cfg
-            .allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("dupe"), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -2327,11 +2430,11 @@ mod tests {
 
         // Create instance at index 0, then remove it, then create at 1
         let inst0 = cfg
-            .allocate_instance(Some("a"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("a"), &default_img(), None)
             .unwrap();
         assert_eq!(inst0.index.as_u16(), 0);
         let inst1 = cfg
-            .allocate_instance(Some("b"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("b"), &default_img(), None)
             .unwrap();
         assert_eq!(inst1.index.as_u16(), 1);
 
@@ -2340,7 +2443,7 @@ mod tests {
 
         // Next allocation should be index 2 (highest + 1), not 0 (gap)
         let inst2 = cfg
-            .allocate_instance(Some("c"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("c"), &default_img(), None)
             .unwrap();
         assert_eq!(inst2.index.as_u16(), 2);
     }
@@ -2361,7 +2464,7 @@ mod tests {
 
         // Next should fill gap at 0 since highest (252) is at ceiling
         let inst = cfg
-            .allocate_instance(Some("fill"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("fill"), &default_img(), None)
             .unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
@@ -2416,7 +2519,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let err = cfg
-            .allocate_instance(Some("../evil"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some("../evil"), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("invalid character"));
     }
@@ -3065,6 +3168,86 @@ skip = ["not-a-slug"]
         assert!(serde_json::from_str::<InstanceName>(json).is_err());
     }
 
+    // ── ImageName ─────────────────────────────────────────────
+
+    #[test]
+    fn image_name_accepts_valid_identifiers() {
+        for s in [
+            "default",
+            "python-dev",
+            "alpha_beta",
+            "img.1",
+            "a",
+            "A1",
+            "ubuntu24.04",
+            "x".repeat(64).as_str(),
+        ] {
+            ImageName::new(s).unwrap_or_else(|e| panic!("{s} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_empty() {
+        assert!(ImageName::new("").is_err());
+    }
+
+    #[test]
+    fn image_name_rejects_leading_dot() {
+        // '.' and '..' would resolve to the images dir itself / its
+        // parent (the directory-traversal motivation for this newtype).
+        // Banning any leading '.' also keeps dotfile-style names out.
+        for s in [".", "..", "..hidden", ".gitkeep", ".x"] {
+            assert!(ImageName::new(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_path_separators() {
+        for s in ["foo/bar", "/abs", "a\\b", "../escape", "foo/", "/"] {
+            assert!(ImageName::new(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_out_of_charset() {
+        for s in ["with space", "tab\tname", "name\n", "weird!", "café"] {
+            assert!(ImageName::new(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_overlong() {
+        let too_long = "a".repeat(MAX_IMAGE_NAME_LEN + 1);
+        assert!(ImageName::new(&too_long).is_err());
+    }
+
+    #[test]
+    fn image_name_roundtrip_serde() {
+        let name = ImageName::new("python-dev").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, r#""python-dev""#);
+        let loaded: ImageName = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, name);
+    }
+
+    #[test]
+    fn image_name_rejects_invalid_on_deserialize() {
+        for json in [r#""../evil""#, r#""""#, r#"".""#, r#""..""#, r#""..foo""#] {
+            assert!(
+                serde_json::from_str::<ImageName>(json).is_err(),
+                "{json} should fail to deserialize"
+            );
+        }
+    }
+
+    /// Pins the invariant relied on by `default_image_name`, which
+    /// bypasses the validating constructor.
+    #[test]
+    fn default_image_is_valid() {
+        ImageName::new(DEFAULT_IMAGE).unwrap();
+        assert_eq!(default_image_name().as_str(), DEFAULT_IMAGE);
+    }
+
     // ── SubnetMask ────────────────────────────────────────────
 
     #[test]
@@ -3283,16 +3466,17 @@ skip = ["not-a-slug"]
             PathBuf::from("/my/data/images/default/rootfs-template.ext4")
         );
         assert_eq!(
-            cfg.template_config_path_for(DEFAULT_IMAGE),
+            cfg.template_config_path_for(&default_img()),
             PathBuf::from("/my/data/images/default/template-config.json")
         );
         // Named image paths
+        let python_dev = ImageName::new("python-dev").unwrap();
         assert_eq!(
-            cfg.template_path_for("python-dev"),
+            cfg.template_path_for(&python_dev),
             PathBuf::from("/my/data/images/python-dev/rootfs-template.ext4")
         );
         assert_eq!(
-            cfg.lima_base_path("python-dev"),
+            cfg.lima_base_path(&python_dev),
             PathBuf::from("/my/data/images/python-dev/lima-base.img")
         );
         assert_eq!(cfg.ssh_key_path(), PathBuf::from("/my/data/vm_key"));
@@ -3661,21 +3845,22 @@ skip = ["not-a-slug"]
             data_dir: PathBuf::from("/data"),
             ..CoopConfig::default()
         };
-        assert_eq!(cfg.image_dir("foo"), PathBuf::from("/data/images/foo"));
+        let foo = ImageName::new("foo").unwrap();
+        assert_eq!(cfg.image_dir(&foo), PathBuf::from("/data/images/foo"));
         assert_eq!(
-            cfg.template_path_for("foo"),
+            cfg.template_path_for(&foo),
             PathBuf::from("/data/images/foo/rootfs-template.ext4")
         );
         assert_eq!(
-            cfg.template_config_path_for("foo"),
+            cfg.template_config_path_for(&foo),
             PathBuf::from("/data/images/foo/template-config.json")
         );
         assert_eq!(
-            cfg.lima_base_path("foo"),
+            cfg.lima_base_path(&foo),
             PathBuf::from("/data/images/foo/lima-base.img")
         );
         assert_eq!(
-            cfg.lima_template_path("foo"),
+            cfg.lima_template_path(&foo),
             PathBuf::from("/data/images/foo/lima-template.yaml")
         );
     }
@@ -3692,12 +3877,28 @@ skip = ["not-a-slug"]
     fn list_images_finds_dirs() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.image_dir("alpha")).unwrap();
-        fs::create_dir_all(cfg.image_dir("beta")).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("alpha").unwrap())).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("beta").unwrap())).unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 2);
-        assert_eq!(images[0].name, "alpha");
-        assert_eq!(images[1].name, "beta");
+        assert_eq!(images[0].name.as_str(), "alpha");
+        assert_eq!(images[1].name.as_str(), "beta");
+    }
+
+    /// Image dirs whose names can't be parsed as [`ImageName`] (e.g. a
+    /// stray dotfile or an entry hand-edited in) are silently skipped
+    /// rather than poisoning the listing — same behaviour as
+    /// `list_instances` for corrupted instance dirs.
+    #[test]
+    fn list_images_skips_invalid_names() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        fs::create_dir_all(cfg.images_dir().join("..hidden")).unwrap();
+        fs::create_dir_all(cfg.images_dir().join("with space")).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap())).unwrap();
+        let images = cfg.list_images().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name.as_str(), "ok");
     }
 
     #[test]
@@ -3708,11 +3909,11 @@ skip = ["not-a-slug"]
             name: InstanceName::new("test").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
-            image: "python-dev".to_string(),
+            image: ImageName::new("python-dev").unwrap(),
         };
         inst.save().unwrap();
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.image, "python-dev");
+        assert_eq!(loaded.image.as_str(), "python-dev");
     }
 
     #[test]
@@ -3723,7 +3924,32 @@ skip = ["not-a-slug"]
         // Write old-format instance.json without image field
         fs::write(dir.join("instance.json"), r#"{"name": "test", "index": 0}"#).unwrap();
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.image, DEFAULT_IMAGE);
+        assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+    }
+
+    /// Pre-`ImageName` instances stored arbitrary strings here; a name
+    /// that fails validation should be rejected at load time rather than
+    /// silently used to construct paths.
+    #[test]
+    fn instance_load_rejects_invalid_image_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("inst");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("instance.json"),
+            r#"{"name": "test", "index": 0, "image": "../escape"}"#,
+        )
+        .unwrap();
+        let err = Instance::load(&dir).unwrap_err();
+        let chain = err.chain().fold(String::new(), |mut acc, e| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{e} | ");
+            acc
+        });
+        assert!(
+            chain.contains("must not start with") || chain.contains("invalid character"),
+            "expected validation error, got: {chain}"
+        );
     }
 
     // ── Resilience: corrupted instance dirs ─────────────────
@@ -3789,7 +4015,9 @@ skip = ["not-a-slug"]
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
         // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let inst = cfg
+            .allocate_instance(None, &ImageName::new(DEFAULT_IMAGE).unwrap(), None)
+            .unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
 
@@ -3803,7 +4031,7 @@ skip = ["not-a-slug"]
             name: InstanceName::new("v1").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
 
@@ -3812,7 +4040,7 @@ skip = ["not-a-slug"]
             name: InstanceName::new("v2").unwrap(),
             index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
-            image: "custom".to_string(),
+            image: ImageName::new("custom").unwrap(),
         };
         inst2.save().unwrap();
 
@@ -3820,7 +4048,7 @@ skip = ["not-a-slug"]
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.name, *"v2");
         assert_eq!(loaded.index.as_u16(), 5);
-        assert_eq!(loaded.image, "custom");
+        assert_eq!(loaded.image.as_str(), "custom");
 
         // No temp file left behind
         assert!(!dir.join("instance.tmp").exists());
@@ -4179,7 +4407,7 @@ skip = ["not-a-slug"]
         fs::create_dir(&ws).unwrap();
 
         let inst = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst.name, *"my-app");
     }
@@ -4194,13 +4422,13 @@ skip = ["not-a-slug"]
 
         // First allocation takes the basename
         let inst1 = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst1.name, *"dupe");
 
         // Second allocation with same basename gets -2 suffix
         let inst2 = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst2.name, *"dupe-2");
     }
@@ -4214,7 +4442,7 @@ skip = ["not-a-slug"]
         fs::create_dir(&ws).unwrap();
 
         let inst = cfg
-            .allocate_instance(Some("custom"), DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(Some("custom"), &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst.name, *"custom");
     }
@@ -4223,7 +4451,7 @@ skip = ["not-a-slug"]
     fn allocate_without_name_or_workspace_uses_index() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.name, *"0");
     }
 
