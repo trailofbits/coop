@@ -337,7 +337,7 @@ pub fn push(
     exclude_git: bool,
 ) -> Result<()> {
     let state = load_or_default(inst, dir, "push")?;
-    let source_dir = resolve_host_dir(dir, &state)?;
+    let source_dir = resolve_host_dir(dir, &state, "push")?;
 
     if !source_dir.is_dir() {
         bail!("Source directory {} does not exist", source_dir.display());
@@ -373,7 +373,7 @@ pub fn pull(
     exclude_git: bool,
 ) -> Result<()> {
     let state = load_or_default(inst, dir, "pull")?;
-    let dest_dir = resolve_host_dir_for_pull(dir, &state)?;
+    let dest_dir = resolve_host_dir(dir, &state, "pull")?;
 
     if !force && dest_dir.exists() {
         check_local_dirty(&dest_dir)?;
@@ -681,27 +681,20 @@ fn tar_pipe_pull(
 
 // ── Helpers ───────────────────────────────────────────────────
 
-fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState) -> Result<PathBuf> {
+fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState, cmd: &str) -> Result<PathBuf> {
     if let Some(d) = explicit {
         return Ok(PathBuf::from(d));
     }
-    state.source.host_path().map(Path::to_path_buf).context(
-        "No host_path in workspace.json and no --dir given.\n\
-         Provide a directory: coop push --dir ./my-project",
-    )
-}
-
-fn resolve_host_dir_for_pull(explicit: Option<&str>, state: &WorkspaceState) -> Result<PathBuf> {
-    if let Some(d) = explicit {
-        return Ok(PathBuf::from(d));
-    }
-    if let Some(hp) = state.source.host_path() {
-        return Ok(hp.to_path_buf());
-    }
-    bail!(
-        "No host_path in workspace.json and no --dir given.\n\
-         Provide a destination: coop pull --dir ./my-project"
-    )
+    state
+        .source
+        .host_path()
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "No host_path in workspace.json and no --dir given.\n\
+                 Provide a directory: coop {cmd} --dir ./my-project"
+            )
+        })
 }
 
 fn check_guest_dirty(target: &SshTarget, guest_path: &str) -> Result<()> {
