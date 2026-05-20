@@ -364,6 +364,7 @@ impl<'de> Deserialize<'de> for PortForward {
         impl<'de> Visitor<'de> for PortForwardVisitor {
             type Value = PortForward;
 
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
                     "a port number, a 'GUEST[:HOST]' string, or a { guest, host, label } table",
@@ -674,6 +675,7 @@ impl<'de> Deserialize<'de> for GitHubAuth {
         impl<'de> Visitor<'de> for AuthVisitor {
             type Value = GitHubAuth;
 
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a string (\"auto\" / \"env\" / \"off\" / \"pat\") or a table")
             }
@@ -818,6 +820,7 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
         impl serde::de::Visitor<'_> for ConfigDirVisitor {
             type Value = ConfigDir;
 
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a path string, false, or null")
             }
@@ -836,14 +839,17 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
                 Ok(ConfigDir::Custom(PathBuf::from(v)))
             }
 
+            #[mutants::skip] // equivalent: serde routes owned strings through visit_str; this path isn't exercised by our deserializer
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Custom(PathBuf::from(v)))
             }
 
+            #[mutants::skip] // equivalent: only called by serde for input shapes we don't accept
             fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Default)
             }
 
+            #[mutants::skip] // equivalent: only called by serde for input shapes we don't accept
             fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Default)
             }

@@ -20,6 +20,7 @@ sha2 = "0.11"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
+mutants = "0.0.4"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
