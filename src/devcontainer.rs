@@ -906,19 +906,10 @@ fn translate_mounts(
     let mut applied: Vec<String> = Vec::new();
     for entry in mounts {
         match parse_mount_entry(entry) {
-            Ok(spec) => match Mount::parse(&spec) {
-                Ok(m) => {
-                    applied.push(format!("{}->{}", m.host_path.display(), m.guest_path));
-                    t.mounts.push(m);
-                }
-                Err(e) => t.report.push(
-                    key,
-                    ReportStatus::Invalid,
-                    ReportSource::Devcontainer,
-                    spec,
-                    e.to_string(),
-                ),
-            },
+            Ok(m) => {
+                applied.push(format!("{}->{}", m.host_path.display(), m.guest_path));
+                t.mounts.push(m);
+            }
             Err(e) => t.report.push(
                 key,
                 ReportStatus::Invalid,
@@ -1047,9 +1038,9 @@ fn parse_forward_port_entry(v: &serde_json::Value) -> Result<PortForward> {
     }
 }
 
-fn parse_mount_entry(v: &serde_json::Value) -> Result<String> {
-    match v {
-        serde_json::Value::String(s) => parse_mount_string(s),
+fn parse_mount_entry(v: &serde_json::Value) -> Result<Mount> {
+    let spec = match v {
+        serde_json::Value::String(s) => normalize_mount_string(s)?,
         serde_json::Value::Object(map) => {
             let typ = map
                 .get("type")
@@ -1066,15 +1057,16 @@ fn parse_mount_entry(v: &serde_json::Value) -> Result<String> {
                 .get("target")
                 .and_then(|v| v.as_str())
                 .context("mount object requires 'target'")?;
-            Ok(format!("{source}:{target}"))
+            format!("{source}:{target}")
         }
         _ => bail!("expected mount string or object"),
-    }
+    };
+    Mount::parse(&spec)
 }
 
 /// Convert a docker-style mount string (`type=bind,source=...,target=...`)
 /// into coop's `HOST_PATH[:GUEST_PATH]` form.
-fn parse_mount_string(s: &str) -> Result<String> {
+fn normalize_mount_string(s: &str) -> Result<String> {
     if !s.contains('=') {
         // Already in HOST:GUEST or HOST form — pass through.
         return Ok(s.to_string());
@@ -1444,18 +1436,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_object_and_string() {
+    fn normalize_mount_string_handles_docker_form() {
         assert_eq!(
-            parse_mount_string("type=bind,source=/a,target=/b").unwrap(),
+            normalize_mount_string("type=bind,source=/a,target=/b").unwrap(),
             "/a:/b"
         );
         assert_eq!(
-            parse_mount_string("source=/a,target=/b,readonly").unwrap(),
+            normalize_mount_string("source=/a,target=/b,readonly").unwrap(),
             "/a:/b"
         );
-        assert!(parse_mount_string("type=volume,source=v,target=/b").is_err());
-        let obj = serde_json::json!({"type": "bind", "source": "/a", "target": "/b"});
-        assert_eq!(parse_mount_entry(&obj).unwrap(), "/a:/b");
+        assert!(normalize_mount_string("type=volume,source=v,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_mount_entry_object_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().to_str().unwrap();
+        let obj = serde_json::json!({"type": "bind", "source": host, "target": "/b"});
+        let m = parse_mount_entry(&obj).unwrap();
+        assert_eq!(m.guest_path, "/b");
+    }
+
+    #[test]
+    fn parse_mount_entry_rejects_unsupported_type() {
+        let obj = serde_json::json!({"type": "volume", "source": "/v", "target": "/b"});
+        let err = parse_mount_entry(&obj).unwrap_err();
+        assert!(format!("{err:#}").contains("unsupported mount type"));
     }
 
     #[test]

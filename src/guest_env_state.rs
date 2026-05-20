@@ -178,26 +178,19 @@ pub fn merge_persisted_entries(
     out
 }
 
-/// Parse `--env KEY=VALUE` argument list into a `BTreeMap`.
+/// Parse a single `--env KEY=VALUE` entry. Suitable for clap
+/// `value_parser`, so invalid keys fail before any VM lifecycle work.
 ///
 /// Rejects entries missing `=` and entries whose key fails
 /// [`EnvVarName`] validation. Empty values are allowed (e.g.
 /// `--env CLEAR=`).
-///
-/// Returned map preserves the "last write wins" precedence of the
-/// argument order: later duplicates of the same key overwrite earlier
-/// ones, matching `merge_cli_guest_env`'s in-memory behaviour.
-pub fn parse_cli_env_args(args: &[String]) -> Result<BTreeMap<EnvVarName, String>> {
-    let mut out = BTreeMap::new();
-    for entry in args {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
-        let name = EnvVarName::new(key)
-            .with_context(|| format!("--env KEY is invalid (got '{entry}')"))?;
-        out.insert(name, value.to_string());
-    }
-    Ok(out)
+pub fn parse_cli_env_arg(entry: &str) -> Result<(EnvVarName, String)> {
+    let (key, value) = entry
+        .split_once('=')
+        .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
+    let name =
+        EnvVarName::new(key).with_context(|| format!("--env KEY is invalid (got '{entry}')"))?;
+    Ok((name, value.to_string()))
 }
 
 #[cfg(test)]
@@ -314,33 +307,34 @@ mod tests {
         assert_eq!(merged.get(&env("K")).map(String::as_str), Some("from-cli"));
     }
 
-    // ── parse_cli_env_args ───────────────────────────────────
+    // ── parse_cli_env_arg ────────────────────────────────────
 
     #[test]
-    fn parse_cli_env_args_basic() {
-        let parsed = parse_cli_env_args(&["FOO=1".into(), "BAR=baz".into()]).unwrap();
-        assert_eq!(parsed.get(&env("FOO")).map(String::as_str), Some("1"));
-        assert_eq!(parsed.get(&env("BAR")).map(String::as_str), Some("baz"));
+    fn parse_cli_env_arg_basic() {
+        let (k, v) = parse_cli_env_arg("FOO=1").unwrap();
+        assert_eq!(k, env("FOO"));
+        assert_eq!(v, "1");
     }
 
     #[test]
-    fn parse_cli_env_args_allows_empty_value() {
-        let parsed = parse_cli_env_args(&["EMPTY=".into()]).unwrap();
-        assert_eq!(parsed.get(&env("EMPTY")).map(String::as_str), Some(""));
+    fn parse_cli_env_arg_allows_empty_value() {
+        let (k, v) = parse_cli_env_arg("EMPTY=").unwrap();
+        assert_eq!(k, env("EMPTY"));
+        assert_eq!(v, "");
     }
 
     #[test]
-    fn parse_cli_env_args_rejects_missing_equals() {
-        let err = parse_cli_env_args(&["BAD".into()]).unwrap_err();
+    fn parse_cli_env_arg_rejects_missing_equals() {
+        let err = parse_cli_env_arg("BAD").unwrap_err();
         assert!(format!("{err:#}").contains("missing '='"));
     }
 
     #[test]
-    fn parse_cli_env_args_rejects_invalid_key() {
+    fn parse_cli_env_arg_rejects_invalid_key() {
         // Empty key, leading digit, embedded space, embedded '=' in key
         // all funnel through `EnvVarName::new`, so one test covers them.
         for bad in ["=value", "1FOO=v", "FOO BAR=v"] {
-            let err = parse_cli_env_args(&[bad.into()]).unwrap_err();
+            let err = parse_cli_env_arg(bad).unwrap_err();
             assert!(
                 format!("{err:#}").contains("--env KEY is invalid"),
                 "expected validation error for '{bad}', got: {err:#}",
@@ -349,17 +343,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_env_args_last_duplicate_wins() {
-        let parsed = parse_cli_env_args(&["K=v1".into(), "K=v2".into()]).unwrap();
-        assert_eq!(parsed.get(&env("K")).map(String::as_str), Some("v2"));
-    }
-
-    #[test]
-    fn parse_cli_env_args_value_may_contain_equals() {
-        let parsed = parse_cli_env_args(&["URL=https://x?a=b&c=d".into()]).unwrap();
-        assert_eq!(
-            parsed.get(&env("URL")).map(String::as_str),
-            Some("https://x?a=b&c=d"),
-        );
+    fn parse_cli_env_arg_value_may_contain_equals() {
+        let (k, v) = parse_cli_env_arg("URL=https://x?a=b&c=d").unwrap();
+        assert_eq!(k, env("URL"));
+        assert_eq!(v, "https://x?a=b&c=d");
     }
 }

@@ -179,13 +179,17 @@ enum Commands {
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
         /// Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
-        #[arg(long, conflicts_with_all = ["workspace", "git_repo"])]
-        mount: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with_all = ["workspace", "git_repo"],
+            value_parser = config::Mount::parse,
+        )]
+        mount: Vec<config::Mount>,
         /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
         /// `--forward-port 3000` forwards guest 3000 to host 3000;
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
-        #[arg(long)]
-        forward_port: Vec<String>,
+        #[arg(long, value_parser = config::PortForward::parse)]
+        forward_port: Vec<config::PortForward>,
         /// Named image to use (default: "default")
         #[arg(
             long,
@@ -208,8 +212,12 @@ enum Commands {
         /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
         /// Overrides `guest_env` entries from config and any forwarded
         /// values with the same name.
-        #[arg(long = "env", value_name = "KEY=VALUE")]
-        guest_env: Vec<String>,
+        #[arg(
+            long = "env",
+            value_name = "KEY=VALUE",
+            value_parser = guest_env_state::parse_cli_env_arg,
+        )]
+        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
         /// Explicit path to a `devcontainer.json` to use (skips discovery).
         #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
         devcontainer: Option<String>,
@@ -662,13 +670,13 @@ fn main() -> Result<()> {
             mem,
             disk,
             no_agents,
-            mount,
+            mount: mounts,
             image,
             exclude_git,
             no_prompt,
             post_start,
             guest_env,
-            forward_port,
+            forward_port: mut forward_ports,
             devcontainer,
             no_devcontainer,
             dry_run,
@@ -678,18 +686,9 @@ fn main() -> Result<()> {
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            let mounts = mount
-                .iter()
-                .map(|s| config::Mount::parse(s))
-                .collect::<Result<Vec<_>>>()?;
-            let mut forward_ports = forward_port
-                .iter()
-                .map(|s| config::PortForward::parse(s))
-                .collect::<Result<Vec<_>>>()?;
-
             let cli_env_keys = guest_env
                 .iter()
-                .filter_map(|s| s.split_once('=').map(|(k, _)| k.to_string()))
+                .map(|(k, _)| k.as_str().to_string())
                 .collect();
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -726,7 +725,10 @@ fn main() -> Result<()> {
                 forward_ports =
                     devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
             }
-            let cli_guest_env = guest_env_state::parse_cli_env_args(&guest_env)?;
+            // `BTreeMap::from_iter` keeps the last value for a repeated
+            // key, matching the documented "last `--env` wins" semantics.
+            let cli_guest_env: std::collections::BTreeMap<_, _> =
+                guest_env.iter().cloned().collect();
             for (key, value) in &cli_guest_env {
                 cfg.guest_env.insert(key.clone(), value.clone());
             }
@@ -2508,10 +2510,37 @@ mod tests {
         let super::Commands::Start { guest_env, .. } = cli.command else {
             panic!("expected Start variant");
         };
+        let pairs: Vec<(String, String)> = guest_env
+            .into_iter()
+            .map(|(k, v)| (k.as_str().to_string(), v))
+            .collect();
         assert_eq!(
-            guest_env,
-            vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]
+            pairs,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+            ]
         );
+    }
+
+    #[test]
+    fn start_env_flag_rejects_invalid_key_at_clap_time() {
+        use clap::Parser as _;
+        let argv = ["coop", "start", "--env", "1BAD=value"];
+        let Err(err) = super::Cli::try_parse_from(argv) else {
+            panic!("expected --env to reject invalid KEY");
+        };
+        assert!(format!("{err}").contains("--env KEY is invalid"));
+    }
+
+    #[test]
+    fn start_forward_port_rejects_invalid_spec_at_clap_time() {
+        use clap::Parser as _;
+        let argv = ["coop", "start", "--forward-port", "abc"];
+        let Err(err) = super::Cli::try_parse_from(argv) else {
+            panic!("expected --forward-port to reject invalid spec");
+        };
+        assert!(format!("{err}").contains("forward-port"));
     }
 
     /// `prepare_session_from_target` must overlay the on-disk
