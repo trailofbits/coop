@@ -1839,6 +1839,135 @@ mod tests {
         assert_eq!(loaded.image, DEFAULT_IMAGE);
     }
 
+    // ── Instance::is_running / is_firecracker_process ────────
+    //
+    // These tests drive `is_running` through real PID files and
+    // real subprocesses. The happy path requires a process whose
+    // `/proc/<pid>/cmdline` contains "firecracker", which we
+    // synthesize with `bash -c 'exec -a firecracker-test sleep'`
+    // — argv[0] is renamed so the matcher recognizes it.
+    //
+    // Sudo-using paths (`kill -0`, `cat /proc/.../cmdline`) are
+    // gated `#[cfg(target_os = "linux")]`: CI runs Linux with
+    // passwordless sudo, and `/proc/<pid>/cmdline` is Linux-only.
+    // The non-sudo paths (missing PID file) run cross-platform.
+
+    /// PID likely-but-not-guaranteed dead. If it happens to belong
+    /// to a live non-firecracker process, the tests still see the
+    /// expected `false` outcome — they assert behavior, not which
+    /// branch fired.
+    const DEAD_PID: u32 = 999_999;
+
+    #[cfg(target_os = "linux")]
+    fn spawn_firecracker_like() -> std::process::Child {
+        std::process::Command::new("bash")
+            .args(["-c", "exec -a firecracker-test sleep 30"])
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_sleep() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn is_running_false_when_pid_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        assert!(!inst.pid_file_path().exists());
+        assert!(!inst.is_running());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_false_for_dead_pid_and_removes_pid_file() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+
+        assert!(!inst.is_running());
+        assert!(
+            !inst.pid_file_path().exists(),
+            "stale PID file should be removed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let mut child = spawn_sleep();
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.is_running();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!running);
+        assert!(
+            !inst.pid_file_path().exists(),
+            "PID file should be removed when PID is not a firecracker"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_true_for_live_firecracker_like_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.is_running();
+        let pid_file_kept = inst.pid_file_path().exists();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            running,
+            "is_running must return true for a live firecracker"
+        );
+        assert!(
+            pid_file_kept,
+            "PID file should be preserved while firecracker is running"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_false_for_dead_pid() {
+        assert!(!is_firecracker_process(DEAD_PID));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_false_for_live_non_firecracker_pid() {
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        let result = is_firecracker_process(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!result);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_true_for_firecracker_named_pid() {
+        let mut child = spawn_firecracker_like();
+        let pid = child.id();
+        let result = is_firecracker_process(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result);
+    }
+
     // ── Allocate instance ────────────────────────────────────
 
     #[test]
