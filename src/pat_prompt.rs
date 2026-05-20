@@ -16,6 +16,7 @@ use anyhow::Result;
 
 use crate::config::{CoopConfig, GitHubAuth};
 use crate::github_pat::{self, SetupOpts};
+use crate::github_repo::RepoSlug;
 
 /// Effective answer to "should we offer the user a PAT wizard right now?"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,7 @@ impl Decision {
     /// `no_prompt_flag` reflects whether `--no-prompt` was passed.
     pub fn resolve(
         cfg: &CoopConfig,
-        repo: Option<&str>,
+        repo: Option<&RepoSlug>,
         tty: bool,
         ci: bool,
         no_prompt_flag: bool,
@@ -79,7 +80,7 @@ impl Decision {
 pub fn maybe_prompt(
     cfg: &mut CoopConfig,
     config_path: &Path,
-    repo: Option<&str>,
+    repo: Option<&RepoSlug>,
     no_prompt_flag: bool,
 ) -> Result<()> {
     let tty = std::io::stdin().is_terminal();
@@ -146,9 +147,9 @@ fn refresh_github_from_disk(cfg: &mut CoopConfig, config_path: &Path) -> Result<
     Ok(())
 }
 
-fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &str) -> Result<()> {
+fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) -> Result<()> {
     let opts = SetupOpts {
-        repo: Some(repo),
+        repo: Some(repo.as_str()),
         config_path,
     };
     match github_pat::run_setup_pat(cfg, &opts) {
@@ -169,6 +170,7 @@ fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &str) -> Re
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
     use crate::config::{PatConfig, PatEntry};
@@ -178,6 +180,10 @@ mod tests {
             github,
             ..CoopConfig::default()
         }
+    }
+
+    fn slug(s: &str) -> RepoSlug {
+        RepoSlug::new(s).unwrap()
     }
 
     #[test]
@@ -193,7 +199,7 @@ mod tests {
     fn skips_when_no_tty() {
         let cfg = cfg_with(None);
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), false, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), false, false, false),
             Decision::Skip
         );
     }
@@ -202,7 +208,7 @@ mod tests {
     fn skips_when_ci() {
         let cfg = cfg_with(None);
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, true, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, true, false),
             Decision::Skip
         );
     }
@@ -211,7 +217,7 @@ mod tests {
     fn skips_when_no_prompt_flag() {
         let cfg = cfg_with(None);
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, true),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, true),
             Decision::Skip
         );
     }
@@ -220,7 +226,7 @@ mod tests {
     fn prompts_when_mode_off_and_interactive() {
         let cfg = cfg_with(Some(GitHubAuth::Off));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Prompt
         );
     }
@@ -229,7 +235,7 @@ mod tests {
     fn prompts_when_pat_mode_but_no_entry() {
         let cfg = cfg_with(Some(GitHubAuth::Pat(PatConfig::default())));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Prompt
         );
     }
@@ -238,14 +244,14 @@ mod tests {
     fn skips_when_pat_mode_has_entry() {
         let mut pc = PatConfig::default();
         pc.entries.insert(
-            "a/b".to_string(),
+            slug("a/b"),
             PatEntry {
                 token: crate::config::Secret::new("cmd:echo x".to_string()),
             },
         );
         let cfg = cfg_with(Some(GitHubAuth::Pat(pc)));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Skip
         );
     }
@@ -253,10 +259,10 @@ mod tests {
     #[test]
     fn skips_when_repo_marked_skip() {
         let mut pc = PatConfig::default();
-        pc.skip.push("a/b".to_string());
+        pc.skip.push(slug("a/b"));
         let cfg = cfg_with(Some(GitHubAuth::Pat(pc)));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Skip
         );
     }
@@ -265,7 +271,7 @@ mod tests {
     fn skips_when_mode_auto() {
         let cfg = cfg_with(Some(GitHubAuth::Auto));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Skip
         );
     }
@@ -274,7 +280,7 @@ mod tests {
     fn skips_when_mode_env() {
         let cfg = cfg_with(Some(GitHubAuth::Env));
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Skip
         );
     }
@@ -284,7 +290,7 @@ mod tests {
         let mut cfg = cfg_with(Some(GitHubAuth::Off));
         cfg.setup.prompt_for_pat = false;
         assert_eq!(
-            Decision::resolve(&cfg, Some("a/b"), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
             Decision::Skip
         );
     }

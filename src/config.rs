@@ -638,7 +638,7 @@ impl GitHubAuth {
     /// Look up a `[github.pat."owner/repo"]` entry by repo slug.
     ///
     /// Returns `None` for non-pat modes or when no entry exists.
-    pub fn pat_entry(&self, repo: &str) -> Option<&PatEntry> {
+    pub fn pat_entry(&self, repo: &crate::github_repo::RepoSlug) -> Option<&PatEntry> {
         match self {
             Self::Pat(cfg) => cfg.entries.get(repo),
             _ => None,
@@ -652,11 +652,13 @@ pub struct PatConfig {
     /// Per-repo PAT entries, keyed by `owner/repo`.
     ///
     /// Uses `BTreeMap` so TOML serialization is stable across runs.
+    /// Invalid slugs are rejected at deserialization time by
+    /// [`RepoSlug`](crate::github_repo::RepoSlug).
     #[serde(default, rename = "pat")]
-    pub entries: std::collections::BTreeMap<String, PatEntry>,
+    pub entries: std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
     /// Repos for which the auto-prompt at `coop start` is suppressed.
     #[serde(default)]
-    pub skip: Vec<String>,
+    pub skip: Vec<crate::github_repo::RepoSlug>,
 }
 
 /// One per-repo PAT entry under `[github.pat."owner/repo"]`.
@@ -710,8 +712,10 @@ impl<'de> Deserialize<'de> for GitHubAuth {
                 }
 
                 let mut mode: Option<String> = None;
-                let mut entries: Option<std::collections::BTreeMap<String, PatEntry>> = None;
-                let mut skip: Option<Vec<String>> = None;
+                let mut entries: Option<
+                    std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
+                > = None;
+                let mut skip: Option<Vec<crate::github_repo::RepoSlug>> = None;
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
                         Field::Mode => mode = Some(map.next_value()?),
@@ -1193,22 +1197,9 @@ impl CoopConfig {
             }
         }
 
-        if let Some(GitHubAuth::Pat(pat)) = self.github.as_ref() {
-            for key in pat.entries.keys() {
-                if let Err(e) = crate::github_repo::validate_repo_slug(key) {
-                    errors.push(format!(
-                        "github.pat.\"{key}\" key is not a valid 'owner/repo' slug: {e}"
-                    ));
-                }
-            }
-            for slug in &pat.skip {
-                if let Err(e) = crate::github_repo::validate_repo_slug(slug) {
-                    errors.push(format!(
-                        "github.skip entry '{slug}' is not a valid 'owner/repo' slug: {e}"
-                    ));
-                }
-            }
-        }
+        // `[github.pat]` keys and `github.skip` entries are typed as
+        // `RepoSlug`; invalid values are rejected at config load time, so
+        // no per-key check is needed here.
 
         if errors.is_empty() {
             Ok(warnings)
@@ -2372,10 +2363,9 @@ token = "cmd:echo y"
             other => panic!("expected Pat variant, got {other:?}"),
         };
         assert_eq!(pat.entries.len(), 2);
+        let slug = crate::github_repo::RepoSlug::new("trailofbits/coop").unwrap();
         assert_eq!(
-            pat.entries
-                .get("trailofbits/coop")
-                .map(|e| e.token.expose().as_str()),
+            pat.entries.get(&slug).map(|e| e.token.expose().as_str()),
             Some("cmd:echo x")
         );
         assert!(pat.skip.is_empty());
@@ -2421,7 +2411,8 @@ skip = ["a/b"]
             GitHubAuth::Pat(p) => p,
             other => panic!("expected Pat variant, got {other:?}"),
         };
-        assert_eq!(pat.skip, vec!["a/b".to_string()]);
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        assert_eq!(pat.skip, vec![ab]);
         assert!(pat.entries.is_empty());
     }
 
@@ -2434,35 +2425,66 @@ mode = "pat"
 token = "cmd:echo x"
 "#;
         let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
-        let entry = auth.pat_entry("a/b").unwrap();
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        let cd = crate::github_repo::RepoSlug::new("c/d").unwrap();
+        let entry = auth.pat_entry(&ab).unwrap();
         assert_eq!(entry.token.expose(), "cmd:echo x");
-        assert!(auth.pat_entry("c/d").is_none());
+        assert!(auth.pat_entry(&cd).is_none());
     }
 
     #[test]
     fn github_auth_lookup_returns_none_for_non_pat_modes() {
-        let auth = GitHubAuth::Auto;
-        assert!(auth.pat_entry("a/b").is_none());
-        let auth = GitHubAuth::Env;
-        assert!(auth.pat_entry("a/b").is_none());
-        let auth = GitHubAuth::Off;
-        assert!(auth.pat_entry("a/b").is_none());
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        for auth in [GitHubAuth::Auto, GitHubAuth::Env, GitHubAuth::Off] {
+            assert!(auth.pat_entry(&ab).is_none());
+        }
+    }
+
+    #[test]
+    fn github_auth_table_form_rejects_invalid_pat_key() {
+        // Invalid slug as a `[github.pat."..."]` key fails at parse time.
+        let toml_str = r#"
+mode = "pat"
+
+[pat."not-a-slug"]
+token = "cmd:echo x"
+"#;
+        let err = toml::from_str::<GitHubAuth>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("owner/repo"),
+            "expected owner/repo error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn github_auth_table_form_rejects_invalid_skip_entry() {
+        let toml_str = r#"
+mode = "pat"
+skip = ["not-a-slug"]
+"#;
+        let err = toml::from_str::<GitHubAuth>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("owner/repo"),
+            "expected owner/repo error, got: {err}"
+        );
     }
 
     #[test]
     fn github_auth_serializes_round_trip_for_pat() {
         // pat-mode → table form; deserialize the serialized output and
         // confirm the entries survived.
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        let cd = crate::github_repo::RepoSlug::new("c/d").unwrap();
         let mut entries = std::collections::BTreeMap::new();
         entries.insert(
-            "a/b".to_string(),
+            ab.clone(),
             PatEntry {
                 token: Secret::new("cmd:echo x".to_string()),
             },
         );
         let auth = GitHubAuth::Pat(PatConfig {
             entries,
-            skip: vec!["c/d".to_string()],
+            skip: vec![cd.clone()],
         });
         let serialized = toml::to_string(&auth).unwrap();
         let parsed: GitHubAuth = toml::from_str(&serialized).unwrap();
@@ -2470,9 +2492,9 @@ token = "cmd:echo x"
             GitHubAuth::Pat(p) => p,
             other => panic!("expected Pat variant after round-trip, got {other:?}"),
         };
-        assert_eq!(pat.skip, vec!["c/d".to_string()]);
+        assert_eq!(pat.skip, vec![cd]);
         assert_eq!(
-            pat.entries.get("a/b").map(|e| e.token.expose().as_str()),
+            pat.entries.get(&ab).map(|e| e.token.expose().as_str()),
             Some("cmd:echo x")
         );
     }

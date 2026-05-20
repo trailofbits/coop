@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
-use crate::github_repo::{detect_workspace_repo, parse_repo_slug_from_url, validate_repo_slug};
+use crate::github_repo::{RepoSlug, detect_workspace_repo, parse_repo_slug_from_url};
 use crate::secret_store::{
     SERVICE, account_for_repo, available_backends, delete_secret, infer_backend, store_secret,
 };
@@ -46,7 +46,6 @@ pub struct SetupOpts<'a> {
 /// entry and any matching skip-marker is removed.
 pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     let repo = resolve_target_repo(opts.repo, None)?;
-    validate_repo_slug(&repo)?;
 
     print_form_instructions(&repo);
     open_browser_best_effort(PAT_NEW_URL);
@@ -145,16 +144,16 @@ pub fn run_status(cfg: &CoopConfig, probe: bool) {
 /// `coop github forget-pat --repo owner/name` — remove the secret and
 /// the config entry. Does **not** add a skip marker.
 pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Result<()> {
-    validate_repo_slug(repo)?;
+    let repo = RepoSlug::new(repo)?;
     let entry = cfg
         .github
         .as_ref()
-        .and_then(|g| g.pat_entry(repo))
+        .and_then(|g| g.pat_entry(&repo))
         .with_context(|| {
             format!("No PAT entry for '{repo}' — nothing to forget. Run `coop github status`.")
         })?;
     let backend = infer_backend(entry.token.expose());
-    let account = account_for_repo(repo);
+    let account = account_for_repo(&repo);
     let state_dir = cfg.data_dir.join("state");
     if let Some(b) = backend {
         if let Err(e) = delete_secret(b, SERVICE, &account, &state_dir) {
@@ -166,7 +165,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Resul
              clean up the underlying secret manually if needed."
         );
     }
-    remove_pat_entry(config_path, repo)?;
+    remove_pat_entry(config_path, &repo)?;
     eprintln!("Removed PAT entry for {repo}.");
     eprintln!(
         "note: the token itself may still be live on GitHub — \
@@ -180,9 +179,9 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Resul
 
 /// Resolve the target repo from explicit `--repo`, fall back to a
 /// best-effort scan of the current working directory.
-fn resolve_target_repo(repo_arg: Option<&str>, git_repo_url: Option<&str>) -> Result<String> {
+fn resolve_target_repo(repo_arg: Option<&str>, git_repo_url: Option<&str>) -> Result<RepoSlug> {
     if let Some(repo) = repo_arg {
-        return Ok(repo.trim().to_string());
+        return RepoSlug::new(repo.trim());
     }
     if let Some(url) = git_repo_url
         && let Some(slug) = parse_repo_slug_from_url(url)
@@ -200,14 +199,11 @@ fn resolve_target_repo(repo_arg: Option<&str>, git_repo_url: Option<&str>) -> Re
     )
 }
 
-fn print_form_instructions(repo: &str) {
-    // Validation has already ensured repo is "owner/name".
-    let owner = repo.split('/').next().unwrap_or(repo);
-
+fn print_form_instructions(repo: &RepoSlug) {
     eprintln!("\nConfigure the form at {PAT_NEW_URL}:");
-    eprintln!("  Token name:        coop-{}", repo.replace('/', "-"));
+    eprintln!("  Token name:        coop-{}-{}", repo.owner(), repo.repo());
     eprintln!("  Expiration:        (your choice — 90 days is a reasonable default)");
-    eprintln!("  Resource owner:    {owner}");
+    eprintln!("  Resource owner:    {}", repo.owner());
     eprintln!("  Repository access: Only select repositories → {repo}");
     eprintln!("  Repository permissions:");
     eprintln!("    Contents:        Read and write");
@@ -309,7 +305,7 @@ fn probe_user(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn probe_repo(token: &str, repo: &str) -> Result<()> {
+fn probe_repo(token: &str, repo: &RepoSlug) -> Result<()> {
     let url = format!("https://api.github.com/repos/{repo}");
     let (status, _body) = curl_with_token(token, &url)?;
     match status {
@@ -396,7 +392,7 @@ fn pick_backend() -> Result<crate::secret_store::Backend> {
 /// read-modify-write window so concurrent wizard invocations (e.g. two
 /// `coop start` auto-prompts firing at once) don't lose each other's
 /// writes.
-fn upsert_pat_entry(path: &Path, repo: &str, token_cmd: &str) -> Result<()> {
+fn upsert_pat_entry(path: &Path, repo: &RepoSlug, token_cmd: &str) -> Result<()> {
     let _lock = crate::fs_util::lock_sibling(path)?;
     let original = read_or_init_doc(path)?;
     let mut doc = original.clone();
@@ -433,13 +429,13 @@ fn upsert_pat_entry(path: &Path, repo: &str, token_cmd: &str) -> Result<()> {
         "token".to_string(),
         toml::Value::String(token_cmd.to_string()),
     );
-    pat_tbl.insert(repo.to_string(), toml::Value::Table(entry));
+    pat_tbl.insert(repo.as_str().to_string(), toml::Value::Table(entry));
 
     // Drop the repo from the skip list, if present.
     if let Some(skip) = github_tbl.get_mut("skip")
         && let Some(arr) = skip.as_array_mut()
     {
-        arr.retain(|v| v.as_str() != Some(repo));
+        arr.retain(|v| v.as_str() != Some(repo.as_str()));
     }
 
     // Skip the rewrite when the parsed result equals what's already on disk.
@@ -456,7 +452,7 @@ fn upsert_pat_entry(path: &Path, repo: &str, token_cmd: &str) -> Result<()> {
     write_doc(path, &doc)
 }
 
-fn remove_pat_entry(path: &Path, repo: &str) -> Result<()> {
+fn remove_pat_entry(path: &Path, repo: &RepoSlug) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -467,7 +463,7 @@ fn remove_pat_entry(path: &Path, repo: &str) -> Result<()> {
             .get_mut("pat")
             .and_then(toml::Value::as_table_mut)
     {
-        pat_tbl.remove(repo);
+        pat_tbl.remove(repo.as_str());
     }
     write_doc(path, &doc)
 }
@@ -482,8 +478,7 @@ fn remove_pat_entry(path: &Path, repo: &str) -> Result<()> {
 /// (with no entries) here is a no-op for token forwarding — pat-mode
 /// with no entries forwards no token, same as "off" — while making
 /// per-repo skip state survive a config reload.
-pub fn add_skip_marker(path: &Path, repo: &str) -> Result<()> {
-    validate_repo_slug(repo)?;
+pub fn add_skip_marker(path: &Path, repo: &RepoSlug) -> Result<()> {
     let _lock = crate::fs_util::lock_sibling(path)?;
     let mut doc = read_or_init_doc(path)?;
     let github = doc
@@ -505,8 +500,8 @@ pub fn add_skip_marker(path: &Path, repo: &str) -> Result<()> {
         *skip = toml::Value::Array(Vec::new());
     }
     let arr = skip.as_array_mut().context("github.skip is not an array")?;
-    if !arr.iter().any(|v| v.as_str() == Some(repo)) {
-        arr.push(toml::Value::String(repo.to_string()));
+    if !arr.iter().any(|v| v.as_str() == Some(repo.as_str())) {
+        arr.push(toml::Value::String(repo.as_str().to_string()));
     }
     write_doc(path, &doc)
 }
@@ -555,7 +550,7 @@ fn doc_contains_literal_token(doc: &toml::Value) -> bool {
 
 /// Hint helper used by `coop start` and other code paths to format the
 /// "no entry for this repo" error consistently.
-pub fn missing_entry_error(repo: &str) -> String {
+pub fn missing_entry_error(repo: &RepoSlug) -> String {
     format!(
         "No GitHub PAT configured for '{repo}'. \
          Run `coop github setup-pat --repo {repo}` to add one, \
@@ -578,14 +573,19 @@ pub(crate) fn pat_config_at(path: &Path) -> Result<Option<crate::config::PatConf
 mod tests {
     use super::*;
 
+    fn slug(s: &str) -> RepoSlug {
+        RepoSlug::new(s).unwrap()
+    }
+
     #[test]
     fn upsert_creates_new_file_with_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        upsert_pat_entry(&path, "trailofbits/coop", "cmd:cat ./t.txt").unwrap();
+        let s = slug("trailofbits/coop");
+        upsert_pat_entry(&path, &s, "cmd:cat ./t.txt").unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
         assert_eq!(cfg.entries.len(), 1);
-        let entry = cfg.entries.get("trailofbits/coop").unwrap();
+        let entry = cfg.entries.get(&s).unwrap();
         assert_eq!(entry.token.expose(), "cmd:cat ./t.txt");
     }
 
@@ -600,7 +600,7 @@ mod tests {
              vcpu_count = 4\n",
         )
         .unwrap();
-        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         assert!(s.contains("ssh_port = 2222"));
         assert!(s.contains("vcpu_count = 4"));
@@ -612,7 +612,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
-        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let cfg = CoopConfig::load(&path).unwrap();
         assert!(matches!(cfg.github, Some(GitHubAuth::Pat(_))));
     }
@@ -627,7 +627,7 @@ mod tests {
         let path = tmp.path().join("config.toml");
         let original = "# user comment\n[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n";
         std::fs::write(&path, original).unwrap();
-        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             after, original,
@@ -644,16 +644,16 @@ mod tests {
             "[github]\nmode = \"pat\"\nskip = [\"a/b\", \"c/d\"]\n",
         )
         .unwrap();
-        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec!["c/d".to_string()]);
+        assert_eq!(cfg.skip, vec![slug("c/d")]);
     }
 
     #[test]
     fn remove_pat_entry_is_idempotent_on_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        remove_pat_entry(&path, "x/y").unwrap();
+        remove_pat_entry(&path, &slug("x/y")).unwrap();
         assert!(!path.exists());
     }
 
@@ -666,20 +666,20 @@ mod tests {
             "[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n\n[github.pat.\"c/d\"]\ntoken = \"cmd:echo y\"\n",
         )
         .unwrap();
-        remove_pat_entry(&path, "a/b").unwrap();
+        remove_pat_entry(&path, &slug("a/b")).unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert!(!cfg.entries.contains_key("a/b"));
-        assert!(cfg.entries.contains_key("c/d"));
+        assert!(!cfg.entries.contains_key(&slug("a/b")));
+        assert!(cfg.entries.contains_key(&slug("c/d")));
     }
 
     #[test]
     fn skip_marker_added_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
-        add_skip_marker(&path, "a/b").unwrap();
-        add_skip_marker(&path, "a/b").unwrap();
+        add_skip_marker(&path, &slug("a/b")).unwrap();
+        add_skip_marker(&path, &slug("a/b")).unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec!["a/b".to_string()]);
+        assert_eq!(cfg.skip, vec![slug("a/b")]);
     }
 
     #[test]
@@ -689,9 +689,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
-        add_skip_marker(&path, "a/b").unwrap();
+        add_skip_marker(&path, &slug("a/b")).unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec!["a/b".to_string()]);
+        assert_eq!(cfg.skip, vec![slug("a/b")]);
     }
 
     #[test]
@@ -702,16 +702,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
-        add_skip_marker(&path, "a/b").unwrap();
-        upsert_pat_entry(&path, "a/b", "cmd:echo x").unwrap();
+        add_skip_marker(&path, &slug("a/b")).unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert!(!cfg.skip.contains(&"a/b".to_string()));
-        assert!(cfg.entries.contains_key("a/b"));
+        assert!(!cfg.skip.contains(&slug("a/b")));
+        assert!(cfg.entries.contains_key(&slug("a/b")));
     }
 
     #[test]
     fn missing_entry_error_mentions_repo_and_command() {
-        let msg = missing_entry_error("trailofbits/coop");
+        let msg = missing_entry_error(&slug("trailofbits/coop"));
         assert!(msg.contains("trailofbits/coop"));
         assert!(msg.contains("setup-pat"));
     }

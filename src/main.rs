@@ -1323,7 +1323,7 @@ fn restart_instance(
     // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
     // recorded workspace-state to recover the repo slug.
     let repo = backend::detect_instance_repo(inst);
-    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
+    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
 
     // Re-apply the forward set the instance was last started with.
     // CLI `--forward-port` on a restart appends/overrides; otherwise the
@@ -1375,7 +1375,7 @@ fn restart_instance(
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_ref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1404,7 +1404,7 @@ fn restart_instance(
 /// convention used by `push`/`pull`, so the slug a user sees here is the
 /// same one `detect_instance_repo` will recover on `coop shell` / `exec`
 /// / `restart`.
-fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<String>> {
+fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<github_repo::RepoSlug>> {
     if let Some(url) = opts.git_repo
         && let Some(slug) = github_repo::parse_repo_slug_from_url(url)
     {
@@ -1436,7 +1436,7 @@ fn start_instance(
     // can fire before any VM cost is incurred, and so pat-mode token
     // forwarding works at bootstrap time.
     let repo = resolve_start_repo(opts)?;
-    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_deref(), opts.no_prompt)?;
+    pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
 
     // Forwards are checked up-front so an in-use host port fails fast,
     // before any VM cost is incurred. The actual `-L` tunnels are
@@ -1476,7 +1476,7 @@ fn start_instance(
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_ref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1682,7 +1682,7 @@ fn open_ssh_session(
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(&running.inst);
-    prepare_session_from_target(cfg, Some(&running.inst), running.target, repo.as_deref())
+    prepare_session_from_target(cfg, Some(&running.inst), running.target, repo.as_ref())
 }
 
 /// Build an `SshSession` from an already-resolved target.
@@ -1704,7 +1704,7 @@ fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: Option<&config::Instance>,
     target: backend::SshTarget,
-    repo: Option<&str>,
+    repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
     let mut env = backend::prepare_env_forwarding(cfg, repo)?;
     if let Some(inst) = inst
@@ -2978,7 +2978,10 @@ mod tests {
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);
         let slug = super::resolve_start_repo(&opts).expect("ok");
-        assert_eq!(slug.as_deref(), Some("trailofbits/coop"));
+        assert_eq!(
+            slug.as_ref().map(super::github_repo::RepoSlug::as_str),
+            Some("trailofbits/coop")
+        );
     }
 
     #[test]

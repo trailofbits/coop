@@ -896,7 +896,9 @@ pub type PlatformBackend = FirecrackerBackend;
 /// `mount` source has a host path we can scan for a `.git/config`
 /// `origin`. Returns `None` when no slug can be derived — pat-mode
 /// then falls back to a clear error.
-pub fn detect_instance_repo(inst: &crate::config::Instance) -> Option<String> {
+pub fn detect_instance_repo(
+    inst: &crate::config::Instance,
+) -> Option<crate::github_repo::RepoSlug> {
     use crate::workspace::WorkspaceSource;
 
     let state = crate::workspace::WorkspaceState::try_load(inst)
@@ -926,7 +928,10 @@ pub fn detect_instance_repo(inst: &crate::config::Instance) -> Option<String> {
 /// `git remote get-url origin` of the workspace. Pass `None` when no
 /// repo context is available; pat-mode then yields no token (the start
 /// flow surfaces a clearer error elsewhere).
-pub fn prepare_env_forwarding(cfg: &CoopConfig, repo: Option<&str>) -> Result<EnvForward> {
+pub fn prepare_env_forwarding(
+    cfg: &CoopConfig,
+    repo: Option<&crate::github_repo::RepoSlug>,
+) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let codex = &cfg.codex;
     let mut env = EnvForward::default();
@@ -1167,7 +1172,7 @@ fn compute_plugin_delta(cfg: &CoopConfig, image: &str) -> (Vec<String>, Vec<Stri
 /// with an entry that fails to resolve).
 fn resolve_github_token(
     strategy: Option<&GitHubAuth>,
-    repo: Option<&str>,
+    repo: Option<&crate::github_repo::RepoSlug>,
 ) -> Result<Option<String>> {
     // Default to Off — never forward tokens without explicit opt-in.
     // Users must set `github = "auto"` / `"env"` / `"pat"` in
@@ -1215,7 +1220,10 @@ fn resolve_github_token(
 
 /// Look up a `[github.pat."repo"]` entry and resolve its `token` via
 /// the `cmd:` indirection.
-fn resolve_pat_token(strategy: Option<&GitHubAuth>, repo: &str) -> Result<String> {
+fn resolve_pat_token(
+    strategy: Option<&GitHubAuth>,
+    repo: &crate::github_repo::RepoSlug,
+) -> Result<String> {
     let entry = strategy
         .and_then(|s| s.pat_entry(repo))
         .with_context(|| crate::github_pat::missing_entry_error(repo))?;
@@ -1734,7 +1742,10 @@ pub fn clone_git_repo(
 /// Returning `None` directs [`resolve_clone_token`] to fall through to
 /// [`host_github_token`] — preserving the pre-PAT behaviour for `Auto`,
 /// `Env`, `Off`, and `Pat`-without-a-matching-entry.
-fn clone_pat_slug(strategy: Option<&GitHubAuth>, repo_url: &str) -> Option<String> {
+fn clone_pat_slug(
+    strategy: Option<&GitHubAuth>,
+    repo_url: &str,
+) -> Option<crate::github_repo::RepoSlug> {
     let strategy = strategy?;
     let GitHubAuth::Pat(_) = strategy else {
         return None;
@@ -2215,8 +2226,9 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     fn pat_auth_with(entries: &[(&str, &str)]) -> GitHubAuth {
         let mut map = std::collections::BTreeMap::new();
         for (slug, token) in entries {
+            let slug = crate::github_repo::RepoSlug::new(slug).unwrap();
             map.insert(
-                (*slug).to_string(),
+                slug,
                 crate::config::PatEntry {
                     token: crate::config::Secret::new((*token).to_string()),
                 },
@@ -2231,9 +2243,10 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn clone_pat_slug_matches_when_entry_exists() {
         let auth = pat_auth_with(&[("owner/repo", "github_pat_dummy")]);
+        let expected = crate::github_repo::RepoSlug::new("owner/repo").unwrap();
         assert_eq!(
-            clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git").as_deref(),
-            Some("owner/repo")
+            clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git"),
+            Some(expected)
         );
     }
 

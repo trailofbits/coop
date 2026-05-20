@@ -357,8 +357,8 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build the conventional account name for a repo's PAT entry.
-pub fn account_for_repo(repo: &str) -> String {
-    repo.replace('/', "-")
+pub fn account_for_repo(repo: &crate::github_repo::RepoSlug) -> String {
+    repo.as_str().replace('/', "-")
 }
 
 /// Conventional service name used across all backends.
@@ -383,10 +383,8 @@ mod tests {
 
     #[test]
     fn account_replaces_slash() {
-        assert_eq!(
-            account_for_repo("trailofbits/coop"),
-            "trailofbits-coop".to_string()
-        );
+        let slug = crate::github_repo::RepoSlug::new("trailofbits/coop").unwrap();
+        assert_eq!(account_for_repo(&slug), "trailofbits-coop".to_string());
     }
 
     #[test]
