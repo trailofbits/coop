@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::backend::LogMode;
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, Instance};
 
@@ -380,25 +381,28 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 
     /// Stream the Firecracker log file to stdout.
-    pub fn stream_logs(&self, follow: bool) -> Result<()> {
+    pub fn stream_logs(&self, mode: LogMode) -> Result<()> {
         let log_path = self.inst.log_path();
         if !log_path.exists() {
             bail!("No log file found at {}", log_path.display());
         }
 
-        if follow {
-            let mut child = Command::new("tail")
-                .arg("-f")
-                .arg(&log_path)
-                .spawn()
-                .context("Failed to tail log file")?;
-            child.wait().context("Log streaming interrupted")?;
-        } else {
-            let file = fs::File::open(&log_path).context("Failed to open log file")?;
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = line.context("Failed to read log line")?;
-                writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+        match mode {
+            LogMode::Follow => {
+                let mut child = Command::new("tail")
+                    .arg("-f")
+                    .arg(&log_path)
+                    .spawn()
+                    .context("Failed to tail log file")?;
+                child.wait().context("Log streaming interrupted")?;
+            }
+            LogMode::Snapshot => {
+                let file = fs::File::open(&log_path).context("Failed to open log file")?;
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let line = line.context("Failed to read log line")?;
+                    writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+                }
             }
         }
         Ok(())

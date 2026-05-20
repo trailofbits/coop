@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::SshTarget;
+use crate::backend::{LogMode, SshTarget};
 use crate::config::{CoopConfig, GiB, Instance};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
@@ -358,7 +358,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
 }
 
 /// Stream Lima instance logs.
-pub fn stream_logs(inst: &Instance, follow: bool) -> Result<()> {
+pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
     let name = lima_name(inst);
 
     // Lima logs are in ~/.lima/<name>/serial.log
@@ -379,19 +379,22 @@ pub fn stream_logs(inst: &Instance, follow: bool) -> Result<()> {
         );
     };
 
-    if follow {
-        let mut child = Command::new("tail")
-            .arg("-f")
-            .arg(&log_path)
-            .spawn()
-            .context("Failed to tail log file")?;
-        child.wait().context("Log streaming interrupted")?;
-    } else {
-        let file = fs::File::open(&log_path).context("Failed to open log file")?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line.context("Failed to read log line")?;
-            writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+    match mode {
+        LogMode::Follow => {
+            let mut child = Command::new("tail")
+                .arg("-f")
+                .arg(&log_path)
+                .spawn()
+                .context("Failed to tail log file")?;
+            child.wait().context("Log streaming interrupted")?;
+        }
+        LogMode::Snapshot => {
+            let file = fs::File::open(&log_path).context("Failed to open log file")?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line.context("Failed to read log line")?;
+                writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+            }
         }
     }
     Ok(())

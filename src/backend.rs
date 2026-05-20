@@ -38,6 +38,26 @@ impl std::fmt::Display for GuestPath {
     }
 }
 
+// ── Operation modes ───────────────────────────────────────────
+
+/// Whether an agent bootstrap is running for the first boot of a new
+/// VM or for a restart of an existing one. On restart, marketplaces,
+/// plugins, and MCP servers are skipped because they persist on the
+/// guest disk across stop/start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootMode {
+    FirstBoot,
+    Restart,
+}
+
+/// Whether log streaming reads the existing log once and exits or
+/// tails it indefinitely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    Snapshot,
+    Follow,
+}
+
 // ── Environment forwarding ────────────────────────────────────
 
 /// Environment variables to forward to guest VMs via SSH `SendEnv`.
@@ -587,7 +607,7 @@ pub trait VmBackend: std::fmt::Display {
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
     fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String>;
-    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, follow: bool) -> Result<()>;
+    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()>;
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
@@ -738,9 +758,9 @@ impl VmBackend for FirecrackerBackend {
         vm.status()
     }
 
-    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, follow: bool) -> Result<()> {
+    fn stream_logs(&self, cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()> {
         let vm = crate::vm::FirecrackerVm::from_running(cfg, inst)?;
-        vm.stream_logs(follow)
+        vm.stream_logs(mode)
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
@@ -862,8 +882,8 @@ impl VmBackend for LimaBackend {
         crate::lima::status(cfg, inst)
     }
 
-    fn stream_logs(&self, _cfg: &CoopConfig, inst: &Instance, follow: bool) -> Result<()> {
-        crate::lima::stream_logs(inst, follow)
+    fn stream_logs(&self, _cfg: &CoopConfig, inst: &Instance, mode: LogMode) -> Result<()> {
+        crate::lima::stream_logs(inst, mode)
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
@@ -1011,7 +1031,7 @@ pub fn bootstrap_agents(
     session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
-    restart: bool,
+    mode: BootMode,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1020,8 +1040,8 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, restart)?;
-    bootstrap_codex(session, cfg, restart)?;
+    bootstrap_claude(session, cfg, inst, mode)?;
+    bootstrap_codex(session, cfg, mode)?;
 
     Ok(())
 }
@@ -1031,7 +1051,7 @@ pub fn bootstrap_agents(
 /// Runs the bootstrap sequence: GitHub auth, user content
 /// (CLAUDE.md, rules), marketplaces, plugins, MCP servers.
 ///
-/// On restart (`restart=true`), only refreshes ephemeral state
+/// On `BootMode::Restart`, only refreshes ephemeral state
 /// (GitHub auth, CLAUDE.md, rules). Marketplaces, plugins, and
 /// MCP servers persist on the guest disk across stop/start.
 ///
@@ -1043,11 +1063,11 @@ fn bootstrap_claude(
     session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
-    restart: bool,
+    mode: BootMode,
 ) -> Result<()> {
     let claude = &cfg.claude;
 
-    if !restart {
+    if let BootMode::FirstBoot = mode {
         let needs_claude_cli = !claude.marketplaces.is_empty()
             || !claude.plugins.is_empty()
             || !claude.mcp_servers.is_empty();
@@ -1075,7 +1095,7 @@ fn bootstrap_claude(
 
     // Marketplaces, plugins, MCP servers — persisted on guest disk,
     // only install on first boot
-    if !restart {
+    if let BootMode::FirstBoot = mode {
         // Compute delta: only install marketplaces/plugins not already
         // baked into the golden image
         let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
@@ -1102,7 +1122,7 @@ fn bootstrap_claude(
 /// Codex uses `~/.codex/config.toml` for MCP registration and related
 /// settings, so bootstrap writes allowlisted user config files and a
 /// managed MCP section there when configured.
-fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, restart: bool) -> Result<()> {
+fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, mode: BootMode) -> Result<()> {
     let codex = &cfg.codex;
     let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
     let needs_codex = codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers);
@@ -1120,10 +1140,9 @@ fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, restart: bool) -> Res
 
     copy_codex_config(&session.target, source_dir.as_deref(), codex)?;
 
-    if restart {
-        tracing::info!("Codex bootstrap refreshed");
-    } else {
-        tracing::info!("Codex bootstrap complete");
+    match mode {
+        BootMode::Restart => tracing::info!("Codex bootstrap refreshed"),
+        BootMode::FirstBoot => tracing::info!("Codex bootstrap complete"),
     }
 
     Ok(())

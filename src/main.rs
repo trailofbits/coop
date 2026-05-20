@@ -825,7 +825,12 @@ fn main() -> Result<()> {
         Commands::Status { name } => cmd_status(&be, &cfg, name.as_deref()),
         Commands::Logs { name, follow } => {
             let running = resolve_running(&be, &cfg, name.as_deref())?;
-            be.stream_logs(&cfg, &running.inst, follow)
+            let mode = if follow {
+                backend::LogMode::Follow
+            } else {
+                backend::LogMode::Snapshot
+            };
+            be.stream_logs(&cfg, &running.inst, mode)
         }
         Commands::Push {
             name,
@@ -1381,7 +1386,7 @@ fn restart_instance(
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
-            backend::bootstrap_agents(&session, cfg, inst, true)?;
+            backend::bootstrap_agents(&session, cfg, inst, backend::BootMode::Restart)?;
         }
         if let Some(cmd) = post_start {
             backend::run_post_start(&session, cmd);
@@ -1482,7 +1487,7 @@ fn start_instance(
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
-            backend::bootstrap_agents(&session, cfg, inst, false)?;
+            backend::bootstrap_agents(&session, cfg, inst, backend::BootMode::FirstBoot)?;
         }
         if let Some(cmd) = post_start {
             backend::run_post_start(&session, cmd);
