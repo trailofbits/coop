@@ -2354,17 +2354,20 @@ test_port_forwards() {
     fi
 
     # Collision: starting another forward to the same host port should error.
+    # The coop() wrapper captures the binary's stderr into $HARNESS_ERR — an
+    # outer `2>` redirect here would be shadowed by the wrapper's internal
+    # redirect and silently capture nothing.
     local fwd_instance2="${INSTANCE}-fwd2"
-    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}" 2>"$content_file.err"; then
+    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance2")
         fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
         coop destroy "$fwd_instance2" 2>/dev/null || true
         untrack_instance "$fwd_instance2"
     else
-        if grep -q "already in use" "$content_file.err"; then
+        if grep -q "already in use" <<<"$HARNESS_ERR"; then
             pass "collision detection rejects in-use host port"
         else
-            fail "collision detection rejects in-use host port" "stderr: $(cat "$content_file.err")"
+            fail "collision detection rejects in-use host port" "stderr: $HARNESS_ERR"
         fi
     fi
 
@@ -2383,7 +2386,7 @@ test_port_forwards() {
 
     coop destroy "$fwd_instance" 2>/dev/null || true
     untrack_instance "$fwd_instance"
-    rm -f "$content_file" "$content_file.got" "$content_file.err"
+    rm -f "$content_file" "$content_file.got"
 }
 
 test_mount_conflicts() {
