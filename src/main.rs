@@ -728,6 +728,16 @@ fn main() -> Result<()> {
             for (key, value) in &cli_guest_env {
                 cfg.guest_env.insert(key.clone(), value.clone());
             }
+            // Union of CLI `--env` and devcontainer `containerEnv`. Both
+            // are start-time inputs that won't be re-derived by later
+            // `coop shell`/`exec`, so they belong in the on-disk snapshot
+            // (see `guest_env_state` module docs for the rationale).
+            let dc_guest_env = translation
+                .as_ref()
+                .map(|t| t.guest_env.clone())
+                .unwrap_or_default();
+            let persisted_guest_env =
+                guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
             let cli_disk = disk
                 .map(|d| config::GiB::new(d).context("--disk must be > 0"))
                 .transpose()?;
@@ -767,7 +777,7 @@ fn main() -> Result<()> {
                     forward_ports,
                     config_path: &cli.config,
                     post_start_override: post_start_override.as_deref(),
-                    cli_guest_env,
+                    persisted_guest_env,
                 },
             )
         }
@@ -1136,11 +1146,13 @@ struct StartOpts<'a> {
     /// CLI override for `post_start` from `config.toml`. `None` means
     /// "use the configured value (if any)"; `Some` always wins.
     post_start_override: Option<&'a str>,
-    /// Parsed `--env KEY=VALUE` set from this invocation. Persisted as
-    /// the per-instance snapshot so later `coop shell`/`exec` runs see
-    /// the values — `config.toml` and devcontainer-derived entries are
-    /// re-read every invocation and are deliberately not saved here.
-    cli_guest_env: std::collections::BTreeMap<String, String>,
+    /// Start-time guest-env entries to persist as the per-instance
+    /// snapshot, so later `coop shell`/`exec` runs see them. This is
+    /// the union of CLI `--env KEY=VALUE` and the devcontainer
+    /// translator's `containerEnv` map (CLI wins per-key). `[guest_env]`
+    /// from `config.toml` is re-read every invocation and deliberately
+    /// not saved here.
+    persisted_guest_env: std::collections::BTreeMap<String, String>,
 }
 
 fn cmd_start(
@@ -1322,14 +1334,15 @@ fn restart_instance(
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
-    // Re-apply the `--env` set from the initial start. New `--env` on
-    // restart overrides per-key; the merged result is what gets
-    // persisted (and forwarded for this restart's bootstrap).
+    // Re-apply the persisted guest-env set from the initial start
+    // (CLI `--env` ∪ devcontainer `containerEnv`). New start-time
+    // entries on restart override per-key; the merged result is what
+    // gets persisted (and forwarded for this restart's bootstrap).
     let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
     let mut merged_guest_env = saved_guest_env;
-    for (key, value) in &opts.cli_guest_env {
+    for (key, value) in &opts.persisted_guest_env {
         merged_guest_env.insert(key.clone(), value.clone());
     }
     for (key, value) in &merged_guest_env {
@@ -1448,12 +1461,14 @@ fn start_instance(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
-    // Persist the CLI `--env` set so later commands targeting this
-    // instance (which reload `config.toml` from scratch) still forward
-    // these values via SSH `SendEnv`. The in-memory `cfg.guest_env`
-    // already contains them for this process's bootstrap pass.
+    // Persist start-time guest-env entries (CLI `--env` ∪ devcontainer
+    // `containerEnv`) so later commands targeting this instance — which
+    // reload `config.toml` from scratch and do not re-parse
+    // `--devcontainer` — still forward these values via SSH `SendEnv`.
+    // The in-memory `cfg.guest_env` already contains them for this
+    // process's bootstrap pass.
     guest_env_state::GuestEnvState {
-        entries: opts.cli_guest_env.clone(),
+        entries: opts.persisted_guest_env.clone(),
     }
     .save(inst)?;
 
@@ -2939,7 +2954,7 @@ mod tests {
             forward_ports: Vec::new(),
             config_path,
             post_start_override: None,
-            cli_guest_env: std::collections::BTreeMap::new(),
+            persisted_guest_env: std::collections::BTreeMap::new(),
         }
     }
 

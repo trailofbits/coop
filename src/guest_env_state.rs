@@ -1,18 +1,25 @@
-//! Per-instance snapshot of `--env` overrides applied at `coop start`.
+//! Per-instance snapshot of start-time guest env overrides.
 //!
-//! Mirrors [`crate::port_forward::ForwardsState`]: `--env KEY=VALUE` lives
-//! only in the `coop start` process's memory, so subsequent invocations
-//! like `coop shell` reload `config.toml` and never see those values.
-//! Persisting the CLI-provided entries lets every later invocation
-//! against the same instance forward them via SSH `SendEnv`.
+//! Mirrors [`crate::port_forward::ForwardsState`]. Two sources contribute
+//! entries that live only in the `coop start` process's memory and would
+//! otherwise be lost to subsequent `coop shell`/`exec` invocations
+//! (which reload `config.toml` from scratch):
 //!
-//! The snapshot stores **only** the CLI-provided `--env` set (not the
-//! whole merged `guest_env` map). `[guest_env]` from `config.toml` and
-//! devcontainer-derived entries are re-read from disk on every command,
-//! so persisting them would freeze edits the user made between `start`
-//! and `shell`. Restart can extend or override the snapshot — passing
-//! `--env KEY=newvalue` on `coop start <stopped>` wins over the saved
-//! value for that key and replaces it in the saved set.
+//! - `--env KEY=VALUE` from the CLI
+//! - `containerEnv` translated from a `--devcontainer` JSON file
+//!
+//! Both are passed at start time and never re-derived by later commands,
+//! so we persist them here and overlay them onto the resolved env-forward
+//! set in [`crate::prepare_session_from_target`].
+//!
+//! `[guest_env]` from `config.toml` is deliberately *not* in the snapshot:
+//! it is re-read on every invocation, so persisting it would freeze edits
+//! the user made between `start` and `shell`.
+//!
+//! Restart can extend or override the snapshot — passing `--env
+//! KEY=newvalue` (or a `--devcontainer` whose `containerEnv` carries a
+//! new value) on `coop start <stopped>` wins over the saved value for
+//! that key and replaces it in the saved set.
 //!
 //! Persistence layout: one JSON file at `<inst.dir>/guest_env.json`.
 //! Empty snapshots are not written; an empty file would be ambiguous
@@ -27,8 +34,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Instance;
 
-/// Persisted CLI `--env KEY=VALUE` snapshot, applied on every later
-/// `coop` invocation that targets the same instance.
+/// Persisted start-time guest-env snapshot (CLI `--env` plus
+/// devcontainer `containerEnv`), applied on every later `coop`
+/// invocation that targets the same instance.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GuestEnvState {
     /// Entries to overlay onto the resolved env-forward set. `BTreeMap`
@@ -76,6 +84,25 @@ impl GuestEnvState {
             }
         }
     }
+}
+
+/// Merge devcontainer `containerEnv` and CLI `--env` entries into the
+/// single map persisted as [`GuestEnvState`]. CLI wins on key conflict,
+/// matching the documented "CLI > devcontainer.json" precedence.
+///
+/// The translator already filters CLI keys out of its `guest_env` map
+/// (see `translate_container_env`), so in practice there is no overlap;
+/// the explicit CLI-wins insertion is defensive against future changes.
+#[must_use]
+pub fn merge_persisted_entries(
+    devcontainer_entries: &BTreeMap<String, String>,
+    cli_entries: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = devcontainer_entries.clone();
+    for (key, value) in cli_entries {
+        out.insert(key.clone(), value.clone());
+    }
+    out
 }
 
 /// Parse `--env KEY=VALUE` argument list into a `BTreeMap`.
@@ -149,6 +176,30 @@ mod tests {
 
         GuestEnvState::default().save(&inst).unwrap();
         assert!(!inst.guest_env_state_path().exists());
+    }
+
+    #[test]
+    fn merge_persisted_entries_unions_disjoint_keys() {
+        let dc = BTreeMap::from([("DC".to_string(), "1".to_string())]);
+        let cli = BTreeMap::from([("CLI".to_string(), "2".to_string())]);
+        let merged = merge_persisted_entries(&dc, &cli);
+        assert_eq!(merged.get("DC").map(String::as_str), Some("1"));
+        assert_eq!(merged.get("CLI").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn merge_persisted_entries_cli_wins_on_conflict() {
+        let dc = BTreeMap::from([("K".to_string(), "from-devcontainer".to_string())]);
+        let cli = BTreeMap::from([("K".to_string(), "from-cli".to_string())]);
+        let merged = merge_persisted_entries(&dc, &cli);
+        assert_eq!(merged.get("K").map(String::as_str), Some("from-cli"));
+    }
+
+    #[test]
+    fn merge_persisted_entries_devcontainer_only() {
+        let dc = BTreeMap::from([("ONLY_DC".to_string(), "x".to_string())]);
+        let merged = merge_persisted_entries(&dc, &BTreeMap::new());
+        assert_eq!(merged.get("ONLY_DC").map(String::as_str), Some("x"));
     }
 
     #[test]
