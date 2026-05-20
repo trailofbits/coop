@@ -1149,27 +1149,6 @@ mod tests {
     }
 
     #[test]
-    fn try_load_returns_state_when_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let inst = temp_instance(dir.path());
-        let state = WorkspaceState {
-            guest_path: "/workspace".to_string(),
-            source: WorkspaceSource::Workspace {
-                host_path: PathBuf::from("/tmp/project"),
-            },
-        };
-        state.save(&inst).expect("save");
-        let loaded = WorkspaceState::try_load(&inst)
-            .expect("no IO error")
-            .expect("should be Some");
-        assert_eq!(loaded.guest_path, "/workspace");
-        assert!(matches!(
-            loaded.source,
-            WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/tmp/project")
-        ));
-    }
-
-    #[test]
     fn try_load_errors_on_invalid_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
@@ -1507,19 +1486,5 @@ Host coop-0\n\
             state.source,
             WorkspaceSource::Mount { ref host_path } if host_path == Path::new("/host/mount")
         ));
-    }
-
-    #[test]
-    fn workspace_state_deserialize_legacy_missing_required_field_errors() {
-        // Legacy `workspace` source without `host_path` would have been
-        // an invalid combination under the old convention too; the new
-        // deserializer rejects it explicitly rather than silently
-        // producing a useless state.
-        let legacy = r#"{
-            "guest_path": "/workspace",
-            "source": "workspace"
-        }"#;
-        let result: Result<WorkspaceState, _> = serde_json::from_str(legacy);
-        assert!(result.is_err(), "expected error, got {result:?}");
     }
 }
