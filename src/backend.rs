@@ -897,15 +897,17 @@ pub type PlatformBackend = FirecrackerBackend;
 /// `origin`. Returns `None` when no slug can be derived — pat-mode
 /// then falls back to a clear error.
 pub fn detect_instance_repo(inst: &crate::config::Instance) -> Option<String> {
+    use crate::workspace::WorkspaceSource;
+
     let state = crate::workspace::WorkspaceState::try_load(inst)
         .ok()
         .flatten()?;
-    if let Some(url) = state.git_repo_url.as_deref()
+    if let WorkspaceSource::GitRepo { url, .. } = &state.source
         && let Some(slug) = crate::github_repo::parse_repo_slug_from_url(url)
     {
         return Some(slug);
     }
-    if let Some(host) = state.host_path.as_deref()
+    if let Some(host) = state.source.host_path()
         && let Ok(Some(slug)) = crate::github_repo::detect_workspace_repo(host)
     {
         return Some(slug);

@@ -1253,7 +1253,7 @@ fn find_stopped_instance(
                 workspace::WorkspaceState::try_load(inst)
                     .ok()
                     .flatten()
-                    .and_then(|s| s.host_path)
+                    .and_then(|s| s.source.host_path().map(Path::to_path_buf))
                     .is_some_and(|hp| hp == canonical)
             })
             .map(|(i, _)| i)
@@ -1505,20 +1505,21 @@ fn start_instance(
         workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
-            host_path: Some(abs_path),
             guest_path: "/workspace".to_string(),
-            source: workspace::WorkspaceSource::Workspace,
-            git_repo_url: None,
+            source: workspace::WorkspaceSource::Workspace {
+                host_path: abs_path,
+            },
         };
         state.save(inst)?;
     } else if let Some(repo_url) = opts.git_repo {
         backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
         let state = workspace::WorkspaceState {
-            host_path: None,
             guest_path: "/workspace".to_string(),
-            source: workspace::WorkspaceSource::GitRepo,
-            git_repo_url: Some(repo_url.to_string()),
+            source: workspace::WorkspaceSource::GitRepo {
+                url: repo_url.to_string(),
+                host_path: None,
+            },
         };
         state.save(inst)?;
     } else if !opts.mounts.is_empty() {
