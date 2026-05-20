@@ -1518,7 +1518,6 @@ fn start_instance(
             guest_path: "/workspace".to_string(),
             source: workspace::WorkspaceSource::GitRepo {
                 url: repo_url.to_string(),
-                host_path: None,
             },
         };
         state.save(inst)?;

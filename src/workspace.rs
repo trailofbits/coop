@@ -38,36 +38,27 @@ pub struct WorkspaceState {
 
 /// How the workspace contents arrived in the guest.
 ///
-/// The variant payloads encode the invariants the previous flat shape
-/// had to enforce by convention: `Workspace` and `Mount` always have a
-/// host path; `GitRepo` has the original URL (used to re-derive the
-/// `owner/repo` slug on follow-up commands) and an optional host path
-/// (set when the clone has a known local origin).
+/// `Workspace` and `Mount` always have a host directory (pushed/synced
+/// or live-mounted). `GitRepo` clones happen entirely inside the guest
+/// — there is no host-side copy, only the original URL used to
+/// re-derive the `owner/repo` slug for follow-up commands.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceSource {
-    Workspace {
-        host_path: PathBuf,
-    },
-    GitRepo {
-        url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        host_path: Option<PathBuf>,
-    },
-    Mount {
-        host_path: PathBuf,
-    },
+    Workspace { host_path: PathBuf },
+    GitRepo { url: String },
+    Mount { host_path: PathBuf },
 }
 
 impl WorkspaceSource {
     /// Return the host path associated with this source, if any.
     ///
-    /// Only `GitRepo` can be `None`: a clone with no local origin has
-    /// no host directory to point back at.
+    /// `GitRepo` has no host path: the clone exists only inside the
+    /// guest.
     pub fn host_path(&self) -> Option<&Path> {
         match self {
             Self::Workspace { host_path } | Self::Mount { host_path } => Some(host_path),
-            Self::GitRepo { host_path, .. } => host_path.as_deref(),
+            Self::GitRepo { .. } => None,
         }
     }
 }
@@ -128,10 +119,10 @@ impl<'de> Deserialize<'de> for WorkspaceState {
                             "legacy git_repo source requires top-level `git_repo_url`",
                         )
                     })?;
-                    WorkspaceSource::GitRepo {
-                        url,
-                        host_path: raw.host_path,
-                    }
+                    // Any stray top-level `host_path` is discarded: the old
+                    // shape carried `Option<PathBuf>` but the previous coop
+                    // never wrote a non-None value for git_repo sources.
+                    WorkspaceSource::GitRepo { url }
                 }
                 LegacyTag::Mount => {
                     let host_path = raw.host_path.ok_or_else(|| {
@@ -1165,7 +1156,6 @@ mod tests {
             guest_path: "/custom".to_string(),
             source: WorkspaceSource::GitRepo {
                 url: "https://github.com/x/y.git".to_string(),
-                host_path: Some(PathBuf::from("/host/dir")),
             },
         };
         state.save(&inst).expect("save");
@@ -1393,36 +1383,17 @@ Host coop-0\n\
     }
 
     #[test]
-    fn workspace_state_round_trip_git_repo_with_host_path() {
+    fn workspace_state_round_trip_git_repo() {
         let state = WorkspaceState {
             guest_path: "/workspace".to_string(),
             source: WorkspaceSource::GitRepo {
                 url: "https://github.com/x/y.git".to_string(),
-                host_path: Some(PathBuf::from("/host/clone")),
             },
         };
         let back = round_trip(&state);
         assert!(matches!(
             back.source,
-            WorkspaceSource::GitRepo { ref url, host_path: Some(ref hp) }
-                if url == "https://github.com/x/y.git" && hp == Path::new("/host/clone")
-        ));
-    }
-
-    #[test]
-    fn workspace_state_round_trip_git_repo_without_host_path() {
-        let state = WorkspaceState {
-            guest_path: "/workspace".to_string(),
-            source: WorkspaceSource::GitRepo {
-                url: "https://github.com/x/y.git".to_string(),
-                host_path: None,
-            },
-        };
-        let back = round_trip(&state);
-        assert!(matches!(
-            back.source,
-            WorkspaceSource::GitRepo { ref url, host_path: None }
-                if url == "https://github.com/x/y.git"
+            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
         ));
     }
 
@@ -1460,7 +1431,7 @@ Host coop-0\n\
     }
 
     #[test]
-    fn workspace_state_deserialize_legacy_git_repo_no_host_path() {
+    fn workspace_state_deserialize_legacy_git_repo() {
         let legacy = r#"{
             "guest_path": "/workspace",
             "source": "git_repo",
@@ -1469,8 +1440,7 @@ Host coop-0\n\
         let state: WorkspaceState = serde_json::from_str(legacy).expect("legacy parses");
         assert!(matches!(
             state.source,
-            WorkspaceSource::GitRepo { ref url, host_path: None }
-                if url == "https://github.com/x/y.git"
+            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
         ));
     }
 
