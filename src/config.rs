@@ -1558,6 +1558,10 @@ impl Instance {
         self.dir.join("forwards.json")
     }
 
+    pub fn guest_env_state_path(&self) -> PathBuf {
+        self.dir.join("guest_env.json")
+    }
+
     pub fn tap_device(&self) -> String {
         format!("tap{}", self.index)
     }

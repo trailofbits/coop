@@ -7,6 +7,7 @@ mod fs_util;
 mod github_pat;
 mod github_repo;
 mod guest;
+mod guest_env_state;
 mod pat_prompt;
 mod port_forward;
 mod secret_store;
@@ -723,7 +724,10 @@ fn main() -> Result<()> {
                 forward_ports =
                     devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
             }
-            merge_cli_guest_env(&mut cfg, &guest_env)?;
+            let cli_guest_env = guest_env_state::parse_cli_env_args(&guest_env)?;
+            for (key, value) in &cli_guest_env {
+                cfg.guest_env.insert(key.clone(), value.clone());
+            }
             let cli_disk = disk
                 .map(|d| config::GiB::new(d).context("--disk must be > 0"))
                 .transpose()?;
@@ -763,6 +767,7 @@ fn main() -> Result<()> {
                     forward_ports,
                     config_path: &cli.config,
                     post_start_override: post_start_override.as_deref(),
+                    cli_guest_env,
                 },
             )
         }
@@ -1023,23 +1028,6 @@ fn apply_vm_overrides(
     Ok(())
 }
 
-/// Merge `--env KEY=VALUE` arguments into `cfg.guest_env`.
-///
-/// CLI values override config entries with the same key. Empty keys
-/// and values without `=` are rejected; empty values are allowed.
-fn merge_cli_guest_env(cfg: &mut config::CoopConfig, args: &[String]) -> Result<()> {
-    for entry in args {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
-        if key.is_empty() {
-            bail!("--env KEY must not be empty (got '{entry}')");
-        }
-        cfg.guest_env.insert(key.to_string(), value.to_string());
-    }
-    Ok(())
-}
-
 /// CLI surface controlling devcontainer.json discovery and apply.
 ///
 /// `explicit_path` opts the caller in to a specific file (skips the
@@ -1148,6 +1136,11 @@ struct StartOpts<'a> {
     /// CLI override for `post_start` from `config.toml`. `None` means
     /// "use the configured value (if any)"; `Some` always wins.
     post_start_override: Option<&'a str>,
+    /// Parsed `--env KEY=VALUE` set from this invocation. Persisted as
+    /// the per-instance snapshot so later `coop shell`/`exec` runs see
+    /// the values — `config.toml` and devcontainer-derived entries are
+    /// re-read every invocation and are deliberately not saved here.
+    cli_guest_env: std::collections::BTreeMap<String, String>,
 }
 
 fn cmd_start(
@@ -1329,6 +1322,20 @@ fn restart_instance(
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    // Re-apply the `--env` set from the initial start. New `--env` on
+    // restart overrides per-key; the merged result is what gets
+    // persisted (and forwarded for this restart's bootstrap).
+    let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
+        .map(|s| s.entries)
+        .unwrap_or_default();
+    let mut merged_guest_env = saved_guest_env;
+    for (key, value) in &opts.cli_guest_env {
+        merged_guest_env.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &merged_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+
     be.start_existing(cfg, inst)?;
 
     signal::check_shutdown()?;
@@ -1346,11 +1353,16 @@ fn restart_instance(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
+    guest_env_state::GuestEnvState {
+        entries: merged_guest_env,
+    }
+    .save(inst)?;
+
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1436,11 +1448,20 @@ fn start_instance(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
 
+    // Persist the CLI `--env` set so later commands targeting this
+    // instance (which reload `config.toml` from scratch) still forward
+    // these values via SSH `SendEnv`. The in-memory `cfg.guest_env`
+    // already contains them for this process's bootstrap pass.
+    guest_env_state::GuestEnvState {
+        entries: opts.cli_guest_env.clone(),
+    }
+    .save(inst)?;
+
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let session = prepare_session_from_target(cfg, target.clone(), repo.as_deref())?;
+        let session = prepare_session_from_target(cfg, None, target.clone(), repo.as_deref())?;
         if opts.no_agents {
             tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         } else {
@@ -1646,7 +1667,7 @@ fn open_ssh_session(
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(&running.inst);
-    prepare_session_from_target(cfg, running.target, repo.as_deref())
+    prepare_session_from_target(cfg, Some(&running.inst), running.target, repo.as_deref())
 }
 
 /// Build an `SshSession` from an already-resolved target.
@@ -1655,12 +1676,29 @@ fn open_ssh_session(
 /// target without going through `resolve_running` — namely the
 /// post-boot bootstrap in fresh start and restart, where the
 /// instance isn't yet registered as running.
+///
+/// When `inst` is `Some`, any persisted `--env` snapshot for that
+/// instance is overlaid onto the resolved env-forward set so values
+/// passed at `coop start --env KEY=VAL` survive across the
+/// per-invocation config reload. Bootstrap callers inside fresh
+/// `start_instance` pass `None` because the in-memory `cfg.guest_env`
+/// is already authoritative for that one process; restart and every
+/// post-start command pass `Some` because the on-disk snapshot is
+/// the only place the original `--env` set still lives.
 fn prepare_session_from_target(
     cfg: &config::CoopConfig,
+    inst: Option<&config::Instance>,
     target: backend::SshTarget,
     repo: Option<&str>,
 ) -> Result<backend::SshSession> {
-    let env = backend::prepare_env_forwarding(cfg, repo)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo)?;
+    if let Some(inst) = inst
+        && let Some(state) = guest_env_state::GuestEnvState::try_load(inst)?
+    {
+        for (name, value) in &state.entries {
+            env.set(name.as_str(), value.as_str());
+        }
+    }
     Ok(backend::SshSession { target, env })
 }
 
@@ -2454,62 +2492,77 @@ mod tests {
         );
     }
 
+    /// `prepare_session_from_target` must overlay the on-disk
+    /// `GuestEnvState` for the running instance on top of values
+    /// resolved from `cfg.guest_env` and forwarded host env vars.
+    /// This is the regression test for issue #131: `coop start --env`
+    /// values must survive across a fresh config reload by later
+    /// `coop shell`/`exec` invocations.
     #[test]
-    fn merge_cli_guest_env_inserts_and_overrides_config() {
+    fn prepare_session_overlays_persisted_guest_env() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::DEFAULT_IMAGE.to_string(),
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state
+            .entries
+            .insert("FROM_CLI".to_string(), "saved-value".to_string());
+        state.save(&inst).expect("save snapshot");
+
         let mut cfg = super::config::CoopConfig::default();
+        // Sanity: an entry in cfg without a CLI override should still
+        // appear (so the overlay is additive, not replacing).
         cfg.guest_env
-            .insert("KEEP".to_string(), "from-config".to_string());
-        cfg.guest_env
-            .insert("OVERWRITE".to_string(), "from-config".to_string());
+            .insert("FROM_CFG".to_string(), "cfg-value".to_string());
 
-        super::merge_cli_guest_env(
-            &mut cfg,
-            &["OVERWRITE=from-cli".to_string(), "NEW=cli-only".to_string()],
-        )
-        .unwrap();
+        let target = super::backend::SshTarget {
+            host: "127.0.0.1".to_string(),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: "ubuntu".to_string(),
+            key_path: tmp.path().join("id_test"),
+        };
 
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+
+        let envs = session.env.as_envs();
         assert_eq!(
-            cfg.guest_env.get("KEEP").map(String::as_str),
-            Some("from-config")
+            envs.get("FROM_CLI").map(String::as_str),
+            Some("saved-value"),
+            "persisted CLI --env entry must reach SshSession",
         );
         assert_eq!(
-            cfg.guest_env.get("OVERWRITE").map(String::as_str),
-            Some("from-cli")
-        );
-        assert_eq!(
-            cfg.guest_env.get("NEW").map(String::as_str),
-            Some("cli-only")
+            envs.get("FROM_CFG").map(String::as_str),
+            Some("cfg-value"),
+            "config.toml [guest_env] entries must still flow through",
         );
     }
 
     #[test]
-    fn merge_cli_guest_env_allows_empty_value() {
-        let mut cfg = super::config::CoopConfig::default();
-        super::merge_cli_guest_env(&mut cfg, &["CLEAR=".to_string()]).unwrap();
-        assert_eq!(cfg.guest_env.get("CLEAR").map(String::as_str), Some(""));
-    }
+    fn prepare_session_skips_overlay_without_instance() {
+        use std::num::NonZeroU16;
 
-    #[test]
-    fn merge_cli_guest_env_rejects_missing_equals() {
-        let mut cfg = super::config::CoopConfig::default();
-        let err = super::merge_cli_guest_env(&mut cfg, &["NO_EQUALS".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("KEY=VALUE"));
-    }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = super::config::CoopConfig::default();
+        let target = super::backend::SshTarget {
+            host: "127.0.0.1".to_string(),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: "ubuntu".to_string(),
+            key_path: tmp.path().join("id_test"),
+        };
 
-    #[test]
-    fn merge_cli_guest_env_rejects_empty_key() {
-        let mut cfg = super::config::CoopConfig::default();
-        let err = super::merge_cli_guest_env(&mut cfg, &["=value".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("KEY"));
-    }
+        let session =
+            super::prepare_session_from_target(&cfg, None, target, None).expect("session");
 
-    #[test]
-    fn merge_cli_guest_env_value_may_contain_equals() {
-        let mut cfg = super::config::CoopConfig::default();
-        super::merge_cli_guest_env(&mut cfg, &["URL=https://x?a=b&c=d".to_string()]).unwrap();
-        assert_eq!(
-            cfg.guest_env.get("URL").map(String::as_str),
-            Some("https://x?a=b&c=d"),
+        assert!(
+            !session.env.contains("FROM_CLI"),
+            "without an instance, no persisted overlay should be applied",
         );
     }
 
@@ -2886,6 +2939,7 @@ mod tests {
             forward_ports: Vec::new(),
             config_path,
             post_start_override: None,
+            cli_guest_env: std::collections::BTreeMap::new(),
         }
     }
 
