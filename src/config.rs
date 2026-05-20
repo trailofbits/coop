@@ -902,8 +902,10 @@ pub enum McpServerDef {
     Stdio {
         command: String,
         args: Vec<String>,
-        /// Env var name mappings (key = server env name, value = host env var name).
-        env: HashMap<String, String>,
+        /// Env var name mappings: key is the variable the server reads,
+        /// value is the host env var name whose contents to forward.
+        /// Both sides are validated POSIX names at deserialize time.
+        env: BTreeMap<crate::guest_env_state::EnvVarName, crate::guest_env_state::EnvVarName>,
     },
     /// Remote server reached over HTTP.
     Http {
@@ -949,7 +951,7 @@ impl<'de> Deserialize<'de> for McpServerDef {
             #[serde(default)]
             url: Option<String>,
             #[serde(default)]
-            env: HashMap<String, String>,
+            env: BTreeMap<crate::guest_env_state::EnvVarName, crate::guest_env_state::EnvVarName>,
             #[serde(default)]
             headers: HashMap<String, String>,
         }
@@ -2809,13 +2811,35 @@ skip = ["not-a-slug"]
             McpServerDef::Stdio { command, args, env } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, vec!["-y", "@myorg/mcp-server"]);
+                let key = crate::guest_env_state::EnvVarName::new("API_KEY").unwrap();
                 assert_eq!(
-                    env.get("API_KEY").map(String::as_str),
+                    env.get(&key)
+                        .map(crate::guest_env_state::EnvVarName::as_str),
                     Some("MYORG_API_KEY")
                 );
             }
             other => panic!("expected Stdio, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_env_var_name() {
+        let json = r#"{"command": "x", "env": {"123BAD": "VALUE"}}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("123BAD"),
+            "error should reference the invalid name: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_env_var_value() {
+        let json = r#"{"command": "x", "env": {"KEY": "not a var name"}}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not a var name"),
+            "error should reference the invalid value: {err}"
+        );
     }
 
     #[test]
@@ -2922,7 +2946,7 @@ skip = ["not-a-slug"]
         let def = McpServerDef::Stdio {
             command: "npx".to_string(),
             args: vec!["-y".to_string()],
-            env: HashMap::new(),
+            env: BTreeMap::new(),
         };
         let json = serde_json::to_value(&def).unwrap();
         assert_eq!(json["command"], "npx");
