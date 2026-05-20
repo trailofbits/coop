@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
 use crate::guest::{BuiltinProfile, builtin_for_feature};
+use crate::guest_env_state::EnvVarName;
 
 /// Default relative path coop looks for inside a workspace or mount root.
 pub const DEFAULT_DEVCONTAINER_REL_PATH: &str = ".devcontainer/devcontainer.json";
@@ -379,7 +380,7 @@ pub struct Translation {
     pub mem_mib: Option<u32>,
     pub disk_gib: Option<u32>,
     pub post_start: Option<String>,
-    pub guest_env: BTreeMap<String, String>,
+    pub guest_env: BTreeMap<EnvVarName, String>,
     pub forward_ports: Vec<PortForward>,
     pub mounts: Vec<Mount>,
     pub profiles: Vec<String>,
@@ -689,11 +690,16 @@ fn translate_container_env(
         .collect();
     let mut overridden = Vec::new();
     let mut applied = Vec::new();
+    let mut invalid = Vec::new();
     for (k, v) in env {
+        let Ok(name) = EnvVarName::new(k) else {
+            invalid.push(k.clone());
+            continue;
+        };
         if cli_keys.contains(k.as_str()) {
             overridden.push(k.clone());
         } else {
-            t.guest_env.insert(k.clone(), v.clone());
+            t.guest_env.insert(name, v.clone());
             applied.push(k.clone());
         }
     }
@@ -713,6 +719,18 @@ fn translate_container_env(
             ReportSource::Cli,
             format!("{} entries", overridden.len()),
             format!("CLI --env overrides: {}", overridden.join(",")),
+        );
+    }
+    if !invalid.is_empty() {
+        t.report.push(
+            key,
+            ReportStatus::Invalid,
+            ReportSource::Devcontainer,
+            format!("{} entries", invalid.len()),
+            format!(
+                "invalid env var names (must match [a-zA-Z_][a-zA-Z0-9_]*): {}",
+                invalid.join(","),
+            ),
         );
     }
 }
@@ -1515,13 +1533,36 @@ mod tests {
             ..TranslatorInputs::default()
         };
         let t = translate(&f, &inputs, Stage::Start);
-        assert_eq!(t.guest_env.get("BAR").map(String::as_str), Some("y"));
-        assert!(!t.guest_env.contains_key("FOO"));
+        let bar = EnvVarName::new("BAR").unwrap();
+        let foo = EnvVarName::new("FOO").unwrap();
+        assert_eq!(t.guest_env.get(&bar).map(String::as_str), Some("y"));
+        assert!(!t.guest_env.contains_key(&foo));
         assert!(
             t.report
                 .entries
                 .iter()
                 .any(|e| e.key == "containerEnv" && e.status == ReportStatus::Overridden)
         );
+    }
+
+    #[test]
+    fn translate_container_env_reports_invalid_names() {
+        let f = parse(r#"{ "containerEnv": { "GOOD": "1", "1BAD": "2", "AL SO": "3" } }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert_eq!(
+            t.guest_env
+                .get(&EnvVarName::new("GOOD").unwrap())
+                .map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(t.guest_env.len(), 1, "invalid keys must be dropped");
+        let invalid = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "containerEnv" && e.status == ReportStatus::Invalid)
+            .unwrap();
+        assert!(invalid.note.contains("1BAD"));
+        assert!(invalid.note.contains("AL SO"));
     }
 }

@@ -552,7 +552,7 @@ pub struct CoopConfig {
     /// `BTreeMap` for deterministic iteration order — useful for
     /// snapshot/diagnostic stability.
     #[serde(default)]
-    pub guest_env: BTreeMap<String, String>,
+    pub guest_env: BTreeMap<crate::guest_env_state::EnvVarName, String>,
 
     /// User-defined profiles (name -> definition)
     #[serde(default)]

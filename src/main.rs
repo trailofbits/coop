@@ -1159,7 +1159,7 @@ struct StartOpts<'a> {
     /// translator's `containerEnv` map (CLI wins per-key). `[guest_env]`
     /// from `config.toml` is re-read every invocation and deliberately
     /// not saved here.
-    persisted_guest_env: std::collections::BTreeMap<String, String>,
+    persisted_guest_env: std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
 }
 
 fn cmd_start(
@@ -2532,16 +2532,19 @@ mod tests {
             image: super::config::DEFAULT_IMAGE.to_string(),
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
-        state
-            .entries
-            .insert("FROM_CLI".to_string(), "saved-value".to_string());
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
+            "saved-value".to_string(),
+        );
         state.save(&inst).expect("save snapshot");
 
         let mut cfg = super::config::CoopConfig::default();
         // Sanity: an entry in cfg without a CLI override should still
         // appear (so the overlay is additive, not replacing).
-        cfg.guest_env
-            .insert("FROM_CFG".to_string(), "cfg-value".to_string());
+        cfg.guest_env.insert(
+            super::guest_env_state::EnvVarName::new("FROM_CFG").expect("valid env var"),
+            "cfg-value".to_string(),
+        );
 
         let target = super::backend::SshTarget {
             host: "127.0.0.1".to_string(),

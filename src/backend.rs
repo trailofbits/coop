@@ -1002,7 +1002,7 @@ pub fn prepare_env_forwarding(
     // an inherited one. Warn on collision so the override is visible —
     // values are not logged (they may be secrets).
     for (name, value) in &cfg.guest_env {
-        if env.contains(name) {
+        if env.contains(name.as_str()) {
             tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
         }
         env.set(name.as_str(), value.as_str());
@@ -2361,7 +2361,10 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         cfg.codex.env_forward = Vec::new();
         cfg.github = None;
         for (k, v) in entries {
-            cfg.guest_env.insert((*k).to_string(), (*v).to_string());
+            cfg.guest_env.insert(
+                crate::guest_env_state::EnvVarName::new(k).unwrap(),
+                (*v).to_string(),
+            );
         }
         cfg
     }

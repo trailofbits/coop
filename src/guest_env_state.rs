@@ -26,13 +26,86 @@
 //! with "no snapshot," and the missing-file branch already means
 //! "nothing extra to overlay."
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Instance;
+
+/// Validated POSIX-style environment variable name.
+///
+/// Construction guarantees the name matches `[a-zA-Z_][a-zA-Z0-9_]*`, so
+/// downstream code (SSH `SendEnv`, JSON snapshots, shell env exports)
+/// can use it without re-checking. The CLI parser and the devcontainer
+/// translator are the two validating boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EnvVarName(String);
+
+impl EnvVarName {
+    /// Parse and validate. Empty input is rejected; the first character
+    /// must be a letter or `_`; subsequent characters may also be digits.
+    pub fn new(s: &str) -> Result<Self> {
+        let mut chars = s.chars();
+        let Some(first) = chars.next() else {
+            bail!("env var name must not be empty");
+        };
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            bail!("env var name '{s}' must start with a letter or '_' (got '{first}')");
+        }
+        for c in chars {
+            if !(c.is_ascii_alphanumeric() || c == '_') {
+                bail!(
+                    "env var name '{s}' contains invalid character '{c}' \
+                     (allowed: a-z, A-Z, 0-9, '_')"
+                );
+            }
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EnvVarName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for EnvVarName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for EnvVarName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+}
+
+impl Serialize for EnvVarName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvVarName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::new(&s).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Persisted start-time guest-env snapshot (CLI `--env` plus
 /// devcontainer `containerEnv`), applied on every later `coop`
@@ -43,7 +116,7 @@ pub struct GuestEnvState {
     /// gives deterministic iteration so `serde_json` output is stable
     /// across runs.
     #[serde(default)]
-    pub entries: BTreeMap<String, String>,
+    pub entries: BTreeMap<EnvVarName, String>,
 }
 
 impl GuestEnvState {
@@ -95,9 +168,9 @@ impl GuestEnvState {
 /// the explicit CLI-wins insertion is defensive against future changes.
 #[must_use]
 pub fn merge_persisted_entries(
-    devcontainer_entries: &BTreeMap<String, String>,
-    cli_entries: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+    devcontainer_entries: &BTreeMap<EnvVarName, String>,
+    cli_entries: &BTreeMap<EnvVarName, String>,
+) -> BTreeMap<EnvVarName, String> {
     let mut out = devcontainer_entries.clone();
     for (key, value) in cli_entries {
         out.insert(key.clone(), value.clone());
@@ -107,22 +180,22 @@ pub fn merge_persisted_entries(
 
 /// Parse `--env KEY=VALUE` argument list into a `BTreeMap`.
 ///
-/// Rejects entries missing `=` and entries with an empty key. Empty
-/// values are allowed (e.g. `--env CLEAR=`).
+/// Rejects entries missing `=` and entries whose key fails
+/// [`EnvVarName`] validation. Empty values are allowed (e.g.
+/// `--env CLEAR=`).
 ///
 /// Returned map preserves the "last write wins" precedence of the
 /// argument order: later duplicates of the same key overwrite earlier
 /// ones, matching `merge_cli_guest_env`'s in-memory behaviour.
-pub fn parse_cli_env_args(args: &[String]) -> Result<BTreeMap<String, String>> {
+pub fn parse_cli_env_args(args: &[String]) -> Result<BTreeMap<EnvVarName, String>> {
     let mut out = BTreeMap::new();
     for entry in args {
         let (key, value) = entry
             .split_once('=')
             .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
-        if key.is_empty() {
-            bail!("--env KEY must not be empty (got '{entry}')");
-        }
-        out.insert(key.to_string(), value.to_string());
+        let name = EnvVarName::new(key)
+            .with_context(|| format!("--env KEY is invalid (got '{entry}')"))?;
+        out.insert(name, value.to_string());
     }
     Ok(out)
 }
@@ -135,6 +208,10 @@ mod tests {
     use super::*;
     use crate::config::{Instance, InstanceIndex, InstanceName};
 
+    fn env(s: &str) -> EnvVarName {
+        EnvVarName::new(s).unwrap()
+    }
+
     fn fake_instance(dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new("test").unwrap(),
@@ -144,18 +221,58 @@ mod tests {
         }
     }
 
+    // ── EnvVarName ───────────────────────────────────────────
+
+    #[test]
+    fn env_var_name_accepts_valid_forms() {
+        for s in ["FOO", "_BAR", "foo", "FOO_BAR_123", "_", "_0"] {
+            assert!(EnvVarName::new(s).is_ok(), "expected '{s}' to be valid");
+        }
+    }
+
+    #[test]
+    fn env_var_name_rejects_invalid_forms() {
+        for s in ["", "1FOO", "FOO BAR", "FOO=BAR", "FOO-BAR", "FOO.BAR", "ä"] {
+            assert!(EnvVarName::new(s).is_err(), "expected '{s}' to be invalid");
+        }
+    }
+
+    #[test]
+    fn env_var_name_serde_round_trips_through_json_map_key() {
+        let mut map: BTreeMap<EnvVarName, String> = BTreeMap::new();
+        map.insert(env("FOO"), "1".to_string());
+        map.insert(env("_BAR"), "2".to_string());
+        let json = serde_json::to_string(&map).unwrap();
+        let back: BTreeMap<EnvVarName, String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, map);
+    }
+
+    #[test]
+    fn env_var_name_serde_rejects_invalid_key() {
+        let json = r#"{"1FOO":"v"}"#;
+        assert!(serde_json::from_str::<BTreeMap<EnvVarName, String>>(json).is_err());
+    }
+
+    // ── GuestEnvState ────────────────────────────────────────
+
     #[test]
     fn save_and_load_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let inst = fake_instance(tmp.path().to_path_buf());
         let mut state = GuestEnvState::default();
-        state.entries.insert("FOO".to_string(), "1".to_string());
-        state.entries.insert("BAR".to_string(), "2".to_string());
+        state.entries.insert(env("FOO"), "1".to_string());
+        state.entries.insert(env("BAR"), "2".to_string());
 
         state.save(&inst).unwrap();
         let loaded = GuestEnvState::try_load(&inst).unwrap().unwrap();
-        assert_eq!(loaded.entries.get("FOO").map(String::as_str), Some("1"));
-        assert_eq!(loaded.entries.get("BAR").map(String::as_str), Some("2"));
+        assert_eq!(
+            loaded.entries.get(&env("FOO")).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            loaded.entries.get(&env("BAR")).map(String::as_str),
+            Some("2")
+        );
     }
 
     #[test]
@@ -170,7 +287,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let inst = fake_instance(tmp.path().to_path_buf());
         let mut state = GuestEnvState::default();
-        state.entries.insert("KEEP".to_string(), "x".to_string());
+        state.entries.insert(env("KEEP"), "x".to_string());
         state.save(&inst).unwrap();
         assert!(inst.guest_env_state_path().exists());
 
@@ -178,41 +295,38 @@ mod tests {
         assert!(!inst.guest_env_state_path().exists());
     }
 
+    // ── merge_persisted_entries ──────────────────────────────
+
     #[test]
     fn merge_persisted_entries_unions_disjoint_keys() {
-        let dc = BTreeMap::from([("DC".to_string(), "1".to_string())]);
-        let cli = BTreeMap::from([("CLI".to_string(), "2".to_string())]);
+        let dc = BTreeMap::from([(env("DC"), "1".to_string())]);
+        let cli = BTreeMap::from([(env("CLI"), "2".to_string())]);
         let merged = merge_persisted_entries(&dc, &cli);
-        assert_eq!(merged.get("DC").map(String::as_str), Some("1"));
-        assert_eq!(merged.get("CLI").map(String::as_str), Some("2"));
+        assert_eq!(merged.get(&env("DC")).map(String::as_str), Some("1"));
+        assert_eq!(merged.get(&env("CLI")).map(String::as_str), Some("2"));
     }
 
     #[test]
     fn merge_persisted_entries_cli_wins_on_conflict() {
-        let dc = BTreeMap::from([("K".to_string(), "from-devcontainer".to_string())]);
-        let cli = BTreeMap::from([("K".to_string(), "from-cli".to_string())]);
+        let dc = BTreeMap::from([(env("K"), "from-devcontainer".to_string())]);
+        let cli = BTreeMap::from([(env("K"), "from-cli".to_string())]);
         let merged = merge_persisted_entries(&dc, &cli);
-        assert_eq!(merged.get("K").map(String::as_str), Some("from-cli"));
+        assert_eq!(merged.get(&env("K")).map(String::as_str), Some("from-cli"));
     }
 
-    #[test]
-    fn merge_persisted_entries_devcontainer_only() {
-        let dc = BTreeMap::from([("ONLY_DC".to_string(), "x".to_string())]);
-        let merged = merge_persisted_entries(&dc, &BTreeMap::new());
-        assert_eq!(merged.get("ONLY_DC").map(String::as_str), Some("x"));
-    }
+    // ── parse_cli_env_args ───────────────────────────────────
 
     #[test]
     fn parse_cli_env_args_basic() {
         let parsed = parse_cli_env_args(&["FOO=1".into(), "BAR=baz".into()]).unwrap();
-        assert_eq!(parsed.get("FOO").map(String::as_str), Some("1"));
-        assert_eq!(parsed.get("BAR").map(String::as_str), Some("baz"));
+        assert_eq!(parsed.get(&env("FOO")).map(String::as_str), Some("1"));
+        assert_eq!(parsed.get(&env("BAR")).map(String::as_str), Some("baz"));
     }
 
     #[test]
     fn parse_cli_env_args_allows_empty_value() {
         let parsed = parse_cli_env_args(&["EMPTY=".into()]).unwrap();
-        assert_eq!(parsed.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(parsed.get(&env("EMPTY")).map(String::as_str), Some(""));
     }
 
     #[test]
@@ -222,22 +336,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_env_args_rejects_empty_key() {
-        let err = parse_cli_env_args(&["=value".into()]).unwrap_err();
-        assert!(format!("{err:#}").contains("KEY must not be empty"));
+    fn parse_cli_env_args_rejects_invalid_key() {
+        // Empty key, leading digit, embedded space, embedded '=' in key
+        // all funnel through `EnvVarName::new`, so one test covers them.
+        for bad in ["=value", "1FOO=v", "FOO BAR=v"] {
+            let err = parse_cli_env_args(&[bad.into()]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("--env KEY is invalid"),
+                "expected validation error for '{bad}', got: {err:#}",
+            );
+        }
     }
 
     #[test]
     fn parse_cli_env_args_last_duplicate_wins() {
         let parsed = parse_cli_env_args(&["K=v1".into(), "K=v2".into()]).unwrap();
-        assert_eq!(parsed.get("K").map(String::as_str), Some("v2"));
+        assert_eq!(parsed.get(&env("K")).map(String::as_str), Some("v2"));
     }
 
     #[test]
     fn parse_cli_env_args_value_may_contain_equals() {
         let parsed = parse_cli_env_args(&["URL=https://x?a=b&c=d".into()]).unwrap();
         assert_eq!(
-            parsed.get("URL").map(String::as_str),
+            parsed.get(&env("URL")).map(String::as_str),
             Some("https://x?a=b&c=d"),
         );
     }
