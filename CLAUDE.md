@@ -56,6 +56,67 @@ You can also run the test script directly if you already have a binary:
 
 When adding new features, consider whether they should be covered by the integration test. The test exercises the full VM lifecycle (setup → start → status → shell → guest environment → docker → stop → destroy). New commands or guest-visible changes are good candidates for new test phases.
 
+### Mutation testing
+
+Mutation testing finds unit tests that pass even when the code is broken — i.e. real behavioral gaps. We use [`cargo-mutants`](https://mutants.rs/). It's a manual quality check, not a CI gate.
+
+**Install once:**
+
+```bash
+cargo install cargo-mutants --locked
+```
+
+**When to run.** After significant edits to a logic-dense module, or before refactoring one (capture surviving mutants first to know what behavior isn't pinned down). Don't run it routinely — runs take minutes per module.
+
+**Where it pays off in this crate.** Mutation testing only earns its keep on code with branches, arithmetic, parsing, or state composition. In coop that means:
+
+- `src/config.rs` — parsing, validation, defaults, env composition
+- `src/workspace.rs` — rsync arg construction, mount-state record/remove
+- `src/devcontainer.rs`, `src/guest_env_state.rs` — env merging and persistence
+- `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug parsing, secret routing
+- `src/fs_util.rs` — path manipulation helpers
+
+**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`. These mostly shell out, run SSH, or talk to external services — unit tests can't catch behavioral changes there. `tests/integration.sh` does that job.
+
+**Running it.** Always scope with `-f`; the crate is a binary so pass `-- --bins`:
+
+```bash
+# One file
+cargo mutants -f src/config.rs -- --bins
+
+# Several logic modules at once
+cargo mutants -f src/config.rs -f src/workspace.rs -f src/devcontainer.rs -- --bins
+
+# PR-scoped: mutate only lines changed vs main
+cargo mutants --in-diff <(git diff origin/main -- 'src/*.rs') -- --bins
+
+# Estimate cost without running
+cargo mutants --list -f src/config.rs
+```
+
+A baseline run on `config.rs` (197 mutants) takes ~8 minutes on a workstation. Budget similarly for other modules and run them one at a time.
+
+**Reading the output.** Results land in `mutants.out/` (gitignored):
+
+- `caught.txt` — mutants tests killed (good)
+- `missed.txt` — mutants tests didn't catch (the interesting ones)
+- `unviable.txt` — mutants that broke the build (ignore; not test gaps)
+- `timeout.txt` — mutants that hung (rare; bump `--timeout` if needed)
+
+A kill rate around 70–80% on viable mutants is healthy for this code. Aim to drop the *number* of survivors, not chase 100% — many remaining mutants will be equivalent.
+
+**Handling survivors.** For each line in `missed.txt`:
+
+1. **Real test gap.** The mutation alters observable behavior and nothing fails. Add a test that distinguishes the mutant from the original (assert on the actual value, not just "it didn't panic"). Re-run on that file to confirm.
+2. **Equivalent mutant.** The mutation doesn't change behavior any caller can observe. Common cases: `fmt::Display` impls returning `Ok(Default::default())`, getter functions returning `Default::default()` when the default happens to match the real value, constant accessors (`default_boot_args`, `mode_name`). Skip with an attribute and a one-line reason:
+    ```rust
+    #[mutants::skip] // equivalent: Display output isn't asserted by callers
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { ... }
+    ```
+3. **Dead code.** If the function is genuinely unused, delete it (per the global "replace, don't deprecate" rule). Surviving mutants on truly dead code are a useful smell.
+
+**Baseline result on `config.rs` (recorded 2026-05-20):** 117 caught / 42 missed / 38 unviable. Real gaps were concentrated in `CoopConfig::validate` (5 survivors), `Instance::is_running` (4), `is_firecracker_process` (2), and `MiB::as_gib_f64` arithmetic. The rest were `fmt::Display` impls and default-value getters. Use this as a reference point — if a future run is much worse on these modules, treat it as a regression in test coverage.
+
 ## Known workarounds (revisit later)
 
 The Firecracker CI kernel (`vmlinux-6.1.155`) is minimal and missing several modules. Two workarounds are applied in the guest install script (`src/setup.rs`, `guest_install_script()`):
