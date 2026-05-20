@@ -2349,12 +2349,28 @@ test_port_forwards() {
 
     GUEST_INSTANCE="$fwd_instance"
 
-    # Run a one-shot HTTP listener in the guest. `nc -l -p` is in the
-    # ubuntu-minimal CI image; pipe a canned HTTP response and exit.
-    # Backgrounded via nohup so the SSH exec returns immediately.
+    # Run a one-shot HTTP listener in the guest. The Firecracker CI rootfs
+    # ships no netcat variant (only socat among net listeners), so we use
+    # python3, which is present on both Firecracker (pulled in via
+    # python3-boto3) and Lima (Ubuntu cloud image default). The listener
+    # script is embedded as a heredoc; coop shell single-quotes each arg,
+    # so newlines pass through to the remote sh -c untouched.
     local payload
     payload=$(cat "$content_file")
-    guest_exec sh -c "nohup sh -c 'printf \"HTTP/1.1 200 OK\\r\\nContent-Length: ${#payload}\\r\\n\\r\\n${payload}\" | nc -l -p ${guest_port} -q 1 > /tmp/fwd.log 2>&1' >/dev/null 2>&1 &" || true
+    guest_exec sh -c "cat > /tmp/fwd.py <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+body = sys.argv[2].encode()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || true
     sleep 1
 
     if curl -fsS --max-time 3 "http://127.0.0.1:${host_port}/" > "$content_file.got"; then
