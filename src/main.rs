@@ -2527,7 +2527,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
-            index: super::config::InstanceIndex::new(0),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::DEFAULT_IMAGE.to_string(),
         };

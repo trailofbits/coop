@@ -972,7 +972,7 @@ mod tests {
     fn temp_instance(dir: &Path) -> Instance {
         Instance {
             name: InstanceName::new("test").expect("valid name"),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).expect("0 is in range"),
             dir: dir.to_path_buf(),
             image: "default".to_string(),
         }

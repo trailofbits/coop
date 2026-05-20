@@ -229,13 +229,20 @@ impl DiskSize {
 }
 
 /// Instance index (0..=252), used to derive guest IP, TAP name, MAC, and vsock CID.
+///
+/// The bound exists because the guest IP is `172.16.0.<idx + 2>`: index 252
+/// maps to `172.16.0.254`, leaving `.255` as the broadcast address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "u16", try_from = "u16")]
 pub struct InstanceIndex(u16);
 
 impl InstanceIndex {
-    pub fn new(value: u16) -> Self {
-        Self(value)
+    /// Largest valid index. See struct docs for the rationale.
+    pub const MAX: u16 = 252;
+
+    /// Create from a runtime value. Returns `None` if greater than [`Self::MAX`].
+    pub fn new(value: u16) -> Option<Self> {
+        (value <= Self::MAX).then_some(Self(value))
     }
 
     pub fn as_u16(self) -> u16 {
@@ -250,6 +257,37 @@ impl InstanceIndex {
 impl fmt::Display for InstanceIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl From<InstanceIndex> for u16 {
+    fn from(idx: InstanceIndex) -> Self {
+        idx.0
+    }
+}
+
+/// Error returned when a raw `u16` exceeds [`InstanceIndex::MAX`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceIndexOutOfRange(pub u16);
+
+impl fmt::Display for InstanceIndexOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "instance index {} out of range 0..={}",
+            self.0,
+            InstanceIndex::MAX
+        )
+    }
+}
+
+impl std::error::Error for InstanceIndexOutOfRange {}
+
+impl TryFrom<u16> for InstanceIndex {
+    type Error = InstanceIndexOutOfRange;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or(InstanceIndexOutOfRange(value))
     }
 }
 
@@ -1369,22 +1407,27 @@ impl CoopConfig {
         image: &str,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
-        const MAX_INDEX: u16 = 252;
-
         let _lock = lock_dir(&self.instances_dir())?;
 
         let instances = self.list_instances()?;
         let used_indices: HashSet<InstanceIndex> = instances.iter().map(|i| i.index).collect();
 
-        // Start from highest + 1, then fall back to lowest gap
-        let highest = instances.iter().map(|i| i.index.as_u16()).max();
-        let raw_index = match highest {
-            Some(h) if h < MAX_INDEX && !used_indices.contains(&InstanceIndex::new(h + 1)) => h + 1,
-            _ => (0..=MAX_INDEX)
-                .find(|i| !used_indices.contains(&InstanceIndex::new(*i)))
+        // Start from highest + 1 (skipping if at the ceiling or already used),
+        // then fall back to the lowest free index.
+        let next_after_highest = instances
+            .iter()
+            .map(|i| i.index.as_u16())
+            .max()
+            .and_then(|h| InstanceIndex::new(h + 1))
+            .filter(|next| !used_indices.contains(next));
+
+        let index = match next_after_highest {
+            Some(idx) => idx,
+            None => (0..=InstanceIndex::MAX)
+                .filter_map(InstanceIndex::new)
+                .find(|idx| !used_indices.contains(idx))
                 .context("All 253 instance slots are in use")?,
         };
-        let index = InstanceIndex::new(raw_index);
 
         let name = if let Some(n) = name {
             InstanceName::new(n)?
@@ -1745,7 +1788,7 @@ mod tests {
     fn make_instance(dir: &Path, name: &str, index: u16) -> Instance {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index),
+            index: InstanceIndex::new(index).unwrap(),
             dir: dir.join("instances").join(name),
             image: DEFAULT_IMAGE.to_string(),
         };
@@ -1756,45 +1799,83 @@ mod tests {
     fn test_inst(name: &str, index: u16, dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index),
+            index: InstanceIndex::new(index).unwrap(),
             dir,
             image: DEFAULT_IMAGE.to_string(),
         }
     }
 
+    // ── InstanceIndex constructor / deserialization ──────────
+
+    #[test]
+    fn instance_index_accepts_zero_to_max() {
+        assert_eq!(InstanceIndex::new(0).unwrap().as_u16(), 0);
+        assert_eq!(
+            InstanceIndex::new(InstanceIndex::MAX).unwrap().as_u16(),
+            InstanceIndex::MAX
+        );
+    }
+
+    #[test]
+    fn instance_index_rejects_above_max() {
+        assert!(InstanceIndex::new(InstanceIndex::MAX + 1).is_none());
+        assert!(InstanceIndex::new(u16::MAX).is_none());
+    }
+
+    #[test]
+    fn instance_index_try_from_reports_value() {
+        let err = InstanceIndex::try_from(500).unwrap_err();
+        assert_eq!(err.0, 500);
+        assert!(err.to_string().contains("500"));
+        assert!(err.to_string().contains("0..=252"));
+    }
+
+    #[test]
+    fn instance_index_deserialize_rejects_out_of_range() {
+        let err = serde_json::from_str::<InstanceIndex>("253").unwrap_err();
+        assert!(err.to_string().contains("253"), "{err}");
+    }
+
+    #[test]
+    fn instance_load_rejects_out_of_range_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("inst");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("instance.json"),
+            r#"{"name": "test", "index": 300, "image": "default"}"#,
+        )
+        .unwrap();
+        let err = Instance::load(&dir).unwrap_err();
+        let chain = err.chain().fold(String::new(), |mut acc, e| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{e} | ");
+            acc
+        });
+        assert!(
+            chain.contains("300") && chain.contains("0..=252"),
+            "expected error to mention 300 and 0..=252, got: {chain}"
+        );
+    }
+
     // ── Instance network derivation ──────────────────────────
 
+    /// Each derivation is index-driven; testing 0 and 252 covers the
+    /// arithmetic at both ends of the valid range, where overflow or
+    /// off-by-one bugs would land.
     #[test]
-    fn instance_guest_ip_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_ip(), "172.16.0.2");
+    fn instance_network_derivations_at_boundaries() {
+        let lo = test_inst("test", 0, PathBuf::from("/tmp/fake"));
+        assert_eq!(lo.guest_ip(), "172.16.0.2");
+        assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
+        assert_eq!(lo.tap_device(), "tap0");
+        assert_eq!(lo.vsock_cid(), 3);
 
-        let inst = test_inst("test", 252, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_ip(), "172.16.0.254");
-    }
-
-    #[test]
-    fn instance_tap_device_from_index() {
-        let inst = test_inst("test", 5, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.tap_device(), "tap5");
-    }
-
-    #[test]
-    fn instance_mac_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_mac(), "06:00:AC:10:00:02");
-
-        let inst = test_inst("test", 252, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_mac(), "06:00:AC:10:00:fe");
-    }
-
-    #[test]
-    fn instance_vsock_cid_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.vsock_cid(), 3);
-
-        let inst = test_inst("test", 10, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.vsock_cid(), 13);
+        let hi = test_inst("test", InstanceIndex::MAX, PathBuf::from("/tmp/fake"));
+        assert_eq!(hi.guest_ip(), "172.16.0.254");
+        assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
+        assert_eq!(hi.tap_device(), "tap252");
+        assert_eq!(hi.vsock_cid(), 255);
     }
 
     // ── Instance paths ───────────────────────────────────────
@@ -1843,7 +1924,7 @@ mod tests {
 
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.name, *"myinst");
-        assert_eq!(loaded.index, InstanceIndex::new(42));
+        assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
         assert_eq!(loaded.image, DEFAULT_IMAGE);
     }
@@ -1984,7 +2065,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
     }
 
@@ -1997,9 +2078,9 @@ mod tests {
         let b = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
         let c = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
 
-        assert_eq!(a.index, InstanceIndex::new(0));
-        assert_eq!(b.index, InstanceIndex::new(1));
-        assert_eq!(c.index, InstanceIndex::new(2));
+        assert_eq!(a.index.as_u16(), 0);
+        assert_eq!(b.index.as_u16(), 1);
+        assert_eq!(c.index.as_u16(), 2);
     }
 
     #[test]
@@ -2011,7 +2092,7 @@ mod tests {
             .allocate_instance(Some("my-project"), DEFAULT_IMAGE, None)
             .unwrap();
         assert_eq!(inst.name, *"my-project");
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     #[test]
@@ -2036,11 +2117,11 @@ mod tests {
         let inst0 = cfg
             .allocate_instance(Some("a"), DEFAULT_IMAGE, None)
             .unwrap();
-        assert_eq!(inst0.index, InstanceIndex::new(0));
+        assert_eq!(inst0.index.as_u16(), 0);
         let inst1 = cfg
             .allocate_instance(Some("b"), DEFAULT_IMAGE, None)
             .unwrap();
-        assert_eq!(inst1.index, InstanceIndex::new(1));
+        assert_eq!(inst1.index.as_u16(), 1);
 
         // Remove instance 0 by deleting its dir
         fs::remove_dir_all(&inst0.dir).unwrap();
@@ -2049,7 +2130,7 @@ mod tests {
         let inst2 = cfg
             .allocate_instance(Some("c"), DEFAULT_IMAGE, None)
             .unwrap();
-        assert_eq!(inst2.index, InstanceIndex::new(2));
+        assert_eq!(inst2.index.as_u16(), 2);
     }
 
     #[test]
@@ -2070,7 +2151,7 @@ mod tests {
         let inst = cfg
             .allocate_instance(Some("fill"), DEFAULT_IMAGE, None)
             .unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     // ── Instance name validation ──────────────────────────────
@@ -2148,15 +2229,8 @@ mod tests {
         make_instance(tmp.path(), "mid", 5);
 
         let instances = cfg.list_instances().unwrap();
-        let indices: Vec<InstanceIndex> = instances.iter().map(|i| i.index).collect();
-        assert_eq!(
-            indices,
-            vec![
-                InstanceIndex::new(2),
-                InstanceIndex::new(5),
-                InstanceIndex::new(10)
-            ]
-        );
+        let indices: Vec<u16> = instances.iter().map(|i| i.index.as_u16()).collect();
+        assert_eq!(indices, vec![2, 5, 10]);
     }
 
     // ── Resolve instance ─────────────────────────────────────
@@ -2203,7 +2277,7 @@ mod tests {
 
         let inst = cfg.resolve_instance(Some("beta")).unwrap();
         assert_eq!(inst.name, *"beta");
-        assert_eq!(inst.index, InstanceIndex::new(1));
+        assert_eq!(inst.index.as_u16(), 1);
     }
 
     #[test]
@@ -3163,7 +3237,7 @@ skip = ["not-a-slug"]
         let dir = tmp.path().join("inst");
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: "python-dev".to_string(),
         };
@@ -3247,7 +3321,7 @@ skip = ["not-a-slug"]
 
         // Allocation should succeed — corrupted dirs are skipped
         let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     #[test]
@@ -3258,7 +3332,7 @@ skip = ["not-a-slug"]
         // Save initial state
         let inst = Instance {
             name: InstanceName::new("v1").unwrap(),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: DEFAULT_IMAGE.to_string(),
         };
@@ -3267,7 +3341,7 @@ skip = ["not-a-slug"]
         // Overwrite with different content
         let inst2 = Instance {
             name: InstanceName::new("v2").unwrap(),
-            index: InstanceIndex::new(5),
+            index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
             image: "custom".to_string(),
         };
@@ -3276,7 +3350,7 @@ skip = ["not-a-slug"]
         // Load should see the new content, not a mix
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.name, *"v2");
-        assert_eq!(loaded.index, InstanceIndex::new(5));
+        assert_eq!(loaded.index.as_u16(), 5);
         assert_eq!(loaded.image, "custom");
 
         // No temp file left behind

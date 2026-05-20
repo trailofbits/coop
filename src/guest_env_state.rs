@@ -138,7 +138,7 @@ mod tests {
     fn fake_instance(dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new("test").unwrap(),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).unwrap(),
             dir,
             image: "test.img".to_string(),
         }
