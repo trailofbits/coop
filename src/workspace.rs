@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::backend::SshTarget;
 use crate::config::Instance;
@@ -26,7 +26,7 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 const GIT_EXCLUDE: &str = ".git/";
 
 /// Persisted workspace metadata written during `start`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
     /// Path inside the guest VM.
     pub guest_path: String,
@@ -63,84 +63,6 @@ impl WorkspaceSource {
     }
 }
 
-/// Custom deserializer that accepts both the new variant-payload shape
-/// and the pre-#147 flat shape (`host_path` / `git_repo_url` as
-/// top-level optionals, `source` as a bare string). Live `workspace.json`
-/// files on developer machines and CI runners are written in the old
-/// shape; we keep reading them without a migration step.
-impl<'de> Deserialize<'de> for WorkspaceState {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum LegacyTag {
-            Workspace,
-            GitRepo,
-            Mount,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum SourceField {
-            // New nested form: `{"kind": "workspace", "host_path": "..."}`.
-            // Tried first because it is more structured — a bare string
-            // would fail this branch and fall through to `Legacy`.
-            Full(WorkspaceSource),
-            Legacy(LegacyTag),
-        }
-
-        #[derive(Deserialize)]
-        struct Raw {
-            guest_path: String,
-            source: SourceField,
-            #[serde(default)]
-            host_path: Option<PathBuf>,
-            #[serde(default)]
-            git_repo_url: Option<String>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let source = match raw.source {
-            SourceField::Full(source) => source,
-            SourceField::Legacy(tag) => match tag {
-                LegacyTag::Workspace => {
-                    let host_path = raw.host_path.ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "legacy workspace source requires top-level `host_path`",
-                        )
-                    })?;
-                    WorkspaceSource::Workspace { host_path }
-                }
-                LegacyTag::GitRepo => {
-                    let url = raw.git_repo_url.ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "legacy git_repo source requires top-level `git_repo_url`",
-                        )
-                    })?;
-                    // Any stray top-level `host_path` is discarded: the old
-                    // shape carried `Option<PathBuf>` but the previous coop
-                    // never wrote a non-None value for git_repo sources.
-                    WorkspaceSource::GitRepo { url }
-                }
-                LegacyTag::Mount => {
-                    let host_path = raw.host_path.ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "legacy mount source requires top-level `host_path`",
-                        )
-                    })?;
-                    WorkspaceSource::Mount { host_path }
-                }
-            },
-        };
-        Ok(WorkspaceState {
-            guest_path: raw.guest_path,
-            source,
-        })
-    }
-}
-
 impl WorkspaceState {
     pub fn save(&self, inst: &Instance) -> Result<()> {
         let path = inst.workspace_state_path();
@@ -154,15 +76,27 @@ impl WorkspaceState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                let state =
-                    serde_json::from_str(&content).context("Failed to parse workspace.json")?;
-                Ok(Some(state))
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(
+                    anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))
+                );
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))),
-        }
+        };
+        serde_json::from_str(&content)
+            .with_context(|| {
+                format!(
+                    "Failed to parse {}.\n\
+                     If this file was written by a pre-#147 coop the on-disk \
+                     shape changed; delete it and run `coop start` again to \
+                     regenerate, or `coop destroy <name>` if the instance is \
+                     no longer needed.",
+                    path.display()
+                )
+            })
+            .map(Some)
     }
 }
 
@@ -1414,47 +1348,27 @@ Host coop-0\n\
     }
 
     #[test]
-    fn workspace_state_deserialize_legacy_workspace() {
-        // The on-disk shape written by every pre-#147 release.
-        let legacy = r#"{
-            "host_path": "/legacy/project",
-            "guest_path": "/workspace",
-            "source": "workspace"
-        }"#;
-        let state: WorkspaceState = serde_json::from_str(legacy).expect("legacy parses");
-        assert_eq!(state.guest_path, "/workspace");
-        assert!(matches!(
-            state.source,
-            WorkspaceSource::Workspace { ref host_path }
-                if host_path == Path::new("/legacy/project")
-        ));
-    }
+    fn try_load_legacy_shape_emits_migration_hint() {
+        // The pre-#147 flat shape no longer parses; the error context
+        // points the user at the remediation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        fs::write(
+            inst.workspace_state_path(),
+            r#"{
+                "host_path": "/legacy/project",
+                "guest_path": "/workspace",
+                "source": "workspace"
+            }"#,
+        )
+        .expect("write");
 
-    #[test]
-    fn workspace_state_deserialize_legacy_git_repo() {
-        let legacy = r#"{
-            "guest_path": "/workspace",
-            "source": "git_repo",
-            "git_repo_url": "https://github.com/x/y.git"
-        }"#;
-        let state: WorkspaceState = serde_json::from_str(legacy).expect("legacy parses");
-        assert!(matches!(
-            state.source,
-            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
-        ));
-    }
-
-    #[test]
-    fn workspace_state_deserialize_legacy_mount() {
-        let legacy = r#"{
-            "host_path": "/host/mount",
-            "guest_path": "/data",
-            "source": "mount"
-        }"#;
-        let state: WorkspaceState = serde_json::from_str(legacy).expect("legacy parses");
-        assert!(matches!(
-            state.source,
-            WorkspaceSource::Mount { ref host_path } if host_path == Path::new("/host/mount")
-        ));
+        let err = WorkspaceState::try_load(&inst).expect_err("legacy shape must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pre-#147"), "expected migration hint: {msg}");
+        assert!(
+            msg.contains("coop start") || msg.contains("coop destroy"),
+            "expected remediation pointer: {msg}"
+        );
     }
 }
