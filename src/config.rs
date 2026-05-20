@@ -2197,6 +2197,34 @@ token = "cmd:echo y"
     }
 
     #[test]
+    fn github_auth_table_form_with_entries_only_implies_pat() {
+        // No explicit `mode`, just per-repo entries. The implied mode is
+        // "pat" because `entries` is non-empty (the `!m.is_empty()` guard
+        // in `visit_map` flips this branch on).
+        let toml_str = r#"
+[pat."a/b"]
+token = "cmd:echo x"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        assert_eq!(pat.entries.len(), 1);
+        assert!(pat.skip.is_empty());
+    }
+
+    #[test]
+    fn github_auth_table_form_with_empty_pat_implies_off() {
+        // An explicit but empty `pat` table with no mode and no skip
+        // means there is no per-repo intent. The implied mode is "off",
+        // not "pat", because `!m.is_empty()` is false for an empty map.
+        let toml_str = "pat = {}\n";
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        assert!(matches!(auth, GitHubAuth::Off));
+    }
+
+    #[test]
     fn github_auth_table_form_with_skip_only() {
         // No explicit `mode`, no entries, only a skip array. Should
         // parse as pat-mode with empty entries and the recorded skip list.
@@ -2328,6 +2356,16 @@ token = "cmd:echo x"
     fn mib_rejects_zero() {
         assert!(MiB::new(0).is_none());
         assert!(MiB::new(1).is_some());
+    }
+
+    #[test]
+    fn mib_as_gib_f64_converts_known_values() {
+        // Pin both the divisor (1024) and the operator (/) — three
+        // concrete points are enough to fail any constant-return,
+        // multiplication, or modulo mutant.
+        assert!((MiB::new(1024).unwrap().as_gib_f64() - 1.0).abs() < f64::EPSILON);
+        assert!((MiB::new(2048).unwrap().as_gib_f64() - 2.0).abs() < f64::EPSILON);
+        assert!((MiB::new(512).unwrap().as_gib_f64() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
