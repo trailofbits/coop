@@ -1088,6 +1088,10 @@ mod tests {
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
         assert_eq!(loaded.guest_path, "/custom");
+        assert!(matches!(
+            loaded.source,
+            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
+        ));
     }
 
     #[test]
@@ -1288,55 +1292,24 @@ Host coop-0\n\
 
     // ── WorkspaceState serialization ──────────────────────────
 
-    fn round_trip(state: &WorkspaceState) -> WorkspaceState {
-        let json = serde_json::to_string(state).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
-    }
-
     #[test]
     fn workspace_state_round_trip_workspace() {
+        // The only direct serde test for the Workspace variant; the
+        // other variants are exercised end-to-end through
+        // `record_mount_state_persists_first_mount` (Mount) and
+        // `load_or_default_uses_saved_state` (GitRepo).
         let state = WorkspaceState {
             guest_path: "/workspace".to_string(),
             source: WorkspaceSource::Workspace {
                 host_path: PathBuf::from("/host/dir"),
             },
         };
-        let back = round_trip(&state);
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: WorkspaceState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.guest_path, "/workspace");
         assert!(matches!(
             back.source,
             WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")
-        ));
-    }
-
-    #[test]
-    fn workspace_state_round_trip_git_repo() {
-        let state = WorkspaceState {
-            guest_path: "/workspace".to_string(),
-            source: WorkspaceSource::GitRepo {
-                url: "https://github.com/x/y.git".to_string(),
-            },
-        };
-        let back = round_trip(&state);
-        assert!(matches!(
-            back.source,
-            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
-        ));
-    }
-
-    #[test]
-    fn workspace_state_round_trip_mount() {
-        let state = WorkspaceState {
-            guest_path: "/data".to_string(),
-            source: WorkspaceSource::Mount {
-                host_path: PathBuf::from("/host/mount"),
-            },
-        };
-        let back = round_trip(&state);
-        assert_eq!(back.guest_path, "/data");
-        assert!(matches!(
-            back.source,
-            WorkspaceSource::Mount { ref host_path } if host_path == Path::new("/host/mount")
         ));
     }
 
