@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -657,7 +658,7 @@ fn check_host_requirements() -> Result<()> {
     }
     eprintln!("  /dev/kvm: present");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
     eprintln!("  Architecture: {arch}");
 
     require_command("curl", "Required for downloading artifacts")?;
@@ -793,7 +794,7 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
     step("Installing Firecracker");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
 
     eprintln!("  Discovering latest Firecracker release...");
     let latest = discover_latest_fc_version()?;
@@ -893,7 +894,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
     step("Fetching guest kernel");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
 
     let latest = discover_latest_fc_version()?;
     let ci_version = derive_ci_version(&latest);
@@ -953,7 +954,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 // ── Rootfs build helpers ──────────────────────────────────────
 
 fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
     let latest = discover_latest_fc_version()?;
     let ci_version = derive_ci_version(&latest);
 
@@ -1253,12 +1254,45 @@ fn derive_ci_version(release_version: &str) -> String {
     }
 }
 
-fn current_arch() -> Result<String> {
-    let output = Command::new("uname")
-        .arg("-m")
-        .output()
-        .context("Failed to get architecture")?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Host architectures supported by the Firecracker setup path.
+///
+/// A closed enum lets `match` arms stay exhaustive and prevents string typos
+/// from silently producing broken URLs or download paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    X86_64,
+    Aarch64,
+}
+
+impl Architecture {
+    /// Detect the architecture this binary was built for.
+    ///
+    /// Reads `std::env::consts::ARCH`, which is fixed at compile time and
+    /// matches the kernel's `uname -m` output for the targets coop supports.
+    pub fn current() -> Result<Self> {
+        Self::from_consts_str(std::env::consts::ARCH)
+    }
+
+    fn from_consts_str(s: &str) -> Result<Self> {
+        match s {
+            "x86_64" => Ok(Self::X86_64),
+            "aarch64" => Ok(Self::Aarch64),
+            other => bail!("Unsupported architecture: {other}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+}
+
+impl fmt::Display for Architecture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn which(program: &str) -> Option<PathBuf> {
@@ -1411,5 +1445,40 @@ mod tests {
         assert!(script.contains("recipe-content\n"));
         assert!(script.contains("MARKEREOF"));
         assert!(!script.contains("post-install"));
+    }
+
+    #[test]
+    fn architecture_from_consts_str_known() {
+        assert!(matches!(
+            Architecture::from_consts_str("x86_64"),
+            Ok(Architecture::X86_64)
+        ));
+        assert!(matches!(
+            Architecture::from_consts_str("aarch64"),
+            Ok(Architecture::Aarch64)
+        ));
+    }
+
+    #[test]
+    fn architecture_from_consts_str_rejects_unknown() {
+        assert!(Architecture::from_consts_str("riscv64").is_err());
+        assert!(Architecture::from_consts_str("").is_err());
+        assert!(Architecture::from_consts_str("arm64").is_err());
+    }
+
+    #[test]
+    fn architecture_display_matches_as_str() {
+        assert_eq!(Architecture::X86_64.to_string(), "x86_64");
+        assert_eq!(Architecture::Aarch64.to_string(), "aarch64");
+    }
+
+    #[test]
+    fn architecture_current_returns_supported_variant() {
+        // cargo runs tests on the host arch, which must be one of the
+        // two supported variants.
+        assert!(matches!(
+            Architecture::current(),
+            Ok(Architecture::X86_64 | Architecture::Aarch64)
+        ));
     }
 }
