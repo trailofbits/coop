@@ -2464,9 +2464,9 @@ mod tests {
         );
 
         let target = super::backend::SshTarget {
-            host: "127.0.0.1".to_string(),
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
             port: NonZeroU16::new(22).expect("non-zero"),
-            user: "ubuntu".to_string(),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
         };
 
@@ -2493,9 +2493,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = super::config::CoopConfig::default();
         let target = super::backend::SshTarget {
-            host: "127.0.0.1".to_string(),
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
             port: NonZeroU16::new(22).expect("non-zero"),
-            user: "ubuntu".to_string(),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
         };
 

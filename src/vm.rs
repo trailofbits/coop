@@ -368,9 +368,9 @@ impl<'a> FirecrackerVm<'a, Running> {
         );
 
         let target = crate::backend::SshTarget {
-            host: self.inst.guest_ip(),
+            host: crate::backend::Hostname::new(self.inst.guest_ip())?,
             port: self.cfg.ssh_port,
-            user: crate::guest::GUEST_USER.to_string(),
+            user: crate::backend::SshUser::new(crate::guest::GUEST_USER)?,
             key_path: self.cfg.ssh_key_path(),
         };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {

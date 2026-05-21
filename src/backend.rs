@@ -163,12 +163,118 @@ impl RunningInstance {
 
 // ── SSH target ────────────────────────────────────────────────
 
+const MAX_HOSTNAME_LEN: usize = 253;
+
+fn validate_hostname(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Hostname must not be empty");
+    }
+    if name.len() > MAX_HOSTNAME_LEN {
+        bail!(
+            "Hostname too long ({} chars, max {MAX_HOSTNAME_LEN})",
+            name.len()
+        );
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| c.is_whitespace() || c.is_control() || !c.is_ascii_graphic())
+    {
+        bail!("Hostname contains invalid character {c:?} (must be printable ASCII, no whitespace)");
+    }
+    Ok(())
+}
+
+/// Validated SSH hostname or IP literal. Construction enforces a
+/// non-empty, printable ASCII string with no whitespace, so downstream
+/// code (shell-escaped SSH args, `user@host` formatting, SSH config
+/// blocks) can use it without re-checking.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Hostname(String);
+
+impl Hostname {
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_hostname(&name)?;
+        Ok(Self(name))
+    }
+}
+
+impl std::fmt::Display for Hostname {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for Hostname {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+const MAX_SSH_USER_LEN: usize = 32;
+
+fn validate_ssh_user(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("SSH user must not be empty");
+    }
+    if name.len() > MAX_SSH_USER_LEN {
+        bail!(
+            "SSH user too long ({} chars, max {MAX_SSH_USER_LEN})",
+            name.len()
+        );
+    }
+    for (i, c) in name.chars().enumerate() {
+        let ok = if i == 0 {
+            matches!(c, 'a'..='z' | '_')
+        } else {
+            matches!(c, 'a'..='z' | '0'..='9' | '_' | '-')
+        };
+        if !ok {
+            if i == 0 {
+                bail!("SSH user must start with [a-z_], got {c:?}");
+            }
+            bail!("SSH user contains invalid character {c:?} (allowed: a-z, 0-9, '_', '-')");
+        }
+    }
+    Ok(())
+}
+
+/// Validated SSH username. Construction enforces the portable POSIX
+/// pattern `[a-z_][a-z0-9_-]{0,31}`, so downstream code (SSH addr
+/// formatting, SSH config blocks) can use it without re-checking.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SshUser(String);
+
+impl SshUser {
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_ssh_user(&name)?;
+        Ok(Self(name))
+    }
+}
+
+impl std::fmt::Display for SshUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SshUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// SSH connection details for reaching a guest VM.
 #[derive(Debug, Clone)]
 pub struct SshTarget {
-    pub host: String,
+    pub host: Hostname,
     pub port: NonZeroU16,
-    pub user: String,
+    pub user: SshUser,
     pub key_path: PathBuf,
 }
 
@@ -830,9 +936,9 @@ impl VmBackend for FirecrackerBackend {
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         Ok(SshTarget {
-            host: inst.guest_ip(),
+            host: Hostname::new(inst.guest_ip())?,
             port: cfg.ssh_port,
-            user: crate::guest::GUEST_USER.to_string(),
+            user: SshUser::new(crate::guest::GUEST_USER)?,
             key_path: cfg.ssh_key_path(),
         })
     }
@@ -1967,6 +2073,77 @@ Buffers:          128000 kB
 Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
+
+    #[test]
+    fn hostname_accepts_valid_inputs() {
+        for s in [
+            "127.0.0.1",
+            "172.16.0.2",
+            "example.com",
+            "host-1.local",
+            "::1",
+        ] {
+            let h = Hostname::new(s).unwrap();
+            assert_eq!(h.to_string(), s);
+            assert_eq!(<Hostname as AsRef<str>>::as_ref(&h), s);
+        }
+    }
+
+    #[test]
+    fn hostname_rejects_empty() {
+        assert!(Hostname::new("").is_err());
+    }
+
+    #[test]
+    fn hostname_rejects_whitespace_and_control() {
+        for s in ["host name", "host\tname", "host\nname", "name\0"] {
+            assert!(Hostname::new(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn hostname_rejects_non_ascii() {
+        assert!(Hostname::new("hôst").is_err());
+    }
+
+    #[test]
+    fn hostname_rejects_too_long() {
+        let long = "a".repeat(MAX_HOSTNAME_LEN + 1);
+        assert!(Hostname::new(long).is_err());
+    }
+
+    #[test]
+    fn ssh_user_accepts_valid_inputs() {
+        for s in ["ubuntu", "_user", "ec2-user", "u", "user_1", "a0"] {
+            let u = SshUser::new(s).unwrap();
+            assert_eq!(u.to_string(), s);
+            assert_eq!(<SshUser as AsRef<str>>::as_ref(&u), s);
+        }
+    }
+
+    #[test]
+    fn ssh_user_rejects_empty() {
+        assert!(SshUser::new("").is_err());
+    }
+
+    #[test]
+    fn ssh_user_rejects_leading_digit_or_dash() {
+        assert!(SshUser::new("0user").is_err());
+        assert!(SshUser::new("-user").is_err());
+    }
+
+    #[test]
+    fn ssh_user_rejects_uppercase_and_special() {
+        for s in ["Ubuntu", "user!", "user.name", "user name"] {
+            assert!(SshUser::new(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_user_rejects_too_long() {
+        let long = "a".repeat(MAX_SSH_USER_LEN + 1);
+        assert!(SshUser::new(long).is_err());
+    }
 
     #[test]
     fn parse_resource_usage_typical_output() {

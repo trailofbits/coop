@@ -1235,10 +1235,11 @@ Host coop-0\n\
     // ── exclude_git policy ────────────────────────────────────
 
     fn fake_ssh_target() -> SshTarget {
+        use crate::backend::{Hostname, SshUser};
         SshTarget {
-            host: "127.0.0.1".to_string(),
+            host: Hostname::new("127.0.0.1").expect("valid host"),
             port: std::num::NonZeroU16::new(2222).unwrap(),
-            user: "ubuntu".to_string(),
+            user: SshUser::new("ubuntu").expect("valid user"),
             key_path: PathBuf::from("/tmp/key"),
         }
     }

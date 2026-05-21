@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::{LogMode, SshTarget};
+use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
@@ -410,9 +410,9 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
     let port = std::num::NonZeroU16::new(port).context("Lima SSH port is 0")?;
 
     Ok(SshTarget {
-        host: "127.0.0.1".to_string(),
+        host: Hostname::new("127.0.0.1")?,
         port,
-        user: crate::guest::GUEST_USER.to_string(),
+        user: SshUser::new(crate::guest::GUEST_USER)?,
         key_path: cfg.ssh_key_path(),
     })
 }
@@ -707,9 +707,9 @@ fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
     let port = u16::try_from(port).context("SSH port out of range")?;
     let port = std::num::NonZeroU16::new(port).context("Builder SSH port is 0")?;
     Ok(SshTarget {
-        host: "127.0.0.1".to_string(),
+        host: Hostname::new("127.0.0.1")?,
         port,
-        user: crate::guest::GUEST_USER.to_string(),
+        user: SshUser::new(crate::guest::GUEST_USER)?,
         key_path: cfg.ssh_key_path(),
     })
 }
@@ -1291,9 +1291,9 @@ fn wait_for_lima_ssh(
     // sshd isn't ready for several seconds. Auth probing detects
     // true readiness so the caller's wait_until_ready is instant.
     let target = SshTarget {
-        host: "127.0.0.1".to_string(),
+        host: Hostname::new("127.0.0.1")?,
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
-        user: crate::guest::GUEST_USER.to_string(),
+        user: SshUser::new(crate::guest::GUEST_USER)?,
         key_path: cfg.ssh_key_path(),
     };
     let mut delay = Duration::from_millis(500);
