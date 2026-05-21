@@ -302,15 +302,23 @@ pub struct Mount {
 impl Mount {
     /// Parse a mount spec in the form `HOST_PATH[:GUEST_PATH]`.
     ///
-    /// If `GUEST_PATH` is omitted, defaults to `/mnt/<dirname>` where
-    /// `<dirname>` is the last component of the host path.
+    /// If `GUEST_PATH` is omitted, defaults to `/workspace`.
     pub fn parse(spec: &str) -> Result<Self> {
         let (host, guest_path) = if let Some((h, g)) = spec.split_once(':') {
             (h, g.to_string())
         } else {
             (spec, "/workspace".to_string())
         };
+        Self::from_parts(host, guest_path)
+    }
 
+    /// Build a `Mount` from already-split host and guest components.
+    ///
+    /// Single source of truth for the canonicalize / is-dir / absolute-guest
+    /// invariants; callers that build the spec from typed fields (devcontainer
+    /// JSON, Docker `type=bind` form) skip the string round-trip by calling
+    /// this directly.
+    pub fn from_parts(host: &str, guest_path: String) -> Result<Self> {
         let host_path = Path::new(host)
             .canonicalize()
             .with_context(|| format!("Mount host path does not exist: {host}"))?;

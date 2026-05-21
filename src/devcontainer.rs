@@ -1069,8 +1069,8 @@ fn parse_forward_port_entry(v: &serde_json::Value) -> Result<PortForward> {
 }
 
 fn parse_mount_entry(v: &serde_json::Value) -> Result<Mount> {
-    let spec = match v {
-        serde_json::Value::String(s) => normalize_mount_string(s)?,
+    match v {
+        serde_json::Value::String(s) => parse_mount_string(s),
         serde_json::Value::Object(map) => {
             let typ = map
                 .get("type")
@@ -1087,19 +1087,23 @@ fn parse_mount_entry(v: &serde_json::Value) -> Result<Mount> {
                 .get("target")
                 .and_then(|v| v.as_str())
                 .context("mount object requires 'target'")?;
-            format!("{source}:{target}")
+            Mount::from_parts(source, target.to_string())
         }
         _ => bail!("expected mount string or object"),
-    };
-    Mount::parse(&spec)
+    }
 }
 
-/// Convert a docker-style mount string (`type=bind,source=...,target=...`)
-/// into coop's `HOST_PATH[:GUEST_PATH]` form.
-fn normalize_mount_string(s: &str) -> Result<String> {
+/// Parse a devcontainer mount string into a [`Mount`].
+///
+/// Accepts both coop's native `HOST_PATH[:GUEST_PATH]` form (deferred to
+/// [`Mount::parse`]) and Docker's `type=bind,source=...,target=...` form
+/// (parsed here and constructed via [`Mount::from_parts`]). Either way
+/// the validated `Mount` value is the single output — no intermediate
+/// string round-trip.
+fn parse_mount_string(s: &str) -> Result<Mount> {
     if !s.contains('=') {
-        // Already in HOST:GUEST or HOST form — pass through.
-        return Ok(s.to_string());
+        // Native HOST:GUEST or HOST form — let `Mount::parse` handle it.
+        return Mount::parse(s);
     }
     let mut typ: Option<&str> = None;
     let mut source: Option<&str> = None;
@@ -1131,7 +1135,7 @@ fn normalize_mount_string(s: &str) -> Result<String> {
     }
     let source = source.context("mount string missing source=...")?;
     let target = target.context("mount string missing target=...")?;
-    Ok(format!("{source}:{target}"))
+    Mount::from_parts(source, target.to_string())
 }
 
 /// Map a devcontainer feature id (raw key) to a built-in coop profile,
@@ -1521,16 +1525,30 @@ mod tests {
     }
 
     #[test]
-    fn normalize_mount_string_handles_docker_form() {
-        assert_eq!(
-            normalize_mount_string("type=bind,source=/a,target=/b").unwrap(),
-            "/a:/b"
-        );
-        assert_eq!(
-            normalize_mount_string("source=/a,target=/b,readonly").unwrap(),
-            "/a:/b"
-        );
-        assert!(normalize_mount_string("type=volume,source=v,target=/b").is_err());
+    fn parse_mount_string_handles_docker_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().to_str().unwrap();
+
+        let docker = format!("type=bind,source={host},target=/b");
+        let m = parse_mount_string(&docker).unwrap();
+        assert_eq!(m.guest_path, "/b");
+
+        let no_type = format!("source={host},target=/b,readonly");
+        let m = parse_mount_string(&no_type).unwrap();
+        assert_eq!(m.guest_path, "/b");
+
+        assert!(parse_mount_string("type=volume,source=v,target=/b").is_err());
+    }
+
+    #[test]
+    fn parse_mount_string_native_form_defers_to_mount_parse() {
+        // Native `HOST[:GUEST]` form goes through `Mount::parse`, which
+        // canonicalises the host path. Use a real directory so the call
+        // succeeds, and check the guest path was preserved.
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = format!("{}:/g", tmp.path().display());
+        let m = parse_mount_string(&spec).unwrap();
+        assert_eq!(m.guest_path, "/g");
     }
 
     #[test]
