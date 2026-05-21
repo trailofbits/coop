@@ -751,7 +751,7 @@ impl fmt::Display for InterfaceName {
     }
 }
 
-/// Host interface selection for NAT. Either the literal string `"auto"`
+/// Host interface selection for NAT. Either the [`AUTO_SENTINEL`] literal
 /// (auto-detect the default route's interface at runtime) or an explicit
 /// [`InterfaceName`].
 ///
@@ -764,11 +764,14 @@ pub enum HostInterface {
     Named(InterfaceName),
 }
 
+/// The string spelling of [`HostInterface::Auto`] in TOML / serde.
+const AUTO_SENTINEL: &str = "auto";
+
 impl HostInterface {
-    /// String form used in TOML (`"auto"` or the interface name).
+    /// String form used in TOML ([`AUTO_SENTINEL`] or the interface name).
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Auto => "auto",
+            Self::Auto => AUTO_SENTINEL,
             Self::Named(name) => name.as_str(),
         }
     }
@@ -790,16 +793,16 @@ impl Serialize for HostInterface {
 impl<'de> Deserialize<'de> for HostInterface {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        if s == "auto" {
+        if s == AUTO_SENTINEL {
             return Ok(Self::Auto);
         }
         // Catch sentinel typos that an InterfaceName check wouldn't:
         // "Auto" / "AUTO" pass the charset, " auto" doesn't, but both
         // would silently mask the user's intent.
-        if s.eq_ignore_ascii_case("auto") || s.trim() == "auto" {
+        if s.eq_ignore_ascii_case(AUTO_SENTINEL) || s.trim() == AUTO_SENTINEL {
             return Err(serde::de::Error::custom(format!(
-                "host_iface '{s}' looks like the 'auto' sentinel — \
-                 write it exactly as \"auto\" for auto-detection"
+                "host_iface '{s}' looks like the '{AUTO_SENTINEL}' sentinel — \
+                 write it exactly as \"{AUTO_SENTINEL}\" for auto-detection"
             )));
         }
         InterfaceName::new(&s)
