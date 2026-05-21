@@ -10,15 +10,17 @@
 //! is omitted from [`available_backends`]. The file fallback is always
 //! available so the wizard always has at least one storage choice.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
+use crate::github_repo::RepoSlug;
 
 /// All secret-store backends recognised by the wizard.
 ///
@@ -65,19 +67,19 @@ impl Backend {
             #[cfg(target_os = "macos")]
             Self::MacosKeychain => Path::new("/usr/bin/security").exists(),
             #[cfg(target_os = "linux")]
-            Self::LinuxSecretService => tool_on_path("secret-tool"),
-            Self::OnePassword => tool_on_path("op"),
+            Self::LinuxSecretService => {
+                ToolName::new("secret-tool").is_ok_and(|n| tool_on_path(&n))
+            }
+            Self::OnePassword => ToolName::new("op").is_ok_and(|n| tool_on_path(&n)),
             Self::File => true,
         }
     }
 }
 
-fn tool_on_path(name: &str) -> bool {
-    // `command -v` is a shell builtin — execute it via `sh -c`. Reject
-    // names with whitespace defensively so we don't shell-inject.
-    if name.is_empty() || name.chars().any(|c| !is_safe_tool_name_char(c)) {
-        return false;
-    }
+fn tool_on_path(name: &ToolName) -> bool {
+    // `command -v` is a shell builtin — execute it via `sh -c`. The
+    // `ToolName` constructor already proved `name` matches
+    // `[a-zA-Z0-9_.-]+`, so embedding it in the shell string can't inject.
     Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {name}"))
@@ -85,8 +87,78 @@ fn tool_on_path(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn is_safe_tool_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+/// Validated executable name for `tool_on_path` lookups.
+///
+/// The constructor enforces a non-empty `[a-zA-Z0-9_.-]+` string, so
+/// downstream code can embed the name in a `sh -c` command line without
+/// re-checking for shell metacharacters or empty input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolName(String);
+
+impl ToolName {
+    pub fn new(name: &str) -> Result<Self> {
+        if name.is_empty() {
+            bail!("Tool name is empty");
+        }
+        if let Some(c) = name
+            .chars()
+            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
+        {
+            bail!(
+                "Tool name '{name}' contains invalid character {c:?} \
+                 (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
+            );
+        }
+        Ok(Self(name.to_string()))
+    }
+}
+
+impl fmt::Display for ToolName {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ToolName {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Account identifier for a secret-store entry.
+///
+/// Built once from a [`RepoSlug`] by replacing the `/` separator with
+/// `-`. Because `RepoSlug` already restricts segments to
+/// `[a-zA-Z0-9_.-]`, the resulting string also matches that class and
+/// is safe to use as a filename component or backend lookup key without
+/// further sanitization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccountName(String);
+
+impl AccountName {
+    pub fn from_repo(slug: &RepoSlug) -> Self {
+        Self(slug.as_str().replace('/', "-"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountName {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for AccountName {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Return the list of usable backends on the current host, in the
@@ -116,7 +188,7 @@ pub fn available_backends() -> Vec<Backend> {
 pub fn store_secret(
     backend: Backend,
     service: &str,
-    account: &str,
+    account: &AccountName,
     token: &str,
     state_dir: &Path,
 ) -> Result<String> {
@@ -136,7 +208,7 @@ pub fn store_secret(
 pub fn delete_secret(
     backend: Backend,
     service: &str,
-    account: &str,
+    account: &AccountName,
     state_dir: &Path,
 ) -> Result<()> {
     match backend {
@@ -147,7 +219,7 @@ pub fn delete_secret(
                 .arg("-s")
                 .arg(service)
                 .arg("-a")
-                .arg(account)
+                .arg(account.as_str())
                 .output();
             Ok(())
         }
@@ -158,7 +230,7 @@ pub fn delete_secret(
                 .arg("service")
                 .arg(service)
                 .arg("account")
-                .arg(account)
+                .arg(account.as_str())
                 .output();
             Ok(())
         }
@@ -223,7 +295,7 @@ pub fn infer_backend(cmd: &str) -> Option<Backend> {
 // ── Backend impls ──────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn store_keychain(service: &str, account: &str, token: &str) -> Result<String> {
+fn store_keychain(service: &str, account: &AccountName, token: &str) -> Result<String> {
     // macOS `security` lacks a stdin-driven write for generic passwords:
     // `-w <password>` reads the secret from argv. The bytes are briefly
     // visible to local `ps`-equivalent observers — an unavoidable cost
@@ -236,7 +308,7 @@ fn store_keychain(service: &str, account: &str, token: &str) -> Result<String> {
         .arg("-s")
         .arg(service)
         .arg("-a")
-        .arg(account)
+        .arg(account.as_str())
         .arg("-w")
         .redacted_arg(token)
         .run()
@@ -244,12 +316,12 @@ fn store_keychain(service: &str, account: &str, token: &str) -> Result<String> {
     Ok(format!(
         "cmd:security find-generic-password -s {} -a {} -w",
         shell_quote(service),
-        shell_quote(account),
+        shell_quote(account.as_str()),
     ))
 }
 
 #[cfg(target_os = "linux")]
-fn store_secret_service(service: &str, account: &str, token: &str) -> Result<String> {
+fn store_secret_service(service: &str, account: &AccountName, token: &str) -> Result<String> {
     // `secret-tool store` reads the password from stdin.
     Cmd::new("secret-tool")
         .arg("store")
@@ -258,18 +330,18 @@ fn store_secret_service(service: &str, account: &str, token: &str) -> Result<Str
         .arg("service")
         .arg(service)
         .arg("account")
-        .arg(account)
+        .arg(account.as_str())
         .stdin_input(token.as_bytes().to_vec())
         .run()
         .context("Failed to write secret to Linux Secret Service")?;
     Ok(format!(
         "cmd:secret-tool lookup service {} account {}",
         shell_quote(service),
-        shell_quote(account),
+        shell_quote(account.as_str()),
     ))
 }
 
-fn store_onepassword(service: &str, account: &str, token: &str) -> Result<String> {
+fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Result<String> {
     // `op item create` reads field values from argv. The token is briefly
     // visible to local observers via /proc; redacted from coop's own
     // debug log via `redacted_arg`. 1Password rejects duplicate titles, so
@@ -297,7 +369,12 @@ fn store_onepassword(service: &str, account: &str, token: &str) -> Result<String
     ))
 }
 
-fn store_file(service: &str, account: &str, token: &str, state_dir: &Path) -> Result<String> {
+fn store_file(
+    service: &str,
+    account: &AccountName,
+    token: &str,
+    state_dir: &Path,
+) -> Result<String> {
     let dir = state_dir.join("github-pat");
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     set_dir_mode(&dir, 0o700)?;
@@ -321,22 +398,8 @@ fn store_file(service: &str, account: &str, token: &str, state_dir: &Path) -> Re
     Ok(format!("cmd:cat {}", shell_quote(&path.to_string_lossy())))
 }
 
-fn file_backend_path(state_dir: &Path, account: &str) -> PathBuf {
-    state_dir
-        .join("github-pat")
-        .join(format!("{}.txt", sanitize(account)))
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+fn file_backend_path(state_dir: &Path, account: &AccountName) -> PathBuf {
+    state_dir.join("github-pat").join(format!("{account}.txt"))
 }
 
 fn set_dir_mode(path: &Path, mode: u32) -> Result<()> {
@@ -357,8 +420,8 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Build the conventional account name for a repo's PAT entry.
-pub fn account_for_repo(repo: &crate::github_repo::RepoSlug) -> String {
-    repo.as_str().replace('/', "-")
+pub fn account_for_repo(repo: &RepoSlug) -> AccountName {
+    AccountName::from_repo(repo)
 }
 
 /// Conventional service name used across all backends.
@@ -381,10 +444,59 @@ mod tests {
         assert_eq!(*backends.last().unwrap(), Backend::File);
     }
 
+    fn account(s: &str) -> AccountName {
+        AccountName::from_repo(&RepoSlug::new(s).unwrap())
+    }
+
     #[test]
     fn account_replaces_slash() {
-        let slug = crate::github_repo::RepoSlug::new("trailofbits/coop").unwrap();
-        assert_eq!(account_for_repo(&slug), "trailofbits-coop".to_string());
+        let slug = RepoSlug::new("trailofbits/coop").unwrap();
+        assert_eq!(account_for_repo(&slug).as_str(), "trailofbits-coop");
+    }
+
+    #[test]
+    fn account_from_repo_uses_safe_chars_only() {
+        // Constructor is infallible; result must consist only of the
+        // [a-zA-Z0-9_.-] class so downstream filename / lookup-key use
+        // is safe without further sanitization.
+        let slug = RepoSlug::new("trail-of.bits_1/coop").unwrap();
+        let acc = AccountName::from_repo(&slug);
+        assert!(
+            acc.as_str()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "AccountName must only contain [a-zA-Z0-9_.-], got '{acc}'"
+        );
+        assert!(!acc.as_str().contains('/'), "slash must be replaced");
+    }
+
+    #[test]
+    fn tool_name_accepts_safe_chars() {
+        for s in ["op", "secret-tool", "tool_1", "a.b", "ABC.def-1_2"] {
+            let t = ToolName::new(s).unwrap();
+            assert_eq!(t.to_string(), s);
+            assert_eq!(<ToolName as AsRef<str>>::as_ref(&t), s);
+        }
+    }
+
+    #[test]
+    fn tool_name_rejects_empty() {
+        assert!(ToolName::new("").is_err());
+    }
+
+    #[test]
+    fn tool_name_rejects_unsafe_chars() {
+        for s in [
+            "secret tool", // space
+            "rm -rf /",    // space + /
+            "tool;evil",   // shell metachar
+            "tool$x",      // shell metachar
+            "tool\nx",     // newline
+            "tool/x",      // path separator
+            "tóol",        // non-ASCII
+        ] {
+            assert!(ToolName::new(s).is_err(), "should reject {s:?}");
+        }
     }
 
     #[test]
@@ -400,18 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_replaces_unsafe_chars() {
-        assert_eq!(sanitize("owner/repo"), "owner-repo");
-        assert_eq!(sanitize("safe-name_v2"), "safe-name_v2");
-    }
-
-    #[test]
     fn file_backend_round_trip() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cmd = store_file(SERVICE, "trailofbits-coop", "github_pat_xyz", tmp.path()).unwrap();
+        let acc = account("trailofbits/coop");
+        let cmd = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
         assert!(cmd.starts_with("cmd:cat "));
         // Verify the file exists with the right contents and mode.
-        let path = file_backend_path(tmp.path(), "trailofbits-coop");
+        let path = file_backend_path(tmp.path(), &acc);
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.trim(), "github_pat_xyz");
         let meta = std::fs::metadata(&path).unwrap();
@@ -421,9 +528,10 @@ mod tests {
     #[test]
     fn file_backend_delete_removes_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let _ = store_file(SERVICE, "x-y", "token", tmp.path()).unwrap();
-        delete_secret(Backend::File, SERVICE, "x-y", tmp.path()).unwrap();
-        let path = file_backend_path(tmp.path(), "x-y");
+        let acc = account("x/y");
+        let _ = store_file(SERVICE, &acc, "token", tmp.path()).unwrap();
+        delete_secret(Backend::File, SERVICE, &acc, tmp.path()).unwrap();
+        let path = file_backend_path(tmp.path(), &acc);
         assert!(!path.exists());
     }
 
