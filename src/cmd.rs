@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -18,6 +19,19 @@ impl Arg {
     fn value(&self) -> &OsStr {
         match self {
             Self::Public(v) | Self::Redacted(v) => v,
+        }
+    }
+
+    /// String form for human-facing output. Redacted args yield the
+    /// placeholder, so the redaction policy lives with the type instead
+    /// of being re-derived at every formatting site.
+    ///
+    /// Not `Display` on purpose: a `Display` impl that silently swaps
+    /// content is a footgun for any future caller who reaches for `{}`.
+    fn display(&self) -> Cow<'_, str> {
+        match self {
+            Self::Public(v) => v.to_string_lossy(),
+            Self::Redacted(_) => Cow::Borrowed("<redacted>"),
         }
     }
 }
@@ -110,14 +124,7 @@ impl Cmd {
         if self.args.is_empty() {
             format!("{prefix}{prog}")
         } else {
-            let args: Vec<String> = self
-                .args
-                .iter()
-                .map(|a| match a {
-                    Arg::Public(v) => v.to_string_lossy().into_owned(),
-                    Arg::Redacted(_) => "<redacted>".to_string(),
-                })
-                .collect();
+            let args: Vec<Cow<'_, str>> = self.args.iter().map(Arg::display).collect();
             format!("{prefix}{prog} {}", args.join(" "))
         }
     }
