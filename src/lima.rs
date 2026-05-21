@@ -1606,7 +1606,7 @@ mod tests {
         let yaml = "mountType: \"virtiofs\"\nmounts: []\n";
         let mounts = vec![crate::config::Mount {
             host_path: "/home/user/project".into(),
-            guest_path: "/workspace".into(),
+            guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
         }];
         let result = super::inject_mounts(yaml, &mounts);
         assert!(
@@ -1633,11 +1633,11 @@ mod tests {
         let mounts = vec![
             crate::config::Mount {
                 host_path: "/a".into(),
-                guest_path: "/workspace".into(),
+                guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
             },
             crate::config::Mount {
                 host_path: "/b".into(),
-                guest_path: "/data".into(),
+                guest_path: crate::paths::GuestPath::absolute("/data").unwrap(),
             },
         ];
         let result = super::inject_mounts(yaml, &mounts);
@@ -1654,7 +1654,7 @@ mod tests {
         let yaml = "vmType: \"vz\"\nmounts: []\ncontainerd:\n  system: false\n";
         let mounts = vec![crate::config::Mount {
             host_path: "/x".into(),
-            guest_path: "/y".into(),
+            guest_path: crate::paths::GuestPath::absolute("/y").unwrap(),
         }];
         let result = super::inject_mounts(yaml, &mounts);
         assert!(result.contains("vmType: \"vz\""), "lost vmType: {result}");

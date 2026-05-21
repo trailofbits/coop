@@ -10,6 +10,7 @@ mod guest;
 mod guest_env_state;
 mod naming;
 mod pat_prompt;
+mod paths;
 mod port_forward;
 mod secret_store;
 mod sha256_hash;
@@ -2898,7 +2899,7 @@ mod tests {
         );
         let mount = super::config::Mount {
             host_path: tmp.path().to_path_buf(),
-            guest_path: "/workspace".to_string(),
+            guest_path: super::paths::GuestPath::absolute("/workspace").expect("absolute"),
         };
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);
@@ -2919,7 +2920,7 @@ mod tests {
         );
         let mount = super::config::Mount {
             host_path: tmp.path().to_path_buf(),
-            guest_path: "/workspace".to_string(),
+            guest_path: super::paths::GuestPath::absolute("/workspace").expect("absolute"),
         };
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);

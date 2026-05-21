@@ -426,7 +426,7 @@ pub fn sync_mounts(
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
         if target.exec_ok("which rsync") {
-            rsync_push(target, &m.host_path, guest, exclude_git)?;
+            rsync_push(target, &m.host_path, guest.as_str(), exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
             tar_pipe_transfer(target, &m.host_path, exclude_git)?;
@@ -445,7 +445,7 @@ pub fn sync_mounts(
 pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
     if let Some(m) = mounts.first() {
         let state = WorkspaceState {
-            guest_path: m.guest_path.clone(),
+            guest_path: m.guest_path.as_str().to_string(),
             source: WorkspaceSource::Mount {
                 host_path: m.host_path.clone(),
             },
@@ -1130,11 +1130,11 @@ mod tests {
         let mounts = vec![
             crate::config::Mount {
                 host_path: primary.path().to_path_buf(),
-                guest_path: "/workspace".to_string(),
+                guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
             },
             crate::config::Mount {
                 host_path: secondary.path().to_path_buf(),
-                guest_path: "/data".to_string(),
+                guest_path: crate::paths::GuestPath::absolute("/data").unwrap(),
             },
         ];
         record_mount_state(&inst, &mounts).expect("save");

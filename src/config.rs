@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cmd::Cmd;
 use crate::naming::validate_safe_chars;
+use crate::paths::GuestPath;
 
 pub const DEFAULT_IMAGE: &str = "default";
 
@@ -296,7 +297,7 @@ impl TryFrom<u16> for InstanceIndex {
 #[derive(Debug, Clone)]
 pub struct Mount {
     pub host_path: PathBuf,
-    pub guest_path: String,
+    pub guest_path: GuestPath,
 }
 
 impl Mount {
@@ -305,20 +306,22 @@ impl Mount {
     /// If `GUEST_PATH` is omitted, defaults to `/workspace`.
     pub fn parse(spec: &str) -> Result<Self> {
         let (host, guest_path) = if let Some((h, g)) = spec.split_once(':') {
-            (h, g.to_string())
+            (h, GuestPath::absolute(g)?)
         } else {
-            (spec, "/workspace".to_string())
+            (spec, GuestPath::absolute("/workspace")?)
         };
         Self::from_parts(host, guest_path)
     }
 
     /// Build a `Mount` from already-split host and guest components.
     ///
-    /// Single source of truth for the canonicalize / is-dir / absolute-guest
-    /// invariants; callers that build the spec from typed fields (devcontainer
-    /// JSON, Docker `type=bind` form) skip the string round-trip by calling
-    /// this directly.
-    pub fn from_parts(host: &str, guest_path: String) -> Result<Self> {
+    /// Single source of truth for the canonicalize / is-dir
+    /// invariants; the absolute-guest invariant is carried by
+    /// `GuestPath::absolute` at the type boundary. Callers that build
+    /// the spec from typed fields (devcontainer JSON, Docker
+    /// `type=bind` form) skip the string round-trip by calling this
+    /// directly.
+    pub fn from_parts(host: &str, guest_path: GuestPath) -> Result<Self> {
         let host_path = Path::new(host)
             .canonicalize()
             .with_context(|| format!("Mount host path does not exist: {host}"))?;
@@ -327,11 +330,6 @@ impl Mount {
             host_path.is_dir(),
             "Mount host path is not a directory: {}",
             host_path.display()
-        );
-
-        anyhow::ensure!(
-            guest_path.starts_with('/'),
-            "Mount guest path must be absolute: {guest_path}"
         );
 
         Ok(Self {
@@ -4318,7 +4316,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path, "/workspace");
+        assert_eq!(m.guest_path.as_str(), "/workspace");
     }
 
     #[test]
@@ -4327,7 +4325,7 @@ skip = ["not-a-slug"]
         let spec = format!("{}:/data/project", tmp.path().display());
         let m = Mount::parse(&spec).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path, "/data/project");
+        assert_eq!(m.guest_path.as_str(), "/data/project");
     }
 
     #[test]

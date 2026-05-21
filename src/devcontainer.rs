@@ -1087,7 +1087,7 @@ fn parse_mount_entry(v: &serde_json::Value) -> Result<Mount> {
                 .get("target")
                 .and_then(|v| v.as_str())
                 .context("mount object requires 'target'")?;
-            Mount::from_parts(source, target.to_string())
+            Mount::from_parts(source, crate::paths::GuestPath::absolute(target)?)
         }
         _ => bail!("expected mount string or object"),
     }
@@ -1135,7 +1135,7 @@ fn parse_mount_string(s: &str) -> Result<Mount> {
     }
     let source = source.context("mount string missing source=...")?;
     let target = target.context("mount string missing target=...")?;
-    Mount::from_parts(source, target.to_string())
+    Mount::from_parts(source, crate::paths::GuestPath::absolute(target)?)
 }
 
 /// Map a devcontainer feature id (raw key) to a built-in coop profile,
@@ -1531,11 +1531,11 @@ mod tests {
 
         let docker = format!("type=bind,source={host},target=/b");
         let m = parse_mount_string(&docker).unwrap();
-        assert_eq!(m.guest_path, "/b");
+        assert_eq!(m.guest_path.as_str(), "/b");
 
         let no_type = format!("source={host},target=/b,readonly");
         let m = parse_mount_string(&no_type).unwrap();
-        assert_eq!(m.guest_path, "/b");
+        assert_eq!(m.guest_path.as_str(), "/b");
 
         assert!(parse_mount_string("type=volume,source=v,target=/b").is_err());
     }
@@ -1548,7 +1548,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = format!("{}:/g", tmp.path().display());
         let m = parse_mount_string(&spec).unwrap();
-        assert_eq!(m.guest_path, "/g");
+        assert_eq!(m.guest_path.as_str(), "/g");
     }
 
     #[test]
@@ -1557,7 +1557,7 @@ mod tests {
         let host = tmp.path().to_str().unwrap();
         let obj = serde_json::json!({"type": "bind", "source": host, "target": "/b"});
         let m = parse_mount_entry(&obj).unwrap();
-        assert_eq!(m.guest_path, "/b");
+        assert_eq!(m.guest_path.as_str(), "/b");
     }
 
     #[test]

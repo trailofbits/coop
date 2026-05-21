@@ -11,67 +11,9 @@ use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
 use crate::config::{ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef};
+use crate::paths::{GuestPath, HostPath};
 use crate::setup::SetupOptions;
 use crate::shell::shell_escape;
-
-// ── Path newtypes ─────────────────────────────────────────────
-
-/// Path inside the guest VM. Prevents confusion between host
-/// `PathBuf` and guest path strings (which use Linux conventions
-/// regardless of the host OS).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GuestPath(String);
-
-impl GuestPath {
-    pub fn new(path: impl Into<String>) -> Self {
-        Self(path.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for GuestPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Path on the host. Pairs with [`GuestPath`] so scp call sites
-/// distinguish source and destination by type rather than by
-/// argument order. Carries no invariant beyond direction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostPath(PathBuf);
-
-impl HostPath {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl From<PathBuf> for HostPath {
-    fn from(p: PathBuf) -> Self {
-        Self(p)
-    }
-}
-
-impl From<&Path> for HostPath {
-    fn from(p: &Path) -> Self {
-        Self(p.to_path_buf())
-    }
-}
-
-impl AsRef<Path> for HostPath {
-    #[mutants::skip] // equivalent: trivial forwarder over self.0
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
 
 // ── Operation modes ───────────────────────────────────────────
 
