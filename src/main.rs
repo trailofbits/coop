@@ -1471,7 +1471,7 @@ fn start_instance(
         workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
-            guest_path: "/workspace".to_string(),
+            guest_path: paths::GuestPath::absolute("/workspace")?,
             source: workspace::WorkspaceSource::Workspace {
                 host_path: abs_path,
             },
@@ -1481,7 +1481,7 @@ fn start_instance(
         backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
         let state = workspace::WorkspaceState {
-            guest_path: "/workspace".to_string(),
+            guest_path: paths::GuestPath::absolute("/workspace")?,
             source: workspace::WorkspaceSource::GitRepo {
                 url: repo_url.to_string(),
             },

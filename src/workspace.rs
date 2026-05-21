@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{RunningInstance, SshTarget};
 use crate::config::Instance;
+use crate::paths::GuestPath;
 
 const GUEST_WORKSPACE: &str = "/workspace";
 
@@ -28,8 +29,8 @@ const GIT_EXCLUDE: &str = ".git/";
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
-    /// Path inside the guest VM.
-    pub guest_path: String,
+    /// Path inside the guest VM. Always absolute by construction.
+    pub guest_path: GuestPath,
     /// How the workspace was created. Variant-specific fields (host
     /// path, original repo URL) live inside the source so invalid
     /// combinations can't be expressed.
@@ -309,13 +310,21 @@ fn format_pull_failure(ssh_stderr: &[u8], tar_stderr: &[u8]) -> String {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "GUEST_WORKSPACE is a const literal starting with '/'; invariant holds at compile time"
+)]
+fn default_workspace_path() -> GuestPath {
+    GuestPath::absolute(GUEST_WORKSPACE).expect("GUEST_WORKSPACE constant is absolute")
+}
+
 fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
     if let Some(state) = WorkspaceState::try_load(inst)? {
         return Ok(state);
     }
     if let Some(d) = dir {
         return Ok(WorkspaceState {
-            guest_path: GUEST_WORKSPACE.to_string(),
+            guest_path: default_workspace_path(),
             source: WorkspaceSource::Workspace {
                 host_path: PathBuf::from(d),
             },
@@ -426,7 +435,7 @@ pub fn sync_mounts(
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
         if target.exec_ok("which rsync") {
-            rsync_push(target, &m.host_path, guest.as_str(), exclude_git)?;
+            rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
             tar_pipe_transfer(target, &m.host_path, exclude_git)?;
@@ -445,7 +454,7 @@ pub fn sync_mounts(
 pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
     if let Some(m) = mounts.first() {
         let state = WorkspaceState {
-            guest_path: m.guest_path.as_str().to_string(),
+            guest_path: m.guest_path.clone(),
             source: WorkspaceSource::Mount {
                 host_path: m.host_path.clone(),
             },
@@ -466,10 +475,14 @@ pub fn vscode(
 ) -> Result<()> {
     let inst = running.instance();
     let target = running.target();
-    let remote_path = project.unwrap_or(GUEST_WORKSPACE);
+    let remote_path = match project {
+        Some(p) => GuestPath::absolute(p)
+            .with_context(|| format!("--project must be an absolute guest path: {p:?}"))?,
+        None => default_workspace_path(),
+    };
 
     update_ssh_config(target, inst)?;
-    launch_editor(inst, remote_path, editor)?;
+    launch_editor(inst, &remote_path, editor)?;
 
     let block = ssh_config_block(target, inst);
     writeln!(
@@ -542,7 +555,7 @@ fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
 pub fn rsync_push(
     target: &SshTarget,
     source: &Path,
-    guest_path: &str,
+    guest_path: &GuestPath,
     exclude_git: bool,
 ) -> Result<()> {
     let mut args = rsync_base_args(target, exclude_git);
@@ -561,7 +574,12 @@ pub fn rsync_push(
     Ok(())
 }
 
-fn rsync_pull(target: &SshTarget, guest_path: &str, dest: &Path, exclude_git: bool) -> Result<()> {
+fn rsync_pull(
+    target: &SshTarget,
+    guest_path: &GuestPath,
+    dest: &Path,
+    exclude_git: bool,
+) -> Result<()> {
     let mut args = rsync_base_args(target, exclude_git);
     args.push(format!("{}:{guest_path}/", target.addr()));
     args.push(format!("{}/", dest.display()));
@@ -581,7 +599,7 @@ fn rsync_pull(target: &SshTarget, guest_path: &str, dest: &Path, exclude_git: bo
 
 fn tar_pipe_pull(
     target: &SshTarget,
-    guest_path: &str,
+    guest_path: &GuestPath,
     dest: &Path,
     exclude_git: bool,
 ) -> Result<()> {
@@ -709,7 +727,7 @@ fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState, cmd: &str) -
         })
 }
 
-fn check_guest_dirty(target: &SshTarget, guest_path: &str) -> Result<()> {
+fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // Untracked files are excluded — they're almost always host-side noise
     // (build artifacts, editor state) that was copied in at start time, not
     // edits made inside the guest. Modified tracked files and unpushed
@@ -907,11 +925,12 @@ struct LaunchStrategy {
     args: Vec<String>,
 }
 
-fn vscode_strategies(remote_arg: &str, remote_path: &str) -> Vec<LaunchStrategy> {
+fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
+    let path_arg = remote_path.as_str().to_string();
     let mut strategies = vec![LaunchStrategy {
         name: "code CLI",
         cmd: "code".into(),
-        args: vec!["--remote".into(), remote_arg.into(), remote_path.into()],
+        args: vec!["--remote".into(), remote_arg.into(), path_arg.clone()],
     }];
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
@@ -923,14 +942,14 @@ fn vscode_strategies(remote_arg: &str, remote_path: &str) -> Vec<LaunchStrategy>
                 "--args".into(),
                 "--remote".into(),
                 remote_arg.into(),
-                remote_path.into(),
+                path_arg,
             ],
         });
     }
     strategies
 }
 
-fn launch_editor(inst: &Instance, remote_path: &str, editor: Option<&str>) -> Result<()> {
+fn launch_editor(inst: &Instance, remote_path: &GuestPath, editor: Option<&str>) -> Result<()> {
     let host = ssh_config_host(inst);
     let remote_arg = format!("ssh-remote+{host}");
 
@@ -1092,14 +1111,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let state = WorkspaceState {
-            guest_path: "/custom".to_string(),
+            guest_path: GuestPath::absolute("/custom").unwrap(),
             source: WorkspaceSource::GitRepo {
                 url: "https://github.com/x/y.git".to_string(),
             },
         };
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
-        assert_eq!(loaded.guest_path, "/custom");
+        assert_eq!(loaded.guest_path.as_str(), "/custom");
         assert!(matches!(
             loaded.source,
             WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
@@ -1114,7 +1133,7 @@ mod tests {
         // explicit --dir as its host_path so consumers can read it
         // uniformly.
         let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
-        assert_eq!(loaded.guest_path, GUEST_WORKSPACE);
+        assert_eq!(loaded.guest_path.as_str(), GUEST_WORKSPACE);
         assert!(matches!(
             loaded.source,
             WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("./project")
@@ -1145,7 +1164,7 @@ mod tests {
             loaded.source,
             WorkspaceSource::Mount { ref host_path } if host_path == primary.path()
         ));
-        assert_eq!(loaded.guest_path, "/workspace");
+        assert_eq!(loaded.guest_path.as_str(), "/workspace");
     }
 
     #[test]
@@ -1312,14 +1331,14 @@ Host coop-0\n\
         // `record_mount_state_persists_first_mount` (Mount) and
         // `load_or_default_uses_saved_state` (GitRepo).
         let state = WorkspaceState {
-            guest_path: "/workspace".to_string(),
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
             source: WorkspaceSource::Workspace {
                 host_path: PathBuf::from("/host/dir"),
             },
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let back: WorkspaceState = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.guest_path, "/workspace");
+        assert_eq!(back.guest_path.as_str(), "/workspace");
         assert!(matches!(
             back.source,
             WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")
