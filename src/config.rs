@@ -695,6 +695,119 @@ impl<'de> Deserialize<'de> for SubnetMask {
     }
 }
 
+/// Linux network interface name (e.g. `eth0`, `ens5`).
+///
+/// Construction enforces the kernel's `dev_valid_name` rules: non-empty,
+/// not `.` or `..`, no `/` or whitespace, and at most `IFNAMSIZ - 1 = 15`
+/// bytes. The constructor is the only entry point, so downstream code
+/// holding an `InterfaceName` can use it without re-validating.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InterfaceName(String);
+
+/// Maximum interface name length excluding the trailing NUL.
+/// Matches the kernel `IFNAMSIZ - 1`.
+const MAX_INTERFACE_NAME_LEN: usize = 15;
+
+impl InterfaceName {
+    pub fn new(name: &str) -> Result<Self> {
+        validate_interface_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn validate_interface_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Interface name is empty");
+    }
+    if name == "." || name == ".." {
+        bail!("Interface name '{name}' is reserved");
+    }
+    if name.len() > MAX_INTERFACE_NAME_LEN {
+        bail!(
+            "Interface name '{name}' too long ({} bytes, max {MAX_INTERFACE_NAME_LEN})",
+            name.len()
+        );
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
+    {
+        bail!(
+            "Interface name '{name}' contains invalid character {c:?} \
+             (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
+        );
+    }
+    Ok(())
+}
+
+impl fmt::Display for InterfaceName {
+    #[mutants::skip] // equivalent: trivial forwarder; as_str() coverage suffices
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Host interface selection for NAT. Either the literal string `"auto"`
+/// (auto-detect the default route's interface at runtime) or an explicit
+/// [`InterfaceName`].
+///
+/// A custom serde impl rejects sentinel typos like `"Auto"` or `" auto"` —
+/// they fail validation as interface names rather than silently bypassing
+/// auto-detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostInterface {
+    Auto,
+    Named(InterfaceName),
+}
+
+impl HostInterface {
+    /// String form used in TOML (`"auto"` or the interface name).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Named(name) => name.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for HostInterface {
+    #[mutants::skip] // equivalent: trivial forwarder; as_str() coverage suffices
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for HostInterface {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HostInterface {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s == "auto" {
+            return Ok(Self::Auto);
+        }
+        // Catch sentinel typos that an InterfaceName check wouldn't:
+        // "Auto" / "AUTO" pass the charset, " auto" doesn't, but both
+        // would silently mask the user's intent.
+        if s.eq_ignore_ascii_case("auto") || s.trim() == "auto" {
+            return Err(serde::de::Error::custom(format!(
+                "host_iface '{s}' looks like the 'auto' sentinel — \
+                 write it exactly as \"auto\" for auto-detection"
+            )));
+        }
+        InterfaceName::new(&s)
+            .map(Self::Named)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Host IP on TAP interfaces
@@ -705,9 +818,9 @@ pub struct NetworkConfig {
     #[serde(default = "default_subnet_mask")]
     pub subnet_mask: SubnetMask,
 
-    /// Host network interface for NAT (e.g., eth0, ens5)
+    /// Host network interface for NAT (`"auto"` or a name like `eth0`, `ens5`)
     #[serde(default = "default_host_iface")]
-    pub host_iface: String,
+    pub host_iface: HostInterface,
 }
 
 /// GitHub authentication mode for the guest VM.
@@ -2068,9 +2181,8 @@ fn default_subnet_mask() -> SubnetMask {
     SubnetMask::new(24).expect("24 is in 0..=32")
 }
 
-#[mutants::skip] // equivalent: "auto" is consumed by host-interface auto-detection at runtime, not by any unit test
-fn default_host_iface() -> String {
-    "auto".to_string()
+fn default_host_iface() -> HostInterface {
+    HostInterface::Auto
 }
 
 fn default_ssh_port() -> NonZeroU16 {
@@ -3361,6 +3473,112 @@ skip = ["not-a-slug"]
         assert!(CoopConfig::load(&path).is_err());
     }
 
+    // ── InterfaceName / HostInterface ─────────────────────────
+
+    #[test]
+    fn interface_name_accepts_typical_linux_names() {
+        for s in [
+            "eth0", "ens5", "en0", "wlan0", "br0", "veth-1", "tap_0", "lo",
+        ] {
+            assert!(InterfaceName::new(s).is_ok(), "{s} should be accepted");
+        }
+    }
+
+    #[test]
+    fn interface_name_rejects_empty_and_reserved() {
+        assert!(InterfaceName::new("").is_err());
+        assert!(InterfaceName::new(".").is_err());
+        assert!(InterfaceName::new("..").is_err());
+    }
+
+    #[test]
+    fn interface_name_rejects_overlong() {
+        let too_long = "a".repeat(MAX_INTERFACE_NAME_LEN + 1);
+        assert!(InterfaceName::new(&too_long).is_err());
+        let max_ok = "a".repeat(MAX_INTERFACE_NAME_LEN);
+        assert!(InterfaceName::new(&max_ok).is_ok());
+    }
+
+    #[test]
+    fn interface_name_rejects_out_of_charset() {
+        for s in [
+            "eth 0",  // space
+            "eth\t0", // tab
+            "eth/0",  // path separator
+            "eth\n0", // newline
+            "weird!", // punctuation
+            "café",   // non-ASCII
+            " eth0",  // leading whitespace
+            "eth0 ",  // trailing whitespace
+        ] {
+            assert!(InterfaceName::new(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn host_interface_deserializes_auto_sentinel() {
+        let parsed: HostInterface = serde_json::from_str(r#""auto""#).unwrap();
+        assert_eq!(parsed, HostInterface::Auto);
+    }
+
+    #[test]
+    fn host_interface_deserializes_named_interface() {
+        let parsed: HostInterface = serde_json::from_str(r#""eth0""#).unwrap();
+        assert_eq!(
+            parsed,
+            HostInterface::Named(InterfaceName::new("eth0").unwrap())
+        );
+    }
+
+    /// The whole point of the enum: typo'd sentinels fail loudly rather
+    /// than silently bypassing auto-detection.
+    #[test]
+    fn host_interface_rejects_sentinel_typos() {
+        for s in [r#""Auto""#, r#""AUTO""#, r#"" auto""#, r#""auto ""#] {
+            assert!(
+                serde_json::from_str::<HostInterface>(s).is_err(),
+                "{s} should not be accepted as the auto sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn host_interface_rejects_invalid_interface_name() {
+        for s in [r#""""#, r#""eth/0""#, r#""eth 0""#] {
+            assert!(
+                serde_json::from_str::<HostInterface>(s).is_err(),
+                "{s} should fail to deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn host_interface_roundtrip_serde() {
+        let auto = HostInterface::Auto;
+        assert_eq!(serde_json::to_string(&auto).unwrap(), r#""auto""#);
+
+        let named = HostInterface::Named(InterfaceName::new("ens5").unwrap());
+        assert_eq!(serde_json::to_string(&named).unwrap(), r#""ens5""#);
+    }
+
+    #[test]
+    fn host_interface_display_matches_as_str() {
+        assert_eq!(HostInterface::Auto.to_string(), "auto");
+        assert_eq!(
+            HostInterface::Named(InterfaceName::new("eth0").unwrap()).to_string(),
+            "eth0"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_typo_host_iface() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        // " auto" with a leading space — the bug the enum exists to prevent.
+        fs::write(&path, "[network]\nhost_iface = \" auto\"\n").unwrap();
+        assert!(CoopConfig::load(&path).is_err());
+    }
+
     #[test]
     fn load_valid_toml_parses() {
         let tmp = TempDir::new().unwrap();
@@ -3424,7 +3642,10 @@ skip = ["not-a-slug"]
         fs::write(&path, "[network]\nhost_iface = \"eth0\"\n").unwrap();
 
         let cfg = CoopConfig::load(&path).unwrap();
-        assert_eq!(cfg.network.host_iface, "eth0");
+        assert_eq!(
+            cfg.network.host_iface,
+            HostInterface::Named(InterfaceName::new("eth0").unwrap())
+        );
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
         assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
     }
