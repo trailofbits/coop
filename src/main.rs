@@ -71,31 +71,41 @@ struct SessionArgs {
     /// Instance name (required if multiple instances exist)
     #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
     name: Option<String>,
-    /// tmux session name
-    #[arg(long, conflicts_with = "no_tmux")]
-    session: Option<String>,
+    /// tmux session name (allowed: a-z, A-Z, 0-9, '_', '-')
+    #[arg(long, conflicts_with = "no_tmux", value_parser = parse_tmux_session)]
+    session: Option<ssh::TmuxSessionName>,
     /// Skip tmux session persistence (raw SSH connection)
     #[arg(long)]
     no_tmux: bool,
 }
 
+fn parse_tmux_session(s: &str) -> Result<ssh::TmuxSessionName, String> {
+    ssh::TmuxSessionName::new(s).map_err(|e| e.to_string())
+}
+
 impl SessionArgs {
-    fn tmux_session<'a>(&'a self, default: &'a str) -> Option<&'a str> {
+    fn tmux_session(&self, default: &'static str) -> Option<ssh::TmuxSessionName> {
         if self.no_tmux {
             return None;
         }
-        Some(self.session.as_deref().unwrap_or(default))
+        Some(self.session.clone().unwrap_or_else(|| {
+            #[expect(
+                clippy::expect_used,
+                reason = "static default literal matches TmuxSessionName charset"
+            )]
+            ssh::TmuxSessionName::new(default).expect("static default is a valid tmux name")
+        }))
     }
 
     /// Returns a tmux session name only when explicitly requested via
     /// `--session`. Used by commands where tmux is opt-in (the wrapped
     /// process manages its own persistence, e.g. `claude agents` whose
     /// background sessions live in the daemon, not the terminal).
-    fn tmux_session_opt_in(&self) -> Option<&str> {
+    fn tmux_session_opt_in(&self) -> Option<ssh::TmuxSessionName> {
         if self.no_tmux {
             return None;
         }
-        self.session.as_deref()
+        self.session.clone()
     }
 }
 
@@ -808,18 +818,18 @@ fn main() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let tmux = session.tmux_session("claude");
-            ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
+            ssh::run_interactive(&sess, &build_remote(tmux, crate::guest::CLAUDE_BIN, args))
         }
         Commands::ClaudeAgents { session, mut args } => {
             let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
             args.insert(0, "agents".to_string());
             let tmux = session.tmux_session_opt_in();
-            ssh::run_interactive(&sess, crate::guest::CLAUDE_BIN, &args, tmux)
+            ssh::run_interactive(&sess, &build_remote(tmux, crate::guest::CLAUDE_BIN, args))
         }
         Commands::Codex { session, args } => {
             let sess = open_ssh_session(&be, &cfg, session.name.as_deref())?;
             let tmux = session.tmux_session("codex");
-            ssh::run_interactive(&sess, crate::guest::CODEX_BIN, &args, tmux)
+            ssh::run_interactive(&sess, &build_remote(tmux, crate::guest::CODEX_BIN, args))
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_deref())?;
@@ -1645,13 +1655,33 @@ fn cmd_shell(
     cfg: &config::CoopConfig,
     name: Option<&str>,
     command: &[String],
-    tmux_session: Option<&str>,
+    tmux_session: Option<ssh::TmuxSessionName>,
 ) -> Result<()> {
     let session = open_ssh_session(be, cfg, name)?;
     if command.is_empty() {
-        ssh::connect(&session, tmux_session)
+        ssh::run_interactive(&session, &build_remote(tmux_session, "", Vec::new()))
     } else {
         ssh::run_command(&session, command)
+    }
+}
+
+/// Build a `RemoteCommand` from a tmux choice and a (binary, args) pair.
+///
+/// `binary` may be empty, meaning "no command" — opens a bare interactive
+/// shell (or attaches to tmux without launching anything).
+fn build_remote(
+    tmux: Option<ssh::TmuxSessionName>,
+    binary: &str,
+    args: Vec<String>,
+) -> ssh::RemoteCommand {
+    let mut command = Vec::with_capacity(1 + args.len());
+    if !binary.is_empty() {
+        command.push(binary.to_string());
+    }
+    command.extend(args);
+    match tmux {
+        Some(session) => ssh::RemoteCommand::Tmux { session, command },
+        None => ssh::RemoteCommand::Shell { command },
     }
 }
 
@@ -2318,14 +2348,18 @@ mod tests {
         assert!(matches!(cli.command, super::Commands::Shell { .. }));
     }
 
+    fn tmux(s: &str) -> super::ssh::TmuxSessionName {
+        super::ssh::TmuxSessionName::new(s).expect("valid tmux session name")
+    }
+
     #[test]
     fn shell_session_flag_parses() {
         let cli = parse(&["shell", "--session", "work"]);
         let super::Commands::Shell { session, .. } = cli.command else {
             panic!("expected Shell variant");
         };
-        assert_eq!(session.session.as_deref(), Some("work"));
-        assert_eq!(session.tmux_session("main"), Some("work"));
+        assert_eq!(session.session, Some(tmux("work")));
+        assert_eq!(session.tmux_session("main"), Some(tmux("work")));
     }
 
     #[test]
@@ -2335,7 +2369,13 @@ mod tests {
             panic!("expected Shell variant");
         };
         assert!(session.session.is_none());
-        assert_eq!(session.tmux_session("main"), Some("main"));
+        assert_eq!(session.tmux_session("main"), Some(tmux("main")));
+    }
+
+    #[test]
+    fn shell_session_flag_rejects_invalid_name() {
+        let err = parse_err(&["shell", "--session", "bad name"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
@@ -2350,8 +2390,8 @@ mod tests {
         let super::Commands::Claude { session, .. } = cli.command else {
             panic!("expected Claude variant");
         };
-        assert_eq!(session.session.as_deref(), Some("dev"));
-        assert_eq!(session.tmux_session("claude"), Some("dev"));
+        assert_eq!(session.session, Some(tmux("dev")));
+        assert_eq!(session.tmux_session("claude"), Some(tmux("dev")));
     }
 
     #[test]
@@ -2397,7 +2437,7 @@ mod tests {
         let super::Commands::ClaudeAgents { session, .. } = cli.command else {
             panic!("expected ClaudeAgents variant");
         };
-        assert_eq!(session.tmux_session_opt_in(), Some("dev"));
+        assert_eq!(session.tmux_session_opt_in(), Some(tmux("dev")));
     }
 
     #[test]
@@ -2432,8 +2472,8 @@ mod tests {
         let super::Commands::Codex { session, .. } = cli.command else {
             panic!("expected Codex variant");
         };
-        assert_eq!(session.session.as_deref(), Some("dev"));
-        assert_eq!(session.tmux_session("codex"), Some("dev"));
+        assert_eq!(session.session, Some(tmux("dev")));
+        assert_eq!(session.tmux_session("codex"), Some(tmux("dev")));
     }
 
     #[test]
