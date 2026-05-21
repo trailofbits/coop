@@ -4,6 +4,24 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+/// A command-line argument paired with its redaction status.
+///
+/// Pairing the value with the variant means a redacted arg cannot be
+/// silently separated from its redaction marker by reordering or
+/// insertion — the contract travels with the value.
+enum Arg {
+    Public(OsString),
+    Redacted(OsString),
+}
+
+impl Arg {
+    fn value(&self) -> &OsStr {
+        match self {
+            Self::Public(v) | Self::Redacted(v) => v,
+        }
+    }
+}
+
 /// Builder for running external commands with consistent logging,
 /// error checking, and optional sudo elevation.
 ///
@@ -11,12 +29,9 @@ use anyhow::{Context, Result, bail};
 /// `Command::new()` patterns with a single fluent API.
 pub struct Cmd {
     program: OsString,
-    args: Vec<OsString>,
+    args: Vec<Arg>,
     sudo: bool,
     stdin: Option<Vec<u8>>,
-    /// Indices into `args` whose values should be redacted in [`Cmd::describe`].
-    /// Use [`Cmd::redact_next`] when staging an arg that carries a secret.
-    redacted_args: Vec<usize>,
 }
 
 impl Cmd {
@@ -26,12 +41,11 @@ impl Cmd {
             args: Vec::new(),
             sudo: false,
             stdin: None,
-            redacted_args: Vec::new(),
         }
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
-        self.args.push(arg.as_ref().to_owned());
+        self.args.push(Arg::Public(arg.as_ref().to_owned()));
         self
     }
 
@@ -41,9 +55,7 @@ impl Cmd {
     /// reading from stdin. Use this only for tools that have no
     /// stdin-friendly path (e.g. macOS `security add-generic-password -w`).
     pub fn redacted_arg(mut self, arg: impl AsRef<OsStr>) -> Self {
-        let idx = self.args.len();
-        self.args.push(arg.as_ref().to_owned());
-        self.redacted_args.push(idx);
+        self.args.push(Arg::Redacted(arg.as_ref().to_owned()));
         self
     }
 
@@ -53,7 +65,7 @@ impl Cmd {
         S: AsRef<OsStr>,
     {
         self.args
-            .extend(args.into_iter().map(|s| s.as_ref().to_owned()));
+            .extend(args.into_iter().map(|s| Arg::Public(s.as_ref().to_owned())));
         self
     }
 
@@ -79,14 +91,15 @@ impl Cmd {
     /// Build the underlying `Command` for complex use cases that
     /// need custom stdio, spawn, or other `Command` methods.
     pub fn build(&self) -> Command {
+        let raw_args = self.args.iter().map(Arg::value);
         if self.sudo {
             let mut cmd = Command::new("sudo");
             cmd.arg(&self.program);
-            cmd.args(&self.args);
+            cmd.args(raw_args);
             cmd
         } else {
             let mut cmd = Command::new(&self.program);
-            cmd.args(&self.args);
+            cmd.args(raw_args);
             cmd
         }
     }
@@ -100,13 +113,9 @@ impl Cmd {
             let args: Vec<String> = self
                 .args
                 .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if self.redacted_args.contains(&i) {
-                        "<redacted>".to_string()
-                    } else {
-                        a.to_string_lossy().into_owned()
-                    }
+                .map(|a| match a {
+                    Arg::Public(v) => v.to_string_lossy().into_owned(),
+                    Arg::Redacted(_) => "<redacted>".to_string(),
                 })
                 .collect();
             format!("{prefix}{prog} {}", args.join(" "))
@@ -314,6 +323,37 @@ mod tests {
     fn cmd_describe_no_args() {
         let cmd = Cmd::new("ls");
         assert_eq!(cmd.describe(), "ls");
+    }
+
+    #[test]
+    fn cmd_describe_redacts_only_redacted_arg() {
+        let cmd = Cmd::new("op")
+            .arg("item")
+            .arg("create")
+            .redacted_arg("password=hunter2")
+            .arg("--title=demo");
+        assert_eq!(cmd.describe(), "op item create <redacted> --title=demo");
+    }
+
+    #[test]
+    fn cmd_describe_redacts_each_redacted_arg() {
+        let cmd = Cmd::new("tool")
+            .redacted_arg("secret-a")
+            .arg("between")
+            .redacted_arg("secret-b");
+        assert_eq!(cmd.describe(), "tool <redacted> between <redacted>");
+    }
+
+    #[test]
+    fn cmd_build_passes_redacted_value_to_command() {
+        let cmd = Cmd::new("echo")
+            .arg("public")
+            .redacted_arg("sensitive-payload");
+        let out = cmd.capture().expect("echo capture should succeed");
+        assert!(
+            out.contains("public") && out.contains("sensitive-payload"),
+            "echo should receive both args verbatim: {out}",
+        );
     }
 
     #[test]
