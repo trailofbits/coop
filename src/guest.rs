@@ -69,7 +69,6 @@ pub const BASE_PACKAGES: &[&str] = &[
     "procps",
     "jq",
     "rsync",
-    "tmux",
     "unzip",
     "zip",
     "file",

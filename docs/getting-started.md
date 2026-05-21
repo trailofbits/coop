@@ -80,7 +80,7 @@ coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment aut
 
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, tmux, and others), the GitHub CLI, Claude Code, and Codex.
+`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
 
 ```
 coop setup
@@ -192,8 +192,6 @@ coop codex -- --model gpt-5
 ```
 coop shell
 ```
-
-`coop shell`, `coop claude`, and `coop codex` attach to persistent tmux sessions. Use `--no-tmux` for a raw SSH connection, or `--session <name>` to pick a named session.
 
 **Run a command non-interactively:**
 

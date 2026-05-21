@@ -573,23 +573,6 @@ test_ssh_alias() {
     fi
 }
 
-test_session_conflict() {
-    echo ""
-    echo "=== Phase: --session / --no-tmux conflict ==="
-
-    if moat_fails shell "$INSTANCE" --session main --no-tmux -- echo nope; then
-        pass "--session and --no-tmux conflict (shell)"
-    else
-        fail "--session and --no-tmux conflict (shell)" "should have failed"
-    fi
-
-    if moat_fails claude "$INSTANCE" --session main --no-tmux; then
-        pass "--session and --no-tmux conflict (claude)"
-    else
-        fail "--session and --no-tmux conflict (claude)" "should have failed"
-    fi
-}
-
 test_exec() {
     echo ""
     echo "=== Phase: exec ==="
@@ -1008,32 +991,6 @@ test_network() {
     else
         fail "HTTPS connectivity works" "curl failed"
     fi
-}
-
-test_tmux() {
-    echo ""
-    echo "=== Phase: tmux session persistence ==="
-
-    # tmux must be installed in the guest image
-    if guest_exec which tmux >/dev/null; then
-        pass "tmux is installed"
-    else
-        fail "tmux is installed" "stderr: $(guest_stderr)"
-        return
-    fi
-
-    # Create a detached tmux session running sleep (no quoting issues)
-    guest_exec tmux new-session -d -s test-persist sleep 300
-    if guest_exec tmux has-session -t test-persist; then
-        pass "tmux session created and persists"
-    else
-        fail "tmux session created and persists" "stderr: $(guest_stderr)"
-        guest_exec tmux kill-session -t test-persist || true
-        return
-    fi
-
-    # Clean up
-    guest_exec tmux kill-session -t test-persist || true
 }
 
 test_docker() {
@@ -3132,7 +3089,6 @@ main() {
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
-    test_session_conflict
     test_exec
     test_claude_bin_path
     test_codex_bin_path
@@ -3141,7 +3097,6 @@ main() {
     test_guest_environment
     test_sudo
     test_network
-    test_tmux
     test_docker
     test_logs
     test_profiles

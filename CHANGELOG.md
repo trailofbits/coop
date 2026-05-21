@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- **tmux session wrapping removed** (#183) — `coop shell`, `coop claude`,
+  and `coop codex` no longer wrap the remote session in tmux, and the
+  `--session <name>` / `--no-tmux` flags are gone. `tmux` is no longer
+  installed in the guest image either. Users who want detachable sessions
+  can run `coop shell` and start tmux themselves, after installing it as
+  an extra package (`--extra-packages tmux` on `coop setup`) or via a
+  custom post-install script. Claude Code's background-agent daemon
+  (`coop claude-agents`) already provides session persistence without a
+  terminal multiplexer.
+
 - **`coop push` / `coop pull` / `coop exec` take the instance name as a
   positional argument** (#90) — these three commands previously accepted
   `--name <name>` while the other eleven subcommands took `name`
@@ -26,10 +36,10 @@
   an already-bound host port fails fast before the VM is created.
 
 - **`coop ca` / `coop claude-agents` shortcut** (#80, #82, #99, #100, #101) —
-  Runs `claude agents` inside the VM in one command. Defaults to no
-  tmux (Claude Code manages background-session lifetime itself);
-  `--session <name>` opts in. The guest is now bootstrapped with a
-  managed `~/.claude/settings.json` that pre-accepts
+  Runs `claude agents` inside the VM in one command. Claude Code's daemon
+  manages background-session lifetime itself, so closing the terminal
+  does not interrupt running agents. The guest is now bootstrapped with
+  a managed `~/.claude/settings.json` that pre-accepts
   `bypassPermissions`, so dispatched sessions no longer prompt for
   tool permissions; `coop claude --ask` explicitly opts back into the
   prompting default.

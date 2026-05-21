@@ -22,16 +22,6 @@ Trailing arguments go straight through to the `claude` CLI:
 coop claude -- --model sonnet --verbose
 ```
 
-### tmux session persistence
-
-`coop claude` runs inside a tmux session named `claude` by default. If the SSH connection drops, the Claude process survives in the guest. Running `coop claude` again reattaches to the existing session rather than starting a new one.
-
-To bypass tmux and get a raw SSH session:
-
-```bash
-coop claude --no-tmux
-```
-
 ## Managing background agents
 
 ```bash
@@ -48,11 +38,7 @@ This runs `claude agents` in the guest, which opens the agent view — an intera
 coop ca -- --cwd /workspace
 ```
 
-Unlike `coop claude`, this command does **not** run inside tmux by default — closing the TUI doesn't stop background sessions, so terminal-level persistence adds little. To opt into tmux, pass coop's `--session <name>` flag *before* the `--` separator (it's a coop flag, not a `claude agents` flag):
-
-```bash
-coop ca --session work
-```
+Closing the TUI does not stop background sessions; reopening `coop ca` reattaches to whatever Claude Code's daemon is still running.
 
 ## Configuration
 

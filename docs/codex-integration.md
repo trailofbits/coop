@@ -16,16 +16,6 @@ Trailing arguments go straight through to the `codex` CLI:
 coop codex -- --model gpt-5
 ```
 
-### tmux session persistence
-
-`coop codex` runs inside a tmux session named `codex` by default. If the SSH connection drops, the Codex process survives in the guest. Running `coop codex` again reattaches to the existing session rather than starting a new one.
-
-To bypass tmux and get a raw SSH session:
-
-```bash
-coop codex --no-tmux
-```
-
 ## Configuration
 
 Codex-related settings live under the `[codex]` section in `config.toml`, except `github` which is a top-level field:

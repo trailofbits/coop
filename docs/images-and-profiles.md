@@ -18,7 +18,7 @@ coop stores the result under `~/.coop/images/<name>/`. On `coop start`, it copie
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `tmux`, `unzip`, `zip`, `file`, `less`
+**Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `unzip`, `zip`, `file`, `less`
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-compose-plugin`
 

@@ -128,18 +128,13 @@ coop shell [NAME] [FLAGS] [-- COMMAND...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--session <name>` | tmux session name (default: `main`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
-Without a trailing command, `shell` drops you into a tmux session named `main` (or the name given by `--session`). With a trailing command, it executes the command and returns its exit code.
-
-`--session` and `--no-tmux` are mutually exclusive.
+Without a trailing command, `shell` drops you into an interactive shell at `/workspace`. With a trailing command, it executes the command and returns its exit code.
 
 ```
 coop shell
-coop shell my-project --no-tmux
-coop shell my-project --session work
+coop shell my-project
 coop shell my-project -- cat /etc/os-release
 ```
 
@@ -155,11 +150,7 @@ coop claude [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Prompt for permissions instead of skipping them |
-| `--session <name>` | tmux session name (default: `claude`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `claude` |
-
-The session runs inside tmux under the name `claude` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
 
 ```
 coop claude
@@ -169,7 +160,7 @@ coop claude my-project -- --model sonnet
 
 ### `claude-agents`
 
-Open the Claude Code agent view (`claude agents`) inside the VM. Unlike `coop claude`, this command does **not** wrap the session in tmux by default — Claude Code's background agents are managed by its own daemon, so a tmux layer adds no persistence. Pass `--session <name>` to opt in to tmux if you want a re-attachable terminal.
+Open the Claude Code agent view (`claude agents`) inside the VM. Claude Code's background agents are managed by its own daemon, so closing the terminal does not stop in-flight sessions; reconnect with `coop claude-agents` to see them again.
 
 ```
 coop claude-agents [NAME] [FLAGS] [ARGS...]
@@ -179,16 +170,14 @@ coop ca [NAME] [FLAGS] [ARGS...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--session <name>` | tmux session name (opt-in; no default) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `claude agents` |
 
-`--session` and `--no-tmux` are mutually exclusive. Alias: `ca`.
+Alias: `ca`.
 
 ```
 coop claude-agents
 coop ca my-project
-coop ca my-project --session agents-work
+coop ca my-project -- --cwd /workspace
 ```
 
 ### `codex`
@@ -202,11 +191,7 @@ coop codex [NAME] [FLAGS] [ARGS...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--session <name>` | tmux session name (default: `codex`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `codex` |
-
-The session runs inside tmux under the name `codex` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
 
 ```
 coop codex
