@@ -27,26 +27,31 @@ pub enum Decision {
     Prompt,
 }
 
+/// Runtime context that influences whether the PAT wizard prompt is
+/// offered. Grouped into a struct so call sites name each flag at the
+/// keyword position rather than relying on positional booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptContext {
+    /// Whether stdin is attached to an interactive terminal.
+    pub is_tty: bool,
+    /// Whether the `CI` env var is set (non-interactive batch run).
+    pub is_ci: bool,
+    /// Whether the caller passed `--no-prompt`.
+    pub no_prompt_flag: bool,
+}
+
 impl Decision {
     /// Pure decision step — no I/O. Easy to unit-test.
     ///
     /// `repo` is the resolved `owner/repo` slug, if any.
-    /// `tty` reflects whether stdin is interactive.
-    /// `ci` reflects whether the `CI` env var is set.
-    /// `no_prompt_flag` reflects whether `--no-prompt` was passed.
-    pub fn resolve(
-        cfg: &CoopConfig,
-        repo: Option<&RepoSlug>,
-        tty: bool,
-        ci: bool,
-        no_prompt_flag: bool,
-    ) -> Self {
+    /// `ctx` carries the TTY / CI / `--no-prompt` flags.
+    pub fn resolve(cfg: &CoopConfig, repo: Option<&RepoSlug>, ctx: PromptContext) -> Self {
         // No repo → nothing to scope to.
         let Some(repo) = repo else {
             return Self::Skip;
         };
         // Hard suppressors first.
-        if no_prompt_flag || ci || !tty || !cfg.setup.prompt_for_pat {
+        if ctx.no_prompt_flag || ctx.is_ci || !ctx.is_tty || !cfg.setup.prompt_for_pat {
             return Self::Skip;
         }
         match cfg.github.as_ref() {
@@ -83,15 +88,18 @@ pub fn maybe_prompt(
     repo: Option<&RepoSlug>,
     no_prompt_flag: bool,
 ) -> Result<()> {
-    let tty = std::io::stdin().is_terminal();
-    let ci = std::env::var("CI").is_ok();
-    let decision = Decision::resolve(cfg, repo, tty, ci, no_prompt_flag);
+    let ctx = PromptContext {
+        is_tty: std::io::stdin().is_terminal(),
+        is_ci: std::env::var("CI").is_ok(),
+        no_prompt_flag,
+    };
+    let decision = Decision::resolve(cfg, repo, ctx);
     match decision {
         Decision::Skip => {
             // Even when we skip the prompt, surface a hint to non-interactive
             // contexts so users discover the wizard exists.
             if let Some(slug) = repo
-                && (!tty || ci)
+                && (!ctx.is_tty || ctx.is_ci)
                 && matches!(cfg.github.as_ref(), None | Some(GitHubAuth::Off))
             {
                 tracing::info!(
@@ -186,20 +194,30 @@ mod tests {
         RepoSlug::new(s).unwrap()
     }
 
+    /// Default interactive context: TTY on, not in CI, no `--no-prompt`.
+    fn interactive() -> PromptContext {
+        PromptContext {
+            is_tty: true,
+            is_ci: false,
+            no_prompt_flag: false,
+        }
+    }
+
     #[test]
     fn skips_when_no_repo() {
         let cfg = cfg_with(None);
-        assert_eq!(
-            Decision::resolve(&cfg, None, true, false, false),
-            Decision::Skip
-        );
+        assert_eq!(Decision::resolve(&cfg, None, interactive()), Decision::Skip);
     }
 
     #[test]
     fn skips_when_no_tty() {
         let cfg = cfg_with(None);
+        let ctx = PromptContext {
+            is_tty: false,
+            ..interactive()
+        };
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), false, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), ctx),
             Decision::Skip
         );
     }
@@ -207,8 +225,12 @@ mod tests {
     #[test]
     fn skips_when_ci() {
         let cfg = cfg_with(None);
+        let ctx = PromptContext {
+            is_ci: true,
+            ..interactive()
+        };
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, true, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), ctx),
             Decision::Skip
         );
     }
@@ -216,8 +238,12 @@ mod tests {
     #[test]
     fn skips_when_no_prompt_flag() {
         let cfg = cfg_with(None);
+        let ctx = PromptContext {
+            no_prompt_flag: true,
+            ..interactive()
+        };
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, true),
+            Decision::resolve(&cfg, Some(&slug("a/b")), ctx),
             Decision::Skip
         );
     }
@@ -226,7 +252,7 @@ mod tests {
     fn prompts_when_mode_off_and_interactive() {
         let cfg = cfg_with(Some(GitHubAuth::Off));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Prompt
         );
     }
@@ -235,7 +261,7 @@ mod tests {
     fn prompts_when_pat_mode_but_no_entry() {
         let cfg = cfg_with(Some(GitHubAuth::Pat(PatConfig::default())));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Prompt
         );
     }
@@ -251,7 +277,7 @@ mod tests {
         );
         let cfg = cfg_with(Some(GitHubAuth::Pat(pc)));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Skip
         );
     }
@@ -262,7 +288,7 @@ mod tests {
         pc.skip.push(slug("a/b"));
         let cfg = cfg_with(Some(GitHubAuth::Pat(pc)));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Skip
         );
     }
@@ -271,7 +297,7 @@ mod tests {
     fn skips_when_mode_auto() {
         let cfg = cfg_with(Some(GitHubAuth::Auto));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Skip
         );
     }
@@ -280,7 +306,7 @@ mod tests {
     fn skips_when_mode_env() {
         let cfg = cfg_with(Some(GitHubAuth::Env));
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Skip
         );
     }
@@ -290,7 +316,7 @@ mod tests {
         let mut cfg = cfg_with(Some(GitHubAuth::Off));
         cfg.setup.prompt_for_pat = false;
         assert_eq!(
-            Decision::resolve(&cfg, Some(&slug("a/b")), true, false, false),
+            Decision::resolve(&cfg, Some(&slug("a/b")), interactive()),
             Decision::Skip
         );
     }
