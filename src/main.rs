@@ -8,6 +8,7 @@ mod github_pat;
 mod github_repo;
 mod guest;
 mod guest_env_state;
+mod naming;
 mod pat_prompt;
 mod port_forward;
 mod secret_store;

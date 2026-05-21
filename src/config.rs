@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::Cmd;
+use crate::naming::validate_safe_chars;
 
 pub const DEFAULT_IMAGE: &str = "default";
 
@@ -732,15 +733,7 @@ fn validate_interface_name(name: &str) -> Result<()> {
             name.len()
         );
     }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
-    {
-        bail!(
-            "Interface name '{name}' contains invalid character {c:?} \
-             (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
-        );
-    }
+    validate_safe_chars(name, "Interface name")?;
     Ok(())
 }
 
@@ -1398,15 +1391,7 @@ fn validate_image_name(name: &str) -> Result<()> {
             name.len()
         );
     }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
-    {
-        bail!(
-            "Image name contains invalid character '{c}' \
-             (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
-        );
-    }
+    validate_safe_chars(name, "Image name")?;
     Ok(())
 }
 
@@ -3325,9 +3310,10 @@ skip = ["not-a-slug"]
 
     #[test]
     fn image_name_rejects_out_of_charset() {
-        for s in ["with space", "tab\tname", "name\n", "weird!", "café"] {
-            assert!(ImageName::new(s).is_err(), "{s} should be rejected");
-        }
+        // Smoke test that the constructor wires through to
+        // `validate_safe_chars`; the exhaustive char-class rejection is
+        // covered by the `naming` module's tests.
+        assert!(ImageName::new("with space").is_err());
     }
 
     #[test]
@@ -3504,18 +3490,10 @@ skip = ["not-a-slug"]
 
     #[test]
     fn interface_name_rejects_out_of_charset() {
-        for s in [
-            "eth 0",  // space
-            "eth\t0", // tab
-            "eth/0",  // path separator
-            "eth\n0", // newline
-            "weird!", // punctuation
-            "café",   // non-ASCII
-            " eth0",  // leading whitespace
-            "eth0 ",  // trailing whitespace
-        ] {
-            assert!(InterfaceName::new(s).is_err(), "{s} should be rejected");
-        }
+        // Smoke test that the constructor wires through to
+        // `validate_safe_chars`; the exhaustive char-class rejection is
+        // covered by the `naming` module's tests.
+        assert!(InterfaceName::new("eth 0").is_err());
     }
 
     #[test]

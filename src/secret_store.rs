@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
 use crate::github_repo::RepoSlug;
+use crate::naming::validate_safe_chars;
 
 /// All secret-store backends recognised by the wizard.
 ///
@@ -100,15 +101,7 @@ impl ToolName {
         if name.is_empty() {
             bail!("Tool name is empty");
         }
-        if let Some(c) = name
-            .chars()
-            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
-        {
-            bail!(
-                "Tool name '{name}' contains invalid character {c:?} \
-                 (allowed: a-z, A-Z, 0-9, '-', '_', '.')"
-            );
-        }
+        validate_safe_chars(name, "Tool name")?;
         Ok(Self(name.to_string()))
     }
 }
@@ -485,18 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_rejects_unsafe_chars() {
-        for s in [
-            "secret tool", // space
-            "rm -rf /",    // space + /
-            "tool;evil",   // shell metachar
-            "tool$x",      // shell metachar
-            "tool\nx",     // newline
-            "tool/x",      // path separator
-            "tóol",        // non-ASCII
-        ] {
-            assert!(ToolName::new(s).is_err(), "should reject {s:?}");
-        }
+    fn tool_name_rejects_unsafe_char() {
+        // Smoke test that the constructor wires through to
+        // `validate_safe_chars`; the exhaustive char-class rejection is
+        // covered by the `naming` module's tests.
+        assert!(ToolName::new("rm -rf /").is_err());
     }
 
     #[test]

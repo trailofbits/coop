@@ -12,6 +12,8 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::naming::is_safe_name_char;
+
 /// A validated `owner/repo` GitHub slug.
 ///
 /// The inner string is module-private — every value must come from
@@ -63,10 +65,9 @@ impl RepoSlug {
 
 /// GitHub usernames and repo names allow ASCII letters, digits, `-`, `_`, `.`.
 /// Leading/trailing `.` or `-` is unusual but accepted by the API; we don't
-/// gate that here.
+/// gate that here. Shares the safe-name character class with [`crate::naming`].
 fn is_valid_segment(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    s.chars().all(is_safe_name_char)
 }
 
 impl fmt::Display for RepoSlug {
