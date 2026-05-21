@@ -14,7 +14,7 @@ use crate::config::{ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpS
 use crate::setup::SetupOptions;
 use crate::shell::shell_escape;
 
-// ── Guest path newtype ────────────────────────────────────────
+// ── Path newtypes ─────────────────────────────────────────────
 
 /// Path inside the guest VM. Prevents confusion between host
 /// `PathBuf` and guest path strings (which use Linux conventions
@@ -35,6 +35,41 @@ impl GuestPath {
 impl std::fmt::Display for GuestPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Path on the host. Pairs with [`GuestPath`] so scp call sites
+/// distinguish source and destination by type rather than by
+/// argument order. Carries no invariant beyond direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPath(PathBuf);
+
+impl HostPath {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl From<PathBuf> for HostPath {
+    fn from(p: PathBuf) -> Self {
+        Self(p)
+    }
+}
+
+impl From<&Path> for HostPath {
+    fn from(p: &Path) -> Self {
+        Self(p.to_path_buf())
+    }
+}
+
+impl AsRef<Path> for HostPath {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -475,32 +510,32 @@ impl SshTarget {
     }
 
     /// SCP a local file to the guest.
-    pub fn scp_to(&self, local_path: &Path, remote: &GuestPath) -> Result<()> {
+    pub fn scp_to(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
         let status = Command::new("scp")
             .args(self.scp_opts())
-            .arg(local_path)
+            .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
             .status()
             .context("Failed to run scp")?;
 
         if !status.success() {
-            bail!("scp failed: {} -> {remote}", local_path.display());
+            bail!("scp failed: {} -> {remote}", local.as_path().display());
         }
         Ok(())
     }
 
     /// Copy a local directory to the guest recursively via scp.
-    pub fn scp_to_recursive(&self, local_path: &Path, remote: &GuestPath) -> Result<()> {
+    pub fn scp_to_recursive(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
         let status = Command::new("scp")
             .args(self.scp_opts())
             .arg("-r")
-            .arg(local_path)
+            .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
             .status()
             .context("Failed to run scp")?;
 
         if !status.success() {
-            bail!("scp -r failed: {} -> {remote}", local_path.display());
+            bail!("scp -r failed: {} -> {remote}", local.as_path().display());
         }
         Ok(())
     }
@@ -1484,13 +1519,14 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
     for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
         let entry = entry.context("Failed to read staging entry")?;
         let path = entry.path();
+        let local = HostPath::new(&path);
         if path.is_dir() {
             target
-                .scp_to_recursive(&path, &guest_claude)
+                .scp_to_recursive(&local, &guest_claude)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         } else {
             target
-                .scp_to(&path, &guest_claude)
+                .scp_to(&local, &guest_claude)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         }
     }
@@ -1567,13 +1603,14 @@ fn copy_codex_config(
     for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
         let entry = entry.context("Failed to read staging entry")?;
         let path = entry.path();
+        let local = HostPath::new(&path);
         if path.is_dir() {
             target
-                .scp_to_recursive(&path, &guest_codex)
+                .scp_to_recursive(&local, &guest_codex)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         } else {
             target
-                .scp_to(&path, &guest_codex)
+                .scp_to(&local, &guest_codex)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         }
     }
@@ -1807,7 +1844,7 @@ pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]
             );
             session
                 .target
-                .scp_to_recursive(local_path, &remote)
+                .scp_to_recursive(&HostPath::from(local_path), &remote)
                 .with_context(|| {
                     format!(
                         "Failed to copy marketplace '{}' to guest",
