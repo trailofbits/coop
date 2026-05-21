@@ -896,7 +896,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     let arch = Architecture::current()?;
 
     let latest = discover_latest_fc_version()?;
-    let ci_version = derive_ci_version(&latest);
+    let ci_version = FcVersion::parse(&latest)?.ci_dirname();
 
     eprintln!("  Looking for kernels in CI bucket (version {ci_version})...");
     let prefix = format!("firecracker-ci/{ci_version}/{arch}/vmlinux-");
@@ -955,7 +955,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
     let arch = Architecture::current()?;
     let latest = discover_latest_fc_version()?;
-    let ci_version = derive_ci_version(&latest);
+    let ci_version = FcVersion::parse(&latest)?.ci_dirname();
 
     eprintln!("  Looking for rootfs in CI bucket (version {ci_version})...");
     let prefix = format!("firecracker-ci/{ci_version}/{arch}/ubuntu-");
@@ -1236,14 +1236,49 @@ fn discover_latest_fc_version() -> Result<String> {
     Ok(version)
 }
 
-/// Derive the CI bucket version from a release version.
-/// e.g., "v1.15.0" -> "v1.15", "v1.14.2" -> "v1.14"
-fn derive_ci_version(release_version: &str) -> String {
-    let parts: Vec<&str> = release_version.split('.').collect();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[0], parts[1])
-    } else {
-        release_version.to_string()
+/// Parsed Firecracker release version (e.g. `v1.15`).
+///
+/// Carries the major and minor components so the CI bucket directory
+/// name is derived from a parsed value rather than re-slicing a string
+/// each time it's needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FcVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl FcVersion {
+    /// Parse a Firecracker release tag like `v1.15.0`.
+    ///
+    /// Accepts the GitHub release tag format: a leading `v` followed by
+    /// at least `MAJOR.MINOR` numeric components. Any trailing `.PATCH`
+    /// (or further) segments are tolerated but discarded — the CI bucket
+    /// is keyed by `vMAJOR.MINOR` only.
+    pub fn parse(release: &str) -> Result<Self> {
+        let rest = release
+            .strip_prefix('v')
+            .with_context(|| format!("Firecracker version must start with 'v': '{release}'"))?;
+        let mut parts = rest.split('.');
+        let major_str = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Firecracker version is missing MAJOR: '{release}'"))?;
+        let minor_str = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Firecracker version is missing MINOR: '{release}'"))?;
+        let major = major_str.parse::<u16>().with_context(|| {
+            format!("Firecracker MAJOR is not a u16 in '{release}' (got '{major_str}')")
+        })?;
+        let minor = minor_str.parse::<u16>().with_context(|| {
+            format!("Firecracker MINOR is not a u16 in '{release}' (got '{minor_str}')")
+        })?;
+        Ok(Self { major, minor })
+    }
+
+    /// CI bucket directory name, e.g. `v1.15`.
+    pub fn ci_dirname(self) -> String {
+        format!("v{}.{}", self.major, self.minor)
     }
 }
 
@@ -1323,6 +1358,7 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -1473,5 +1509,65 @@ mod tests {
             Architecture::current(),
             Ok(Architecture::X86_64 | Architecture::Aarch64)
         ));
+    }
+
+    #[test]
+    fn fc_version_parses_release_tag() {
+        let v = FcVersion::parse("v1.15.0").unwrap();
+        assert_eq!(
+            v,
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+        );
+    }
+
+    #[test]
+    fn fc_version_parses_double_digit_minor() {
+        let v = FcVersion::parse("v2.103.7").unwrap();
+        assert_eq!(
+            v,
+            FcVersion {
+                major: 2,
+                minor: 103,
+            }
+        );
+    }
+
+    #[test]
+    fn fc_version_ci_dirname_keeps_v_prefix() {
+        assert_eq!(
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+            .ci_dirname(),
+            "v1.15"
+        );
+    }
+
+    #[test]
+    fn fc_version_rejects_missing_v_prefix() {
+        let err = FcVersion::parse("1.15.0").unwrap_err().to_string();
+        assert!(err.contains("must start with 'v'"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_missing_minor() {
+        let err = FcVersion::parse("v1").unwrap_err().to_string();
+        assert!(err.contains("missing MINOR"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_non_numeric_major() {
+        let err = FcVersion::parse("vfoo.bar").unwrap_err().to_string();
+        assert!(err.contains("MAJOR is not a u16"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_empty_segments() {
+        let err = FcVersion::parse("v.15").unwrap_err().to_string();
+        assert!(err.contains("missing MAJOR"), "{err}");
     }
 }
