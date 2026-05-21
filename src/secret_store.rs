@@ -464,12 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_accepts_safe_chars() {
-        for s in ["op", "secret-tool", "tool_1", "a.b", "ABC.def-1_2"] {
-            let t = ToolName::new(s).unwrap();
-            assert_eq!(t.to_string(), s);
-            assert_eq!(<ToolName as AsRef<str>>::as_ref(&t), s);
-        }
+    fn tool_name_forwards_display_and_as_ref() {
+        // Confirms the Display / AsRef impls forward to the inner string.
+        // Char-class acceptance is covered by the `naming` module's tests.
+        let t = ToolName::new("secret-tool").unwrap();
+        assert_eq!(t.to_string(), "secret-tool");
+        assert_eq!(<ToolName as AsRef<str>>::as_ref(&t), "secret-tool");
     }
 
     #[test]
