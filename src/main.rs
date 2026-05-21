@@ -11,6 +11,7 @@ mod guest_env_state;
 mod pat_prompt;
 mod port_forward;
 mod secret_store;
+mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
 #[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "Lima-only"))]
 #[expect(

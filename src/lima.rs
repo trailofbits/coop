@@ -12,7 +12,8 @@ use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
     SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
 };
-use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, hash_string, utc_timestamp};
+use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
+use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
@@ -466,11 +467,11 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     Ok(())
 }
 
-fn provision_script_hash(cfg: &CoopConfig, profiles: &[ProfileDef]) -> String {
+fn provision_script_hash(cfg: &CoopConfig, profiles: &[ProfileDef]) -> Sha256Hash {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = fs::read_to_string(&pubkey_path).unwrap_or_default();
     let script = compose_provision_script(pubkey.trim(), profiles);
-    hash_string(&script)
+    Sha256Hash::of(&script)
 }
 
 /// Returns `true` if the golden image needs rebuilding.

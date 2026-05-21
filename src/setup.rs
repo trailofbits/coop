@@ -6,7 +6,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, ImageName, Instance};
@@ -14,6 +13,7 @@ use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
     SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
 };
+use crate::sha256_hash::Sha256Hash;
 
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
 const S3_LIST: &str = "http://spec.ccfc.min.s3.amazonaws.com";
@@ -39,10 +39,10 @@ pub struct SetupOptions {
 pub struct TemplateConfig {
     pub version: u32,
     pub created: String,
-    pub install_script_hash: String,
+    pub install_script_hash: Sha256Hash,
     pub profiles: Vec<String>,
     pub extra_packages: Vec<String>,
-    pub post_install_hash: Option<String>,
+    pub post_install_hash: Option<Sha256Hash>,
     #[serde(default)]
     pub marketplaces: Vec<String>,
     #[serde(default)]
@@ -294,13 +294,13 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
 
     // Compose recipe and compute hashes
     let recipe = compose_recipe(&profiles, &extra_packages);
-    let script_hash = hash_string(&recipe);
+    let script_hash = Sha256Hash::of(&recipe);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
-    let post_install_hash = post_install_content.as_ref().map(|s| hash_string(s));
+    let post_install_hash = post_install_content.as_ref().map(Sha256Hash::of);
 
     // Check existing template — rebuild automatically if stale
     if template.exists() && !opts.rebuild {
-        if !needs_rebuild(cfg, image, &script_hash, post_install_hash.as_deref()) {
+        if !needs_rebuild(cfg, image, script_hash, post_install_hash) {
             step("Template rootfs: up to date");
             return Ok(());
         }
@@ -326,9 +326,9 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         &profiles,
         &extra_packages,
         &recipe,
-        &script_hash,
+        script_hash,
         post_install_content.as_deref(),
-        post_install_hash.as_deref(),
+        post_install_hash,
         &staging,
     );
 
@@ -377,15 +377,14 @@ fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
 fn needs_rebuild(
     cfg: &CoopConfig,
     image: &ImageName,
-    current_hash: &str,
-    current_post_hash: Option<&str>,
+    current_hash: Sha256Hash,
+    current_post_hash: Option<Sha256Hash>,
 ) -> bool {
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating template as stale");
         return true;
     };
-    existing.install_script_hash != current_hash
-        || existing.post_install_hash.as_deref() != current_post_hash
+    existing.install_script_hash != current_hash || existing.post_install_hash != current_post_hash
 }
 
 #[expect(clippy::too_many_arguments, reason = "template build orchestration")]
@@ -396,9 +395,9 @@ fn build_template(
     profiles: &[ProfileDef],
     extra_packages: &[String],
     recipe: &str,
-    script_hash: &str,
+    script_hash: Sha256Hash,
     post_install_content: Option<&str>,
-    post_install_hash: Option<&str>,
+    post_install_hash: Option<Sha256Hash>,
     output_path: &Path,
 ) -> Result<()> {
     step("Building template rootfs");
@@ -446,10 +445,10 @@ fn build_template(
     let marker_config = TemplateConfig {
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
-        install_script_hash: script_hash.to_string(),
+        install_script_hash: script_hash,
         profiles: profile_names(profiles),
         extra_packages: extra_packages.to_vec(),
-        post_install_hash: post_install_hash.map(String::from),
+        post_install_hash,
         marketplaces: Vec::new(),
         plugins: Vec::new(),
     };
@@ -1198,12 +1197,6 @@ fn unmount_chroot(mount_str: &str) {
 }
 
 // ── General helpers ───────────────────────────────────────────
-
-pub fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
 
 pub fn utc_timestamp() -> String {
     Command::new("date")
