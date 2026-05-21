@@ -10,7 +10,9 @@
 //! rather than silently degrading.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fmt::Write as _;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -158,9 +160,9 @@ struct RawHostRequirements {
     #[serde(default)]
     cpus: Option<u32>,
     #[serde(default)]
-    memory: Option<String>,
+    memory: Option<MemorySpec>,
     #[serde(default)]
-    storage: Option<String>,
+    storage: Option<MemorySpec>,
     #[serde(flatten)]
     extras: serde_json::Map<String, serde_json::Value>,
 }
@@ -547,10 +549,6 @@ pub fn translate(
     t
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "three independent fields with similar override branches"
-)]
 fn translate_host_requirements(
     reqs: &RawHostRequirements,
     inputs: &TranslatorInputs,
@@ -588,68 +586,48 @@ fn translate_host_requirements(
             ),
         }
     }
-    if let Some(mem) = &reqs.memory {
+    if let Some(mem) = reqs.memory {
         let key = "hostRequirements.memory";
-        match parse_size_mib(mem) {
-            Ok(mib) => {
-                if let Some(cli) = inputs.cli_mem_mib {
-                    t.report.push(
-                        key,
-                        ReportStatus::Overridden,
-                        ReportSource::Cli,
-                        format!("{cli} MiB"),
-                        format!("CLI --mem overrides devcontainer.json value {mib} MiB"),
-                    );
-                } else {
-                    t.mem_mib = Some(mib);
-                    t.report.push(
-                        key,
-                        ReportStatus::Applied,
-                        ReportSource::Devcontainer,
-                        format!("{mib} MiB"),
-                        "",
-                    );
-                }
-            }
-            Err(e) => t.report.push(
+        let mib = mem.as_mib();
+        if let Some(cli) = inputs.cli_mem_mib {
+            t.report.push(
                 key,
-                ReportStatus::Invalid,
+                ReportStatus::Overridden,
+                ReportSource::Cli,
+                format!("{cli} MiB"),
+                format!("CLI --mem overrides devcontainer.json value {mib} MiB"),
+            );
+        } else {
+            t.mem_mib = Some(mib);
+            t.report.push(
+                key,
+                ReportStatus::Applied,
                 ReportSource::Devcontainer,
-                mem.clone(),
-                e.to_string(),
-            ),
+                format!("{mib} MiB"),
+                "",
+            );
         }
     }
-    if let Some(storage) = &reqs.storage {
+    if let Some(storage) = reqs.storage {
         let key = "hostRequirements.storage";
-        match parse_size_gib(storage) {
-            Ok(gib) => {
-                if let Some(cli) = inputs.cli_disk_gib {
-                    t.report.push(
-                        key,
-                        ReportStatus::Overridden,
-                        ReportSource::Cli,
-                        format!("{cli} GiB"),
-                        format!("CLI --disk overrides devcontainer.json value {gib} GiB"),
-                    );
-                } else {
-                    t.disk_gib = Some(gib);
-                    t.report.push(
-                        key,
-                        ReportStatus::Applied,
-                        ReportSource::Devcontainer,
-                        format!("{gib} GiB"),
-                        "",
-                    );
-                }
-            }
-            Err(e) => t.report.push(
+        let gib = storage.as_gib();
+        if let Some(cli) = inputs.cli_disk_gib {
+            t.report.push(
                 key,
-                ReportStatus::Invalid,
+                ReportStatus::Overridden,
+                ReportSource::Cli,
+                format!("{cli} GiB"),
+                format!("CLI --disk overrides devcontainer.json value {gib} GiB"),
+            );
+        } else {
+            t.disk_gib = Some(gib);
+            t.report.push(
+                key,
+                ReportStatus::Applied,
                 ReportSource::Devcontainer,
-                storage.clone(),
-                e.to_string(),
-            ),
+                format!("{gib} GiB"),
+                "",
+            );
         }
     }
     for (k, v) in &reqs.extras {
@@ -954,32 +932,79 @@ fn post_start_to_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Parse a memory size string per the [devcontainer spec][spec]:
-/// `{decimal}{KB|MB|GB|TB}`, where the suffix is decimal-base. We honour
-/// the spec while accepting the binary suffixes (KiB/MiB/GiB/TiB) that
-/// real-world files use interchangeably.
+/// Memory or storage size parsed from devcontainer.json `hostRequirements`.
 ///
-/// Returns mebibytes (rounded up to the nearest MiB).
+/// Stored as `NonZeroU32` mebibytes (rounded up from the parsed byte
+/// count). Parsing rejects zero, non-finite values, and overflow at the
+/// deserialize boundary so downstream code can treat the value as a
+/// validated quantity.
+///
+/// Accepts the [devcontainer spec][spec] decimal units (`KB`, `MB`, `GB`,
+/// `TB`), single-letter aliases for those (`K`, `M`, `G`, `T`), binary
+/// suffixes (`KiB`, `MiB`, `GiB`, `TiB`) that real-world files use
+/// interchangeably, a bare `B` suffix, and bare unit-less integers
+/// (interpreted as bytes per the Kubernetes convention). Matching is
+/// case-insensitive.
 ///
 /// [spec]: https://containers.dev/implementors/json_reference/#image-specific
-fn parse_size_mib(s: &str) -> Result<u32> {
-    let bytes = parse_size_bytes(s)?;
-    let mib = bytes.div_ceil(1024 * 1024);
-    u32::try_from(mib).context("memory value overflows u32 MiB")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySpec(NonZeroU32);
+
+impl MemorySpec {
+    /// Parse a size string per the formats described in the type-level doc.
+    pub fn parse(s: &str) -> Result<Self> {
+        let bytes = parse_size_bytes(s)?;
+        let mib = bytes.div_ceil(1024 * 1024);
+        let mib_u32 =
+            u32::try_from(mib).with_context(|| format!("size '{s}' overflows u32 MiB"))?;
+        let nz = NonZeroU32::new(mib_u32)
+            .with_context(|| format!("size '{s}' must be greater than zero"))?;
+        Ok(Self(nz))
+    }
+
+    /// Mebibytes (rounded up).
+    pub fn as_mib(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Gibibytes (rounded up from the stored MiB).
+    pub fn as_gib(self) -> u32 {
+        self.0.get().div_ceil(1024)
+    }
 }
 
-fn parse_size_gib(s: &str) -> Result<u32> {
-    let bytes = parse_size_bytes(s)?;
-    let gib = bytes.div_ceil(1024 * 1024 * 1024);
-    u32::try_from(gib).context("storage value overflows u32 GiB")
+impl fmt::Display for MemorySpec {
+    #[mutants::skip] // equivalent: callers don't assert the formatted output, only the numeric accessors
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} MiB", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MemorySpec {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
+    }
 }
 
 fn parse_size_bytes(s: &str) -> Result<u64> {
     let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("size string is empty");
+    }
+    // Bare unit-less integer — interpret as bytes (Kubernetes convention).
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return trimmed
+            .parse::<u64>()
+            .with_context(|| format!("size '{s}' overflows u64 bytes"));
+    }
     let (num_str, mult) = split_size(trimmed)?;
-    let num: f64 = num_str
-        .parse()
-        .with_context(|| format!("expected '<decimal><unit>' (e.g. '4GB'); got '{s}'"))?;
+    let num: f64 = num_str.parse().with_context(|| {
+        format!("expected '<decimal><unit>' (e.g. '4GB') or bare bytes; got '{s}'")
+    })?;
     if !num.is_finite() || num < 0.0 {
         bail!("size must be a non-negative finite number: '{s}'");
     }
@@ -995,9 +1020,10 @@ fn parse_size_bytes(s: &str) -> Result<u64> {
 
 /// Split a `<decimal><unit>` string into the numeric part and a byte
 /// multiplier. Suffix matching is case-insensitive and accepts both
-/// decimal (`GB`) and binary (`GiB`) units.
+/// decimal (`GB`) and binary (`GiB`) units. Single-letter shorthands
+/// (`K`/`M`/`G`/`T`) are decimal aliases (e.g. `1g` == `1GB`).
 fn split_size(s: &str) -> Result<(&str, u64)> {
-    // Longest suffix first so "GiB" matches before "B".
+    // Longest suffix first so "GiB" matches before "GB" matches before "G".
     let suffixes: &[(&str, u64)] = &[
         ("TiB", 1u64 << 40),
         ("GiB", 1u64 << 30),
@@ -1007,6 +1033,10 @@ fn split_size(s: &str) -> Result<(&str, u64)> {
         ("GB", 1_000_000_000),
         ("MB", 1_000_000),
         ("KB", 1_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("K", 1_000),
         ("B", 1),
     ];
     let lower = s.to_ascii_lowercase();
@@ -1017,7 +1047,7 @@ fn split_size(s: &str) -> Result<(&str, u64)> {
             return Ok((s[..cut].trim(), *mult));
         }
     }
-    bail!("expected a unit suffix (B, KB, MB, GB, TB; KiB/MiB/GiB/TiB also accepted)");
+    bail!("expected a unit suffix (B, KB, MB, GB, TB; KiB/MiB/GiB/TiB also accepted): '{s}'");
 }
 
 fn parse_forward_port_entry(v: &serde_json::Value) -> Result<PortForward> {
@@ -1425,14 +1455,69 @@ mod tests {
     }
 
     #[test]
-    fn parse_size_handles_decimal_and_binary_units() {
-        assert_eq!(parse_size_mib("4GiB").unwrap(), 4096);
-        assert_eq!(parse_size_mib("4096MiB").unwrap(), 4096);
-        // 4GB = 4_000_000_000 B; rounded up to MiB = ceil(4e9 / 2^20) = 3815
-        assert_eq!(parse_size_mib("4GB").unwrap(), 3815);
-        assert_eq!(parse_size_gib("8GiB").unwrap(), 8);
-        assert!(parse_size_mib("4 lemons").is_err());
-        assert!(parse_size_mib("").is_err());
+    fn memory_spec_parses_binary_units() {
+        assert_eq!(MemorySpec::parse("4GiB").unwrap().as_mib(), 4096);
+        assert_eq!(MemorySpec::parse("4096MiB").unwrap().as_mib(), 4096);
+        assert_eq!(MemorySpec::parse("512MiB").unwrap().as_mib(), 512);
+        assert_eq!(MemorySpec::parse("8GiB").unwrap().as_gib(), 8);
+    }
+
+    #[test]
+    fn memory_spec_parses_decimal_units() {
+        // 1G = 1_000_000_000 B; ceil(1e9 / 2^20) = 954 MiB
+        assert_eq!(MemorySpec::parse("1g").unwrap().as_mib(), 954);
+        // 512MB = 5.12e8 B; ceil(5.12e8 / 2^20) = 489 MiB
+        assert_eq!(MemorySpec::parse("512mb").unwrap().as_mib(), 489);
+        // 4GB rounds to 3815 MiB
+        assert_eq!(MemorySpec::parse("4GB").unwrap().as_mib(), 3815);
+    }
+
+    #[test]
+    fn memory_spec_accepts_bare_bytes() {
+        // Bare integer = bytes; 1024 B rounds up to 1 MiB.
+        assert_eq!(MemorySpec::parse("1024").unwrap().as_mib(), 1);
+        // 2 MiB worth of bytes survives the round-trip exactly.
+        assert_eq!(
+            MemorySpec::parse(&(2u64 * 1024 * 1024).to_string())
+                .unwrap()
+                .as_mib(),
+            2,
+        );
+    }
+
+    #[test]
+    fn memory_spec_rejects_garbage() {
+        assert!(MemorySpec::parse("abc").is_err());
+        assert!(MemorySpec::parse("4 lemons").is_err());
+        assert!(MemorySpec::parse("").is_err());
+        // Zero is rejected at parse time so downstream code never sees it.
+        assert!(MemorySpec::parse("0MiB").is_err());
+        assert!(MemorySpec::parse("0").is_err());
+    }
+
+    #[test]
+    fn memory_spec_as_gib_rounds_up_from_mib() {
+        // 1500 MiB → ceil(1500/1024) = 2 GiB
+        let spec = MemorySpec::parse("1500MiB").unwrap();
+        assert_eq!(spec.as_mib(), 1500);
+        assert_eq!(spec.as_gib(), 2);
+    }
+
+    #[test]
+    fn memory_spec_fails_at_deserialize_for_bad_units() {
+        // A bad memory value rejects the whole file at parse time, not at
+        // translate time. The error path through serde carries the bad
+        // string verbatim so the user can locate it.
+        let err = ParsedDevcontainer::from_str(
+            PathBuf::from("test.json"),
+            r#"{ "hostRequirements": { "memory": "abc" } }"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("abc"),
+            "expected error to mention bad value, got: {msg}"
+        );
     }
 
     #[test]
