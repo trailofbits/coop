@@ -310,11 +310,16 @@ fn format_pull_failure(ssh_stderr: &[u8], tar_stderr: &[u8]) -> String {
     }
 }
 
+/// The coop convention for where a workspace lands inside the guest.
+///
+/// Use this in preference to constructing `GuestPath::absolute("/workspace")`
+/// at call sites: it's the single source of truth for the default mount
+/// target and never fails (the underlying constant is a static absolute path).
 #[expect(
     clippy::expect_used,
     reason = "GUEST_WORKSPACE is a const literal starting with '/'; invariant holds at compile time"
 )]
-fn default_workspace_path() -> GuestPath {
+pub(crate) fn default_workspace_path() -> GuestPath {
     GuestPath::absolute(GUEST_WORKSPACE).expect("GUEST_WORKSPACE constant is absolute")
 }
 
@@ -1149,7 +1154,7 @@ mod tests {
         let mounts = vec![
             crate::config::Mount {
                 host_path: primary.path().to_path_buf(),
-                guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
+                guest_path: default_workspace_path(),
             },
             crate::config::Mount {
                 host_path: secondary.path().to_path_buf(),

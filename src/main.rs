@@ -1474,7 +1474,7 @@ fn start_instance(
         workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
-            guest_path: paths::GuestPath::absolute("/workspace")?,
+            guest_path: workspace::default_workspace_path(),
             source: workspace::WorkspaceSource::Workspace {
                 host_path: abs_path,
             },
@@ -1484,7 +1484,7 @@ fn start_instance(
         backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
         let state = workspace::WorkspaceState {
-            guest_path: paths::GuestPath::absolute("/workspace")?,
+            guest_path: workspace::default_workspace_path(),
             source: workspace::WorkspaceSource::GitRepo {
                 url: repo_url.to_string(),
             },
@@ -2902,7 +2902,7 @@ mod tests {
         );
         let mount = super::config::Mount {
             host_path: tmp.path().to_path_buf(),
-            guest_path: super::paths::GuestPath::absolute("/workspace").expect("absolute"),
+            guest_path: super::workspace::default_workspace_path(),
         };
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);
@@ -2923,7 +2923,7 @@ mod tests {
         );
         let mount = super::config::Mount {
             host_path: tmp.path().to_path_buf(),
-            guest_path: super::paths::GuestPath::absolute("/workspace").expect("absolute"),
+            guest_path: super::workspace::default_workspace_path(),
         };
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);

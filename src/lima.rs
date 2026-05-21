@@ -1606,7 +1606,7 @@ mod tests {
         let yaml = "mountType: \"virtiofs\"\nmounts: []\n";
         let mounts = vec![crate::config::Mount {
             host_path: "/home/user/project".into(),
-            guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
+            guest_path: crate::workspace::default_workspace_path(),
         }];
         let result = super::inject_mounts(yaml, &mounts);
         assert!(
@@ -1633,7 +1633,7 @@ mod tests {
         let mounts = vec![
             crate::config::Mount {
                 host_path: "/a".into(),
-                guest_path: crate::paths::GuestPath::absolute("/workspace").unwrap(),
+                guest_path: crate::workspace::default_workspace_path(),
             },
             crate::config::Mount {
                 host_path: "/b".into(),
