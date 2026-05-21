@@ -143,17 +143,16 @@ pub fn run_status(cfg: &CoopConfig, probe: bool) {
 
 /// `coop github forget-pat --repo owner/name` — remove the secret and
 /// the config entry. Does **not** add a skip marker.
-pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Result<()> {
-    let repo = RepoSlug::new(repo)?;
+pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> Result<()> {
     let entry = cfg
         .github
         .as_ref()
-        .and_then(|g| g.pat_entry(&repo))
+        .and_then(|g| g.pat_entry(repo))
         .with_context(|| {
             format!("No PAT entry for '{repo}' — nothing to forget. Run `coop github status`.")
         })?;
     let backend = infer_backend(entry.token.expose());
-    let account = account_for_repo(&repo);
+    let account = account_for_repo(repo);
     let state_dir = cfg.data_dir.join("state");
     if let Some(b) = backend {
         if let Err(e) = delete_secret(b, SERVICE, &account, &state_dir) {
@@ -165,7 +164,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &str, config_path: &Path) -> Resul
              clean up the underlying secret manually if needed."
         );
     }
-    remove_pat_entry(config_path, &repo)?;
+    remove_pat_entry(config_path, repo)?;
     eprintln!("Removed PAT entry for {repo}.");
     eprintln!(
         "note: the token itself may still be live on GitHub — \

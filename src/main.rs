@@ -878,7 +878,10 @@ fn cmd_github(cfg: &config::CoopConfig, config_path: &Path, action: &GithubActio
             github_pat::run_status(cfg, *probe);
             Ok(())
         }
-        GithubAction::ForgetPat { repo } => github_pat::run_forget_pat(cfg, repo, config_path),
+        GithubAction::ForgetPat { repo } => {
+            let slug = github_repo::RepoSlug::new(repo)?;
+            github_pat::run_forget_pat(cfg, &slug, config_path)
+        }
     }
 }
 
