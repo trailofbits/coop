@@ -1147,16 +1147,9 @@ pub fn prepare_env_forwarding(
     }
 
     // User-specified env_forward vars from process environment
-    for name in &claude.env_forward {
-        if !env.contains(name)
-            && let Ok(val) = std::env::var(name)
-        {
-            env.set(name.as_str(), val);
-        }
-    }
-    for name in &codex.env_forward {
-        if !env.contains(name)
-            && let Ok(val) = std::env::var(name)
+    for name in claude.env_forward.iter().chain(codex.env_forward.iter()) {
+        if !env.contains(name.as_str())
+            && let Ok(val) = std::env::var(name.as_str())
         {
             env.set(name.as_str(), val);
         }

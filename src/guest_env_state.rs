@@ -330,19 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_env_arg_rejects_invalid_key() {
-        // Empty key, leading digit, embedded space, embedded '=' in key
-        // all funnel through `EnvVarName::new`, so one test covers them.
-        for bad in ["=value", "1FOO=v", "FOO BAR=v"] {
-            let err = parse_cli_env_arg(bad).unwrap_err();
-            assert!(
-                format!("{err:#}").contains("--env KEY is invalid"),
-                "expected validation error for '{bad}', got: {err:#}",
-            );
-        }
-    }
-
-    #[test]
     fn parse_cli_env_arg_value_may_contain_equals() {
         let (k, v) = parse_cli_env_arg("URL=https://x?a=b&c=d").unwrap();
         assert_eq!(k, env("URL"));

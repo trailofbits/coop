@@ -706,10 +706,7 @@ fn main() -> Result<()> {
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            let cli_env_keys = guest_env
-                .iter()
-                .map(|(k, _)| k.as_str().to_string())
-                .collect();
+            let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
                 cli_mem_mib: mem,

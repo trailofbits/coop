@@ -353,7 +353,7 @@ pub struct TranslatorInputs {
     pub cli_mem_mib: Option<u32>,
     pub cli_disk_gib: Option<u32>,
     pub cli_post_start: Option<String>,
-    pub cli_guest_env_keys: Vec<String>,
+    pub cli_guest_env_keys: Vec<EnvVarName>,
     pub cli_forward_ports: Vec<PortForward>,
     pub cli_mounts: Vec<Mount>,
     pub cli_profiles: Vec<String>,
@@ -664,7 +664,7 @@ fn translate_container_env(
     let cli_keys: std::collections::HashSet<&str> = inputs
         .cli_guest_env_keys
         .iter()
-        .map(String::as_str)
+        .map(EnvVarName::as_str)
         .collect();
     let mut overridden = Vec::new();
     let mut applied = Vec::new();
@@ -1638,7 +1638,7 @@ mod tests {
     fn translate_container_env_overridden_by_cli() {
         let f = parse(r#"{ "containerEnv": { "FOO": "x", "BAR": "y" } }"#);
         let inputs = TranslatorInputs {
-            cli_guest_env_keys: vec!["FOO".to_string()],
+            cli_guest_env_keys: vec![EnvVarName::new("FOO").unwrap()],
             ..TranslatorInputs::default()
         };
         let t = translate(&f, &inputs, Stage::Start);

@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::Cmd;
+use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
 
@@ -1246,7 +1247,7 @@ pub struct ClaudeConfig {
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
-    pub env_forward: Vec<String>,
+    pub env_forward: Vec<EnvVarName>,
 
     /// Plugin marketplace sources (URL, path, or GitHub repo)
     #[serde(default)]
@@ -1295,7 +1296,7 @@ pub struct CodexConfig {
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
-    pub env_forward: Vec<String>,
+    pub env_forward: Vec<EnvVarName>,
 
     /// MCP servers to register in `~/.codex/config.toml`
     #[serde(default)]
@@ -2768,7 +2769,7 @@ mod tests {
             cfg.api_key.as_ref().map(|s| s.expose().as_str()),
             Some("sk-ant-test")
         );
-        assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
         assert_eq!(cfg.marketplaces.len(), 1);
         assert_eq!(cfg.plugins, vec!["context7"]);
         assert_eq!(cfg.mcp_servers.len(), 1);
@@ -2803,7 +2804,7 @@ mod tests {
             cfg.api_key.as_ref().map(|s| s.expose().as_str()),
             Some("sk-openai-test")
         );
-        assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert!(cfg.mcp_servers.contains_key("sentry"));
     }
