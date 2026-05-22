@@ -522,12 +522,18 @@ fn init_tracing(verbosity: u8) {
         .init();
 }
 
-fn load_and_validate_config(path: &Path) -> Result<config::CoopConfig> {
-    let cfg = config::CoopConfig::load(path)?;
+/// Run `CoopConfig::validate` and surface warnings via `tracing::warn`.
+///
+/// Called by commands that consume the paths probed in `validate`
+/// (`setup`, `build`, `start`). Query commands like `list`/`status`/`logs`
+/// skip this so an unrelated config error (e.g. a stale
+/// `claude.config_dir`) can't block them. `coop validate` runs the same
+/// check explicitly and prints the warnings to stdout instead.
+fn warn_on_validate(cfg: &config::CoopConfig) -> Result<()> {
     for w in cfg.validate()? {
         tracing::warn!("{w}");
     }
-    Ok(cfg)
+    Ok(())
 }
 
 /// Returns true if the raw argv contains the deprecated `--no-claude`
@@ -610,7 +616,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut cfg = load_and_validate_config(&cli.config)?;
+    let mut cfg = config::CoopConfig::load(&cli.config)?;
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
@@ -632,6 +638,7 @@ fn main() -> Result<()> {
             no_devcontainer,
             dry_run,
         } => {
+            warn_on_validate(&cfg)?;
             let ws_path = workspace.as_deref().map(Path::new);
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -681,7 +688,10 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Commands::Build => cmd_build(&cfg),
+        Commands::Build => {
+            warn_on_validate(&cfg)?;
+            cmd_build(&cfg)
+        }
         Commands::Start {
             name,
             workspace,
@@ -701,6 +711,7 @@ fn main() -> Result<()> {
             no_devcontainer,
             dry_run,
         } => {
+            warn_on_validate(&cfg)?;
             if raw_args_use_deprecated_no_claude(std::env::args()) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
