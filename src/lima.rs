@@ -1315,30 +1315,37 @@ fn wait_for_lima_ssh(
     }
 }
 
-/// Get the SSH local port for a Lima instance from `limactl list`.
+/// Get the SSH local port for a Lima instance by reading `ssh.config`.
+///
+/// Lima's hostagent writes `~/.lima/<name>/ssh.config` once it has
+/// assigned an SSH port. Reading the file is much cheaper than forking
+/// `limactl list --json` on every poll tick, so phase-1 of
+/// [`wait_for_lima_ssh`] uses it as the readiness signal.
+///
+/// Returns `None` if the file is missing or has no usable `Port` line —
+/// both signal "not ready yet" and the caller will retry.
 fn get_lima_ssh_port(name: &InstanceName) -> Option<u16> {
-    let lima_name = lima_name_for(name);
-    let output = Command::new("limactl")
-        .args(["list", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let config_path = lima_home()
+        .ok()?
+        .join(lima_name_for(name))
+        .join("ssh.config");
+    let content = fs::read_to_string(&config_path).ok()?;
+    parse_ssh_config_port(&content)
+}
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+/// Extract the `Port` directive from a Lima-generated `ssh.config`.
+///
+/// SSH config directive names are case-insensitive; Lima emits a single
+/// indented `Port <N>` line under one `Host` block.
+fn parse_ssh_config_port(content: &str) -> Option<u16> {
+    for line in content.lines() {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let Some(key) = parts.next() else { continue };
+        if !key.eq_ignore_ascii_case("Port") {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
-            && val["name"].as_str() == Some(&lima_name)
-            && let Some(port) = val["sshLocalPort"].as_u64()
-            && let Ok(port) = u16::try_from(port)
+        let Some(value) = parts.next() else { continue };
+        if let Ok(port) = value.trim().parse::<u16>()
             && port > 0
         {
             return Some(port);
@@ -1730,5 +1737,70 @@ time="..." level=fatal msg="disk too small: 1G < 20G"
         std::fs::File::create(&img).unwrap();
         // 0 bytes → GiB::new(0) returns None
         assert!(super::base_image_size_gib(&img).is_none());
+    }
+
+    // ── parse_ssh_config_port ───────────────────────────────────
+
+    #[test]
+    fn parse_ssh_config_port_typical_lima_output() {
+        let content = "\
+# This SSH config file can be passed to 'ssh -F'.
+# This file is created by Lima.
+
+Host lima-coop-myinst
+  IdentityFile \"/Users/me/.lima/_config/user\"
+  User myuser
+  Hostname 127.0.0.1
+  Port 60022
+  StrictHostKeyChecking no
+";
+        assert_eq!(super::parse_ssh_config_port(content), Some(60022));
+    }
+
+    #[test]
+    fn parse_ssh_config_port_missing_returns_none() {
+        let content = "\
+Host lima-coop-myinst
+  User myuser
+  Hostname 127.0.0.1
+";
+        assert!(super::parse_ssh_config_port(content).is_none());
+    }
+
+    #[test]
+    fn parse_ssh_config_port_empty_returns_none() {
+        assert!(super::parse_ssh_config_port("").is_none());
+    }
+
+    #[test]
+    fn parse_ssh_config_port_zero_rejected() {
+        // A zero port would be a degenerate value; treat as "not ready".
+        let content = "Host h\n  Port 0\n";
+        assert!(super::parse_ssh_config_port(content).is_none());
+    }
+
+    #[test]
+    fn parse_ssh_config_port_case_insensitive() {
+        let content = "  port 60022\n";
+        assert_eq!(super::parse_ssh_config_port(content), Some(60022));
+    }
+
+    #[test]
+    fn parse_ssh_config_port_ignores_unrelated_directives() {
+        // Other directives that share a prefix or contain "Port" as a
+        // substring must not be misread as the Port directive.
+        let content = "\
+Host h
+  LocalForward 8080 127.0.0.1:8080
+  PortForwarding yes
+  Port 60022
+";
+        assert_eq!(super::parse_ssh_config_port(content), Some(60022));
+    }
+
+    #[test]
+    fn parse_ssh_config_port_out_of_range_rejected() {
+        let content = "Host h\n  Port 99999\n";
+        assert!(super::parse_ssh_config_port(content).is_none());
     }
 }
