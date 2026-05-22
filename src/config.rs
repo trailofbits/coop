@@ -7,6 +7,7 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -1976,11 +1977,17 @@ struct InstanceMeta {
     image: ImageName,
 }
 
-/// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
-/// construction (skipping `ImageName::new`) is safe here because the
-/// const is pinned by the `default_image_is_valid` test below.
+/// Returns the [`ImageName`] for [`DEFAULT_IMAGE`], validating the
+/// constant once and reusing the result for subsequent calls. The
+/// invariant is pinned by the `default_image_is_valid` test.
 fn default_image_name() -> ImageName {
-    ImageName(DEFAULT_IMAGE.to_string())
+    static DEFAULT: OnceLock<ImageName> = OnceLock::new();
+    DEFAULT
+        .get_or_init(|| {
+            #[expect(clippy::expect_used, reason = "DEFAULT_IMAGE pinned by unit test")]
+            ImageName::new(DEFAULT_IMAGE).expect("DEFAULT_IMAGE is a valid ImageName")
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone)]
@@ -2231,7 +2238,7 @@ mod tests {
         inst
     }
 
-    fn test_inst(name: &str, index: InstanceIndex, dir: PathBuf) -> Instance {
+    fn test_instance(name: &str, index: InstanceIndex, dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new(name).unwrap(),
             index,
@@ -2300,13 +2307,13 @@ mod tests {
     /// off-by-one bugs would land.
     #[test]
     fn instance_network_derivations_at_boundaries() {
-        let lo = test_inst("test", idx(0), PathBuf::from("/tmp/fake"));
+        let lo = test_instance("test", idx(0), PathBuf::from("/tmp/fake"));
         assert_eq!(lo.guest_ip(), "172.16.0.2");
         assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
         assert_eq!(lo.tap_device(), "tap0");
         assert_eq!(lo.vsock_cid(), 3);
 
-        let hi = test_inst("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
+        let hi = test_instance("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
         assert_eq!(hi.guest_ip(), "172.16.0.254");
         assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
         assert_eq!(hi.tap_device(), "tap252");
@@ -2317,7 +2324,7 @@ mod tests {
 
     #[test]
     fn instance_paths_under_dir() {
-        let inst = test_inst("foo", idx(0), PathBuf::from("/data/instances/foo"));
+        let inst = test_instance("foo", idx(0), PathBuf::from("/data/instances/foo"));
         assert_eq!(
             inst.rootfs_path(),
             PathBuf::from("/data/instances/foo/rootfs.ext4")
@@ -2354,7 +2361,7 @@ mod tests {
     fn instance_save_load_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("myinst");
-        let inst = test_inst("myinst", idx(42), dir.clone());
+        let inst = test_instance("myinst", idx(42), dir.clone());
         inst.save().unwrap();
 
         let loaded = Instance::load(&dir).unwrap();
@@ -2402,7 +2409,7 @@ mod tests {
     #[test]
     fn is_running_false_when_pid_file_missing() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let inst = test_instance("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
     }
@@ -2411,7 +2418,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let inst = test_instance("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
 
         assert!(!inst.is_running());
@@ -2425,7 +2432,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let inst = test_instance("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_sleep();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
@@ -2444,7 +2451,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_true_for_live_firecracker_like_pid() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let inst = test_instance("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
@@ -2592,46 +2599,45 @@ mod tests {
     // ── Instance name validation ──────────────────────────────
 
     #[test]
-    fn validate_name_accepts_valid() {
-        for name in ["foo", "my-project", "test_vm", "Dev-Box_01", "a", "A"] {
-            validate_instance_name(name).unwrap();
+    fn validate_name_table() {
+        enum Expect {
+            Ok,
+            Err(&'static str),
         }
-    }
-
-    #[test]
-    fn validate_name_rejects_empty() {
-        let err = validate_instance_name("").unwrap_err();
-        assert!(err.to_string().contains("must not be empty"));
-    }
-
-    #[test]
-    fn validate_name_rejects_path_traversal() {
-        let err = validate_instance_name("../../../tmp/evil").unwrap_err();
-        assert!(err.to_string().contains("invalid character"));
-    }
-
-    #[test]
-    fn validate_name_rejects_spaces_and_special_chars() {
-        for name in ["has space", "semi;colon", "new\nline", "sl/ash", "d.ot"] {
-            let err = validate_instance_name(name).unwrap_err();
-            assert!(
-                err.to_string().contains("invalid character"),
-                "expected rejection for {name:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_name_rejects_too_long() {
-        let long = "a".repeat(65);
-        let err = validate_instance_name(&long).unwrap_err();
-        assert!(err.to_string().contains("too long"));
-    }
-
-    #[test]
-    fn validate_name_accepts_max_length() {
         let max = "a".repeat(64);
-        validate_instance_name(&max).unwrap();
+        let too_long = "a".repeat(65);
+        let cases: Vec<(&str, Expect)> = vec![
+            // Accepted
+            ("foo", Expect::Ok),
+            ("my-project", Expect::Ok),
+            ("test_vm", Expect::Ok),
+            ("Dev-Box_01", Expect::Ok),
+            ("a", Expect::Ok),
+            ("A", Expect::Ok),
+            (max.as_str(), Expect::Ok),
+            // Rejected
+            ("", Expect::Err("must not be empty")),
+            ("../../../tmp/evil", Expect::Err("invalid character")),
+            ("has space", Expect::Err("invalid character")),
+            ("semi;colon", Expect::Err("invalid character")),
+            ("new\nline", Expect::Err("invalid character")),
+            ("sl/ash", Expect::Err("invalid character")),
+            ("d.ot", Expect::Err("invalid character")),
+            (too_long.as_str(), Expect::Err("too long")),
+        ];
+        for (input, expect) in cases {
+            match expect {
+                Expect::Ok => validate_instance_name(input)
+                    .unwrap_or_else(|e| panic!("expected {input:?} valid, got: {e}")),
+                Expect::Err(needle) => {
+                    let err = validate_instance_name(input).unwrap_err();
+                    assert!(
+                        err.to_string().contains(needle),
+                        "expected {input:?} to fail with {needle:?}, got: {err}"
+                    );
+                }
+            }
+        }
     }
 
     // ── List instances ───────────────────────────────────────
@@ -3342,11 +3348,10 @@ skip = ["not-a-slug"]
         assert!(serde_json::from_str::<ImageName>(r#""../evil""#).is_err());
     }
 
-    /// Pins the invariant relied on by `default_image_name`, which
-    /// bypasses the validating constructor.
+    /// Pins the invariant relied on by `default_image_name`: the
+    /// `DEFAULT_IMAGE` constant must round-trip through `ImageName::new`.
     #[test]
     fn default_image_is_valid() {
-        ImageName::new(DEFAULT_IMAGE).unwrap();
         assert_eq!(default_image_name().as_str(), DEFAULT_IMAGE);
     }
 
@@ -4228,12 +4233,7 @@ skip = ["not-a-slug"]
         let dir = tmp.path().join("inst");
 
         // Save initial state
-        let inst = Instance {
-            name: InstanceName::new("v1").unwrap(),
-            index: InstanceIndex::new(0).unwrap(),
-            dir: dir.clone(),
-            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
-        };
+        let inst = test_instance("v1", idx(0), dir.clone());
         inst.save().unwrap();
 
         // Overwrite with different content

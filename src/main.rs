@@ -296,9 +296,15 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Follow log output
-        #[arg(short, long)]
-        follow: bool,
+        /// Follow log output (snapshot by default; pass `-f` to follow).
+        #[arg(
+            short,
+            long,
+            num_args = 0..=1,
+            default_value_t = backend::LogMode::Snapshot,
+            default_missing_value = "follow",
+        )]
+        follow: backend::LogMode,
     },
     /// Push local workspace into the running VM
     Push {
@@ -838,12 +844,7 @@ fn main() -> Result<()> {
         Commands::Status { name } => cmd_status(&be, &cfg, name.as_ref()),
         Commands::Logs { name, follow } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
-            let mode = if follow {
-                backend::LogMode::Follow
-            } else {
-                backend::LogMode::Snapshot
-            };
-            be.stream_logs(&cfg, &running, mode)
+            be.stream_logs(&cfg, &running, follow)
         }
         Commands::Push {
             name,
@@ -2451,7 +2452,7 @@ mod tests {
         };
         let pairs: Vec<(String, String)> = guest_env
             .into_iter()
-            .map(|(k, v)| (k.as_str().to_string(), v))
+            .map(|(k, v)| (k.to_string(), v))
             .collect();
         assert_eq!(
             pairs,

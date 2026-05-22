@@ -29,10 +29,19 @@ pub enum BootMode {
 
 /// Whether log streaming reads the existing log once and exits or
 /// tails it indefinitely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum LogMode {
     Snapshot,
     Follow,
+}
+
+impl std::fmt::Display for LogMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogMode::Snapshot => f.write_str("snapshot"),
+            LogMode::Follow => f.write_str("follow"),
+        }
+    }
 }
 
 // ── Environment forwarding ────────────────────────────────────

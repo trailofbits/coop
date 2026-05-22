@@ -428,7 +428,7 @@ fn upsert_pat_entry(path: &Path, repo: &RepoSlug, token_cmd: &str) -> Result<()>
         "token".to_string(),
         toml::Value::String(token_cmd.to_string()),
     );
-    pat_tbl.insert(repo.as_str().to_string(), toml::Value::Table(entry));
+    pat_tbl.insert(repo.to_string(), toml::Value::Table(entry));
 
     // Drop the repo from the skip list, if present.
     if let Some(skip) = github_tbl.get_mut("skip")
@@ -500,7 +500,7 @@ pub fn add_skip_marker(path: &Path, repo: &RepoSlug) -> Result<()> {
     }
     let arr = skip.as_array_mut().context("github.skip is not an array")?;
     if !arr.iter().any(|v| v.as_str() == Some(repo.as_str())) {
-        arr.push(toml::Value::String(repo.as_str().to_string()));
+        arr.push(toml::Value::String(repo.to_string()));
     }
     write_doc(path, &doc)
 }
