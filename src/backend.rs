@@ -138,6 +138,25 @@ impl RunningInstance {
     }
 }
 
+// ── Instance view ─────────────────────────────────────────────
+
+/// Whether a VM instance is currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    Stopped,
+}
+
+/// One-shot snapshot of an instance: identity, run state, and (when
+/// running) reachability. Produced by [`VmBackend::inspect`] in a
+/// single round-trip per backend, letting bulk callers avoid the
+/// N+1 fork pattern of probing each instance individually.
+pub struct InstanceView {
+    pub instance: Instance,
+    pub state: RunState,
+    pub ssh: Option<SshTarget>,
+}
+
 // ── SSH target ────────────────────────────────────────────────
 
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -699,6 +718,13 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// The `PlatformBackend` type alias selects the correct one at compile
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
+    /// One round-trip view of every configured instance — disk-side
+    /// facts plus live VM state plus reachability. Lima captures one
+    /// `limactl list --json` snapshot; Firecracker walks PID files.
+    /// Bulk callers (`cmd_list`, `cmd_status` no-name, `purge_all_data`,
+    /// `find_stopped_instance` no-name) iterate the result instead of
+    /// probing per instance.
+    fn inspect(&self, cfg: &CoopConfig) -> Result<Vec<InstanceView>>;
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
     fn create_and_start(
         &self,
@@ -769,6 +795,27 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
+    fn inspect(&self, cfg: &CoopConfig) -> Result<Vec<InstanceView>> {
+        cfg.list_instances()?
+            .into_iter()
+            .map(|inst| {
+                let state = if inst.is_running() {
+                    RunState::Running
+                } else {
+                    RunState::Stopped
+                };
+                let ssh = (state == RunState::Running)
+                    .then(|| self.ssh_target(cfg, &inst).ok())
+                    .flatten();
+                Ok(InstanceView {
+                    instance: inst,
+                    state,
+                    ssh,
+                })
+            })
+            .collect()
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         crate::setup::run(cfg, opts)
     }
@@ -950,6 +997,28 @@ impl std::fmt::Display for LimaBackend {
 
 #[cfg(target_os = "macos")]
 impl VmBackend for LimaBackend {
+    fn inspect(&self, cfg: &CoopConfig) -> Result<Vec<InstanceView>> {
+        let snap = crate::lima::LimaSnapshot::capture()?;
+        cfg.list_instances()?
+            .into_iter()
+            .map(|inst| {
+                let state = if snap.is_running(&inst.name) {
+                    RunState::Running
+                } else {
+                    RunState::Stopped
+                };
+                let ssh = (state == RunState::Running)
+                    .then(|| crate::lima::ssh_target(cfg, &snap, &inst).ok())
+                    .flatten();
+                Ok(InstanceView {
+                    instance: inst,
+                    state,
+                    ssh,
+                })
+            })
+            .collect()
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         crate::lima::setup(cfg, opts)
     }
@@ -1024,22 +1093,26 @@ impl VmBackend for LimaBackend {
     }
 
     fn is_running(&self, inst: &Instance) -> bool {
-        crate::lima::is_running(inst)
+        crate::lima::LimaSnapshot::capture()
+            .ok()
+            .is_some_and(|s| s.is_running(&inst.name))
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance> {
-        if !crate::lima::is_running(&inst) {
+        let snap = crate::lima::LimaSnapshot::capture()?;
+        if !snap.is_running(&inst.name) {
             bail!(
                 "Instance '{}' is not running (Lima reports state != Running)",
                 inst.name,
             );
         }
-        let target = crate::lima::ssh_target(cfg, &inst)?;
+        let target = crate::lima::ssh_target(cfg, &snap, &inst)?;
         Ok(RunningInstance::new(inst, target))
     }
 
     fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-        crate::lima::status(cfg, inst)
+        let snap = crate::lima::LimaSnapshot::capture()?;
+        crate::lima::status(cfg, &snap, inst)
     }
 
     fn stream_logs(
@@ -1052,7 +1125,8 @@ impl VmBackend for LimaBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-        crate::lima::ssh_target(cfg, inst)
+        let snap = crate::lima::LimaSnapshot::capture()?;
+        crate::lima::ssh_target(cfg, &snap, inst)
     }
 
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf> {

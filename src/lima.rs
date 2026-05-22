@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -17,6 +19,76 @@ use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
+
+// ── Snapshot ──────────────────────────────────────────────────
+
+/// Point-in-time `limactl list --json` output, indexed by lima full
+/// name. Capture once per CLI invocation and pass to read paths so
+/// they don't each fork their own `limactl list`. Drop and re-capture
+/// after any write (start, stop, delete).
+#[derive(Debug)]
+pub struct LimaSnapshot {
+    by_name: HashMap<String, serde_json::Value>,
+}
+
+impl LimaSnapshot {
+    /// Run `limactl list --json` once and capture every entry.
+    pub fn capture() -> Result<Self> {
+        let output = Command::new("limactl")
+            .args(["list", "--json"])
+            .output()
+            .context("Failed to run limactl list")?;
+        if !output.status.success() {
+            bail!("limactl list failed");
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Self::parse(&stdout)
+    }
+
+    /// Parse the NDJSON output of `limactl list --json`.
+    fn parse(ndjson: &str) -> Result<Self> {
+        let mut by_name = HashMap::new();
+        for line in ndjson.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value = serde_json::from_str(line)
+                .with_context(|| format!("Failed to parse limactl JSON: {line}"))?;
+            if let Some(name) = val["name"].as_str() {
+                by_name.insert(name.to_string(), val);
+            }
+        }
+        Ok(Self { by_name })
+    }
+
+    /// Look up by coop instance name (adds the `coop-` prefix).
+    pub fn entry(&self, name: &InstanceName) -> Option<&serde_json::Value> {
+        self.entry_by_lima_name(&lima_name_for(name))
+    }
+
+    /// Look up by raw lima full name (e.g. `coop-builder`).
+    fn entry_by_lima_name(&self, lima_name: &str) -> Option<&serde_json::Value> {
+        self.by_name.get(lima_name)
+    }
+
+    /// `"Running"`, `"Stopped"`, etc., or `None` if missing.
+    pub fn status(&self, name: &InstanceName) -> Option<&str> {
+        self.entry(name)?["status"].as_str()
+    }
+
+    /// True iff the instance exists in `limactl list` with state `Running`.
+    pub fn is_running(&self, name: &InstanceName) -> bool {
+        self.status(name) == Some("Running")
+    }
+
+    /// SSH local port for an instance, if present and non-zero.
+    pub fn ssh_port(&self, name: &InstanceName) -> Option<NonZeroU16> {
+        let p = self.entry(name)?["sshLocalPort"].as_u64()?;
+        let p = u16::try_from(p).ok()?;
+        NonZeroU16::new(p)
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────
 
@@ -85,19 +157,13 @@ pub fn create_and_start(
         inst_template
     };
 
-    // Clean up leftover Lima instance from a previous failed start
-    if let Some(status) = lima_status(&inst.name) {
-        tracing::warn!(
-            "Lima instance '{name}' already exists (status: {status}) — \
-             cleaning up before re-creating"
-        );
-        if let Err(e) = Command::new("limactl")
-            .args(["delete", "--force", &name])
-            .status()
-        {
-            tracing::debug!("Failed to force-delete stale instance (non-fatal): {e}");
-        }
-    }
+    // Blind pre-start cleanup: a previous failed start may have left a
+    // stale Lima instance with the same name. `limactl delete --force`
+    // succeeds whether or not the instance exists, so this is safe.
+    let _ = Command::new("limactl")
+        .args(["delete", "--force", &name])
+        .stderr(Stdio::null())
+        .status();
 
     tracing::info!("Creating Lima instance '{name}'");
 
@@ -144,12 +210,12 @@ pub fn create_and_start(
 }
 
 /// Start an existing stopped Lima instance (no template — resumes in place).
+///
+/// Callers (`cmd_start` via `find_stopped_instance`) have already
+/// confirmed the instance is stopped, so this skips the guard. Any
+/// "instance already running" error is surfaced by `limactl start`.
 pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
-
-    if is_running(inst) {
-        bail!("Lima instance '{name}' is already running");
-    }
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
@@ -204,35 +270,39 @@ pub fn stop_running(inst: &Instance) -> Result<()> {
 }
 
 /// Delete a Lima instance.
+///
+/// Skips the existence check and the running guard: `limactl stop` on
+/// a non-running (or non-existent) instance is harmless, and
+/// `limactl delete --force` is idempotent for missing instances.
 pub fn destroy(inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
     tracing::info!("Deleting Lima instance '{name}'");
 
-    // If the instance doesn't exist in Lima, nothing to do
-    if lima_status(&inst.name).is_none() {
-        tracing::debug!("Lima instance '{name}' not found — already deleted");
+    // `stop` may fail if the VM isn't running — that's expected.
+    let _ = Command::new("limactl")
+        .args(["stop", &name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let output = Command::new("limactl")
+        .args(["delete", "--force", &name])
+        .stdout(Stdio::null())
+        .output()
+        .context("Failed to run limactl delete")?;
+
+    if output.status.success() {
         return Ok(());
     }
 
-    // Stop first if running
-    if is_running(inst)
-        && let Err(e) = Command::new("limactl").args(["stop", &name]).status()
-    {
-        tracing::debug!("Failed to stop Lima instance '{name}' before delete (non-fatal): {e}");
+    // Treat "not found"/"does not exist" stderr as success — the
+    // instance was already gone, which is the desired post-state.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not found") || stderr.contains("does not exist") {
+        tracing::debug!("Lima instance '{name}' already absent — treating delete as success");
+        return Ok(());
     }
-
-    let status = Command::new("limactl")
-        .args(["delete", "--force", &name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("Failed to run limactl delete")?;
-
-    if !status.success() {
-        bail!("limactl delete failed for '{name}'");
-    }
-
-    Ok(())
+    bail!("limactl delete failed for '{name}': {}", stderr.trim());
 }
 
 /// Resize the disk of a stopped Lima instance.
@@ -304,17 +374,11 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
     Ok(dir.join("diffdisk"))
 }
 
-/// Check if a Lima instance is running.
-pub fn is_running(inst: &Instance) -> bool {
-    match lima_status(&inst.name) {
-        Some(s) => s == "Running",
-        None => false,
-    }
-}
-
 /// Get a human-readable status string.
-pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-    let info = limactl_info(&inst.name)?;
+pub fn status(cfg: &CoopConfig, snap: &LimaSnapshot, inst: &Instance) -> Result<String> {
+    let info = snap
+        .entry(&inst.name)
+        .with_context(|| format!("Lima instance '{}' not found in limactl list", inst.name))?;
 
     let status_str = info["status"].as_str().unwrap_or("Unknown");
     let arch = info["arch"].as_str().unwrap_or("unknown");
@@ -344,7 +408,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     );
 
     if status_str == "Running"
-        && let Ok(target) = ssh_target(cfg, inst)
+        && let Ok(target) = ssh_target(cfg, snap, inst)
         && let Some(usage) = crate::backend::query_resource_usage(&target)
     {
         use std::fmt::Write as _;
@@ -398,14 +462,20 @@ pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
 }
 
 /// Get SSH connection details for a Lima instance.
-pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-    let info = limactl_info(&inst.name)?;
+pub fn ssh_target(cfg: &CoopConfig, snap: &LimaSnapshot, inst: &Instance) -> Result<SshTarget> {
+    let info = snap
+        .entry(&inst.name)
+        .with_context(|| format!("Lima instance '{}' not found in limactl list", inst.name))?;
+    ssh_target_from_entry(cfg, info)
+}
 
+/// Build an `SshTarget` from a `limactl list --json` entry.
+fn ssh_target_from_entry(cfg: &CoopConfig, info: &serde_json::Value) -> Result<SshTarget> {
     let port = info["sshLocalPort"]
         .as_u64()
         .context("Lima instance has no sshLocalPort")?;
     let port = u16::try_from(port).context("SSH port out of range")?;
-    let port = std::num::NonZeroU16::new(port).context("Lima SSH port is 0")?;
+    let port = NonZeroU16::new(port).context("Lima SSH port is 0")?;
 
     Ok(SshTarget {
         host: Hostname::new("127.0.0.1")?,
@@ -698,18 +768,11 @@ fn run_builder_vm(
 
 /// Get an SSH target for the builder VM.
 fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
-    let info = limactl_list_entry(BUILDER_NAME)?;
-    let port = info["sshLocalPort"]
-        .as_u64()
-        .context("Builder VM has no sshLocalPort")?;
-    let port = u16::try_from(port).context("SSH port out of range")?;
-    let port = std::num::NonZeroU16::new(port).context("Builder SSH port is 0")?;
-    Ok(SshTarget {
-        host: Hostname::new("127.0.0.1")?,
-        port,
-        user: SshUser::new(crate::guest::GUEST_USER)?,
-        key_path: cfg.ssh_key_path(),
-    })
+    let snap = LimaSnapshot::capture()?;
+    let info = snap
+        .entry_by_lima_name(BUILDER_NAME)
+        .with_context(|| format!("Builder VM '{BUILDER_NAME}' not found in limactl list"))?;
+    ssh_target_from_entry(cfg, info)
 }
 
 /// Install marketplaces and plugins in the builder VM via SSH.
@@ -1265,7 +1328,10 @@ fn wait_for_lima_ssh(
 ) -> Result<()> {
     let start = Instant::now();
 
-    // Phase 1: Wait for the hostagent to assign an SSH port.
+    // Phase 1: Wait for the hostagent to assign an SSH port. The
+    // snapshot is intentionally re-captured each poll — the port
+    // appears asynchronously in `limactl list` while the hostagent
+    // sets up the VM, so a cached snapshot would never see it.
     let port = loop {
         if start.elapsed() >= timeout {
             bail!("Timeout waiting for Lima to assign SSH port");
@@ -1276,7 +1342,7 @@ fn wait_for_lima_ssh(
             }
             return Ok(());
         }
-        if let Some(p) = get_lima_ssh_port(name) {
+        if let Some(p) = LimaSnapshot::capture().ok().and_then(|s| s.ssh_port(name)) {
             break p;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -1290,7 +1356,7 @@ fn wait_for_lima_ssh(
     // true readiness so the caller's wait_until_ready is instant.
     let target = SshTarget {
         host: Hostname::new("127.0.0.1")?,
-        port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
+        port,
         user: SshUser::new(crate::guest::GUEST_USER)?,
         key_path: cfg.ssh_key_path(),
     };
@@ -1313,38 +1379,6 @@ fn wait_for_lima_ssh(
         std::thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_secs(1));
     }
-}
-
-/// Get the SSH local port for a Lima instance from `limactl list`.
-fn get_lima_ssh_port(name: &InstanceName) -> Option<u16> {
-    let lima_name = lima_name_for(name);
-    let output = Command::new("limactl")
-        .args(["list", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
-            && val["name"].as_str() == Some(&lima_name)
-            && let Some(port) = val["sshLocalPort"].as_u64()
-            && let Ok(port) = u16::try_from(port)
-            && port > 0
-        {
-            return Some(port);
-        }
-    }
-    None
 }
 
 /// Wait for a child process in a background thread to prevent zombies.
@@ -1429,50 +1463,6 @@ fn lima_home() -> Result<PathBuf> {
     }
     let home = dirs::home_dir().context("Could not determine home directory")?;
     Ok(home.join(".lima"))
-}
-
-/// Get the status string for a Lima instance ("Running", "Stopped", etc.).
-fn lima_status(name: &InstanceName) -> Option<String> {
-    let info = limactl_info(name).ok()?;
-    info["status"].as_str().map(String::from)
-}
-
-/// Get full instance info from limactl for a coop instance.
-fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
-    limactl_list_entry(&lima_name_for(name))
-}
-
-/// Find a `limactl list --json` entry by its Lima VM name (the
-/// `coop-<instance>` form, or the special `coop-builder`).
-fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
-    let output = Command::new("limactl")
-        .args(["list", "--json"])
-        .output()
-        .context("Failed to run limactl list")?;
-
-    if !output.status.success() {
-        bail!("limactl list failed");
-    }
-
-    // limactl list --json outputs one JSON object per line (NDJSON)
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let val: serde_json::Value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "Failed to parse limactl JSON output: \
-                     {line}"
-            )
-        })?;
-        if val["name"].as_str() == Some(lima_name) {
-            return Ok(val);
-        }
-    }
-
-    bail!("Lima instance '{lima_name}' not found in limactl list")
 }
 
 #[cfg(test)]
@@ -1730,5 +1720,78 @@ time="..." level=fatal msg="disk too small: 1G < 20G"
         std::fs::File::create(&img).unwrap();
         // 0 bytes → GiB::new(0) returns None
         assert!(super::base_image_size_gib(&img).is_none());
+    }
+
+    // ── LimaSnapshot ────────────────────────────────────────────
+
+    fn name(s: &str) -> InstanceName {
+        InstanceName::new(s).unwrap()
+    }
+
+    fn entry(lima_name: &str, status: &str, ssh_port: u64) -> String {
+        format!(r#"{{"name":"{lima_name}","status":"{status}","sshLocalPort":{ssh_port}}}"#)
+    }
+
+    #[test]
+    fn snapshot_parse_skips_blank_lines() {
+        let nd = format!(
+            "\n{}\n\n{}\n",
+            entry("coop-a", "Running", 60022),
+            entry("coop-b", "Stopped", 0),
+        );
+        let snap = LimaSnapshot::parse(&nd).unwrap();
+        assert_eq!(snap.status(&name("a")), Some("Running"));
+        assert_eq!(snap.status(&name("b")), Some("Stopped"));
+    }
+
+    #[test]
+    fn snapshot_status_and_is_running() {
+        let nd = entry("coop-foo", "Running", 60022);
+        let snap = LimaSnapshot::parse(&nd).unwrap();
+        assert!(snap.is_running(&name("foo")));
+        assert!(!snap.is_running(&name("missing")));
+        assert_eq!(snap.status(&name("missing")), None);
+    }
+
+    #[test]
+    fn snapshot_ssh_port_zero_returns_none() {
+        let nd = entry("coop-foo", "Running", 0);
+        let snap = LimaSnapshot::parse(&nd).unwrap();
+        // sshLocalPort == 0 means lima hasn't assigned a port yet
+        assert!(snap.ssh_port(&name("foo")).is_none());
+    }
+
+    #[test]
+    fn snapshot_ssh_port_valid() {
+        let nd = entry("coop-foo", "Running", 60022);
+        let snap = LimaSnapshot::parse(&nd).unwrap();
+        assert_eq!(snap.ssh_port(&name("foo")).unwrap().get(), 60022);
+    }
+
+    #[test]
+    fn snapshot_ssh_port_missing_field() {
+        let nd = r#"{"name":"coop-foo","status":"Running"}"#;
+        let snap = LimaSnapshot::parse(nd).unwrap();
+        assert!(snap.ssh_port(&name("foo")).is_none());
+    }
+
+    #[test]
+    fn snapshot_entry_by_lima_name_finds_builder() {
+        let nd = entry("coop-builder", "Running", 60099);
+        let snap = LimaSnapshot::parse(nd.as_str()).unwrap();
+        assert!(snap.entry_by_lima_name("coop-builder").is_some());
+        assert!(snap.entry_by_lima_name("coop-missing").is_none());
+    }
+
+    #[test]
+    fn snapshot_parse_rejects_malformed_json() {
+        let nd = "{not valid json}\n";
+        assert!(LimaSnapshot::parse(nd).is_err());
+    }
+
+    #[test]
+    fn snapshot_parse_empty_input_succeeds() {
+        let snap = LimaSnapshot::parse("").unwrap();
+        assert!(snap.status(&name("anything")).is_none());
     }
 }

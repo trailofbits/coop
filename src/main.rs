@@ -1293,9 +1293,11 @@ fn find_stopped_instance(
         return Ok(None);
     }
 
-    let stopped: Vec<_> = instances
+    let stopped: Vec<config::Instance> = be
+        .inspect(cfg)?
         .into_iter()
-        .filter(|i| !be.is_running(i))
+        .filter(|v| v.state == backend::RunState::Stopped)
+        .map(|v| v.instance)
         .collect();
 
     match stopped.len() {
@@ -1778,24 +1780,27 @@ fn cmd_destroy(
 }
 
 fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
-    let mut instances = cfg.list_instances()?;
-    if instances.is_empty() {
+    let mut views = be.inspect(cfg)?;
+    if views.is_empty() {
         writeln!(std::io::stdout(), "No instances found")
             .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
         return Ok(());
     }
-    instances.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    views.sort_by(|a, b| a.instance.name.as_str().cmp(b.instance.name.as_str()));
 
     writeln!(std::io::stdout(), "{:<16} STATE", "NAME")
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
-    for inst in &instances {
-        let state = if be.is_running(inst) {
-            "running"
-        } else {
-            "stopped"
+    for view in &views {
+        let state = match view.state {
+            backend::RunState::Running => "running",
+            backend::RunState::Stopped => "stopped",
         };
-        writeln!(std::io::stdout(), "{:<16} {state}", inst.name.as_str())
-            .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+        writeln!(
+            std::io::stdout(),
+            "{:<16} {state}",
+            view.instance.name.as_str()
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     }
     Ok(())
 }
@@ -1807,14 +1812,14 @@ fn cmd_list(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<(
 /// Shared by `coop destroy --all` and `coop uninstall`. Does **not** remove
 /// the `data_dir` itself or the binary — uninstall handles those.
 fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Result<()> {
-    let instances = cfg.list_instances()?;
-    for inst in &instances {
-        tracing::info!("Destroying instance '{}'", inst.name);
-        if let Ok(target) = be.ssh_target(cfg, inst) {
-            port_forward::teardown_ssh_forwards(inst, &target);
+    let views = be.inspect(cfg)?;
+    for view in &views {
+        tracing::info!("Destroying instance '{}'", view.instance.name);
+        if let Some(target) = view.ssh.as_ref() {
+            port_forward::teardown_ssh_forwards(&view.instance, target);
         }
-        be.destroy_instance(cfg, inst)?;
-        workspace::remove_ssh_config(inst)?;
+        be.destroy_instance(cfg, &view.instance)?;
+        workspace::remove_ssh_config(&view.instance)?;
     }
 
     be.destroy_shared(cfg);
@@ -2028,30 +2033,29 @@ fn cmd_status(
         writeln!(std::io::stdout(), "{status}")
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
     } else {
-        let instances = cfg.list_instances()?;
-        if instances.is_empty() {
+        let views = be.inspect(cfg)?;
+        if views.is_empty() {
             writeln!(std::io::stdout(), "No instances found")
                 .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
             return Ok(());
         }
-        for inst in &instances {
-            let running = be.is_running(inst);
-            let state = if running { "running" } else { "stopped" };
-            let usage_str = if running {
-                be.ssh_target(cfg, inst)
-                    .ok()
-                    .and_then(|t| backend::query_resource_usage(&t))
-                    .map(|u| format!("  {}", u.summary()))
-                    .unwrap_or_default()
-            } else {
-                String::new()
+        for view in &views {
+            let state = match view.state {
+                backend::RunState::Running => "running",
+                backend::RunState::Stopped => "stopped",
             };
+            let usage_str = view
+                .ssh
+                .as_ref()
+                .and_then(backend::query_resource_usage)
+                .map(|u| format!("  {}", u.summary()))
+                .unwrap_or_default();
             writeln!(
                 std::io::stdout(),
                 "{:<16} {:<10} {:<10} {}{usage_str}",
-                inst.name,
+                view.instance.name,
                 state,
-                inst.image,
+                view.instance.image,
                 be,
             )
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
