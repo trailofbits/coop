@@ -150,6 +150,21 @@ impl MiB {
         NonZeroU32::new(value).map(Self)
     }
 
+    /// Wrap an existing `NonZeroU32` — infallible because the inner
+    /// invariant already holds. Use this to bridge from other
+    /// non-zero-backed types without round-tripping through `Option`.
+    pub fn from_nonzero(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+
+    /// Clap value parser: accept a positive integer string, reject zero.
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        let n: u32 = s
+            .parse()
+            .with_context(|| format!("expected positive integer MiB, got '{s}'"))?;
+        Self::new(n).with_context(|| format!("MiB must be > 0, got '{s}'"))
+    }
+
     pub fn as_u32(self) -> u32 {
         self.0.get()
     }
@@ -175,6 +190,21 @@ impl GiB {
     /// Create from a runtime value. Returns `None` if zero.
     pub fn new(value: u32) -> Option<Self> {
         NonZeroU32::new(value).map(Self)
+    }
+
+    /// Wrap an existing `NonZeroU32` — infallible because the inner
+    /// invariant already holds. Use this to bridge from other
+    /// non-zero-backed types without round-tripping through `Option`.
+    pub fn from_nonzero(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+
+    /// Clap value parser: accept a positive integer string, reject zero.
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        let n: u32 = s
+            .parse()
+            .with_context(|| format!("expected positive integer GiB, got '{s}'"))?;
+        Self::new(n).with_context(|| format!("GiB must be > 0, got '{s}'"))
     }
 
     pub fn as_u32(self) -> u32 {

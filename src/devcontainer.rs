@@ -350,8 +350,8 @@ impl Report {
 #[derive(Debug, Default)]
 pub struct TranslatorInputs {
     pub cli_vcpus: Option<u8>,
-    pub cli_mem_mib: Option<u32>,
-    pub cli_disk_gib: Option<u32>,
+    pub cli_mem_mib: Option<MiB>,
+    pub cli_disk_gib: Option<GiB>,
     pub cli_post_start: Option<String>,
     pub cli_guest_env_keys: Vec<EnvVarName>,
     pub cli_forward_ports: Vec<PortForward>,
@@ -379,8 +379,8 @@ pub enum Stage {
 #[derive(Debug, Default)]
 pub struct Translation {
     pub vcpus: Option<u8>,
-    pub mem_mib: Option<u32>,
-    pub disk_gib: Option<u32>,
+    pub mem_mib: Option<MiB>,
+    pub disk_gib: Option<GiB>,
     pub post_start: Option<String>,
     pub guest_env: BTreeMap<EnvVarName, String>,
     pub forward_ports: Vec<PortForward>,
@@ -963,13 +963,21 @@ impl MemorySpec {
     }
 
     /// Mebibytes (rounded up).
-    pub fn as_mib(self) -> u32 {
-        self.0.get()
+    pub fn as_mib(self) -> MiB {
+        // `MiB` and `MemorySpec` share the same `NonZeroU32` invariant,
+        // so the wrap is infallible.
+        MiB::from_nonzero(self.0)
     }
 
     /// Gibibytes (rounded up from the stored MiB).
-    pub fn as_gib(self) -> u32 {
-        self.0.get().div_ceil(1024)
+    pub fn as_gib(self) -> GiB {
+        #[expect(
+            clippy::expect_used,
+            reason = "div_ceil of a non-zero by 1024 stays non-zero"
+        )]
+        let nz = NonZeroU32::new(self.0.get().div_ceil(1024))
+            .expect("div_ceil of non-zero MiB by 1024 is non-zero");
+        GiB::from_nonzero(nz)
     }
 }
 
@@ -1246,7 +1254,7 @@ pub fn apply_to_config(cfg: &mut CoopConfig, t: &Translation) -> Result<()> {
             std::num::NonZeroU8::new(v).context("translated --vcpus value resolved to zero")?;
     }
     if let Some(m) = t.mem_mib {
-        cfg.vm.mem_size_mib = MiB::new(m).context("translated --mem value resolved to zero")?;
+        cfg.vm.mem_size_mib = m;
     }
     if let Some(p) = &t.post_start {
         cfg.post_start = Some(p.clone());
@@ -1262,10 +1270,7 @@ pub fn apply_to_config(cfg: &mut CoopConfig, t: &Translation) -> Result<()> {
 /// `disk_gib` is used.
 #[must_use]
 pub fn effective_disk(cli: Option<GiB>, t: &Translation) -> Option<GiB> {
-    if let Some(c) = cli {
-        return Some(c);
-    }
-    t.disk_gib.and_then(GiB::new)
+    cli.or(t.disk_gib)
 }
 
 /// Merge devcontainer.json forwards on top of existing config defaults.
@@ -1460,31 +1465,35 @@ mod tests {
 
     #[test]
     fn memory_spec_parses_binary_units() {
-        assert_eq!(MemorySpec::parse("4GiB").unwrap().as_mib(), 4096);
-        assert_eq!(MemorySpec::parse("4096MiB").unwrap().as_mib(), 4096);
-        assert_eq!(MemorySpec::parse("512MiB").unwrap().as_mib(), 512);
-        assert_eq!(MemorySpec::parse("8GiB").unwrap().as_gib(), 8);
+        assert_eq!(MemorySpec::parse("4GiB").unwrap().as_mib().as_u32(), 4096);
+        assert_eq!(
+            MemorySpec::parse("4096MiB").unwrap().as_mib().as_u32(),
+            4096,
+        );
+        assert_eq!(MemorySpec::parse("512MiB").unwrap().as_mib().as_u32(), 512);
+        assert_eq!(MemorySpec::parse("8GiB").unwrap().as_gib().as_u32(), 8);
     }
 
     #[test]
     fn memory_spec_parses_decimal_units() {
         // 1G = 1_000_000_000 B; ceil(1e9 / 2^20) = 954 MiB
-        assert_eq!(MemorySpec::parse("1g").unwrap().as_mib(), 954);
+        assert_eq!(MemorySpec::parse("1g").unwrap().as_mib().as_u32(), 954);
         // 512MB = 5.12e8 B; ceil(5.12e8 / 2^20) = 489 MiB
-        assert_eq!(MemorySpec::parse("512mb").unwrap().as_mib(), 489);
+        assert_eq!(MemorySpec::parse("512mb").unwrap().as_mib().as_u32(), 489);
         // 4GB rounds to 3815 MiB
-        assert_eq!(MemorySpec::parse("4GB").unwrap().as_mib(), 3815);
+        assert_eq!(MemorySpec::parse("4GB").unwrap().as_mib().as_u32(), 3815);
     }
 
     #[test]
     fn memory_spec_accepts_bare_bytes() {
         // Bare integer = bytes; 1024 B rounds up to 1 MiB.
-        assert_eq!(MemorySpec::parse("1024").unwrap().as_mib(), 1);
+        assert_eq!(MemorySpec::parse("1024").unwrap().as_mib().as_u32(), 1);
         // 2 MiB worth of bytes survives the round-trip exactly.
         assert_eq!(
             MemorySpec::parse(&(2u64 * 1024 * 1024).to_string())
                 .unwrap()
-                .as_mib(),
+                .as_mib()
+                .as_u32(),
             2,
         );
     }
@@ -1503,8 +1512,8 @@ mod tests {
     fn memory_spec_as_gib_rounds_up_from_mib() {
         // 1500 MiB → ceil(1500/1024) = 2 GiB
         let spec = MemorySpec::parse("1500MiB").unwrap();
-        assert_eq!(spec.as_mib(), 1500);
-        assert_eq!(spec.as_gib(), 2);
+        assert_eq!(spec.as_mib().as_u32(), 1500);
+        assert_eq!(spec.as_gib().as_u32(), 2);
     }
 
     #[test]
