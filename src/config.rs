@@ -1564,6 +1564,16 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
     bail!("Could not find unique instance name for '{base}'")
 }
 
+/// Witness that [`CoopConfig::validate_and_warn`] has been run.
+///
+/// Only obtainable via [`CoopConfig::validate_and_warn`] (the unit field
+/// is private). Functions that depend on the paths probed by
+/// [`CoopConfig::validate`] take `&Validated` so the compiler refuses
+/// calls that skipped validation. Sibling to `RunningInstance` in
+/// `backend.rs`.
+#[must_use]
+pub struct Validated(());
+
 impl CoopConfig {
     /// Default config path: `~/.coop/config.toml`.
     pub fn default_path() -> PathBuf {
@@ -1607,6 +1617,24 @@ impl CoopConfig {
             })
             .collect();
         Ok(cfg)
+    }
+
+    /// Run `validate` and surface warnings via `tracing::warn`, returning
+    /// a [`Validated`] witness.
+    ///
+    /// Commands that consume the paths probed by [`Self::validate`]
+    /// (`setup`, `build`, `start`) take `&Validated` so the compiler
+    /// enforces the precondition. Query commands (`list`/`status`/`logs`)
+    /// skip the call and don't need the witness, so an unrelated config
+    /// error (e.g. a stale `claude.config_dir`) can't block them.
+    ///
+    /// `coop validate` keeps using [`Self::validate`] directly because
+    /// it prints warnings to stdout instead of routing them to tracing.
+    pub fn validate_and_warn(&self) -> Result<Validated> {
+        for w in self.validate()? {
+            tracing::warn!("{w}");
+        }
+        Ok(Validated(()))
     }
 
     /// Validate config values, returning all problems found.

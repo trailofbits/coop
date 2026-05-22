@@ -10,7 +10,9 @@ use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
-use crate::config::{ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef};
+use crate::config::{
+    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef, Validated,
+};
 use crate::paths::{GuestPath, HostPath};
 use crate::setup::SetupOptions;
 use crate::shell::shell_escape;
@@ -699,7 +701,7 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// The `PlatformBackend` type alias selects the correct one at compile
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
-    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
+    fn setup(&self, cfg: &CoopConfig, validated: &Validated, opts: &SetupOptions) -> Result<()>;
     fn create_and_start(
         &self,
         cfg: &CoopConfig,
@@ -769,7 +771,7 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
-    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+    fn setup(&self, cfg: &CoopConfig, _: &Validated, opts: &SetupOptions) -> Result<()> {
         crate::setup::run(cfg, opts)
     }
 
@@ -950,7 +952,7 @@ impl std::fmt::Display for LimaBackend {
 
 #[cfg(target_os = "macos")]
 impl VmBackend for LimaBackend {
-    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+    fn setup(&self, cfg: &CoopConfig, _: &Validated, opts: &SetupOptions) -> Result<()> {
         crate::lima::setup(cfg, opts)
     }
 
