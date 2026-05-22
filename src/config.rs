@@ -1818,9 +1818,20 @@ impl CoopConfig {
 
     /// Resolve an instance by name, or auto-select if only one exists.
     pub fn resolve_instance(&self, name: Option<&InstanceName>) -> Result<Instance> {
-        let instances = self.list_instances()?;
         if let Some(name) = name {
-            instances
+            // Fast path: `allocate_instance` writes each instance to
+            // `instances_dir/<name>/`, so the metadata is one file read
+            // away. Skipping the full directory walk avoids parsing every
+            // other `instance.json` on `coop stop`/`shell`/`destroy`.
+            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str()))
+                && &inst.name == name
+            {
+                return Ok(inst);
+            }
+            // Miss or stale metadata: fall back to the full listing so
+            // the error message still names the available instances.
+            let instances = self.list_instances()?;
+            return instances
                 .into_iter()
                 .find(|i| &i.name == name)
                 .with_context(|| {
@@ -1829,8 +1840,10 @@ impl CoopConfig {
                         "No instance named '{name}'. {available}\n\
                          Create one with: coop start --name {name}"
                     )
-                })
-        } else if instances.len() == 1 {
+                });
+        }
+        let instances = self.list_instances()?;
+        if instances.len() == 1 {
             // Safe: we just checked len == 1
             instances
                 .into_iter()
