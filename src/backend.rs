@@ -1793,7 +1793,7 @@ pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]
                         local_path.display()
                     )
                 })?;
-            remote.as_str().to_string()
+            remote.to_string()
         } else {
             source.clone()
         };

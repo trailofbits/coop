@@ -4319,7 +4319,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path.as_str(), "/workspace");
+        assert_eq!(m.guest_path.to_string(), "/workspace");
     }
 
     #[test]
@@ -4328,7 +4328,7 @@ skip = ["not-a-slug"]
         let spec = format!("{}:/data/project", tmp.path().display());
         let m = Mount::parse(&spec).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path.as_str(), "/data/project");
+        assert_eq!(m.guest_path.to_string(), "/data/project");
     }
 
     #[test]

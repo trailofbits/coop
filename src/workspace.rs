@@ -931,7 +931,7 @@ struct LaunchStrategy {
 }
 
 fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
-    let path_arg = remote_path.as_str().to_string();
+    let path_arg = remote_path.to_string();
     let mut strategies = vec![LaunchStrategy {
         name: "code CLI",
         cmd: "code".into(),
@@ -1123,7 +1123,7 @@ mod tests {
         };
         state.save(&inst).expect("save");
         let loaded = load_or_default(&inst, None, "push").expect("load");
-        assert_eq!(loaded.guest_path.as_str(), "/custom");
+        assert_eq!(loaded.guest_path.to_string(), "/custom");
         assert!(matches!(
             loaded.source,
             WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
@@ -1138,7 +1138,7 @@ mod tests {
         // explicit --dir as its host_path so consumers can read it
         // uniformly.
         let loaded = load_or_default(&inst, Some("./project"), "push").expect("load");
-        assert_eq!(loaded.guest_path.as_str(), GUEST_WORKSPACE);
+        assert_eq!(loaded.guest_path.to_string(), GUEST_WORKSPACE);
         assert!(matches!(
             loaded.source,
             WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("./project")
@@ -1169,7 +1169,7 @@ mod tests {
             loaded.source,
             WorkspaceSource::Mount { ref host_path } if host_path == primary.path()
         ));
-        assert_eq!(loaded.guest_path.as_str(), "/workspace");
+        assert_eq!(loaded.guest_path.to_string(), "/workspace");
     }
 
     #[test]
@@ -1343,7 +1343,7 @@ Host coop-0\n\
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let back: WorkspaceState = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.guest_path.as_str(), "/workspace");
+        assert_eq!(back.guest_path.to_string(), "/workspace");
         assert!(matches!(
             back.source,
             WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")

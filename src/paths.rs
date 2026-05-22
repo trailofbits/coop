@@ -43,10 +43,6 @@ impl GuestPath {
         }
         Ok(Self(path))
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl std::fmt::Display for GuestPath {
@@ -100,7 +96,7 @@ mod tests {
     #[test]
     fn absolute_accepts_leading_slash() {
         let p = GuestPath::absolute("/workspace").unwrap();
-        assert_eq!(p.as_str(), "/workspace");
+        assert_eq!(p.to_string(), "/workspace");
     }
 
     #[test]
@@ -119,7 +115,7 @@ mod tests {
         // Permissive constructor: `./...` is intentional (SFTP tilde
         // expansion gotcha, see CLAUDE.md).
         let p = GuestPath::new("./.claude");
-        assert_eq!(p.as_str(), "./.claude");
+        assert_eq!(p.to_string(), "./.claude");
     }
 
     #[test]

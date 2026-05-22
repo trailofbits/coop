@@ -1531,11 +1531,11 @@ mod tests {
 
         let docker = format!("type=bind,source={host},target=/b");
         let m = parse_mount_string(&docker).unwrap();
-        assert_eq!(m.guest_path.as_str(), "/b");
+        assert_eq!(m.guest_path.to_string(), "/b");
 
         let no_type = format!("source={host},target=/b,readonly");
         let m = parse_mount_string(&no_type).unwrap();
-        assert_eq!(m.guest_path.as_str(), "/b");
+        assert_eq!(m.guest_path.to_string(), "/b");
 
         assert!(parse_mount_string("type=volume,source=v,target=/b").is_err());
     }
@@ -1548,7 +1548,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = format!("{}:/g", tmp.path().display());
         let m = parse_mount_string(&spec).unwrap();
-        assert_eq!(m.guest_path.as_str(), "/g");
+        assert_eq!(m.guest_path.to_string(), "/g");
     }
 
     #[test]
@@ -1557,7 +1557,7 @@ mod tests {
         let host = tmp.path().to_str().unwrap();
         let obj = serde_json::json!({"type": "bind", "source": host, "target": "/b"});
         let m = parse_mount_entry(&obj).unwrap();
-        assert_eq!(m.guest_path.as_str(), "/b");
+        assert_eq!(m.guest_path.to_string(), "/b");
     }
 
     #[test]
