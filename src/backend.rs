@@ -748,6 +748,13 @@ pub trait VmBackend: std::fmt::Display {
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
     fn mounts_are_live(&self) -> bool;
+    /// Whether `image` has its backend-specific build artifacts on disk.
+    ///
+    /// On Firecracker this means the template rootfs (`rootfs-template.ext4`).
+    /// On Lima it means both the base disk (`lima-base.img`) and the start
+    /// template (`lima-template.yaml`). Used by `coop quickstart` to skip
+    /// `setup` when nothing needs building.
+    fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool;
 }
 
 // ── Firecracker backend ───────────────────────────────────────
@@ -930,6 +937,10 @@ impl VmBackend for FirecrackerBackend {
     fn mounts_are_live(&self) -> bool {
         false
     }
+
+    fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
+        cfg.template_path_for(image).exists()
+    }
 }
 
 // ── Lima backend ──────────────────────────────────────────────
@@ -1064,6 +1075,10 @@ impl VmBackend for LimaBackend {
 
     fn mounts_are_live(&self) -> bool {
         true
+    }
+
+    fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
+        cfg.lima_base_path(image).exists() && cfg.lima_template_path(image).exists()
     }
 }
 

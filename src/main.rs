@@ -842,6 +842,7 @@ fn main() -> Result<()> {
                     persisted_guest_env,
                 },
             )
+            .map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {
@@ -1096,7 +1097,7 @@ fn cmd_quickstart(
     let validated = cfg.validate_and_warn()?;
     let image = config::default_image_name();
 
-    if cfg.template_path_for(&image).exists() {
+    if be.image_is_built(cfg, &image) {
         tracing::debug!("Image '{image}' already built — skipping setup");
     } else {
         tracing::info!("No '{image}' image found — running setup");
@@ -1122,20 +1123,26 @@ fn cmd_quickstart(
         None => None,
     };
 
-    let inst_name: Option<config::InstanceName> = match existing {
+    let inst = match existing {
         Some(inst) if be.is_running(&inst) => {
             tracing::info!("Reusing running instance '{}'", inst.name);
-            Some(inst.name)
+            inst
         }
         Some(inst) => {
             tracing::info!("Restarting stopped instance '{}'", inst.name);
+            // Use the existing instance's image, not the default — the two
+            // can diverge if the instance was created via `coop start
+            // --image <other>`. On restart this is currently ignored, but
+            // passing `&image` would silently allocate fresh with the
+            // wrong image if `find_stopped_instance` lost the race to a
+            // concurrent destroy.
             cmd_start(
                 be,
                 cfg,
                 &validated,
                 &StartOpts {
                     name: Some(&inst.name),
-                    image: &image,
+                    image: &inst.image,
                     workspace_dir: None,
                     git_repo: None,
                     no_agents: false,
@@ -1148,38 +1155,31 @@ fn cmd_quickstart(
                     post_start_override: None,
                     persisted_guest_env: std::collections::BTreeMap::new(),
                 },
-            )?;
-            Some(inst.name)
+            )?
         }
-        None => {
-            quickstart_fresh_start(
-                be,
-                cfg,
-                config_path,
-                &validated,
-                &image,
-                workspace_dir.as_deref(),
-                opts.no_devcontainer,
-            )?;
-            // Re-derive the started instance from the workspace state we
-            // just persisted. For `--no-workspace`, fall through to
-            // `resolve_running`'s "single running" rule by passing None.
-            workspace_dir
-                .as_deref()
-                .map(|ws| find_workspace_instance(cfg, ws))
-                .transpose()?
-                .flatten()
-                .map(|i| i.name)
-        }
+        None => quickstart_fresh_start(
+            be,
+            cfg,
+            config_path,
+            &validated,
+            &image,
+            workspace_dir.as_deref(),
+            opts.no_devcontainer,
+        )?,
     };
 
-    let sess = open_ssh_session(be, cfg, inst_name.as_ref())?;
+    let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
     ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, Vec::new()))
 }
 
-/// Drives `cmd_start` with `--workspace <ws>` defaults (no mounts, no
+/// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no
 /// `--env`, no forwards, no `--post-start`), folding any discovered
-/// `devcontainer.json` into the start.
+/// `devcontainer.json` into the start. Returns the started instance.
+///
+/// With `workspace_dir = None` (i.e. `--no-workspace`) this calls
+/// `allocate_and_start` directly rather than `cmd_start`, deliberately
+/// bypassing `find_stopped_instance`'s "single stopped instance" fallback
+/// — that fallback would silently restart an unrelated stopped instance.
 fn quickstart_fresh_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -1188,7 +1188,7 @@ fn quickstart_fresh_start(
     image: &config::ImageName,
     workspace_dir: Option<&Path>,
     no_devcontainer: bool,
-) -> Result<()> {
+) -> Result<config::Instance> {
     let inputs = devcontainer::TranslatorInputs {
         cli_workspace_or_git_repo: workspace_dir.is_some(),
         ..devcontainer::TranslatorInputs::default()
@@ -1209,6 +1209,8 @@ fn quickstart_fresh_start(
         devcontainer::apply_to_config(cfg, t)?;
     }
 
+    // `cfg.forward_ports` is folded in by `start_instance` itself, so it
+    // doesn't need to be merged in here.
     let forward_ports = translation
         .as_ref()
         .map(|t| devcontainer::merge_into_forward_ports(&t.forward_ports, &[]))
@@ -1238,26 +1240,30 @@ fn quickstart_fresh_start(
         })
         .transpose()?;
 
-    cmd_start(
-        be,
-        cfg,
-        validated,
-        &StartOpts {
-            name: None,
-            image,
-            workspace_dir: workspace_str,
-            git_repo: None,
-            no_agents: false,
-            no_prompt: false,
-            disk: effective_disk,
-            mounts: final_mounts,
-            exclude_git: false,
-            forward_ports,
-            config_path,
-            post_start_override: post_start_override.as_deref(),
-            persisted_guest_env,
-        },
-    )
+    let start_opts = StartOpts {
+        name: None,
+        image,
+        workspace_dir: workspace_str,
+        git_repo: None,
+        no_agents: false,
+        no_prompt: false,
+        disk: effective_disk,
+        mounts: final_mounts,
+        exclude_git: false,
+        forward_ports,
+        config_path,
+        post_start_override: post_start_override.as_deref(),
+        persisted_guest_env,
+    };
+
+    if workspace_dir.is_some() {
+        cmd_start(be, cfg, validated, &start_opts)
+    } else {
+        // `--no-workspace`: skip the "single stopped instance" fallback in
+        // `find_stopped_instance` so we never hijack an unrelated VM. Each
+        // quickstart with `--no-workspace` allocates a fresh instance.
+        allocate_and_start(be, cfg, None, image, None, &start_opts)
+    }
 }
 
 /// Resolve the workspace directory for `coop quickstart`.
@@ -1296,7 +1302,13 @@ fn resolve_quickstart_workspace(no_workspace: bool) -> Result<Option<PathBuf>> {
 /// directory `/`.
 ///
 /// `home` is passed in rather than read from the process env so the function
-/// is pure and testable without env mutation.
+/// is pure and testable without env mutation. The comparison is byte-equality
+/// — symlinks (e.g. macOS `/var` → `/private/var`) and trailing slashes are
+/// intentionally *not* normalised, so this is a best-effort guardrail rather
+/// than a hard safety check. The fallback behaviour (proceed with the cwd
+/// mount) is benign for any user who deliberately runs in a normalised
+/// project directory; users who land here from an unusual cwd can still
+/// opt out with `--no-workspace`.
 fn is_sensitive_workspace(p: &Path, home: Option<&Path>) -> bool {
     if p == Path::new("/") {
         return true;
@@ -1333,7 +1345,8 @@ fn find_workspace_instance(
             let names: Vec<_> = matching.iter().map(|i| i.name.as_str()).collect();
             bail!(
                 "Multiple instances share workspace {}:\n  {}\n\
-                 Pick one explicitly: coop claude <name>",
+                 Pick one explicitly with `coop start <name>` (for a stopped\n\
+                 instance) or `coop claude <name>` (for a running one).",
                 canonical.display(),
                 names.join(", "),
             )
@@ -1496,7 +1509,7 @@ fn cmd_start(
     cfg: &mut config::CoopConfig,
     _: &config::Validated,
     opts: &StartOpts<'_>,
-) -> Result<()> {
+) -> Result<config::Instance> {
     let ws_path = opts.workspace_dir.map(Path::new);
 
     // Creation-only flags (`--mount`, `--git-repo`, `--disk`, `--exclude-git`)
@@ -1530,10 +1543,27 @@ fn cmd_start(
             );
         }
 
-        return restart_instance(be, cfg, &inst, opts);
+        restart_instance(be, cfg, &inst, opts)?;
+        return Ok(inst);
     }
 
-    let inst = cfg.allocate_instance(opts.name, opts.image, ws_path)?;
+    allocate_and_start(be, cfg, opts.name, opts.image, ws_path, opts)
+}
+
+/// Allocate a fresh instance and run the first-boot start, cleaning up any
+/// partial state on error. Used by `cmd_start`'s "no stopped instance to
+/// restart" path and by `cmd_quickstart`'s `--no-workspace` fresh path
+/// (which skips the `find_stopped_instance` "single stopped" rule to avoid
+/// hijacking an unrelated instance).
+fn allocate_and_start(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    name: Option<&config::InstanceName>,
+    image: &config::ImageName,
+    workspace_path: Option<&Path>,
+    opts: &StartOpts<'_>,
+) -> Result<config::Instance> {
+    let inst = cfg.allocate_instance(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
@@ -1552,7 +1582,7 @@ fn cmd_start(
         }
     }
 
-    result
+    result.map(|()| inst)
 }
 
 /// Find a stopped instance to restart, if applicable.

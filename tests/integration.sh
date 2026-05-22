@@ -1686,6 +1686,17 @@ test_quickstart() {
     # Track for cleanup even if status assertions below fail.
     STARTED_INSTANCES+=("$qs_inst_name")
 
+    # `ssh::run_interactive` swallows non-zero remote exit, so checking only
+    # `rc=0` would let a quickstart that bailed before the ssh leg slip
+    # through. Grep the tracing output for the connect line to confirm the
+    # claude exec was actually reached.
+    if grep -q "Connecting via SSH" "$tmpdir/qs1_err"; then
+        pass "first quickstart reached SSH/claude exec"
+    else
+        fail "first quickstart reached SSH/claude exec" \
+            "stderr: $(cat "$tmpdir/qs1_err")"
+    fi
+
     if "$BINARY" status "$qs_inst_name" >/dev/null 2>&1; then
         pass "quickstart created and started instance '$qs_inst_name'"
     else
@@ -1707,6 +1718,13 @@ test_quickstart() {
         pass "second quickstart exits 0 (reconnect path)"
     else
         fail "second quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs2_err")"
+    fi
+
+    if grep -q "Connecting via SSH" "$tmpdir/qs2_err"; then
+        pass "second quickstart reached SSH/claude exec"
+    else
+        fail "second quickstart reached SSH/claude exec" \
+            "stderr: $(cat "$tmpdir/qs2_err")"
     fi
 
     post_list=$("$BINARY" list 2>/dev/null | sort)
@@ -1731,6 +1749,13 @@ test_quickstart() {
         pass "third quickstart exits 0 (restart path)"
     else
         fail "third quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs3_err")"
+    fi
+
+    if grep -q "Connecting via SSH" "$tmpdir/qs3_err"; then
+        pass "third quickstart reached SSH/claude exec"
+    else
+        fail "third quickstart reached SSH/claude exec" \
+            "stderr: $(cat "$tmpdir/qs3_err")"
     fi
 
     if "$BINARY" status "$qs_inst_name" 2>/dev/null | grep -q -i running; then
