@@ -2064,7 +2064,7 @@ struct InstanceMeta {
 /// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
 /// construction (skipping `ImageName::new`) is safe here because the
 /// const is pinned by the `default_image_is_valid` test below.
-fn default_image_name() -> ImageName {
+pub(crate) fn default_image_name() -> ImageName {
     ImageName(DEFAULT_IMAGE.to_string())
 }
 

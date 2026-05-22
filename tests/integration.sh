@@ -1643,6 +1643,109 @@ test_idempotency() {
     untrack_instance "$inst_name"
 }
 
+# ── Quickstart (--full only) ──────────────────────────────────
+
+# `coop quickstart` chains ensure-image, ensure-instance, launch-claude. The
+# first two steps share code with `coop setup` / `coop start` (covered above);
+# this phase exercises the reconnect/restart logic specific to quickstart and
+# the workspace-affinity lookup that drives it.
+#
+# Claude is interactive — with stdin redirected from /dev/null `ssh` doesn't
+# allocate a PTY and the claude binary fails fast. `run_interactive` only
+# logs (does not error) on non-zero remote status, so quickstart still
+# returns 0 to the host. Each invocation is bounded with `timeout` defensively
+# so a future claude that hangs on EOF can't wedge the suite.
+test_quickstart() {
+    echo ""
+    echo "=== Phase: quickstart ==="
+
+    if ! "$BINARY" exec --help >/dev/null 2>&1; then
+        skip "quickstart" "binary missing exec subcommand"
+        return
+    fi
+
+    local qs_ws qs_inst_name
+    qs_ws=$(mktemp -d "$tmpdir/qs-ws-XXXXXX")
+    # The instance name is the sanitised basename of the workspace path.
+    qs_inst_name=$(basename "$qs_ws" | tr -c 'a-zA-Z0-9_-' '-')
+
+    # First invocation: image is already built (from test_setup) and no
+    # instance for this workspace exists, so quickstart must allocate fresh.
+    local rc=0
+    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+        </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        pass "first quickstart exits 0"
+    else
+        fail "first quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs1_err")"
+        rm -rf "$qs_ws"
+        return
+    fi
+
+    # Track for cleanup even if status assertions below fail.
+    STARTED_INSTANCES+=("$qs_inst_name")
+
+    if "$BINARY" status "$qs_inst_name" >/dev/null 2>&1; then
+        pass "quickstart created and started instance '$qs_inst_name'"
+    else
+        fail "quickstart created and started instance" "no instance '$qs_inst_name'"
+        rm -rf "$qs_ws"
+        return
+    fi
+
+    # Second invocation in the same cwd: must reconnect — same name, no new
+    # instance allocated.
+    local pre_list post_list
+    pre_list=$("$BINARY" list 2>/dev/null | sort)
+
+    rc=0
+    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+        </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        pass "second quickstart exits 0 (reconnect path)"
+    else
+        fail "second quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs2_err")"
+    fi
+
+    post_list=$("$BINARY" list 2>/dev/null | sort)
+    if [[ "$pre_list" == "$post_list" ]]; then
+        pass "second quickstart reuses existing instance for cwd"
+    else
+        fail "second quickstart reuses existing instance for cwd" \
+            "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
+    fi
+
+    # Stop and re-invoke: must restart the same stopped instance.
+    if ! coop stop "$qs_inst_name"; then
+        fail "stop quickstart instance before restart test" "exit code: $?"
+        return
+    fi
+
+    rc=0
+    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+        </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        pass "third quickstart exits 0 (restart path)"
+    else
+        fail "third quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs3_err")"
+    fi
+
+    if "$BINARY" status "$qs_inst_name" 2>/dev/null | grep -q -i running; then
+        pass "quickstart restarted stopped instance '$qs_inst_name'"
+    else
+        fail "quickstart restarted stopped instance" \
+            "status: $("$BINARY" status "$qs_inst_name" 2>&1)"
+    fi
+
+    # Cleanup
+    coop destroy "$qs_inst_name" 2>/dev/null || true
+    untrack_instance "$qs_inst_name"
+    rm -rf "$qs_ws"
+}
+
 # ── Workspace sync tests (--full only) ────────────────────────
 
 test_workspace_sync() {
@@ -3385,6 +3488,7 @@ main() {
 
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" ]]; then
+        test_quickstart
         test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
