@@ -221,7 +221,10 @@ impl<'a> FirecrackerVm<'a, Running> {
     /// PID file.
     ///
     /// Validates that the PID is alive and belongs to a Firecracker
-    /// process, cleaning up stale PID files if not.
+    /// process, cleaning up stale PID files if not. Callers that
+    /// already hold a `RunningInstance` proof should use
+    /// [`Self::from_running_unchecked`] instead to avoid the
+    /// redundant live-state probe.
     pub fn from_running(cfg: &'a CoopConfig, inst: &'a Instance) -> Result<Self> {
         if !inst.is_running() {
             let pid_path = inst.pid_file_path();
@@ -233,12 +236,20 @@ impl<'a> FirecrackerVm<'a, Running> {
             );
         }
 
-        Ok(Self {
+        Ok(Self::from_running_unchecked(cfg, inst))
+    }
+
+    /// Attach to a Firecracker VM whose running state has already
+    /// been established by the caller (e.g. via a
+    /// [`crate::backend::RunningInstance`] proof). Skips the
+    /// `is_running()` probe that [`Self::from_running`] performs.
+    pub fn from_running_unchecked(cfg: &'a CoopConfig, inst: &'a Instance) -> Self {
+        Self {
             cfg,
             inst,
             fc_config: build_config(cfg, inst),
             _state: PhantomData,
-        })
+        }
     }
 
     /// Wait for the guest to become reachable via SSH.

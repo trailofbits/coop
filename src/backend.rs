@@ -801,7 +801,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
-        let vm = crate::vm::FirecrackerVm::from_running(cfg, &inst)?;
+        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
         vm.stop()
     }
 
@@ -907,7 +907,7 @@ impl VmBackend for FirecrackerBackend {
         running: &RunningInstance,
         mode: LogMode,
     ) -> Result<()> {
-        let vm = crate::vm::FirecrackerVm::from_running(cfg, running.instance())?;
+        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
         vm.stream_logs(mode)
     }
 
