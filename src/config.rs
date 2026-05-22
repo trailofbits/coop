@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
+use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::os::unix::io::AsRawFd;
@@ -138,84 +139,91 @@ impl<T> fmt::Debug for Secret<T> {
 
 // ── Newtypes ─────────────────────────────────────────────────
 
-/// Memory size in mebibytes. Inner `NonZeroU32` rejects zero at
-/// deserialization time — no runtime validation needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MiB(NonZeroU32);
+/// Marker types and trait for [`Quantity`] — the only place a new
+/// unit is introduced. Adding a unit means: a marker struct, an
+/// `impl Unit for ...` with the human-facing suffix, and a `type` alias.
+pub trait Unit: Copy + fmt::Debug + 'static {
+    /// Human-readable suffix used in CLI/parser error messages.
+    const SUFFIX: &'static str;
+}
 
-impl MiB {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MibUnit;
+impl Unit for MibUnit {
+    const SUFFIX: &'static str = "MiB";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GibUnit;
+impl Unit for GibUnit {
+    const SUFFIX: &'static str = "GiB";
+}
+
+/// Non-zero byte-scaled quantity. The phantom unit parameter prevents
+/// silently mixing `MiB` and `GiB`; the inner `NonZeroU32` rejects
+/// zero at deserialization time so no runtime check is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Quantity<U: Unit>(NonZeroU32, PhantomData<U>);
+
+/// Memory size in mebibytes.
+pub type MiB = Quantity<MibUnit>;
+/// Disk/storage size in gibibytes.
+pub type GiB = Quantity<GibUnit>;
+
+impl<U: Unit> Quantity<U> {
     /// Create from a runtime value. Returns `None` if zero.
     pub fn new(value: u32) -> Option<Self> {
-        NonZeroU32::new(value).map(Self)
+        NonZeroU32::new(value).map(|n| Self(n, PhantomData))
     }
 
     /// Wrap an existing `NonZeroU32` — infallible because the inner
     /// invariant already holds. Use this to bridge from other
-    /// non-zero-backed types without round-tripping through `Option`.
-    pub fn from_nonzero(value: NonZeroU32) -> Self {
-        Self(value)
+    /// non-zero-backed types without round-tripping through `Option`,
+    /// and to build `const` quantity values from non-zero literals.
+    pub const fn from_nonzero(value: NonZeroU32) -> Self {
+        Self(value, PhantomData)
     }
 
     /// Clap value parser: accept a positive integer string, reject zero.
     pub fn parse_cli(s: &str) -> Result<Self> {
         let n: u32 = s
             .parse()
-            .with_context(|| format!("expected positive integer MiB, got '{s}'"))?;
-        Self::new(n).with_context(|| format!("MiB must be > 0, got '{s}'"))
+            .with_context(|| format!("expected positive integer {}, got '{s}'", U::SUFFIX))?;
+        Self::new(n).with_context(|| format!("{} must be > 0, got '{s}'", U::SUFFIX))
     }
 
     pub fn as_u32(self) -> u32 {
         self.0.get()
     }
 
+    pub fn as_nonzero(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+impl<U: Unit> fmt::Display for Quantity<U> {
+    #[mutants::skip] // equivalent: callers don't assert the formatted output, only round-trip via parse_cli
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<U: Unit> Serialize for Quantity<U> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de, U: Unit> Deserialize<'de> for Quantity<U> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        NonZeroU32::deserialize(d).map(Self::from_nonzero)
+    }
+}
+
+impl Quantity<MibUnit> {
+    /// MiB → GiB as floating-point (1024 MiB = 1 GiB).
     pub fn as_gib_f64(self) -> f64 {
         f64::from(self.0.get()) / 1024.0
-    }
-}
-
-impl fmt::Display for MiB {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Disk size in gibibytes. Inner `NonZeroU32` rejects zero at
-/// deserialization time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GiB(NonZeroU32);
-
-impl GiB {
-    /// Create from a runtime value. Returns `None` if zero.
-    pub fn new(value: u32) -> Option<Self> {
-        NonZeroU32::new(value).map(Self)
-    }
-
-    /// Wrap an existing `NonZeroU32` — infallible because the inner
-    /// invariant already holds. Use this to bridge from other
-    /// non-zero-backed types without round-tripping through `Option`.
-    pub fn from_nonzero(value: NonZeroU32) -> Self {
-        Self(value)
-    }
-
-    /// Clap value parser: accept a positive integer string, reject zero.
-    pub fn parse_cli(s: &str) -> Result<Self> {
-        let n: u32 = s
-            .parse()
-            .with_context(|| format!("expected positive integer GiB, got '{s}'"))?;
-        Self::new(n).with_context(|| format!("GiB must be > 0, got '{s}'"))
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl fmt::Display for GiB {
-    #[mutants::skip] // equivalent: callers don't assert the formatted output, only that GiB round-trips through CLI parsing
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -250,14 +258,18 @@ impl DiskSize {
     }
 
     /// Resolve to an absolute GiB value given the current disk size.
-    pub fn resolve(self, current_gib: u32) -> Result<GiB> {
-        let target = match self {
-            Self::Absolute(gib) => gib.as_u32(),
-            Self::Relative(gib) => current_gib
+    ///
+    /// Both inputs are non-zero, so the result is too; the only
+    /// remaining failure mode is `u32` overflow on a relative add.
+    pub fn resolve(self, current: GiB) -> Result<GiB> {
+        match self {
+            Self::Absolute(gib) => Ok(gib),
+            Self::Relative(gib) => current
+                .as_nonzero()
                 .checked_add(gib.as_u32())
-                .context("Disk size overflow")?,
-        };
-        GiB::new(target).context("Resolved disk size is 0")
+                .map(GiB::from_nonzero)
+                .context("Disk size overflow"),
+        }
     }
 }
 
@@ -1603,16 +1615,18 @@ impl CoopConfig {
     /// Returns `Ok(warnings)` where warnings are non-fatal observations,
     /// or `Err` with all fatal validation errors joined.
     pub fn validate(&self) -> Result<Vec<String>> {
+        const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
+
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
         // VM config bounds
         // vcpu_count, mem_size_mib, template_size_gib, and ssh_port are
         // NonZero types — zero is rejected at deserialization time.
-        if self.vm.mem_size_mib.as_u32() < 128 {
+        if self.vm.mem_size_mib < MIN_MEM_MIB {
             errors.push(format!(
-                "vm.mem_size_mib={} is too low (minimum 128)",
-                self.vm.mem_size_mib
+                "vm.mem_size_mib={} is too low (minimum {MIN_MEM_MIB})",
+                self.vm.mem_size_mib,
             ));
         }
 
@@ -4332,15 +4346,15 @@ skip = ["not-a-slug"]
     #[test]
     fn disk_size_resolve_absolute() {
         let ds = DiskSize::Absolute(GiB::new(150).unwrap());
-        let resolved = ds.resolve(100).unwrap();
-        assert_eq!(resolved.as_u32(), 150);
+        let resolved = ds.resolve(GiB::new(100).unwrap()).unwrap();
+        assert_eq!(resolved, GiB::new(150).unwrap());
     }
 
     #[test]
     fn disk_size_resolve_relative() {
         let ds = DiskSize::Relative(GiB::new(20).unwrap());
-        let resolved = ds.resolve(100).unwrap();
-        assert_eq!(resolved.as_u32(), 120);
+        let resolved = ds.resolve(GiB::new(100).unwrap()).unwrap();
+        assert_eq!(resolved, GiB::new(120).unwrap());
     }
 
     // ── Mount parsing ───────────────────────────────────────────

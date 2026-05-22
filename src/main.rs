@@ -2069,20 +2069,21 @@ fn cmd_resize(
     let inst = cfg.resolve_instance(name)?;
     let disk_size = config::DiskSize::parse(size)?;
 
-    let current_gib = current_disk_gib(be, &inst)?;
-    let new_size = disk_size.resolve(current_gib)?;
+    let current = current_disk_gib(be, &inst)?;
+    let new_size = disk_size.resolve(current)?;
 
     be.resize_disk(cfg, &inst, new_size)
 }
 
-fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<u32> {
+fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
     let path = be.disk_path(inst)?;
     let bytes = std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
         .len();
     #[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
     let gib = (bytes / (1024 * 1024 * 1024)) as u32;
-    Ok(gib)
+    config::GiB::new(gib)
+        .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
 }
 
 fn cmd_profiles(cfg: &config::CoopConfig, action: &ProfilesAction) -> Result<()> {
