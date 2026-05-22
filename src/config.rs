@@ -1342,6 +1342,11 @@ impl InstanceName {
         Ok(Self(name.to_string()))
     }
 
+    /// Clap `value_parser` entry point for instance-name arguments.
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1767,12 +1772,12 @@ impl CoopConfig {
     }
 
     /// Resolve an instance by name, or auto-select if only one exists.
-    pub fn resolve_instance(&self, name: Option<&str>) -> Result<Instance> {
+    pub fn resolve_instance(&self, name: Option<&InstanceName>) -> Result<Instance> {
         let instances = self.list_instances()?;
         if let Some(name) = name {
             instances
                 .into_iter()
-                .find(|i| i.name == *name)
+                .find(|i| &i.name == name)
                 .with_context(|| {
                     let available = self.format_instance_list_or_none();
                     format!(
@@ -1817,7 +1822,7 @@ impl CoopConfig {
     /// concurrent allocations.
     pub fn allocate_instance(
         &self,
-        name: Option<&str>,
+        name: Option<&InstanceName>,
         image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
@@ -1844,7 +1849,7 @@ impl CoopConfig {
         };
 
         let name = if let Some(n) = name {
-            InstanceName::new(n)?
+            n.clone()
         } else if let Some(ws) = workspace_path {
             let basename = ws
                 .file_name()
@@ -2206,10 +2211,18 @@ mod tests {
         ImageName::new(DEFAULT_IMAGE).unwrap()
     }
 
-    fn make_instance(dir: &Path, name: &str, index: u16) -> Instance {
+    fn idx(n: u16) -> InstanceIndex {
+        InstanceIndex::new(n).unwrap()
+    }
+
+    fn iname(s: &str) -> InstanceName {
+        InstanceName::new(s).unwrap()
+    }
+
+    fn make_instance(dir: &Path, name: &str, index: InstanceIndex) -> Instance {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index).unwrap(),
+            index,
             dir: dir.join("instances").join(name),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
@@ -2217,10 +2230,10 @@ mod tests {
         inst
     }
 
-    fn test_inst(name: &str, index: u16, dir: PathBuf) -> Instance {
+    fn test_inst(name: &str, index: InstanceIndex, dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index).unwrap(),
+            index,
             dir,
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         }
@@ -2286,13 +2299,13 @@ mod tests {
     /// off-by-one bugs would land.
     #[test]
     fn instance_network_derivations_at_boundaries() {
-        let lo = test_inst("test", 0, PathBuf::from("/tmp/fake"));
+        let lo = test_inst("test", idx(0), PathBuf::from("/tmp/fake"));
         assert_eq!(lo.guest_ip(), "172.16.0.2");
         assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
         assert_eq!(lo.tap_device(), "tap0");
         assert_eq!(lo.vsock_cid(), 3);
 
-        let hi = test_inst("test", InstanceIndex::MAX, PathBuf::from("/tmp/fake"));
+        let hi = test_inst("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
         assert_eq!(hi.guest_ip(), "172.16.0.254");
         assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
         assert_eq!(hi.tap_device(), "tap252");
@@ -2303,7 +2316,7 @@ mod tests {
 
     #[test]
     fn instance_paths_under_dir() {
-        let inst = test_inst("foo", 0, PathBuf::from("/data/instances/foo"));
+        let inst = test_inst("foo", idx(0), PathBuf::from("/data/instances/foo"));
         assert_eq!(
             inst.rootfs_path(),
             PathBuf::from("/data/instances/foo/rootfs.ext4")
@@ -2340,7 +2353,7 @@ mod tests {
     fn instance_save_load_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("myinst");
-        let inst = test_inst("myinst", 42, dir.clone());
+        let inst = test_inst("myinst", idx(42), dir.clone());
         inst.save().unwrap();
 
         let loaded = Instance::load(&dir).unwrap();
@@ -2388,7 +2401,7 @@ mod tests {
     #[test]
     fn is_running_false_when_pid_file_missing() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
     }
@@ -2397,7 +2410,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
 
         assert!(!inst.is_running());
@@ -2411,7 +2424,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_sleep();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
@@ -2430,7 +2443,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn is_running_true_for_live_firecracker_like_pid() {
         let tmp = TempDir::new().unwrap();
-        let inst = test_inst("test", 0, tmp.path().to_path_buf());
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
@@ -2510,7 +2523,7 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let inst = cfg
-            .allocate_instance(Some("my-project"), &default_img(), None)
+            .allocate_instance(Some(&iname("my-project")), &default_img(), None)
             .unwrap();
         assert_eq!(inst.name, *"my-project");
         assert_eq!(inst.index.as_u16(), 0);
@@ -2521,10 +2534,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        cfg.allocate_instance(Some("dupe"), &default_img(), None)
+        cfg.allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap();
         let err = cfg
-            .allocate_instance(Some("dupe"), &default_img(), None)
+            .allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -2536,11 +2549,11 @@ mod tests {
 
         // Create instance at index 0, then remove it, then create at 1
         let inst0 = cfg
-            .allocate_instance(Some("a"), &default_img(), None)
+            .allocate_instance(Some(&iname("a")), &default_img(), None)
             .unwrap();
         assert_eq!(inst0.index.as_u16(), 0);
         let inst1 = cfg
-            .allocate_instance(Some("b"), &default_img(), None)
+            .allocate_instance(Some(&iname("b")), &default_img(), None)
             .unwrap();
         assert_eq!(inst1.index.as_u16(), 1);
 
@@ -2549,7 +2562,7 @@ mod tests {
 
         // Next allocation should be index 2 (highest + 1), not 0 (gap)
         let inst2 = cfg
-            .allocate_instance(Some("c"), &default_img(), None)
+            .allocate_instance(Some(&iname("c")), &default_img(), None)
             .unwrap();
         assert_eq!(inst2.index.as_u16(), 2);
     }
@@ -2560,17 +2573,17 @@ mod tests {
         let cfg = test_config(&tmp);
 
         // Create instance at index 252 (max)
-        make_instance(tmp.path(), "max", 252);
+        make_instance(tmp.path(), "max", idx(252));
 
         // Create another at index 0 (gap at low end)
-        make_instance(tmp.path(), "zero", 0);
+        make_instance(tmp.path(), "zero", idx(0));
 
         // Remove index 0
         fs::remove_dir_all(tmp.path().join("instances/zero")).unwrap();
 
         // Next should fill gap at 0 since highest (252) is at ceiling
         let inst = cfg
-            .allocate_instance(Some("fill"), &default_img(), None)
+            .allocate_instance(Some(&iname("fill")), &default_img(), None)
             .unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
@@ -2620,16 +2633,6 @@ mod tests {
         validate_instance_name(&max).unwrap();
     }
 
-    #[test]
-    fn allocate_rejects_invalid_name() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
-        let err = cfg
-            .allocate_instance(Some("../evil"), &default_img(), None)
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid character"));
-    }
-
     // ── List instances ───────────────────────────────────────
 
     #[test]
@@ -2645,9 +2648,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "high", 10);
-        make_instance(tmp.path(), "low", 2);
-        make_instance(tmp.path(), "mid", 5);
+        make_instance(tmp.path(), "high", idx(10));
+        make_instance(tmp.path(), "low", idx(2));
+        make_instance(tmp.path(), "mid", idx(5));
 
         let instances = cfg.list_instances().unwrap();
         let indices: Vec<u16> = instances.iter().map(|i| i.index.as_u16()).collect();
@@ -2661,7 +2664,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "only", 0);
+        make_instance(tmp.path(), "only", idx(0));
 
         let inst = cfg.resolve_instance(None).unwrap();
         assert_eq!(inst.name, *"only");
@@ -2681,8 +2684,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "a", 0);
-        make_instance(tmp.path(), "b", 1);
+        make_instance(tmp.path(), "a", idx(0));
+        make_instance(tmp.path(), "b", idx(1));
 
         let err = cfg.resolve_instance(None).unwrap_err();
         assert!(err.to_string().contains("Multiple instances"));
@@ -2693,10 +2696,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "alpha", 0);
-        make_instance(tmp.path(), "beta", 1);
+        make_instance(tmp.path(), "alpha", idx(0));
+        make_instance(tmp.path(), "beta", idx(1));
 
-        let inst = cfg.resolve_instance(Some("beta")).unwrap();
+        let inst = cfg.resolve_instance(Some(&iname("beta"))).unwrap();
         assert_eq!(inst.name, *"beta");
         assert_eq!(inst.index.as_u16(), 1);
     }
@@ -2706,9 +2709,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "real", 0);
+        make_instance(tmp.path(), "real", idx(0));
 
-        let err = cfg.resolve_instance(Some("fake")).unwrap_err();
+        let err = cfg.resolve_instance(Some(&iname("fake"))).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("No instance named 'fake'"));
         assert!(msg.contains("Available: real"), "missing hint in: {msg}");
@@ -2719,7 +2722,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        let err = cfg.resolve_instance(Some("ghost")).unwrap_err();
+        let err = cfg.resolve_instance(Some(&iname("ghost"))).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("No instance named 'ghost'"));
         assert!(
@@ -2739,8 +2742,8 @@ mod tests {
     fn format_instance_list_or_none_lists_names() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        make_instance(tmp.path(), "alpha", 0);
-        make_instance(tmp.path(), "beta", 1);
+        make_instance(tmp.path(), "alpha", idx(0));
+        make_instance(tmp.path(), "beta", idx(1));
         assert_eq!(cfg.format_instance_list_or_none(), "Available: alpha, beta");
     }
 
@@ -4156,7 +4159,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with no instance.json (crashed mid-create)
         let orphan = tmp.path().join("instances").join("orphan");
@@ -4172,7 +4175,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with garbage JSON (truncated write)
         let broken = tmp.path().join("instances").join("broken");
@@ -4189,7 +4192,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with empty file (truncated before any content)
         let empty = tmp.path().join("instances").join("empty");
@@ -4581,7 +4584,7 @@ skip = ["not-a-slug"]
     #[test]
     fn unique_name_with_collision() {
         let tmp = TempDir::new().unwrap();
-        let inst = make_instance(tmp.path(), "foo", 0);
+        let inst = make_instance(tmp.path(), "foo", idx(0));
         let name = unique_instance_name("foo", &[inst]).unwrap();
         assert_eq!(name, *"foo-2");
     }
@@ -4589,8 +4592,8 @@ skip = ["not-a-slug"]
     #[test]
     fn unique_name_multiple_collisions() {
         let tmp = TempDir::new().unwrap();
-        let i1 = make_instance(tmp.path(), "foo", 0);
-        let i2 = make_instance(tmp.path(), "foo-2", 1);
+        let i1 = make_instance(tmp.path(), "foo", idx(0));
+        let i2 = make_instance(tmp.path(), "foo-2", idx(1));
         let name = unique_instance_name("foo", &[i1, i2]).unwrap();
         assert_eq!(name, *"foo-3");
     }
@@ -4639,7 +4642,7 @@ skip = ["not-a-slug"]
         fs::create_dir(&ws).unwrap();
 
         let inst = cfg
-            .allocate_instance(Some("custom"), &default_img(), Some(&ws))
+            .allocate_instance(Some(&iname("custom")), &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst.name, *"custom");
     }

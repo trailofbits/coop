@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
-use crate::config::{CoopConfig, GiB, ImageName, Instance};
+use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
     SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
@@ -86,7 +86,7 @@ pub fn create_and_start(
     };
 
     // Clean up leftover Lima instance from a previous failed start
-    if let Some(status) = lima_status(&name) {
+    if let Some(status) = lima_status(&inst.name) {
         tracing::warn!(
             "Lima instance '{name}' already exists (status: {status}) — \
              cleaning up before re-creating"
@@ -122,7 +122,7 @@ pub fn create_and_start(
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    if let Err(e) = wait_for_lima_ssh(&name, &mut child, cfg, Duration::from_secs(60)) {
+    if let Err(e) = wait_for_lima_ssh(&inst.name, &mut child, cfg, Duration::from_secs(60)) {
         let _ = child.kill();
         let lima_stderr = match child.wait_with_output() {
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
@@ -160,7 +160,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    if let Err(e) = wait_for_lima_ssh(&name, &mut child, cfg, Duration::from_secs(60)) {
+    if let Err(e) = wait_for_lima_ssh(&inst.name, &mut child, cfg, Duration::from_secs(60)) {
         let _ = child.kill();
         let lima_stderr = match child.wait_with_output() {
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
@@ -209,7 +209,7 @@ pub fn destroy(inst: &Instance) -> Result<()> {
     tracing::info!("Deleting Lima instance '{name}'");
 
     // If the instance doesn't exist in Lima, nothing to do
-    if lima_status(&name).is_none() {
+    if lima_status(&inst.name).is_none() {
         tracing::debug!("Lima instance '{name}' not found — already deleted");
         return Ok(());
     }
@@ -306,8 +306,7 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
 
 /// Check if a Lima instance is running.
 pub fn is_running(inst: &Instance) -> bool {
-    let name = lima_name(inst);
-    match lima_status(&name) {
+    match lima_status(&inst.name) {
         Some(s) => s == "Running",
         None => false,
     }
@@ -315,8 +314,7 @@ pub fn is_running(inst: &Instance) -> bool {
 
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-    let name = lima_name(inst);
-    let info = limactl_info(&name)?;
+    let info = limactl_info(&inst.name)?;
 
     let status_str = info["status"].as_str().unwrap_or("Unknown");
     let arch = info["arch"].as_str().unwrap_or("unknown");
@@ -401,8 +399,7 @@ pub fn stream_logs(inst: &Instance, mode: LogMode) -> Result<()> {
 
 /// Get SSH connection details for a Lima instance.
 pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-    let name = lima_name(inst);
-    let info = limactl_info(&name)?;
+    let info = limactl_info(&inst.name)?;
 
     let port = info["sshLocalPort"]
         .as_u64()
@@ -701,7 +698,7 @@ fn run_builder_vm(
 
 /// Get an SSH target for the builder VM.
 fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
-    let info = limactl_info(BUILDER_NAME)?;
+    let info = limactl_list_entry(BUILDER_NAME)?;
     let port = info["sshLocalPort"]
         .as_u64()
         .context("Builder VM has no sshLocalPort")?;
@@ -1261,7 +1258,7 @@ echo 'AcceptEnv *' >> /etc/ssh/sshd_config
 /// hostagent is already running as a daemon; the CLI process is
 /// just waiting to print "READY".
 fn wait_for_lima_ssh(
-    name: &str,
+    name: &InstanceName,
     child: &mut std::process::Child,
     cfg: &CoopConfig,
     timeout: Duration,
@@ -1319,7 +1316,8 @@ fn wait_for_lima_ssh(
 }
 
 /// Get the SSH local port for a Lima instance from `limactl list`.
-fn get_lima_ssh_port(name: &str) -> Option<u16> {
+fn get_lima_ssh_port(name: &InstanceName) -> Option<u16> {
+    let lima_name = lima_name_for(name);
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .stdout(Stdio::piped())
@@ -1338,7 +1336,7 @@ fn get_lima_ssh_port(name: &str) -> Option<u16> {
             continue;
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
-            && val["name"].as_str() == Some(name)
+            && val["name"].as_str() == Some(&lima_name)
             && let Some(port) = val["sshLocalPort"].as_u64()
             && let Ok(port) = u16::try_from(port)
             && port > 0
@@ -1417,7 +1415,11 @@ fn extract_logfmt_msg(line: &str) -> Option<String> {
 }
 
 fn lima_name(inst: &Instance) -> String {
-    format!("{LIMA_PREFIX}{}", inst.name)
+    lima_name_for(&inst.name)
+}
+
+fn lima_name_for(name: &InstanceName) -> String {
+    format!("{LIMA_PREFIX}{name}")
 }
 
 fn lima_home() -> Result<PathBuf> {
@@ -1430,13 +1432,19 @@ fn lima_home() -> Result<PathBuf> {
 }
 
 /// Get the status string for a Lima instance ("Running", "Stopped", etc.).
-fn lima_status(name: &str) -> Option<String> {
+fn lima_status(name: &InstanceName) -> Option<String> {
     let info = limactl_info(name).ok()?;
     info["status"].as_str().map(String::from)
 }
 
-/// Get full instance info from limactl.
-fn limactl_info(name: &str) -> Result<serde_json::Value> {
+/// Get full instance info from limactl for a coop instance.
+fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
+    limactl_list_entry(&lima_name_for(name))
+}
+
+/// Find a `limactl list --json` entry by its Lima VM name (the
+/// `coop-<instance>` form, or the special `coop-builder`).
+fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .output()
@@ -1459,12 +1467,12 @@ fn limactl_info(name: &str) -> Result<serde_json::Value> {
                      {line}"
             )
         })?;
-        if val["name"].as_str() == Some(name) {
+        if val["name"].as_str() == Some(lima_name) {
             return Ok(val);
         }
     }
 
-    bail!("Lima instance '{name}' not found in limactl list")
+    bail!("Lima instance '{lima_name}' not found in limactl list")
 }
 
 #[cfg(test)]

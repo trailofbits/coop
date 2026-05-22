@@ -130,7 +130,8 @@ enum Commands {
     /// Launch a new Firecracker VM instance
     Start {
         /// Instance name (auto-generated if omitted)
-        name: Option<String>,
+        #[arg(value_parser = config::InstanceName::parse)]
+        name: Option<config::InstanceName>,
         /// Workspace directory to sync into the VM
         #[arg(long, conflicts_with = "git_repo")]
         workspace: Option<String>,
@@ -205,8 +206,11 @@ enum Commands {
     #[command(alias = "ssh")]
     Shell {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Command to run (non-interactive, no PTY)
         #[arg(allow_hyphen_values = true, last = true)]
         command: Vec<String>,
@@ -214,8 +218,11 @@ enum Commands {
     /// Launch Claude Code inside the VM (skips permissions by default)
     Claude {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Prompt for permissions instead of skipping them
         #[arg(long)]
         ask: bool,
@@ -227,8 +234,11 @@ enum Commands {
     #[command(alias = "ca")]
     ClaudeAgents {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Extra arguments passed to `claude agents`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -236,8 +246,11 @@ enum Commands {
     /// Launch Codex inside the VM
     Codex {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Extra arguments passed to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -245,14 +258,20 @@ enum Commands {
     /// Gracefully stop the VM
     Stop {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
     },
     /// Stop and clean up instance resources (keeps template)
     Destroy {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Also remove template, kernel, and Firecracker binary
         #[arg(long)]
         all: bool,
@@ -263,14 +282,20 @@ enum Commands {
     /// Show VM status
     Status {
         /// Instance name (shows all if omitted)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
     },
     /// Stream VM serial console logs
     Logs {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Follow log output
         #[arg(short, long)]
         follow: bool,
@@ -278,8 +303,11 @@ enum Commands {
     /// Push local workspace into the running VM
     Push {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Local directory to push (defaults to `workspace.json` `host_path`)
         #[arg(long)]
         dir: Option<String>,
@@ -293,8 +321,11 @@ enum Commands {
     /// Pull guest workspace to local directory
     Pull {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
         #[arg(long)]
         dir: Option<String>,
@@ -312,8 +343,11 @@ enum Commands {
     /// `coop exec my-vm -- ls -la` or `coop exec -- ls -la`.
     Exec {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Command and arguments to run (after `--`)
         #[arg(required = true, last = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -321,8 +355,11 @@ enum Commands {
     /// Open VS Code connected to the guest VM
     Vscode {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// Remote path to open in VS Code
         #[arg(long, default_value = "/workspace")]
         project: String,
@@ -346,8 +383,11 @@ enum Commands {
     /// Resize a stopped instance's disk
     Resize {
         /// Instance name (required if multiple instances exist)
-        #[arg(add = ArgValueCandidates::new(completions::instance_candidates))]
-        name: Option<String>,
+        #[arg(
+            value_parser = config::InstanceName::parse,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
         /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
         #[arg(long, required = true)]
         size: String,
@@ -749,7 +789,7 @@ fn main() -> Result<()> {
                 &be,
                 &mut cfg,
                 &StartOpts {
-                    name: name.as_deref(),
+                    name: name.as_ref(),
                     image: &image,
                     workspace_dir: workspace.as_deref(),
                     git_repo: git_repo.as_deref(),
@@ -765,13 +805,13 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_deref(), &command),
+        Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {
             name,
             ask,
             mut args,
         } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_deref())?;
+            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -781,26 +821,26 @@ fn main() -> Result<()> {
             ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, args))
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_deref())?;
+            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
             ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, args))
         }
         Commands::Codex { name, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_deref())?;
+            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             ssh::run_interactive(&sess, &prepend_binary(crate::guest::CODEX_BIN, args))
         }
         Commands::Stop { name } => {
-            let inst = cfg.resolve_instance(name.as_deref())?;
+            let inst = cfg.resolve_instance(name.as_ref())?;
             cmd_stop(&be, &cfg, &inst)
         }
         Commands::Destroy { name, all } => {
             let _guard = signal::install_handlers();
-            cmd_destroy(&be, &cfg, name.as_deref(), all)
+            cmd_destroy(&be, &cfg, name.as_ref(), all)
         }
         Commands::List => cmd_list(&be, &cfg),
-        Commands::Status { name } => cmd_status(&be, &cfg, name.as_deref()),
+        Commands::Status { name } => cmd_status(&be, &cfg, name.as_ref()),
         Commands::Logs { name, follow } => {
-            let running = resolve_running(&be, &cfg, name.as_deref())?;
+            let running = resolve_running(&be, &cfg, name.as_ref())?;
             let mode = if follow {
                 backend::LogMode::Follow
             } else {
@@ -814,7 +854,7 @@ fn main() -> Result<()> {
             force,
             exclude_git,
         } => {
-            let running = resolve_running(&be, &cfg, name.as_deref())?;
+            let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::push(&running, dir.as_deref(), force, exclude_git)
         }
         Commands::Pull {
@@ -823,10 +863,10 @@ fn main() -> Result<()> {
             force,
             exclude_git,
         } => {
-            let running = resolve_running(&be, &cfg, name.as_deref())?;
+            let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::pull(&running, dir.as_deref(), force, exclude_git)
         }
-        Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_deref(), &command),
+        Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_ref(), &command),
         Commands::Vscode {
             name,
             project,
@@ -834,16 +874,16 @@ fn main() -> Result<()> {
             clean,
         } => {
             if clean {
-                let inst = cfg.resolve_instance(name.as_deref())?;
+                let inst = cfg.resolve_instance(name.as_ref())?;
                 workspace::remove_ssh_config(&inst)?;
                 tracing::info!("Removed SSH config for '{}'", inst.name);
                 return Ok(());
             }
-            let running = resolve_running(&be, &cfg, name.as_deref())?;
+            let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::vscode(&running, Some(&project), editor.as_deref())
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
-        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_deref(), &size),
+        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), &size),
         Commands::Profiles { action } => {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
@@ -1095,7 +1135,7 @@ fn cmd_build(cfg: &config::CoopConfig) -> Result<()> {
 }
 
 struct StartOpts<'a> {
-    name: Option<&'a str>,
+    name: Option<&'a config::InstanceName>,
     image: &'a config::ImageName,
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
@@ -1190,13 +1230,13 @@ fn cmd_start(
 fn find_stopped_instance(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
     workspace_dir: Option<&Path>,
 ) -> Result<Option<config::Instance>> {
     let mut instances = cfg.list_instances()?;
 
     if let Some(name) = name {
-        let Some(inst) = instances.into_iter().find(|i| i.name.as_str() == name) else {
+        let Some(inst) = instances.into_iter().find(|i| &i.name == name) else {
             return Ok(None);
         };
         if be.is_running(&inst) {
@@ -1545,14 +1585,14 @@ fn warn_on_live_git_mounts(mounts: &[config::Mount]) {
 fn resolve_running(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
 ) -> Result<backend::RunningInstance> {
     let instances = cfg.list_instances()?;
 
     if let Some(name) = name {
         let inst = instances
             .into_iter()
-            .find(|i| i.name.as_str() == name)
+            .find(|i| &i.name == name)
             .with_context(|| {
                 format!(
                     "No instance named '{name}'.\n\
@@ -1614,7 +1654,7 @@ fn resolve_running(
 fn cmd_shell(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
     command: &[String],
 ) -> Result<()> {
     let session = open_ssh_session(be, cfg, name)?;
@@ -1636,7 +1676,7 @@ fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
 fn cmd_exec(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
     command: &[String],
 ) -> Result<()> {
     let session = open_ssh_session(be, cfg, name)?;
@@ -1651,7 +1691,7 @@ fn cmd_exec(
 fn open_ssh_session(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(running.instance());
@@ -1723,7 +1763,7 @@ fn cmd_stop(
 fn cmd_destroy(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
     all: bool,
 ) -> Result<()> {
     if all {
@@ -1986,7 +2026,7 @@ fn remove_self_binary(binary_path: &Path) -> Result<()> {
 fn cmd_status(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
 ) -> Result<()> {
     if let Some(name) = name {
         let inst = cfg.resolve_instance(Some(name))?;
@@ -2029,7 +2069,7 @@ fn cmd_status(
 fn cmd_resize(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&str>,
+    name: Option<&config::InstanceName>,
     size: &str,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
@@ -2302,7 +2342,10 @@ mod tests {
         let super::Commands::Claude { name, args, .. } = cli.command else {
             panic!("expected Claude variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(args, vec!["--model", "opus"]);
     }
 
@@ -2324,7 +2367,10 @@ mod tests {
         let super::Commands::ClaudeAgents { name, args, .. } = cli.command else {
             panic!("expected ClaudeAgents variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(args, vec!["--cwd", "/workspace"]);
     }
 
@@ -2334,7 +2380,10 @@ mod tests {
         let super::Commands::Codex { name, args, .. } = cli.command else {
             panic!("expected Codex variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(args, vec!["--model", "gpt-5"]);
     }
 
@@ -2523,7 +2572,10 @@ mod tests {
         else {
             panic!("expected Push variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(dir.as_deref(), Some("./src"));
         assert!(force);
     }
@@ -2537,7 +2589,10 @@ mod tests {
         else {
             panic!("expected Push variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert!(dir.is_none());
         assert!(!force);
     }
@@ -2565,7 +2620,10 @@ mod tests {
         else {
             panic!("expected Pull variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(dir.as_deref(), Some("./out"));
         assert!(force);
     }
@@ -2576,7 +2634,10 @@ mod tests {
         let super::Commands::Exec { name, command } = cli.command else {
             panic!("expected Exec variant");
         };
-        assert_eq!(name.as_deref(), Some("myvm"));
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
         assert_eq!(command, vec!["ls", "-la"]);
     }
 
