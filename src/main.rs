@@ -1181,6 +1181,21 @@ struct StartOpts<'a> {
     persisted_guest_env: std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
 }
 
+/// Did the user pass creation-only flags (`--mount`, `--git-repo`, `--disk`,
+/// `--exclude-git`) without an identifier (`--name` or `--workspace`) that
+/// could pick out an existing instance?
+///
+/// When true, `cmd_start` must allocate a fresh instance rather than fall
+/// back to the "single stopped instance" shortcut in `find_stopped_instance`.
+fn creation_intent_without_target(opts: &StartOpts<'_>) -> bool {
+    let identifies_existing = opts.name.is_some() || opts.workspace_dir.is_some();
+    let has_creation_only_flags = !opts.mounts.is_empty()
+        || opts.git_repo.is_some()
+        || opts.disk.is_some()
+        || opts.exclude_git;
+    has_creation_only_flags && !identifies_existing
+}
+
 fn cmd_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -1188,7 +1203,20 @@ fn cmd_start(
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     let ws_path = opts.workspace_dir.map(Path::new);
-    if let Some(inst) = find_stopped_instance(be, cfg, opts.name, ws_path)? {
+
+    // Creation-only flags (`--mount`, `--git-repo`, `--disk`, `--exclude-git`)
+    // unambiguously signal "I want a new VM with these settings". When the user
+    // didn't also identify an existing instance (via `--name` or `--workspace`),
+    // skip the single-stopped-instance shortcut in `find_stopped_instance` —
+    // otherwise we'd tell the user to destroy an unrelated stopped instance
+    // when their real intent was to allocate a fresh one (issue #214).
+    let restart_candidate = if creation_intent_without_target(opts) {
+        None
+    } else {
+        find_stopped_instance(be, cfg, opts.name, ws_path)?
+    };
+
+    if let Some(inst) = restart_candidate {
         let has_ignored_flags = !opts.mounts.is_empty()
             || opts.workspace_dir.is_some()
             || opts.git_repo.is_some()
@@ -3018,6 +3046,88 @@ mod tests {
         let opts = start_opts(Vec::new(), &cfg_path);
         let slug = super::resolve_start_repo(&opts).expect("ok");
         assert!(slug.is_none());
+    }
+
+    /// Issue #214 regression: bare `coop start --mount <dir>` must signal
+    /// "allocate a new VM" even when an unrelated stopped instance exists.
+    #[test]
+    fn creation_intent_without_target_detects_bare_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: super::workspace::default_workspace_path(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(vec![mount], &cfg_path);
+        assert!(super::creation_intent_without_target(&opts));
+    }
+
+    #[test]
+    fn creation_intent_without_target_detects_git_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.git_repo = Some("trailofbits/coop");
+        assert!(super::creation_intent_without_target(&opts));
+    }
+
+    #[test]
+    fn creation_intent_without_target_detects_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.disk = super::config::GiB::new(20);
+        assert!(super::creation_intent_without_target(&opts));
+    }
+
+    #[test]
+    fn creation_intent_without_target_detects_exclude_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.exclude_git = true;
+        assert!(super::creation_intent_without_target(&opts));
+    }
+
+    /// A `--name` defers to the find/restart path even with creation-only
+    /// flags; the bail message there still tells the user how to proceed.
+    #[test]
+    fn creation_intent_without_target_false_when_name_given() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: super::workspace::default_workspace_path(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let name = super::config::InstanceName::new("explicit").expect("valid name");
+        let mut opts = start_opts(vec![mount], &cfg_path);
+        opts.name = Some(&name);
+        assert!(!super::creation_intent_without_target(&opts));
+    }
+
+    /// A `--workspace` is the affinity key for restart; the find path keeps
+    /// owning that decision so workspace-matched instances can be restarted.
+    #[test]
+    fn creation_intent_without_target_false_when_workspace_given() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = super::config::Mount {
+            host_path: tmp.path().to_path_buf(),
+            guest_path: super::workspace::default_workspace_path(),
+        };
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(vec![mount], &cfg_path);
+        opts.workspace_dir = Some("/some/workspace");
+        assert!(!super::creation_intent_without_target(&opts));
+    }
+
+    /// `coop start` with no flags must keep going through the
+    /// single-stopped-instance lookup — that's the normal restart UX.
+    #[test]
+    fn creation_intent_without_target_false_for_bare_start() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &cfg_path);
+        assert!(!super::creation_intent_without_target(&opts));
     }
 
     #[test]
