@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
-use crate::guest::{BuiltinProfile, builtin_for_feature};
+use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
 
 /// Default relative path coop looks for inside a workspace or mount root.
@@ -346,7 +346,6 @@ impl Report {
 /// All fields share the `cli_` prefix on purpose: the report needs to
 /// distinguish CLI-sourced values from any other state, and the prefix
 /// reads as a stable boundary in call sites that build this struct.
-#[expect(clippy::struct_field_names, reason = "cli_ prefix is load-bearing")]
 #[derive(Debug, Default)]
 pub struct TranslatorInputs {
     pub cli_vcpus: Option<u8>,
@@ -357,6 +356,17 @@ pub struct TranslatorInputs {
     pub cli_forward_ports: Vec<PortForward>,
     pub cli_mounts: Vec<Mount>,
     pub cli_profiles: Vec<String>,
+    /// CLI-provided guest user, when `--guest-user` was passed to
+    /// `coop setup`. When set, the translator reports the
+    /// devcontainer's `remoteUser` as `Overridden` rather than applying
+    /// it. Only meaningful at `Stage::Setup`.
+    pub cli_guest_user: Option<GuestUser>,
+    /// Persisted guest user from the image's `template_config.json`.
+    /// Only meaningful at `Stage::Start` — the translator compares this
+    /// against the devcontainer's `remoteUser` and skips `containerEnv`
+    /// translation on mismatch (the env vars would target a home dir
+    /// that doesn't exist).
+    pub persisted_guest_user: Option<GuestUser>,
     /// True when the caller passed `--workspace` or `--git-repo`. coop's
     /// `start` path uses `--mount` only when neither of these is set, so
     /// devcontainer `mounts` are dropped with a report row pointing at
@@ -386,6 +396,10 @@ pub struct Translation {
     pub forward_ports: Vec<PortForward>,
     pub mounts: Vec<Mount>,
     pub profiles: Vec<String>,
+    /// Guest user requested by the devcontainer's `remoteUser`, when
+    /// no CLI `--guest-user` overrode it. Only set at `Stage::Setup`;
+    /// callers fold this into `SetupOptions`.
+    pub guest_user: Option<GuestUser>,
     pub report: Report,
 }
 
@@ -453,7 +467,17 @@ pub fn translate(
     }
 
     if let Some(env) = &file.raw.container_env {
-        translate_container_env(env, inputs, stage, &mut t);
+        if stage == Stage::Start && remote_user_mismatch(file, inputs) {
+            t.report.push(
+                "containerEnv",
+                ReportStatus::Unsupported,
+                ReportSource::Devcontainer,
+                format!("{} entries", env.len()),
+                "skipped because devcontainer.json's `remoteUser` does not match the image",
+            );
+        } else {
+            translate_container_env(env, inputs, stage, &mut t);
+        }
     }
 
     if let Some(ports) = &file.raw.forward_ports {
@@ -469,24 +493,7 @@ pub fn translate(
     }
 
     if let Some(user) = &file.raw.remote_user {
-        let key = "remoteUser";
-        if user == "ubuntu" {
-            t.report.push(
-                key,
-                ReportStatus::Applied,
-                ReportSource::Devcontainer,
-                user.clone(),
-                "matches coop's hardcoded guest user",
-            );
-        } else {
-            t.report.push(
-                key,
-                ReportStatus::Unsupported,
-                ReportSource::Devcontainer,
-                user.clone(),
-                "coop hardcodes the guest user to 'ubuntu' in v1",
-            );
-        }
+        translate_remote_user(user, inputs, stage, &mut t);
     }
 
     if file.raw.image.is_some() {
@@ -639,6 +646,120 @@ fn translate_host_requirements(
             "unrecognised hostRequirements key",
         );
     }
+}
+
+/// Translate `remoteUser`. The behaviour differs by stage:
+///
+/// - At `Stage::Setup`, a valid `remoteUser` becomes the requested
+///   guest user unless `--guest-user` already pinned one (then we
+///   report `Overridden`).
+/// - At `Stage::Start`, the persisted user is already baked into the
+///   image. We compare and report `Applied` on match or `Mismatch` on
+///   divergence — `translate_container_env` reads back the mismatch
+///   and refuses to forward env vars whose paths target a missing
+///   home dir.
+fn translate_remote_user(user: &str, inputs: &TranslatorInputs, stage: Stage, t: &mut Translation) {
+    let key = "remoteUser";
+    let parsed = match GuestUser::new(user) {
+        Ok(u) => u,
+        Err(e) => {
+            t.report.push(
+                key,
+                ReportStatus::Invalid,
+                ReportSource::Devcontainer,
+                user.to_string(),
+                e.to_string(),
+            );
+            return;
+        }
+    };
+
+    match stage {
+        Stage::Setup => {
+            if let Some(cli) = &inputs.cli_guest_user {
+                t.report.push(
+                    key,
+                    ReportStatus::Overridden,
+                    ReportSource::Cli,
+                    cli.to_string(),
+                    format!("CLI --guest-user overrides devcontainer.json value {parsed}"),
+                );
+            } else {
+                t.guest_user = Some(parsed.clone());
+                t.report.push(
+                    key,
+                    ReportStatus::Applied,
+                    ReportSource::Devcontainer,
+                    parsed.to_string(),
+                    "baked into the image at setup time",
+                );
+            }
+        }
+        Stage::Start => match &inputs.persisted_guest_user {
+            Some(persisted) if persisted == &parsed => {
+                t.report.push(
+                    key,
+                    ReportStatus::Applied,
+                    ReportSource::Devcontainer,
+                    parsed.to_string(),
+                    "matches the image's persisted guest user",
+                );
+            }
+            Some(persisted) => {
+                t.report.push(
+                    key,
+                    ReportStatus::Unsupported,
+                    ReportSource::Devcontainer,
+                    parsed.to_string(),
+                    format!(
+                        "image was set up with `{persisted}`; \
+                         `coop destroy && coop setup --guest-user {parsed}` to switch \
+                         (containerEnv skipped to avoid pointing at /home/{parsed})"
+                    ),
+                );
+            }
+            None => {
+                // Image lacks a persisted user (legacy template_config.json
+                // or template missing). Default is `ubuntu`.
+                let default = GuestUser::default();
+                if parsed == default {
+                    t.report.push(
+                        key,
+                        ReportStatus::Applied,
+                        ReportSource::Devcontainer,
+                        parsed.to_string(),
+                        "matches the default guest user",
+                    );
+                } else {
+                    t.report.push(
+                        key,
+                        ReportStatus::Unsupported,
+                        ReportSource::Devcontainer,
+                        parsed.to_string(),
+                        format!(
+                            "image was set up with the default `{default}`; \
+                             `coop destroy && coop setup --guest-user {parsed}` to switch"
+                        ),
+                    );
+                }
+            }
+        },
+    }
+}
+
+/// True at `Stage::Start` iff the devcontainer's `remoteUser` does not
+/// match the image's persisted guest user. When this returns `true` the
+/// translator must not forward `containerEnv` — env values often
+/// reference `/home/<remoteUser>/...` paths that don't exist on disk.
+fn remote_user_mismatch(file: &ParsedDevcontainer, inputs: &TranslatorInputs) -> bool {
+    let Some(user) = &file.raw.remote_user else {
+        return false;
+    };
+    let Ok(parsed) = GuestUser::new(user) else {
+        return false;
+    };
+    let persisted = inputs.persisted_guest_user.clone().unwrap_or_default();
+    persisted != parsed
 }
 
 fn translate_container_env(
@@ -1410,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_remote_user_warns_unless_ubuntu() {
+    fn translate_remote_user_rejects_root() {
         let f = parse(r#"{ "remoteUser": "root" }"#);
         let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
         let entry = t
@@ -1419,8 +1540,11 @@ mod tests {
             .iter()
             .find(|e| e.key == "remoteUser")
             .unwrap();
-        assert_eq!(entry.status, ReportStatus::Unsupported);
+        assert_eq!(entry.status, ReportStatus::Invalid);
+    }
 
+    #[test]
+    fn translate_remote_user_matching_default_applies_at_start() {
         let f = parse(r#"{ "remoteUser": "ubuntu" }"#);
         let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
         let entry = t
@@ -1430,6 +1554,92 @@ mod tests {
             .find(|e| e.key == "remoteUser")
             .unwrap();
         assert_eq!(entry.status, ReportStatus::Applied);
+    }
+
+    #[test]
+    fn translate_remote_user_setup_captures_into_translation() {
+        let f = parse(r#"{ "remoteUser": "vscode" }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
+        assert_eq!(t.guest_user.as_ref().map(GuestUser::as_str), Some("vscode"));
+        let entry = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "remoteUser")
+            .unwrap();
+        assert_eq!(entry.status, ReportStatus::Applied);
+        assert_eq!(entry.source, ReportSource::Devcontainer);
+    }
+
+    #[test]
+    fn translate_remote_user_setup_cli_overrides() {
+        let f = parse(r#"{ "remoteUser": "vscode" }"#);
+        let inputs = TranslatorInputs {
+            cli_guest_user: Some(GuestUser::new("ubuntu").unwrap()),
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Setup);
+        // Translation must not bake `vscode` when CLI pinned `ubuntu`.
+        assert!(t.guest_user.is_none());
+        let entry = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "remoteUser")
+            .unwrap();
+        assert_eq!(entry.status, ReportStatus::Overridden);
+        assert_eq!(entry.source, ReportSource::Cli);
+    }
+
+    #[test]
+    fn translate_remote_user_start_mismatch_reports_unsupported() {
+        let f = parse(r#"{ "remoteUser": "vscode" }"#);
+        let inputs = TranslatorInputs {
+            persisted_guest_user: Some(GuestUser::new("ubuntu").unwrap()),
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Start);
+        let entry = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "remoteUser")
+            .unwrap();
+        assert_eq!(entry.status, ReportStatus::Unsupported);
+        let note = &entry.note;
+        assert!(
+            note.contains("ubuntu") && note.contains("vscode"),
+            "diagnostic should name both users: {note}"
+        );
+    }
+
+    #[test]
+    fn translate_remote_user_start_mismatch_skips_container_env() {
+        // The triggering bug: a mismatched remoteUser must not forward
+        // env vars like GIT_CONFIG_GLOBAL=/home/vscode/.gitconfig.local
+        // into a `ubuntu`-based image.
+        let f = parse(
+            r#"{
+                "remoteUser": "vscode",
+                "containerEnv": { "GIT_CONFIG_GLOBAL": "/home/vscode/.gitconfig.local" }
+            }"#,
+        );
+        let inputs = TranslatorInputs {
+            persisted_guest_user: Some(GuestUser::new("ubuntu").unwrap()),
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Start);
+        assert!(
+            t.guest_env.is_empty(),
+            "containerEnv must not be forwarded on remoteUser mismatch"
+        );
+        let env_entry = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "containerEnv")
+            .unwrap();
+        assert_eq!(env_entry.status, ReportStatus::Unsupported);
     }
 
     #[test]

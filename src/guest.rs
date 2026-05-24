@@ -1,8 +1,10 @@
 // Shared guest provisioning constants used by both Lima and Firecracker.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{CoopConfig, CustomProfile};
 
@@ -22,19 +24,130 @@ pub fn builtin_for_feature(id: &str) -> Option<&'static BuiltinProfile> {
     }
 }
 
-/// Username for the non-root guest user. Both backends ensure this user
-/// exists at uid 1000. On Firecracker's rootfs the `ubuntu` user already
-/// exists; on Lima, cloud-init may replace it with a host-mirror user,
-/// so the provisioning script evicts that user and recreates `ubuntu`.
-pub const GUEST_USER: &str = "ubuntu";
+/// Default username when neither the CLI nor a devcontainer pins one.
+/// Matches the user that Firecracker's CI rootfs already ships with and
+/// that Lima's `useradd` block creates at uid 1000.
+pub const DEFAULT_GUEST_USER: &str = "ubuntu";
 
-/// Absolute path to the Claude Code binary in the guest.
+const MAX_GUEST_USER_LEN: usize = 32;
+
+/// Validated guest username, persisted in `TemplateConfig` and threaded
+/// through both backends.
 ///
-/// The installer puts it under the user's home directory. Bootstrap
-/// commands and verification use this path directly rather than
-/// relying on PATH (non-interactive SSH sessions don't source
+/// Enforces the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}` and
+/// rejects `root` so the rest of coop can assume an unprivileged uid-1000
+/// account. The same rules as `backend::SshUser` plus the root exclusion,
+/// so callers can losslessly convert to an `SshUser` for SSH plumbing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GuestUser(String);
+
+impl GuestUser {
+    /// Construct a validated guest user. Returns an error when the name
+    /// is empty, exceeds 32 characters, contains characters outside the
+    /// portable POSIX set, or is `root`.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        Self::validate(&name)?;
+        Ok(Self(name))
+    }
+
+    /// `clap` value parser. Equivalent to `GuestUser::new` but with the
+    /// `(&str) -> Result<Self>` signature clap's `value_parser` expects.
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+
+    fn validate(name: &str) -> Result<()> {
+        if name.is_empty() {
+            bail!("guest user must not be empty");
+        }
+        if name.len() > MAX_GUEST_USER_LEN {
+            bail!(
+                "guest user too long ({} chars, max {MAX_GUEST_USER_LEN})",
+                name.len()
+            );
+        }
+        if name == "root" {
+            bail!("guest user must not be 'root'; coop requires an unprivileged uid-1000 account");
+        }
+        for (i, c) in name.chars().enumerate() {
+            let ok = if i == 0 {
+                matches!(c, 'a'..='z' | '_')
+            } else {
+                matches!(c, 'a'..='z' | '0'..='9' | '_' | '-')
+            };
+            if !ok {
+                if i == 0 {
+                    bail!("guest user must start with [a-z_], got {c:?}");
+                }
+                bail!(
+                    "guest user contains invalid character {c:?} \
+                     (allowed: a-z, 0-9, '_', '-')"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrow as a string slice for paths, scripts, and shell composition.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Absolute home directory of this user inside the guest.
+    pub fn home(&self) -> String {
+        format!("/home/{}", self.0)
+    }
+}
+
+impl Default for GuestUser {
+    fn default() -> Self {
+        // Safe: DEFAULT_GUEST_USER ("ubuntu") satisfies the validator.
+        Self(DEFAULT_GUEST_USER.to_owned())
+    }
+}
+
+impl fmt::Display for GuestUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for GuestUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GuestUser {
+    type Error = anyhow::Error;
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<GuestUser> for String {
+    #[mutants::skip] // equivalent: trivial forwarder
+    fn from(value: GuestUser) -> Self {
+        value.0
+    }
+}
+
+/// Absolute path to the Claude Code binary in the guest, for the given
+/// user. The installer places the binary under `~/.local/bin/claude`.
+/// Bootstrap commands and verification use this path directly rather
+/// than relying on PATH (non-interactive SSH sessions don't source
 /// `.bashrc`/`.profile`).
-pub const CLAUDE_BIN: &str = "/home/ubuntu/.local/bin/claude";
+///
+/// Accepts `&str` so call sites can pass either a `GuestUser` (via
+/// `as_str()`) or an `SshUser` (via `as_ref()`) without an extra
+/// conversion. The same validation applies in both directions.
+pub fn claude_bin_for(user: &str) -> String {
+    format!("/home/{user}/.local/bin/claude")
+}
 
 /// Absolute path to the Codex CLI binary in the guest.
 ///
@@ -45,8 +158,14 @@ pub const CODEX_BIN: &str = "/usr/local/bin/codex";
 /// Binaries that must exist in the guest image after provisioning.
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
-pub const REQUIRED_GUEST_BINARIES: &[&str] =
-    &["/usr/bin/docker", "/usr/bin/gh", CLAUDE_BIN, CODEX_BIN];
+pub fn required_guest_binaries(user: &GuestUser) -> [String; 4] {
+    [
+        "/usr/bin/docker".to_owned(),
+        "/usr/bin/gh".to_owned(),
+        claude_bin_for(user.as_str()),
+        CODEX_BIN.to_owned(),
+    ]
+}
 
 pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh");
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
@@ -276,14 +395,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_guest_binaries_include_codex() {
-        assert!(
-            REQUIRED_GUEST_BINARIES.contains(&"/usr/local/bin/codex"),
-            "guest image should include codex in the default PATH",
-        );
-    }
-
-    #[test]
     fn codex_script_installs_extracted_binary_not_archive() {
         assert!(
             SCRIPT_CODEX.contains("BIN=\"$TMPDIR/${ASSET%.tar.gz}\""),
@@ -363,5 +474,77 @@ mod tests {
             assert_eq!(bp.name, *id);
         }
         assert!(builtin_for_feature("nonexistent").is_none());
+    }
+
+    #[test]
+    fn guest_user_default_is_ubuntu() {
+        assert_eq!(GuestUser::default().as_str(), DEFAULT_GUEST_USER);
+        assert_eq!(GuestUser::default().home(), "/home/ubuntu");
+    }
+
+    #[test]
+    fn guest_user_accepts_valid_names() {
+        for s in ["ubuntu", "vscode", "_dev", "u", "user_1", "ec2-user"] {
+            let u = GuestUser::new(s).unwrap_or_else(|e| panic!("rejected {s:?}: {e}"));
+            assert_eq!(u.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn guest_user_rejects_root() {
+        let err = GuestUser::new("root").unwrap_err().to_string();
+        assert!(err.contains("must not be 'root'"), "{err}");
+    }
+
+    #[test]
+    fn guest_user_rejects_empty_and_too_long() {
+        assert!(GuestUser::new("").is_err());
+        let long = "a".repeat(MAX_GUEST_USER_LEN + 1);
+        assert!(GuestUser::new(long).is_err());
+    }
+
+    #[test]
+    fn guest_user_rejects_invalid_chars() {
+        for s in [
+            "Ubuntu",
+            "0user",
+            "-user",
+            "user.name",
+            "user!",
+            "user name",
+        ] {
+            assert!(GuestUser::new(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn guest_user_serde_roundtrip() {
+        let u = GuestUser::new("vscode").unwrap();
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(json, "\"vscode\"");
+        let back: GuestUser = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn guest_user_serde_rejects_invalid() {
+        let err = serde_json::from_str::<GuestUser>("\"root\"").unwrap_err();
+        assert!(err.to_string().contains("root"), "{err}");
+    }
+
+    #[test]
+    fn claude_bin_for_user_uses_home() {
+        assert_eq!(claude_bin_for("ubuntu"), "/home/ubuntu/.local/bin/claude");
+        assert_eq!(claude_bin_for("vscode"), "/home/vscode/.local/bin/claude");
+    }
+
+    #[test]
+    fn required_guest_binaries_include_codex() {
+        let user = GuestUser::default();
+        let bins = required_guest_binaries(&user);
+        assert!(
+            bins.iter().any(|b| b == "/usr/local/bin/codex"),
+            "guest image should include codex in the default PATH",
+        );
     }
 }

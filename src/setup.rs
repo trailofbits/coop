@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, ImageName, Instance};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
-    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
+    SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -32,9 +32,16 @@ pub struct SetupOptions {
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
     pub image: ImageName,
+    pub guest_user: GuestUser,
 }
 
 /// Persisted template configuration (profiles, packages, hashes).
+///
+/// `guest_user` is set at setup time and immutable for the image's
+/// lifetime — `coop start`/`shell`/`exec` read it from here rather
+/// than accepting a flag. Existing `template_config.json` files
+/// without the field deserialize via `GuestUser::default()` to the
+/// historical `ubuntu` user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateConfig {
     pub version: u32,
@@ -47,6 +54,8 @@ pub struct TemplateConfig {
     pub marketplaces: Vec<String>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub guest_user: GuestUser,
 }
 
 impl TemplateConfig {
@@ -293,7 +302,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
     // Compose recipe and compute hashes
-    let recipe = compose_recipe(&profiles, &extra_packages);
+    let recipe = compose_recipe(&profiles, &extra_packages, &opts.guest_user);
     let script_hash = Sha256Hash::of(&recipe);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
     let post_install_hash = post_install_content.as_ref().map(Sha256Hash::of);
@@ -360,6 +369,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         post_install_hash,
         marketplaces: Vec::new(),
         plugins: Vec::new(),
+        guest_user: opts.guest_user.clone(),
     };
     template_config.save_for(cfg, image)?;
 
@@ -451,11 +461,12 @@ fn build_template(
         post_install_hash,
         marketplaces: Vec::new(),
         plugins: Vec::new(),
+        guest_user: opts.guest_user.clone(),
     };
     let marker_json = serde_json::to_string_pretty(&marker_config)
         .context("Failed to serialize version marker")?;
     let full_script = compose_full_script(recipe, &marker_json, post_install_content);
-    install_guest_packages(cfg, output_path, &full_script)?;
+    install_guest_packages(cfg, output_path, &full_script, &opts.guest_user)?;
 
     // Clean up intermediate files
     eprintln!("  Cleaning up...");
@@ -512,7 +523,11 @@ fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
 ///
 /// This portion is hashed for staleness detection.
 /// Does NOT include version marker, post-install script, or cleanup.
-fn compose_recipe(profiles: &[ProfileDef], extra_packages: &[String]) -> String {
+fn compose_recipe(
+    profiles: &[ProfileDef],
+    extra_packages: &[String],
+    guest_user: &GuestUser,
+) -> String {
     // Collect and deduplicate profile + extra apt packages
     let mut extra_apt: Vec<&str> = profiles
         .iter()
@@ -536,6 +551,14 @@ fn compose_recipe(profiles: &[ProfileDef], extra_packages: &[String]) -> String 
 
     // Preamble (chroot workarounds + initial apt-get update)
     s.push_str(SCRIPT_PREAMBLE);
+
+    // Export GUEST_USER so the chroot scripts (`guest-config.sh`,
+    // `claude-code.sh`) and any user-supplied post-install can pick it
+    // up. `GuestUser::new` validated the name against POSIX-portable
+    // chars, so single-quoting is sufficient against shell injection.
+    s.push_str("\nexport GUEST_USER='");
+    s.push_str(guest_user.as_str());
+    s.push_str("'\n");
 
     // Install base packages first (provides curl/gpg for repo setup)
     s.push_str("echo '  [guest] Installing core tools...'\n");
@@ -602,9 +625,9 @@ fn compose_recipe(profiles: &[ProfileDef], extra_packages: &[String]) -> String 
         s.push_str("exit 1\n");
     }
 
-    // Guest config configures the ubuntu user — must come before claude-code.
+    // Guest config configures the guest user — must come before claude-code.
     s.push_str(SCRIPT_GUEST_CONFIG);
-    // Direct binary download (runs as root in chroot, installs for ubuntu user).
+    // Direct binary download (runs as root in chroot, installs for guest user).
     s.push_str(SCRIPT_CLAUDE_CODE);
     // Codex installs as a standalone binary under /usr/local/bin.
     s.push_str(SCRIPT_CODEX);
@@ -1085,7 +1108,12 @@ fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
 }
 
 /// Mount the template rootfs and run the install script in a chroot.
-fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> Result<()> {
+fn install_guest_packages(
+    cfg: &CoopConfig,
+    image_path: &Path,
+    script: &str,
+    guest_user: &GuestUser,
+) -> Result<()> {
     eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
@@ -1101,7 +1129,7 @@ fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> 
         .run()
         .context("Guest package installation failed")?;
 
-    verify_chroot_binaries(&mount_str)?;
+    verify_chroot_binaries(&mount_str, guest_user)?;
 
     // _guard dropped here → unmount_chroot runs regardless of status
     Ok(())
@@ -1111,17 +1139,17 @@ fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> 
 ///
 /// Uses `symlink_metadata` (lstat) instead of `exists` (stat) because
 /// the Claude binary is a symlink with an absolute target
-/// (`/home/ubuntu/.local/share/claude/versions/X.Y.Z`). When checked
+/// (`/home/<user>/.local/share/claude/versions/X.Y.Z`). When checked
 /// from outside the chroot, `exists()` follows the symlink to the
 /// host filesystem where the target doesn't exist. A symlink being
 /// present is sufficient — it will resolve correctly inside the guest.
-fn verify_chroot_binaries(mount_str: &str) -> Result<()> {
-    use crate::guest::REQUIRED_GUEST_BINARIES;
+fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()> {
+    use crate::guest::required_guest_binaries;
 
     eprintln!("  Verifying installed binaries...");
     let mut missing = Vec::new();
 
-    for &path in REQUIRED_GUEST_BINARIES {
+    for path in required_guest_binaries(guest_user) {
         let full_path = format!("{mount_str}{path}");
         let exists = std::fs::symlink_metadata(&full_path).is_ok();
         if !exists {
@@ -1385,7 +1413,7 @@ mod tests {
 
     #[test]
     fn compose_recipe_no_profiles_succeeds() {
-        let script = compose_recipe(&[], &[]);
+        let script = compose_recipe(&[], &[], &GuestUser::default());
         assert!(script.contains("apt-get"));
         assert!(
             script.contains("Installing Codex CLI"),
@@ -1395,9 +1423,36 @@ mod tests {
     }
 
     #[test]
+    fn compose_recipe_exports_guest_user() {
+        let user = GuestUser::new("vscode").unwrap();
+        let script = compose_recipe(&[], &[], &user);
+        assert!(
+            script.contains("export GUEST_USER='vscode'"),
+            "recipe must export GUEST_USER for the chroot scripts:\n{script}"
+        );
+    }
+
+    #[test]
+    fn template_config_loads_legacy_json_without_guest_user_field() {
+        // Pre-PR images on disk have no `guest_user` field; the serde
+        // default keeps them deserializable as `ubuntu`. Regression
+        // guard against accidentally dropping the `#[serde(default)]`.
+        let json = r#"{
+            "version": 1,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null
+        }"#;
+        let tc: TemplateConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.guest_user, GuestUser::default());
+    }
+
+    #[test]
     fn compose_recipe_post_install_without_trailing_newline() {
         let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
-        let script = compose_recipe(&profiles, &[]);
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // The post_install "echo done" must be on its own line
         assert!(
@@ -1415,7 +1470,7 @@ mod tests {
             Some("curl -fsSL https://example.com | bash"),
             None,
         )];
-        let script = compose_recipe(&profiles, &[]);
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         assert!(
             script.contains("| bash\n"),
@@ -1427,7 +1482,7 @@ mod tests {
     #[test]
     fn compose_recipe_scripts_with_trailing_newline_no_double() {
         let profiles = vec![profile("test", &[], Some("pre-cmd\n"), Some("post-cmd\n"))];
-        let script = compose_recipe(&profiles, &[]);
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // Should not produce triple+ newlines from double-adding
         assert!(
@@ -1443,7 +1498,7 @@ mod tests {
             profile("a", &[], None, Some("echo a-done")),
             profile("b", &[], None, Some("echo b-done")),
         ];
-        let script = compose_recipe(&profiles, &[]);
+        let script = compose_recipe(&profiles, &[], &GuestUser::default());
 
         // Each post_install must be on its own line
         assert!(script.contains("echo a-done\n"));

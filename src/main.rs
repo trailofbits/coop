@@ -109,6 +109,15 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
+        /// Guest username to create in the image (default: "ubuntu").
+        /// Baked into the image at setup time and immutable for its
+        /// lifetime — `start`/`shell`/`exec` read it from the image's
+        /// `template_config.json`. Use this when a workspace's
+        /// `devcontainer.json` declares a `remoteUser` other than
+        /// `ubuntu` (e.g. `vscode` for the Microsoft devcontainer base
+        /// images).
+        #[arg(long, value_name = "NAME", value_parser = guest::GuestUser::parse)]
+        guest_user: Option<guest::GuestUser>,
         /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
         /// When present (and `--no-devcontainer` is not set), coop offers to
         /// apply the file's `features` and `hostRequirements` to this setup.
@@ -619,6 +628,7 @@ fn main() -> Result<()> {
             post_install,
             template_size,
             image,
+            guest_user,
             workspace,
             devcontainer,
             no_devcontainer,
@@ -630,6 +640,7 @@ fn main() -> Result<()> {
                 cli_vcpus: vcpus,
                 cli_mem_mib: mem,
                 cli_profiles: profile.clone(),
+                cli_guest_user: guest_user.clone(),
                 ..devcontainer::TranslatorInputs::default()
             };
             let translation = resolve_devcontainer(
@@ -661,6 +672,11 @@ fn main() -> Result<()> {
             }
             // Resolve profile names once at the CLI boundary.
             let resolved_profiles = guest::resolve_profiles(&profile, &cfg.profiles)?;
+            // CLI wins; otherwise honour the devcontainer's `remoteUser`;
+            // otherwise default to `ubuntu`.
+            let resolved_guest_user = guest_user
+                .or_else(|| translation.as_ref().and_then(|t| t.guest_user.clone()))
+                .unwrap_or_default();
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
@@ -672,6 +688,7 @@ fn main() -> Result<()> {
                     extra_packages,
                     post_install: post_install.map(PathBuf::from),
                     image,
+                    guest_user: resolved_guest_user,
                 },
             )
         }
@@ -714,7 +731,9 @@ fn main() -> Result<()> {
                 cli_forward_ports: forward_ports.clone(),
                 cli_mounts: mounts.clone(),
                 cli_profiles: Vec::new(),
+                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
                 cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+                ..devcontainer::TranslatorInputs::default()
             };
             let ws_path = workspace.as_deref().map(Path::new);
             let translation = resolve_devcontainer(
@@ -811,12 +830,14 @@ fn main() -> Result<()> {
                 args.insert(0, "default".to_string());
                 args.insert(0, "--permission-mode".to_string());
             }
-            ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, args))
+            let claude_bin = crate::guest::claude_bin_for(sess.target.user.as_ref());
+            ssh::run_interactive(&sess, &prepend_binary(&claude_bin, args))
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
-            ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, args))
+            let claude_bin = crate::guest::claude_bin_for(sess.target.user.as_ref());
+            ssh::run_interactive(&sess, &prepend_binary(&claude_bin, args))
         }
         Commands::Codex { name, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;

@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, ProfileDef, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
-    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
+    SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
 };
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
 use crate::sha256_hash::Sha256Hash;
@@ -29,7 +29,10 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
 
     let image = &opts.image;
     let base_img = cfg.lima_base_path(image);
-    if base_img.exists() && !opts.rebuild && !needs_rebuild(cfg, image, &opts.profiles) {
+    if base_img.exists()
+        && !opts.rebuild
+        && !needs_rebuild(cfg, image, &opts.profiles, &opts.guest_user)
+    {
         eprintln!(
             "\n=> Golden image '{image}': up to date ({})",
             base_img.display()
@@ -38,7 +41,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         if base_img.exists() && !opts.rebuild {
             eprintln!("\n=> Golden image '{image}' is stale — rebuilding");
         }
-        build_golden_image(cfg, image, &opts.profiles)?;
+        build_golden_image(cfg, image, &opts.profiles, &opts.guest_user)?;
     }
 
     generate_start_template(cfg, image)?;
@@ -122,7 +125,14 @@ pub fn create_and_start(
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    if let Err(e) = wait_for_lima_ssh(&inst.name, &mut child, cfg, Duration::from_secs(60)) {
+    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    if let Err(e) = wait_for_lima_ssh(
+        &inst.name,
+        &mut child,
+        cfg,
+        Duration::from_secs(60),
+        &guest_user,
+    ) {
         let _ = child.kill();
         let lima_stderr = match child.wait_with_output() {
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
@@ -160,7 +170,14 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         .spawn()
         .context("Failed to spawn limactl start")?;
 
-    if let Err(e) = wait_for_lima_ssh(&inst.name, &mut child, cfg, Duration::from_secs(60)) {
+    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+    if let Err(e) = wait_for_lima_ssh(
+        &inst.name,
+        &mut child,
+        cfg,
+        Duration::from_secs(60),
+        &guest_user,
+    ) {
         let _ = child.kill();
         let lima_stderr = match child.wait_with_output() {
             Ok(out) => String::from_utf8_lossy(&out.stderr).to_string(),
@@ -407,10 +424,12 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
     let port = u16::try_from(port).context("SSH port out of range")?;
     let port = std::num::NonZeroU16::new(port).context("Lima SSH port is 0")?;
 
+    let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
+
     Ok(SshTarget {
         host: Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(crate::guest::GUEST_USER)?,
+        user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
     })
 }
@@ -464,20 +483,30 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     Ok(())
 }
 
-fn provision_script_hash(cfg: &CoopConfig, profiles: &[ProfileDef]) -> Sha256Hash {
+fn provision_script_hash(
+    cfg: &CoopConfig,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+) -> Sha256Hash {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = fs::read_to_string(&pubkey_path).unwrap_or_default();
-    let script = compose_provision_script(pubkey.trim(), profiles);
+    let script = compose_provision_script(pubkey.trim(), profiles, guest_user);
     Sha256Hash::of(&script)
 }
 
 /// Returns `true` if the golden image needs rebuilding.
 ///
 /// A rebuild is needed when the config file is missing (orphaned
-/// image), the provision-script hash has changed, or the baked
-/// marketplace/plugin lists have changed.
-fn needs_rebuild(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDef]) -> bool {
-    let current_hash = provision_script_hash(cfg, profiles);
+/// image), the provision-script hash has changed, the persisted guest
+/// user differs from the requested one, or the baked marketplace/plugin
+/// lists have changed.
+fn needs_rebuild(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+) -> bool {
+    let current_hash = provision_script_hash(cfg, profiles, guest_user);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
         return true;
@@ -487,11 +516,24 @@ fn needs_rebuild(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDef]) -
         return true;
     }
 
+    if &existing.guest_user != guest_user {
+        tracing::info!(
+            "Guest user changed ({} -> {guest_user}) — rebuilding",
+            existing.guest_user
+        );
+        return true;
+    }
+
     let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
     existing.marketplaces != wanted_m || existing.plugins != wanted_p
 }
 
-fn build_golden_image(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDef]) -> Result<()> {
+fn build_golden_image(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+) -> Result<()> {
     eprintln!(
         "\n=> Building golden VM image \
          (this takes a few minutes on first run)"
@@ -520,7 +562,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDe
 
     // Generate builder template with full provisioning
     let builder_template = cfg.data_dir.join("lima-builder.yaml");
-    let provision_script = compose_provision_script(pubkey.trim(), profiles);
+    let provision_script = compose_provision_script(pubkey.trim(), profiles, guest_user);
     let yaml = compose_template_yaml(cfg, &provision_script);
     fs::write(&builder_template, &yaml).with_context(|| {
         format!(
@@ -535,7 +577,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDe
     }
 
     // Build to staging path — old image is never touched
-    let result = run_builder_vm(cfg, profiles, &staging, &builder_template);
+    let result = run_builder_vm(cfg, profiles, &staging, &builder_template, guest_user);
 
     // Always clean up builder resources
     eprintln!("  Cleaning up builder VM...");
@@ -579,12 +621,13 @@ fn build_golden_image(cfg: &CoopConfig, image: &ImageName, profiles: &[ProfileDe
     let template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
-        install_script_hash: provision_script_hash(cfg, profiles),
+        install_script_hash: provision_script_hash(cfg, profiles, guest_user),
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
         marketplaces,
         plugins,
+        guest_user: guest_user.clone(),
     };
     template_config.save_for(cfg, image)?;
 
@@ -598,6 +641,7 @@ fn run_builder_vm(
     profiles: &[ProfileDef],
     output_path: &std::path::Path,
     builder_template: &std::path::Path,
+    guest_user: &GuestUser,
 ) -> Result<(Vec<String>, Vec<String>)> {
     eprintln!("  Starting builder VM and installing packages...");
     let status = Command::new("limactl")
@@ -621,12 +665,12 @@ fn run_builder_vm(
     // Verify critical binaries are installed before extracting the
     // image. Cloud-init can report "done" even if individual install
     // steps failed silently (e.g. network timeout during download).
-    verify_builder_binaries()?;
+    verify_builder_binaries(guest_user)?;
 
     // Install marketplaces and plugins into the builder VM so they're
     // baked into the golden image. Runs after binary verification
     // (confirms claude CLI is installed) and before cloud-init clean.
-    let (marketplaces, plugins) = install_builder_plugins(cfg, profiles)?;
+    let (marketplaces, plugins) = install_builder_plugins(cfg, profiles, guest_user)?;
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
@@ -697,7 +741,7 @@ fn run_builder_vm(
 }
 
 /// Get an SSH target for the builder VM.
-fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
+fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTarget> {
     let info = limactl_list_entry(BUILDER_NAME)?;
     let port = info["sshLocalPort"]
         .as_u64()
@@ -707,7 +751,7 @@ fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
     Ok(SshTarget {
         host: Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(crate::guest::GUEST_USER)?,
+        user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
     })
 }
@@ -718,6 +762,7 @@ fn builder_ssh_target(cfg: &CoopConfig) -> Result<SshTarget> {
 fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
+    guest_user: &GuestUser,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
 
@@ -726,7 +771,7 @@ fn install_builder_plugins(
     }
 
     eprintln!("  Installing marketplaces and plugins...");
-    let target = builder_ssh_target(cfg)?;
+    let target = builder_ssh_target(cfg, guest_user)?;
 
     // Minimal env forwarding: GITHUB_TOKEN for private repo access
     let mut env = crate::backend::EnvForward::default();
@@ -905,13 +950,13 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 /// Runs after cloud-init completes but before extracting the disk
 /// image. Catches silent install failures (e.g. network timeouts)
 /// that cloud-init doesn't flag as errors.
-fn verify_builder_binaries() -> Result<()> {
-    use crate::guest::REQUIRED_GUEST_BINARIES;
+fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
+    use crate::guest::required_guest_binaries;
 
     eprintln!("  Verifying installed binaries...");
-    let mut missing = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
 
-    for &path in REQUIRED_GUEST_BINARIES {
+    for path in required_guest_binaries(guest_user) {
         let check_cmd = format!("test -x {path}");
         let status = Command::new("limactl")
             .args(["shell", BUILDER_NAME, "--", "bash", "-c", &check_cmd])
@@ -1078,7 +1123,11 @@ provision:
     )
 }
 
-fn compose_provision_script(ssh_pubkey: &str, profiles: &[ProfileDef]) -> String {
+fn compose_provision_script(
+    ssh_pubkey: &str,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+) -> String {
     let mut s = String::with_capacity(8192);
 
     // Preamble
@@ -1147,8 +1196,8 @@ fn compose_provision_script(ssh_pubkey: &str, profiles: &[ProfileDef]) -> String
         }
     }
 
-    // Guest configuration configures the ubuntu user — must come before claude-code install
-    s.push_str(&compose_lima_guest_config(ssh_pubkey));
+    // Guest configuration configures the guest user — must come before claude-code install
+    s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user));
 
     // Claude Code (direct binary download, runs as root, chowns to claude)
     s.push_str(SCRIPT_CLAUDE_CODE);
@@ -1174,42 +1223,51 @@ fn compose_provision_script(ssh_pubkey: &str, profiles: &[ProfileDef]) -> String
     s
 }
 
-fn compose_lima_guest_config(ssh_pubkey: &str) -> String {
+fn compose_lima_guest_config(ssh_pubkey: &str, guest_user: &GuestUser) -> String {
+    // GuestUser::new validated the name against POSIX-portable chars, so
+    // it's safe to interpolate into the shell script body and a single-
+    // quoted export at the top of the recipe.
+    let user = guest_user.as_str();
+    let home = guest_user.home();
     format!(
         r#"
-echo '  [guest] Ensuring ubuntu user exists (uid 1000)...'
-if id ubuntu &>/dev/null; then
-    usermod -aG sudo,docker ubuntu
+export GUEST_USER='{user}'
+
+echo "  [guest] Ensuring {user} user exists (uid 1000)..."
+if id "{user}" &>/dev/null; then
+    usermod -aG sudo,docker "{user}"
 else
-    # Remove any other user occupying uid 1000 (e.g. Lima's host-mirror user)
+    # Remove any other user occupying uid 1000 (e.g. Lima's host-mirror user
+    # or the cloud-init `ubuntu` user) so our configured guest user takes
+    # over uid 1000 cleanly.
     EXISTING=$(getent passwd 1000 | cut -d: -f1) || true
     if [[ -n "$EXISTING" ]]; then
         userdel "$EXISTING"
     fi
-    useradd -m -s /bin/bash --uid 1000 -G sudo,docker ubuntu
+    useradd -m -s /bin/bash --uid 1000 -G sudo,docker "{user}"
 fi
-echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
-chmod 440 /etc/sudoers.d/ubuntu
+echo "{user} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/{user}"
+chmod 440 "/etc/sudoers.d/{user}"
 
-echo '  [guest] Setting up home and SSH for ubuntu user...'
-mkdir -p /home/ubuntu
-chown ubuntu:ubuntu /home/ubuntu
-chmod 755 /home/ubuntu
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local/bin
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local/share
-mkdir -p /home/ubuntu/.ssh
-echo '{ssh_pubkey}' > /home/ubuntu/.ssh/authorized_keys
-chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-chmod 700 /home/ubuntu/.ssh
-chmod 600 /home/ubuntu/.ssh/authorized_keys
+echo "  [guest] Setting up home and SSH for {user} user..."
+mkdir -p "{home}"
+chown "{user}:{user}" "{home}"
+chmod 755 "{home}"
+install -d -o "{user}" -g "{user}" "{home}/.local"
+install -d -o "{user}" -g "{user}" "{home}/.local/bin"
+install -d -o "{user}" -g "{user}" "{home}/.local/share"
+mkdir -p "{home}/.ssh"
+echo '{ssh_pubkey}' > "{home}/.ssh/authorized_keys"
+chown -R "{user}:{user}" "{home}/.ssh"
+chmod 700 "{home}/.ssh"
+chmod 600 "{home}/.ssh/authorized_keys"
 
-echo '  [guest] Configuring ubuntu user PATH...'
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.profile
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
+echo "  [guest] Configuring {user} user PATH..."
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "{home}/.profile"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "{home}/.bashrc"
 
 echo '  [guest] Symlinking claude into system PATH...'
-ln -sf /home/ubuntu/.local/bin/claude /usr/local/bin/claude
+ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -1227,7 +1285,7 @@ chmod 755 /usr/local/bin/codex-yolo
 
 echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace
-chown ubuntu:ubuntu /workspace
+chown "{user}:{user}" /workspace
 
 # No iptables-legacy or NO_IPTABLES_RAW needed — Lima uses a full kernel with
 # nftables and iptable_raw support. These workarounds are Firecracker-only
@@ -1262,6 +1320,7 @@ fn wait_for_lima_ssh(
     child: &mut std::process::Child,
     cfg: &CoopConfig,
     timeout: Duration,
+    guest_user: &GuestUser,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -1291,7 +1350,7 @@ fn wait_for_lima_ssh(
     let target = SshTarget {
         host: Hostname::new("127.0.0.1")?,
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
-        user: SshUser::new(crate::guest::GUEST_USER)?,
+        user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
     };
     let mut delay = Duration::from_millis(500);
@@ -1560,7 +1619,11 @@ mod tests {
     #[test]
     fn provision_script_post_install_without_trailing_newline() {
         let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
-        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &profiles,
+            &GuestUser::default(),
+        );
 
         assert!(
             script.contains("echo done\n"),
@@ -1577,7 +1640,11 @@ mod tests {
             Some("curl -fsSL https://example.com | bash"),
             None,
         )];
-        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &profiles,
+            &GuestUser::default(),
+        );
 
         assert!(
             script.contains("| bash\n"),
@@ -1592,7 +1659,11 @@ mod tests {
             profile("a", &[], None, Some("echo a-done")),
             profile("b", &[], None, Some("echo b-done")),
         ];
-        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &profiles);
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &profiles,
+            &GuestUser::default(),
+        );
 
         assert!(script.contains("echo a-done\n"));
         assert!(script.contains("echo b-done\n"));
@@ -1606,7 +1677,8 @@ mod tests {
 
     #[test]
     fn provision_script_installs_codex() {
-        let script = compose_provision_script("ssh-ed25519 AAAA test@test", &[]);
+        let script =
+            compose_provision_script("ssh-ed25519 AAAA test@test", &[], &GuestUser::default());
 
         assert!(
             script.contains("Installing Codex CLI"),

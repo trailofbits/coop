@@ -914,10 +914,11 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
+        let guest_user = persisted_guest_user(cfg, &inst.image);
         Ok(SshTarget {
             host: Hostname::new(inst.guest_ip())?,
             port: cfg.ssh_port,
-            user: SshUser::new(crate::guest::GUEST_USER)?,
+            user: SshUser::new(guest_user.as_str())?,
             key_path: cfg.ssh_key_path(),
         })
     }
@@ -1233,9 +1234,10 @@ fn bootstrap_claude(
             || !claude.mcp_servers.is_empty();
 
         if needs_claude_cli
-            && !session
-                .target
-                .exec_ok(&format!("test -x {}", crate::guest::CLAUDE_BIN))
+            && !session.target.exec_ok(&format!(
+                "test -x {}",
+                crate::guest::claude_bin_for(session.target.user.as_ref())
+            ))
         {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
@@ -1315,6 +1317,17 @@ fn codex_missing_guest_cli_message() -> &'static str {
      If you want to skip Codex bootstrap for now, retry with \
      `--no-agents` (the `--no-claude` alias is deprecated).\n\
      Otherwise run `coop setup --rebuild` to rebuild the image."
+}
+
+/// Load the persisted guest user for an image, falling back to the
+/// default `ubuntu` when no `template_config.json` exists yet (e.g.
+/// the SSH target is being requested before setup has written the
+/// config). Returning the default keeps pre-existing call sites
+/// working unchanged on legacy images.
+pub fn persisted_guest_user(cfg: &CoopConfig, image: &ImageName) -> crate::guest::GuestUser {
+    crate::setup::TemplateConfig::load_for(cfg, image)
+        .map(|tc| tc.guest_user)
+        .unwrap_or_default()
 }
 
 /// Compute which marketplaces and plugins are missing from the
@@ -1796,7 +1809,7 @@ pub(crate) fn install_marketplaces(session: &SshSession, marketplaces: &[String]
         tracing::info!("Adding marketplace: {guest_source}");
         let cmd = format!(
             "{} plugin marketplace add {} --scope user",
-            crate::guest::CLAUDE_BIN,
+            crate::guest::claude_bin_for(session.target.user.as_ref()),
             shell_escape(&guest_source),
         );
         session
@@ -1811,7 +1824,7 @@ pub(crate) fn install_plugins(session: &SshSession, plugins: &[String]) -> Resul
         tracing::info!("Installing plugin: {plugin}");
         let cmd = format!(
             "{} plugin install {} -s user",
-            crate::guest::CLAUDE_BIN,
+            crate::guest::claude_bin_for(session.target.user.as_ref()),
             shell_escape(plugin),
         );
         session
@@ -1835,7 +1848,7 @@ fn register_mcp_servers(
             .context("Failed to serialize MCP server definition")?;
         let cmd = format!(
             "{} mcp add-json -s user {} {}",
-            crate::guest::CLAUDE_BIN,
+            crate::guest::claude_bin_for(session.target.user.as_ref()),
             shell_escape(name),
             shell_escape(&json),
         );
