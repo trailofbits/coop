@@ -830,18 +830,21 @@ fn main() -> Result<()> {
                 args.insert(0, "default".to_string());
                 args.insert(0, "--permission-mode".to_string());
             }
-            let claude_bin = crate::guest::claude_bin_for(sess.target.user.as_ref());
-            ssh::run_interactive(&sess, &prepend_binary(&claude_bin, args))
+            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
-            let claude_bin = crate::guest::claude_bin_for(sess.target.user.as_ref());
-            ssh::run_interactive(&sess, &prepend_binary(&claude_bin, args))
+            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), args))
         }
         Commands::Codex { name, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
-            ssh::run_interactive(&sess, &prepend_binary(crate::guest::CODEX_BIN, args))
+            ssh::run_interactive(
+                &sess,
+                &prepend_binary(&guest::codex_bin().to_string(), args),
+            )
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;

@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CoopConfig, CustomProfile};
+use crate::paths::GuestPath;
 
 /// Devcontainer feature ids (bare names) that map to builtin profiles.
 /// The id is the same string as the builtin name; this slice acts as the
@@ -95,10 +96,29 @@ impl GuestUser {
         &self.0
     }
 
-    /// Absolute home directory of this user inside the guest.
-    pub fn home(&self) -> String {
-        format!("/home/{}", self.0)
+    /// Absolute home directory of this user inside the guest. Returned
+    /// as a `GuestPath` so call sites can't accidentally confuse it
+    /// with a host `PathBuf` or another string. The result is absolute
+    /// by construction — `/home/<validated user>` — so we don't pay
+    /// for the runtime check on `GuestPath::absolute`.
+    pub fn home(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}", self.0))
     }
+
+    /// Where the Claude Code installer places the per-user binary.
+    /// The installer writes to `~/.local/bin/claude`; coop calls this
+    /// path directly because non-interactive SSH sessions don't source
+    /// `.bashrc`/`.profile` and so don't have `~/.local/bin` on PATH.
+    pub fn claude_bin(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}/.local/bin/claude", self.0))
+    }
+}
+
+/// Where the Codex CLI installer places the system-wide binary.
+/// Independent of the guest user — Codex lives in `/usr/local/bin`,
+/// not in any user's home — so callers don't pass a `GuestUser`.
+pub fn codex_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex")
 }
 
 impl Default for GuestUser {
@@ -136,34 +156,20 @@ impl From<GuestUser> for String {
     }
 }
 
-/// Absolute path to the Claude Code binary in the guest, for the given
-/// user. The installer places the binary under `~/.local/bin/claude`.
-/// Bootstrap commands and verification use this path directly rather
-/// than relying on PATH (non-interactive SSH sessions don't source
-/// `.bashrc`/`.profile`).
-///
-/// Accepts `&str` so call sites can pass either a `GuestUser` (via
-/// `as_str()`) or an `SshUser` (via `as_ref()`) without an extra
-/// conversion. The same validation applies in both directions.
-pub fn claude_bin_for(user: &str) -> String {
-    format!("/home/{user}/.local/bin/claude")
-}
-
-/// Absolute path to the Codex CLI binary in the guest.
-///
-/// The installer places a standalone binary in `/usr/local/bin`, so
-/// both bootstrap and verification can rely on a stable path.
-pub const CODEX_BIN: &str = "/usr/local/bin/codex";
-
 /// Binaries that must exist in the guest image after provisioning.
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
-pub fn required_guest_binaries(user: &GuestUser) -> [String; 4] {
+///
+/// Returns `GuestPath`s rather than raw strings so call sites that
+/// build shell commands or inspect the chroot get path semantics for
+/// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
+/// mistaken for host paths).
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 4] {
     [
-        "/usr/bin/docker".to_owned(),
-        "/usr/bin/gh".to_owned(),
-        claude_bin_for(user.as_str()),
-        CODEX_BIN.to_owned(),
+        GuestPath::new("/usr/bin/docker"),
+        GuestPath::new("/usr/bin/gh"),
+        user.claude_bin(),
+        codex_bin(),
     ]
 }
 
@@ -479,7 +485,16 @@ mod tests {
     #[test]
     fn guest_user_default_is_ubuntu() {
         assert_eq!(GuestUser::default().as_str(), DEFAULT_GUEST_USER);
-        assert_eq!(GuestUser::default().home(), "/home/ubuntu");
+        assert_eq!(GuestUser::default().home().to_string(), "/home/ubuntu");
+    }
+
+    #[test]
+    fn guest_user_claude_bin_lives_under_home() {
+        let user = GuestUser::new("vscode").unwrap();
+        assert_eq!(
+            user.claude_bin().to_string(),
+            "/home/vscode/.local/bin/claude"
+        );
     }
 
     #[test]
@@ -533,17 +548,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_bin_for_user_uses_home() {
-        assert_eq!(claude_bin_for("ubuntu"), "/home/ubuntu/.local/bin/claude");
-        assert_eq!(claude_bin_for("vscode"), "/home/vscode/.local/bin/claude");
-    }
-
-    #[test]
     fn required_guest_binaries_include_codex() {
         let user = GuestUser::default();
         let bins = required_guest_binaries(&user);
         assert!(
-            bins.iter().any(|b| b == "/usr/local/bin/codex"),
+            bins.iter().any(|b| b.to_string() == "/usr/local/bin/codex"),
             "guest image should include codex in the default PATH",
         );
     }

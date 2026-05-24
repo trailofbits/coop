@@ -1147,13 +1147,13 @@ fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()>
     use crate::guest::required_guest_binaries;
 
     eprintln!("  Verifying installed binaries...");
-    let mut missing = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
 
     for path in required_guest_binaries(guest_user) {
         let full_path = format!("{mount_str}{path}");
         let exists = std::fs::symlink_metadata(&full_path).is_ok();
         if !exists {
-            missing.push(path);
+            missing.push(path.to_string());
         }
     }
 

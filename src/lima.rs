@@ -780,13 +780,14 @@ fn install_builder_plugins(
     }
 
     let session = crate::backend::SshSession { target, env };
+    let claude_bin = guest_user.claude_bin();
 
     if !marketplaces.is_empty() {
-        crate::backend::install_marketplaces(&session, &marketplaces)?;
+        crate::backend::install_marketplaces(&session, &claude_bin, &marketplaces)?;
     }
 
     if !plugins.is_empty() {
-        crate::backend::install_plugins(&session, &plugins)?;
+        crate::backend::install_plugins(&session, &claude_bin, &plugins)?;
     }
 
     Ok((marketplaces, plugins))
@@ -965,7 +966,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
             .status();
 
         if !status.is_ok_and(|s| s.success()) {
-            missing.push(path);
+            missing.push(path.to_string());
         }
     }
 
