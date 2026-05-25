@@ -2872,12 +2872,15 @@ test_devcontainer_translator() {
         fail "JSONC (comments + trailing commas) parses" "stderr: $HARNESS_ERR"
     fi
 
-    # remoteUser != ubuntu must surface as unsupported.
-    if grep -q "remoteUser" <<< "$HARNESS_ERR" \
-        && grep -q "unsupported" <<< "$HARNESS_ERR"; then
-        pass "remoteUser != ubuntu is reported unsupported"
+    # `remoteUser: "root"` is rejected by the GuestUser validator
+    # (coop requires an unprivileged uid-1000 account), so the report
+    # row for `remoteUser` must specifically read "invalid" — not
+    # "unsupported" (which other rows like `image` carry, so a fuzzy
+    # whole-buffer grep would pass by coincidence).
+    if grep "remoteUser" <<< "$HARNESS_ERR" | grep -q "invalid"; then
+        pass "remoteUser=root is reported invalid"
     else
-        fail "remoteUser != ubuntu is reported unsupported" "stderr: $HARNESS_ERR"
+        fail "remoteUser=root is reported invalid" "stderr: $HARNESS_ERR"
     fi
 
     # --no-devcontainer silently skips the file: the report header must NOT appear.
@@ -3058,6 +3061,200 @@ test_provision_failure() {
     fi
 }
 
+# ── Guest user CLI validation (pre-VM) ────────────────────────
+
+test_guest_user_validation() {
+    echo ""
+    echo "=== Phase: --guest-user CLI validation ==="
+
+    # `root` is rejected by the GuestUser validator: coop requires an
+    # unprivileged uid-1000 account.
+    if moat_fails setup -y --guest-user root --dry-run; then
+        pass "setup --guest-user root is rejected"
+    else
+        fail "setup --guest-user root is rejected" "should have failed"
+    fi
+
+    # Uppercase and other non-POSIX-portable characters are rejected.
+    if moat_fails setup -y --guest-user Vscode --dry-run; then
+        pass "setup --guest-user with uppercase rejected"
+    else
+        fail "setup --guest-user with uppercase rejected" "should have failed"
+    fi
+
+    # `--guest-user` is only on `setup` — the rest of the lifecycle
+    # reads the persisted value. clap should reject the flag on `start`.
+    if moat_fails start "${INSTANCE}-gu-flag" --guest-user vscode --no-agents; then
+        if grep -qi "unexpected\|unknown\|unrecognized\|--guest-user" <<< "$HARNESS_ERR"; then
+            pass "start --guest-user is rejected as unknown flag"
+        else
+            fail "start --guest-user is rejected as unknown flag" "unexpected error: $HARNESS_ERR"
+        fi
+    else
+        fail "start --guest-user is rejected as unknown flag" "should have failed"
+    fi
+}
+
+# ── Alternate guest user lifecycle (--full only) ──────────────
+
+test_guest_user_alt() {
+    echo ""
+    echo "=== Phase: alternate guest user ==="
+
+    local img_name="test-altuser-$$"
+    local inst_name="${INSTANCE}-altuser"
+    local alt_user="vscode"
+
+    # Setup a separate image whose `template_config.json` should record
+    # guest_user=vscode and whose first boot should create the vscode
+    # account at uid 1000.
+    if coop setup -y --image "$img_name" --guest-user "$alt_user"; then
+        pass "setup --guest-user $alt_user exits 0"
+    else
+        fail "setup --guest-user $alt_user exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # template_config.json must serialize the configured user — this is
+    # what start/shell/exec read on subsequent invocations.
+    local tc_path="$HOME/.coop/images/$img_name/template-config.json"
+    if [[ -f "$tc_path" ]]; then
+        if grep -q "\"guest_user\": *\"$alt_user\"" "$tc_path"; then
+            pass "template_config.json records guest_user=$alt_user"
+        else
+            fail "template_config.json records guest_user=$alt_user" "contents: $(cat "$tc_path")"
+        fi
+    else
+        skip "template_config.json records guest_user=$alt_user" "config at $tc_path not found"
+    fi
+
+    # Start an instance from the alt-user image — no `--guest-user` flag
+    # here on purpose; coop must read the persisted value.
+    if coop start "$inst_name" --no-agents --image "$img_name"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "start (alt-user image) exits 0"
+    else
+        fail "start (alt-user image) exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        coop images --delete "$img_name" 2>/dev/null || true
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+
+    # whoami via SSH — this is the highest-signal assertion. If any
+    # SshTarget construction site still hardcoded `ubuntu`, the session
+    # would either fail to authenticate or land on the wrong account.
+    local whoami_out
+    if whoami_out=$(guest_exec whoami); then
+        if [[ "$whoami_out" == "$alt_user" ]]; then
+            pass "guest user is '$alt_user'"
+        else
+            fail "guest user is '$alt_user'" "got: $whoami_out"
+        fi
+    else
+        fail "guest user is '$alt_user'" "ssh failed; stderr: $(guest_stderr)"
+    fi
+
+    # HOME should resolve to the alt user's directory.
+    local home
+    if home=$(guest_exec printenv HOME); then
+        if [[ "$home" == "/home/$alt_user" ]]; then
+            pass "HOME is /home/$alt_user"
+        else
+            fail "HOME is /home/$alt_user" "got: $home"
+        fi
+    else
+        fail "HOME is /home/$alt_user" "printenv failed"
+    fi
+
+    # /workspace ownership tracks the configured user.
+    local ws_owner
+    if ws_owner=$(guest_exec stat -c '%U' /workspace); then
+        if [[ "$ws_owner" == "$alt_user" ]]; then
+            pass "/workspace owned by $alt_user"
+        else
+            fail "/workspace owned by $alt_user" "owner: $ws_owner"
+        fi
+    else
+        fail "/workspace owned by $alt_user" "stat failed"
+    fi
+
+    # The Claude installer writes to ~/.local/bin under the configured
+    # user's home, not /home/ubuntu. This is exactly the bake-time path
+    # that `GuestUser::claude_bin` resolves at runtime.
+    if guest_exec test -x "/home/$alt_user/.local/bin/claude"; then
+        pass "claude binary at /home/$alt_user/.local/bin/claude"
+    else
+        skip "claude binary at /home/$alt_user/.local/bin/claude" \
+            "not installed in this image (no Claude profile)"
+    fi
+
+    # The alt user must be in sudo + docker groups so the lifecycle
+    # parity with `ubuntu` actually holds.
+    local groups_out
+    if groups_out=$(guest_exec groups); then
+        if echo "$groups_out" | grep -qw docker && echo "$groups_out" | grep -qw sudo; then
+            pass "$alt_user is in sudo and docker groups"
+        else
+            fail "$alt_user is in sudo and docker groups" "groups: $groups_out"
+        fi
+    else
+        fail "$alt_user is in sudo and docker groups" "stderr: $(guest_stderr)"
+    fi
+
+    # Passwordless sudo for the alt user (the sudoers drop-in is keyed
+    # by the configured user name).
+    local sudo_out
+    if sudo_out=$(guest_exec sudo whoami); then
+        if [[ "$sudo_out" == "root" ]]; then
+            pass "$alt_user has passwordless sudo"
+        else
+            fail "$alt_user has passwordless sudo" "got: $sudo_out"
+        fi
+    else
+        fail "$alt_user has passwordless sudo" "stderr: $(guest_stderr)"
+    fi
+
+    unset GUEST_INSTANCE
+
+    # Stop + restart — the restart path reads the persisted user via a
+    # different code path (`start_existing` + `wait_for_lima_ssh`), so
+    # this catches drift between the two SSH-target sites.
+    if coop stop "$inst_name"; then
+        pass "stop alt-user instance exits 0"
+    else
+        fail "stop alt-user instance exits 0" "exit code: $?"
+    fi
+
+    if coop start "$inst_name"; then
+        pass "restart alt-user instance exits 0"
+    else
+        fail "restart alt-user instance exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+    if whoami_out=$(guest_exec whoami); then
+        if [[ "$whoami_out" == "$alt_user" ]]; then
+            pass "whoami after restart still '$alt_user'"
+        else
+            fail "whoami after restart still '$alt_user'" "got: $whoami_out"
+        fi
+    else
+        fail "whoami after restart still '$alt_user'" "stderr: $(guest_stderr)"
+    fi
+    unset GUEST_INSTANCE
+
+    # Cleanup
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+
+    if coop images --delete "$img_name"; then
+        pass "images --delete $img_name exits 0"
+    else
+        fail "images --delete $img_name exits 0" "exit code: $?"
+    fi
+}
+
 # ── Main ──────────────────────────────────────────────────────
 
 main() {
@@ -3079,6 +3276,7 @@ main() {
     test_profiles_cli
     test_completions
     test_devcontainer_translator
+    test_guest_user_validation
 
     # Setup + primary instance
     test_setup
@@ -3128,6 +3326,7 @@ main() {
         test_git_repo_private_clone
         test_multi_instance
         test_named_images
+        test_guest_user_alt
         test_custom_profiles
         test_builtin_profiles
         test_post_start
