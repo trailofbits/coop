@@ -1470,6 +1470,67 @@ test_restart_rejects_ignored_flags() {
     rm -rf "$mount_dir"
 }
 
+# Issue #214 regression: with $INSTANCE stopped and unrelated to the user's
+# intent, `coop start --mount <dir>` (no --name, no --workspace) must allocate
+# a fresh VM rather than reusing the stopped one or bailing with a destroy
+# advisory. The unit tests cover the predicate; this phase exercises the full
+# cmd_start path that uses it.
+test_bare_start_allocates_fresh() {
+    echo ""
+    echo "=== Phase: bare start --mount allocates fresh instance ==="
+
+    local mount_dir
+    mount_dir=$(mktemp -d)
+
+    # Snapshot instance names before allocating. The only entry should be the
+    # stopped $INSTANCE left by the previous phase.
+    local before_names
+    before_names=$(RUST_LOG=off "$BINARY" status 2>/dev/null \
+        | awk '/running|stopped/ {print $1}' | sort -u)
+
+    if ! coop start --no-agents --mount "$mount_dir"; then
+        fail "bare start --mount exits 0" "exit=$?; stderr: $HARNESS_ERR"
+        rm -rf "$mount_dir"
+        return
+    fi
+    pass "bare start --mount exits 0"
+
+    local after_names
+    after_names=$(RUST_LOG=off "$BINARY" status 2>/dev/null \
+        | awk '/running|stopped/ {print $1}' | sort -u)
+
+    local new_name
+    new_name=$(comm -13 <(echo "$before_names") <(echo "$after_names") | head -n1)
+
+    if [[ -z "$new_name" ]]; then
+        fail "fresh instance allocated" "no new name in status; after: $after_names"
+        rm -rf "$mount_dir"
+        return
+    fi
+    STARTED_INSTANCES+=("$new_name")
+    pass "fresh instance allocated ($new_name)"
+
+    if [[ "$new_name" == "$INSTANCE" ]]; then
+        fail "fresh instance is distinct from stopped \$INSTANCE" "got: $new_name"
+    else
+        pass "fresh instance is distinct from stopped \$INSTANCE"
+    fi
+
+    # The pre-existing $INSTANCE must remain stopped and untouched.
+    if RUST_LOG=off "$BINARY" status 2>/dev/null | grep -qE "^${INSTANCE} +stopped\\b"; then
+        pass "pre-existing stopped instance untouched"
+    else
+        fail "pre-existing stopped instance untouched" \
+            "status: $(RUST_LOG=off "$BINARY" status 2>/dev/null)"
+    fi
+
+    # Tear down the freshly allocated instance so subsequent phases see the
+    # same world they expect: $INSTANCE stopped, no other coop VMs.
+    coop destroy "$new_name" 2>/dev/null || true
+    untrack_instance "$new_name"
+    rm -rf "$mount_dir"
+}
+
 test_destroy() {
     echo ""
     echo "=== Phase: destroy ==="
@@ -3308,6 +3369,7 @@ main() {
     test_resize_status
     test_restart_stopped
     test_restart_rejects_ignored_flags
+    test_bare_start_allocates_fresh
     test_destroy
     test_auto_resolve_no_instances
     test_list_empty
