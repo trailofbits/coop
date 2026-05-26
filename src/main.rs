@@ -1112,6 +1112,7 @@ fn cmd_quickstart(
                 extra_packages: Vec::new(),
                 post_install: None,
                 image: image.clone(),
+                guest_user: guest::GuestUser::default(),
             },
         )?;
     }
@@ -1169,7 +1170,8 @@ fn cmd_quickstart(
     };
 
     let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
-    ssh::run_interactive(&sess, &prepend_binary(crate::guest::CLAUDE_BIN, Vec::new()))
+    let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+    ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), Vec::new()))
 }
 
 /// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no
