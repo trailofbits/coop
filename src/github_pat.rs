@@ -48,7 +48,8 @@ pub struct SetupOpts<'a> {
 pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     let repo = resolve_target_repo(opts.repo, None)?;
 
-    print_form_instructions(&repo);
+    let prediscovered = prefetch_submodules(&repo);
+    print_form_instructions(&repo, prediscovered.as_ref());
     open_browser_best_effort(PAT_NEW_URL);
 
     let token = read_token_no_echo()?;
@@ -56,7 +57,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     eprintln!("\nValidating token against api.github.com…");
     probe_user(&token)?;
     probe_repo(&token, &repo)?;
-    let token = handle_submodules(token, &repo)?;
+    let token = handle_submodules(token, &repo, prediscovered)?;
 
     let backend = pick_backend()?;
     let account = account_for_repo(&repo);
@@ -200,19 +201,87 @@ fn resolve_target_repo(repo_arg: Option<&str>, git_repo_url: Option<&str>) -> Re
     )
 }
 
-fn print_form_instructions(repo: &RepoSlug) {
-    eprintln!("\nConfigure the form at {PAT_NEW_URL}:");
-    eprintln!("  Token name:        coop-{}-{}", repo.owner(), repo.repo());
-    eprintln!("  Expiration:        (your choice — 90 days is a reasonable default)");
-    eprintln!("  Resource owner:    {}", repo.owner());
-    eprintln!("  Repository access: Only select repositories → {repo}");
-    eprintln!("  Repository permissions:");
-    eprintln!("    Contents:        Read and write");
-    eprintln!("    Pull requests:   Read and write");
-    eprintln!("    Issues:          Read and write");
-    eprintln!("    Commit statuses: Read-only");
-    eprintln!("    Metadata:        Read-only (auto-included)\n");
-    eprintln!("Click \"Generate token\", then paste it below.");
+fn print_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscovery>) {
+    eprint!("{}", build_form_instructions(repo, discovery));
+    std::io::stderr().flush().ok();
+}
+
+/// Render the wizard's form instructions as a string.
+///
+/// When `discovery` is `Some`, the "Only select repositories" line is
+/// expanded to list the parent plus each same-owner private submodule,
+/// and any cross-owner / non-GitHub submodules are surfaced before the
+/// paste prompt so the user can plan their token scope up front. With
+/// `None` (no pre-discovery credential available) the original
+/// single-repo instructions are produced.
+fn build_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscovery>) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let extras = discovery.map_or(&[][..], |d| d.same_owner.as_slice());
+
+    let _ = writeln!(s, "\nConfigure the form at {PAT_NEW_URL}:");
+    let _ = writeln!(
+        s,
+        "  Token name:        coop-{}-{}",
+        repo.owner(),
+        repo.repo()
+    );
+    let _ = writeln!(
+        s,
+        "  Expiration:        (your choice — 90 days is a reasonable default)"
+    );
+    let _ = writeln!(s, "  Resource owner:    {}", repo.owner());
+    if extras.is_empty() {
+        let _ = writeln!(s, "  Repository access: Only select repositories → {repo}");
+    } else {
+        let _ = writeln!(s, "  Repository access: Only select repositories:");
+        let _ = writeln!(s, "                       - {repo}");
+        for slug in extras {
+            let _ = writeln!(s, "                       - {slug}");
+        }
+    }
+    let _ = writeln!(s, "  Repository permissions:");
+    let _ = writeln!(s, "    Contents:        Read and write");
+    let _ = writeln!(s, "    Pull requests:   Read and write");
+    let _ = writeln!(s, "    Issues:          Read and write");
+    let _ = writeln!(s, "    Commit statuses: Read-only");
+    let _ = writeln!(s, "    Metadata:        Read-only (auto-included)");
+
+    if let Some(d) = discovery {
+        if !d.cross_owner.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nSubmodules under other resource owners need their own FGPAT \
+                 (one form per owner). After this token, run:"
+            );
+            for (owner, repos) in &d.cross_owner {
+                let _ = writeln!(s, "\n  Resource owner: {owner}");
+                for slug in repos {
+                    let _ = writeln!(s, "    coop github setup-pat --repo {slug}");
+                }
+            }
+        }
+        if !d.non_github_urls.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nThese submodule URLs are not on github.com — this token \
+                 can't cover them:"
+            );
+            for url in &d.non_github_urls {
+                let _ = writeln!(s, "  - {url}");
+            }
+        }
+        if !extras.is_empty() || !d.cross_owner.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nNote: only depth-1 submodules were checked. Nested submodules \
+                 (submodules of submodules) need their own `setup-pat` runs."
+            );
+        }
+    }
+
+    let _ = writeln!(s, "\nClick \"Generate token\", then paste it below.");
+    s
 }
 
 fn open_browser_best_effort(url: &str) {
@@ -361,10 +430,14 @@ fn curl_with_accept(token: &str, url: &str, accept: &str) -> Result<(u16, String
 /// API requests share a 60/hour rate limit per IP, so we keep the use
 /// narrow (one probe per cross-owner / same-owner submodule slug).
 fn curl_anonymous(url: &str) -> Result<(u16, String)> {
+    curl_anonymous_with_accept(url, "application/vnd.github+json")
+}
+
+fn curl_anonymous_with_accept(url: &str, accept: &str) -> Result<(u16, String)> {
     let out = Cmd::new("curl")
         .arg("-sSL")
         .arg("-H")
-        .arg("Accept: application/vnd.github+json")
+        .arg(format!("Accept: {accept}"))
         .arg("-w")
         .arg("\n%{http_code}")
         .arg(url)
@@ -402,6 +475,69 @@ fn is_public_repo_anonymous(slug: &RepoSlug) -> bool {
             false
         }
     }
+}
+
+/// Best-effort read of `gh auth token` — returns `None` if `gh` is
+/// missing, not authenticated, or produced empty output.
+///
+/// The token is used only to pre-fetch the parent repo's `.gitmodules`
+/// during the setup wizard. It is never persisted, forwarded into the
+/// guest, or compared against the FGPAT the user pastes.
+fn gh_auth_token() -> Option<String> {
+    Cmd::new("gh")
+        .arg("auth")
+        .arg("token")
+        .capture()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Pre-discover submodules using locally available credentials, before
+/// the user fills out the FGPAT form.
+///
+/// Tries in order: the user's `gh auth token` (if any), then an
+/// anonymous request (works when the parent repo is public). Returns
+/// `None` when neither path produced a usable response, so the wizard
+/// falls back to its original post-paste behaviour. A `200` with an
+/// empty body and a `404` (no `.gitmodules`) both yield an empty
+/// discovery — pre-discovery succeeded; nothing to suggest.
+fn prefetch_submodules(parent: &RepoSlug) -> Option<SubmoduleDiscovery> {
+    let url = format!("https://api.github.com/repos/{parent}/contents/.gitmodules");
+    let raw = "application/vnd.github.raw+json";
+
+    let body = gh_auth_token()
+        .and_then(|token| match curl_with_accept(&token, &url, raw) {
+            Ok((200, body)) => Some(body),
+            Ok((404, _)) => Some(String::new()),
+            Ok((status, _)) => {
+                tracing::debug!(
+                    "prefetch with gh token returned HTTP {status} for {url} — \
+                     falling through to anonymous"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!("prefetch with gh token failed: {e:#}");
+                None
+            }
+        })
+        .or_else(|| match curl_anonymous_with_accept(&url, raw) {
+            Ok((200, body)) => Some(body),
+            Ok((404, _)) => Some(String::new()),
+            Ok((status, _)) => {
+                tracing::debug!("anonymous prefetch returned HTTP {status} for {url}");
+                None
+            }
+            Err(e) => {
+                tracing::debug!("anonymous prefetch failed: {e:#}");
+                None
+            }
+        })?;
+
+    let mut discovery = classify_urls(parent, &extract_urls(&body));
+    let _ = discovery.drop_public(is_public_repo_anonymous);
+    Some(discovery)
 }
 
 /// Fetch `.gitmodules` from the parent's default branch and classify the URLs.
@@ -449,33 +585,31 @@ fn probe_same_owner_coverage(token: &str, expected: &[RepoSlug]) -> Result<Vec<R
 /// Surface the discovery to the user and, when same-owner submodules
 /// exist, loop until the pasted token covers them all.
 ///
+/// `prediscovered` is the result of the pre-paste [`prefetch_submodules`]
+/// step. When it is `Some`, this acts purely as a verification layer:
+/// the form already listed the expanded repo set and printed the
+/// cross-owner / non-GitHub advice, so we only re-probe coverage and
+/// re-prompt if the user didn't follow it. When it is `None` (no local
+/// credential was available pre-paste), we discover from scratch using
+/// the freshly pasted token and print the full advice here.
+///
 /// Returns the (possibly re-pasted) token. The caller stores whatever
 /// token this returns — by construction it is the latest one that
 /// passed `probe_user` + `probe_repo` for `parent`, so the broader
 /// scope replaces the originally pasted token.
-fn handle_submodules(token: String, parent: &RepoSlug) -> Result<String> {
-    let mut discovery = discover_submodule_repos(&token, parent)?;
+fn handle_submodules(
+    token: String,
+    parent: &RepoSlug,
+    prediscovered: Option<SubmoduleDiscovery>,
+) -> Result<String> {
+    let used_prediscovery = prediscovered.is_some();
+    let discovery = match prediscovered {
+        Some(d) => d,
+        None => discover_from_pasted_token(&token, parent)?,
+    };
 
     if discovery.is_empty() {
         return Ok(token);
-    }
-
-    let public_skipped = discovery.drop_public(is_public_repo_anonymous);
-    if !public_skipped.is_empty() {
-        eprintln!(
-            "\nSkipping {} public submodule repo(s) — they clone without a token:",
-            public_skipped.len(),
-        );
-        for slug in &public_skipped {
-            eprintln!("  - {slug}");
-        }
-    }
-
-    if !discovery.non_github_urls.is_empty() {
-        eprintln!("\nIgnoring non-GitHub submodule URLs (this token can't cover them):");
-        for url in &discovery.non_github_urls {
-            eprintln!("  - {url}");
-        }
     }
 
     let mut token = token;
@@ -495,25 +629,50 @@ fn handle_submodules(token: String, parent: &RepoSlug) -> Result<String> {
         }
     }
 
-    if !discovery.cross_owner.is_empty() {
-        eprintln!(
-            "\nNote: submodules under other resource owners need their own \
-             FGPAT (one form per owner). Run:"
-        );
-        for (owner, repos) in &discovery.cross_owner {
-            eprintln!("\n  Resource owner: {owner}");
-            for slug in repos {
-                eprintln!("    coop github setup-pat --repo {slug}");
+    if !used_prediscovery {
+        if !discovery.cross_owner.is_empty() {
+            eprintln!(
+                "\nNote: submodules under other resource owners need their own \
+                 FGPAT (one form per owner). Run:"
+            );
+            for (owner, repos) in &discovery.cross_owner {
+                eprintln!("\n  Resource owner: {owner}");
+                for slug in repos {
+                    eprintln!("    coop github setup-pat --repo {slug}");
+                }
             }
         }
+        eprintln!(
+            "\nNote: only depth-1 submodules were checked. Nested submodules \
+             (submodules of submodules) need their own `setup-pat` runs."
+        );
     }
 
-    eprintln!(
-        "\nNote: only depth-1 submodules were checked. Nested submodules \
-         (submodules of submodules) need their own `setup-pat` runs."
-    );
-
     Ok(token)
+}
+
+/// Discover submodules with the freshly pasted token and announce the
+/// public-skip and non-GitHub buckets. Used only when pre-discovery had
+/// no local credential to work with.
+fn discover_from_pasted_token(token: &str, parent: &RepoSlug) -> Result<SubmoduleDiscovery> {
+    let mut discovery = discover_submodule_repos(token, parent)?;
+    let public_skipped = discovery.drop_public(is_public_repo_anonymous);
+    if !public_skipped.is_empty() {
+        eprintln!(
+            "\nSkipping {} public submodule repo(s) — they clone without a token:",
+            public_skipped.len(),
+        );
+        for slug in &public_skipped {
+            eprintln!("  - {slug}");
+        }
+    }
+    if !discovery.non_github_urls.is_empty() {
+        eprintln!("\nIgnoring non-GitHub submodule URLs (this token can't cover them):");
+        for url in &discovery.non_github_urls {
+            eprintln!("  - {url}");
+        }
+    }
+    Ok(discovery)
 }
 
 fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[RepoSlug]) {
@@ -899,5 +1058,91 @@ mod tests {
         let msg = missing_entry_error(&slug("trailofbits/coop"));
         assert!(msg.contains("trailofbits/coop"));
         assert!(msg.contains("setup-pat"));
+    }
+
+    fn discovery(
+        same_owner: &[&str],
+        cross_owner: &[(&str, &[&str])],
+        non_github_urls: &[&str],
+    ) -> SubmoduleDiscovery {
+        SubmoduleDiscovery {
+            same_owner: same_owner.iter().map(|s| slug(s)).collect(),
+            cross_owner: cross_owner
+                .iter()
+                .map(|(owner, repos)| {
+                    (
+                        (*owner).to_string(),
+                        repos.iter().map(|s| slug(s)).collect(),
+                    )
+                })
+                .collect(),
+            non_github_urls: non_github_urls.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn form_text_without_discovery_uses_single_repo_line() {
+        let text = build_form_instructions(&slug("acme/parent"), None);
+        assert!(text.contains("Only select repositories → acme/parent"));
+        assert!(!text.contains("                       - "));
+        assert!(!text.contains("setup-pat --repo"));
+        assert!(!text.contains("only depth-1"));
+        assert!(text.contains("Click \"Generate token\""));
+    }
+
+    #[test]
+    fn form_text_lists_same_owner_private_submodules() {
+        let d = discovery(&["acme/lib-a", "acme/lib-b"], &[], &[]);
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+        assert!(text.contains("Only select repositories:"));
+        assert!(text.contains("- acme/parent"));
+        assert!(text.contains("- acme/lib-a"));
+        assert!(text.contains("- acme/lib-b"));
+        // The single-arrow form must not be used once we have extras.
+        assert!(!text.contains("Only select repositories →"));
+        // Depth-1 caveat appears once submodules are listed.
+        assert!(text.contains("only depth-1 submodules were checked"));
+    }
+
+    #[test]
+    fn form_text_surfaces_cross_owner_and_non_github_before_paste() {
+        let d = discovery(
+            &["acme/lib-a"],
+            &[("other", &["other/dep"])],
+            &["https://gitlab.com/x/y"],
+        );
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+
+        let cross_owner_at = text.find("coop github setup-pat --repo other/dep").unwrap();
+        let non_github_at = text.find("https://gitlab.com/x/y").unwrap();
+        let paste_at = text.find("Click \"Generate token\"").unwrap();
+
+        assert!(text.contains("other resource owners"));
+        assert!(text.contains("not on github.com"));
+        // Both advisories must precede the paste prompt.
+        assert!(cross_owner_at < paste_at);
+        assert!(non_github_at < paste_at);
+    }
+
+    #[test]
+    fn form_text_with_only_cross_owner_keeps_single_parent_line() {
+        // No same-owner extras, but a cross-owner submodule exists: the
+        // parent line stays single, yet the cross-owner advice and the
+        // depth-1 caveat still appear.
+        let d = discovery(&[], &[("other", &["other/dep"])], &[]);
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+        assert!(text.contains("Only select repositories → acme/parent"));
+        assert!(text.contains("coop github setup-pat --repo other/dep"));
+        assert!(text.contains("only depth-1 submodules were checked"));
+    }
+
+    #[test]
+    fn form_text_empty_discovery_matches_no_discovery() {
+        // A successful prefetch that found no submodules (empty discovery)
+        // must produce the same single-repo form as no prefetch at all.
+        let d = discovery(&[], &[], &[]);
+        let with_empty = build_form_instructions(&slug("acme/parent"), Some(&d));
+        let without = build_form_instructions(&slug("acme/parent"), None);
+        assert_eq!(with_empty, without);
     }
 }
