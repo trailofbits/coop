@@ -6,6 +6,7 @@ mod devcontainer;
 mod fs_util;
 mod github_pat;
 mod github_repo;
+mod github_submodules;
 mod guest;
 mod guest_env_state;
 mod naming;
