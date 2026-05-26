@@ -138,6 +138,34 @@ guest_stderr() {
     cat "$tmpdir/guest_stderr" 2>/dev/null
 }
 
+# Cross-platform timeout wrapper. Prefer GNU timeout (Linux, or macOS with
+# coreutils installed as `gtimeout`); fall back to a perl-based implementation
+# since perl ships in the macOS base system.
+if command -v timeout >/dev/null 2>&1; then
+    _timeout() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+    _timeout() { gtimeout "$@"; }
+else
+    _timeout() {
+        perl -e '
+            my $d = shift;
+            my $pid = fork() // die "fork: $!";
+            if ($pid == 0) { exec @ARGV; die "exec: $!"; }
+            local $SIG{ALRM} = sub {
+                kill TERM => $pid;
+                sleep 1;
+                kill KILL => $pid;
+                waitpid $pid, 0;
+                exit 124;
+            };
+            alarm $d;
+            waitpid $pid, 0;
+            alarm 0;
+            exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+        ' "$@"
+    }
+fi
+
 # Remove an instance from the tracked list.
 untrack_instance() {
     local target="$1"
@@ -1653,7 +1681,7 @@ test_idempotency() {
 # Claude is interactive — with stdin redirected from /dev/null `ssh` doesn't
 # allocate a PTY and the claude binary fails fast. `run_interactive` only
 # logs (does not error) on non-zero remote status, so quickstart still
-# returns 0 to the host. Each invocation is bounded with `timeout` defensively
+# returns 0 to the host. Each invocation is bounded with `_timeout` defensively
 # so a future claude that hangs on EOF can't wedge the suite.
 test_quickstart() {
     echo ""
@@ -1667,12 +1695,15 @@ test_quickstart() {
     local qs_ws qs_inst_name
     qs_ws=$(mktemp -d "$tmpdir/qs-ws-XXXXXX")
     # The instance name is the sanitised basename of the workspace path.
-    qs_inst_name=$(basename "$qs_ws" | tr -c 'a-zA-Z0-9_-' '-')
+    # `basename | tr` would rewrite the trailing newline to a dash; use bash
+    # pattern expansion to mirror `sanitize_basename` in src/config.rs.
+    qs_inst_name=${qs_ws##*/}
+    qs_inst_name=${qs_inst_name//[!a-zA-Z0-9_-]/-}
 
     # First invocation: image is already built (from test_setup) and no
     # instance for this workspace exists, so quickstart must allocate fresh.
     local rc=0
-    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
         </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -1711,7 +1742,7 @@ test_quickstart() {
     pre_list=$("$BINARY" list 2>/dev/null | sort)
 
     rc=0
-    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
         </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -1742,7 +1773,7 @@ test_quickstart() {
     fi
 
     rc=0
-    ( cd "$qs_ws" && timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
         </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
