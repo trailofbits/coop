@@ -38,6 +38,44 @@ impl SubmoduleDiscovery {
     pub(crate) fn is_empty(&self) -> bool {
         self.same_owner.is_empty() && self.cross_owner.is_empty() && self.non_github_urls.is_empty()
     }
+
+    /// Drop slugs that `is_public` accepts from both actionable buckets.
+    ///
+    /// Public GitHub repos clone without authentication, so suggesting
+    /// a PAT for them is noise. Returns the dropped slugs (sorted) so
+    /// the wizard can announce them. Empty cross-owner groups left
+    /// behind by the filter are pruned to keep the output tight.
+    ///
+    /// The predicate is passed in (rather than calling out to curl
+    /// here) so the function is exercised by unit tests without a
+    /// network round-trip.
+    pub(crate) fn drop_public(
+        &mut self,
+        mut is_public: impl FnMut(&RepoSlug) -> bool,
+    ) -> Vec<RepoSlug> {
+        let mut dropped = Vec::new();
+        self.same_owner.retain(|slug| {
+            if is_public(slug) {
+                dropped.push(slug.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for slugs in self.cross_owner.values_mut() {
+            slugs.retain(|slug| {
+                if is_public(slug) {
+                    dropped.push(slug.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.cross_owner.retain(|_, v| !v.is_empty());
+        dropped.sort();
+        dropped
+    }
 }
 
 /// Extract `url = …` values from a `.gitmodules` body.
@@ -336,6 +374,60 @@ mod tests {
         let urls = vec![String::new()];
         let d = classify_urls(&parent, &urls);
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn drop_public_filters_both_buckets_and_returns_sorted_list() {
+        let parent = slug("acme/parent");
+        let urls = vec![
+            "https://github.com/acme/private-lib".to_string(),
+            "https://github.com/acme/public-lib".to_string(),
+            "https://github.com/other/public-thing".to_string(),
+            "https://github.com/other/private-thing".to_string(),
+        ];
+        let mut d = classify_urls(&parent, &urls);
+        let publics = [slug("acme/public-lib"), slug("other/public-thing")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let dropped = d.drop_public(|s| publics.contains(s));
+
+        assert_eq!(
+            dropped,
+            vec![slug("acme/public-lib"), slug("other/public-thing")]
+        );
+        assert_eq!(d.same_owner, vec![slug("acme/private-lib")]);
+        assert_eq!(d.cross_owner.len(), 1);
+        assert_eq!(
+            d.cross_owner.get("other").map(Vec::as_slice),
+            Some(&[slug("other/private-thing")][..])
+        );
+    }
+
+    #[test]
+    fn drop_public_prunes_empty_cross_owner_groups() {
+        let parent = slug("acme/parent");
+        let urls = vec![
+            "https://github.com/other/only-public".to_string(),
+            "https://github.com/another/keep-private".to_string(),
+        ];
+        let mut d = classify_urls(&parent, &urls);
+        let dropped = d.drop_public(|s| s.owner() == "other");
+
+        assert_eq!(dropped, vec![slug("other/only-public")]);
+        assert!(!d.cross_owner.contains_key("other"));
+        assert!(d.cross_owner.contains_key("another"));
+    }
+
+    #[test]
+    fn drop_public_no_matches_is_noop() {
+        let parent = slug("acme/parent");
+        let urls = vec!["https://github.com/acme/lib-a".to_string()];
+        let mut d = classify_urls(&parent, &urls);
+        let dropped = d.drop_public(|_| false);
+
+        assert!(dropped.is_empty());
+        assert_eq!(d.same_owner, vec![slug("acme/lib-a")]);
     }
 
     #[test]

@@ -350,12 +350,58 @@ fn curl_with_accept(token: &str, url: &str, accept: &str) -> Result<(u16, String
         .arg(url)
         .capture()
         .with_context(|| format!("curl GET {url} failed"))?;
+    parse_curl_status_body(&out)
+}
+
+/// Anonymous (no Authorization header) GET — used to detect public
+/// GitHub repos without consuming the user's token's API budget.
+///
+/// Returns `Err` only on a curl failure; HTTP errors are returned via
+/// the status code so the caller can map them. Unauthenticated GitHub
+/// API requests share a 60/hour rate limit per IP, so we keep the use
+/// narrow (one probe per cross-owner / same-owner submodule slug).
+fn curl_anonymous(url: &str) -> Result<(u16, String)> {
+    let out = Cmd::new("curl")
+        .arg("-sSL")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg(url)
+        .capture()
+        .with_context(|| format!("curl GET {url} failed"))?;
+    parse_curl_status_body(&out)
+}
+
+fn parse_curl_status_body(out: &str) -> Result<(u16, String)> {
     let (body, status_str) = out.rsplit_once('\n').unwrap_or(("", out.trim()));
     let status: u16 = status_str
         .trim()
         .parse()
         .with_context(|| format!("Failed to parse HTTP status from curl output: '{status_str}'"))?;
     Ok((status, body.to_string()))
+}
+
+/// Does an anonymous `GET /repos/{slug}` return 200?
+///
+/// `true` only when an unauthenticated request can read the repo —
+/// i.e. it is genuinely public. Anything else (404 for private/missing,
+/// 403 for rate-limited, network failure) is treated as "not public"
+/// so the wizard errs on the side of recommending a PAT rather than
+/// silently skipping a repo the user actually needs to authorize.
+fn is_public_repo_anonymous(slug: &RepoSlug) -> bool {
+    let url = format!("https://api.github.com/repos/{slug}");
+    match curl_anonymous(&url) {
+        Ok((200, _)) => true,
+        Ok((status, _)) => {
+            tracing::debug!("anonymous probe of {slug} returned HTTP {status}");
+            false
+        }
+        Err(e) => {
+            tracing::debug!("anonymous probe of {slug} failed: {e:#}");
+            false
+        }
+    }
 }
 
 /// Fetch `.gitmodules` from the parent's default branch and classify the URLs.
@@ -408,10 +454,21 @@ fn probe_same_owner_coverage(token: &str, expected: &[RepoSlug]) -> Result<Vec<R
 /// passed `probe_user` + `probe_repo` for `parent`, so the broader
 /// scope replaces the originally pasted token.
 fn handle_submodules(token: String, parent: &RepoSlug) -> Result<String> {
-    let discovery = discover_submodule_repos(&token, parent)?;
+    let mut discovery = discover_submodule_repos(&token, parent)?;
 
     if discovery.is_empty() {
         return Ok(token);
+    }
+
+    let public_skipped = discovery.drop_public(is_public_repo_anonymous);
+    if !public_skipped.is_empty() {
+        eprintln!(
+            "\nSkipping {} public submodule repo(s) — they clone without a token:",
+            public_skipped.len(),
+        );
+        for slug in &public_skipped {
+            eprintln!("  - {slug}");
+        }
     }
 
     if !discovery.non_github_urls.is_empty() {
