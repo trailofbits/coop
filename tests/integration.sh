@@ -1516,12 +1516,18 @@ test_bare_start_allocates_fresh() {
         pass "fresh instance is distinct from stopped \$INSTANCE"
     fi
 
-    # The pre-existing $INSTANCE must remain stopped and untouched.
-    if RUST_LOG=off "$BINARY" status 2>/dev/null | grep -qE "^${INSTANCE} +stopped\\b"; then
+    # The pre-existing $INSTANCE must remain stopped and untouched. Capture
+    # `status` output before grep'ing — piping directly into `grep -q` lets
+    # grep exit early on the first match, which closes the pipe and makes
+    # `coop status` exit non-zero (SIGPIPE/BrokenPipe) on the remaining
+    # writes; combined with `set -o pipefail` that turns a passing match
+    # into a spurious failure when other instances follow ours.
+    local status_out
+    status_out=$(RUST_LOG=off "$BINARY" status 2>/dev/null || true)
+    if echo "$status_out" | grep -qE "^${INSTANCE} +stopped\\b"; then
         pass "pre-existing stopped instance untouched"
     else
-        fail "pre-existing stopped instance untouched" \
-            "status: $(RUST_LOG=off "$BINARY" status 2>/dev/null)"
+        fail "pre-existing stopped instance untouched" "status: $status_out"
     fi
 
     # Tear down the freshly allocated instance so subsequent phases see the
