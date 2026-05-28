@@ -101,6 +101,29 @@ impl WorkspaceState {
     }
 }
 
+/// Load `workspace.json`, logging a `WARN` on parse errors.
+///
+/// Returns `None` when no state file exists (the instance simply hasn't
+/// been started, or was started by a coop too old to write one) and also
+/// when the file exists but cannot be deserialized — typically a pre-#147
+/// shape that the current loader rejects. The parse-error case logs a
+/// warning that includes the loader's migration hint and the supplied
+/// `consequence` so the user can see which feature degraded (pat-mode
+/// token forwarding, workspace-affinity matching, etc.) rather than the
+/// failure being silently swallowed.
+pub fn try_load_or_warn(inst: &Instance, consequence: &str) -> Option<WorkspaceState> {
+    match WorkspaceState::try_load(inst) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read workspace state for '{}'; {consequence}. {e:#}",
+                inst.name,
+            );
+            None
+        }
+    }
+}
+
 /// Transfer a local directory to the guest via tar-pipe over SSH.
 ///
 /// Streams `tar cf -` straight into a guest-side `tar xf - -C /workspace`.
@@ -1109,6 +1132,39 @@ mod tests {
         fs::write(inst.workspace_state_path(), "not json").expect("write");
         let result = WorkspaceState::try_load(&inst);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_load_or_warn_returns_none_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        assert!(try_load_or_warn(&inst, "test").is_none());
+    }
+
+    #[test]
+    fn try_load_or_warn_returns_none_on_parse_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        fs::write(inst.workspace_state_path(), "not json").expect("write");
+        assert!(try_load_or_warn(&inst, "test").is_none());
+    }
+
+    #[test]
+    fn try_load_or_warn_returns_state_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute(GUEST_WORKSPACE).unwrap(),
+            source: WorkspaceSource::GitRepo {
+                url: "https://github.com/x/y.git".to_string(),
+            },
+        };
+        state.save(&inst).expect("save");
+        let loaded = try_load_or_warn(&inst, "test").expect("state should load");
+        assert!(matches!(
+            loaded.source,
+            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
+        ));
     }
 
     #[test]

@@ -1334,9 +1334,7 @@ fn find_workspace_instance(
     let mut matching: Vec<config::Instance> = instances
         .into_iter()
         .filter(|inst| {
-            workspace::WorkspaceState::try_load(inst)
-                .ok()
-                .flatten()
+            workspace::try_load_or_warn(inst, "workspace-affinity matching will skip this instance")
                 .and_then(|s| s.source.host_path().map(Path::to_path_buf))
                 .is_some_and(|hp| hp == canonical)
         })
@@ -1633,11 +1631,12 @@ fn find_stopped_instance(
             .iter()
             .enumerate()
             .filter(|(_, inst)| {
-                workspace::WorkspaceState::try_load(inst)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.source.host_path().map(Path::to_path_buf))
-                    .is_some_and(|hp| hp == canonical)
+                workspace::try_load_or_warn(
+                    inst,
+                    "workspace-affinity matching will skip this instance",
+                )
+                .and_then(|s| s.source.host_path().map(Path::to_path_buf))
+                .is_some_and(|hp| hp == canonical)
             })
             .map(|(i, _)| i)
             .collect();

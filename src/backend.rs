@@ -1109,19 +1109,10 @@ pub fn detect_instance_repo(
 ) -> Option<crate::github_repo::RepoSlug> {
     use crate::workspace::WorkspaceSource;
 
-    let state = match crate::workspace::WorkspaceState::try_load(inst) {
-        Ok(Some(state)) => state,
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::warn!(
-                "Could not read workspace state for '{}'; GitHub repo \
-                 detection is disabled (pat-mode tokens will not be \
-                 forwarded). {e:#}",
-                inst.name,
-            );
-            return None;
-        }
-    };
+    let state = crate::workspace::try_load_or_warn(
+        inst,
+        "GitHub repo detection is disabled (pat-mode tokens will not be forwarded)",
+    )?;
     match &state.source {
         WorkspaceSource::GitRepo { url } => crate::github_repo::parse_repo_slug_from_url(url),
         WorkspaceSource::Workspace { host_path } | WorkspaceSource::Mount { host_path } => {
