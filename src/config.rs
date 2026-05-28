@@ -1365,12 +1365,26 @@ fn validate_instance_name(name: &str) -> Result<()> {
         .chars()
         .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'))
     {
-        bail!(
+        let mut msg = format!(
             "Instance name contains invalid character '{c}' \
              (allowed: a-z, A-Z, 0-9, '-', '_')"
         );
+        if looks_like_path(name) {
+            msg.push_str(
+                ".\nIf you meant to start an instance for that directory, \
+                 use `--workspace <PATH>` or `--mount <PATH>`",
+            );
+        }
+        bail!(msg);
     }
     Ok(())
+}
+
+/// Whether a rejected instance name looks like the user typed a filesystem
+/// path by mistake (e.g. `coop start ~/projects/foo`). Used only to enrich
+/// the validation error with a hint toward `--workspace`/`--mount`.
+fn looks_like_path(name: &str) -> bool {
+    name.contains('/') || name.starts_with('~')
 }
 
 /// Validated instance name. Construction guarantees the name matches
@@ -2702,6 +2716,41 @@ mod tests {
             assert!(
                 err.to_string().contains("invalid character"),
                 "expected rejection for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_path_like_suggests_workspace() {
+        for name in [
+            "/Users/hbrodin/projects/foo",
+            "~/projects/foo",
+            "./relative",
+            "~",
+        ] {
+            let err = validate_instance_name(name).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid character"),
+                "expected base rejection for {name:?}, got: {err}"
+            );
+            assert!(
+                err.contains("--workspace") && err.contains("--mount"),
+                "expected workspace/mount hint for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_non_path_omits_workspace_hint() {
+        for name in ["has space", "semi;colon", "d.ot"] {
+            let err = validate_instance_name(name).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid character"),
+                "expected rejection for {name:?}, got: {err}"
+            );
+            assert!(
+                !err.contains("--workspace"),
+                "did not expect workspace hint for {name:?}, got: {err}"
             );
         }
     }
