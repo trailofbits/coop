@@ -1,4 +1,4 @@
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -41,6 +41,40 @@ fn guest_term() -> String {
     }
 }
 
+/// Keepalive options for interactive sessions.
+///
+/// A paused/suspended VM or a dropped local connection leaves SSH
+/// blocked on a dead socket indefinitely. With these, SSH sends a probe
+/// every 30s and gives up after 3 unanswered probes — so an unreachable
+/// session terminates within ~90s instead of hanging. Scoped to
+/// interactive use; the short-lived non-interactive paths don't need it.
+fn keepalive_opts() -> [String; 4] {
+    [
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+    ]
+}
+
+/// Restore the local terminal after an SSH failure.
+///
+/// When SSH itself fails (exit 255) the remote TUI never restores the
+/// terminal, leaving it in raw mode and the alternate screen. Emit the
+/// escape sequences to exit the alt-screen, show the cursor, re-enable
+/// line wrap, and reset attributes, then run `stty sane` to restore line
+/// discipline (echo, canonical mode). Best-effort: errors are ignored,
+/// and it is a no-op when stdout isn't a terminal so pipes stay clean.
+fn restore_terminal() {
+    let mut stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
+    let _ = stdout.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
+    let _ = stdout.flush();
+    let _ = Command::new("stty").arg("sane").status();
+}
+
 /// Run a command interactively over SSH with a PTY.
 ///
 /// Empty `command` opens a bare interactive shell. Otherwise the
@@ -55,6 +89,7 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
     );
 
     let mut args = session.ssh_opts();
+    args.extend(keepalive_opts());
     args.push(session.target.addr());
     args.extend(["-t".to_string(), remote_cmd]);
 
@@ -67,6 +102,7 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
 
     if !status.success() {
         tracing::warn!("SSH session exited with status: {status}");
+        restore_terminal();
     }
 
     Ok(())
@@ -145,6 +181,19 @@ mod tests {
     fn command_renders_with_cd_and_escaping() {
         let cmd = vec!["echo".into(), "hi".into()];
         assert_eq!(render_remote(&cmd), "cd /workspace && 'echo' 'hi'");
+    }
+
+    #[test]
+    fn keepalive_opts_set_interval_and_count() {
+        assert_eq!(
+            keepalive_opts(),
+            [
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+            ],
+        );
     }
 
     #[test]
