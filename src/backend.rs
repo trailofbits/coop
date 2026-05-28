@@ -1099,14 +1099,29 @@ pub type PlatformBackend = FirecrackerBackend;
 /// `mount` source has a host path we can scan for a `.git/config`
 /// `origin`. Returns `None` when no slug can be derived — pat-mode
 /// then falls back to a clear error.
+///
+/// An unreadable or stale-format `workspace.json` (e.g. a pre-#147 file
+/// that no longer deserializes) is logged at `WARN` with the loader's
+/// migration hint before returning `None`, so the lost repo context is
+/// diagnosable rather than silently degrading to "no token forwarded".
 pub fn detect_instance_repo(
     inst: &crate::config::Instance,
 ) -> Option<crate::github_repo::RepoSlug> {
     use crate::workspace::WorkspaceSource;
 
-    let state = crate::workspace::WorkspaceState::try_load(inst)
-        .ok()
-        .flatten()?;
+    let state = match crate::workspace::WorkspaceState::try_load(inst) {
+        Ok(Some(state)) => state,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read workspace state for '{}'; GitHub repo \
+                 detection is disabled (pat-mode tokens will not be \
+                 forwarded). {e:#}",
+                inst.name,
+            );
+            return None;
+        }
+    };
     match &state.source {
         WorkspaceSource::GitRepo { url } => crate::github_repo::parse_repo_slug_from_url(url),
         WorkspaceSource::Workspace { host_path } | WorkspaceSource::Mount { host_path } => {
@@ -2108,6 +2123,37 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn hostname_rejects_non_ascii() {
         assert!(Hostname::new("hôst").is_err());
+    }
+
+    fn temp_instance(dir: &std::path::Path) -> crate::config::Instance {
+        crate::config::Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: dir.to_path_buf(),
+            image: crate::config::ImageName::new("default").unwrap(),
+        }
+    }
+
+    #[test]
+    fn detect_instance_repo_none_when_state_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = temp_instance(dir.path());
+        assert!(detect_instance_repo(&inst).is_none());
+    }
+
+    #[test]
+    fn detect_instance_repo_none_on_stale_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = temp_instance(dir.path());
+        // Pre-#147 flat shape: `host_path` at the top level and a bare
+        // `source` string. The current loader rejects this; detection must
+        // degrade to `None` rather than panic.
+        std::fs::write(
+            inst.workspace_state_path(),
+            r#"{"host_path":"/x","guest_path":"/workspace","source":"mount"}"#,
+        )
+        .unwrap();
+        assert!(detect_instance_repo(&inst).is_none());
     }
 
     #[test]
