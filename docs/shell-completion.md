@@ -55,7 +55,7 @@ Restart the shell (or `source` your rc) after the first install.
 
 ## Dynamic completion
 
-Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop start --image <TAB>` lists existing images, and `coop setup --profile <TAB>` lists builtin and custom profiles.
+Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop up --image <TAB>` lists existing images, and `coop setup --profile <TAB>` lists builtin and custom profiles.
 
 Add one line to your shell rc:
 

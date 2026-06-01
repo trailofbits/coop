@@ -91,7 +91,7 @@ impl WorkspaceState {
                 format!(
                     "Failed to parse {}.\n\
                      If this file was written by a pre-#147 coop the on-disk \
-                     shape changed; delete it and run `coop start` again to \
+                     shape changed; delete it and run `coop up` again to \
                      regenerate, or `coop destroy <name>` if the instance is \
                      no longer needed.",
                     path.display()
@@ -276,7 +276,7 @@ fn join_drainer(handle: std::thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<
 }
 
 const GUEST_DISK_HINT: &str = "The guest disk is likely too small for this \
-    workspace. Retry with a larger disk: `coop start --disk <GiB> ...`.";
+    workspace. Recreate it with a larger disk: `coop up --disk <GiB> ...`.";
 
 /// Build a user-facing message from a captured stderr buffer.
 ///
@@ -360,7 +360,7 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
     }
     bail!(
         "No workspace.json found and no --dir given.\n\
-         Either start the VM with --workspace or provide a path: \
+         Either create/reconnect with `coop up <PATH>` or provide a path: \
          coop {cmd} --dir ./my-project"
     )
 }

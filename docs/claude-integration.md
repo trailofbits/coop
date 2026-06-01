@@ -1,6 +1,6 @@
 # Claude Code Integration
 
-coop sets up Claude Code inside guest VMs and gives you a single command to launch it. This guide covers the `coop claude` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs at `coop start`.
+coop sets up Claude Code inside guest VMs and gives you a single command to launch it. This guide covers the `coop claude` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs when a VM starts.
 
 ## Launching Claude Code
 
@@ -8,7 +8,7 @@ coop sets up Claude Code inside guest VMs and gives you a single command to laun
 coop claude [instance-name] [-- extra-args...]
 ```
 
-This SSHes into the guest and runs the `claude` CLI. The guest's managed `~/.claude/settings.json` (written during `coop start`) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
+This SSHes into the guest and runs the `claude` CLI. The guest's managed `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
 
 To restore permission prompts for a single session, pass `--ask`. coop then launches `claude` with `--permission-mode default`, overriding the guest default:
 
@@ -176,11 +176,11 @@ Server definitions can include an `env` map for environment variable name mappin
 
 ## Bootstrap sequence
 
-When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
+When `coop up` creates/restarts a project VM or `coop start` restarts a stopped VM (without `--no-agents`), coop executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted entries (`CLAUDE.md`, `rules/`, `commands/`) from `config_dir` to `~/.claude/` in the guest.
-3. **Managed permissions**: Write a coop-managed `~/.claude/settings.json` in the guest containing `permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. This file is overwritten on every `coop start`; per-VM customization belongs in coop's config, not in the guest file.
+3. **Managed permissions**: Write a coop-managed `~/.claude/settings.json` in the guest containing `permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. This file is overwritten on every VM startup; per-VM customization belongs in coop's config, not in the guest file.
 4. **Marketplaces**: Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
 5. **Plugins**: Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
 6. **MCP servers**: Register each MCP server definition.
@@ -189,9 +189,10 @@ On restart (`coop start` of a stopped instance), only ephemeral state is refresh
 
 ### Skipping bootstrap
 
-To start a VM without any Claude Code configuration:
+To create or restart a VM without any Claude Code configuration:
 
 ```bash
+coop up . --no-agents
 coop start --no-agents
 ```
 

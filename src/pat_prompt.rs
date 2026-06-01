@@ -1,5 +1,5 @@
-//! `coop start` pre-flight hook: offer to scope GitHub auth to the resolved
-//! repo before the VM boots.
+//! VM startup pre-flight hook: offer to scope GitHub auth to the resolved repo
+//! before the VM boots.
 //!
 //! Decision logic lives in [`Decision::resolve`]; the side-effecting wrapper
 //! [`maybe_prompt`] is what `start_instance` calls.

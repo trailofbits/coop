@@ -14,7 +14,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
-| `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail the start. Override per invocation with `coop start --post-start <cmd>`. |
+| `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ## GitHub auth
 
@@ -31,7 +31,7 @@ When a token is present, coop runs `gh auth setup-git` inside the guest to wire 
 
 ### Fine-grained PAT (`github = "pat"`)
 
-In pat mode coop forwards a *per-repo* fine-grained personal access token: the resolved `owner/repo` at `coop start` time selects the matching entry in `[github.pat]`. Compared with `"auto"` / `"env"`, the effective reach of a leaked token is bounded by the repos and permissions GitHub recorded when it was created — GitHub rejects out-of-scope operations (REST and GraphQL) server-side, not in coop.
+In pat mode coop forwards a *per-repo* fine-grained personal access token: the resolved `owner/repo` at VM startup selects the matching entry in `[github.pat]`. Compared with `"auto"` / `"env"`, the effective reach of a leaked token is bounded by the repos and permissions GitHub recorded when it was created — GitHub rejects out-of-scope operations (REST and GraphQL) server-side, not in coop.
 
 Configure via the wizard:
 
@@ -78,9 +78,9 @@ Other subcommands:
 | `coop github forget-pat --repo X/Y` | Remove the stored secret and the `[github.pat."X/Y"]` entry. Does **not** add a skip marker; the token may still be live on GitHub. |
 | `coop validate --probe` | Resolves each entry and probes `GET /user` against api.github.com. May trigger Keychain authorization or a 1Password Touch-ID prompt the first time per session. |
 
-#### Auto-prompt at `coop start`
+#### Auto-prompt at VM startup
 
-When `coop start` runs with a resolvable repo (from `--git-repo` or the synced workspace's `origin`) and `github` is `"off"` (or `"pat"` with no matching entry), coop offers to run the wizard inline: `[y/N/never]`. Three answers:
+When `coop up` or `coop start` runs with a resolvable repo (usually the synced workspace's `origin`) and `github` is `"off"` (or `"pat"` with no matching entry), coop offers to run the wizard inline: `[y/N/never]`. Three answers:
 
 - `y` — run the wizard, then continue the start.
 - `N` (default) — start unauthenticated, ask again next time.
@@ -134,7 +134,7 @@ Keys are env var names; values are the literals to inject. Entries here **overri
 
 **Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
 
-Override or extend per-invocation with `coop start --env KEY=VALUE` (repeatable).
+Override or extend per-invocation with `coop up --env KEY=VALUE` or `coop start --env KEY=VALUE` (repeatable).
 
 ## `claude` section
 
@@ -222,7 +222,7 @@ Custom profiles compose with built-in ones (`python`, `node`, `c`, `fuzz`, `rust
 
 ## `forward_ports` field
 
-Default host-to-guest TCP port forwards applied to every `coop start`. Forwards are established as SSH `-L` tunnels after the VM is ready and torn down on `coop stop`.
+Default host-to-guest TCP port forwards applied to every VM startup. Forwards are established as SSH `-L` tunnels after the VM is ready and torn down on `coop stop`.
 
 Each entry accepts a bare port (host and guest match), a `"GUEST:HOST"` string, or a table.
 
@@ -240,7 +240,7 @@ host = 15432
 label = "postgres"
 ```
 
-`--forward-port` on `coop start` appends to (or overrides on guest-port collision) the entries from config; later entries win. Each instance remembers its forward set across `coop stop` / `coop start`, so a restart without `--forward-port` re-establishes the same tunnels.
+`--forward-port` on `coop up` or `coop start` appends to (or overrides on guest-port collision) the entries from config; later entries win. Each instance remembers its forward set across `coop stop` / `coop start`, so a restart without `--forward-port` re-establishes the same tunnels.
 
 Collision with an in-use host port fails fast before the VM is created. The error names the offending port and suggests a `GUEST:HOST` override.
 

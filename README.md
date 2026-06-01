@@ -31,18 +31,19 @@ Set up the VM template, start an instance, and launch an agent CLI:
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-proj-...
 coop setup
-coop start my-project --workspace ~/code/my-project
+cd ~/code/my-project
+coop up
 coop claude
 # or
 coop codex
 ```
 
-That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. During `coop start`, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Pass `--ask` to `coop claude` to restore prompts for that session (`--permission-mode default`).
+That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. `coop up` is re-runnable: it creates an environment for the current project the first time, reuses it if it is already running, and restarts it after `coop stop`. During startup, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Pass `--ask` to `coop claude` to restore prompts for that session (`--permission-mode default`).
 
 ## Features
 
 - **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
-- **Workspace sync**: push a local directory into the VM, or clone a git repo directly with `--git-repo` (private GitHub repos use `gh auth token` or `GITHUB_TOKEN` on the host)
+- **Workspace sync**: copy or mount a local project directory into the VM with `coop up`
 - **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
@@ -56,9 +57,10 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 
 | Command | Description |
 |---------|-------------|
+| `up` | Ensure a project environment exists and is running |
 | `setup` | Install backend runtime, fetch kernel, build template rootfs |
 | `build` | Rebuild rootfs image and fetch kernel |
-| `start` | Launch a new VM instance |
+| `start` | Start an existing stopped VM instance |
 | `stop` | Stop a running VM (preserves disk) |
 | `destroy` | Stop and remove a VM instance |
 | `shell` | Interactive shell session in a running VM |

@@ -72,7 +72,7 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 - `"env"`: requires `GITHUB_TOKEN` in your environment
 - `"pat"`: forwards a per-repo fine-grained PAT recorded under `[github.pat."owner/repo"]`. GitHub enforces the token's scope server-side — see [GitHub auth](configuration.md#fine-grained-pat-github--pat) for the full reference.
 
-GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop start` itself offers to run the PAT wizard inline the first time you start an instance against a GitHub repo without auth configured.
+GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
 
 coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
 
@@ -102,51 +102,68 @@ coop setup -y --profile python
 
 Setup is idempotent. Rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
 
-### 2. Start an instance
+### 2. Bring up a project environment
+
+For normal project work, use `coop up` from your project directory:
+
+```
+cd ~/code/my-project
+coop up
+```
+
+`coop up` is project-oriented and re-runnable. It creates an instance the
+first time, reuses it if it is already running, and restarts it after
+`coop stop`. By default it copies/syncs the project into `/workspace`.
+
+Choose mount transport explicitly:
+
+```
+coop up . --mount
+```
+
+On macOS/Lima this is live filesystem sharing. On Linux/Firecracker it is a
+one-time sync.
+
+Mount additional data directories when creating the project instance:
+
+```
+coop up . --extra-mount ~/data:/data
+```
+
+After the environment is running, connect to it:
+
+```
+coop shell
+coop claude
+coop codex
+```
+
+### 3. Restart a stopped instance
 
 ```
 coop start
 ```
 
-This creates a VM instance from the template, boots it, waits for SSH, and injects Claude Code and Codex credentials/config. The instance gets an auto-generated name.
+`coop start` only starts existing stopped instances. Use it after `coop stop`
+when you want to boot the same VM disk again. If exactly one stopped instance
+exists, the name is optional.
 
-Name it explicitly:
+Restart a specific stopped instance:
 
 ```
 coop start my-project
 ```
 
-Sync a local directory into the VM as `/workspace`:
+Restart by project path when the instance was created for that project:
 
 ```
-coop start my-project --workspace ~/code/my-project
+coop start --workspace ~/code/my-project
 ```
 
-Clone a git repository inside the VM instead:
+Creation options belong to `coop up`, not `coop start`:
 
 ```
-coop start my-project --git-repo https://github.com/user/repo
-```
-
-Set a custom disk size for the instance (must be >= template size):
-
-```
-coop start my-project --disk 40
-```
-
-Mount host directories into the VM:
-
-```
-coop start my-project --mount ~/data
-coop start my-project --mount ~/data:/guest/data --mount ~/models:/guest/models
-```
-
-`--mount HOST_PATH[:GUEST_PATH]` is repeatable. On macOS/Lima, mounts are live virtiofs mounts. On Linux/Firecracker, mounts are a one-time rsync sync. Conflicts with `--workspace` and `--git-repo`.
-
-Start from a specific named image:
-
-```
-coop start my-project --image python-dev
+coop up ~/code/my-project --disk 40 --mount
 ```
 
 Skip Claude Code and Codex credential/config injection:
@@ -155,7 +172,7 @@ Skip Claude Code and Codex credential/config injection:
 coop start my-project --no-agents
 ```
 
-### 3. Connect
+### 4. Connect
 
 **Launch Claude Code inside the VM:**
 
@@ -163,7 +180,7 @@ coop start my-project --no-agents
 coop claude
 ```
 
-During `coop start`, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts by default. The VM itself is the isolation boundary. For permission prompts (coop launches `claude` with `--permission-mode default`):
+During VM startup, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts by default. The VM itself is the isolation boundary. For permission prompts (coop launches `claude` with `--permission-mode default`):
 
 ```
 coop claude --ask
@@ -200,7 +217,7 @@ coop shell -- ls /workspace
 coop exec -- docker ps
 ```
 
-### 4. Check status
+### 5. Check status
 
 ```
 coop status
@@ -214,7 +231,7 @@ coop status my-project
 
 Running instances report resource usage: load average, memory, and disk.
 
-### 5. Sync files
+### 6. Sync files
 
 Push local changes into a running VM:
 
@@ -228,7 +245,7 @@ Pull guest changes back to the host:
 coop pull
 ```
 
-Both commands default to the workspace path from `coop start --workspace`. Override with `--dir`:
+Both commands default to the workspace path recorded by `coop up`. Override with `--dir`:
 
 ```
 coop push --dir ~/other-dir
@@ -264,10 +281,10 @@ coop setup --image python-dev --profile python
 coop setup --image polyglot --profile python,node,rust
 ```
 
-Start an instance from a specific image:
+Create a project environment from a specific image:
 
 ```
-coop start --image python-dev
+coop up . --image python-dev
 ```
 
 List images:

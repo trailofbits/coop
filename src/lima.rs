@@ -47,7 +47,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     generate_start_template(cfg, image)?;
 
     eprintln!("\nSetup complete.");
-    eprintln!("Run `coop start` to launch a VM.");
+    eprintln!("Run `coop up` in a project directory to launch a VM.");
     Ok(())
 }
 

@@ -1,42 +1,41 @@
 # Workspace Sync
 
-coop moves code between the host and guest VM. There are three ways to get code in, and two commands, `push` and `pull`, for ongoing sync.
+coop moves code between the host and guest VM. The normal way to get code in is `coop up`, with `push` and `pull` for ongoing sync.
 
 ## Getting Code into the VM
 
-### Local directory (`--workspace`)
+### Project environment (`coop up`)
 
 ```bash
-coop start --workspace ./my-project
+coop up ./my-project
+coop up ./my-project --mount
 ```
 
-This tar-pipes the contents of `./my-project` into `/workspace` inside the guest over SSH. Both sides independently SHA-256-hash the tar stream. If the checksums diverge, the transfer aborts.
+`coop up` treats the directory as the project identity. Re-running the same
+command finds the existing instance for that directory instead of allocating
+another VM. The default transport is copy/sync into `/workspace`; `--mount`
+uses mount transport for the project directory. On macOS/Lima this is live
+filesystem sharing; on Linux/Firecracker it is a one-time sync. Use
+`--extra-mount HOST:GUEST` for additional mounted data directories when
+creating the project instance. If the instance already exists, destroy it
+first to change creation-time choices such as transport, image, disk size, or
+extra mounts.
 
-coop persists the host-to-guest path mapping in `workspace.json` so that later `push` and `pull` calls resolve paths automatically.
+`coop up` in copy mode tar-pipes the project into `/workspace` inside the
+guest over SSH. Both sides independently SHA-256-hash the tar stream. If the
+checksums diverge, the transfer aborts. coop persists the host-to-guest path
+mapping in `workspace.json` so that later `push` and `pull` calls resolve paths
+automatically.
 
-### Git clone (`--git-repo`)
-
-```bash
-coop start --git-repo https://github.com/org/repo.git
-```
-
-Clones the repository inside the guest at `/workspace/repo`. Nothing transfers from the host. The resulting `workspace.json` has a null `host_path`, so `push` and `pull` require an explicit directory argument.
-
-For private GitHub repositories, coop resolves a host-side token (`gh auth token` first, then `GITHUB_TOKEN`) and forwards it to git in the guest via a one-shot credential helper for this clone only. The token never appears on argv and never persists in the guest. Without a token, the clone runs unauthenticated and will fail for private repos.
-
-### Host mount (`--mount`)
-
-```bash
-coop start --mount ~/data
-coop start --mount ~/data:/mnt/data
-```
-
-Mounts a host directory into the guest. Behavior differs by backend:
+`coop up --mount` mounts the project directory into the guest. Behavior differs
+by backend:
 
 - **Lima (macOS)**: Live virtiofs mount. Changes on host are visible in guest immediately and vice versa.
 - **Firecracker (Linux)**: One-time rsync sync at boot. Not a live mount. Use `coop push` / `coop pull` to sync changes afterward.
 
-If GUEST_PATH is omitted, defaults to `/workspace`. Conflicts with `--workspace` and `--git-repo`.
+Additional host data can be mounted at creation time with
+`coop up --extra-mount HOST_PATH:GUEST_PATH`. In copy mode, extra mounts must
+not target `/workspace`, because the copied project owns that path.
 
 #### Mounting a git repository (live-mount caveat)
 
@@ -49,7 +48,10 @@ Because the mount is live, those entries appear on the host as well. After the V
 
 coop prints a warning at start time when a live-mount source is a git repo. To avoid the issue, do not run commands inside the guest that record absolute paths in `.git/config` — in particular, `git worktree add` and `prek install` (or any other tool that calls `git config core.hooksPath`).
 
-Switching from `--mount` to `--workspace` does not on its own fix this: `--workspace` copies the repo into the guest, but `.git/` is included by default and is brought back by `coop pull`, so corrupted config entries written inside the guest still reach the host. Either avoid the offending commands or pass `--exclude-git` on `coop pull`.
+Switching from mount mode to copy mode does not on its own fix this: copy mode
+includes `.git/` by default and `coop pull` can bring corrupted config entries
+written inside the guest back to the host. Either avoid the offending commands
+or pass `--exclude-git` on `coop pull`.
 
 ### Manual via SSH
 
@@ -62,13 +64,13 @@ No workspace state is recorded. `push` and `pull` will not work without a `works
 
 ## State file: `workspace.json`
 
-Starting a VM with `--workspace`, `--git-repo`, or `--mount` writes a `workspace.json` in the instance directory:
+Creating a project VM with `coop up` writes a `workspace.json` in the instance directory:
 
 | Field        | Description                                                    |
 |-------------|----------------------------------------------------------------|
-| `host_path`  | Absolute path on the host (null for `--git-repo` workspaces)  |
+| `host_path`  | Absolute path on the host                                     |
 | `guest_path` | Path inside the guest VM (always `/workspace`)                 |
-| `source`     | How the workspace was created: `workspace`, `git_repo`, or `mount` |
+| `source`     | How the workspace was created: `workspace` or `mount`          |
 
 `push` and `pull` read this file to resolve default paths.
 
@@ -118,7 +120,7 @@ All transfers (rsync and tar-pipe) exclude these reproducible build and cache di
 - `.venv/`
 - `.coop/`
 
-`.git/` is **included** by default so agents in the guest get full history, branches, and the ability to make commits that survive a `coop pull`. Pass `--exclude-git` to `coop start`, `coop push`, or `coop pull` to skip it on a per-transfer basis (useful for very large repos where transfer time dominates).
+`.git/` is **included** by default so agents in the guest get full history, branches, and the ability to make commits that survive a `coop pull`. Pass `--exclude-git` to `coop up`, `coop push`, or `coop pull` to skip it on a per-transfer basis (useful for very large repos where transfer time dominates).
 
 ## .gitignore integration
 

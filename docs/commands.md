@@ -14,11 +14,67 @@ coop creates isolated VM environments for running Claude Code and Codex. It runs
 
 Most commands accept an optional instance name. coop resolves the target instance with three rules:
 
-- **Zero instances exist.** The command fails and tells you to run `coop start`.
+- **Zero instances exist.** The command fails and tells you to run `coop up`.
 - **One instance exists.** The name is optional. coop selects it automatically.
 - **Multiple instances exist.** The name is required. coop lists available instances on error.
 
 ## Commands
+
+### `up`
+
+Ensure an environment exists and is running for a project directory.
+
+```
+coop up [DIR] [FLAGS]
+```
+
+`DIR` defaults to the current directory. coop canonicalizes it and uses it as
+the project identity for instance naming, devcontainer discovery, GitHub PAT
+lookup, and future `coop up DIR` affinity. If a matching instance is already
+running, `up` reports success without creating another VM. If a matching
+instance is stopped, `up` restarts it. If no matching instance exists, `up`
+creates one.
+
+By default, `up` copies/syncs the project into `/workspace`. Pass `--mount` to use the mount transport for the
+project at `/workspace` instead. On macOS/Lima this is a live virtiofs mount;
+on Linux/Firecracker it is a one-time sync.
+`--copy` is accepted as an explicit spelling of the default.
+
+| Flag | Description |
+|------|-------------|
+| `DIR` | Project directory (default: current directory) |
+| `--name <name>` | Instance name to use when creating the project environment |
+| `--copy` | Copy/sync `DIR` into `/workspace` (default) |
+| `--mount` | Mount `DIR` at `/workspace` instead of using `--copy` |
+| `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`) |
+| `--vcpus <N>` | Number of vCPUs when creating a new instance |
+| `--mem <MiB>` | Memory in MiB when creating a new instance |
+| `--disk <GiB>` | Instance disk size when creating a new instance |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--image <name>` | Named image to use when creating a new instance (default: `default`) |
+| `--exclude-git` | Skip the `.git/` directory when copying/syncing |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
+| `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
+| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work |
+
+```
+coop up .
+coop up ~/code/my-project --mount
+coop up . --copy --forward-port 3000
+coop up . --extra-mount ~/data:/data
+```
+
+Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
+`--extra-mount`, `--exclude-git`, and `--devcontainer` are applied only when
+`up` creates a new instance. If a matching project instance already exists,
+destroy it first to recreate it with different creation options. Runtime
+startup options such as `--forward-port`, `--post-start`, and `--env` can be
+used when `up` creates or restarts an instance; if the matching instance is
+already running, stop it first so those options can take effect.
 
 ### `init`
 
@@ -41,8 +97,8 @@ coop setup [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `-y`, `--yes` | Skip confirmation prompts (accept all) |
-| `--vcpus <N>` | Number of vCPUs (overrides config) |
-| `--mem <MiB>` | Memory in MiB (overrides config) |
+| `--vcpus <N>` | Number of vCPUs for generated devcontainer/setup settings (overrides config) |
+| `--mem <MiB>` | Memory in MiB for generated devcontainer/setup settings (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
 | `--extra-packages <list>` | Comma-separated extra apt packages to install |
@@ -74,25 +130,30 @@ No additional flags.
 
 ### `start`
 
-Launch a new VM instance.
+Start an existing stopped VM instance.
 
 ```
 coop start [NAME] [FLAGS]
 ```
 
+`start` is restart-only: it never creates a new instance. Use `coop up [DIR]`
+to create or reconnect to a project environment. Without `NAME`, `start`
+restarts the only stopped instance if exactly one exists; with multiple stopped
+instances, pass the instance name.
+
 | Flag | Description |
 |------|-------------|
-| `NAME` | Instance name (auto-generated if omitted) |
-| `--workspace <dir>` | Local directory to sync into the VM (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Git repository URL to clone inside the VM (conflicts with `--workspace`) |
-| `--vcpus <N>` | Number of vCPUs (overrides config) |
-| `--mem <MiB>` | Memory in MiB (overrides config) |
-| `--disk <GiB>` | Instance disk size in GiB (grows from template size if larger) |
+| `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
+| `--workspace <dir>` | Restart the stopped instance associated with this project path (conflicts with `--git-repo`) |
+| `--git-repo <url>` | Creation-time option retained only for compatibility; use `coop up` for new project environments |
+| `--vcpus <N>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--mem <MiB>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--disk <GiB>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
-| `--image <name>` | Named image to use (default: `default`) |
-| `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
+| `--image <name>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--mount <spec>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
-| `--exclude-git` | Skip the `.git/` directory when syncing the workspace (conflicts with `--git-repo`). |
+| `--exclude-git` | Creation-time option retained only for compatibility; rejected on restart |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
@@ -100,17 +161,12 @@ coop start [NAME] [FLAGS]
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
 
-When `--workspace <dir>` contains a `.devcontainer/devcontainer.json` (or one of `--mount`'s host roots does), coop reads a subset of it and prompts before applying. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
-
-`--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
-
-For private GitHub repos, `--git-repo` resolves a host-side token (`gh auth token` first, then `GITHUB_TOKEN`) and hands it to git in the guest via a one-shot credential helper. Without a token, the clone runs unauthenticated and will fail for private repos.
+When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
 
 ```
-coop start my-project --workspace ./src --vcpus 4 --mem 8192
-coop start --git-repo https://github.com/org/repo.git --disk 50
-coop start --image ml-dev --no-agents
-coop start --mount ~/data:/mnt/data
+coop start
+coop start my-project
+coop start my-project --no-agents
 coop start --env RUST_LOG=info --env MY_FLAG=1
 coop start --forward-port 3000 --forward-port 8080:18080
 ```
@@ -140,7 +196,7 @@ coop shell my-project -- cat /etc/os-release
 
 ### `claude`
 
-Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during `coop start`) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
+Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
 
 ```
 coop claude [NAME] [FLAGS] [ARGS...]

@@ -96,7 +96,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         "\nSetup complete. All artifacts are in {}/",
         cfg.data_dir.display()
     );
-    eprintln!("Run `coop start` to launch the VM.");
+    eprintln!("Run `coop up` in a project directory to launch a VM.");
     Ok(())
 }
 

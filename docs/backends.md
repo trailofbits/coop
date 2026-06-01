@@ -38,7 +38,7 @@ Each instance is a Lima VM created with `limactl start` using the fast-start tem
 The Lima template configures:
 - `vmType: "vz"` (Virtualization.framework, not QEMU)
 - Rosetta enabled for x86_64 binary translation on Apple Silicon
-- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop start --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides.
+- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides.
 - Lima's built-in containerd disabled (Docker is installed in the guest instead)
 
 ### Disk resize
@@ -72,7 +72,7 @@ All three steps are idempotent. If the artifact already exists and is up to date
 
 ### How instances work
 
-Creating an instance (`coop start`) follows this sequence:
+Creating an instance (`coop up`) follows this sequence:
 
 1. Copies the template rootfs to the instance directory using `cp --reflink=auto` for copy-on-write on supported filesystems.
 2. Mounts the copy and patches the guest network config with the instance's unique IP address and hostname.
@@ -141,7 +141,8 @@ Both backends support the same CLI commands and guest capabilities:
 | Capability | Lima (macOS) | Firecracker (Linux) |
 |---|---|---|
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
-| `coop start` | `limactl start` with fast-start template | Copies rootfs, configures TAP, starts Firecracker |
+| `coop up` | Creates or reconnects/restarts a project VM | Copies rootfs, configures TAP, starts Firecracker |
+| `coop start` | Starts an existing stopped Lima VM | Starts an existing stopped Firecracker VM |
 | `coop stop` | `limactl stop` | API socket shutdown, SIGTERM, SIGKILL |
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |

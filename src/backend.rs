@@ -1529,7 +1529,7 @@ fn managed_claude_settings_json() -> String {
 
 /// Write coop's managed `~/.claude/settings.json` to the guest.
 ///
-/// Runs every `coop start`, overwriting any in-guest edits. The file
+/// Runs every VM startup, overwriting any in-guest edits. The file
 /// is small and owned by coop; users wanting per-VM customization should
 /// extend coop's config rather than editing the guest file in place.
 fn write_managed_claude_settings(target: &SshTarget) -> Result<()> {
@@ -1929,7 +1929,7 @@ pub fn clone_git_repo(
                 "Failed to clone {repo_url} in guest. \
                  If this is a private repo, configure a PAT with \
                  `coop github setup-pat --repo <owner/repo>`, run `gh auth login`, \
-                 or set `GITHUB_TOKEN` on the host before `coop start --git-repo`."
+                 or set `GITHUB_TOKEN` on the host before starting the VM."
             )
         } else {
             format!("Failed to clone {repo_url} in guest")

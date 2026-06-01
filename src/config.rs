@@ -618,7 +618,7 @@ pub struct CoopConfig {
     #[serde(default)]
     pub post_start: Option<String>,
 
-    /// Default host:guest port forwards applied to every `coop start`.
+    /// Default host:guest port forwards applied to every VM startup.
     ///
     /// CLI `--forward-port` values are appended; later entries override
     /// earlier ones with the same guest port.
@@ -926,7 +926,7 @@ pub struct PatConfig {
     /// [`RepoSlug`](crate::github_repo::RepoSlug).
     #[serde(default, rename = "pat")]
     pub entries: std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
-    /// Repos for which the auto-prompt at `coop start` is suppressed.
+    /// Repos for which the VM startup auto-prompt is suppressed.
     #[serde(default)]
     pub skip: Vec<crate::github_repo::RepoSlug>,
 }
@@ -1308,10 +1308,10 @@ pub struct ClaudeConfig {
     pub config_dir: ConfigDir,
 }
 
-/// `[setup]` section: controls one-time UX behaviour at `coop start`.
+/// `[setup]` section: controls one-time UX behaviour at VM startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
-    /// Whether `coop start` prompts the user to set up a fine-grained PAT
+    /// Whether VM startup prompts the user to set up a fine-grained PAT
     /// when the resolved repo has no entry. Set to `false` to suppress
     /// globally. The per-repo `skip` list under `[github]` suppresses
     /// individual repos.
@@ -1371,8 +1371,8 @@ fn validate_instance_name(name: &str) -> Result<()> {
         );
         if looks_like_path(name) {
             msg.push_str(
-                ".\nIf you meant to start an instance for that directory, \
-                 use `--workspace <PATH>` or `--mount <PATH>`",
+                ".\nIf you meant to create or reconnect to a project environment, \
+                 use `coop up <PATH>`",
             );
         }
         bail!(msg);
@@ -1382,7 +1382,7 @@ fn validate_instance_name(name: &str) -> Result<()> {
 
 /// Whether a rejected instance name looks like the user typed a filesystem
 /// path by mistake (e.g. `coop start ~/projects/foo`). Used only to enrich
-/// the validation error with a hint toward `--workspace`/`--mount`.
+/// the validation error with a hint toward `coop up <PATH>`.
 fn looks_like_path(name: &str) -> bool {
     name.contains('/') || name.starts_with('~')
 }
@@ -1880,7 +1880,7 @@ impl CoopConfig {
                     let available = self.format_instance_list_or_none();
                     format!(
                         "No instance named '{name}'. {available}\n\
-                         Create one with: coop start --name {name}"
+                         Create one with: coop up . --name {name}"
                     )
                 });
         }
@@ -1894,7 +1894,7 @@ impl CoopConfig {
         } else if instances.is_empty() {
             bail!(
                 "No instances found.\n\
-                 Create one with: coop start\n\
+                 Create one with: coop up\n\
                  (Run `coop setup` first if you haven't built an image yet.)"
             )
         } else {
@@ -2735,8 +2735,8 @@ mod tests {
                 "expected base rejection for {name:?}, got: {err}"
             );
             assert!(
-                err.contains("--workspace") && err.contains("--mount"),
-                "expected workspace/mount hint for {name:?}, got: {err}"
+                err.contains("coop up <PATH>"),
+                "expected coop up hint for {name:?}, got: {err}"
             );
         }
     }

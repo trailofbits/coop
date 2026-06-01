@@ -75,7 +75,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
         opts.config_path.display(),
         cmd_str,
     );
-    eprintln!("\nDone. `coop start --git-repo https://github.com/{repo}` will use this token.");
+    eprintln!("\nDone. VM startups for https://github.com/{repo} will use this token.");
     Ok(())
 }
 
@@ -734,7 +734,7 @@ fn pick_backend() -> Result<crate::secret_store::Backend> {
 ///
 /// Holds an exclusive `flock` on a sibling `.lock` file across the
 /// read-modify-write window so concurrent wizard invocations (e.g. two
-/// `coop start` auto-prompts firing at once) don't lose each other's
+/// VM startup auto-prompts firing at once) don't lose each other's
 /// writes.
 fn upsert_pat_entry(path: &Path, repo: &RepoSlug, token_cmd: &str) -> Result<()> {
     let _lock = crate::fs_util::lock_sibling(path)?;
@@ -892,7 +892,7 @@ fn doc_contains_literal_token(doc: &toml::Value) -> bool {
     })
 }
 
-/// Hint helper used by `coop start` and other code paths to format the
+/// Hint helper used by VM startup code paths to format the
 /// "no entry for this repo" error consistently.
 pub fn missing_entry_error(repo: &RepoSlug) -> String {
     format!(

@@ -391,25 +391,39 @@ test_setup() {
 
 # ── Primary instance lifecycle ────────────────────────────────
 
-test_start() {
+test_up_creates_primary_instance() {
     echo ""
-    echo "=== Phase: start ==="
+    echo "=== Phase: up creates primary instance ==="
 
     # `--env` exercises the guest_env CLI -> config -> SendEnv path
     # end-to-end. `test_guest_environment` verifies the value is
     # visible inside the guest via `printenv`.
+    mkdir -p "$tmpdir/primary-ws"
     local args=(
-        start "$INSTANCE" --no-agents
+        up "$tmpdir/primary-ws" --name "$INSTANCE" --no-agents --no-devcontainer
         --env "COOP_TEST_GUEST_ENV=hello-from-cli"
     )
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$INSTANCE")
-        pass "start exits 0"
+        pass "up creates primary instance"
     else
-        fail "start exits 0" "exit code: $?"
+        fail "up creates primary instance" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
-        echo "FATAL: start failed, cannot continue"
+        echo "FATAL: primary instance creation failed, cannot continue"
         exit 1
+    fi
+}
+
+test_start_rejects_missing_instance() {
+    echo ""
+    echo "=== Phase: start rejects missing instance ==="
+
+    local missing="${INSTANCE}-missing"
+    if moat_fails start "$missing" --no-agents; then
+        pass "start rejects missing instance"
+    else
+        fail "start rejects missing instance" "should have failed"
+        coop destroy "$missing" 2>/dev/null || true
     fi
 }
 
@@ -417,12 +431,21 @@ test_duplicate_name() {
     echo ""
     echo "=== Phase: duplicate instance name ==="
 
-    if moat_fails start "$INSTANCE" --no-agents; then
+    local other_ws="$tmpdir/duplicate-ws"
+    mkdir -p "$other_ws"
+    if moat_fails up "$other_ws" --name "$INSTANCE" --no-agents --no-devcontainer; then
         pass "rejects duplicate instance name"
     else
         fail "rejects duplicate instance name" "should have failed"
         # Clean up the accidental second instance
         coop destroy "$INSTANCE" 2>/dev/null || true
+    fi
+
+    if moat_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents --no-devcontainer; then
+        pass "rejects mismatched name for existing project"
+    else
+        fail "rejects mismatched name for existing project" "should have failed"
+        coop destroy "${INSTANCE}-other" 2>/dev/null || true
     fi
 }
 
@@ -846,16 +869,17 @@ CFGEOF
         return
     }
 
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" start \
-            "$pat_instance" \
-            --workspace "$ws_dir" \
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up \
+            "$ws_dir" \
+            --name "$pat_instance" \
             --no-agents \
+            --no-devcontainer \
             --no-prompt \
             >"$tmpdir/pat-start.out" 2>&1; then
         STARTED_INSTANCES+=("$pat_instance")
-        pass "pat: start with --workspace whose origin matches the configured slug"
+        pass "pat: up with workspace whose origin matches the configured slug"
     else
-        fail "pat: start with --workspace whose origin matches the configured slug" \
+        fail "pat: up with workspace whose origin matches the configured slug" \
             "$(cat "$tmpdir/pat-start.out")"
         env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" destroy "$pat_instance" 2>/dev/null || true
         return
@@ -1479,6 +1503,13 @@ test_restart_rejects_ignored_flags() {
         coop stop "$INSTANCE" 2>/dev/null || true
     fi
 
+    if moat_fails start "$INSTANCE" --no-agents --vcpus 4; then
+        pass "restart with --vcpus rejected"
+    else
+        fail "restart with --vcpus rejected" "should have failed"
+        coop stop "$INSTANCE" 2>/dev/null || true
+    fi
+
     if moat_fails start "$INSTANCE" --no-agents --exclude-git; then
         pass "restart with --exclude-git rejected"
     else
@@ -1495,73 +1526,6 @@ test_restart_rejects_ignored_flags() {
 
     # Stop again for the destroy phase
     coop stop "$INSTANCE" || true
-    rm -rf "$mount_dir"
-}
-
-# Issue #214 regression: with $INSTANCE stopped and unrelated to the user's
-# intent, `coop start --mount <dir>` (no --name, no --workspace) must allocate
-# a fresh VM rather than reusing the stopped one or bailing with a destroy
-# advisory. The unit tests cover the predicate; this phase exercises the full
-# cmd_start path that uses it.
-test_bare_start_allocates_fresh() {
-    echo ""
-    echo "=== Phase: bare start --mount allocates fresh instance ==="
-
-    local mount_dir
-    mount_dir=$(mktemp -d)
-
-    # Snapshot instance names before allocating. The only entry should be the
-    # stopped $INSTANCE left by the previous phase.
-    local before_names
-    before_names=$(RUST_LOG=off "$BINARY" status 2>/dev/null \
-        | awk '/running|stopped/ {print $1}' | sort -u)
-
-    if ! coop start --no-agents --mount "$mount_dir"; then
-        fail "bare start --mount exits 0" "exit=$?; stderr: $HARNESS_ERR"
-        rm -rf "$mount_dir"
-        return
-    fi
-    pass "bare start --mount exits 0"
-
-    local after_names
-    after_names=$(RUST_LOG=off "$BINARY" status 2>/dev/null \
-        | awk '/running|stopped/ {print $1}' | sort -u)
-
-    local new_name
-    new_name=$(comm -13 <(echo "$before_names") <(echo "$after_names") | head -n1)
-
-    if [[ -z "$new_name" ]]; then
-        fail "fresh instance allocated" "no new name in status; after: $after_names"
-        rm -rf "$mount_dir"
-        return
-    fi
-    STARTED_INSTANCES+=("$new_name")
-    pass "fresh instance allocated ($new_name)"
-
-    if [[ "$new_name" == "$INSTANCE" ]]; then
-        fail "fresh instance is distinct from stopped \$INSTANCE" "got: $new_name"
-    else
-        pass "fresh instance is distinct from stopped \$INSTANCE"
-    fi
-
-    # The pre-existing $INSTANCE must remain stopped and untouched. Capture
-    # `status` output before grep'ing — piping directly into `grep -q` lets
-    # grep exit early on the first match, which closes the pipe and makes
-    # `coop status` exit non-zero (SIGPIPE/BrokenPipe) on the remaining
-    # writes; combined with `set -o pipefail` that turns a passing match
-    # into a spurious failure when other instances follow ours.
-    local status_out
-    status_out=$(RUST_LOG=off "$BINARY" status 2>/dev/null || true)
-    if echo "$status_out" | grep -qE "^${INSTANCE} +stopped\\b"; then
-        pass "pre-existing stopped instance untouched"
-    else
-        fail "pre-existing stopped instance untouched" "status: $status_out"
-    fi
-
-    # Tear down the freshly allocated instance so subsequent phases see the
-    # same world they expect: $INSTANCE stopped, no other coop VMs.
-    coop destroy "$new_name" 2>/dev/null || true
-    untrack_instance "$new_name"
     rm -rf "$mount_dir"
 }
 
@@ -1646,8 +1610,10 @@ test_idempotency() {
 
     # stop idempotency: start an instance, stop it twice
     local inst_name="${INSTANCE}-idem"
-    if ! coop start "$inst_name" --no-agents; then
-        fail "start for stop-idempotency test" "exit code: $?"
+    local idem_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$idem_ws"
+    if ! coop up "$idem_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+        fail "up for stop-idempotency test" "exit code: $?"
         return
     fi
     STARTED_INSTANCES+=("$inst_name")
@@ -1674,7 +1640,7 @@ test_idempotency() {
 # ── Quickstart (--full only) ──────────────────────────────────
 
 # `coop quickstart` chains ensure-image, ensure-instance, launch-claude. The
-# first two steps share code with `coop setup` / `coop start` (covered above);
+# first two steps share code with `coop setup` / `coop up` (covered above);
 # this phase exercises the reconnect/restart logic specific to quickstart and
 # the workspace-affinity lookup that drives it.
 #
@@ -1802,6 +1768,141 @@ test_quickstart() {
     rm -rf "$qs_ws"
 }
 
+# ── Project workflow tests (`coop up`, --full only) ───────────
+
+test_up_project_workflow() {
+    echo ""
+    echo "=== Phase: project up ==="
+
+    local up_ws up_inst_name
+    up_ws=$(mktemp -d "$tmpdir/up-ws-XXXXXX")
+    echo "up-copy-content" > "$up_ws/hello.txt"
+    up_inst_name=${up_ws##*/}
+    up_inst_name=${up_inst_name//[!a-zA-Z0-9_-]/-}
+
+    if coop up "$up_ws" --no-agents --no-devcontainer; then
+        STARTED_INSTANCES+=("$up_inst_name")
+        pass "up copy creates project instance"
+    else
+        fail "up copy creates project instance" "exit code: $? stderr: $HARNESS_ERR"
+        rm -rf "$up_ws"
+        return
+    fi
+
+    GUEST_INSTANCE="$up_inst_name"
+    local content
+    if content=$(guest_exec cat /workspace/hello.txt); then
+        if [[ "$content" == "up-copy-content" ]]; then
+            pass "up copy syncs project into /workspace"
+        else
+            fail "up copy syncs project into /workspace" "got: $content"
+        fi
+    else
+        fail "up copy syncs project into /workspace" "file not found"
+    fi
+    unset GUEST_INSTANCE
+
+    local pre_list post_list
+    pre_list=$("$BINARY" list 2>/dev/null | sort)
+    if coop up "$up_ws" --no-devcontainer; then
+        pass "up copy re-run exits 0 while running"
+    else
+        fail "up copy re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    post_list=$("$BINARY" list 2>/dev/null | sort)
+    if [[ "$pre_list" == "$post_list" ]]; then
+        pass "up copy reuses running project instance"
+    else
+        fail "up copy reuses running project instance" \
+            "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
+    fi
+
+    if coop stop "$up_inst_name" && coop up "$up_ws" --no-agents --no-devcontainer; then
+        pass "up copy restarts stopped project instance"
+    else
+        fail "up copy restarts stopped project instance" "stderr: $HARNESS_ERR"
+    fi
+
+    local reject_ws data_dir
+    reject_ws=$(mktemp -d "$tmpdir/up-reject-XXXXXX")
+    data_dir=$(mktemp -d "$tmpdir/up-data-XXXXXX")
+    if moat_fails up "$reject_ws" --extra-mount "$data_dir" --no-devcontainer; then
+        if echo "$HARNESS_ERR" | grep -q "/workspace"; then
+            pass "up copy rejects host-only extra mount at /workspace"
+        else
+            fail "up copy rejects host-only extra mount at /workspace" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "up copy rejects host-only extra mount at /workspace" \
+            "command unexpectedly succeeded"
+    fi
+    rm -rf "$reject_ws" "$data_dir"
+
+    coop destroy "$up_inst_name" 2>/dev/null || true
+    untrack_instance "$up_inst_name"
+    rm -rf "$up_ws"
+
+    local mount_ws mount_inst_name
+    mount_ws=$(mktemp -d "$tmpdir/up-mount-XXXXXX")
+    echo "up-mount-content" > "$mount_ws/marker.txt"
+    mount_inst_name=${mount_ws##*/}
+    mount_inst_name=${mount_inst_name//[!a-zA-Z0-9_-]/-}
+
+    if coop up "$mount_ws" --mount --no-agents --no-devcontainer; then
+        STARTED_INSTANCES+=("$mount_inst_name")
+        pass "up mount creates project instance"
+    else
+        fail "up mount creates project instance" "exit code: $? stderr: $HARNESS_ERR"
+        rm -rf "$mount_ws"
+        return
+    fi
+
+    GUEST_INSTANCE="$mount_inst_name"
+    if content=$(guest_exec cat /workspace/marker.txt); then
+        if [[ "$content" == "up-mount-content" ]]; then
+            pass "up mount exposes project at /workspace"
+        else
+            fail "up mount exposes project at /workspace" "got: $content"
+        fi
+    else
+        fail "up mount exposes project at /workspace" "file not found"
+    fi
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "live-up-update" > "$mount_ws/live.txt"
+        if content=$(guest_exec cat /workspace/live.txt); then
+            if [[ "$content" == "live-up-update" ]]; then
+                pass "up mount is live on Lima"
+            else
+                fail "up mount is live on Lima" "got: $content"
+            fi
+        else
+            fail "up mount is live on Lima" "file not found"
+        fi
+    else
+        skip "up mount live sync" "Firecracker uses one-time rsync sync"
+    fi
+    unset GUEST_INSTANCE
+
+    pre_list=$("$BINARY" list 2>/dev/null | sort)
+    if coop up "$mount_ws" --mount --no-devcontainer; then
+        pass "up mount re-run exits 0 while running"
+    else
+        fail "up mount re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    post_list=$("$BINARY" list 2>/dev/null | sort)
+    if [[ "$pre_list" == "$post_list" ]]; then
+        pass "up mount reuses running project instance"
+    else
+        fail "up mount reuses running project instance" \
+            "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
+    fi
+
+    coop destroy "$mount_inst_name" 2>/dev/null || true
+    untrack_instance "$mount_inst_name"
+    rm -rf "$mount_ws"
+}
+
 # ── Workspace sync tests (--full only) ────────────────────────
 
 test_workspace_sync() {
@@ -1825,13 +1926,13 @@ test_workspace_sync() {
         git -c user.email=ci@test -c user.name=CI commit --allow-empty --quiet -m "init"
     ) || fail "set up git repo in workspace tmpdir" "git init/commit failed"
 
-    # Start instance with --workspace
-    local args=(start "$ws_instance" --no-agents --workspace "$ws_tmpdir")
+    # Create instance for the workspace.
+    local args=(up "$ws_tmpdir" --name "$ws_instance" --no-agents --no-devcontainer)
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$ws_instance")
-        pass "start with --workspace exits 0"
+        pass "up with workspace exits 0"
     else
-        fail "start with --workspace exits 0" "exit code: $?"
+        fail "up with workspace exits 0" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
         return
     fi
@@ -1922,160 +2023,6 @@ test_workspace_sync() {
     ws_tmpdir=""
 }
 
-# ── Private GitHub clone (--full only) ────────────────────────
-#
-# Exercises the `--git-repo` auth path against the (private) trailofbits/coop
-# repo. Skipped if the host has neither a usable `gh` token nor `GITHUB_TOKEN`,
-# so the test can run on machines that don't have GitHub credentials wired up.
-test_git_repo_private_clone() {
-    echo ""
-    echo "=== Phase: --git-repo against private GitHub repo ==="
-
-    if ! command -v gh >/dev/null 2>&1 || ! gh auth token >/dev/null 2>&1; then
-        if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-            skip "--git-repo clones private trailofbits/coop" \
-                "no gh auth token and GITHUB_TOKEN unset"
-            return
-        fi
-    fi
-
-    local repo_instance="${INSTANCE}-gitrepo"
-    local repo_url="https://github.com/trailofbits/coop.git"
-
-    if coop start "$repo_instance" --no-agents --git-repo "$repo_url"; then
-        STARTED_INSTANCES+=("$repo_instance")
-        pass "start with --git-repo against private repo exits 0"
-    else
-        fail "start with --git-repo against private repo exits 0" "exit code: $?"
-        echo "stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$repo_instance"
-
-    # Verify the clone landed: a few files we know exist in this repo.
-    if guest_exec test -f /workspace/repo/Cargo.toml; then
-        pass "/workspace/repo/Cargo.toml present after private clone"
-    else
-        fail "/workspace/repo/Cargo.toml present after private clone" \
-            "stderr: $(guest_stderr)"
-    fi
-
-    if guest_exec test -f /workspace/repo/src/backend.rs; then
-        pass "/workspace/repo/src/backend.rs present after private clone"
-    else
-        fail "/workspace/repo/src/backend.rs present after private clone" \
-            "stderr: $(guest_stderr)"
-    fi
-
-    # Token must not persist in the cloned repo's git config (remote URL,
-    # credential helper, or otherwise). The clone uses a one-shot
-    # `-c credential.helper=...` which is not written to .git/config.
-    local git_config
-    if git_config=$(guest_exec cat /workspace/repo/.git/config); then
-        if echo "$git_config" | grep -Eq '(x-access-token|ghp_|gho_|ghu_|ghs_|github_pat_|credential\.helper)'; then
-            fail "no token or credential helper persisted in .git/config" \
-                "config contained sensitive markers"
-        else
-            pass "no token or credential helper persisted in .git/config"
-        fi
-    else
-        fail "no token or credential helper persisted in .git/config" \
-            "could not read .git/config: $(guest_stderr)"
-    fi
-
-    # The user's global gitconfig in the guest should not have been written
-    # with a credential helper by this code path (--no-agents skips the
-    # separate `gh auth setup-git` flow).
-    if guest_exec test -f /home/coop/.gitconfig; then
-        local global_config
-        global_config=$(guest_exec cat /home/coop/.gitconfig 2>/dev/null || echo "")
-        if echo "$global_config" | grep -q 'credential.helper'; then
-            fail "no global git credential helper installed" \
-                "found credential.helper in /home/coop/.gitconfig"
-        else
-            pass "no global git credential helper installed"
-        fi
-    else
-        pass "no global git credential helper installed"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$repo_instance" 2>/dev/null || true
-    untrack_instance "$repo_instance"
-}
-
-# ── Push/pull without --workspace (--full only) ──────────────
-
-test_push_pull_no_workspace() {
-    echo ""
-    echo "=== Phase: push/pull without --workspace ==="
-
-    local nw_instance="${INSTANCE}-nw"
-
-    # Start instance WITHOUT --workspace, --git-repo, or --mount
-    if coop start "$nw_instance" --no-agents; then
-        STARTED_INSTANCES+=("$nw_instance")
-        pass "start without --workspace exits 0"
-    else
-        fail "start without --workspace exits 0" "exit code: $?"
-        echo "stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$nw_instance"
-
-    # Pull with explicit dir should work (no workspace.json exists)
-    local pull_dir
-    pull_dir=$(mktemp -d)
-    if coop pull "$nw_instance" --force --dir "$pull_dir"; then
-        pass "pull with explicit dir (no workspace.json)"
-    else
-        fail "pull with explicit dir (no workspace.json)" "exit code: $?"
-    fi
-    rm -rf "$pull_dir"
-
-    # Push with explicit dir should work
-    local push_dir
-    push_dir=$(mktemp -d)
-    echo "no-workspace-push-test" > "$push_dir/marker.txt"
-    if coop push "$nw_instance" --force --dir "$push_dir"; then
-        pass "push with explicit dir (no workspace.json)"
-
-        # Verify the file arrived in guest at /workspace
-        local content
-        content=$(guest_exec cat /workspace/marker.txt) || content=""
-        if echo "$content" | grep -q "no-workspace-push-test"; then
-            pass "push defaulted to guest:/workspace"
-        else
-            fail "push defaulted to guest:/workspace" "got: '$content'"
-        fi
-    else
-        fail "push with explicit dir (no workspace.json)" "exit code: $?"
-    fi
-    rm -rf "$push_dir"
-
-    # Pull without dir and without workspace.json should fail
-    if moat_fails pull "$nw_instance"; then
-        pass "pull without dir or workspace.json fails"
-    else
-        fail "pull without dir or workspace.json fails" "should have failed"
-    fi
-
-    # Push without dir and without workspace.json should fail
-    if moat_fails push "$nw_instance"; then
-        pass "push without dir or workspace.json fails"
-    else
-        fail "push without dir or workspace.json fails" "should have failed"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$nw_instance" 2>/dev/null || true
-    untrack_instance "$nw_instance"
-}
-
 # ── Multi-instance tests (--full only) ────────────────────────
 
 test_multi_instance() {
@@ -2084,21 +2031,24 @@ test_multi_instance() {
 
     local inst_a="${INSTANCE}-a"
     local inst_b="${INSTANCE}-b"
+    local ws_a="$tmpdir/${inst_a}-ws"
+    local ws_b="$tmpdir/${inst_b}-ws"
+    mkdir -p "$ws_a" "$ws_b"
 
-    # Start two instances
-    if coop start "$inst_a" --no-agents; then
+    # Create two project instances
+    if coop up "$ws_a" --name "$inst_a" --no-agents --no-devcontainer; then
         STARTED_INSTANCES+=("$inst_a")
-        pass "start instance A ($inst_a)"
+        pass "up creates instance A ($inst_a)"
     else
-        fail "start instance A ($inst_a)" "exit code: $?"
+        fail "up creates instance A ($inst_a)" "exit code: $?"
         return
     fi
 
-    if coop start "$inst_b" --no-agents; then
+    if coop up "$ws_b" --name "$inst_b" --no-agents --no-devcontainer; then
         STARTED_INSTANCES+=("$inst_b")
-        pass "start instance B ($inst_b)"
+        pass "up creates instance B ($inst_b)"
     else
-        fail "start instance B ($inst_b)" "exit code: $?"
+        fail "up creates instance B ($inst_b)" "exit code: $?"
         coop destroy "$inst_a" 2>/dev/null || true
         return
     fi
@@ -2197,13 +2147,15 @@ test_named_images() {
         fail "images exits 0" "exit code: $?"
     fi
 
-    # Start an instance from the named image
+    # Create an instance from the named image
     local inst_name="${INSTANCE}-img"
-    if coop start "$inst_name" --no-agents --image "$img_name"; then
+    local img_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$img_ws"
+    if coop up "$img_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start --image $img_name exits 0"
+        pass "up --image $img_name exits 0"
     else
-        fail "start --image $img_name exits 0" "exit code: $?"
+        fail "up --image $img_name exits 0" "exit code: $?"
         coop images --delete "$img_name" 2>/dev/null || true
         return
     fi
@@ -2280,13 +2232,15 @@ CFGEOF
         return
     fi
 
-    # Start instance from custom image
+    # Create instance from custom image
     local inst_name="${INSTANCE}-custom"
-    if "$BINARY" --config "$cfg_file" start "$inst_name" --no-agents --image "$custom_img" 2>"$tmpdir/stderr"; then
+    local custom_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$custom_ws"
+    if "$BINARY" --config "$cfg_file" up "$custom_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$custom_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start with custom profile image exits 0"
+        pass "up with custom profile image exits 0"
     else
-        fail "start with custom profile image exits 0" "exit code: $?"
+        fail "up with custom profile image exits 0" "exit code: $?"
         rm -rf "$cfg_dir"
         return
     fi
@@ -2327,13 +2281,15 @@ test_builtin_profiles() {
         return
     fi
 
-    # Start instance from the profiled image
+    # Create instance from the profiled image
     local inst_name="${INSTANCE}-prof"
-    if coop start "$inst_name" --no-agents --image "$img_name"; then
+    local prof_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$prof_ws"
+    if coop up "$prof_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start from profiled image exits 0"
+        pass "up from profiled image exits 0"
     else
-        fail "start from profiled image exits 0" "exit code: $?"
+        fail "up from profiled image exits 0" "exit code: $?"
         coop images --delete "$img_name" 2>/dev/null || true
         return
     fi
@@ -2392,12 +2348,12 @@ test_host_mount() {
     mkdir -p "$mount_dir/subdir"
     echo "nested-mount" > "$mount_dir/subdir/deep.txt"
 
-    # Start instance with --mount (defaults to /workspace)
-    if coop start "$mount_instance" --no-agents --mount "$mount_dir"; then
+    # Create instance with project mount at /workspace
+    if coop up "$mount_dir" --name "$mount_instance" --no-agents --no-devcontainer --mount; then
         STARTED_INSTANCES+=("$mount_instance")
-        pass "start with --mount exits 0"
+        pass "up --mount exits 0"
     else
-        fail "start with --mount exits 0" "exit code: $?"
+        fail "up --mount exits 0" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
         rm -rf "$mount_dir"
         return
@@ -2476,12 +2432,14 @@ test_host_mount_custom_guest_path() {
     mount_dir=$(mktemp -d)
     echo "custom-path-test" > "$mount_dir/marker.txt"
 
+    local project_dir="$tmpdir/${mount_instance}-ws"
+    mkdir -p "$project_dir"
     # Mount with explicit guest path
-    if coop start "$mount_instance" --no-agents --mount "$mount_dir:/data/project"; then
+    if coop up "$project_dir" --name "$mount_instance" --no-agents --no-devcontainer --extra-mount "$mount_dir:/data/project"; then
         STARTED_INSTANCES+=("$mount_instance")
-        pass "start with --mount host:guest exits 0"
+        pass "up with --extra-mount host:guest exits 0"
     else
-        fail "start with --mount host:guest exits 0" "exit code: $?"
+        fail "up with --extra-mount host:guest exits 0" "exit code: $?"
         rm -rf "$mount_dir"
         return
     fi
@@ -2520,12 +2478,14 @@ test_port_forwards() {
     local content_file
     content_file=$(mktemp)
     echo "forward-test-payload" > "$content_file"
+    local fwd_ws="$tmpdir/${fwd_instance}-ws"
+    mkdir -p "$fwd_ws"
 
-    if coop start "$fwd_instance" --no-agents --forward-port "${guest_port}:${host_port}"; then
+    if coop up "$fwd_ws" --name "$fwd_instance" --no-agents --no-devcontainer --forward-port "${guest_port}:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance")
-        pass "start with --forward-port exits 0"
+        pass "up with --forward-port exits 0"
     else
-        fail "start with --forward-port exits 0" "exit code: $?"
+        fail "up with --forward-port exits 0" "exit code: $?"
         rm -f "$content_file"
         return
     fi
@@ -2573,7 +2533,9 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
     # outer `2>` redirect here would be shadowed by the wrapper's internal
     # redirect and silently capture nothing.
     local fwd_instance2="${INSTANCE}-fwd2"
-    if coop start "$fwd_instance2" --no-agents --forward-port "9999:${host_port}"; then
+    local fwd_ws2="$tmpdir/${fwd_instance2}-ws"
+    mkdir -p "$fwd_ws2"
+    if coop up "$fwd_ws2" --name "$fwd_instance2" --no-agents --no-devcontainer --forward-port "9999:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance2")
         fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
         coop destroy "$fwd_instance2" 2>/dev/null || true
@@ -2639,15 +2601,18 @@ test_destroy_all() {
     # Start two throwaway instances
     local inst_x="${INSTANCE}-x"
     local inst_y="${INSTANCE}-y"
+    local ws_x="$tmpdir/${inst_x}-ws"
+    local ws_y="$tmpdir/${inst_y}-ws"
+    mkdir -p "$ws_x" "$ws_y"
 
-    if ! coop start "$inst_x" --no-agents; then
-        fail "start instance for destroy --all" "exit code: $?"
+    if ! coop up "$ws_x" --name "$inst_x" --no-agents --no-devcontainer; then
+        fail "up instance for destroy --all" "exit code: $?"
         return
     fi
     STARTED_INSTANCES+=("$inst_x")
 
-    if ! coop start "$inst_y" --no-agents; then
-        fail "start second instance for destroy --all" "exit code: $?"
+    if ! coop up "$ws_y" --name "$inst_y" --no-agents --no-devcontainer; then
+        fail "up second instance for destroy --all" "exit code: $?"
         coop destroy "$inst_x" 2>/dev/null || true
         return
     fi
@@ -2739,15 +2704,18 @@ CFGEOF
         return
     fi
 
-    # Start the instance WITH bootstrap. The stub claude handles
+    local mp_ws="$tmpdir/${mp_instance}-ws"
+    mkdir -p "$mp_ws"
+
+    # Create the instance WITH bootstrap. The stub claude handles
     # `marketplace add` calls. Unset tokens to avoid auth steps.
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" start "$mp_instance" --image "$mp_img" 2>"$tmpdir/stderr"; then
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up "$mp_ws" --name "$mp_instance" --image "$mp_img" --no-devcontainer 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$mp_instance")
-        pass "start with local marketplace exits 0"
+        pass "up with local marketplace exits 0"
     else
         local boot_err
         boot_err=$(cat "$tmpdir/stderr")
-        fail "start with local marketplace exits 0" "stderr: $boot_err"
+        fail "up with local marketplace exits 0" "stderr: $boot_err"
         env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" images --delete "$mp_img" 2>/dev/null || true
         rm -rf "$mp_dir" "$cfg_dir"
         return
@@ -2879,13 +2847,15 @@ CFGEOF
         return $rc
     }
 
-    # ── 1. First start: allowlisted files copied to guest ──
+    # ── 1. First up: allowlisted files copied to guest ──
 
-    if cs start "$inst_name"; then
+    local cd_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$cd_ws"
+    if cs up "$cd_ws" --name "$inst_name" --no-devcontainer; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start with config_dir exits 0"
+        pass "up with config_dir exits 0"
     else
-        fail "start with config_dir exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        fail "up with config_dir exits 0" "exit code: $? stderr: $HARNESS_ERR"
         rm -r "$cs_dir"
         return
     fi
@@ -3017,11 +2987,13 @@ test_interrupted_setup() {
 
     # Verify the image works: start a VM and check basic connectivity
     local inst_name="${INSTANCE}-recovery"
-    if coop start "$inst_name" --no-agents --image "$img"; then
+    local recovery_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$recovery_ws"
+    if coop up "$recovery_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start from recovered image exits 0"
+        pass "up from recovered image exits 0"
     else
-        fail "start from recovered image exits 0" "exit code: $?"
+        fail "up from recovered image exits 0" "exit code: $?"
         coop images --delete "$img" 2>/dev/null || true
         return
     fi
@@ -3077,10 +3049,10 @@ test_devcontainer_translator() {
     local dcfile="$dcdir/.devcontainer/devcontainer.json"
 
     # --dry-run with auto-discovery: report is printed to stderr, no VM work.
-    if coop start "${INSTANCE}-dc-dry" --workspace "$dcdir" --dry-run --no-agents; then
-        pass "start --workspace ... --dry-run exits 0"
+    if coop up "$dcdir" --name "${INSTANCE}-dc-dry" --dry-run --no-agents; then
+        pass "up ... --dry-run exits 0"
     else
-        fail "start --workspace ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        fail "up ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
     fi
 
     # Report content lands on stderr (per the CLAUDE.md "tracing → stderr" rule).
@@ -3111,7 +3083,7 @@ test_devcontainer_translator() {
 
     # --no-devcontainer silently skips the file: the report header must NOT appear.
     # `--dry-run` lets us exercise the discovery path without any VM work.
-    if coop start "${INSTANCE}-dc-skip" --workspace "$dcdir" \
+    if coop up "$dcdir" --name "${INSTANCE}-dc-skip" \
         --no-devcontainer --dry-run --no-agents; then
         if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
             fail "--no-devcontainer suppresses discovery" "report header still appeared: $HARNESS_ERR"
@@ -3124,7 +3096,7 @@ test_devcontainer_translator() {
 
     # Non-interactive + discovered file + no escape hatch must error with the
     # hint pointing at --devcontainer / --no-devcontainer.
-    if moat_fails start "${INSTANCE}-dc-noopt" --workspace "$dcdir" --no-agents; then
+    if moat_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then
         if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
             && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
             pass "non-TTY without escape hatch errors with hint"
@@ -3137,11 +3109,11 @@ test_devcontainer_translator() {
 
     # CLI overrides devcontainer.json values — report should mark cpus as
     # "overridden" with source = CLI.
-    if coop start "${INSTANCE}-dc-override" --workspace "$dcdir" \
+    if coop up "$dcdir" --name "${INSTANCE}-dc-override" \
         --vcpus 8 --dry-run --no-agents; then
-        pass "start --dry-run with overriding CLI flag exits 0"
+        pass "up --dry-run with overriding CLI flag exits 0"
     else
-        fail "start --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
+        fail "up --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
         return
     fi
     if grep "hostRequirements.cpus" <<< "$HARNESS_ERR" | grep -q "overridden"; then
@@ -3163,12 +3135,12 @@ test_devcontainer_apply() {
     local inst_name="${INSTANCE}-dc-apply"
 
     # Use explicit --devcontainer to skip the prompt in CI.
-    if coop start "$inst_name" --workspace "$dcdir" \
+    if coop up "$dcdir" --name "$inst_name" \
         --devcontainer "$dcfile" --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start with --devcontainer exits 0"
+        pass "up with --devcontainer exits 0"
     else
-        fail "start with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        fail "up with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
         return
     fi
 
@@ -3209,12 +3181,14 @@ test_post_start() {
 
     # --post-start runs the command in the guest after SSH is ready.
     # The marker file written by the hook is the assertion.
-    if coop start "$inst_name" --no-agents \
+    local post_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$post_ws"
+    if coop up "$post_ws" --name "$inst_name" --no-agents --no-devcontainer \
         --post-start "echo hooked > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start --post-start exits 0"
+        pass "up --post-start exits 0"
     else
-        fail "start --post-start exits 0" "exit code: $?"
+        fail "up --post-start exits 0" "exit code: $?"
         return
     fi
 
@@ -3229,14 +3203,16 @@ test_post_start() {
         fail "--post-start hook ran in the guest" "marker contents: '$seen'"
     fi
 
-    # Verify a failing hook does not fail `coop start` (warn-and-continue).
+    # Verify a failing hook does not fail `coop up` (warn-and-continue).
     local fail_inst="${INSTANCE}-poststart-fail"
-    if coop start "$fail_inst" --no-agents \
+    local fail_ws="$tmpdir/${fail_inst}-ws"
+    mkdir -p "$fail_ws"
+    if coop up "$fail_ws" --name "$fail_inst" --no-agents --no-devcontainer \
         --post-start "false; exit 1"; then
         STARTED_INSTANCES+=("$fail_inst")
-        pass "start succeeds when --post-start fails (warn-and-continue)"
+        pass "up succeeds when --post-start fails (warn-and-continue)"
     else
-        fail "start succeeds when --post-start fails" "exit code: $?"
+        fail "up succeeds when --post-start fails" "exit code: $?"
     fi
 
     coop destroy "$inst_name" 2>/dev/null || true
@@ -3354,13 +3330,15 @@ test_guest_user_alt() {
         skip "template_config.json records guest_user=$alt_user" "config at $tc_path not found"
     fi
 
-    # Start an instance from the alt-user image — no `--guest-user` flag
+    # Create an instance from the alt-user image — no `--guest-user` flag
     # here on purpose; coop must read the persisted value.
-    if coop start "$inst_name" --no-agents --image "$img_name"; then
+    local alt_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$alt_ws"
+    if coop up "$alt_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start (alt-user image) exits 0"
+        pass "up (alt-user image) exits 0"
     else
-        fail "start (alt-user image) exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        fail "up (alt-user image) exits 0" "exit code: $? stderr: $HARNESS_ERR"
         coop images --delete "$img_name" 2>/dev/null || true
         return
     fi
@@ -3506,7 +3484,8 @@ main() {
 
     # Setup + primary instance
     test_setup
-    test_start
+    test_up_creates_primary_instance
+    test_start_rejects_missing_instance
     test_duplicate_name
     test_status_running
     test_list_running
@@ -3534,7 +3513,6 @@ main() {
     test_resize_status
     test_restart_stopped
     test_restart_rejects_ignored_flags
-    test_bare_start_allocates_fresh
     test_destroy
     test_auto_resolve_no_instances
     test_list_empty
@@ -3545,13 +3523,12 @@ main() {
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" ]]; then
         test_quickstart
+        test_up_project_workflow
         test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
         test_port_forwards
-        test_push_pull_no_workspace
         test_workspace_sync
-        test_git_repo_private_clone
         test_multi_instance
         test_named_images
         test_guest_user_alt

@@ -72,12 +72,86 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Ensure an environment for a project directory exists and is running.
+    ///
+    /// Re-runnable: if an instance already exists for DIR it is reused
+    /// (running) or restarted (stopped) instead of being recreated.
+    Up {
+        /// Project directory (default: current directory)
+        dir: Option<String>,
+        /// Instance name to use when creating the project environment
+        #[arg(long, value_parser = config::InstanceName::parse)]
+        name: Option<config::InstanceName>,
+        /// Copy/sync DIR into the guest as /workspace (default)
+        #[arg(long, conflicts_with = "mount")]
+        copy: bool,
+        /// Mount DIR at /workspace instead of using --copy
+        #[arg(long)]
+        mount: bool,
+        /// Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
+        #[arg(long, value_parser = config::Mount::parse)]
+        extra_mount: Vec<config::Mount>,
+        /// Number of vCPUs (overrides config when creating a new instance)
+        #[arg(long)]
+        vcpus: Option<u8>,
+        /// Memory in MiB (overrides config when creating a new instance)
+        #[arg(long, value_parser = config::MiB::parse_cli)]
+        mem: Option<config::MiB>,
+        /// Instance disk size in GiB (only used when creating a new instance)
+        #[arg(long, value_parser = config::GiB::parse_cli)]
+        disk: Option<config::GiB>,
+        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        #[arg(long, alias = "no-claude")]
+        no_agents: bool,
+        /// Named image to use when creating a new instance (default: "default")
+        #[arg(
+            long,
+            default_value = config::DEFAULT_IMAGE,
+            value_parser = config::ImageName::parse,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
+        image: config::ImageName,
+        /// Skip the `.git` directory when copying/syncing the project
+        #[arg(long)]
+        exclude_git: bool,
+        /// Suppress the interactive prompt to set up a scoped GitHub PAT
+        /// when one is missing for the resolved repo.
+        #[arg(long)]
+        no_prompt: bool,
+        /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
+        #[arg(long, value_parser = config::PortForward::parse)]
+        forward_port: Vec<config::PortForward>,
+        /// Shell command to run inside the guest after boot (overrides
+        /// `post_start` from `config.toml`). Failure is logged but does
+        /// not fail the start.
+        #[arg(long, value_name = "CMD")]
+        post_start: Option<String>,
+        /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
+        /// Overrides `guest_env` entries from config and any forwarded
+        /// values with the same name.
+        #[arg(
+            long = "env",
+            value_name = "KEY=VALUE",
+            value_parser = guest_env_state::parse_cli_env_arg,
+        )]
+        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+        /// Explicit path to a `devcontainer.json` to use (skips discovery).
+        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
+        devcontainer: Option<String>,
+        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
+        #[arg(long)]
+        no_devcontainer: bool,
+        /// Translate `devcontainer.json` and print the report, then exit
+        /// before any VM work.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// One-shot: ensure default image, start an instance for cwd, launch Claude.
     ///
     /// Re-runnable: if an instance already exists for the current workspace it
     /// is reconnected (running) or restarted (stopped) instead of being
     /// recreated. For per-instance tuning (profiles, mounts, image, ...) use
-    /// `coop setup` / `coop start` directly.
+    /// `coop setup` / `coop up` directly.
     Quickstart {
         /// Skip mounting the current directory as the workspace.
         #[arg(long)]
@@ -151,30 +225,30 @@ enum Commands {
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
     Build,
-    /// Launch a new Firecracker VM instance
+    /// Start an existing stopped VM instance
     Start {
-        /// Instance name (auto-generated if omitted)
+        /// Stopped instance name (optional only when exactly one stopped instance exists)
         #[arg(value_parser = config::InstanceName::parse)]
         name: Option<config::InstanceName>,
-        /// Workspace directory to sync into the VM
+        /// Project directory used to select an associated stopped instance
         #[arg(long, conflicts_with = "git_repo")]
         workspace: Option<String>,
-        /// Git repository URL to clone inside the VM
+        /// Deprecated creation option; rejected by `coop start`
         #[arg(long, conflicts_with = "workspace")]
         git_repo: Option<String>,
-        /// Number of vCPUs (overrides config)
+        /// Creation-time option; rejected by `coop start`
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config)
+        /// Creation-time option; rejected by `coop start`
         #[arg(long, value_parser = config::MiB::parse_cli)]
         mem: Option<config::MiB>,
-        /// Instance disk size in GiB (grows from template size if larger)
+        /// Creation-time option; rejected by `coop start`
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
-        /// Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
+        /// Creation-time option; rejected by `coop start`
         #[arg(
             long,
             conflicts_with_all = ["workspace", "git_repo"],
@@ -186,7 +260,7 @@ enum Commands {
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
         #[arg(long, value_parser = config::PortForward::parse)]
         forward_port: Vec<config::PortForward>,
-        /// Named image to use (default: "default")
+        /// Creation-time option; rejected by `coop start`
         #[arg(
             long,
             default_value = config::DEFAULT_IMAGE,
@@ -194,7 +268,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
-        /// Skip the `.git` directory when syncing the workspace
+        /// Creation-time option; rejected by `coop start`
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -562,6 +636,15 @@ where
         .any(|a| a.as_ref() == "--no-claude" || a.as_ref().starts_with("--no-claude="))
 }
 
+fn raw_args_use_long_flag<I, S>(args: I, flag: &str) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|a| a.as_ref() == flag || a.as_ref().starts_with(&format!("{flag}=")))
+}
+
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
 fn main() -> Result<()> {
     // Dynamic shell completion: when invoked with COMPLETE=<shell>, compute
@@ -635,7 +718,61 @@ fn main() -> Result<()> {
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
     tracing::debug!("Using backend: {be}");
 
+    let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        Commands::Up {
+            dir,
+            name,
+            copy,
+            mount,
+            extra_mount,
+            vcpus,
+            mem,
+            disk,
+            no_agents,
+            image,
+            exclude_git,
+            no_prompt,
+            forward_port,
+            post_start,
+            guest_env,
+            devcontainer,
+            no_devcontainer,
+            dry_run,
+        } => {
+            let validated = cfg.validate_and_warn()?;
+            let transport = if mount {
+                ProjectTransport::Mount
+            } else {
+                let _ = copy;
+                ProjectTransport::Copy
+            };
+            let opts = UpOpts {
+                dir: dir.as_deref(),
+                name: name.as_ref(),
+                transport,
+                extra_mount,
+                vcpus,
+                mem,
+                disk,
+                image,
+                image_explicit: raw_args_use_long_flag(&raw_args, "--image"),
+                runtime: UpRuntimeOpts {
+                    no_agents,
+                    exclude_git,
+                    no_prompt,
+                    forward_ports: forward_port,
+                    post_start,
+                    guest_env,
+                },
+                devcontainer: UpDevcontainerOpts {
+                    path: devcontainer,
+                    no_devcontainer,
+                    dry_run,
+                },
+            };
+            cmd_up(&be, &mut cfg, &validated, &cli.config, &opts)
+        }
         Commands::Quickstart {
             no_workspace,
             no_devcontainer,
@@ -746,11 +883,34 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let validated = cfg.validate_and_warn()?;
-            if raw_args_use_deprecated_no_claude(std::env::args()) {
+            if raw_args_use_deprecated_no_claude(&raw_args) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
+            if vcpus.is_some() || mem.is_some() {
+                bail!(
+                    "`coop start` only starts stopped instances; VM sizing options belong to `coop up`."
+                );
+            }
+            let preflight_opts = StartOpts {
+                name: name.as_ref(),
+                image: StartImage {
+                    explicit: raw_args_use_long_flag(&raw_args, "--image"),
+                },
+                workspace_dir: workspace.as_deref(),
+                git_repo: git_repo.as_deref(),
+                no_agents,
+                no_prompt,
+                disk,
+                mounts: mounts.clone(),
+                exclude_git,
+                forward_ports: forward_ports.clone(),
+                config_path: &cli.config,
+                post_start_override: post_start.as_deref(),
+                persisted_guest_env: std::collections::BTreeMap::new(),
+            };
+            preflight_start_target(&be, &cfg, &preflight_opts)?;
             let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -832,7 +992,9 @@ fn main() -> Result<()> {
                 &validated,
                 &StartOpts {
                     name: name.as_ref(),
-                    image: &image,
+                    image: StartImage {
+                        explicit: raw_args_use_long_flag(&raw_args, "--image"),
+                    },
                     workspace_dir: workspace.as_deref(),
                     git_repo: git_repo.as_deref(),
                     no_agents,
@@ -1082,6 +1244,425 @@ struct QuickstartOpts {
     no_devcontainer: bool,
 }
 
+struct UpOpts<'a> {
+    dir: Option<&'a str>,
+    name: Option<&'a config::InstanceName>,
+    transport: ProjectTransport,
+    extra_mount: Vec<config::Mount>,
+    vcpus: Option<u8>,
+    mem: Option<config::MiB>,
+    disk: Option<config::GiB>,
+    image: config::ImageName,
+    image_explicit: bool,
+    runtime: UpRuntimeOpts,
+    devcontainer: UpDevcontainerOpts,
+}
+
+struct UpRuntimeOpts {
+    no_agents: bool,
+    exclude_git: bool,
+    no_prompt: bool,
+    forward_ports: Vec<config::PortForward>,
+    post_start: Option<String>,
+    guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+}
+
+struct UpDevcontainerOpts {
+    path: Option<String>,
+    no_devcontainer: bool,
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectTransport {
+    Copy,
+    Mount,
+}
+
+/// Project-oriented start: ensure DIR has a single matching environment.
+///
+/// Unlike `start`, `up` treats the project directory as identity and keeps
+/// transport explicit. Existing instances are found by their recorded
+/// `workspace.json` host path; creation-only inputs are only applied when no
+/// matching instance exists.
+fn cmd_up(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    _: &config::Validated,
+    config_path: &Path,
+    opts: &UpOpts<'_>,
+) -> Result<()> {
+    let transport = opts.transport;
+    let project_dir = resolve_project_dir(opts.dir)?;
+
+    let project_mount = config::Mount {
+        host_path: project_dir.clone(),
+        guest_path: workspace::default_workspace_path(),
+    };
+    let discovery_mounts = if transport == ProjectTransport::Mount {
+        std::slice::from_ref(&project_mount)
+    } else {
+        &[]
+    };
+
+    if opts.devcontainer.dry_run {
+        let inputs = up_translator_inputs(cfg, opts);
+        resolve_devcontainer(
+            &DevcontainerOpts {
+                explicit_path: opts.devcontainer.path.as_deref(),
+                no_devcontainer: opts.devcontainer.no_devcontainer,
+                dry_run: true,
+                workspace: Some(&project_dir),
+                mounts: discovery_mounts,
+            },
+            &inputs,
+            devcontainer::Stage::Start,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(inst) = find_workspace_instance(cfg, &project_dir)? {
+        ensure_up_project_name_matches(&inst, &project_dir, opts)?;
+        ensure_up_existing_inputs_are_compatible(&inst, transport, opts)?;
+        if be.is_running(&inst) {
+            reject_running_up_restart_inputs(&inst, opts)?;
+            tracing::info!(
+                "Instance '{}' is already running for {}",
+                inst.name,
+                project_dir.display()
+            );
+            return Ok(());
+        }
+
+        let mut restart_opts = runtime_start_opts_from_up(opts, config_path);
+        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, None, &mut restart_opts);
+        restart_instance(be, cfg, &inst, &restart_opts)?;
+        return Ok(());
+    }
+
+    create_up_instance(
+        be,
+        cfg,
+        config_path,
+        opts,
+        &project_dir,
+        &project_mount,
+        discovery_mounts,
+    )
+}
+
+fn up_translator_inputs(
+    cfg: &config::CoopConfig,
+    opts: &UpOpts<'_>,
+) -> devcontainer::TranslatorInputs {
+    devcontainer::TranslatorInputs {
+        cli_vcpus: opts.vcpus,
+        cli_mem_mib: opts.mem,
+        cli_disk_gib: opts.disk,
+        cli_post_start: opts.runtime.post_start.clone(),
+        cli_guest_env_keys: opts
+            .runtime
+            .guest_env
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect(),
+        cli_forward_ports: opts.runtime.forward_ports.clone(),
+        cli_mounts: opts.extra_mount.clone(),
+        persisted_guest_user: Some(backend::persisted_guest_user(cfg, &opts.image)),
+        cli_workspace_or_git_repo: true,
+        ..devcontainer::TranslatorInputs::default()
+    }
+}
+
+fn create_up_instance(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    opts: &UpOpts<'_>,
+    project_dir: &Path,
+    project_mount: &config::Mount,
+    discovery_mounts: &[config::Mount],
+) -> Result<()> {
+    let inputs = up_translator_inputs(cfg, opts);
+    let translation = resolve_devcontainer(
+        &DevcontainerOpts {
+            explicit_path: opts.devcontainer.path.as_deref(),
+            no_devcontainer: opts.devcontainer.no_devcontainer,
+            dry_run: false,
+            workspace: Some(project_dir),
+            mounts: discovery_mounts,
+        },
+        &inputs,
+        devcontainer::Stage::Start,
+    )?;
+
+    apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
+    if let Some(t) = &translation {
+        devcontainer::apply_to_config(cfg, t)?;
+    }
+
+    let mut forward_ports = opts.runtime.forward_ports.clone();
+    if let Some(t) = &translation {
+        forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
+    }
+
+    let dc_guest_env = translation
+        .as_ref()
+        .map(|t| t.guest_env.clone())
+        .unwrap_or_default();
+    let cli_guest_env: std::collections::BTreeMap<_, _> =
+        opts.runtime.guest_env.iter().cloned().collect();
+    let persisted_guest_env =
+        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
+    for (key, value) in &persisted_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+
+    let default_translation = devcontainer::Translation::default();
+    let effective_disk = devcontainer::effective_disk(
+        opts.disk,
+        translation.as_ref().unwrap_or(&default_translation),
+    );
+    let post_start_override = opts
+        .runtime
+        .post_start
+        .clone()
+        .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
+
+    let mut mounts = translation
+        .as_ref()
+        .map(|t| t.mounts.clone())
+        .unwrap_or_default();
+    mounts.extend(opts.extra_mount.clone());
+
+    let workspace_dir = match opts.transport {
+        ProjectTransport::Copy => Some(project_dir_to_str(project_dir)?),
+        ProjectTransport::Mount => {
+            mounts.insert(0, project_mount.clone());
+            None
+        }
+    };
+    validate_copy_workspace_mounts(opts.transport, &mounts)?;
+    validate_unique_guest_paths(&mounts)?;
+
+    let start_opts = StartOpts {
+        name: None,
+        image: StartImage {
+            explicit: opts.image_explicit,
+        },
+        workspace_dir: workspace_dir.as_deref(),
+        git_repo: None,
+        no_agents: opts.runtime.no_agents,
+        no_prompt: opts.runtime.no_prompt,
+        disk: effective_disk,
+        mounts,
+        exclude_git: opts.runtime.exclude_git,
+        forward_ports,
+        config_path,
+        post_start_override: post_start_override.as_deref(),
+        persisted_guest_env,
+    };
+
+    allocate_and_start(
+        be,
+        cfg,
+        opts.name,
+        &opts.image,
+        Some(project_dir),
+        &start_opts,
+    )
+    .map(|_| ())
+}
+
+fn resolve_project_dir(dir: Option<&str>) -> Result<PathBuf> {
+    let path = match dir {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir().context("Failed to read current directory")?,
+    };
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve project directory {}", path.display()))?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "Project directory is not a directory: {}",
+        canonical.display()
+    );
+    Ok(canonical)
+}
+
+fn project_dir_to_str(project_dir: &Path) -> Result<String> {
+    project_dir
+        .to_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("Project path is not valid UTF-8: {}", project_dir.display()))
+}
+
+fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -> StartOpts<'a> {
+    StartOpts {
+        name: None,
+        image: StartImage { explicit: false },
+        workspace_dir: None,
+        git_repo: None,
+        no_agents: opts.runtime.no_agents,
+        no_prompt: opts.runtime.no_prompt,
+        disk: None,
+        mounts: Vec::new(),
+        exclude_git: false,
+        forward_ports: opts.runtime.forward_ports.clone(),
+        config_path,
+        post_start_override: opts.runtime.post_start.as_deref(),
+        persisted_guest_env: std::collections::BTreeMap::new(),
+    }
+}
+
+fn apply_runtime_guest_env(
+    cfg: &mut config::CoopConfig,
+    cli_guest_env: &[(guest_env_state::EnvVarName, String)],
+    dc_guest_env: Option<&std::collections::BTreeMap<guest_env_state::EnvVarName, String>>,
+    start_opts: &mut StartOpts<'_>,
+) {
+    let cli_guest_env: std::collections::BTreeMap<_, _> = cli_guest_env.iter().cloned().collect();
+    let dc_guest_env = dc_guest_env.cloned().unwrap_or_default();
+    start_opts.persisted_guest_env =
+        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
+    for (key, value) in &start_opts.persisted_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+}
+
+fn ensure_up_existing_inputs_are_compatible(
+    inst: &config::Instance,
+    transport: ProjectTransport,
+    opts: &UpOpts<'_>,
+) -> Result<()> {
+    if opts.image_explicit && inst.image != opts.image {
+        bail!(
+            "Instance '{}' already exists for this project using image '{}'. \
+             `coop up --image {}` only applies when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with a different image.",
+            inst.name,
+            inst.image,
+            opts.image,
+            inst.name,
+        );
+    }
+    if opts.disk.is_some()
+        || opts.vcpus.is_some()
+        || opts.mem.is_some()
+        || !opts.extra_mount.is_empty()
+        || opts.runtime.exclude_git
+        || opts.devcontainer.path.is_some()
+    {
+        bail!(
+            "Instance '{}' already exists for this project. \
+             --vcpus, --mem, --disk, --extra-mount, --exclude-git, and \
+             --devcontainer only apply when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with those options.",
+            inst.name,
+            inst.name,
+        );
+    }
+
+    let Some(state) =
+        workspace::try_load_or_warn(inst, "project transport check will skip this instance")
+    else {
+        return Ok(());
+    };
+    let existing = match state.source {
+        workspace::WorkspaceSource::Workspace { .. } => ProjectTransport::Copy,
+        workspace::WorkspaceSource::Mount { .. } => ProjectTransport::Mount,
+        workspace::WorkspaceSource::GitRepo { .. } => return Ok(()),
+    };
+    if existing != transport {
+        let existing = match existing {
+            ProjectTransport::Copy => "copy",
+            ProjectTransport::Mount => "mount",
+        };
+        let requested = match transport {
+            ProjectTransport::Copy => "copy",
+            ProjectTransport::Mount => "mount",
+        };
+        bail!(
+            "Instance '{}' already exists for this project using {existing} transport, \
+             but this command requested {requested}.\n\
+             Re-run with the original transport, or `coop destroy {}` first to recreate it.",
+            inst.name,
+            inst.name,
+        );
+    }
+    Ok(())
+}
+
+fn ensure_up_project_name_matches(
+    inst: &config::Instance,
+    project_dir: &Path,
+    opts: &UpOpts<'_>,
+) -> Result<()> {
+    if let Some(name) = opts.name {
+        anyhow::ensure!(
+            &inst.name == name,
+            "Project {} is already associated with instance '{}', not '{}'.",
+            project_dir.display(),
+            inst.name,
+            name,
+        );
+    }
+    Ok(())
+}
+
+fn up_has_restart_only_inputs(opts: &UpOpts<'_>) -> bool {
+    opts.runtime.no_agents
+        || !opts.runtime.forward_ports.is_empty()
+        || opts.runtime.post_start.is_some()
+        || !opts.runtime.guest_env.is_empty()
+}
+
+fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) -> Result<()> {
+    if up_has_restart_only_inputs(opts) {
+        bail!(
+            "Instance '{}' is already running for this project. \
+             --no-agents, --forward-port, --post-start, and --env only take \
+             effect during start or restart.\n\
+             Run `coop stop {}` first, then repeat `coop up` with those options.",
+            inst.name,
+            inst.name,
+        );
+    }
+    Ok(())
+}
+
+fn validate_unique_guest_paths(mounts: &[config::Mount]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for mount in mounts {
+        let guest_path = mount.guest_path.to_string();
+        if !seen.insert(guest_path.clone()) {
+            bail!("Duplicate mount guest path: {guest_path}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_copy_workspace_mounts(
+    transport: ProjectTransport,
+    mounts: &[config::Mount],
+) -> Result<()> {
+    if transport != ProjectTransport::Copy {
+        return Ok(());
+    }
+    let workspace_path = workspace::default_workspace_path().to_string();
+    if mounts
+        .iter()
+        .any(|mount| mount.guest_path.to_string() == workspace_path)
+    {
+        bail!(
+            "`coop up --copy` already uses /workspace for the project. \
+             Give --extra-mount an explicit non-/workspace guest path, or use \
+             `coop up --mount` to mount the project itself."
+        );
+    }
+    Ok(())
+}
+
 /// One-shot `setup → start → claude`. See `Commands::Quickstart`.
 ///
 /// The flow short-circuits any step that's already done:
@@ -1089,9 +1670,8 @@ struct QuickstartOpts {
 /// * reconnects to a running instance for the current workspace, or restarts
 ///   a stopped one, instead of allocating fresh.
 ///
-/// `--no-workspace` skips workspace affinity entirely and falls back to the
-/// same "single running / single stopped" rules used by `coop start` and
-/// `coop claude` when called without a name.
+/// `--no-workspace` skips workspace affinity entirely and creates a fresh
+/// instance when no running workspace instance can be reused.
 fn cmd_quickstart(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -1136,18 +1716,15 @@ fn cmd_quickstart(
         Some(inst) => {
             tracing::info!("Restarting stopped instance '{}'", inst.name);
             // Use the existing instance's image, not the default — the two
-            // can diverge if the instance was created via `coop start
-            // --image <other>`. On restart this is currently ignored, but
-            // passing `&image` would silently allocate fresh with the
-            // wrong image if `find_stopped_instance` lost the race to a
-            // concurrent destroy.
+            // can diverge if the instance was created with `coop up
+            // --image <other>`.
             cmd_start(
                 be,
                 cfg,
                 &validated,
                 &StartOpts {
                     name: Some(&inst.name),
-                    image: &inst.image,
+                    image: StartImage { explicit: false },
                     workspace_dir: None,
                     git_repo: None,
                     no_agents: false,
@@ -1182,10 +1759,8 @@ fn cmd_quickstart(
 /// `--env`, no forwards, no `--post-start`), folding any discovered
 /// `devcontainer.json` into the start. Returns the started instance.
 ///
-/// With `workspace_dir = None` (i.e. `--no-workspace`) this calls
-/// `allocate_and_start` directly rather than `cmd_start`, deliberately
-/// bypassing `find_stopped_instance`'s "single stopped instance" fallback
-/// — that fallback would silently restart an unrelated stopped instance.
+/// This allocates directly rather than going through `cmd_start`; quickstart
+/// creates project environments while `start` only restarts stopped instances.
 fn quickstart_fresh_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -1248,7 +1823,7 @@ fn quickstart_fresh_start(
 
     let start_opts = StartOpts {
         name: None,
-        image,
+        image: StartImage { explicit: false },
         workspace_dir: workspace_str,
         git_repo: None,
         no_agents: false,
@@ -1262,14 +1837,8 @@ fn quickstart_fresh_start(
         persisted_guest_env,
     };
 
-    if workspace_dir.is_some() {
-        cmd_start(be, cfg, validated, &start_opts)
-    } else {
-        // `--no-workspace`: skip the "single stopped instance" fallback in
-        // `find_stopped_instance` so we never hijack an unrelated VM. Each
-        // quickstart with `--no-workspace` allocates a fresh instance.
-        allocate_and_start(be, cfg, None, image, None, &start_opts)
-    }
+    let _ = validated;
+    allocate_and_start(be, cfg, None, image, workspace_dir, &start_opts)
 }
 
 /// Resolve the workspace directory for `coop quickstart`.
@@ -1463,9 +2032,13 @@ fn cmd_build(cfg: &config::CoopConfig, _: &config::Validated) -> Result<()> {
     Ok(())
 }
 
+struct StartImage {
+    explicit: bool,
+}
+
 struct StartOpts<'a> {
     name: Option<&'a config::InstanceName>,
-    image: &'a config::ImageName,
+    image: StartImage,
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
     no_agents: bool,
@@ -1493,19 +2066,76 @@ struct StartOpts<'a> {
     persisted_guest_env: std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
 }
 
-/// Did the user pass creation-only flags (`--mount`, `--git-repo`, `--disk`,
-/// `--exclude-git`) without an identifier (`--name` or `--workspace`) that
-/// could pick out an existing instance?
-///
-/// When true, `cmd_start` must allocate a fresh instance rather than fall
-/// back to the "single stopped instance" shortcut in `find_stopped_instance`.
-fn creation_intent_without_target(opts: &StartOpts<'_>) -> bool {
-    let identifies_existing = opts.name.is_some() || opts.workspace_dir.is_some();
-    let has_creation_only_flags = !opts.mounts.is_empty()
+fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
+    let workspace_was_restart_key = opts.name.is_none() && opts.workspace_dir.is_some();
+    !opts.mounts.is_empty()
+        || opts.image.explicit
+        || (opts.workspace_dir.is_some() && !workspace_was_restart_key)
         || opts.git_repo.is_some()
         || opts.disk.is_some()
-        || opts.exclude_git;
-    has_creation_only_flags && !identifies_existing
+        || opts.exclude_git
+}
+
+fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Path>) -> String {
+    let mut msg = if let Some(name) = opts.name {
+        format!("No stopped instance named '{name}' exists.")
+    } else if let Some(path) = workspace_path {
+        format!(
+            "No stopped instance is associated with workspace {}.",
+            path.display()
+        )
+    } else {
+        "No stopped instances exist.".to_string()
+    };
+
+    if !opts.mounts.is_empty()
+        || opts.git_repo.is_some()
+        || opts.disk.is_some()
+        || opts.image.explicit
+        || opts.exclude_git
+    {
+        msg.push_str(
+            "\n`coop start` only starts stopped instances; creation options belong to `coop up`.",
+        );
+    }
+
+    if let Some(path) = workspace_path {
+        msg.push_str("\nCreate or reconnect to this project with:\n  coop up ");
+        msg.push_str(&path.display().to_string());
+    } else {
+        msg.push_str("\nCreate or reconnect to a project with:\n  coop up [DIR]");
+    }
+    msg.push_str("\nUse `coop list` to see existing instances.");
+    msg
+}
+
+fn creation_options_rejected_message(inst: &config::Instance) -> String {
+    format!(
+        "Instance '{}' already exists (stopped). These creation options \
+         would be silently \
+         ignored on restart.\n\
+         To apply new options, destroy the instance first:\n  \
+         coop destroy {0}\n  coop up [DIR]",
+        inst.name,
+    )
+}
+
+fn preflight_start_target(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let ws_path = opts.workspace_dir.map(Path::new);
+
+    let Some(inst) = find_stopped_instance(be, cfg, opts.name, ws_path)? else {
+        bail!("{}", no_stopped_instance_message(opts, ws_path));
+    };
+
+    if restart_has_ignored_creation_flags(opts) {
+        bail!("{}", creation_options_rejected_message(&inst));
+    }
+
+    Ok(())
 }
 
 fn cmd_start(
@@ -1516,49 +2146,22 @@ fn cmd_start(
 ) -> Result<config::Instance> {
     let ws_path = opts.workspace_dir.map(Path::new);
 
-    // Creation-only flags (`--mount`, `--git-repo`, `--disk`, `--exclude-git`)
-    // unambiguously signal "I want a new VM with these settings". When the user
-    // didn't also identify an existing instance (via `--name` or `--workspace`),
-    // skip the single-stopped-instance shortcut in `find_stopped_instance` —
-    // otherwise we'd tell the user to destroy an unrelated stopped instance
-    // when their real intent was to allocate a fresh one (issue #214).
-    let restart_candidate = if creation_intent_without_target(opts) {
-        None
-    } else {
-        find_stopped_instance(be, cfg, opts.name, ws_path)?
+    let Some(inst) = find_stopped_instance(be, cfg, opts.name, ws_path)? else {
+        bail!("{}", no_stopped_instance_message(opts, ws_path));
     };
 
-    if let Some(inst) = restart_candidate {
-        let has_ignored_flags = !opts.mounts.is_empty()
-            || opts.workspace_dir.is_some()
-            || opts.git_repo.is_some()
-            || opts.disk.is_some()
-            || opts.exclude_git;
-
-        if has_ignored_flags {
-            bail!(
-                "Instance '{}' already exists (stopped). The flags \
-                 --mount, --workspace, --git-repo, --disk, and --exclude-git \
-                 are only applied at creation time and would be silently \
-                 ignored on restart.\n\
-                 To apply new options, destroy the instance first:\n  \
-                 coop destroy {0}\n  coop start {0} [options]",
-                inst.name,
-            );
-        }
-
-        restart_instance(be, cfg, &inst, opts)?;
-        return Ok(inst);
+    let has_ignored_flags = restart_has_ignored_creation_flags(opts);
+    if has_ignored_flags {
+        bail!("{}", creation_options_rejected_message(&inst));
     }
 
-    allocate_and_start(be, cfg, opts.name, opts.image, ws_path, opts)
+    restart_instance(be, cfg, &inst, opts)?;
+    Ok(inst)
 }
 
 /// Allocate a fresh instance and run the first-boot start, cleaning up any
-/// partial state on error. Used by `cmd_start`'s "no stopped instance to
-/// restart" path and by `cmd_quickstart`'s `--no-workspace` fresh path
-/// (which skips the `find_stopped_instance` "single stopped" rule to avoid
-/// hijacking an unrelated instance).
+/// partial state on error. Used by project-oriented flows that create
+/// instances (`coop up` and `coop quickstart`).
 fn allocate_and_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -1597,7 +2200,7 @@ fn allocate_and_start(
 /// With a workspace path (no name): looks up instances by their stored
 /// workspace `host_path`. If a match is found and running, errors with
 /// a helpful message. If stopped, returns it for restart. If no match,
-/// returns None so a new instance is allocated.
+/// returns None so the caller can report that `start` is restart-only.
 ///
 /// With neither: returns the single stopped instance if exactly one
 /// exists, errors if multiple stopped instances exist, returns None
@@ -1972,7 +2575,7 @@ fn resolve_running(
             .with_context(|| {
                 format!(
                     "No instance named '{name}'.\n\
-                     Create one with: coop start {name}"
+                     Create one with: coop up . --name {name}"
                 )
             })?;
         return be.as_running(cfg, inst).with_context(|| {
@@ -2004,7 +2607,7 @@ fn resolve_running(
         0 if stopped.is_empty() => {
             bail!(
                 "No instances found.\n\
-                 Create one with: coop start\n\
+                 Create one with: coop up\n\
                  (Run `coop setup` first if you haven't \
                  built an image yet.)"
             )
@@ -3298,19 +3901,13 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    static TEST_IMAGE: std::sync::LazyLock<super::config::ImageName> =
-        std::sync::LazyLock::new(|| {
-            super::config::ImageName::new(super::config::DEFAULT_IMAGE)
-                .expect("DEFAULT_IMAGE is valid")
-        });
-
     fn start_opts(
         mounts: Vec<super::config::Mount>,
         config_path: &std::path::Path,
     ) -> super::StartOpts<'_> {
         super::StartOpts {
             name: None,
-            image: &TEST_IMAGE,
+            image: super::StartImage { explicit: false },
             workspace_dir: None,
             git_repo: None,
             no_agents: false,
@@ -3378,10 +3975,28 @@ mod tests {
         assert!(slug.is_none());
     }
 
-    /// Issue #214 regression: bare `coop start --mount <dir>` must signal
-    /// "allocate a new VM" even when an unrelated stopped instance exists.
     #[test]
-    fn creation_intent_without_target_detects_bare_mount() {
+    fn restart_ignored_flags_allows_workspace_affinity_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.workspace_dir = Some("/some/workspace");
+        assert!(!super::restart_has_ignored_creation_flags(&opts));
+    }
+
+    #[test]
+    fn restart_ignored_flags_rejects_workspace_with_explicit_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let name = super::config::InstanceName::new("explicit").expect("valid name");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.name = Some(&name);
+        opts.workspace_dir = Some("/some/workspace");
+        assert!(super::restart_has_ignored_creation_flags(&opts));
+    }
+
+    #[test]
+    fn no_stopped_instance_message_points_creation_to_up() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mount = super::config::Mount {
             host_path: tmp.path().to_path_buf(),
@@ -3389,75 +4004,173 @@ mod tests {
         };
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(vec![mount], &cfg_path);
-        assert!(super::creation_intent_without_target(&opts));
+        let msg = super::no_stopped_instance_message(&opts, None);
+        assert!(msg.contains("only starts stopped instances"));
+        assert!(msg.contains("coop up [DIR]"));
     }
 
     #[test]
-    fn creation_intent_without_target_detects_git_repo() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(Vec::new(), &cfg_path);
-        opts.git_repo = Some("trailofbits/coop");
-        assert!(super::creation_intent_without_target(&opts));
+    fn up_subcommand_parses_defaults() {
+        let cli = parse(&["up"]);
+        let super::Commands::Up {
+            dir,
+            name,
+            copy,
+            mount,
+            extra_mount,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(dir, None);
+        assert!(name.is_none());
+        assert!(!copy);
+        assert!(!mount);
+        assert!(extra_mount.is_empty());
     }
 
     #[test]
-    fn creation_intent_without_target_detects_disk() {
+    fn up_subcommand_parses_project_and_mount_mode() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(Vec::new(), &cfg_path);
+        let cli = parse(&[
+            "up",
+            tmp.path().to_str().unwrap(),
+            "--mount",
+            "--name",
+            "named-project",
+        ]);
+        let super::Commands::Up {
+            dir, name, mount, ..
+        } = cli.command
+        else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(dir.as_deref(), tmp.path().to_str());
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("named-project")
+        );
+        assert!(mount);
+    }
+
+    #[test]
+    fn up_copy_and_mount_conflict() {
+        let err = parse_err(&["up", "--copy", "--mount"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn validate_unique_guest_paths_rejects_duplicates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).expect("create a");
+        std::fs::create_dir(&b).expect("create b");
+        let mounts = vec![
+            super::config::Mount::parse(&format!("{}:/data", a.display())).expect("mount a"),
+            super::config::Mount::parse(&format!("{}:/data", b.display())).expect("mount b"),
+        ];
+        let err = super::validate_unique_guest_paths(&mounts).expect_err("expected duplicate");
+        assert!(format!("{err}").contains("/data"));
+    }
+
+    #[test]
+    fn up_copy_rejects_extra_mount_at_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).expect("data");
+        let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
+
+        let err = super::validate_copy_workspace_mounts(super::ProjectTransport::Copy, &mounts)
+            .expect_err("expected /workspace collision");
+        assert!(format!("{err}").contains("/workspace"));
+    }
+
+    fn up_opts_for_tests(dir: Option<&str>) -> super::UpOpts<'_> {
+        super::UpOpts {
+            dir,
+            name: None,
+            transport: super::ProjectTransport::Copy,
+            extra_mount: Vec::new(),
+            vcpus: None,
+            mem: None,
+            disk: None,
+            image: super::config::default_image_name(),
+            image_explicit: false,
+            runtime: super::UpRuntimeOpts {
+                no_agents: false,
+                exclude_git: false,
+                no_prompt: true,
+                forward_ports: Vec::new(),
+                post_start: None,
+                guest_env: Vec::new(),
+            },
+            devcontainer: super::UpDevcontainerOpts {
+                path: None,
+                no_devcontainer: true,
+                dry_run: false,
+            },
+        }
+    }
+
+    #[test]
+    fn up_existing_rejects_creation_only_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+        let mut opts = up_opts_for_tests(project.to_str());
         opts.disk = super::config::GiB::new(20);
-        assert!(super::creation_intent_without_target(&opts));
+
+        let err = super::ensure_up_existing_inputs_are_compatible(
+            &inst,
+            super::ProjectTransport::Copy,
+            &opts,
+        )
+        .expect_err("expected incompatible");
+        assert!(format!("{err}").contains("--disk"));
     }
 
     #[test]
-    fn creation_intent_without_target_detects_exclude_git() {
+    fn up_existing_rejects_mismatched_explicit_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(Vec::new(), &cfg_path);
-        opts.exclude_git = true;
-        assert!(super::creation_intent_without_target(&opts));
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+        let other = super::config::InstanceName::new("other").expect("valid name");
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.name = Some(&other);
+
+        let err = super::ensure_up_project_name_matches(&inst, &project, &opts)
+            .expect_err("expected mismatched explicit name");
+        assert!(format!("{err}").contains("already associated"));
     }
 
-    /// A `--name` defers to the find/restart path even with creation-only
-    /// flags; the bail message there still tells the user how to proceed.
     #[test]
-    fn creation_intent_without_target_false_when_name_given() {
+    fn up_running_rejects_restart_only_inputs() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mount = super::config::Mount {
-            host_path: tmp.path().to_path_buf(),
-            guest_path: super::workspace::default_workspace_path(),
-        };
-        let cfg_path = tmp.path().join("config.toml");
-        let name = super::config::InstanceName::new("explicit").expect("valid name");
-        let mut opts = start_opts(vec![mount], &cfg_path);
-        opts.name = Some(&name);
-        assert!(!super::creation_intent_without_target(&opts));
-    }
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.runtime.post_start = Some("echo hi".to_string());
 
-    /// A `--workspace` is the affinity key for restart; the find path keeps
-    /// owning that decision so workspace-matched instances can be restarted.
-    #[test]
-    fn creation_intent_without_target_false_when_workspace_given() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let mount = super::config::Mount {
-            host_path: tmp.path().to_path_buf(),
-            guest_path: super::workspace::default_workspace_path(),
-        };
-        let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(vec![mount], &cfg_path);
-        opts.workspace_dir = Some("/some/workspace");
-        assert!(!super::creation_intent_without_target(&opts));
-    }
-
-    /// `coop start` with no flags must keep going through the
-    /// single-stopped-instance lookup — that's the normal restart UX.
-    #[test]
-    fn creation_intent_without_target_false_for_bare_start() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.toml");
-        let opts = start_opts(Vec::new(), &cfg_path);
-        assert!(!super::creation_intent_without_target(&opts));
+        let err = super::reject_running_up_restart_inputs(&inst, &opts)
+            .expect_err("expected restart-only rejection");
+        assert!(format!("{err}").contains("--post-start"));
     }
 
     #[test]

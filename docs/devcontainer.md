@@ -4,7 +4,7 @@ coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps
 
 ## How discovery and apply work
 
-When you run `coop start --workspace <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each `--mount` host root, with workspace winning ties).
+When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). On restart, `coop start --workspace <dir>` can also read the project's devcontainer file for restart-time settings.
 
 If a file is found, coop prompts:
 
@@ -53,4 +53,4 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 - OCI feature registry pulls (`ghcr.io/devcontainers/features/*` features other than the built-in name match)
 - `--git-repo` auto-detection — the file lives inside the repo before coop has cloned it
 - Sticky `--no-devcontainer` (persistent per-workspace state)
-- Live re-application on an existing VM (destroy + start to pick up changes)
+- Live re-application on an existing VM (destroy + `coop up` to pick up changes)
