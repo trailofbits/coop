@@ -162,6 +162,8 @@ coop claude my-project -- --model sonnet
 
 Open the Claude Code agent view (`claude agents`) inside the VM. Claude Code's background agents are managed by its own daemon, so closing the terminal does not stop in-flight sessions; reconnect with `coop claude-agents` to see them again.
 
+If the remote TUI stops responding, type Enter, then `~.` to disconnect the SSH session. coop forces OpenSSH's interactive escape character to `~`, so this works even if your user SSH config disables or changes `EscapeChar`. If the terminal remains in a broken raw/no-echo state afterward, run `stty sane`.
+
 ```
 coop claude-agents [NAME] [FLAGS] [ARGS...]
 coop ca [NAME] [FLAGS] [ARGS...]

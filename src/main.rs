@@ -255,7 +255,10 @@ enum Commands {
         args: Vec<String>,
     },
     /// Open the Claude Code agent view inside the VM (`claude agents`)
-    #[command(alias = "ca")]
+    #[command(
+        alias = "ca",
+        after_help = "If the remote TUI stops responding, type Enter, then ~. to disconnect. If your terminal remains broken afterward, run `stty sane`."
+    )]
     ClaudeAgents {
         /// Instance name (required if multiple instances exist)
         #[arg(

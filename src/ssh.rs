@@ -57,6 +57,23 @@ fn keepalive_opts() -> [String; 4] {
     ]
 }
 
+/// Force a known OpenSSH escape character for emergency disconnects.
+///
+/// OpenSSH only recognizes the escape at the start of a line, so users
+/// should type Enter, then `~.`. Setting it here keeps user SSH config from
+/// disabling or changing the escape path for coop's interactive sessions.
+fn escape_opts() -> [String; 2] {
+    ["-e".into(), "~".into()]
+}
+
+fn interactive_ssh_args(session: &SshSession, remote_cmd: String) -> Vec<String> {
+    let mut args = session.ssh_opts();
+    args.extend(keepalive_opts());
+    args.extend(escape_opts());
+    args.extend(["-t".to_string(), session.target.addr(), remote_cmd]);
+    args
+}
+
 /// Restore the local terminal after an SSH failure.
 ///
 /// When SSH itself fails (exit 255) the remote TUI never restores the
@@ -87,11 +104,11 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
         session.target.host,
         session.target.port,
     );
+    tracing::info!(
+        "If the remote session stops responding, type Enter, then ~. to disconnect; run `stty sane` if your terminal remains broken.",
+    );
 
-    let mut args = session.ssh_opts();
-    args.extend(keepalive_opts());
-    args.push(session.target.addr());
-    args.extend(["-t".to_string(), remote_cmd]);
+    let args = interactive_ssh_args(session, remote_cmd);
 
     let status = Command::new("ssh")
         .args(&args)
@@ -169,6 +186,7 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests construct known-valid SSH values")]
 mod tests {
     use super::*;
 
@@ -192,6 +210,52 @@ mod tests {
                 "ServerAliveInterval=30",
                 "-o",
                 "ServerAliveCountMax=3",
+            ],
+        );
+    }
+
+    #[test]
+    fn escape_opts_force_tilde_escape() {
+        assert_eq!(escape_opts(), ["-e", "~"]);
+    }
+
+    #[test]
+    fn interactive_args_force_escape_before_target() {
+        let session = SshSession {
+            target: crate::backend::SshTarget {
+                host: crate::backend::Hostname::new("127.0.0.1")
+                    .expect("test host should be valid"),
+                port: std::num::NonZeroU16::MIN,
+                user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
+                key_path: "/tmp/coop-test-key".into(),
+            },
+            env: crate::backend::EnvForward::default(),
+        };
+
+        assert_eq!(
+            interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
+            [
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "LogLevel=ERROR",
+                "-i",
+                "/tmp/coop-test-key",
+                "-p",
+                "1",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-e",
+                "~",
+                "-t",
+                "ubuntu@127.0.0.1",
+                "cd /workspace && 'claude' 'agents'",
             ],
         );
     }

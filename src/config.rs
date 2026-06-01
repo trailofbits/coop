@@ -2480,6 +2480,7 @@ mod tests {
     /// to a live non-firecracker process, the tests still see the
     /// expected `false` outcome — they assert behavior, not which
     /// branch fired.
+    #[cfg(target_os = "linux")]
     const DEAD_PID: u32 = 999_999;
 
     #[cfg(target_os = "linux")]

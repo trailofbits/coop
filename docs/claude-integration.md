@@ -32,6 +32,14 @@ coop ca
 
 This runs `claude agents` in the guest, which opens the agent view — an interactive TUI for monitoring background agent sessions. Background sessions are managed by Claude Code (not by coop), so closing the TUI and reconnecting later with `coop ca` keeps you in sync with whatever is still running.
 
+If the remote TUI appears stuck or stops responding, use OpenSSH's local escape: type Enter, then `~.` to disconnect. coop forces the interactive SSH escape character to `~`, so the escape path is available even if your user SSH config changes or disables `EscapeChar`. If your terminal remains in raw/no-echo mode after the disconnect, run:
+
+```bash
+stty sane
+```
+
+This is separate from SSH startup failures that exit with code 255. coop already restores the terminal after those failures; the escape sequence is for sessions where SSH is still connected and forwarding keystrokes to the remote TUI.
+
 `claude agents` accepts `--cwd <path>` (filter sessions by working directory) and `--setting-sources <sources>`; pass them after `--`:
 
 ```bash
