@@ -3081,6 +3081,21 @@ test_devcontainer_translator() {
         fail "remoteUser=root is reported invalid" "stderr: $HARNESS_ERR"
     fi
 
+    # Dedicated check command: validates the same file without discovery,
+    # config loading, setup, or VM work.
+    if coop devcontainer check "$dcfile" --stage both; then
+        pass "devcontainer check exits 0"
+    else
+        fail "devcontainer check exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    if grep -q "setup-stage translation:" <<< "$HARNESS_ERR" \
+        && grep -q "start-stage translation:" <<< "$HARNESS_ERR" \
+        && grep -q "remoteUser" <<< "$HARNESS_ERR"; then
+        pass "devcontainer check reports setup and start stages"
+    else
+        fail "devcontainer check reports setup and start stages" "stderr: $HARNESS_ERR"
+    fi
+
     # --no-devcontainer silently skips the file: the report header must NOT appear.
     # `--dry-run` lets us exercise the discovery path without any VM work.
     if coop up "$dcdir" --name "${INSTANCE}-dc-skip" \

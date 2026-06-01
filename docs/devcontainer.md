@@ -21,6 +21,7 @@ For CI or scripted use, pass one of:
 - `--devcontainer <path>` — use this specific file, skip the prompt
 - `--no-devcontainer` — ignore any discovered file
 - `--dry-run` — print the report and exit before any VM work
+- `coop devcontainer check <path>` — print setup/start translation reports for a file without loading coop config or touching VM state
 
 A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing.
 
@@ -39,9 +40,9 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 | `features` (anything else) | warn and skip | No silent fallback to a custom profile |
 | `hostRequirements.cpus` | `--vcpus` | |
 | `hostRequirements.memory` | `--mem` | Accepts `4GB`/`4GiB`-style values |
-| `hostRequirements.storage` | `--disk` | Accepts `16GB`/`16GiB`-style values |
+| `hostRequirements.storage` | `--disk` | Start-time only; accepts `16GB`/`16GiB`-style values |
 | `mounts` | `--mount` | Docker `type=bind,source=...,target=...` strings and objects supported; non-bind types are rejected |
-| `remoteUser` | warn and skip unless `ubuntu` | coop hardcodes the guest user |
+| `remoteUser` | `--guest-user` at setup time | Baked into the image at setup; start reports a mismatch and skips `containerEnv` if the image uses a different guest user |
 | `image`, `build`, `dockerComposeFile`, `customizations`, `name` | warn and skip | coop manages its own rootfs |
 
 ## JSON with comments

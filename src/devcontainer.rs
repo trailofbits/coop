@@ -423,7 +423,7 @@ pub fn translate(
     t.report.source_path = Some(file.path.clone());
 
     if let Some(reqs) = &file.raw.host_requirements {
-        translate_host_requirements(reqs, inputs, &mut t);
+        translate_host_requirements(reqs, inputs, stage, &mut t);
     }
 
     if let Some(cmd) = &file.raw.post_start_command {
@@ -559,6 +559,7 @@ pub fn translate(
 fn translate_host_requirements(
     reqs: &RawHostRequirements,
     inputs: &TranslatorInputs,
+    stage: Stage,
     t: &mut Translation,
 ) {
     if let Some(cpus) = reqs.cpus {
@@ -618,7 +619,15 @@ fn translate_host_requirements(
     if let Some(storage) = reqs.storage {
         let key = "hostRequirements.storage";
         let gib = storage.as_gib();
-        if let Some(cli) = inputs.cli_disk_gib {
+        if stage == Stage::Setup {
+            t.report.push(
+                key,
+                ReportStatus::Unsupported,
+                ReportSource::Devcontainer,
+                format!("{gib} GiB"),
+                "instance disk size is applied at `coop start` time, not during setup",
+            );
+        } else if let Some(cli) = inputs.cli_disk_gib {
             t.report.push(
                 key,
                 ReportStatus::Overridden,
@@ -1504,6 +1513,20 @@ mod tests {
         assert_eq!(cmd.status, ReportStatus::Overridden);
         assert!(t.vcpus.is_none());
         assert!(t.post_start.is_none());
+    }
+
+    #[test]
+    fn translate_setup_reports_storage_as_start_time_only() {
+        let f = parse(r#"{ "hostRequirements": { "storage": "16GiB" } }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
+        let storage = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "hostRequirements.storage")
+            .unwrap();
+        assert_eq!(storage.status, ReportStatus::Unsupported);
+        assert!(t.disk_gib.is_none());
     }
 
     #[test]

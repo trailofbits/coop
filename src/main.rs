@@ -48,7 +48,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
@@ -225,6 +225,11 @@ enum Commands {
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
     Build,
+    /// Inspect devcontainer.json support without starting setup or a VM
+    Devcontainer {
+        #[command(subcommand)]
+        command: DevcontainerCommands,
+    },
     /// Start an existing stopped VM instance
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
@@ -609,6 +614,28 @@ enum GithubAction {
     },
 }
 
+#[derive(Subcommand)]
+enum DevcontainerCommands {
+    /// Parse devcontainer.json and print coop's translation report.
+    Check {
+        /// Path to the devcontainer.json file to inspect
+        path: PathBuf,
+        /// Which lifecycle translation to report
+        #[arg(long, value_enum, default_value_t = DevcontainerCheckStage::Both)]
+        stage: DevcontainerCheckStage,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DevcontainerCheckStage {
+    /// Report setup-time keys such as features, hostRequirements, and remoteUser
+    Setup,
+    /// Report start-time keys such as postStartCommand, containerEnv, ports, and mounts
+    Start,
+    /// Report both setup and start translations
+    Both,
+}
+
 fn init_tracing(verbosity: u8) {
     let filter = match verbosity {
         0 => "coop=info",
@@ -712,6 +739,10 @@ fn main() -> Result<()> {
         );
     }
 
+    if let Commands::Devcontainer { ref command } = cli.command {
+        return cmd_devcontainer(command);
+    }
+
     let mut cfg = config::CoopConfig::load(&cli.config)?;
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
@@ -812,7 +843,7 @@ fn main() -> Result<()> {
             };
             let translation = resolve_devcontainer(
                 &DevcontainerOpts {
-                    explicit_path: devcontainer.as_deref(),
+                    explicit_path: devcontainer.as_deref().map(Path::new),
                     no_devcontainer,
                     dry_run,
                     workspace: ws_path,
@@ -863,6 +894,7 @@ fn main() -> Result<()> {
             let validated = cfg.validate_and_warn()?;
             cmd_build(&cfg, &validated)
         }
+        Commands::Devcontainer { .. } => unreachable!("handled before config load"),
         Commands::Start {
             name,
             workspace,
@@ -928,7 +960,7 @@ fn main() -> Result<()> {
             let ws_path = workspace.as_deref().map(Path::new);
             let translation = resolve_devcontainer(
                 &DevcontainerOpts {
-                    explicit_path: devcontainer.as_deref(),
+                    explicit_path: devcontainer.as_deref().map(Path::new),
                     no_devcontainer,
                     dry_run,
                     workspace: ws_path,
@@ -1309,7 +1341,7 @@ fn cmd_up(
         let inputs = up_translator_inputs(cfg, opts);
         resolve_devcontainer(
             &DevcontainerOpts {
-                explicit_path: opts.devcontainer.path.as_deref(),
+                explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
                 no_devcontainer: opts.devcontainer.no_devcontainer,
                 dry_run: true,
                 workspace: Some(&project_dir),
@@ -1386,7 +1418,7 @@ fn create_up_instance(
     let inputs = up_translator_inputs(cfg, opts);
     let translation = resolve_devcontainer(
         &DevcontainerOpts {
-            explicit_path: opts.devcontainer.path.as_deref(),
+            explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
             no_devcontainer: opts.devcontainer.no_devcontainer,
             dry_run: false,
             workspace: Some(project_dir),
@@ -1951,7 +1983,7 @@ fn apply_vm_overrides(
 /// prompt). `no_devcontainer` opts out entirely (skips discovery).
 /// `dry_run` prints the report and exits before any side effects.
 struct DevcontainerOpts<'a> {
-    explicit_path: Option<&'a str>,
+    explicit_path: Option<&'a Path>,
     no_devcontainer: bool,
     dry_run: bool,
     workspace: Option<&'a Path>,
@@ -1982,7 +2014,7 @@ fn resolve_devcontainer(
     }
 
     let (path, losers) = if let Some(p) = opts.explicit_path {
-        (PathBuf::from(p), Vec::new())
+        (p.to_path_buf(), Vec::new())
     } else {
         let found = devcontainer::discover(opts.workspace, opts.mounts);
         if let Some((winner, losers)) = devcontainer::pick_winner(found) {
@@ -2023,6 +2055,61 @@ fn resolve_devcontainer(
     eprintln!("{}", translation.report.render());
 
     Ok(Some(translation))
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "devcontainer check report is intentional user-facing CLI output"
+)]
+fn cmd_devcontainer(command: &DevcontainerCommands) -> Result<()> {
+    match command {
+        DevcontainerCommands::Check { path, stage } => {
+            let opts = DevcontainerOpts {
+                explicit_path: Some(path.as_path()),
+                no_devcontainer: false,
+                dry_run: true,
+                workspace: None,
+                mounts: &[],
+            };
+            let setup_inputs = devcontainer::TranslatorInputs::default();
+
+            match stage {
+                DevcontainerCheckStage::Setup => {
+                    resolve_devcontainer(&opts, &setup_inputs, devcontainer::Stage::Setup)?;
+                }
+                DevcontainerCheckStage::Start => {
+                    let start_inputs = devcontainer::TranslatorInputs {
+                        persisted_guest_user: Some(guest::GuestUser::default()),
+                        ..devcontainer::TranslatorInputs::default()
+                    };
+                    resolve_devcontainer(&opts, &start_inputs, devcontainer::Stage::Start)?;
+                }
+                DevcontainerCheckStage::Both => {
+                    eprintln!("setup-stage translation:");
+                    let setup_translation =
+                        resolve_devcontainer(&opts, &setup_inputs, devcontainer::Stage::Setup)?;
+                    let assumed_guest_user =
+                        devcontainer_check_assumed_guest_user(setup_translation.as_ref());
+                    let start_inputs = devcontainer::TranslatorInputs {
+                        persisted_guest_user: Some(assumed_guest_user),
+                        ..devcontainer::TranslatorInputs::default()
+                    };
+                    eprintln!();
+                    eprintln!("start-stage translation:");
+                    resolve_devcontainer(&opts, &start_inputs, devcontainer::Stage::Start)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn devcontainer_check_assumed_guest_user(
+    setup_translation: Option<&devcontainer::Translation>,
+) -> guest::GuestUser {
+    setup_translation
+        .and_then(|t| t.guest_user.clone())
+        .unwrap_or_default()
 }
 
 fn cmd_build(cfg: &config::CoopConfig, _: &config::Validated) -> Result<()> {
@@ -4212,6 +4299,56 @@ mod tests {
     fn quickstart_rejects_unknown_flag() {
         let err = parse_err(&["quickstart", "--name", "foo"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn devcontainer_check_subcommand_parses_with_defaults() {
+        let cli = parse(&["devcontainer", "check", ".devcontainer/devcontainer.json"]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Check { path, stage } = command;
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(".devcontainer/devcontainer.json")
+        );
+        assert!(matches!(stage, super::DevcontainerCheckStage::Both));
+    }
+
+    #[test]
+    fn devcontainer_check_stage_flag_parses() {
+        let cli = parse(&[
+            "devcontainer",
+            "check",
+            ".devcontainer/devcontainer.json",
+            "--stage",
+            "start",
+        ]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Check { stage, .. } = command;
+        assert!(matches!(stage, super::DevcontainerCheckStage::Start));
+    }
+
+    #[test]
+    fn devcontainer_check_both_stage_reuses_setup_guest_user() {
+        let translation = super::devcontainer::Translation {
+            guest_user: Some(super::guest::GuestUser::new("vscode").unwrap()),
+            ..super::devcontainer::Translation::default()
+        };
+        assert_eq!(
+            super::devcontainer_check_assumed_guest_user(Some(&translation)).to_string(),
+            "vscode"
+        );
+    }
+
+    #[test]
+    fn devcontainer_check_both_stage_defaults_without_setup_guest_user() {
+        assert_eq!(
+            super::devcontainer_check_assumed_guest_user(None).to_string(),
+            "ubuntu"
+        );
     }
 
     #[test]

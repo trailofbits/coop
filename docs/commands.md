@@ -105,6 +105,7 @@ coop setup [FLAGS]
 | `--post-install <path>` | Path to a post-install script to run in the chroot |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
+| `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
 | `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json`. |
@@ -127,6 +128,21 @@ coop build
 ```
 
 No additional flags.
+
+### `devcontainer check`
+
+Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM.
+
+```
+coop devcontainer check <path> [--stage setup|start|both]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<path>` | Path to the `devcontainer.json` file to inspect |
+| `--stage <stage>` | Which lifecycle translation to report: `setup`, `start`, or `both` (default: `both`) |
+
+Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirements.cpus`, `hostRequirements.memory`, and `remoteUser`. Use `--stage start` to inspect start-time keys such as `postStartCommand`, `containerEnv`, `forwardPorts`, `mounts`, and `hostRequirements.storage`.
 
 ### `start`
 
