@@ -146,30 +146,32 @@ Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirem
 
 ### `start`
 
-Start an existing stopped VM instance.
+Restart a stopped VM, or build and start a profile-derived image.
 
 ```
 coop start [NAME] [FLAGS]
 ```
 
-`start` is restart-only: it never creates a new instance. Use `coop up [DIR]`
-to create or reconnect to a project environment. Without `NAME`, `start`
-restarts the only stopped instance if exactly one exists; with multiple stopped
-instances, pass the instance name.
+`start` normally restarts existing stopped instances. Use `coop up [DIR]` to
+create or reconnect to a project environment. Without `NAME`, `start` restarts
+the only stopped instance if exactly one exists; with multiple stopped
+instances, pass the instance name. The profile shorthand
+`coop start --profile <list>` is the creation exception described below.
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
+| `--profile <list>` | Build or reuse a profile-derived image for a new instance, named from the sorted profiles (for example `node-python`) |
 | `--workspace <dir>` | Restart the stopped instance associated with this project path (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Creation-time option retained only for compatibility; use `coop up` for new project environments |
+| `--git-repo <url>` | Deprecated creation option; only applies when creating with `--profile` |
 | `--vcpus <N>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--mem <MiB>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--disk <GiB>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--disk <GiB>` | Instance disk size when creating with `--profile`; rejected on restart |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--mount <spec>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--mount <spec>` | Host directory to mount when creating with `--profile`; rejected on restart |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
-| `--exclude-git` | Creation-time option retained only for compatibility; rejected on restart |
+| `--exclude-git` | Skip `.git/` when copying/syncing a workspace for `--profile`; rejected on restart |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
@@ -179,9 +181,17 @@ instances, pass the instance name.
 
 When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
 
+`coop start --profile <list>` is the exception to the restart-only rule. It
+derives an image name from the sorted profile list, runs the same stale-image
+check as `coop setup`, builds or rebuilds that image if needed, and then starts
+a new instance from it. Explicit named images are unchanged: use `coop setup
+--image <name> --profile ...` followed by `coop up --image <name>` when you
+want to choose the image name yourself.
+
 ```
 coop start
 coop start my-project
+coop start --profile python,node
 coop start my-project --no-agents
 coop start --env RUST_LOG=info --env MY_FLAG=1
 coop start --forward-port 3000 --forward-port 8080:18080

@@ -2270,28 +2270,30 @@ test_builtin_profiles() {
     echo ""
     echo "=== Phase: built-in profiles ==="
 
-    # Build a named image with python and node profiles.
-    # These cover apt-only (python) and pre-install script (node/NodeSource).
-    local img_name="profiles-test-$$"
-    if coop setup -y --image "$img_name" --profile python,node; then
-        pass "setup --profile python,node exits 0"
+    # Build-on-demand via start. The sorted profile list derives the
+    # node-python image name. These cover apt-only (python) and
+    # pre-install script (node/NodeSource).
+    local img_name="node-python"
+    coop images --delete "$img_name" 2>/dev/null || true
+
+    local inst_name="${INSTANCE}-prof"
+    if coop start "$inst_name" --profile python,node --no-agents; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "start --profile python,node exits 0"
     else
-        fail "setup --profile python,node exits 0" "exit code: $?"
+        fail "start --profile python,node exits 0" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
         return
     fi
 
-    # Create instance from the profiled image
-    local inst_name="${INSTANCE}-prof"
-    local prof_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$prof_ws"
-    if coop up "$prof_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up from profiled image exits 0"
+    if coop images; then
+        if echo "$HARNESS_OUT" | grep -q "^${img_name} "; then
+            pass "derived profile image is listed"
+        else
+            fail "derived profile image is listed" "output: $HARNESS_OUT"
+        fi
     else
-        fail "up from profiled image exits 0" "exit code: $?"
-        coop images --delete "$img_name" 2>/dev/null || true
-        return
+        fail "images exits 0 after start --profile" "exit code: $?"
     fi
 
     GUEST_INSTANCE="$inst_name"

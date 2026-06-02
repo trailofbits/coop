@@ -94,6 +94,15 @@ coop setup --profile python,node
 
 Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`. Combine them with commas (e.g. `--profile python,node,rust`). Use `coop profiles list` to inspect what each one installs.
 
+You can also let `start` build a profile-derived image on demand:
+
+```
+coop start --profile python,node
+```
+
+This creates or refreshes an image named from the sorted profile list
+(`node-python` here), then starts a new instance from it.
+
 Skip confirmation prompts with `-y`:
 
 ```

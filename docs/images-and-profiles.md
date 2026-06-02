@@ -78,6 +78,30 @@ coop setup --profile ml
 coop setup --profile ml,node
 ```
 
+## Build-on-demand from `start`
+
+For profile-only workflows, `coop start --profile <list>` builds the matching
+image automatically before starting a new instance. The image name is derived
+from the sorted profile list, so these commands all target the same
+`node-python` image:
+
+```bash
+coop start --profile python,node
+coop start --profile node,python
+```
+
+coop runs the same recipe-hash staleness check used by `coop setup`. If the
+derived image is missing or stale, it is built or rebuilt first; if it is
+current, startup reuses it.
+
+Explicitly named images are not affected by this shorthand. To choose the
+image name yourself, build it with `setup` and start a project from that image:
+
+```bash
+coop setup --image ml-dev --profile python,node
+coop up . --image ml-dev
+```
+
 ## Extra packages
 
 For one-off additions without a full profile, use `--extra-packages`:

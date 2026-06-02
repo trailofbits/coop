@@ -230,15 +230,22 @@ enum Commands {
         #[command(subcommand)]
         command: DevcontainerCommands,
     },
-    /// Start an existing stopped VM instance
+    /// Restart a stopped VM, or build/start a profile-derived image
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
         #[arg(value_parser = config::InstanceName::parse)]
         name: Option<config::InstanceName>,
+        /// Install profiles for a new profile-derived image, building it on demand
+        #[arg(
+            long,
+            value_delimiter = ',',
+            add = ArgValueCandidates::new(completions::profile_candidates),
+        )]
+        profile: Vec<String>,
         /// Project directory used to select an associated stopped instance
         #[arg(long, conflicts_with = "git_repo")]
         workspace: Option<String>,
-        /// Deprecated creation option; rejected by `coop start`
+        /// Deprecated creation option; only applies when creating with --profile
         #[arg(long, conflicts_with = "workspace")]
         git_repo: Option<String>,
         /// Creation-time option; rejected by `coop start`
@@ -247,13 +254,13 @@ enum Commands {
         /// Creation-time option; rejected by `coop start`
         #[arg(long, value_parser = config::MiB::parse_cli)]
         mem: Option<config::MiB>,
-        /// Creation-time option; rejected by `coop start`
+        /// Creation-time option; only applies when creating with --profile
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
-        /// Creation-time option; rejected by `coop start`
+        /// Creation-time option; only applies when creating with --profile
         #[arg(
             long,
             conflicts_with_all = ["workspace", "git_repo"],
@@ -265,7 +272,7 @@ enum Commands {
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
         #[arg(long, value_parser = config::PortForward::parse)]
         forward_port: Vec<config::PortForward>,
-        /// Creation-time option; rejected by `coop start`
+        /// Explicit named image; rejected by `coop start`
         #[arg(
             long,
             default_value = config::DEFAULT_IMAGE,
@@ -273,7 +280,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
-        /// Creation-time option; rejected by `coop start`
+        /// Creation-time option; only applies when creating with --profile
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -897,6 +904,7 @@ fn main() -> Result<()> {
         Commands::Devcontainer { .. } => unreachable!("handled before config load"),
         Commands::Start {
             name,
+            profile,
             workspace,
             git_repo,
             vcpus,
@@ -925,10 +933,19 @@ fn main() -> Result<()> {
                     "`coop start` only starts stopped instances; VM sizing options belong to `coop up`."
                 );
             }
+            let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
+            let profile_target = if profile.is_empty() {
+                None
+            } else {
+                Some(ProfileImageTarget::new(&profile)?)
+            };
+            let effective_image = profile_target
+                .as_ref()
+                .map_or(&image, |target| &target.image);
             let preflight_opts = StartOpts {
                 name: name.as_ref(),
                 image: StartImage {
-                    explicit: raw_args_use_long_flag(&raw_args, "--image"),
+                    explicit: image_explicit,
                 },
                 workspace_dir: workspace.as_deref(),
                 git_repo: git_repo.as_deref(),
@@ -942,7 +959,28 @@ fn main() -> Result<()> {
                 post_start_override: post_start.as_deref(),
                 persisted_guest_env: std::collections::BTreeMap::new(),
             };
-            preflight_start_target(&be, &cfg, &preflight_opts)?;
+            if profile.is_empty() {
+                preflight_start_target(&be, &cfg, &preflight_opts)?;
+            } else if image_explicit {
+                bail!(
+                    "`coop start --profile` derives the image name from the sorted profile list; \
+                     use `coop setup --image {image} --profile ...` and then `coop up --image {image}` \
+                     for an explicit named image."
+                );
+            } else if (preflight_opts.name.is_some() || preflight_opts.workspace_dir.is_some())
+                && find_stopped_instance(
+                    &be,
+                    &cfg,
+                    preflight_opts.name,
+                    preflight_opts.workspace_dir.map(Path::new),
+                )?
+                .is_some()
+            {
+                bail!(
+                    "`coop start --profile` creates a new profile-derived instance; \
+                     it cannot change an existing stopped instance's image."
+                );
+            }
             let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -952,8 +990,8 @@ fn main() -> Result<()> {
                 cli_guest_env_keys: cli_env_keys,
                 cli_forward_ports: forward_ports.clone(),
                 cli_mounts: mounts.clone(),
-                cli_profiles: Vec::new(),
-                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
+                cli_profiles: profile.clone(),
+                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, effective_image)),
                 cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
                 ..devcontainer::TranslatorInputs::default()
             };
@@ -1018,29 +1056,63 @@ fn main() -> Result<()> {
             } else {
                 mounts
             };
-            cmd_start(
-                &be,
-                &mut cfg,
-                &validated,
-                &StartOpts {
-                    name: name.as_ref(),
-                    image: StartImage {
-                        explicit: raw_args_use_long_flag(&raw_args, "--image"),
-                    },
-                    workspace_dir: workspace.as_deref(),
-                    git_repo: git_repo.as_deref(),
-                    no_agents,
-                    no_prompt,
-                    disk: effective_disk,
-                    mounts: final_mounts,
-                    exclude_git,
-                    forward_ports,
-                    config_path: &cli.config,
-                    post_start_override: post_start_override.as_deref(),
-                    persisted_guest_env,
+            let start_opts = StartOpts {
+                name: name.as_ref(),
+                image: StartImage {
+                    explicit: image_explicit,
                 },
-            )
-            .map(|_| ())
+                workspace_dir: workspace.as_deref(),
+                git_repo: git_repo.as_deref(),
+                no_agents,
+                no_prompt,
+                disk: effective_disk,
+                mounts: final_mounts,
+                exclude_git,
+                forward_ports,
+                config_path: &cli.config,
+                post_start_override: post_start_override.as_deref(),
+                persisted_guest_env,
+            };
+            if let Some(profile_target) = profile_target {
+                let resolved_profiles =
+                    guest::resolve_profiles(&profile_target.profiles, &cfg.profiles)?;
+                let _guard = signal::install_handlers();
+                be.setup(
+                    &cfg,
+                    &validated,
+                    &setup::SetupOptions {
+                        skip_confirm: true,
+                        rebuild: false,
+                        profiles: resolved_profiles,
+                        extra_packages: Vec::new(),
+                        post_install: None,
+                        image: profile_target.image.clone(),
+                        guest_user: guest::GuestUser::default(),
+                    },
+                )?;
+                let workspace_path = workspace
+                    .as_deref()
+                    .map(Path::new)
+                    .map(Path::canonicalize)
+                    .transpose()
+                    .with_context(|| {
+                        format!(
+                            "Failed to resolve workspace path {}",
+                            workspace.as_deref().unwrap_or_default()
+                        )
+                    })?;
+                allocate_and_start(
+                    &be,
+                    &mut cfg,
+                    name.as_ref(),
+                    &profile_target.image,
+                    workspace_path.as_deref(),
+                    &start_opts,
+                )
+                .map(|_| ())
+            } else {
+                cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
+            }
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {
@@ -2119,8 +2191,33 @@ fn cmd_build(cfg: &config::CoopConfig, _: &config::Validated) -> Result<()> {
     Ok(())
 }
 
+struct ProfileImageTarget {
+    profiles: Vec<String>,
+    image: config::ImageName,
+}
+
+impl ProfileImageTarget {
+    fn new(profiles: &[String]) -> Result<Self> {
+        let profiles = canonical_profile_list(profiles);
+        let image = config::ImageName::new(&profiles.join("-")).with_context(|| {
+            format!(
+                "Cannot derive an image name from profile list: {}",
+                profiles.join(", ")
+            )
+        })?;
+        Ok(Self { profiles, image })
+    }
+}
+
 struct StartImage {
     explicit: bool,
+}
+
+fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
+    let mut names = profiles.to_vec();
+    names.sort();
+    names.dedup();
+    names
 }
 
 struct StartOpts<'a> {
@@ -3473,6 +3570,27 @@ mod tests {
             panic!("expected Start variant");
         };
         assert!(no_agents);
+    }
+
+    #[test]
+    fn start_profile_flag_parses_comma_list() {
+        let cli = parse(&["start", "--profile", "python,node"]);
+        let super::Commands::Start { profile, .. } = cli.command else {
+            panic!("expected Start variant");
+        };
+        assert_eq!(profile, vec!["python", "node"]);
+    }
+
+    #[test]
+    fn profile_image_target_sorts_and_deduplicates_profiles() {
+        let profiles = vec![
+            "python".to_string(),
+            "node".to_string(),
+            "python".to_string(),
+        ];
+        let target = super::ProfileImageTarget::new(&profiles).expect("image target");
+        assert_eq!(target.image.as_str(), "node-python");
+        assert_eq!(target.profiles, vec!["node", "python"]);
     }
 
     #[test]
