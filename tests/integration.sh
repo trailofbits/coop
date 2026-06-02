@@ -1269,6 +1269,21 @@ test_stop() {
     fi
 }
 
+test_stop_idempotency() {
+    echo ""
+    echo "=== Phase: stop idempotency ==="
+
+    # The primary instance was just stopped by test_stop. Reuse that state
+    # instead of booting a throwaway VM solely to stop it twice.
+    local rc=0
+    "$BINARY" stop "$INSTANCE" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "second stop succeeds (idempotent)"
+    else
+        fail "second stop is idempotent" "exit code: $rc"
+    fi
+}
+
 test_auto_resolve_stopped() {
     echo ""
     echo "=== Phase: auto-resolve (single stopped) ==="
@@ -1608,33 +1623,6 @@ test_idempotency() {
         pass "destroy already-destroyed instance succeeds (idempotent)"
     fi
 
-    # stop idempotency: start an instance, stop it twice
-    local inst_name="${INSTANCE}-idem"
-    local idem_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$idem_ws"
-    if ! coop up "$idem_ws" --name "$inst_name" --no-agents --no-devcontainer; then
-        fail "up for stop-idempotency test" "exit code: $?"
-        return
-    fi
-    STARTED_INSTANCES+=("$inst_name")
-
-    if coop stop "$inst_name"; then
-        pass "first stop succeeds"
-    else
-        fail "first stop succeeds" "exit code: $?"
-    fi
-
-    # Second stop on an already-stopped instance
-    rc=0
-    "$BINARY" stop "$inst_name" >/dev/null 2>&1 || rc=$?
-    if [[ $rc -eq 0 ]]; then
-        pass "second stop succeeds (idempotent)"
-    else
-        fail "second stop is idempotent" "exit code: $rc"
-    fi
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
 }
 
 # ── Quickstart (--full only) ──────────────────────────────────
@@ -3524,6 +3512,7 @@ main() {
 
     # Stop + restart + stopped-state verification
     test_stop
+    test_stop_idempotency
     test_auto_resolve_stopped
     test_status_stopped
     test_list_stopped
