@@ -917,7 +917,7 @@ fn main() -> Result<()> {
             no_prompt,
             post_start,
             guest_env,
-            forward_port: mut forward_ports,
+            forward_port: forward_ports,
             devcontainer,
             no_devcontainer,
             dry_run,
@@ -926,11 +926,6 @@ fn main() -> Result<()> {
             if raw_args_use_deprecated_no_claude(&raw_args) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
-                );
-            }
-            if vcpus.is_some() || mem.is_some() {
-                bail!(
-                    "`coop start` only starts stopped instances; VM sizing options belong to `coop up`."
                 );
             }
             let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
@@ -942,7 +937,46 @@ fn main() -> Result<()> {
             let effective_image = profile_target
                 .as_ref()
                 .map_or(&image, |target| &target.image);
-            let preflight_opts = StartOpts {
+            if dry_run {
+                let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
+                let inputs = devcontainer::TranslatorInputs {
+                    cli_vcpus: vcpus,
+                    cli_mem_mib: mem,
+                    cli_disk_gib: disk,
+                    cli_post_start: post_start.clone(),
+                    cli_guest_env_keys: cli_env_keys,
+                    cli_forward_ports: forward_ports.clone(),
+                    cli_mounts: mounts.clone(),
+                    cli_profiles: profile.clone(),
+                    persisted_guest_user: Some(backend::persisted_guest_user(
+                        &cfg,
+                        effective_image,
+                    )),
+                    cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+                    ..devcontainer::TranslatorInputs::default()
+                };
+                let ws_path = workspace.as_deref().map(Path::new);
+                let _ = resolve_devcontainer(
+                    &DevcontainerOpts {
+                        explicit_path: devcontainer.as_deref().map(Path::new),
+                        no_devcontainer,
+                        dry_run,
+                        workspace: ws_path,
+                        mounts: &mounts,
+                    },
+                    &inputs,
+                    devcontainer::Stage::Start,
+                )?;
+                return Ok(());
+            }
+
+            if vcpus.is_some() || mem.is_some() {
+                bail!(
+                    "`coop start` only starts stopped instances; VM sizing options belong to `coop up`."
+                );
+            }
+
+            let mut start_opts = StartOpts {
                 name: name.as_ref(),
                 image: StartImage {
                     explicit: image_explicit,
@@ -952,27 +986,28 @@ fn main() -> Result<()> {
                 no_agents,
                 no_prompt,
                 disk,
-                mounts: mounts.clone(),
+                mounts,
                 exclude_git,
-                forward_ports: forward_ports.clone(),
+                forward_ports,
                 config_path: &cli.config,
                 post_start_override: post_start.as_deref(),
                 persisted_guest_env: std::collections::BTreeMap::new(),
+                devcontainer_path: devcontainer.as_deref().map(Path::new),
             };
             if profile.is_empty() {
-                preflight_start_target(&be, &cfg, &preflight_opts)?;
+                preflight_start_target(&be, &cfg, &start_opts)?;
             } else if image_explicit {
                 bail!(
                     "`coop start --profile` derives the image name from the sorted profile list; \
                      use `coop setup --image {image} --profile ...` and then `coop up --image {image}` \
                      for an explicit named image."
                 );
-            } else if (preflight_opts.name.is_some() || preflight_opts.workspace_dir.is_some())
+            } else if (start_opts.name.is_some() || start_opts.workspace_dir.is_some())
                 && find_stopped_instance(
                     &be,
                     &cfg,
-                    preflight_opts.name,
-                    preflight_opts.workspace_dir.map(Path::new),
+                    start_opts.name,
+                    start_opts.workspace_dir.map(Path::new),
                 )?
                 .is_some()
             {
@@ -981,98 +1016,7 @@ fn main() -> Result<()> {
                      it cannot change an existing stopped instance's image."
                 );
             }
-            let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
-            let inputs = devcontainer::TranslatorInputs {
-                cli_vcpus: vcpus,
-                cli_mem_mib: mem,
-                cli_disk_gib: disk,
-                cli_post_start: post_start.clone(),
-                cli_guest_env_keys: cli_env_keys,
-                cli_forward_ports: forward_ports.clone(),
-                cli_mounts: mounts.clone(),
-                cli_profiles: profile.clone(),
-                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, effective_image)),
-                cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
-                ..devcontainer::TranslatorInputs::default()
-            };
-            let ws_path = workspace.as_deref().map(Path::new);
-            let translation = resolve_devcontainer(
-                &DevcontainerOpts {
-                    explicit_path: devcontainer.as_deref().map(Path::new),
-                    no_devcontainer,
-                    dry_run,
-                    workspace: ws_path,
-                    mounts: &mounts,
-                },
-                &inputs,
-                devcontainer::Stage::Start,
-            )?;
-            if dry_run {
-                return Ok(());
-            }
-            // CLI flags are applied first; the translation only carries
-            // values that survived the "CLI > devcontainer.json" precedence
-            // check inside `translate`, so the two cannot fight here.
-            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
-            if let Some(t) = &translation {
-                devcontainer::apply_to_config(&mut cfg, t)?;
-                forward_ports =
-                    devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
-            }
-            // `BTreeMap::from_iter` keeps the last value for a repeated
-            // key, matching the documented "last `--env` wins" semantics.
-            let cli_guest_env: std::collections::BTreeMap<_, _> =
-                guest_env.iter().cloned().collect();
-            for (key, value) in &cli_guest_env {
-                cfg.guest_env.insert(key.clone(), value.clone());
-            }
-            // Union of CLI `--env` and devcontainer `containerEnv`. Both
-            // are start-time inputs that won't be re-derived by later
-            // `coop shell`/`exec`, so they belong in the on-disk snapshot
-            // (see `guest_env_state` module docs for the rationale).
-            let dc_guest_env = translation
-                .as_ref()
-                .map(|t| t.guest_env.clone())
-                .unwrap_or_default();
-            let persisted_guest_env =
-                guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-            let default_translation = devcontainer::Translation::default();
-            let effective_disk = devcontainer::effective_disk(
-                disk,
-                translation.as_ref().unwrap_or(&default_translation),
-            );
-            let post_start_override = post_start
-                .clone()
-                .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
-            // `--mount` and devcontainer `mounts` aren't combined: --mount is
-            // a complete replacement of the mount set (its `conflicts_with`
-            // rules with --workspace/--git-repo encode this). The CLI-wins
-            // outcome is reported by `translate`.
-            let final_mounts = if mounts.is_empty() {
-                translation
-                    .as_ref()
-                    .map(|t| t.mounts.clone())
-                    .unwrap_or_default()
-            } else {
-                mounts
-            };
-            let start_opts = StartOpts {
-                name: name.as_ref(),
-                image: StartImage {
-                    explicit: image_explicit,
-                },
-                workspace_dir: workspace.as_deref(),
-                git_repo: git_repo.as_deref(),
-                no_agents,
-                no_prompt,
-                disk: effective_disk,
-                mounts: final_mounts,
-                exclude_git,
-                forward_ports,
-                config_path: &cli.config,
-                post_start_override: post_start_override.as_deref(),
-                persisted_guest_env,
-            };
+            apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
             if let Some(profile_target) = profile_target {
                 let resolved_profiles =
                     guest::resolve_profiles(&profile_target.profiles, &cfg.profiles)?;
@@ -1565,6 +1509,7 @@ fn create_up_instance(
         config_path,
         post_start_override: post_start_override.as_deref(),
         persisted_guest_env,
+        devcontainer_path: None,
     };
 
     allocate_and_start(
@@ -1616,6 +1561,7 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         config_path,
         post_start_override: opts.runtime.post_start.as_deref(),
         persisted_guest_env: std::collections::BTreeMap::new(),
+        devcontainer_path: None,
     }
 }
 
@@ -1840,6 +1786,7 @@ fn cmd_quickstart(
                     config_path,
                     post_start_override: None,
                     persisted_guest_env: std::collections::BTreeMap::new(),
+                    devcontainer_path: None,
                 },
             )?
         }
@@ -1907,6 +1854,9 @@ fn quickstart_fresh_start(
         .unwrap_or_default();
     let persisted_guest_env =
         guest_env_state::merge_persisted_entries(&dc_guest_env, &std::collections::BTreeMap::new());
+    for (key, value) in &persisted_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
 
     let default_translation = devcontainer::Translation::default();
     let effective_disk =
@@ -1939,6 +1889,7 @@ fn quickstart_fresh_start(
         config_path,
         post_start_override: post_start_override.as_deref(),
         persisted_guest_env,
+        devcontainer_path: None,
     };
 
     let _ = validated;
@@ -2241,13 +2192,11 @@ struct StartOpts<'a> {
     /// CLI override for `post_start` from `config.toml`. `None` means
     /// "use the configured value (if any)"; `Some` always wins.
     post_start_override: Option<&'a str>,
-    /// Start-time guest-env entries to persist as the per-instance
-    /// snapshot, so later `coop shell`/`exec` runs see them. This is
-    /// the union of CLI `--env KEY=VALUE` and the devcontainer
-    /// translator's `containerEnv` map (CLI wins per-key). `[guest_env]`
-    /// from `config.toml` is re-read every invocation and deliberately
-    /// not saved here.
     persisted_guest_env: std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
+    /// Explicit `--devcontainer` is creation-only. `start --dry-run` handles
+    /// translation before this struct is built; normal `start` only uses this
+    /// marker to reject silently ignored creation options on restart.
+    devcontainer_path: Option<&'a Path>,
 }
 
 fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
@@ -2258,6 +2207,7 @@ fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
         || opts.git_repo.is_some()
         || opts.disk.is_some()
         || opts.exclude_git
+        || opts.devcontainer_path.is_some()
 }
 
 fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Path>) -> String {
@@ -2277,6 +2227,7 @@ fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Pat
         || opts.disk.is_some()
         || opts.image.explicit
         || opts.exclude_git
+        || opts.devcontainer_path.is_some()
     {
         msg.push_str(
             "\n`coop start` only starts stopped instances; creation options belong to `coop up`.",
@@ -4124,6 +4075,7 @@ mod tests {
             config_path,
             post_start_override: None,
             persisted_guest_env: std::collections::BTreeMap::new(),
+            devcontainer_path: None,
         }
     }
 
@@ -4376,6 +4328,15 @@ mod tests {
         let err = super::reject_running_up_restart_inputs(&inst, &opts)
             .expect_err("expected restart-only rejection");
         assert!(format!("{err}").contains("--post-start"));
+    }
+
+    #[test]
+    fn restart_creation_flags_detect_explicit_devcontainer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("config.toml");
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.devcontainer_path = Some(std::path::Path::new("/tmp/devcontainer.json"));
+        assert!(super::restart_has_ignored_creation_flags(&opts));
     }
 
     #[test]
