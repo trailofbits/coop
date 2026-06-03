@@ -4,6 +4,7 @@ mod completions;
 mod config;
 mod devcontainer;
 mod fs_util;
+mod git_repo_devcontainer;
 mod github_pat;
 mod github_repo;
 mod github_submodules;
@@ -855,6 +856,8 @@ fn main() -> Result<()> {
                     dry_run,
                     workspace: ws_path,
                     mounts: &[],
+                    git_repo: None,
+                    github_auth: cfg.github.as_ref(),
                 },
                 &inputs,
                 devcontainer::Stage::Setup,
@@ -963,6 +966,8 @@ fn main() -> Result<()> {
                         dry_run,
                         workspace: ws_path,
                         mounts: &mounts,
+                        git_repo: git_repo.as_deref(),
+                        github_auth: cfg.github.as_ref(),
                     },
                     &inputs,
                     devcontainer::Stage::Start,
@@ -1016,7 +1021,73 @@ fn main() -> Result<()> {
                      it cannot change an existing stopped instance's image."
                 );
             }
-            apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
+            let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
+            let inputs = devcontainer::TranslatorInputs {
+                cli_vcpus: vcpus,
+                cli_mem_mib: mem,
+                cli_disk_gib: disk,
+                cli_post_start: post_start.clone(),
+                cli_guest_env_keys: cli_env_keys,
+                cli_forward_ports: start_opts.forward_ports.clone(),
+                cli_mounts: start_opts.mounts.clone(),
+                cli_profiles: profile.clone(),
+                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, effective_image)),
+                cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+                ..devcontainer::TranslatorInputs::default()
+            };
+            let ws_path = workspace.as_deref().map(Path::new);
+            let translation = resolve_devcontainer(
+                &DevcontainerOpts {
+                    explicit_path: devcontainer.as_deref().map(Path::new),
+                    no_devcontainer,
+                    dry_run,
+                    workspace: ws_path,
+                    mounts: &start_opts.mounts,
+                    git_repo: git_repo.as_deref(),
+                    github_auth: cfg.github.as_ref(),
+                },
+                &inputs,
+                devcontainer::Stage::Start,
+            )?;
+            if dry_run {
+                return Ok(());
+            }
+            // CLI flags are applied first; the translation only carries
+            // values that survived the "CLI > devcontainer.json" precedence
+            // check inside `translate`, so the two cannot fight here.
+            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
+            if let Some(t) = &translation {
+                devcontainer::apply_to_config(&mut cfg, t)?;
+                start_opts.forward_ports = devcontainer::merge_into_forward_ports(
+                    &t.forward_ports,
+                    &start_opts.forward_ports,
+                );
+            }
+            let default_translation = devcontainer::Translation::default();
+            start_opts.disk = devcontainer::effective_disk(
+                disk,
+                translation.as_ref().unwrap_or(&default_translation),
+            );
+            let dc_post_start = (post_start.is_none())
+                .then(|| translation.as_ref().and_then(|t| t.post_start.clone()))
+                .flatten();
+            start_opts.post_start_override = post_start.as_deref().or(dc_post_start.as_deref());
+            // `--mount` and devcontainer `mounts` aren't combined: --mount is
+            // a complete replacement of the mount set (its `conflicts_with`
+            // rules with --workspace/--git-repo encode this). The CLI-wins
+            // outcome is reported by `translate`.
+            if start_opts.mounts.is_empty() {
+                start_opts.mounts = translation
+                    .as_ref()
+                    .map(|t| t.mounts.clone())
+                    .unwrap_or_default();
+            }
+            apply_runtime_guest_env(
+                &mut cfg,
+                &guest_env,
+                translation.as_ref().map(|t| &t.guest_env),
+                &mut start_opts,
+            );
             if let Some(profile_target) = profile_target {
                 let resolved_profiles =
                     guest::resolve_profiles(&profile_target.profiles, &cfg.profiles)?;
@@ -1362,6 +1433,8 @@ fn cmd_up(
                 dry_run: true,
                 workspace: Some(&project_dir),
                 mounts: discovery_mounts,
+                git_repo: None,
+                github_auth: cfg.github.as_ref(),
             },
             &inputs,
             devcontainer::Stage::Start,
@@ -1439,6 +1512,8 @@ fn create_up_instance(
             dry_run: false,
             workspace: Some(project_dir),
             mounts: discovery_mounts,
+            git_repo: None,
+            github_auth: cfg.github.as_ref(),
         },
         &inputs,
         devcontainer::Stage::Start,
@@ -1832,6 +1907,8 @@ fn quickstart_fresh_start(
             dry_run: false,
             workspace: workspace_dir,
             mounts: &[],
+            git_repo: None,
+            github_auth: cfg.github.as_ref(),
         },
         &inputs,
         devcontainer::Stage::Start,
@@ -2011,6 +2088,16 @@ struct DevcontainerOpts<'a> {
     dry_run: bool,
     workspace: Option<&'a Path>,
     mounts: &'a [config::Mount],
+    git_repo: Option<&'a str>,
+    github_auth: Option<&'a config::GitHubAuth>,
+}
+
+enum DevcontainerSource {
+    Path(PathBuf),
+    Contents {
+        display_path: PathBuf,
+        contents: String,
+    },
 }
 
 /// Discover, prompt, and translate a `devcontainer.json` for the given
@@ -2036,42 +2123,79 @@ fn resolve_devcontainer(
         return Ok(None);
     }
 
-    let (path, losers) = if let Some(p) = opts.explicit_path {
-        (p.to_path_buf(), Vec::new())
+    let (source, losers) = if let Some(p) = opts.explicit_path {
+        (DevcontainerSource::Path(p.to_path_buf()), Vec::new())
     } else {
         let found = devcontainer::discover(opts.workspace, opts.mounts);
         if let Some((winner, losers)) = devcontainer::pick_winner(found) {
-            (winner.path, losers)
+            (DevcontainerSource::Path(winner.path), losers)
+        } else if let Some(repo_url) = opts.git_repo
+            && let Some(remote) = git_repo_devcontainer::discover(repo_url, opts.github_auth)?
+        {
+            (
+                DevcontainerSource::Contents {
+                    display_path: remote.display_path,
+                    contents: remote.contents,
+                },
+                Vec::new(),
+            )
         } else {
             return Ok(None);
         }
+    };
+    let display_path = match &source {
+        DevcontainerSource::Path(path) => path,
+        DevcontainerSource::Contents { display_path, .. } => display_path,
     };
 
     // When discovery (not an explicit flag) found the file, defer to the
     // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
     if opts.explicit_path.is_none() && !opts.dry_run {
         if !std::io::stdin().is_terminal() {
-            bail!(
-                "Found {} but stdin is not a TTY.\n\
-                 Pass --devcontainer {} to apply it, or --no-devcontainer to ignore.\n\
-                 coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
-                path.display(),
-                path.display()
-            );
+            match &source {
+                DevcontainerSource::Path(_) => bail!(
+                    "Found {} but stdin is not a TTY.\n\
+                     Pass --devcontainer {} to apply it, or --no-devcontainer to ignore.\n\
+                     coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
+                    display_path.display(),
+                    display_path.display()
+                ),
+                DevcontainerSource::Contents { .. } => bail!(
+                    "Found {} but stdin is not a TTY.\n\
+                     Run interactively to confirm the remote file, pass --no-devcontainer to ignore it, \
+                     or pass --devcontainer <local-path> to apply an explicit file.\n\
+                     coop reads a subset of devcontainer.json — see docs/devcontainer.md for the supported keys.",
+                    display_path.display()
+                ),
+            }
         }
-        let answer =
-            prompt::confirm_default_yes(&format!("Use devcontainer.json at {}?", path.display()))?;
+        let answer = prompt::confirm_default_yes(&format!(
+            "Use devcontainer.json at {}?",
+            display_path.display()
+        ))?;
         if !answer {
-            tracing::info!(
-                "Skipping {}. Re-run with --devcontainer {} to apply it later.",
-                path.display(),
-                path.display()
-            );
+            match &source {
+                DevcontainerSource::Path(_) => tracing::info!(
+                    "Skipping {}. Re-run with --devcontainer {} to apply it later.",
+                    display_path.display(),
+                    display_path.display()
+                ),
+                DevcontainerSource::Contents { .. } => tracing::info!(
+                    "Skipping {}. Re-run interactively to apply it later.",
+                    display_path.display()
+                ),
+            }
             return Ok(None);
         }
     }
 
-    let parsed = devcontainer::ParsedDevcontainer::load(&path)?;
+    let parsed = match source {
+        DevcontainerSource::Path(path) => devcontainer::ParsedDevcontainer::load(&path)?,
+        DevcontainerSource::Contents {
+            display_path,
+            contents,
+        } => devcontainer::ParsedDevcontainer::from_str(display_path, &contents)?,
+    };
     let mut translation = devcontainer::translate(&parsed, inputs, stage);
     translation.report.ignored_paths = losers;
 
@@ -2093,6 +2217,8 @@ fn cmd_devcontainer(command: &DevcontainerCommands) -> Result<()> {
                 dry_run: true,
                 workspace: None,
                 mounts: &[],
+                git_repo: None,
+                github_auth: None,
             };
             let setup_inputs = devcontainer::TranslatorInputs::default();
 

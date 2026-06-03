@@ -4,7 +4,7 @@ coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps
 
 ## How discovery and apply work
 
-When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). On restart, `coop start --workspace <dir>` can also read the project's devcontainer file for restart-time settings.
+When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). On restart, `coop start --workspace <dir>` can also read the project's devcontainer file for restart-time settings. For `coop start --git-repo <url>`, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM.
 
 If a file is found, coop prompts:
 
@@ -23,7 +23,7 @@ For CI or scripted use, pass one of:
 - `--dry-run` — print the report and exit before any VM work
 - `coop devcontainer check <path>` — print setup/start translation reports for a file without loading coop config or touching VM state
 
-A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing.
+A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `--git-repo`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`.
 
 ## Precedence
 
@@ -52,6 +52,6 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 ## Out of scope in v1
 
 - OCI feature registry pulls (`ghcr.io/devcontainers/features/*` features other than the built-in name match)
-- `--git-repo` auto-detection — the file lives inside the repo before coop has cloned it
+- `--git-repo` auto-detection for non-GitHub hosts
 - Sticky `--no-devcontainer` (persistent per-workspace state)
 - Live re-application on an existing VM (destroy + `coop up` to pick up changes)

@@ -163,7 +163,7 @@ instances, pass the instance name. The profile shorthand
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
 | `--profile <list>` | Build or reuse a profile-derived image for a new instance, named from the sorted profiles (for example `node-python`) |
 | `--workspace <dir>` | Restart the stopped instance associated with this project path (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Deprecated creation option; only applies when creating with `--profile` |
+| `--git-repo <url>` | Deprecated creation option; only applies when creating with `--profile`. For GitHub URLs, coop can discover `.devcontainer/devcontainer.json` before creating the VM. |
 | `--vcpus <N>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--mem <MiB>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--disk <GiB>` | Instance disk size when creating with `--profile`; rejected on restart |
@@ -179,7 +179,7 @@ instances, pass the instance name. The profile shorthand
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
 
-When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
+When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, or `--git-repo <url>` points at a GitHub repository with one, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
 
 `coop start --profile <list>` is the exception to the restart-only rule. It
 derives an image name from the sorted profile list, runs the same stale-image
