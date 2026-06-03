@@ -97,7 +97,7 @@ Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`. Combine them wit
 You can also let `start` build a profile-derived image on demand:
 
 ```
-coop start --profile python,node
+coop setup --profile python,node
 ```
 
 This creates or refreshes an image named from the sorted profile list
