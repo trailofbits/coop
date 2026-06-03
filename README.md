@@ -44,7 +44,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 
 - **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
 - **Workspace sync**: copy or mount a local project directory into the VM with `coop up`
-- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing; `coop start --profile python,node` builds the matching image on demand
+- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing; `coop up --profile python,node` builds the matching image on demand
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
 - **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
@@ -60,7 +60,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `up` | Ensure a project environment exists and is running |
 | `setup` | Install backend runtime, fetch kernel, build template rootfs |
 | `build` | Rebuild rootfs image and fetch kernel |
-| `start` | Restart a stopped VM, or build/start a profile-derived image with `--profile` |
+| `start` | Restart a stopped VM |
 | `stop` | Stop a running VM (preserves disk) |
 | `destroy` | Stop and remove a VM instance |
 | `shell` | Interactive shell session in a running VM |

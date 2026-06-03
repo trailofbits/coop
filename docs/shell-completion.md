@@ -55,7 +55,7 @@ Restart the shell (or `source` your rc) after the first install.
 
 ## Dynamic completion
 
-Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop up --image <TAB>` lists existing images, and `coop setup --profile <TAB>` lists builtin and custom profiles.
+Dynamic completion lets `coop` itself compute candidates on TAB — so `coop shell <TAB>` lists your running instances, `coop up --image <TAB>` lists existing images, and `coop setup --profile <TAB>` / `coop up --profile <TAB>` list builtin and custom profiles.
 
 Add one line to your shell rc:
 
@@ -80,5 +80,5 @@ Dynamic and static completion can coexist — static fills in subcommand and fla
 | Argument | Source |
 |----------|--------|
 | Instance name (`shell`, `claude`, `claude-agents`, `codex`, `stop`, `destroy`, `status`, `logs`, `push`, `pull`, `exec`, `vscode`, `resize`) | `~/.coop/instances/` |
-| `--image` (`start`, `setup`), `images --delete` | `~/.coop/images/` |
-| `--profile` (`setup`), `profiles show <name>` | builtin profiles plus `[profiles.*]` from `~/.coop/config.toml` |
+| `--image` (`up`, `setup`, `start` compatibility flag), `images --delete` | `~/.coop/images/` |
+| `--profile` (`setup`, `up`), `profiles show <name>` | builtin profiles plus `[profiles.*]` from `~/.coop/config.toml` |

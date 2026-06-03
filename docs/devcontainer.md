@@ -36,7 +36,7 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 | `postStartCommand` | `post_start` | String or `[string,...]`; arrays are joined with ` && ` |
 | `containerEnv` | `guest_env` (`--env KEY=VALUE`) | CLI `--env` wins on conflict |
 | `forwardPorts` | `--forward-port` | Items may be integers or `"GUEST[:HOST]"` strings |
-| `features` (`rust`, `node`, `python`, `go`, `c`, `fuzz`) | built-in `--profile` | Only at `coop setup`; ignored at `coop start` |
+| `features` (`rust`, `node`, `python`, `go`, `c`, `fuzz`) | built-in `--profile` | Only at `coop setup`; ignored during VM start/restart |
 | `features` (anything else) | warn and skip | No silent fallback to a custom profile |
 | `hostRequirements.cpus` | `--vcpus` | |
 | `hostRequirements.memory` | `--mem` | Accepts `4GB`/`4GiB`-style values |

@@ -78,16 +78,16 @@ coop setup --profile ml
 coop setup --profile ml,node
 ```
 
-## Build-on-demand from `start`
+## Build-on-demand from `up`
 
-For profile-only workflows, `coop start --profile <list>` builds the matching
+For profile-only workflows, `coop up --profile <list>` builds the matching
 image automatically before starting a new instance. The image name is derived
 from the sorted profile list, so these commands all target the same
 `node-python` image:
 
 ```bash
-coop start --profile python,node
-coop start --profile node,python
+coop up --profile python,node
+coop up --profile node,python
 ```
 
 coop runs the same recipe-hash staleness check used by `coop setup`. If the

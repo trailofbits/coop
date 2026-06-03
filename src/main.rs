@@ -112,6 +112,13 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
+        /// Build or reuse a profile-derived image when creating a new instance
+        #[arg(
+            long,
+            value_delimiter = ',',
+            add = ArgValueCandidates::new(completions::profile_candidates),
+        )]
+        profile: Vec<String>,
         /// Skip the `.git` directory when copying/syncing the project
         #[arg(long)]
         exclude_git: bool,
@@ -231,22 +238,18 @@ enum Commands {
         #[command(subcommand)]
         command: DevcontainerCommands,
     },
-    /// Restart a stopped VM, or build/start a profile-derived image
+    /// Restart a stopped VM
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
         #[arg(value_parser = config::InstanceName::parse)]
         name: Option<config::InstanceName>,
-        /// Install profiles for a new profile-derived image, building it on demand
-        #[arg(
-            long,
-            value_delimiter = ',',
-            add = ArgValueCandidates::new(completions::profile_candidates),
-        )]
+        /// Deprecated profile shorthand; use `coop up --profile`.
+        #[arg(long, value_delimiter = ',', hide = true)]
         profile: Vec<String>,
         /// Project directory used to select an associated stopped instance
         #[arg(long, conflicts_with = "git_repo")]
         workspace: Option<String>,
-        /// Deprecated creation option; only applies when creating with --profile
+        /// Deprecated creation option; rejected by `coop start`
         #[arg(long, conflicts_with = "workspace")]
         git_repo: Option<String>,
         /// Creation-time option; rejected by `coop start`
@@ -255,13 +258,13 @@ enum Commands {
         /// Creation-time option; rejected by `coop start`
         #[arg(long, value_parser = config::MiB::parse_cli)]
         mem: Option<config::MiB>,
-        /// Creation-time option; only applies when creating with --profile
+        /// Creation-time option; rejected by `coop start`
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
-        /// Creation-time option; only applies when creating with --profile
+        /// Creation-time option; rejected by `coop start`
         #[arg(
             long,
             conflicts_with_all = ["workspace", "git_repo"],
@@ -281,7 +284,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
-        /// Creation-time option; only applies when creating with --profile
+        /// Creation-time option; rejected by `coop start`
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -770,6 +773,7 @@ fn main() -> Result<()> {
             disk,
             no_agents,
             image,
+            profile,
             exclude_git,
             no_prompt,
             forward_port,
@@ -786,6 +790,22 @@ fn main() -> Result<()> {
                 let _ = copy;
                 ProjectTransport::Copy
             };
+            let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
+            let profile_target = if profile.is_empty() {
+                None
+            } else {
+                if image_explicit {
+                    bail!(
+                        "`coop up --profile` derives the image name from the sorted profile list; \
+                         use `coop setup --image {image} --profile ...` and then `coop up --image {image}` \
+                         for an explicit named image."
+                    );
+                }
+                Some(ProfileImageTarget::new(&profile)?)
+            };
+            let effective_image = profile_target
+                .as_ref()
+                .map_or_else(|| image.clone(), |target| target.image.clone());
             let opts = UpOpts {
                 dir: dir.as_deref(),
                 name: name.as_ref(),
@@ -794,8 +814,9 @@ fn main() -> Result<()> {
                 vcpus,
                 mem,
                 disk,
-                image,
-                image_explicit: raw_args_use_long_flag(&raw_args, "--image"),
+                image: effective_image,
+                image_explicit,
+                profile_target,
                 runtime: UpRuntimeOpts {
                     no_agents,
                     exclude_git,
@@ -931,15 +952,14 @@ fn main() -> Result<()> {
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
+            if !profile.is_empty() {
+                bail!(
+                    "`coop start --profile` has moved to `coop up --profile`.\n\
+                     Run `coop up --profile {}` to create or reuse a project environment with that profile-derived image.",
+                    canonical_profile_list(&profile).join(","),
+                );
+            }
             let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
-            let profile_target = if profile.is_empty() {
-                None
-            } else {
-                Some(ProfileImageTarget::new(&profile)?)
-            };
-            let effective_image = profile_target
-                .as_ref()
-                .map_or(&image, |target| &target.image);
             if dry_run {
                 let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
                 let inputs = devcontainer::TranslatorInputs {
@@ -950,11 +970,7 @@ fn main() -> Result<()> {
                     cli_guest_env_keys: cli_env_keys,
                     cli_forward_ports: forward_ports.clone(),
                     cli_mounts: mounts.clone(),
-                    cli_profiles: profile.clone(),
-                    persisted_guest_user: Some(backend::persisted_guest_user(
-                        &cfg,
-                        effective_image,
-                    )),
+                    persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
                     cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
                     ..devcontainer::TranslatorInputs::default()
                 };
@@ -999,28 +1015,7 @@ fn main() -> Result<()> {
                 persisted_guest_env: std::collections::BTreeMap::new(),
                 devcontainer_path: devcontainer.as_deref().map(Path::new),
             };
-            if profile.is_empty() {
-                preflight_start_target(&be, &cfg, &start_opts)?;
-            } else if image_explicit {
-                bail!(
-                    "`coop start --profile` derives the image name from the sorted profile list; \
-                     use `coop setup --image {image} --profile ...` and then `coop up --image {image}` \
-                     for an explicit named image."
-                );
-            } else if (start_opts.name.is_some() || start_opts.workspace_dir.is_some())
-                && find_stopped_instance(
-                    &be,
-                    &cfg,
-                    start_opts.name,
-                    start_opts.workspace_dir.map(Path::new),
-                )?
-                .is_some()
-            {
-                bail!(
-                    "`coop start --profile` creates a new profile-derived instance; \
-                     it cannot change an existing stopped instance's image."
-                );
-            }
+            preflight_start_target(&be, &cfg, &start_opts)?;
             let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -1030,8 +1025,7 @@ fn main() -> Result<()> {
                 cli_guest_env_keys: cli_env_keys,
                 cli_forward_ports: start_opts.forward_ports.clone(),
                 cli_mounts: start_opts.mounts.clone(),
-                cli_profiles: profile.clone(),
-                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, effective_image)),
+                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
                 cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
                 ..devcontainer::TranslatorInputs::default()
             };
@@ -1088,46 +1082,7 @@ fn main() -> Result<()> {
                 translation.as_ref().map(|t| &t.guest_env),
                 &mut start_opts,
             );
-            if let Some(profile_target) = profile_target {
-                let resolved_profiles =
-                    guest::resolve_profiles(&profile_target.profiles, &cfg.profiles)?;
-                let _guard = signal::install_handlers();
-                be.setup(
-                    &cfg,
-                    &validated,
-                    &setup::SetupOptions {
-                        skip_confirm: true,
-                        rebuild: false,
-                        profiles: resolved_profiles,
-                        extra_packages: Vec::new(),
-                        post_install: None,
-                        image: profile_target.image.clone(),
-                        guest_user: guest::GuestUser::default(),
-                    },
-                )?;
-                let workspace_path = workspace
-                    .as_deref()
-                    .map(Path::new)
-                    .map(Path::canonicalize)
-                    .transpose()
-                    .with_context(|| {
-                        format!(
-                            "Failed to resolve workspace path {}",
-                            workspace.as_deref().unwrap_or_default()
-                        )
-                    })?;
-                allocate_and_start(
-                    &be,
-                    &mut cfg,
-                    name.as_ref(),
-                    &profile_target.image,
-                    workspace_path.as_deref(),
-                    &start_opts,
-                )
-                .map(|_| ())
-            } else {
-                cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
-            }
+            cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {
@@ -1373,6 +1328,7 @@ struct UpOpts<'a> {
     disk: Option<config::GiB>,
     image: config::ImageName,
     image_explicit: bool,
+    profile_target: Option<ProfileImageTarget>,
     runtime: UpRuntimeOpts,
     devcontainer: UpDevcontainerOpts,
 }
@@ -1407,7 +1363,7 @@ enum ProjectTransport {
 fn cmd_up(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
-    _: &config::Validated,
+    validated: &config::Validated,
     config_path: &Path,
     opts: &UpOpts<'_>,
 ) -> Result<()> {
@@ -1461,6 +1417,8 @@ fn cmd_up(
         return Ok(());
     }
 
+    ensure_profile_image(be, cfg, validated, opts.profile_target.as_ref())?;
+
     create_up_instance(
         be,
         cfg,
@@ -1489,6 +1447,11 @@ fn up_translator_inputs(
             .collect(),
         cli_forward_ports: opts.runtime.forward_ports.clone(),
         cli_mounts: opts.extra_mount.clone(),
+        cli_profiles: opts
+            .profile_target
+            .as_ref()
+            .map(|target| target.profiles.clone())
+            .unwrap_or_default(),
         persisted_guest_user: Some(backend::persisted_guest_user(cfg, &opts.image)),
         cli_workspace_or_git_repo: true,
         ..devcontainer::TranslatorInputs::default()
@@ -1598,6 +1561,32 @@ fn create_up_instance(
     .map(|_| ())
 }
 
+fn ensure_profile_image(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    validated: &config::Validated,
+    target: Option<&ProfileImageTarget>,
+) -> Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let resolved_profiles = guest::resolve_profiles(&target.profiles, &cfg.profiles)?;
+    let _guard = signal::install_handlers();
+    be.setup(
+        cfg,
+        validated,
+        &setup::SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: resolved_profiles,
+            extra_packages: Vec::new(),
+            post_install: None,
+            image: target.image.clone(),
+            guest_user: guest::GuestUser::default(),
+        },
+    )
+}
+
 fn resolve_project_dir(dir: Option<&str>) -> Result<PathBuf> {
     let path = match dir {
         Some(dir) => PathBuf::from(dir),
@@ -1668,6 +1657,20 @@ fn ensure_up_existing_inputs_are_compatible(
             inst.name,
             inst.image,
             opts.image,
+            inst.name,
+        );
+    }
+    if let Some(target) = &opts.profile_target
+        && inst.image != target.image
+    {
+        bail!(
+            "Instance '{}' already exists for this project using image '{}'. \
+             `coop up --profile {}` would use image '{}', but profiles only apply when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with those profiles.",
+            inst.name,
+            inst.image,
+            target.profiles.join(","),
+            target.image,
             inst.name,
         );
     }
@@ -3650,7 +3653,16 @@ mod tests {
     }
 
     #[test]
-    fn start_profile_flag_parses_comma_list() {
+    fn up_profile_flag_parses_comma_list() {
+        let cli = parse(&["up", "--profile", "python,node"]);
+        let super::Commands::Up { profile, .. } = cli.command else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(profile, vec!["python", "node"]);
+    }
+
+    #[test]
+    fn start_profile_flag_parses_for_migration_hint() {
         let cli = parse(&["start", "--profile", "python,node"]);
         let super::Commands::Start { profile, .. } = cli.command else {
             panic!("expected Start variant");
@@ -4381,6 +4393,7 @@ mod tests {
             disk: None,
             image: super::config::default_image_name(),
             image_explicit: false,
+            profile_target: None,
             runtime: super::UpRuntimeOpts {
                 no_agents: false,
                 exclude_git: false,
@@ -4417,6 +4430,34 @@ mod tests {
         )
         .expect_err("expected incompatible");
         assert!(format!("{err}").contains("--disk"));
+    }
+
+    #[test]
+    fn up_existing_rejects_mismatched_profile_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        let inst = cfg
+            .allocate_instance(None, &img, Some(&project))
+            .expect("inst");
+        let mut opts = up_opts_for_tests(project.to_str());
+        opts.profile_target = Some(
+            super::ProfileImageTarget::new(&["python".to_string(), "node".to_string()])
+                .expect("profile target"),
+        );
+        opts.image = opts.profile_target.as_ref().unwrap().image.clone();
+
+        let err = super::ensure_up_existing_inputs_are_compatible(
+            &inst,
+            super::ProjectTransport::Copy,
+            &opts,
+        )
+        .expect_err("expected profile mismatch rejection");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("coop up --profile node,python"));
+        assert!(msg.contains("profiles only apply when creating a new instance"));
     }
 
     #[test]

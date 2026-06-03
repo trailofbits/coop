@@ -52,6 +52,7 @@ on Linux/Firecracker it is a one-time sync.
 | `--disk <GiB>` | Instance disk size when creating a new instance |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
+| `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
 | `--exclude-git` | Skip the `.git/` directory when copying/syncing |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
@@ -64,17 +65,23 @@ on Linux/Firecracker it is a one-time sync.
 ```
 coop up .
 coop up ~/code/my-project --mount
+coop up . --profile python,node
 coop up . --copy --forward-port 3000
 coop up . --extra-mount ~/data:/data
 ```
 
 Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
-`--extra-mount`, `--exclude-git`, and `--devcontainer` are applied only when
-`up` creates a new instance. If a matching project instance already exists,
-destroy it first to recreate it with different creation options. Runtime
-startup options such as `--forward-port`, `--post-start`, and `--env` can be
-used when `up` creates or restarts an instance; if the matching instance is
-already running, stop it first so those options can take effect.
+`--profile`, `--extra-mount`, `--exclude-git`, and `--devcontainer` are
+applied only when `up` creates a new instance. `coop up --profile <list>`
+derives an image name from the sorted profile list, runs the same stale-image
+check as `coop setup`, and builds or rebuilds that image if needed. Explicit
+named images are unchanged: use `coop setup --image <name> --profile ...`
+followed by `coop up --image <name>` when you want to choose the image name
+yourself. If a matching project instance already exists, destroy it first to
+recreate it with different creation options. Runtime startup options such as
+`--forward-port`, `--post-start`, and `--env` can be used when `up` creates or
+restarts an instance; if the matching instance is already running, stop it
+first so those options can take effect.
 
 ### `init`
 
@@ -97,8 +104,8 @@ coop setup [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `-y`, `--yes` | Skip confirmation prompts (accept all) |
-| `--vcpus <N>` | Number of vCPUs for generated devcontainer/setup settings (overrides config) |
-| `--mem <MiB>` | Memory in MiB for generated devcontainer/setup settings (overrides config) |
+| `--vcpus <N>` | Number of vCPUs (overrides config) |
+| `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
 | `--extra-packages <list>` | Comma-separated extra apt packages to install |
@@ -146,7 +153,7 @@ Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirem
 
 ### `start`
 
-Restart a stopped VM, or build and start a profile-derived image.
+Restart a stopped VM.
 
 ```
 coop start [NAME] [FLAGS]
@@ -155,23 +162,21 @@ coop start [NAME] [FLAGS]
 `start` normally restarts existing stopped instances. Use `coop up [DIR]` to
 create or reconnect to a project environment. Without `NAME`, `start` restarts
 the only stopped instance if exactly one exists; with multiple stopped
-instances, pass the instance name. The profile shorthand
-`coop start --profile <list>` is the creation exception described below.
+instances, pass the instance name.
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
-| `--profile <list>` | Build or reuse a profile-derived image for a new instance, named from the sorted profiles (for example `node-python`) |
 | `--workspace <dir>` | Restart the stopped instance associated with this project path (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Deprecated creation option; only applies when creating with `--profile`. For GitHub URLs, coop can discover `.devcontainer/devcontainer.json` before creating the VM. |
+| `--git-repo <url>` | Deprecated creation option; rejected on restart |
 | `--vcpus <N>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--mem <MiB>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--disk <GiB>` | Instance disk size when creating with `--profile`; rejected on restart |
+| `--disk <GiB>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--mount <spec>` | Host directory to mount when creating with `--profile`; rejected on restart |
+| `--mount <spec>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
-| `--exclude-git` | Skip `.git/` when copying/syncing a workspace for `--profile`; rejected on restart |
+| `--exclude-git` | Creation-time option retained only for compatibility; rejected on restart |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
@@ -181,17 +186,9 @@ instances, pass the instance name. The profile shorthand
 
 When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, or `--git-repo <url>` points at a GitHub repository with one, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
 
-`coop start --profile <list>` is the exception to the restart-only rule. It
-derives an image name from the sorted profile list, runs the same stale-image
-check as `coop setup`, builds or rebuilds that image if needed, and then starts
-a new instance from it. Explicit named images are unchanged: use `coop setup
---image <name> --profile ...` followed by `coop up --image <name>` when you
-want to choose the image name yourself.
-
 ```
 coop start
 coop start my-project
-coop start --profile python,node
 coop start my-project --no-agents
 coop start --env RUST_LOG=info --env MY_FLAG=1
 coop start --forward-port 3000 --forward-port 8080:18080
@@ -385,7 +382,8 @@ coop logs my-project -f
 
 ### `push`
 
-Copy a local directory into the running VM at `/workspace`. Defaults to the host path recorded when the instance was started with `--workspace`.
+Copy a local directory into the running VM at `/workspace`. Defaults to the
+host path recorded when the instance was created with `coop up`.
 
 ```
 coop push [NAME] [FLAGS]
@@ -405,7 +403,8 @@ coop push my-project --dir ./src --force
 
 ### `pull`
 
-Copy the VM's `/workspace` to a local directory. Defaults to the host path recorded when the instance was started with `--workspace`.
+Copy the VM's `/workspace` to a local directory. Defaults to the host path
+recorded when the instance was created with `coop up`.
 
 ```
 coop pull [NAME] [FLAGS]

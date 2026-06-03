@@ -94,14 +94,14 @@ coop setup --profile python,node
 
 Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`. Combine them with commas (e.g. `--profile python,node,rust`). Use `coop profiles list` to inspect what each one installs.
 
-You can also let `start` build a profile-derived image on demand:
+You can also let `up` build a profile-derived image on demand:
 
 ```
-coop start --profile python,node
+coop up --profile python,node
 ```
 
 This creates or refreshes an image named from the sorted profile list
-(`node-python` here), then starts a new instance from it.
+(`node-python` here), then creates the project instance from it.
 
 Skip confirmation prompts with `-y`:
 
@@ -153,8 +153,8 @@ coop codex
 coop start
 ```
 
-`coop start` only starts existing stopped instances. Use it after `coop stop`
-when you want to boot the same VM disk again. If exactly one stopped instance
+`coop start` starts existing stopped instances. Use it after `coop stop` when
+you want to boot the same VM disk again. If exactly one stopped instance
 exists, the name is optional.
 
 Restart a specific stopped instance:
@@ -169,10 +169,11 @@ Restart by project path when the instance was created for that project:
 coop start --workspace ~/code/my-project
 ```
 
-Creation options belong to `coop up`, not `coop start`:
+Project creation options belong to `coop up`, not `coop start`:
 
 ```
 coop up ~/code/my-project --disk 40 --mount
+coop up ~/code/my-project --profile python,node
 ```
 
 Skip Claude Code and Codex credential/config injection:

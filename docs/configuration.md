@@ -104,8 +104,8 @@ VM resource allocation and boot configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `vcpu_count` | integer | `2` | Number of vCPUs. Must be > 0. Overridable with `--vcpus` on `setup` and `start`. |
-| `mem_size_mib` | integer | `4096` | Memory in MiB. Must be >= 128. Overridable with `--mem` on `setup` and `start`. |
+| `vcpu_count` | integer | `2` | Number of vCPUs. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. |
+| `mem_size_mib` | integer | `4096` | Memory in MiB. Must be >= 128. Overridable with `--mem` on `setup` and `up`. |
 | `template_size_gib` | integer | `8` | Template rootfs disk size in GiB. Must be > 0. Overridable with `--template-size` on `setup`. |
 | `kernel_path` | string (path) | `~/.coop/vmlinux` | Path to the vmlinux kernel image. Linux/Firecracker only. |
 | `boot_args` | string | `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw` | Kernel boot arguments. Linux/Firecracker only. |
@@ -266,11 +266,11 @@ Several config values accept per-invocation overrides via flags:
 
 | Flag | Applies to | Overrides |
 |------|-----------|-----------|
-| `--vcpus <N>` | `setup`, `start` | `vm.vcpu_count` |
-| `--mem <MiB>` | `setup`, `start` | `vm.mem_size_mib` |
+| `--vcpus <N>` | `setup`, `up` | `vm.vcpu_count` |
+| `--mem <MiB>` | `setup`, `up` | `vm.mem_size_mib` |
 | `--template-size <GiB>` | `setup` | `vm.template_size_gib` |
-| `--disk <GiB>` | `start` | Per-instance disk size (grows from template if larger) |
-| `--env KEY=VALUE` | `start` | Adds or overrides a `guest_env` entry (repeatable) |
+| `--disk <GiB>` | `up` | Per-instance disk size (grows from template if larger) |
+| `--env KEY=VALUE` | `up`, `start` | Adds or overrides a `guest_env` entry (repeatable) |
 | `--config <path>` | all commands | Config file path (default: `~/.coop/config.toml`) |
 
 ## Examples

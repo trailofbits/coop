@@ -2258,19 +2258,23 @@ test_builtin_profiles() {
     echo ""
     echo "=== Phase: built-in profiles ==="
 
-    # Build-on-demand via start. The sorted profile list derives the
+    # Build-on-demand via up. The sorted profile list derives the
     # node-python image name. These cover apt-only (python) and
     # pre-install script (node/NodeSource).
     local img_name="node-python"
     coop images --delete "$img_name" 2>/dev/null || true
 
     local inst_name="${INSTANCE}-prof"
-    if coop start "$inst_name" --profile python,node --no-agents; then
+    local prof_ws
+    prof_ws=$(mktemp -d)
+    echo "profile workspace" > "$prof_ws/README.md"
+    if coop up "$prof_ws" --name "$inst_name" --profile python,node --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "start --profile python,node exits 0"
+        pass "up --profile python,node exits 0"
     else
-        fail "start --profile python,node exits 0" "exit code: $?"
+        fail "up --profile python,node exits 0" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
+        rm -rf "$prof_ws"
         return
     fi
 
@@ -2281,7 +2285,7 @@ test_builtin_profiles() {
             fail "derived profile image is listed" "output: $HARNESS_OUT"
         fi
     else
-        fail "images exits 0 after start --profile" "exit code: $?"
+        fail "images exits 0 after up --profile" "exit code: $?"
     fi
 
     GUEST_INSTANCE="$inst_name"
@@ -2320,6 +2324,7 @@ test_builtin_profiles() {
     coop destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
     coop images --delete "$img_name" 2>/dev/null || true
+    rm -rf "$prof_ws"
 }
 
 # ── Host mount tests (--full only) ────────────────────────────
