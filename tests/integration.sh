@@ -3091,6 +3091,29 @@ test_devcontainer_translator() {
         fail "devcontainer check reports setup and start stages" "stderr: $HARNESS_ERR"
     fi
 
+    local oci_bad="$tmpdir/devcontainer-oci-bad.json"
+    cat > "$oci_bad" <<'EOF'
+{
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": { "nested": true }
+    }
+  }
+}
+EOF
+    if coop devcontainer check "$oci_bad" --stage setup; then
+        pass "devcontainer check handles invalid OCI feature options"
+    else
+        fail "devcontainer check handles invalid OCI feature options" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    if grep -q "features.ghcr.io/devcontainers/features/github-cli:1" <<< "$HARNESS_ERR" \
+        && grep -q "invalid" <<< "$HARNESS_ERR" \
+        && grep -q "must be a string" <<< "$HARNESS_ERR"; then
+        pass "invalid OCI feature options are reported loudly"
+    else
+        fail "invalid OCI feature options are reported loudly" "stderr: $HARNESS_ERR"
+    fi
+
     # --no-devcontainer silently skips the file: the report header must NOT appear.
     # `--dry-run` lets us exercise the discovery path without any VM work.
     if coop up "$dcdir" --name "${INSTANCE}-dc-skip" \

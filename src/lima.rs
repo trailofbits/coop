@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName};
+use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
@@ -31,7 +32,13 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
-        && !needs_rebuild(cfg, image, &opts.profiles, &opts.guest_user)
+        && !needs_rebuild(
+            cfg,
+            image,
+            &opts.profiles,
+            &opts.oci_features,
+            &opts.guest_user,
+        )
     {
         eprintln!(
             "\n=> Golden image '{image}': up to date ({})",
@@ -41,7 +48,13 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         if base_img.exists() && !opts.rebuild {
             eprintln!("\n=> Golden image '{image}' is stale — rebuilding");
         }
-        build_golden_image(cfg, image, &opts.profiles, &opts.guest_user)?;
+        build_golden_image(
+            cfg,
+            image,
+            &opts.profiles,
+            &opts.oci_features,
+            &opts.guest_user,
+        )?;
     }
 
     generate_start_template(cfg, image)?;
@@ -486,11 +499,12 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
 fn provision_script_hash(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
     guest_user: &GuestUser,
 ) -> Sha256Hash {
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = fs::read_to_string(&pubkey_path).unwrap_or_default();
-    let script = compose_provision_script(pubkey.trim(), profiles, guest_user);
+    let script = compose_provision_script(pubkey.trim(), profiles, oci_features, guest_user);
     Sha256Hash::of(&script)
 }
 
@@ -504,9 +518,10 @@ fn needs_rebuild(
     cfg: &CoopConfig,
     image: &ImageName,
     profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
     guest_user: &GuestUser,
 ) -> bool {
-    let current_hash = provision_script_hash(cfg, profiles, guest_user);
+    let current_hash = provision_script_hash(cfg, profiles, oci_features, guest_user);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
         return true;
@@ -532,6 +547,7 @@ fn build_golden_image(
     cfg: &CoopConfig,
     image: &ImageName,
     profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
     guest_user: &GuestUser,
 ) -> Result<()> {
     eprintln!(
@@ -562,7 +578,8 @@ fn build_golden_image(
 
     // Generate builder template with full provisioning
     let builder_template = cfg.data_dir.join("lima-builder.yaml");
-    let provision_script = compose_provision_script(pubkey.trim(), profiles, guest_user);
+    let provision_script =
+        compose_provision_script(pubkey.trim(), profiles, oci_features, guest_user);
     let yaml = compose_template_yaml(cfg, &provision_script);
     fs::write(&builder_template, &yaml).with_context(|| {
         format!(
@@ -574,6 +591,13 @@ fn build_golden_image(
     if !profiles.is_empty() {
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
         eprintln!("  Profiles: {}", names.join(", "));
+    }
+    if !oci_features.is_empty() {
+        let names: Vec<&str> = oci_features
+            .iter()
+            .map(|f| f.installed.id.as_str())
+            .collect();
+        eprintln!("  Devcontainer OCI features: {}", names.join(", "));
     }
 
     // Build to staging path — old image is never touched
@@ -621,17 +645,22 @@ fn build_golden_image(
     let template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
-        install_script_hash: provision_script_hash(cfg, profiles, guest_user),
+        install_script_hash: provision_script_hash(cfg, profiles, oci_features, guest_user),
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
         marketplaces,
         plugins,
         guest_user: guest_user.clone(),
+        oci_features: installed_features(oci_features),
     };
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn installed_features(features: &[ResolvedFeature]) -> Vec<InstalledFeature> {
+    features.iter().map(|f| f.installed.clone()).collect()
 }
 
 /// Start the builder VM, install marketplaces/plugins, clean
@@ -1127,6 +1156,7 @@ provision:
 fn compose_provision_script(
     ssh_pubkey: &str,
     profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
     guest_user: &GuestUser,
 ) -> String {
     let mut s = String::with_capacity(8192);
@@ -1199,6 +1229,9 @@ fn compose_provision_script(
 
     // Guest configuration configures the guest user — must come before claude-code install
     s.push_str(&compose_lima_guest_config(ssh_pubkey, guest_user));
+    for feature in oci_features {
+        s.push_str(&crate::devcontainer_oci::compose_install_snippet(feature));
+    }
 
     // Claude Code (direct binary download, runs as root, chowns to claude)
     s.push_str(SCRIPT_CLAUDE_CODE);
@@ -1623,6 +1656,7 @@ mod tests {
         let script = compose_provision_script(
             "ssh-ed25519 AAAA test@test",
             &profiles,
+            &[],
             &GuestUser::default(),
         );
 
@@ -1644,6 +1678,7 @@ mod tests {
         let script = compose_provision_script(
             "ssh-ed25519 AAAA test@test",
             &profiles,
+            &[],
             &GuestUser::default(),
         );
 
@@ -1663,6 +1698,7 @@ mod tests {
         let script = compose_provision_script(
             "ssh-ed25519 AAAA test@test",
             &profiles,
+            &[],
             &GuestUser::default(),
         );
 
@@ -1678,8 +1714,12 @@ mod tests {
 
     #[test]
     fn provision_script_installs_codex() {
-        let script =
-            compose_provision_script("ssh-ed25519 AAAA test@test", &[], &GuestUser::default());
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
 
         assert!(
             script.contains("Installing Codex CLI"),

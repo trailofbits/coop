@@ -3,6 +3,7 @@ mod cmd;
 mod completions;
 mod config;
 mod devcontainer;
+mod devcontainer_oci;
 mod fs_util;
 mod git_repo_devcontainer;
 mod github_pat;
@@ -914,6 +915,10 @@ fn main() -> Result<()> {
                     skip_confirm: yes,
                     rebuild,
                     profiles: resolved_profiles,
+                    oci_features: translation
+                        .as_ref()
+                        .map(|t| t.oci_features.clone())
+                        .unwrap_or_default(),
                     extra_packages,
                     post_install: post_install.map(PathBuf::from),
                     image,
@@ -1579,6 +1584,7 @@ fn ensure_profile_image(
             skip_confirm: true,
             rebuild: false,
             profiles: resolved_profiles,
+            oci_features: Vec::new(),
             extra_packages: Vec::new(),
             post_install: None,
             image: target.image.clone(),
@@ -1821,6 +1827,7 @@ fn cmd_quickstart(
                 skip_confirm: true,
                 rebuild: false,
                 profiles: Vec::new(),
+                oci_features: Vec::new(),
                 extra_packages: Vec::new(),
                 post_install: None,
                 image: image.clone(),
@@ -2201,10 +2208,49 @@ fn resolve_devcontainer(
     };
     let mut translation = devcontainer::translate(&parsed, inputs, stage);
     translation.report.ignored_paths = losers;
+    resolve_oci_feature_requests(&mut translation);
 
     eprintln!("{}", translation.report.render());
 
     Ok(Some(translation))
+}
+
+fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
+    if translation.oci_feature_requests.is_empty() {
+        return;
+    }
+    for (request, resolved) in
+        translation
+            .oci_feature_requests
+            .iter()
+            .zip(devcontainer_oci::resolve_features(
+                &translation.oci_feature_requests,
+            ))
+    {
+        let key = format!("features.{}", request.raw_id);
+        match resolved {
+            Ok(feature) => {
+                translation.report.push(
+                    key,
+                    devcontainer::ReportStatus::Applied,
+                    devcontainer::ReportSource::Devcontainer,
+                    feature.installed.digest.clone(),
+                    format!(
+                        "OCI feature '{}' install.sh sha256 {} will run during setup",
+                        feature.installed.id, feature.installed.install_script_hash
+                    ),
+                );
+                translation.oci_features.push(feature);
+            }
+            Err(e) => translation.report.push(
+                key,
+                devcontainer::ReportStatus::Invalid,
+                devcontainer::ReportSource::Devcontainer,
+                request.raw_id.clone(),
+                format!("failed to resolve OCI feature: {e:#}"),
+            ),
+        }
+    }
 }
 
 #[expect(

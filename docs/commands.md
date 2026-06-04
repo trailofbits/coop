@@ -113,7 +113,7 @@ coop setup [FLAGS]
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
-| `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. |
+| `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. Supported public `ghcr.io/devcontainers/features/*` entries are resolved and baked into the image. |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json`. |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any setup work. |
@@ -138,7 +138,7 @@ No additional flags.
 
 ### `devcontainer check`
 
-Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM.
+Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM. Setup-stage checks resolve supported public GHCR OCI Features so the report can show the digest and `install.sh` hash that would run.
 
 ```
 coop devcontainer check <path> [--stage setup|start|both]

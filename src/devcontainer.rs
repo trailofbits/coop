@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
+use crate::devcontainer_oci::{FeatureRequest, ResolvedFeature};
 use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
 
@@ -257,7 +258,7 @@ pub struct Report {
 }
 
 impl Report {
-    fn push(
+    pub fn push(
         &mut self,
         key: impl Into<String>,
         status: ReportStatus,
@@ -395,6 +396,8 @@ pub struct Translation {
     pub guest_env: BTreeMap<EnvVarName, String>,
     pub forward_ports: Vec<PortForward>,
     pub mounts: Vec<Mount>,
+    pub oci_feature_requests: Vec<FeatureRequest>,
+    pub oci_features: Vec<ResolvedFeature>,
     pub profiles: Vec<String>,
     /// Guest user requested by the devcontainer's `remoteUser`, when
     /// no CLI `--guest-user` overrode it. Only set at `Stage::Setup`;
@@ -924,48 +927,71 @@ fn translate_features(
     }
     let cli_profiles: std::collections::HashSet<&str> =
         inputs.cli_profiles.iter().map(String::as_str).collect();
-    for raw_id in features.keys() {
+    for (raw_id, raw_options) in features {
         let key = format!("features.{raw_id}");
-        let Some(builtin) = map_feature_to_profile(raw_id) else {
+        if let Some(builtin) = map_feature_to_profile(raw_id) {
+            let name = builtin.name;
+            if stage == Stage::Start {
+                t.report.push(
+                    key,
+                    ReportStatus::Unsupported,
+                    ReportSource::Devcontainer,
+                    name.to_string(),
+                    "features are baked into the template at `coop setup` time, \
+                     not selected per-start",
+                );
+                continue;
+            }
+            if cli_profiles.contains(&name) {
+                t.report.push(
+                    key,
+                    ReportStatus::Overridden,
+                    ReportSource::Cli,
+                    name.to_string(),
+                    "CLI --profile already includes this profile",
+                );
+                continue;
+            }
+            t.profiles.push(name.to_string());
             t.report.push(
                 key,
-                ReportStatus::Unsupported,
+                ReportStatus::Applied,
                 ReportSource::Devcontainer,
-                raw_id.clone(),
-                "no built-in profile match; coop does not pull OCI feature images in v1",
+                name.to_string(),
+                format!("mapped to built-in profile '{name}'"),
             );
             continue;
-        };
-        let name = builtin.name;
+        }
         if stage == Stage::Start {
             t.report.push(
                 key,
                 ReportStatus::Unsupported,
                 ReportSource::Devcontainer,
-                name.to_string(),
+                raw_id.clone(),
                 "features are baked into the template at `coop setup` time, \
                  not selected per-start",
             );
             continue;
         }
-        if cli_profiles.contains(&name) {
-            t.report.push(
+        match crate::devcontainer_oci::parse_feature_request(raw_id, raw_options) {
+            Ok(Some(req)) => {
+                t.oci_feature_requests.push(req);
+            }
+            Ok(None) => t.report.push(
                 key,
-                ReportStatus::Overridden,
-                ReportSource::Cli,
-                name.to_string(),
-                "CLI --profile already includes this profile",
-            );
-            continue;
+                ReportStatus::Unsupported,
+                ReportSource::Devcontainer,
+                raw_id.clone(),
+                "no built-in profile match and only ghcr.io/devcontainers/features/* OCI features are supported",
+            ),
+            Err(e) => t.report.push(
+                key,
+                ReportStatus::Invalid,
+                ReportSource::Devcontainer,
+                render_value(raw_options),
+                e.to_string(),
+            ),
         }
-        t.profiles.push(name.to_string());
-        t.report.push(
-            key,
-            ReportStatus::Applied,
-            ReportSource::Devcontainer,
-            name.to_string(),
-            format!("mapped to built-in profile '{name}'"),
-        );
     }
 }
 
@@ -1541,16 +1567,26 @@ mod tests {
         let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
         assert!(t.profiles.contains(&"rust".to_string()));
         assert!(t.profiles.contains(&"node".to_string()));
-        let docker = t
-            .report
-            .entries
-            .iter()
-            .find(|e| {
-                e.key
-                    .starts_with("features.ghcr.io/devcontainers/features/docker")
-            })
-            .unwrap();
-        assert_eq!(docker.status, ReportStatus::Unsupported);
+        assert!(t.oci_feature_requests.iter().any(|req| {
+            req.raw_id
+                .starts_with("ghcr.io/devcontainers/features/docker")
+        }));
+    }
+
+    #[test]
+    fn translate_features_collects_supported_oci_requests() {
+        let f = parse(
+            r#"{ "features": {
+                "ghcr.io/devcontainers/features/github-cli:1": { "version": "latest" }
+            } }"#,
+        );
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
+        assert_eq!(t.oci_feature_requests.len(), 1);
+        assert_eq!(
+            t.oci_feature_requests[0].reference.repository,
+            "devcontainers/features/github-cli"
+        );
+        assert_eq!(t.oci_feature_requests[0].options["version"], "latest");
     }
 
     #[test]

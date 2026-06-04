@@ -1,6 +1,6 @@
 # Reading `devcontainer.json`
 
-coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps recognised keys to its own primitives. This is not full devcontainer support — coop builds its own rootfs and does not run Dockerfiles, compose files, or arbitrary OCI feature images. The supported subset is listed below; everything else is reported as `unsupported` and skipped.
+coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps recognised keys to its own primitives. This is not full devcontainer support — coop builds its own rootfs and does not run Dockerfiles or compose files. The supported subset is listed below; everything else is reported as `unsupported` and skipped.
 
 ## How discovery and apply work
 
@@ -37,7 +37,8 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 | `containerEnv` | `guest_env` (`--env KEY=VALUE`) | CLI `--env` wins on conflict |
 | `forwardPorts` | `--forward-port` | Items may be integers or `"GUEST[:HOST]"` strings |
 | `features` (`rust`, `node`, `python`, `go`, `c`, `fuzz`) | built-in `--profile` | Only at `coop setup`; ignored during VM start/restart |
-| `features` (anything else) | warn and skip | No silent fallback to a custom profile |
+| `features` (`ghcr.io/devcontainers/features/*`) | OCI Feature `install.sh` baked into the image | Public GHCR devcontainer Features only; report includes the resolved digest and script hash |
+| `features` (anything else) | warn and skip | No silent fallback to a custom profile or unsupported registry |
 | `hostRequirements.cpus` | `--vcpus` | |
 | `hostRequirements.memory` | `--mem` | Accepts `4GB`/`4GiB`-style values |
 | `hostRequirements.storage` | `--disk` | Start-time only; accepts `16GB`/`16GiB`-style values |
@@ -49,9 +50,17 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 
 `devcontainer.json` officially allows `//` and `/* */` comments and trailing commas. coop parses these correctly.
 
+## OCI Feature installs
+
+For public `ghcr.io/devcontainers/features/<name>[:tag|@digest]` entries that do not map to a built-in profile, `coop setup --workspace ... --devcontainer ...` fetches the Feature metadata and layer from GHCR, validates that the layer contains `devcontainer-feature.json` and `install.sh`, and bakes the Feature payload into the image setup recipe. Features run in deterministic `features` key order after profile post-install scripts and guest-user setup, before coop's agent setup.
+
+Feature option values must be strings, numbers, booleans, or `null`. They are exposed to the Feature script as uppercased environment variables, along with `_REMOTE_USER` and `_REMOTE_USER_HOME`.
+
+Treat Feature install scripts as untrusted project-provided code. The report prints the resolved digest and `install.sh` SHA-256 before setup continues; use `--dry-run` or `coop devcontainer check <path> --stage setup` to inspect this without building an image.
+
 ## Out of scope in v1
 
-- OCI feature registry pulls (`ghcr.io/devcontainers/features/*` features other than the built-in name match)
+- OCI feature registries other than public `ghcr.io/devcontainers/features/*`
 - `--git-repo` auto-detection for non-GitHub hosts
 - Sticky `--no-devcontainer` (persistent per-workspace state)
 - Live re-application on an existing VM (destroy + `coop up` to pick up changes)
