@@ -4,7 +4,7 @@ coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps
 
 ## How discovery and apply work
 
-When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). For `--git-repo` creation flows, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM.
+When you run `coop up <dir>`, `coop setup --workspace <dir>`, or a fresh `coop quickstart` for the current directory, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). For `--git-repo` creation flows, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM. `coop start --dry-run --workspace <dir>` also uses discovery as a translation preview; normal `coop start` only restarts stopped instances and does not create a VM or re-apply devcontainer changes.
 
 If a file is found, coop prompts:
 
@@ -21,11 +21,30 @@ When a local `devcontainer.json` is applied while creating a VM, coop records th
 For CI or scripted use, pass one of:
 
 - `--devcontainer <path>` — use this specific file, skip the prompt
-- `--no-devcontainer` — ignore any discovered file
+- `--no-devcontainer` — ignore any discovered file for this invocation
 - `--dry-run` — print the report and exit before any VM work
 - `coop devcontainer check <path>` — print setup/start translation reports for a file without loading coop config or touching VM state
 
 A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `--git-repo`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`.
+
+## Persistent project opt-outs
+
+If a project has a `devcontainer.json` that you do not want coop to read, record an explicit opt-out:
+
+```
+coop devcontainer ignore <project-dir>
+```
+
+Future discovery for that project skips the file and prints a message explaining that the stored opt-out was used. `--devcontainer <path>` still applies an explicit file for a single run, and `--no-devcontainer` remains a non-persistent escape hatch.
+
+Inspect and clear stored opt-outs with:
+
+```
+coop devcontainer status [project-dir]
+coop devcontainer clear <project-dir>
+```
+
+`status` lists the stored absolute project path. If the original directory was moved or deleted, pass that listed path to `clear`.
 
 ## Precedence
 
@@ -64,5 +83,4 @@ Treat Feature install scripts as untrusted project-provided code. The report pri
 
 - OCI feature registries other than public `ghcr.io/devcontainers/features/*`
 - `--git-repo` auto-detection for non-GitHub hosts
-- Sticky `--no-devcontainer` (persistent per-workspace state)
 - Live re-application on an existing VM (destroy + `coop up` to pick up changes)

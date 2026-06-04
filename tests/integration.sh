@@ -3127,6 +3127,104 @@ EOF
         fail "--no-devcontainer suppresses discovery" "exit code: $? stderr: $HARNESS_ERR"
     fi
 
+    local pref_cfg="$tmpdir/devcontainer-pref-config.toml"
+    local pref_data="$tmpdir/devcontainer-pref-data"
+    mkdir -p "$pref_data"
+    cat > "$pref_cfg" <<EOF
+data_dir = "$pref_data"
+EOF
+
+    if coop --config "$pref_cfg" devcontainer ignore "$dcdir"; then
+        pass "devcontainer ignore records persistent opt-out"
+    else
+        fail "devcontainer ignore records persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" devcontainer status "$dcdir" \
+        && grep -q "disabled" <<< "$HARNESS_OUT" \
+        && grep -q "$dcdir" <<< "$HARNESS_OUT"; then
+        pass "devcontainer status reports project opt-out"
+    else
+        fail "devcontainer status reports project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref" \
+        --dry-run --no-agents; then
+        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+            && ! grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
+            pass "stored devcontainer opt-out skips discovery"
+        else
+            fail "stored devcontainer opt-out skips discovery" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "stored devcontainer opt-out skips discovery" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" setup --workspace "$dcdir" --dry-run; then
+        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+            && ! grep -q "setup-stage translation" <<< "$HARNESS_ERR"; then
+            pass "stored devcontainer opt-out skips setup --workspace dry-run discovery"
+        else
+            fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" start --workspace "$dcdir" --dry-run; then
+        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+            && ! grep -q "start-stage translation" <<< "$HARNESS_ERR"; then
+            pass "stored devcontainer opt-out skips start --workspace dry-run discovery"
+        else
+            fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-explicit" \
+        --devcontainer "$dcfile" --dry-run --no-agents; then
+        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
+            pass "explicit --devcontainer bypasses stored opt-out"
+        else
+            fail "explicit --devcontainer bypasses stored opt-out" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "explicit --devcontainer bypasses stored opt-out" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop --config "$pref_cfg" devcontainer clear "$dcdir"; then
+        pass "devcontainer clear removes persistent opt-out"
+    else
+        fail "devcontainer clear removes persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    local stale_ws
+    stale_ws=$(mktemp -d "$tmpdir/devcontainer-stale-XXXXXX")
+    _write_devcontainer "$stale_ws"
+    if coop --config "$pref_cfg" devcontainer ignore "$stale_ws"; then
+        rm -rf "$stale_ws"
+        if coop --config "$pref_cfg" devcontainer clear "$stale_ws" \
+            && grep -q "Cleared devcontainer opt-out" <<< "$HARNESS_OUT"; then
+            pass "devcontainer clear removes stale deleted-project opt-out"
+        else
+            fail "devcontainer clear removes stale deleted-project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "devcontainer clear removes stale deleted-project opt-out" "ignore failed: $HARNESS_ERR"
+    fi
+
+    if moat_fails --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-cleared" --no-agents; then
+        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
+            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
+            pass "cleared devcontainer opt-out restores non-TTY prompt error"
+        else
+            fail "cleared devcontainer opt-out restores non-TTY prompt error" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "cleared devcontainer opt-out restores non-TTY prompt error" "expected non-zero exit"
+    fi
+
     # Non-interactive + discovered file + no escape hatch must error with the
     # hint pointing at --devcontainer / --no-devcontainer.
     if moat_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then

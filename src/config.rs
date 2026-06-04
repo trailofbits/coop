@@ -1827,6 +1827,11 @@ impl CoopConfig {
         self.data_dir.join("instances")
     }
 
+    /// Path to per-project devcontainer discovery preferences.
+    pub fn devcontainer_preferences_path(&self) -> PathBuf {
+        self.data_dir.join("devcontainer_preferences.json")
+    }
+
     /// List all existing instances, sorted by index.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let dir = self.instances_dir();

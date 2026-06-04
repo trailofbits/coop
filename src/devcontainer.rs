@@ -29,6 +29,94 @@ use crate::sha256_hash::Sha256Hash;
 /// Default relative path coop looks for inside a workspace or mount root.
 pub const DEFAULT_DEVCONTAINER_REL_PATH: &str = ".devcontainer/devcontainer.json";
 
+// ── Per-project preferences ──────────────────────────────────
+
+/// Stored devcontainer discovery preference for one project directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDevcontainerPreference {
+    /// Explicit user opt-out. Missing entries mean "ask/apply normally".
+    #[serde(default)]
+    pub ignore: bool,
+}
+
+/// Persistent project preferences keyed by canonical host project path.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevcontainerPreferences {
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectDevcontainerPreference>,
+}
+
+impl DevcontainerPreferences {
+    pub fn load(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {}", path.display())),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => {
+                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
+            }
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if self.projects.is_empty() {
+            if path.exists() {
+                fs::remove_file(path)
+                    .with_context(|| format!("Failed to remove {}", path.display()))?;
+            }
+            return Ok(());
+        }
+        let json = serde_json::to_string_pretty(self)
+            .context("Failed to serialize devcontainer preferences")?;
+        crate::fs_util::atomic_write_json(path, &json)
+            .with_context(|| format!("Failed to write {}", path.display()))
+    }
+
+    pub fn set_ignored(&mut self, project: &Path) -> Result<String> {
+        let key = project_preference_key(project)?;
+        self.projects
+            .insert(key.clone(), ProjectDevcontainerPreference { ignore: true });
+        Ok(key)
+    }
+
+    pub fn clear(&mut self, project: &Path) -> Result<bool> {
+        let key = project_preference_lookup_key(project)?;
+        Ok(self.projects.remove(&key).is_some())
+    }
+
+    pub fn ignored_project(&self, project: &Path) -> Result<Option<&str>> {
+        let key = project_preference_lookup_key(project)?;
+        Ok(self
+            .projects
+            .get_key_value(&key)
+            .and_then(|(k, pref)| pref.ignore.then_some(k.as_str())))
+    }
+
+    pub fn ignored_projects(&self) -> impl Iterator<Item = &str> {
+        self.projects
+            .iter()
+            .filter_map(|(project, pref)| pref.ignore.then_some(project.as_str()))
+    }
+}
+
+pub fn project_preference_key(project: &Path) -> Result<String> {
+    let canonical = project.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve project directory {} for devcontainer preference",
+            project.display()
+        )
+    })?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+pub fn project_preference_lookup_key(project: &Path) -> Result<String> {
+    match project_preference_key(project) {
+        Ok(key) => Ok(key),
+        Err(_) if project.is_absolute() => Ok(project.to_string_lossy().into_owned()),
+        Err(e) => Err(e),
+    }
+}
+
 // ── Parsing ──────────────────────────────────────────────────
 
 /// Convert JSONC (`//`, `/* */`, trailing commas) to plain JSON.
@@ -2149,5 +2237,55 @@ mod tests {
         };
 
         assert!(state.changed_warning("demo").unwrap().is_none());
+    }
+
+    #[test]
+    fn devcontainer_preferences_round_trip_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let path = dir.path().join("prefs.json");
+
+        let mut prefs = DevcontainerPreferences::default();
+        let key = prefs.set_ignored(&project).unwrap();
+        prefs.save(&path).unwrap();
+
+        let loaded = DevcontainerPreferences::load(&path).unwrap();
+        assert_eq!(
+            loaded.ignored_project(&project).unwrap(),
+            Some(key.as_str())
+        );
+        assert_eq!(loaded.ignored_projects().collect::<Vec<_>>(), vec![key]);
+
+        let mut loaded = loaded;
+        assert!(loaded.clear(&project).unwrap());
+        loaded.save(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn devcontainer_preferences_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        let prefs = DevcontainerPreferences::load(&path).unwrap();
+        assert!(prefs.ignored_projects().next().is_none());
+    }
+
+    #[test]
+    fn devcontainer_preferences_clear_deleted_project_by_stored_absolute_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+
+        let mut prefs = DevcontainerPreferences::default();
+        let key = prefs.set_ignored(&project).unwrap();
+        fs::remove_dir(&project).unwrap();
+
+        assert_eq!(
+            prefs.ignored_project(Path::new(&key)).unwrap(),
+            Some(key.as_str())
+        );
+        assert!(prefs.clear(Path::new(&key)).unwrap());
+        assert!(prefs.ignored_projects().next().is_none());
     }
 }

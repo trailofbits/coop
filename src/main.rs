@@ -636,6 +636,21 @@ enum DevcontainerCommands {
         #[arg(long, value_enum, default_value_t = DevcontainerCheckStage::Both)]
         stage: DevcontainerCheckStage,
     },
+    /// Persistently ignore discovered devcontainer.json for a project.
+    Ignore {
+        /// Project directory whose discovered devcontainer.json should be ignored
+        project: PathBuf,
+    },
+    /// Show persistent devcontainer opt-outs.
+    Status {
+        /// Project directory to inspect; omitted lists every stored opt-out
+        project: Option<PathBuf>,
+    },
+    /// Clear a persistent devcontainer opt-out for a project.
+    Clear {
+        /// Project directory whose opt-out should be cleared
+        project: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -751,8 +766,10 @@ fn main() -> Result<()> {
         );
     }
 
-    if let Commands::Devcontainer { ref command } = cli.command {
-        return cmd_devcontainer(command);
+    if let Commands::Devcontainer { ref command } = cli.command
+        && matches!(command, DevcontainerCommands::Check { .. })
+    {
+        return cmd_devcontainer_check(command);
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
@@ -880,6 +897,7 @@ fn main() -> Result<()> {
                     mounts: &[],
                     git_repo: None,
                     github_auth: cfg.github.as_ref(),
+                    preference_path: Some(&cfg.devcontainer_preferences_path()),
                 },
                 &inputs,
                 devcontainer::Stage::Setup,
@@ -930,7 +948,7 @@ fn main() -> Result<()> {
             let validated = cfg.validate_and_warn()?;
             cmd_build(&cfg, &validated)
         }
-        Commands::Devcontainer { .. } => unreachable!("handled before config load"),
+        Commands::Devcontainer { command } => cmd_devcontainer(&cfg, &command),
         Commands::Start {
             name,
             profile,
@@ -989,6 +1007,7 @@ fn main() -> Result<()> {
                         mounts: &mounts,
                         git_repo: git_repo.as_deref(),
                         github_auth: cfg.github.as_ref(),
+                        preference_path: Some(&cfg.devcontainer_preferences_path()),
                     },
                     &inputs,
                     devcontainer::Stage::Start,
@@ -1333,6 +1352,7 @@ fn cmd_up(
                 mounts: discovery_mounts,
                 git_repo: None,
                 github_auth: cfg.github.as_ref(),
+                preference_path: Some(&cfg.devcontainer_preferences_path()),
             },
             &inputs,
             devcontainer::Stage::Start,
@@ -1420,6 +1440,7 @@ fn create_up_instance(
             mounts: discovery_mounts,
             git_repo: None,
             github_auth: cfg.github.as_ref(),
+            preference_path: Some(&cfg.devcontainer_preferences_path()),
         },
         &inputs,
         devcontainer::Stage::Start,
@@ -1860,6 +1881,7 @@ fn quickstart_fresh_start(
             mounts: &[],
             git_repo: None,
             github_auth: cfg.github.as_ref(),
+            preference_path: Some(&cfg.devcontainer_preferences_path()),
         },
         &inputs,
         devcontainer::Stage::Start,
@@ -2042,6 +2064,7 @@ struct DevcontainerOpts<'a> {
     mounts: &'a [config::Mount],
     git_repo: Option<&'a str>,
     github_auth: Option<&'a config::GitHubAuth>,
+    preference_path: Option<&'a Path>,
 }
 
 enum DevcontainerSource {
@@ -2050,6 +2073,58 @@ enum DevcontainerSource {
         display_path: PathBuf,
         contents: String,
     },
+}
+
+fn discovered_local_devcontainer(opts: &DevcontainerOpts<'_>, source: &DevcontainerSource) -> bool {
+    opts.explicit_path.is_none() && matches!(source, DevcontainerSource::Path(_))
+}
+
+fn maybe_skip_stored_devcontainer_opt_out(
+    opts: &DevcontainerOpts<'_>,
+    source: &DevcontainerSource,
+    display_path: &Path,
+) -> Result<bool> {
+    if !discovered_local_devcontainer(opts, source) {
+        return Ok(false);
+    }
+    let (Some(preference_path), Some(project)) = (opts.preference_path, opts.workspace) else {
+        return Ok(false);
+    };
+    let preferences = devcontainer::DevcontainerPreferences::load(preference_path)?;
+    let Some(project_key) = preferences.ignored_project(project)? else {
+        return Ok(false);
+    };
+
+    let mut stderr = std::io::stderr();
+    writeln!(
+        stderr,
+        "Skipping {} because a stored devcontainer opt-out is set for project {}.\n\
+         Run `coop devcontainer clear {}` to re-enable discovery, or pass --devcontainer {} to apply this file once.",
+        display_path.display(),
+        project_key,
+        project_key,
+        display_path.display(),
+    )
+    .context("Failed to write devcontainer opt-out message")?;
+    Ok(true)
+}
+
+fn maybe_record_devcontainer_opt_out(opts: &DevcontainerOpts<'_>, project: &Path) -> Result<()> {
+    let Some(preference_path) = opts.preference_path else {
+        return Ok(());
+    };
+    if !prompt::confirm(&format!(
+        "Always ignore devcontainer.json for project {}?",
+        project.display()
+    ))? {
+        return Ok(());
+    }
+
+    let mut preferences = devcontainer::DevcontainerPreferences::load(preference_path)?;
+    let project_key = preferences.set_ignored(project)?;
+    preferences.save(preference_path)?;
+    tracing::info!("Recorded persistent devcontainer opt-out for project {project_key}");
+    Ok(())
 }
 
 /// Discover, prompt, and translate a `devcontainer.json` for the given
@@ -2100,6 +2175,10 @@ fn resolve_devcontainer(
         DevcontainerSource::Contents { display_path, .. } => display_path,
     };
 
+    if maybe_skip_stored_devcontainer_opt_out(opts, &source, display_path)? {
+        return Ok(None);
+    }
+
     // When discovery (not an explicit flag) found the file, defer to the
     // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
     if opts.explicit_path.is_none() && !opts.dry_run {
@@ -2127,11 +2206,16 @@ fn resolve_devcontainer(
         ))?;
         if !answer {
             match &source {
-                DevcontainerSource::Path(_) => tracing::info!(
-                    "Skipping {}. Re-run with --devcontainer {} to apply it later.",
-                    display_path.display(),
-                    display_path.display()
-                ),
+                DevcontainerSource::Path(_) => {
+                    tracing::info!(
+                        "Skipping {}. Re-run with --devcontainer {} to apply it later.",
+                        display_path.display(),
+                        display_path.display()
+                    );
+                    if let Some(project) = opts.workspace {
+                        maybe_record_devcontainer_opt_out(opts, project)?;
+                    }
+                }
                 DevcontainerSource::Contents { .. } => tracing::info!(
                     "Skipping {}. Re-run interactively to apply it later.",
                     display_path.display()
@@ -2203,7 +2287,7 @@ fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
     clippy::print_stderr,
     reason = "devcontainer check report is intentional user-facing CLI output"
 )]
-fn cmd_devcontainer(command: &DevcontainerCommands) -> Result<()> {
+fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<()> {
     match command {
         DevcontainerCommands::Check { path, stage } => {
             let opts = DevcontainerOpts {
@@ -2214,6 +2298,7 @@ fn cmd_devcontainer(command: &DevcontainerCommands) -> Result<()> {
                 mounts: &[],
                 git_repo: None,
                 github_auth: None,
+                preference_path: None,
             };
             let setup_inputs = devcontainer::TranslatorInputs::default();
 
@@ -2242,6 +2327,85 @@ fn cmd_devcontainer(command: &DevcontainerCommands) -> Result<()> {
                     eprintln!("start-stage translation:");
                     resolve_devcontainer(&opts, &start_inputs, devcontainer::Stage::Start)?;
                 }
+            }
+            Ok(())
+        }
+        DevcontainerCommands::Ignore { .. }
+        | DevcontainerCommands::Status { .. }
+        | DevcontainerCommands::Clear { .. } => {
+            unreachable!("devcontainer preference commands require config")
+        }
+    }
+}
+
+fn cmd_devcontainer(cfg: &config::CoopConfig, command: &DevcontainerCommands) -> Result<()> {
+    let preference_path = cfg.devcontainer_preferences_path();
+    match command {
+        DevcontainerCommands::Check { .. } => cmd_devcontainer_check(command),
+        DevcontainerCommands::Ignore { project } => {
+            let mut preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
+            let project_key = preferences.set_ignored(project)?;
+            preferences.save(&preference_path)?;
+            let mut stdout = std::io::stdout();
+            writeln!(
+                stdout,
+                "Devcontainer discovery disabled for project {project_key}"
+            )
+            .context("Failed to write devcontainer ignore status")?;
+            Ok(())
+        }
+        DevcontainerCommands::Status { project } => {
+            let preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
+            let mut stdout = std::io::stdout();
+            if let Some(project) = project {
+                if let Some(project_key) = preferences.ignored_project(project)? {
+                    writeln!(
+                        stdout,
+                        "Devcontainer discovery disabled for project {project_key}"
+                    )
+                    .context("Failed to write devcontainer status")?;
+                } else {
+                    let project_key = devcontainer::project_preference_lookup_key(project)?;
+                    writeln!(
+                        stdout,
+                        "Devcontainer discovery enabled for project {project_key}"
+                    )
+                    .context("Failed to write devcontainer status")?;
+                }
+            } else {
+                let ignored: Vec<_> = preferences.ignored_projects().collect();
+                if ignored.is_empty() {
+                    writeln!(stdout, "No persistent devcontainer opt-outs recorded.")
+                        .context("Failed to write devcontainer status")?;
+                } else {
+                    writeln!(stdout, "Persistent devcontainer opt-outs:")
+                        .context("Failed to write devcontainer status")?;
+                    for project in ignored {
+                        writeln!(stdout, "  {project}")
+                            .context("Failed to write devcontainer status")?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        DevcontainerCommands::Clear { project } => {
+            let mut preferences = devcontainer::DevcontainerPreferences::load(&preference_path)?;
+            let project_key = devcontainer::project_preference_lookup_key(project)?;
+            let removed = preferences.clear(project)?;
+            preferences.save(&preference_path)?;
+            let mut stdout = std::io::stdout();
+            if removed {
+                writeln!(
+                    stdout,
+                    "Cleared devcontainer opt-out for project {project_key}"
+                )
+                .context("Failed to write devcontainer clear status")?;
+            } else {
+                writeln!(
+                    stdout,
+                    "No persistent devcontainer opt-out recorded for project {project_key}"
+                )
+                .context("Failed to write devcontainer clear status")?;
             }
             Ok(())
         }
@@ -4556,7 +4720,9 @@ mod tests {
         let super::Commands::Devcontainer { command } = cli.command else {
             panic!("expected Devcontainer variant");
         };
-        let super::DevcontainerCommands::Check { path, stage } = command;
+        let super::DevcontainerCommands::Check { path, stage } = command else {
+            panic!("expected devcontainer check variant");
+        };
         assert_eq!(
             path,
             std::path::PathBuf::from(".devcontainer/devcontainer.json")
@@ -4576,8 +4742,55 @@ mod tests {
         let super::Commands::Devcontainer { command } = cli.command else {
             panic!("expected Devcontainer variant");
         };
-        let super::DevcontainerCommands::Check { stage, .. } = command;
+        let super::DevcontainerCommands::Check { stage, .. } = command else {
+            panic!("expected devcontainer check variant");
+        };
         assert!(matches!(stage, super::DevcontainerCheckStage::Start));
+    }
+
+    #[test]
+    fn devcontainer_ignore_subcommand_parses() {
+        let cli = parse(&["devcontainer", "ignore", "."]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Ignore { project } = command else {
+            panic!("expected devcontainer ignore variant");
+        };
+        assert_eq!(project, std::path::PathBuf::from("."));
+    }
+
+    #[test]
+    fn devcontainer_status_subcommand_parses_optional_project() {
+        let cli = parse(&["devcontainer", "status"]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Status { project } = command else {
+            panic!("expected devcontainer status variant");
+        };
+        assert!(project.is_none());
+
+        let cli = parse(&["devcontainer", "status", "."]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Status { project } = command else {
+            panic!("expected devcontainer status variant");
+        };
+        assert_eq!(project, Some(std::path::PathBuf::from(".")));
+    }
+
+    #[test]
+    fn devcontainer_clear_subcommand_parses() {
+        let cli = parse(&["devcontainer", "clear", "."]);
+        let super::Commands::Devcontainer { command } = cli.command else {
+            panic!("expected Devcontainer variant");
+        };
+        let super::DevcontainerCommands::Clear { project } = command else {
+            panic!("expected devcontainer clear variant");
+        };
+        assert_eq!(project, std::path::PathBuf::from("."));
     }
 
     #[test]

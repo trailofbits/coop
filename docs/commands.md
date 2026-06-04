@@ -59,7 +59,7 @@ on Linux/Firecracker it is a one-time sync.
 | `--post-start <cmd>` | Shell command to run inside the guest after boot |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work |
 
 ```
@@ -121,7 +121,7 @@ coop setup [FLAGS]
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
 | `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. Supported public `ghcr.io/devcontainers/features/*` entries are resolved and baked into the image. |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json`. |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation. |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any setup work. |
 
 ```
@@ -157,6 +157,30 @@ coop devcontainer check <path> [--stage setup|start|both]
 
 Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirements.cpus`, `hostRequirements.memory`, and `remoteUser`. Use `--stage start` to inspect start-time keys such as `postStartCommand`, `containerEnv`, `forwardPorts`, `mounts`, and `hostRequirements.storage`.
 
+### `devcontainer ignore`
+
+Record a persistent opt-out for a project directory. Future automatic discovery for that project skips `.devcontainer/devcontainer.json` and reports that the stored preference was used. Explicit `--devcontainer <path>` still applies a file for that run.
+
+```
+coop devcontainer ignore <project-dir>
+```
+
+### `devcontainer status`
+
+Inspect persistent devcontainer opt-outs. With no project argument, this lists all stored opt-outs.
+
+```
+coop devcontainer status [project-dir]
+```
+
+### `devcontainer clear`
+
+Remove a persistent devcontainer opt-out for a project. If the project directory was moved or deleted, use the absolute path shown by `coop devcontainer status`.
+
+```
+coop devcontainer clear <project-dir>
+```
+
 ### `start`
 
 Restart a stopped VM.
@@ -187,7 +211,7 @@ instances, pass the instance name.
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
 | `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation (escape hatch for CI). |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
 
 Normal `start` restarts an existing VM without re-reading or re-applying
