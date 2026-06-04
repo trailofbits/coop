@@ -3197,6 +3197,56 @@ test_devcontainer_apply() {
         fail "postStartCommand ran in the guest" "marker contents: '$seen_marker'"
     fi
 
+    cat > "$dcfile" <<'EOF'
+{
+    "name": "coop-it-demo-changed",
+    "hostRequirements": {
+        "cpus": 4,
+        "memory": "2GiB"
+    },
+    "containerEnv": {
+        "COOP_TEST_DEVCONTAINER": "changed"
+    },
+    "forwardPorts": [3001],
+    "postStartCommand": "echo changed > /tmp/coop-dc-marker",
+    "remoteUser": "root"
+}
+EOF
+
+    if coop stop "$inst_name"; then
+        pass "stop devcontainer apply instance exits 0"
+    else
+        fail "stop devcontainer apply instance exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+
+    if coop start --workspace "$dcdir" --no-agents; then
+        pass "start --workspace after devcontainer change exits 0"
+    else
+        fail "start --workspace after devcontainer change exits 0" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    if grep -q "devcontainer.json changed" <<< "$HARNESS_ERR" \
+        && grep -q "Destroy and recreate" <<< "$HARNESS_ERR" \
+        && grep -q "features, hostRequirements, mounts" <<< "$HARNESS_ERR" \
+        && grep -q "not re-applied automatically" <<< "$HARNESS_ERR"; then
+        pass "changed devcontainer warning is informational"
+    else
+        fail "changed devcontainer warning is informational" "stderr: $HARNESS_ERR"
+    fi
+
+    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
+    if [[ "$seen_env" == "applied" ]]; then
+        pass "changed containerEnv is not re-applied on restart"
+    else
+        fail "changed containerEnv is not re-applied on restart" "got: '$seen_env'"
+    fi
+
+    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
+    if [[ "$seen_marker" != *changed* ]]; then
+        pass "changed postStartCommand is not re-applied on restart"
+    else
+        fail "changed postStartCommand is not re-applied on restart" "marker contents: '$seen_marker'"
+    fi
+
     unset GUEST_INSTANCE
 
     coop destroy "$inst_name" 2>/dev/null || true

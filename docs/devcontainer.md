@@ -4,7 +4,7 @@ coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps
 
 ## How discovery and apply work
 
-When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). On restart, `coop start --workspace <dir>` can also read the project's devcontainer file for restart-time settings. For `coop start --git-repo <url>`, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM.
+When you run `coop up <dir>` or `coop setup --workspace <dir>`, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). For `--git-repo` creation flows, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM.
 
 If a file is found, coop prompts:
 
@@ -13,6 +13,8 @@ Use devcontainer.json at <path>? [Y/n]
 ```
 
 After your reply (or non-interactive escape hatches, below), coop prints a per-key report showing exactly which devcontainer.json keys took effect, which were overridden by CLI flags, and which are unsupported.
+
+When a local `devcontainer.json` is applied while creating a VM, coop records the file path and SHA-256 content hash in the instance state. Later `coop up` reconnects and `coop start` restarts compare the current file at that path with the recorded hash. If it changed or disappeared, coop prints an informational warning and leaves the existing VM unchanged. Destroy and recreate the VM to apply creation-time changes such as `features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`. Start-time values from the old file, including `containerEnv`, `forwardPorts`, and `postStartCommand`, are not re-applied automatically on restart.
 
 ## Non-interactive escape hatches
 

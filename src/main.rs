@@ -1019,74 +1019,11 @@ fn main() -> Result<()> {
                 post_start_override: post_start.as_deref(),
                 persisted_guest_env: std::collections::BTreeMap::new(),
                 devcontainer_path: devcontainer.as_deref().map(Path::new),
+                applied_devcontainer: None,
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
-            let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
-            let inputs = devcontainer::TranslatorInputs {
-                cli_vcpus: vcpus,
-                cli_mem_mib: mem,
-                cli_disk_gib: disk,
-                cli_post_start: post_start.clone(),
-                cli_guest_env_keys: cli_env_keys,
-                cli_forward_ports: start_opts.forward_ports.clone(),
-                cli_mounts: start_opts.mounts.clone(),
-                persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
-                cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
-                ..devcontainer::TranslatorInputs::default()
-            };
-            let ws_path = workspace.as_deref().map(Path::new);
-            let translation = resolve_devcontainer(
-                &DevcontainerOpts {
-                    explicit_path: devcontainer.as_deref().map(Path::new),
-                    no_devcontainer,
-                    dry_run,
-                    workspace: ws_path,
-                    mounts: &start_opts.mounts,
-                    git_repo: git_repo.as_deref(),
-                    github_auth: cfg.github.as_ref(),
-                },
-                &inputs,
-                devcontainer::Stage::Start,
-            )?;
-            if dry_run {
-                return Ok(());
-            }
-            // CLI flags are applied first; the translation only carries
-            // values that survived the "CLI > devcontainer.json" precedence
-            // check inside `translate`, so the two cannot fight here.
             apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
-            if let Some(t) = &translation {
-                devcontainer::apply_to_config(&mut cfg, t)?;
-                start_opts.forward_ports = devcontainer::merge_into_forward_ports(
-                    &t.forward_ports,
-                    &start_opts.forward_ports,
-                );
-            }
-            let default_translation = devcontainer::Translation::default();
-            start_opts.disk = devcontainer::effective_disk(
-                disk,
-                translation.as_ref().unwrap_or(&default_translation),
-            );
-            let dc_post_start = (post_start.is_none())
-                .then(|| translation.as_ref().and_then(|t| t.post_start.clone()))
-                .flatten();
-            start_opts.post_start_override = post_start.as_deref().or(dc_post_start.as_deref());
-            // `--mount` and devcontainer `mounts` aren't combined: --mount is
-            // a complete replacement of the mount set (its `conflicts_with`
-            // rules with --workspace/--git-repo encode this). The CLI-wins
-            // outcome is reported by `translate`.
-            if start_opts.mounts.is_empty() {
-                start_opts.mounts = translation
-                    .as_ref()
-                    .map(|t| t.mounts.clone())
-                    .unwrap_or_default();
-            }
-            apply_runtime_guest_env(
-                &mut cfg,
-                &guest_env,
-                translation.as_ref().map(|t| &t.guest_env),
-                &mut start_opts,
-            );
+            apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
             cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
@@ -1407,6 +1344,7 @@ fn cmd_up(
         ensure_up_project_name_matches(&inst, &project_dir, opts)?;
         ensure_up_existing_inputs_are_compatible(&inst, transport, opts)?;
         if be.is_running(&inst) {
+            devcontainer::warn_if_applied_devcontainer_changed(&inst);
             reject_running_up_restart_inputs(&inst, opts)?;
             tracing::info!(
                 "Instance '{}' is already running for {}",
@@ -1553,6 +1491,7 @@ fn create_up_instance(
         post_start_override: post_start_override.as_deref(),
         persisted_guest_env,
         devcontainer_path: None,
+        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
     };
 
     allocate_and_start(
@@ -1632,6 +1571,7 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         post_start_override: opts.runtime.post_start.as_deref(),
         persisted_guest_env: std::collections::BTreeMap::new(),
         devcontainer_path: None,
+        applied_devcontainer: None,
     }
 }
 
@@ -1872,6 +1812,7 @@ fn cmd_quickstart(
                     post_start_override: None,
                     persisted_guest_env: std::collections::BTreeMap::new(),
                     devcontainer_path: None,
+                    applied_devcontainer: None,
                 },
             )?
         }
@@ -1977,6 +1918,7 @@ fn quickstart_fresh_start(
         post_start_override: post_start_override.as_deref(),
         persisted_guest_env,
         devcontainer_path: None,
+        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
     };
 
     let _ = validated;
@@ -2199,6 +2141,7 @@ fn resolve_devcontainer(
         }
     }
 
+    let source_is_remote = matches!(source, DevcontainerSource::Contents { .. });
     let parsed = match source {
         DevcontainerSource::Path(path) => devcontainer::ParsedDevcontainer::load(&path)?,
         DevcontainerSource::Contents {
@@ -2207,6 +2150,9 @@ fn resolve_devcontainer(
         } => devcontainer::ParsedDevcontainer::from_str(display_path, &contents)?,
     };
     let mut translation = devcontainer::translate(&parsed, inputs, stage);
+    if source_is_remote && let Some(applied) = &mut translation.applied {
+        applied.source = devcontainer::AppliedDevcontainerSource::RemoteContents;
+    }
     translation.report.ignored_paths = losers;
     resolve_oci_feature_requests(&mut translation);
 
@@ -2372,6 +2318,9 @@ struct StartOpts<'a> {
     /// translation before this struct is built; normal `start` only uses this
     /// marker to reject silently ignored creation options on restart.
     devcontainer_path: Option<&'a Path>,
+    /// Devcontainer path/hash that was applied to a newly-created instance.
+    /// Empty on restarts and when no devcontainer was used.
+    applied_devcontainer: Option<devcontainer::AppliedDevcontainer>,
 }
 
 fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
@@ -2615,6 +2564,7 @@ fn restart_instance(
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
+    devcontainer::warn_if_applied_devcontainer_changed(inst);
 
     let _guard = signal::install_handlers();
 
@@ -2769,6 +2719,12 @@ fn start_instance(
         entries: opts.persisted_guest_env.clone(),
     }
     .save(inst)?;
+    if let Some(applied) = &opts.applied_devcontainer {
+        devcontainer::DevcontainerState {
+            applied: applied.clone(),
+        }
+        .save(inst)?;
+    }
 
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     if opts.no_agents && post_start.is_none() {
@@ -4260,6 +4216,7 @@ mod tests {
             post_start_override: None,
             persisted_guest_env: std::collections::BTreeMap::new(),
             devcontainer_path: None,
+            applied_devcontainer: None,
         }
     }
 

@@ -12,16 +12,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
+use std::fs;
+use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
 use crate::devcontainer_oci::{FeatureRequest, ResolvedFeature};
 use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
+use crate::sha256_hash::Sha256Hash;
 
 /// Default relative path coop looks for inside a workspace or mount root.
 pub const DEFAULT_DEVCONTAINER_REL_PATH: &str = ".devcontainer/devcontainer.json";
@@ -173,6 +176,7 @@ struct RawHostRequirements {
 #[derive(Debug)]
 pub struct ParsedDevcontainer {
     pub path: PathBuf,
+    pub content_hash: Sha256Hash,
     raw: RawDevcontainer,
 }
 
@@ -182,14 +186,135 @@ impl ParsedDevcontainer {
         let json = jsonc_to_json(text);
         let raw: RawDevcontainer = serde_json::from_str(&json)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
-        Ok(Self { path, raw })
+        Ok(Self {
+            path,
+            content_hash: Sha256Hash::of(text),
+            raw,
+        })
     }
 
     /// Read and parse a file from disk.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        Self::from_str(path.to_path_buf(), &text)
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        Self::from_str(canonical_path, &text)
+    }
+}
+
+/// Devcontainer file that was applied when an instance was created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedDevcontainer {
+    pub path: PathBuf,
+    pub content_hash: Sha256Hash,
+    #[serde(default)]
+    pub source: AppliedDevcontainerSource,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppliedDevcontainerSource {
+    #[default]
+    LocalFile,
+    RemoteContents,
+}
+
+impl AppliedDevcontainer {
+    fn current_hash(&self) -> Result<Option<Sha256Hash>> {
+        if self.source != AppliedDevcontainerSource::LocalFile {
+            return Ok(None);
+        }
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(Sha256Hash::of(bytes))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(anyhow::Error::new(e)
+                    .context(format!("Failed to read {}", self.path.display())))
+            }
+        }
+    }
+}
+
+/// Persisted devcontainer snapshot written per instance after start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevcontainerState {
+    pub applied: AppliedDevcontainer,
+}
+
+impl DevcontainerState {
+    pub fn save(&self, inst: &config::Instance) -> Result<()> {
+        let path = inst.devcontainer_state_path();
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize devcontainer state")?;
+        crate::fs_util::atomic_write_json(&path, &json)
+            .context("Failed to write devcontainer_state.json")?;
+        tracing::debug!("Wrote devcontainer state to {}", path.display());
+        Ok(())
+    }
+
+    pub fn try_load(inst: &config::Instance) -> Result<Option<Self>> {
+        let path = inst.devcontainer_state_path();
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let state = serde_json::from_str(&content)
+                    .context("Failed to parse devcontainer_state.json")?;
+                Ok(Some(state))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
+            }
+        }
+    }
+
+    pub fn changed_warning(&self, instance_name: &str) -> Result<Option<String>> {
+        if self.applied.source != AppliedDevcontainerSource::LocalFile {
+            return Ok(None);
+        }
+
+        let Some(current_hash) = self.applied.current_hash()? else {
+            return Ok(Some(format!(
+                "devcontainer.json previously applied to instance '{instance_name}' is no longer readable at {}. \
+                 The existing VM was not changed. Destroy and recreate it to apply creation-time devcontainer changes \
+                 such as features, hostRequirements, mounts, image/build, or remoteUser.",
+                self.applied.path.display()
+            )));
+        };
+
+        if current_hash == self.applied.content_hash {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "devcontainer.json changed since instance '{instance_name}' was created: {}. \
+             The existing VM was not changed. Destroy and recreate it to apply creation-time devcontainer changes \
+             such as features, hostRequirements, mounts, image/build, or remoteUser. \
+             Restart-time values from the old file, including containerEnv, forwardPorts, and postStartCommand, \
+             are not re-applied automatically.",
+            self.applied.path.display()
+        )))
+    }
+}
+
+pub fn warn_if_applied_devcontainer_changed(inst: &config::Instance) {
+    let state = match DevcontainerState::try_load(inst) {
+        Ok(Some(state)) => state,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read devcontainer state for '{}'; devcontainer change check skipped. {e:#}",
+                inst.name,
+            );
+            return;
+        }
+    };
+    match state.changed_warning(inst.name.as_str()) {
+        Ok(Some(message)) => tracing::warn!("{message}"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "Could not compare devcontainer.json for '{}'; devcontainer change check skipped. {e:#}",
+            inst.name,
+        ),
     }
 }
 
@@ -389,6 +514,7 @@ pub enum Stage {
 /// Result of `translate` — the values to push into config plus a report.
 #[derive(Debug, Default)]
 pub struct Translation {
+    pub applied: Option<AppliedDevcontainer>,
     pub vcpus: Option<u8>,
     pub mem_mib: Option<MiB>,
     pub disk_gib: Option<GiB>,
@@ -422,7 +548,14 @@ pub fn translate(
     inputs: &TranslatorInputs,
     stage: Stage,
 ) -> Translation {
-    let mut t = Translation::default();
+    let mut t = Translation {
+        applied: Some(AppliedDevcontainer {
+            path: file.path.clone(),
+            content_hash: file.content_hash,
+            source: AppliedDevcontainerSource::LocalFile,
+        }),
+        ..Translation::default()
+    };
     t.report.source_path = Some(file.path.clone());
 
     if let Some(reqs) = &file.raw.host_requirements {
@@ -1951,5 +2084,70 @@ mod tests {
             .unwrap();
         assert!(invalid.note.contains("1BAD"));
         assert!(invalid.note.contains("AL SO"));
+    }
+
+    #[test]
+    fn translation_records_applied_path_and_content_hash() {
+        let f = parse(r#"{ "containerEnv": { "GOOD": "1" } }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let applied = t.applied.as_ref().unwrap();
+        assert_eq!(applied.path, PathBuf::from("test.json"));
+        assert_eq!(applied.source, AppliedDevcontainerSource::LocalFile);
+        assert_eq!(
+            applied.content_hash,
+            Sha256Hash::of(r#"{ "containerEnv": { "GOOD": "1" } }"#),
+        );
+    }
+
+    #[test]
+    fn devcontainer_state_warns_when_file_hash_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devcontainer.json");
+        fs::write(&path, r#"{ "name": "old" }"#).unwrap();
+        let state = DevcontainerState {
+            applied: AppliedDevcontainer {
+                path: path.clone(),
+                content_hash: Sha256Hash::of(r#"{ "name": "old" }"#),
+                source: AppliedDevcontainerSource::LocalFile,
+            },
+        };
+
+        assert!(state.changed_warning("demo").unwrap().is_none());
+
+        fs::write(&path, r#"{ "name": "new" }"#).unwrap();
+        let warning = state.changed_warning("demo").unwrap().unwrap();
+        assert!(warning.contains("devcontainer.json changed"));
+        assert!(warning.contains("features"));
+        assert!(warning.contains("hostRequirements"));
+        assert!(warning.contains("remoteUser"));
+        assert!(warning.contains("not re-applied automatically"));
+    }
+
+    #[test]
+    fn devcontainer_state_warns_when_file_disappears() {
+        let state = DevcontainerState {
+            applied: AppliedDevcontainer {
+                path: PathBuf::from("/path/does/not/exist/devcontainer.json"),
+                content_hash: Sha256Hash::of("{}"),
+                source: AppliedDevcontainerSource::LocalFile,
+            },
+        };
+
+        let warning = state.changed_warning("demo").unwrap().unwrap();
+        assert!(warning.contains("no longer readable"));
+        assert!(warning.contains("Destroy and recreate"));
+    }
+
+    #[test]
+    fn devcontainer_state_does_not_local_compare_remote_contents() {
+        let state = DevcontainerState {
+            applied: AppliedDevcontainer {
+                path: PathBuf::from("github.com/owner/repo/.devcontainer/devcontainer.json"),
+                content_hash: Sha256Hash::of("{}"),
+                source: AppliedDevcontainerSource::RemoteContents,
+            },
+        };
+
+        assert!(state.changed_warning("demo").unwrap().is_none());
     }
 }

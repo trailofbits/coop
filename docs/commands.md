@@ -83,6 +83,12 @@ recreate it with different creation options. Runtime startup options such as
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.
 
+When a local `devcontainer.json` was applied while creating the instance, coop stores
+its path and content hash. Later `coop up` reconnects or restarts warn if that
+file changed, but the existing VM is not mutated automatically. Destroy and
+recreate the instance to apply creation-time devcontainer changes such as
+`features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`.
+
 ### `init`
 
 Generate a starter config file at `~/.coop/config.toml`.
@@ -180,11 +186,15 @@ instances, pass the instance name.
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
-| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
+| `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
 | `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
 
-When `--workspace <dir>` contains a `.devcontainer/devcontainer.json`, or `--git-repo <url>` points at a GitHub repository with one, coop reads a subset of it and prompts before applying restart-time settings. See [docs/devcontainer.md](devcontainer.md) for the supported keys and discovery rules.
+Normal `start` restarts an existing VM without re-reading or re-applying
+`devcontainer.json`. If the instance was created with a devcontainer file, coop
+warns when the recorded file path now has different contents. See
+[docs/devcontainer.md](devcontainer.md) for the supported keys, discovery
+rules, and recreate guidance.
 
 ```
 coop start

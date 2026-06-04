@@ -2128,6 +2128,10 @@ impl Instance {
         self.dir.join("guest_env.json")
     }
 
+    pub fn devcontainer_state_path(&self) -> PathBuf {
+        self.dir.join("devcontainer_state.json")
+    }
+
     pub fn tap_device(&self) -> String {
         format!("tap{}", self.index)
     }
