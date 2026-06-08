@@ -2945,7 +2945,7 @@ CFGEOF
 # `test_guest_environment` covers the `--env` CLI path against the shared
 # primary instance. This phase covers the complementary `[guest_env]`
 # config-file path, plus the literal-over-forwarded precedence (and its
-# WARN) from `resolve_guest_env` in src/backend.rs. It owns a dedicated
+# WARN) from `prepare_env_forwarding` in src/backend.rs. It owns a dedicated
 # config file and instance so it doesn't perturb the primary instance.
 test_guest_env_config() {
     echo ""
@@ -2961,7 +2961,13 @@ test_guest_env_config() {
     # `COOP_TEST_GUEST_ENV_PRECEDENCE` is also listed in `claude.env_forward`
     # and exported on the host below, so the literal must override the
     # forwarded host value (and a WARN must be emitted on the collision).
+    # `post_start` forces the up-time SSH session (and thus
+    # `prepare_env_forwarding`, which emits the precedence WARN) to run even
+    # under `--no-agents`, which otherwise skips all session work. `true` is
+    # a no-op. Without it the WARN is never produced during `up`.
     cat > "$cfg_file" <<CFGEOF
+post_start = "true"
+
 [claude]
 github = "off"
 env_forward = ["COOP_TEST_GUEST_ENV_PRECEDENCE"]
@@ -2978,6 +2984,19 @@ CFGEOF
             "$BINARY" --config "$cfg_file" "$@" 2>"$tmpdir/stderr") || rc=$?
         HARNESS_ERR=$(cat "$tmpdir/stderr")
         return $rc
+    }
+
+    # `coop shell` must run with this config file: config-block `guest_env`
+    # literals are re-derived from `config.toml` on each command (only CLI
+    # `--env` and devcontainer entries are persisted to `guest_env.json`).
+    # A bare `coop shell` would load the default config and never see them.
+    # `RUST_LOG=off` keeps tracing out of captured stdout, mirroring
+    # `guest_exec`; stderr lands in the shared guest_stderr file.
+    ge_exec() {
+        RUST_LOG=off env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY \
+            COOP_TEST_GUEST_ENV_PRECEDENCE="forwarded-loses" \
+            "$BINARY" --config "$cfg_file" shell "$inst_name" -- "$@" \
+            2>"$tmpdir/guest_stderr"
     }
 
     local ge_ws="$tmpdir/${inst_name}-ws"
@@ -2998,11 +3017,9 @@ CFGEOF
         fail "guest_env literal override logs a WARN" "stderr: $HARNESS_ERR"
     fi
 
-    GUEST_INSTANCE="$inst_name"
-
     # The pure config literal must reach the guest process environment.
     local cfg_val
-    if cfg_val=$(guest_exec printenv COOP_TEST_GUEST_ENV_CONFIG); then
+    if cfg_val=$(ge_exec printenv COOP_TEST_GUEST_ENV_CONFIG); then
         if [[ "$cfg_val" == "from-config-file" ]]; then
             pass "guest_env from config block reaches the guest"
         else
@@ -3015,7 +3032,7 @@ CFGEOF
 
     # The literal must win over the forwarded host value of the same name.
     local prec_val
-    if prec_val=$(guest_exec printenv COOP_TEST_GUEST_ENV_PRECEDENCE); then
+    if prec_val=$(ge_exec printenv COOP_TEST_GUEST_ENV_PRECEDENCE); then
         if [[ "$prec_val" == "literal-wins" ]]; then
             pass "guest_env literal overrides forwarded value"
         else
@@ -3025,8 +3042,6 @@ CFGEOF
         fail "guest_env literal overrides forwarded value" \
             "printenv failed; stderr: $(guest_stderr)"
     fi
-
-    unset GUEST_INSTANCE
 
     ge stop "$inst_name" 2>/dev/null || true
     ge destroy "$inst_name" 2>/dev/null || true
