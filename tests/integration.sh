@@ -2571,6 +2571,54 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
         pass "host port released after stop"
     fi
 
+    # Restart WITHOUT re-passing --forward-port. The forward set persisted to
+    # forwards.json at `up` time must be reloaded and respawned, proving the
+    # tunnel survives a stop/start cycle without the caller restating it.
+    if coop start "$fwd_instance" --no-agents; then
+        STARTED_INSTANCES+=("$fwd_instance")
+        pass "restart without --forward-port exits 0"
+    else
+        fail "restart without --forward-port exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        coop destroy "$fwd_instance" 2>/dev/null || true
+        untrack_instance "$fwd_instance"
+        rm -f "$content_file" "$content_file.got"
+        return
+    fi
+
+    GUEST_INSTANCE="$fwd_instance"
+
+    # The previous listener died with the guest on stop; re-launch it so there
+    # is something to reach through the respawned tunnel.
+    guest_exec sh -c "cat > /tmp/fwd.py <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+body = sys.argv[2].encode()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || true
+    sleep 1
+
+    if curl -fsS --max-time 3 "http://127.0.0.1:${host_port}/" > "$content_file.got"; then
+        local got_restart
+        got_restart=$(cat "$content_file.got")
+        if [[ "$got_restart" == "$payload" ]]; then
+            pass "forwarded port reachable again after restart"
+        else
+            fail "forwarded port reachable again after restart" "got: $got_restart"
+        fi
+    else
+        fail "forwarded port reachable again after restart" "curl failed"
+    fi
+
+    unset GUEST_INSTANCE
+
     coop destroy "$fwd_instance" 2>/dev/null || true
     untrack_instance "$fwd_instance"
     rm -f "$content_file" "$content_file.got"
