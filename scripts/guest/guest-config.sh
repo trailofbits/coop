@@ -101,6 +101,12 @@ echo "  [guest] Adding ${GUEST_USER} ~/.local/bin to /etc/environment PATH..."
 # Code remote sessions. The .profile/.bashrc appends did not: .profile is
 # login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
 # pam_env does no variable expansion, so the home path is baked in literally.
+#
+# /etc/environment is system-wide, so this prepends the guest user's writable
+# ~/.local/bin to PATH for every account, including root. That's safe here:
+# sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
+# ~/.local/bin, and the guest is a single-user dev VM where that user already
+# has passwordless root — there is no privilege boundary to cross.
 if ! grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
     if grep -q '^PATH="' /etc/environment 2>/dev/null; then
         sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.local/bin:|" /etc/environment
