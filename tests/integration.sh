@@ -3475,6 +3475,68 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# ── OCI devcontainer feature install (--full only) ────────────
+
+# Resolve a real public GHCR devcontainer Feature, bake it into the image,
+# and assert the tool it installs is present and runnable in the guest. This
+# is the end-to-end counterpart to the invalid-options error path exercised
+# in test_devcontainer_translator (which only runs `devcontainer check`).
+test_devcontainer_oci_feature() {
+    echo ""
+    echo "=== Phase: OCI devcontainer feature install (--full) ==="
+
+    local dcdir="$tmpdir/devcontainer-oci-ws"
+    mkdir -p "$dcdir/.devcontainer"
+    local dcfile="$dcdir/.devcontainer/devcontainer.json"
+    local inst_name="${INSTANCE}-dc-oci"
+
+    # github-cli is a small public Feature on ghcr.io that installs `gh` to
+    # /usr/local/bin. Pinning the major tag keeps the resolved digest stable.
+    cat > "$dcfile" <<'EOF'
+{
+    "name": "coop-it-oci-feature",
+    "features": {
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    }
+}
+EOF
+
+    # Use explicit --devcontainer to skip the prompt in CI. Feature resolution
+    # and bake happen during `up`; a network failure reaching ghcr.io would
+    # surface here.
+    if coop up "$dcdir" --name "$inst_name" \
+        --devcontainer "$dcfile" --no-agents; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up with OCI feature exits 0"
+    else
+        fail "up with OCI feature exits 0" "exit code: $? stderr: $HARNESS_ERR"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+
+    # The feature's install.sh must have placed `gh` on PATH in the guest.
+    if guest_exec command -v gh >/dev/null 2>&1; then
+        pass "gh is on PATH in the guest"
+    else
+        fail "gh is on PATH in the guest" "stderr: $(guest_stderr)"
+    fi
+
+    # The installed tool must be runnable, not just present.
+    local gh_version
+    if gh_version=$(guest_exec gh --version 2>/dev/null) \
+        && [[ "$gh_version" == *"gh version"* ]]; then
+        pass "gh runs in the guest"
+    else
+        fail "gh runs in the guest" "got: '$gh_version' stderr: $(guest_stderr)"
+    fi
+
+    unset GUEST_INSTANCE
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -3842,6 +3904,7 @@ main() {
         test_builtin_profiles
         test_post_start
         test_devcontainer_apply
+        test_devcontainer_oci_feature
 
         # Local marketplace directory copy
         test_local_marketplace
