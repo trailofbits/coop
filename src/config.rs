@@ -4999,6 +4999,18 @@ skip = ["not-a-slug"]
             debug.contains("redacted"),
             "McpServerDef Debug should mark redaction: {debug}"
         );
+
+        // The guest registration path serializes the resolved def and
+        // must emit the real token, not the redacted marker.
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            json.contains("bearer-real-secret-token"),
+            "serialized MCP def must carry the real header value for the guest: {json}"
+        );
+        assert!(
+            !json.contains("redacted"),
+            "serialized MCP def must not leak the Debug redaction marker: {json}"
+        );
     }
 
     // ── PortForward parsing ──────────────────────────────────
