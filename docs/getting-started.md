@@ -80,6 +80,13 @@ coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment aut
 
 ## First run
 
+In a hurry? From your project directory, `coop quickstart` runs setup, brings up
+an instance, and launches Claude Code in one command — building the default
+image only if it is missing and reconnecting to an existing instance when one is
+already running. The steps below walk through the same flow one command at a
+time and give you per-instance control. See the [`quickstart`
+reference](commands.md#quickstart) for details.
+
 ### 1. Setup
 
 `coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.

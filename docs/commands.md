@@ -89,6 +89,47 @@ file changed, but the existing VM is not mutated automatically. Destroy and
 recreate the instance to apply creation-time devcontainer changes such as
 `features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`.
 
+### `quickstart`
+
+One-shot entry point: ensure the default image exists, bring up an instance for
+the current directory, and launch Claude Code inside it. Runs `setup`, `up`, and
+`claude` in sequence, short-circuiting any step that is already done.
+
+```
+coop quickstart [FLAGS]
+```
+
+`quickstart` resolves the workspace to the current directory (unless
+`--no-workspace`) and uses it as the project identity, the same way `coop up`
+does. It then takes one of three branches based on the instance for that
+workspace:
+
+- **A running instance exists.** coop reconnects to it and launches Claude Code —
+  no setup, restart, or recreation.
+- **A stopped instance exists.** coop restarts it (reusing the instance's own
+  image, not necessarily `default`) and launches Claude Code.
+- **No instance exists.** coop creates one for the workspace, folding in any
+  discovered `devcontainer.json`, then launches Claude Code.
+
+Image setup runs only when the `default` template image is missing; otherwise it
+is skipped. Setup runs non-interactively (no confirmation prompts).
+
+| Flag | Description |
+|------|-------------|
+| `--no-workspace` | Skip mounting the current directory as the workspace. Creates a fresh instance with no workspace affinity when no running instance can be reused. |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
+
+```
+coop quickstart
+coop quickstart --no-devcontainer
+coop quickstart --no-workspace
+```
+
+`quickstart` takes no instance name or per-instance tuning flags. For control
+over profiles, mounts, image, resources, or named instances, use `coop setup`
+and `coop up` directly. When run from your `$HOME` or `/`, coop prompts before
+mounting (or bails in a non-TTY); pass `--no-workspace` to skip the mount.
+
 ### `init`
 
 Generate a starter config file at `~/.coop/config.toml`.
