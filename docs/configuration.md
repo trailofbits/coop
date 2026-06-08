@@ -120,6 +120,31 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 | `subnet_mask` | string (CIDR) | `/24` | Subnet mask in CIDR notation. Must be `/0` through `/32`. |
 | `host_iface` | string | `auto` | Host network interface for NAT (e.g., `eth0`, `ens5`). `auto` detects it at runtime. |
 
+## Guest user
+
+The guest VM runs as an unprivileged account, `ubuntu` (uid 1000) by default. Override the username at setup time with `coop setup --guest-user <name>`:
+
+```sh
+coop setup --guest-user vscode
+```
+
+The name is validated against the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}`; `root` is rejected because coop assumes an unprivileged uid-1000 account.
+
+The guest user is **baked into the image at setup time and immutable for the image's lifetime** — it is persisted in the image's `template_config.json`, and `up` / `start` / `shell` / `exec` read it back from there. To change it, destroy and recreate the image: `coop destroy && coop setup --guest-user <name>`.
+
+### devcontainer `remoteUser`
+
+When a workspace's `devcontainer.json` declares a `remoteUser` (e.g. `vscode` for the Microsoft devcontainer base images), the handling depends on the stage:
+
+- **At `coop setup`**, a valid `remoteUser` becomes the image's guest user unless `--guest-user` already pins one (the CLI flag wins, and the override is reported).
+- **At `coop up` / `coop start`**, the guest user is already baked in. If the file's `remoteUser` matches the image's persisted user, it is applied; if it differs, coop reports the mismatch, skips forwarding `containerEnv` (its values often reference a `/home/<remoteUser>/...` path that doesn't exist on disk), and points you at `coop destroy && coop setup --guest-user <remoteUser>` to switch.
+
+See [Devcontainer support](devcontainer.md) for the full translation table.
+
+## Guest PATH
+
+Every guest SSH session — login, non-login, and `exec` — has the guest user's `~/.local/bin` on `PATH`. coop prepends it to `PATH` in `/etc/environment`, which `pam_env` applies to all sessions. This is where the Claude Code installer places its per-user `claude` binary.
+
 ## `guest_env` section
 
 Literal environment variables to set inside the guest, independent of the host process environment. Use this when you want a value that isn't (or shouldn't be) on the host — `env_forward` covers the inherit-from-host case.

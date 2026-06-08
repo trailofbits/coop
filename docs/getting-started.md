@@ -47,6 +47,8 @@ template_size_gib = 20
 
 All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
 
+The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
+
 ### Claude Code and Codex integration
 
 Forward your API keys and GitHub credentials into the guest:
@@ -138,6 +140,16 @@ Mount additional data directories when creating the project instance:
 ```
 coop up . --extra-mount ~/data:/data
 ```
+
+Tune a project environment at startup (each flag is repeatable where it makes sense, and works on both `coop up` and `coop start`):
+
+```
+coop up --forward-port 3000        # tunnel a guest port to the host
+coop up --env RUST_LOG=debug       # set a guest env var
+coop up --post-start "npm install" # run a command after every boot
+```
+
+See the [command reference](commands.md) and [configuration reference](configuration.md) for the full behavior of `--forward-port`, `--env`, and `--post-start`.
 
 After the environment is running, connect to it:
 
