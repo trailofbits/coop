@@ -116,7 +116,7 @@ is skipped. Setup runs non-interactively (no confirmation prompts).
 
 | Flag | Description |
 |------|-------------|
-| `--no-workspace` | Skip mounting the current directory as the workspace. Creates a fresh instance with no workspace affinity when no running instance can be reused. |
+| `--no-workspace` | Skip mounting the current directory as the workspace. Without a workspace there is no instance to match, so quickstart always creates a fresh instance rather than reusing an existing one. |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
 
 ```
