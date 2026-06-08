@@ -1068,12 +1068,15 @@ pub enum McpServerDef {
     /// Remote server reached over HTTP.
     Http {
         url: url::Url,
-        headers: HashMap<String, String>,
+        /// Header names are not secret, but values may carry tokens
+        /// (e.g. `Authorization`), so they are wrapped in [`Secret`].
+        headers: HashMap<String, Secret<String>>,
     },
     /// Remote server reached over Server-Sent Events.
     Sse {
         url: url::Url,
-        headers: HashMap<String, String>,
+        /// See [`McpServerDef::Http`] for why values are [`Secret`].
+        headers: HashMap<String, Secret<String>>,
     },
 }
 
@@ -1086,9 +1089,10 @@ impl McpServerDef {
             McpServerDef::Http { headers, .. } | McpServerDef::Sse { headers, .. } => headers,
         };
         for (key, value) in headers {
-            *value = resolve_cmd_value(value).with_context(|| {
+            let resolved = resolve_cmd_value(value.expose()).with_context(|| {
                 format!("Failed to resolve header '{key}' for {label} '{name}'")
             })?;
+            *value = Secret::new(resolved);
         }
         Ok(())
     }
@@ -1111,7 +1115,7 @@ impl<'de> Deserialize<'de> for McpServerDef {
             #[serde(default)]
             env: BTreeMap<crate::guest_env_state::EnvVarName, crate::guest_env_state::EnvVarName>,
             #[serde(default)]
-            headers: HashMap<String, String>,
+            headers: HashMap<String, Secret<String>>,
         }
 
         let Raw {
@@ -1204,7 +1208,7 @@ fn serialize_remote<S: serde::Serializer>(
     serializer: S,
     kind: &'static str,
     url: &url::Url,
-    headers: &HashMap<String, String>,
+    headers: &HashMap<String, Secret<String>>,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
 
@@ -3239,7 +3243,7 @@ skip = ["not-a-slug"]
             McpServerDef::Sse { url, headers } => {
                 assert_eq!(url.as_str(), "https://mcp.example.com/sse");
                 assert_eq!(
-                    headers.get("Authorization").map(String::as_str),
+                    headers.get("Authorization").map(|v| v.expose().as_str()),
                     Some("Bearer x")
                 );
             }
@@ -4963,6 +4967,37 @@ skip = ["not-a-slug"]
         assert!(
             !debug.contains("github_pat_secret"),
             "PatEntry Debug leaked token: {debug}"
+        );
+    }
+
+    #[test]
+    fn mcp_resolved_header_debug_redacts() {
+        let mut def = McpServerDef::Http {
+            url: url::Url::parse("https://mcp.example.com/").unwrap(),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                Secret::new("cmd:echo bearer-real-secret-token".to_string()),
+            )]),
+        };
+        def.resolve_header_secrets("MCP server", "example").unwrap();
+
+        let McpServerDef::Http { headers, .. } = &def else {
+            panic!("expected Http variant");
+        };
+        assert_eq!(
+            headers.get("Authorization").map(|v| v.expose().as_str()),
+            Some("bearer-real-secret-token"),
+            "header value should resolve to the command output"
+        );
+
+        let debug = format!("{def:?}");
+        assert!(
+            !debug.contains("bearer-real-secret-token"),
+            "McpServerDef Debug leaked resolved header value: {debug}"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "McpServerDef Debug should mark redaction: {debug}"
         );
     }
 
