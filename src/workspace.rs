@@ -131,9 +131,20 @@ pub fn try_load_or_warn(inst: &Instance, consequence: &str) -> Option<WorkspaceS
 /// just the extracted tree. Integrity relies on SSH's MAC over the
 /// localhost transport plus tar's per-header checksums.
 pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path, exclude_git: bool) -> Result<()> {
+    let workspace = GuestPath::absolute(GUEST_WORKSPACE)?;
+    tar_pipe_transfer_to(target, source_dir, &workspace, exclude_git)
+}
+
+/// Transfer a local directory to an arbitrary guest path via tar-pipe.
+pub fn tar_pipe_transfer_to(
+    target: &SshTarget,
+    source_dir: &Path,
+    guest_path: &GuestPath,
+    exclude_git: bool,
+) -> Result<()> {
     tracing::info!(
-        "Transferring {} to guest:{GUEST_WORKSPACE} via tar-pipe",
-        source_dir.display()
+        "Transferring {} to guest:{guest_path} via tar-pipe",
+        source_dir.display(),
     );
 
     let mut tar_cmd = Command::new("tar");
@@ -165,7 +176,7 @@ pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path, exclude_git: boo
         .take()
         .context("Failed to get tar stderr")?;
 
-    let extract_cmd = format!("tar xf - -C {GUEST_WORKSPACE}");
+    let extract_cmd = format!("tar xf - -C {guest_path}");
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
     ssh_args.push(extract_cmd);
@@ -454,6 +465,16 @@ pub fn sync_mounts(
     mounts: &[crate::config::Mount],
     exclude_git: bool,
 ) -> Result<()> {
+    sync_mount_contents(target, mounts, exclude_git)?;
+    record_mount_state(inst, mounts)
+}
+
+/// Sync mount directories to the guest without changing workspace metadata.
+pub fn sync_mount_contents(
+    target: &SshTarget,
+    mounts: &[crate::config::Mount],
+    exclude_git: bool,
+) -> Result<()> {
     for m in mounts {
         let guest = &m.guest_path;
         target.exec(&format!(
@@ -466,11 +487,10 @@ pub fn sync_mounts(
             rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
-            tar_pipe_transfer(target, &m.host_path, exclude_git)?;
+            tar_pipe_transfer_to(target, &m.host_path, guest, exclude_git)?;
         }
     }
-
-    record_mount_state(inst, mounts)
+    Ok(())
 }
 
 /// Persist mount metadata to `workspace.json`.

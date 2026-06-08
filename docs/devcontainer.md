@@ -4,7 +4,7 @@ coop reads a **subset** of [devcontainer.json](https://containers.dev/) and maps
 
 ## How discovery and apply work
 
-When you run `coop up <dir>`, `coop setup --workspace <dir>`, or a fresh `coop quickstart` for the current directory, coop looks for `.devcontainer/devcontainer.json` in that directory (and in each mount host root, with the project directory winning ties). For `--git-repo` creation flows, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM. `coop start --dry-run --workspace <dir>` also uses discovery as a translation preview; normal `coop start` only restarts stopped instances and does not create a VM or re-apply devcontainer changes.
+When you run `coop up <dir>`, `coop up --git-repo <url>`, `coop setup --workspace <dir>`, or a fresh `coop quickstart` for the current directory, coop looks for `.devcontainer/devcontainer.json` in that workspace source (and in each mount host root, with the project directory winning ties). For `--git-repo` creation flows, coop can discover `.devcontainer/devcontainer.json` from common GitHub repository URLs before creating the VM. `coop start --dry-run --workspace <dir>` also uses discovery as a translation preview; normal `coop start` only restarts stopped instances and does not create a VM or re-apply devcontainer changes.
 
 If a file is found, coop prompts:
 
@@ -25,7 +25,7 @@ For CI or scripted use, pass one of:
 - `--dry-run` — print the report and exit before any VM work
 - `coop devcontainer check <path>` — print setup/start translation reports for a file without loading coop config or touching VM state
 
-A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `--git-repo`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`.
+A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `coop up --git-repo <url>` and `coop start --dry-run --git-repo <url>`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`. Normal `coop start --git-repo` is rejected because `--git-repo` moved to `coop up --git-repo`.
 
 ## Persistent project opt-outs
 

@@ -9,6 +9,7 @@ coop moves code between the host and guest VM. The normal way to get code in is 
 ```bash
 coop up ./my-project
 coop up ./my-project --mount
+coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 `coop up` treats the directory as the project identity. Re-running the same
@@ -36,6 +37,11 @@ by backend:
 Additional host data can be mounted at creation time with
 `coop up --extra-mount HOST_PATH:GUEST_PATH`. In copy mode, extra mounts must
 not target `/workspace`, because the copied project owns that path.
+
+`coop up --git-repo <url>` clones the repository inside the guest at
+`/workspace` and records the original URL in `workspace.json`. Because there
+is no host workspace path for that source, later `push` and `pull` commands
+need an explicit `--dir` if you want to sync files back to the host.
 
 #### Mounting a git repository (live-mount caveat)
 
@@ -68,9 +74,9 @@ Creating a project VM with `coop up` writes a `workspace.json` in the instance d
 
 | Field        | Description                                                    |
 |-------------|----------------------------------------------------------------|
-| `host_path`  | Absolute path on the host                                     |
+| `host_path`  | Absolute path on the host for local workspace and mount sources |
 | `guest_path` | Path inside the guest VM (always `/workspace`)                 |
-| `source`     | How the workspace was created: `workspace` or `mount`          |
+| `source`     | How the workspace was created: `workspace`, `mount`, or `git_repo` |
 
 `push` and `pull` read this file to resolve default paths.
 

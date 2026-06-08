@@ -93,6 +93,9 @@ enum Commands {
         /// Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable)
         #[arg(long, value_parser = config::Mount::parse)]
         extra_mount: Vec<config::Mount>,
+        /// Clone a git repository into /workspace instead of copying a local project directory
+        #[arg(long, conflicts_with_all = ["dir", "copy", "mount"])]
+        git_repo: Option<String>,
         /// Number of vCPUs (overrides config when creating a new instance)
         #[arg(long)]
         vcpus: Option<u8>,
@@ -120,7 +123,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::profile_candidates),
         )]
         profile: Vec<String>,
-        /// Skip the `.git` directory when copying/syncing the project
+        /// Skip `.git/` when copying/syncing local directories
         #[arg(long)]
         exclude_git: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -786,6 +789,7 @@ fn main() -> Result<()> {
             copy,
             mount,
             extra_mount,
+            git_repo,
             vcpus,
             mem,
             disk,
@@ -829,6 +833,7 @@ fn main() -> Result<()> {
                 name: name.as_ref(),
                 transport,
                 extra_mount,
+                git_repo: git_repo.as_deref(),
                 vcpus,
                 mem,
                 disk,
@@ -1284,6 +1289,7 @@ struct UpOpts<'a> {
     name: Option<&'a config::InstanceName>,
     transport: ProjectTransport,
     extra_mount: Vec<config::Mount>,
+    git_repo: Option<&'a str>,
     vcpus: Option<u8>,
     mem: Option<config::MiB>,
     disk: Option<config::GiB>,
@@ -1328,6 +1334,10 @@ fn cmd_up(
     config_path: &Path,
     opts: &UpOpts<'_>,
 ) -> Result<()> {
+    if let Some(repo_url) = opts.git_repo {
+        return cmd_up_git_repo(be, cfg, validated, config_path, opts, repo_url);
+    }
+
     let transport = opts.transport;
     let project_dir = resolve_project_dir(opts.dir)?;
 
@@ -1391,6 +1401,52 @@ fn cmd_up(
         &project_mount,
         discovery_mounts,
     )
+}
+
+fn cmd_up_git_repo(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    validated: &config::Validated,
+    config_path: &Path,
+    opts: &UpOpts<'_>,
+    repo_url: &str,
+) -> Result<()> {
+    if opts.devcontainer.dry_run {
+        let inputs = up_translator_inputs(cfg, opts);
+        resolve_devcontainer(
+            &DevcontainerOpts {
+                explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
+                no_devcontainer: opts.devcontainer.no_devcontainer,
+                dry_run: true,
+                workspace: None,
+                mounts: &[],
+                git_repo: Some(repo_url),
+                github_auth: cfg.github.as_ref(),
+                preference_path: Some(&cfg.devcontainer_preferences_path()),
+            },
+            &inputs,
+            devcontainer::Stage::Start,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(inst) = find_git_repo_instance(cfg, repo_url)? {
+        ensure_up_git_repo_name_matches(&inst, repo_url, opts)?;
+        ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, opts)?;
+        if be.is_running(&inst) {
+            reject_running_up_restart_inputs(&inst, opts)?;
+            tracing::info!("Instance '{}' is already running for {repo_url}", inst.name);
+            return Ok(());
+        }
+
+        let mut restart_opts = runtime_start_opts_from_up(opts, config_path);
+        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, None, &mut restart_opts);
+        restart_instance(be, cfg, &inst, &restart_opts)?;
+        return Ok(());
+    }
+
+    ensure_profile_image(be, cfg, validated, opts.profile_target.as_ref())?;
+    create_git_repo_instance(be, cfg, config_path, opts, repo_url)
 }
 
 fn up_translator_inputs(
@@ -1521,6 +1577,105 @@ fn create_up_instance(
         opts.name,
         &opts.image,
         Some(project_dir),
+        &start_opts,
+    )
+    .map(|_| ())
+}
+
+fn create_git_repo_instance(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    opts: &UpOpts<'_>,
+    repo_url: &str,
+) -> Result<()> {
+    let inputs = up_translator_inputs(cfg, opts);
+    let translation = resolve_devcontainer(
+        &DevcontainerOpts {
+            explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
+            no_devcontainer: opts.devcontainer.no_devcontainer,
+            dry_run: false,
+            workspace: None,
+            mounts: &[],
+            git_repo: Some(repo_url),
+            github_auth: cfg.github.as_ref(),
+            preference_path: Some(&cfg.devcontainer_preferences_path()),
+        },
+        &inputs,
+        devcontainer::Stage::Start,
+    )?;
+
+    apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
+    if let Some(t) = &translation {
+        devcontainer::apply_to_config(cfg, t)?;
+    }
+
+    let mut forward_ports = opts.runtime.forward_ports.clone();
+    if let Some(t) = &translation {
+        forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
+    }
+
+    let dc_guest_env = translation
+        .as_ref()
+        .map(|t| t.guest_env.clone())
+        .unwrap_or_default();
+    let cli_guest_env: std::collections::BTreeMap<_, _> =
+        opts.runtime.guest_env.iter().cloned().collect();
+    let persisted_guest_env =
+        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
+    for (key, value) in &persisted_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+
+    let default_translation = devcontainer::Translation::default();
+    let effective_disk = devcontainer::effective_disk(
+        opts.disk,
+        translation.as_ref().unwrap_or(&default_translation),
+    );
+    let post_start_override = opts
+        .runtime
+        .post_start
+        .clone()
+        .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
+
+    let mut mounts = translation
+        .as_ref()
+        .map(|t| t.mounts.clone())
+        .unwrap_or_default();
+    mounts.extend(opts.extra_mount.clone());
+    validate_git_repo_workspace_mounts(&mounts)?;
+    validate_unique_guest_paths(&mounts)?;
+
+    let start_opts = StartOpts {
+        name: None,
+        image: StartImage {
+            explicit: opts.image_explicit,
+        },
+        workspace_dir: None,
+        git_repo: Some(repo_url),
+        no_agents: opts.runtime.no_agents,
+        no_prompt: opts.runtime.no_prompt,
+        disk: effective_disk,
+        mounts,
+        exclude_git: opts.runtime.exclude_git,
+        forward_ports,
+        config_path,
+        post_start_override: post_start_override.as_deref(),
+        persisted_guest_env,
+        devcontainer_path: None,
+        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
+    };
+
+    let derived_name = opts
+        .name
+        .cloned()
+        .or_else(|| git_repo_default_instance_name(repo_url));
+    allocate_and_start(
+        be,
+        cfg,
+        derived_name.as_ref(),
+        &opts.image,
+        None,
         &start_opts,
     )
     .map(|_| ())
@@ -1688,6 +1843,53 @@ fn ensure_up_existing_inputs_are_compatible(
     Ok(())
 }
 
+fn ensure_up_existing_inputs_are_compatible_for_git_repo(
+    inst: &config::Instance,
+    opts: &UpOpts<'_>,
+) -> Result<()> {
+    if opts.image_explicit && inst.image != opts.image {
+        bail!(
+            "Instance '{}' already exists for this git repo using image '{}'. \
+             `coop up --image {}` only applies when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with a different image.",
+            inst.name,
+            inst.image,
+            opts.image,
+            inst.name,
+        );
+    }
+    if let Some(target) = &opts.profile_target
+        && inst.image != target.image
+    {
+        bail!(
+            "Instance '{}' already exists for this git repo using image '{}'. \
+             `coop up --profile {}` would use image '{}', but profiles only apply when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with those profiles.",
+            inst.name,
+            inst.image,
+            target.profiles.join(","),
+            target.image,
+            inst.name,
+        );
+    }
+    if opts.disk.is_some()
+        || opts.vcpus.is_some()
+        || opts.mem.is_some()
+        || !opts.extra_mount.is_empty()
+        || opts.devcontainer.path.is_some()
+    {
+        bail!(
+            "Instance '{}' already exists for this git repo. \
+             --vcpus, --mem, --disk, --extra-mount, and --devcontainer only \
+             apply when creating a new instance.\n\
+             Use `coop destroy {}` first to recreate it with those options.",
+            inst.name,
+            inst.name,
+        );
+    }
+    Ok(())
+}
+
 fn ensure_up_project_name_matches(
     inst: &config::Instance,
     project_dir: &Path,
@@ -1698,6 +1900,22 @@ fn ensure_up_project_name_matches(
             &inst.name == name,
             "Project {} is already associated with instance '{}', not '{}'.",
             project_dir.display(),
+            inst.name,
+            name,
+        );
+    }
+    Ok(())
+}
+
+fn ensure_up_git_repo_name_matches(
+    inst: &config::Instance,
+    repo_url: &str,
+    opts: &UpOpts<'_>,
+) -> Result<()> {
+    if let Some(name) = opts.name {
+        anyhow::ensure!(
+            &inst.name == name,
+            "Git repo {repo_url} is already associated with instance '{}', not '{}'.",
             inst.name,
             name,
         );
@@ -1733,6 +1951,20 @@ fn validate_unique_guest_paths(mounts: &[config::Mount]) -> Result<()> {
         if !seen.insert(guest_path.clone()) {
             bail!("Duplicate mount guest path: {guest_path}");
         }
+    }
+    Ok(())
+}
+
+fn validate_git_repo_workspace_mounts(mounts: &[config::Mount]) -> Result<()> {
+    let workspace_path = workspace::default_workspace_path().to_string();
+    if mounts
+        .iter()
+        .any(|mount| mount.guest_path.to_string() == workspace_path)
+    {
+        bail!(
+            "`coop up --git-repo` clones into /workspace. \
+             Give --extra-mount an explicit non-/workspace guest path."
+        );
     }
     Ok(())
 }
@@ -2031,6 +2263,66 @@ fn find_workspace_instance(
             )
         }
     }
+}
+
+fn find_git_repo_instance(
+    cfg: &config::CoopConfig,
+    repo_url: &str,
+) -> Result<Option<config::Instance>> {
+    let instances = cfg.list_instances()?;
+    let mut matching: Vec<config::Instance> = instances
+        .into_iter()
+        .filter(|inst| {
+            workspace::try_load_or_warn(inst, "git-repo matching will skip this instance")
+                .is_some_and(|s| {
+                    matches!(
+                        s.source,
+                        workspace::WorkspaceSource::GitRepo { ref url } if url == repo_url
+                    )
+                })
+        })
+        .collect();
+    match matching.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matching.swap_remove(0))),
+        _ => {
+            let names: Vec<_> = matching.iter().map(|i| i.name.as_str()).collect();
+            bail!(
+                "Multiple instances share git repo {repo_url}:\n  {}\n\
+                 Pick one explicitly with `coop start <name>` (for a stopped\n\
+                 instance) or `coop claude <name>` (for a running one).",
+                names.join(", "),
+            )
+        }
+    }
+}
+
+fn git_repo_default_instance_name(repo_url: &str) -> Option<config::InstanceName> {
+    let base = github_repo::parse_repo_slug_from_url(repo_url)
+        .and_then(|slug| slug.as_str().rsplit('/').next().map(ToOwned::to_owned))
+        .or_else(|| {
+            repo_url
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .map(|s| s.trim_end_matches(".git").to_string())
+        })?;
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        return None;
+    }
+    let max = 60.min(sanitized.len());
+    config::InstanceName::new(&sanitized[..max]).ok()
 }
 
 fn apply_vm_overrides(
@@ -2907,9 +3199,11 @@ fn start_instance(
 
     signal::check_shutdown()?;
 
-    // Workspace sync: tar-pipe for --workspace, git clone for --git-repo,
-    // rsync for --mount on Firecracker (Lima mounts are live via virtiofs).
-    if let Some(ws_dir) = opts.workspace_dir {
+    // Workspace sync: tar-pipe for --workspace, git clone for --git-repo.
+    // Mounts may be additional data directories or the workspace source
+    // itself. Only mount-only instances record the first mount as the
+    // workspace identity.
+    let workspace_source_written = if let Some(ws_dir) = opts.workspace_dir {
         let ws_path = std::path::Path::new(ws_dir);
         anyhow::ensure!(
             ws_path.is_dir(),
@@ -2929,6 +3223,7 @@ fn start_instance(
             },
         };
         state.save(inst)?;
+        true
     } else if let Some(repo_url) = opts.git_repo {
         backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
@@ -2939,15 +3234,26 @@ fn start_instance(
             },
         };
         state.save(inst)?;
-    } else if !opts.mounts.is_empty() {
+        true
+    } else {
+        false
+    };
+
+    if !opts.mounts.is_empty() {
         if be.mounts_are_live() {
             // Lima: virtiofs already serves the host directory live. No
             // sync step, but we still record state so `push`/`pull` and
             // PAT slug detection work for follow-up commands.
-            workspace::record_mount_state(inst, &opts.mounts)?;
+            if !workspace_source_written {
+                workspace::record_mount_state(inst, &opts.mounts)?;
+            }
             warn_on_live_git_mounts(&opts.mounts);
         } else {
-            workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+            if workspace_source_written {
+                workspace::sync_mount_contents(&target, &opts.mounts, opts.exclude_git)?;
+            } else {
+                workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+            }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
                  Use `coop push` / `coop pull` to sync changes."
@@ -4523,6 +4829,143 @@ mod tests {
     }
 
     #[test]
+    fn up_git_repo_parses_as_workspace_source() {
+        let cli = parse(&[
+            "up",
+            "--git-repo",
+            "https://github.com/trailofbits/coop.git",
+        ]);
+        let super::Commands::Up { git_repo, .. } = cli.command else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(
+            git_repo.as_deref(),
+            Some("https://github.com/trailofbits/coop.git")
+        );
+    }
+
+    #[test]
+    fn up_git_repo_conflicts_with_local_workspace_sources() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = parse_err(&[
+            "up",
+            tmp.path().to_str().unwrap(),
+            "--git-repo",
+            "https://github.com/trailofbits/coop.git",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = parse_err(&[
+            "up",
+            "--git-repo",
+            "https://github.com/trailofbits/coop.git",
+            "--mount",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_uses_repo_basename() {
+        let name = super::git_repo_default_instance_name("https://github.com/trailofbits/coop.git")
+            .expect("name");
+        assert_eq!(name.as_str(), "coop");
+
+        let name =
+            super::git_repo_default_instance_name("git@example.com:org/my.repo.git").expect("name");
+        assert_eq!(name.as_str(), "my-repo");
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_handles_url_edges() {
+        // Trailing slash, no `.git` suffix.
+        let name =
+            super::git_repo_default_instance_name("https://example.com/org/widget/").expect("name");
+        assert_eq!(name.as_str(), "widget");
+
+        // scp-style without a `.git` suffix.
+        let name =
+            super::git_repo_default_instance_name("git@example.com:org/tools").expect("name");
+        assert_eq!(name.as_str(), "tools");
+
+        // Bare path with no host.
+        let name = super::git_repo_default_instance_name("/srv/git/repo.git").expect("name");
+        assert_eq!(name.as_str(), "repo");
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_rejects_unusable_basenames() {
+        // A basename that sanitizes to nothing has no usable instance name.
+        assert!(super::git_repo_default_instance_name("https://example.com/org/.git").is_none());
+        assert!(super::git_repo_default_instance_name("https://example.com/org/---").is_none());
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_caps_long_basenames() {
+        let long = format!("https://example.com/org/{}.git", "a".repeat(200));
+        let name = super::git_repo_default_instance_name(&long).expect("name");
+        assert_eq!(name.as_str().len(), 60);
+        assert!(name.as_str().chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn git_repo_rejects_extra_mount_at_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).expect("data");
+        let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
+
+        let err = super::validate_git_repo_workspace_mounts(&mounts)
+            .expect_err("expected /workspace collision");
+        assert!(format!("{err}").contains("/workspace"));
+    }
+
+    #[test]
+    fn find_git_repo_instance_returns_none_when_unmatched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let found = super::find_git_repo_instance(&cfg, "https://example.com/org/absent.git")
+            .expect("lookup");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn find_git_repo_instance_errors_on_multiple_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let repo_url = "https://github.com/trailofbits/coop.git";
+        for _ in 0..2 {
+            let inst = cfg.allocate_instance(None, &img, None).expect("inst");
+            let state = super::workspace::WorkspaceState {
+                guest_path: super::workspace::default_workspace_path(),
+                source: super::workspace::WorkspaceSource::GitRepo {
+                    url: repo_url.to_string(),
+                },
+            };
+            state.save(&inst).expect("save workspace state");
+        }
+        let err = super::find_git_repo_instance(&cfg, repo_url).expect_err("expected ambiguity");
+        assert!(format!("{err}").contains("Multiple instances"));
+    }
+
+    #[test]
+    fn ensure_up_git_repo_name_matches_rejects_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let inst = cfg.allocate_instance(None, &img, None).expect("inst");
+        let repo_url = "https://github.com/trailofbits/coop.git";
+
+        let mut opts = up_opts_for_tests(None);
+        let requested = super::config::InstanceName::new("other-name").expect("name");
+        opts.name = Some(&requested);
+
+        let err = super::ensure_up_git_repo_name_matches(&inst, repo_url, &opts)
+            .expect_err("expected name mismatch");
+        assert!(format!("{err}").contains("already associated"));
+    }
+
+    #[test]
     fn validate_unique_guest_paths_rejects_duplicates() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let a = tmp.path().join("a");
@@ -4555,6 +4998,7 @@ mod tests {
             name: None,
             transport: super::ProjectTransport::Copy,
             extra_mount: Vec::new(),
+            git_repo: None,
             vcpus: None,
             mem: None,
             disk: None,
@@ -4644,6 +5088,35 @@ mod tests {
         let err = super::ensure_up_project_name_matches(&inst, &project, &opts)
             .expect_err("expected mismatched explicit name");
         assert!(format!("{err}").contains("already associated"));
+    }
+
+    #[test]
+    fn up_existing_git_repo_rejects_creation_only_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        let img = super::config::default_image_name();
+        let repo_url = "https://github.com/trailofbits/coop.git";
+        let inst = cfg.allocate_instance(None, &img, None).expect("inst");
+        let state = super::workspace::WorkspaceState {
+            guest_path: super::workspace::default_workspace_path(),
+            source: super::workspace::WorkspaceSource::GitRepo {
+                url: repo_url.to_string(),
+            },
+        };
+        state.save(&inst).expect("save workspace state");
+
+        let mut opts = up_opts_for_tests(None);
+        opts.git_repo = Some(repo_url);
+        opts.disk = super::config::GiB::new(20);
+
+        let found = super::find_git_repo_instance(&cfg, repo_url)
+            .expect("lookup")
+            .expect("match");
+        assert_eq!(found.name.as_str(), inst.name.as_str());
+
+        let err = super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
+            .expect_err("expected incompatible");
+        assert!(format!("{err}").contains("--disk"));
     }
 
     #[test]

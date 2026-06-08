@@ -148,6 +148,12 @@ Mount additional data directories when creating the project instance:
 coop up . --extra-mount ~/data:/data
 ```
 
+Or clone a remote repository directly into `/workspace` inside the guest:
+
+```
+coop up --git-repo https://github.com/trailofbits/coop.git
+```
+
 Tune a project environment at startup (each flag is repeatable where it makes sense, and works on both `coop up` and `coop start`):
 
 ```
@@ -157,7 +163,6 @@ coop up --post-start "npm install" # run a command after every boot
 ```
 
 See the [command reference](commands.md) and [configuration reference](configuration.md) for the full behavior of `--forward-port`, `--env`, and `--post-start`.
-
 After the environment is running, connect to it:
 
 ```
@@ -193,6 +198,7 @@ Project creation options belong to `coop up`, not `coop start`:
 ```
 coop up ~/code/my-project --disk 40 --mount
 coop up ~/code/my-project --profile python,node
+coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 Skip Claude Code and Codex credential/config injection:

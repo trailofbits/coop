@@ -35,10 +35,12 @@ running, `up` reports success without creating another VM. If a matching
 instance is stopped, `up` restarts it. If no matching instance exists, `up`
 creates one.
 
-By default, `up` copies/syncs the project into `/workspace`. Pass `--mount` to use the mount transport for the
-project at `/workspace` instead. On macOS/Lima this is a live virtiofs mount;
-on Linux/Firecracker it is a one-time sync.
-`--copy` is accepted as an explicit spelling of the default.
+By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
+to use the mount transport for the project at `/workspace` instead. On
+macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
+one-time sync. `--copy` is accepted as an explicit spelling of the default.
+Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
+`/workspace` inside the guest.
 
 | Flag | Description |
 |------|-------------|
@@ -47,13 +49,14 @@ on Linux/Firecracker it is a one-time sync.
 | `--copy` | Copy/sync `DIR` into `/workspace` (default) |
 | `--mount` | Mount `DIR` at `/workspace` instead of using `--copy` |
 | `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`) |
+| `--git-repo <url>` | Clone a git repository into `/workspace` instead of copying a local project directory |
 | `--vcpus <N>` | Number of vCPUs when creating a new instance |
 | `--mem <MiB>` | Memory in MiB when creating a new instance |
 | `--disk <GiB>` | Instance disk size when creating a new instance |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
 | `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
-| `--exclude-git` | Skip the `.git/` directory when copying/syncing |
+| `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot |
@@ -68,11 +71,13 @@ coop up ~/code/my-project --mount
 coop up . --profile python,node
 coop up . --copy --forward-port 3000
 coop up . --extra-mount ~/data:/data
+coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
-`--profile`, `--extra-mount`, `--exclude-git`, and `--devcontainer` are
-applied only when `up` creates a new instance. `coop up --profile <list>`
+`--profile`, `--extra-mount`, `--git-repo`, `--exclude-git`, and
+`--devcontainer` are applied only when `up` creates a new instance. `coop up
+--profile <list>`
 derives an image name from the sorted profile list, runs the same stale-image
 check as `coop setup`, and builds or rebuilds that image if needed. Explicit
 named images are unchanged: use `coop setup --image <name> --profile ...`
