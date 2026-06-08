@@ -2574,8 +2574,9 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
     # Restart WITHOUT re-passing --forward-port. The forward set persisted to
     # forwards.json at `up` time must be reloaded and respawned, proving the
     # tunnel survives a stop/start cycle without the caller restating it.
+    # Already tracked from the initial `up`; `coop stop` does not untrack, so
+    # the instance stays in STARTED_INSTANCES across the restart.
     if coop start "$fwd_instance" --no-agents; then
-        STARTED_INSTANCES+=("$fwd_instance")
         pass "restart without --forward-port exits 0"
     else
         fail "restart without --forward-port exits 0" "exit code: $? stderr: $HARNESS_ERR"
