@@ -106,9 +106,10 @@ impl GuestUser {
     }
 
     /// Where the Claude Code installer places the per-user binary.
-    /// The installer writes to `~/.local/bin/claude`; coop calls this
-    /// path directly because non-interactive SSH sessions don't source
-    /// `.bashrc`/`.profile` and so don't have `~/.local/bin` on PATH.
+    /// The installer writes to `~/.local/bin/claude`; coop calls this path
+    /// directly as belt-and-braces. (`~/.local/bin` is also on PATH for every
+    /// SSH session via `/etc/environment`, but the absolute path costs nothing
+    /// and removes any dependence on PATH resolution.)
     pub fn claude_bin(&self) -> GuestPath {
         GuestPath::new(format!("/home/{}/.local/bin/claude", self.0))
     }

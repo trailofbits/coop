@@ -657,8 +657,7 @@ test_claude_bin_path() {
     echo "=== Phase: claude binary path ==="
 
     # The Claude Code binary is installed at /home/ubuntu/.local/bin/claude.
-    # Non-interactive SSH sessions don't source .bashrc/.profile, so bare
-    # `claude` won't work. Verify the full path is reachable via coop exec.
+    # Verify the full path is reachable via coop exec.
     if guest_exec test -x /home/ubuntu/.local/bin/claude; then
         pass "claude binary exists at CLAUDE_BIN path"
     else
@@ -685,6 +684,22 @@ test_claude_bin_path() {
         fi
     else
         fail "claude symlink in /usr/local/bin" "not found"
+    fi
+
+    # Verify ~/.local/bin is on PATH in a non-interactive SSH session — the
+    # exact case `coop claude` and claude's Bash-tool subshells hit (issue
+    # #248). `guest_exec` runs `coop shell -- cmd`, which sshs a bare remote
+    # command (no login shell, no .profile), so this pins the fix in
+    # /etc/environment rather than the old .profile/.bashrc appends.
+    local guest_path
+    if guest_path=$(guest_exec printenv PATH); then
+        if [[ ":$guest_path:" == *":/home/ubuntu/.local/bin:"* ]]; then
+            pass "~/.local/bin on PATH in non-interactive session"
+        else
+            fail "~/.local/bin on PATH in non-interactive session" "PATH=$guest_path"
+        fi
+    else
+        fail "~/.local/bin on PATH in non-interactive session" "printenv PATH failed; stderr: $(guest_stderr)"
     fi
 
     # Verify claude-yolo shortcut exists and is executable

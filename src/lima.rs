@@ -1296,9 +1296,20 @@ chown -R "{user}:{user}" "{home}/.ssh"
 chmod 700 "{home}/.ssh"
 chmod 600 "{home}/.ssh/authorized_keys"
 
-echo "  [guest] Configuring {user} user PATH..."
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> "{home}/.profile"
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> "{home}/.bashrc"
+echo "  [guest] Adding {user} ~/.local/bin to /etc/environment PATH..."
+# pam_env reads /etc/environment for every SSH session — login, non-login,
+# and non-interactive (`ssh host cmd`) alike — so this is the one layer that
+# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
+# Code remote sessions. The .profile/.bashrc appends did not: .profile is
+# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
+# pam_env does no variable expansion, so the home path is baked in literally.
+if ! grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="|PATH="{home}/.local/bin:|' /etc/environment
+    else
+        echo 'PATH="{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
+    fi
+fi
 
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
@@ -1648,6 +1659,30 @@ mod tests {
                 i + 1,
             );
         }
+    }
+
+    #[test]
+    fn provision_script_sets_path_via_etc_environment() {
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+
+        // PATH is set in /etc/environment (pam_env applies it to every SSH
+        // session), with the guest home interpolated as a literal path.
+        assert!(
+            script
+                .contains("sed -i 's|^PATH=\"|PATH=\"/home/ubuntu/.local/bin:|' /etc/environment"),
+            "should prepend ~/.local/bin to /etc/environment PATH",
+        );
+        // The old PATH appends to .profile/.bashrc are gone (see issue #248).
+        assert!(
+            !script.contains(">> \"/home/ubuntu/.profile\"")
+                && !script.contains(">> \"/home/ubuntu/.bashrc\""),
+            "should no longer append PATH to .profile/.bashrc",
+        );
     }
 
     #[test]

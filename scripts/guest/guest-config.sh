@@ -94,9 +94,20 @@ chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}/.ssh"
 chmod 700 "${GUEST_HOME}/.ssh"
 chmod 600 "${GUEST_HOME}/.ssh/authorized_keys"
 
-echo "  [guest] Configuring ${GUEST_USER} user PATH..."
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${GUEST_HOME}/.profile"
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${GUEST_HOME}/.bashrc"
+echo "  [guest] Adding ${GUEST_USER} ~/.local/bin to /etc/environment PATH..."
+# pam_env reads /etc/environment for every SSH session — login, non-login,
+# and non-interactive (`ssh host cmd`) alike — so this is the one layer that
+# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
+# Code remote sessions. The .profile/.bashrc appends did not: .profile is
+# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
+# pam_env does no variable expansion, so the home path is baked in literally.
+if ! grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.local/bin:|" /etc/environment
+    else
+        echo "PATH=\"${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
+    fi
+fi
 
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "${GUEST_HOME}/.local/bin/claude" /usr/local/bin/claude
