@@ -41,6 +41,23 @@ coop github setup-pat --repo trailofbits/coop
 
 The wizard opens the PAT-creation form in your browser, validates the token via `/user` and `/repos/<repo>`, stores the token in a secret manager you choose (macOS Keychain, Linux Secret Service, 1Password, or a `0600` file under `~/.coop/state/github-pat/`), and writes a `[github.pat."owner/repo"]` entry. The token itself is stored only in the chosen secret manager — the config file holds a `cmd:` invocation that retrieves it.
 
+#### Submodule discovery
+
+A fine-grained PAT is scoped to specific repositories, so a token for the parent repo alone cannot clone its submodules. To help you scope the token correctly, the wizard inspects the parent repo's `.gitmodules` and classifies the submodule URLs it finds. This is advisory only — it never fails the wizard, and a discovery problem won't block writing a valid PAT entry.
+
+Discovery makes outbound network calls:
+
+- It fetches `.gitmodules` from the parent's default branch via the GitHub Contents API. Before you paste a token, it tries `gh auth token` (if `gh` is installed and authenticated) and otherwise falls back to an anonymous request, which succeeds for public parent repos. If neither produces a response, discovery happens after you paste the token instead, using that token. A `gh auth token` value read here is used only for this fetch — it is never persisted or forwarded into the guest.
+- For each candidate submodule it makes an anonymous `GET /repos/<slug>` to detect public repos. Public submodules clone without a token, so they are dropped from the suggestions. Unauthenticated GitHub API requests share a 60/hour per-IP rate limit, so a repo that can't be confirmed public (404, rate-limited, or a network error) is treated as private and kept in the suggestions.
+
+The remaining (private) submodules are routed by resource owner:
+
+- **Same owner as the parent** — a single PAT can cover these, so they are added to the form's "Only select repositories" list alongside the parent. The wizard then re-probes the pasted token against each and re-prompts you to widen the token until all are covered.
+- **Other owners** — a fine-grained PAT is scoped to one resource owner, so each needs its own token. The wizard prints a follow-up `coop github setup-pat --repo <slug>` line per repo, grouped by owner.
+- **Non-GitHub URLs** (e.g. GitLab) — listed as a warning; this token can't cover them.
+
+Only depth-1 submodules are inspected. Submodules of submodules are not expanded and need their own `setup-pat` runs.
+
 Multi-repo example:
 
 ```toml
