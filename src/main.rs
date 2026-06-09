@@ -1512,17 +1512,11 @@ fn create_up_instance(
         forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
     }
 
-    let dc_guest_env = translation
-        .as_ref()
-        .map(|t| t.guest_env.clone())
-        .unwrap_or_default();
-    let cli_guest_env: std::collections::BTreeMap<_, _> =
-        opts.runtime.guest_env.iter().cloned().collect();
-    let persisted_guest_env =
-        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-    for (key, value) in &persisted_guest_env {
-        cfg.guest_env.insert(key.clone(), value.clone());
-    }
+    let persisted_guest_env = merge_runtime_guest_env(
+        cfg,
+        &opts.runtime.guest_env,
+        translation.as_ref().map(|t| &t.guest_env),
+    );
 
     let default_translation = devcontainer::Translation::default();
     let effective_disk = devcontainer::effective_disk(
@@ -1615,17 +1609,11 @@ fn create_git_repo_instance(
         forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
     }
 
-    let dc_guest_env = translation
-        .as_ref()
-        .map(|t| t.guest_env.clone())
-        .unwrap_or_default();
-    let cli_guest_env: std::collections::BTreeMap<_, _> =
-        opts.runtime.guest_env.iter().cloned().collect();
-    let persisted_guest_env =
-        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-    for (key, value) in &persisted_guest_env {
-        cfg.guest_env.insert(key.clone(), value.clone());
-    }
+    let persisted_guest_env = merge_runtime_guest_env(
+        cfg,
+        &opts.runtime.guest_env,
+        translation.as_ref().map(|t| &t.guest_env),
+    );
 
     let default_translation = devcontainer::Translation::default();
     let effective_disk = devcontainer::effective_disk(
@@ -1751,19 +1739,34 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
     }
 }
 
+/// Merge guest-env entries by precedence (CLI > devcontainer.json > config.toml),
+/// persist the result into `cfg.guest_env`, and return the merged map.
+///
+/// This is the single implementation of the precedence rule. All call sites —
+/// the `start_opts`-mutating [`apply_runtime_guest_env`] and the struct-literal
+/// construction paths — route through here.
+fn merge_runtime_guest_env(
+    cfg: &mut config::CoopConfig,
+    cli_guest_env: &[(guest_env_state::EnvVarName, String)],
+    dc_guest_env: Option<&std::collections::BTreeMap<guest_env_state::EnvVarName, String>>,
+) -> std::collections::BTreeMap<guest_env_state::EnvVarName, String> {
+    let cli_guest_env: std::collections::BTreeMap<_, _> = cli_guest_env.iter().cloned().collect();
+    let dc_guest_env = dc_guest_env.cloned().unwrap_or_default();
+    let persisted_guest_env =
+        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
+    for (key, value) in &persisted_guest_env {
+        cfg.guest_env.insert(key.clone(), value.clone());
+    }
+    persisted_guest_env
+}
+
 fn apply_runtime_guest_env(
     cfg: &mut config::CoopConfig,
     cli_guest_env: &[(guest_env_state::EnvVarName, String)],
     dc_guest_env: Option<&std::collections::BTreeMap<guest_env_state::EnvVarName, String>>,
     start_opts: &mut StartOpts<'_>,
 ) {
-    let cli_guest_env: std::collections::BTreeMap<_, _> = cli_guest_env.iter().cloned().collect();
-    let dc_guest_env = dc_guest_env.cloned().unwrap_or_default();
-    start_opts.persisted_guest_env =
-        guest_env_state::merge_persisted_entries(&dc_guest_env, &cli_guest_env);
-    for (key, value) in &start_opts.persisted_guest_env {
-        cfg.guest_env.insert(key.clone(), value.clone());
-    }
+    start_opts.persisted_guest_env = merge_runtime_guest_env(cfg, cli_guest_env, dc_guest_env);
 }
 
 fn ensure_up_existing_inputs_are_compatible(
@@ -2130,15 +2133,8 @@ fn quickstart_fresh_start(
         .map(|t| devcontainer::merge_into_forward_ports(&t.forward_ports, &[]))
         .unwrap_or_default();
 
-    let dc_guest_env = translation
-        .as_ref()
-        .map(|t| t.guest_env.clone())
-        .unwrap_or_default();
     let persisted_guest_env =
-        guest_env_state::merge_persisted_entries(&dc_guest_env, &std::collections::BTreeMap::new());
-    for (key, value) in &persisted_guest_env {
-        cfg.guest_env.insert(key.clone(), value.clone());
-    }
+        merge_runtime_guest_env(cfg, &[], translation.as_ref().map(|t| &t.guest_env));
 
     let default_translation = devcontainer::Translation::default();
     let effective_disk =
@@ -4291,6 +4287,82 @@ mod tests {
             envs.get("FROM_CFG").map(String::as_str),
             Some("cfg-value"),
             "config.toml [guest_env] entries must still flow through",
+        );
+    }
+
+    #[test]
+    fn merge_runtime_guest_env_applies_three_tier_precedence() {
+        use super::guest_env_state::EnvVarName;
+
+        let env = |s: &str| EnvVarName::new(s).expect("valid env var");
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.guest_env.insert(env("ONLY_CFG"), "cfg".to_string());
+        cfg.guest_env.insert(env("SHARED"), "cfg".to_string());
+
+        let mut dc = std::collections::BTreeMap::new();
+        dc.insert(env("ONLY_DC"), "dc".to_string());
+        dc.insert(env("SHARED"), "dc".to_string());
+
+        let cli = vec![
+            (env("ONLY_CLI"), "cli".to_string()),
+            (env("SHARED"), "cli".to_string()),
+        ];
+
+        let merged = super::merge_runtime_guest_env(&mut cfg, &cli, Some(&dc));
+
+        // CLI wins over devcontainer wins over config.toml on conflict.
+        assert_eq!(merged.get(&env("SHARED")).map(String::as_str), Some("cli"));
+        assert_eq!(
+            cfg.guest_env.get(&env("SHARED")).map(String::as_str),
+            Some("cli")
+        );
+
+        // The merged map carries dc + cli entries; config-only entries are not
+        // re-added to it but remain in cfg.guest_env.
+        assert_eq!(merged.get(&env("ONLY_DC")).map(String::as_str), Some("dc"));
+        assert_eq!(
+            merged.get(&env("ONLY_CLI")).map(String::as_str),
+            Some("cli")
+        );
+        assert!(!merged.contains_key(&env("ONLY_CFG")));
+
+        // The side effect folds dc + cli into cfg.guest_env without dropping
+        // the pre-existing config.toml-only entry.
+        assert_eq!(
+            cfg.guest_env.get(&env("ONLY_CFG")).map(String::as_str),
+            Some("cfg")
+        );
+        assert_eq!(
+            cfg.guest_env.get(&env("ONLY_DC")).map(String::as_str),
+            Some("dc")
+        );
+        assert_eq!(
+            cfg.guest_env.get(&env("ONLY_CLI")).map(String::as_str),
+            Some("cli")
+        );
+    }
+
+    #[test]
+    fn merge_runtime_guest_env_without_devcontainer_uses_cli_only() {
+        use super::guest_env_state::EnvVarName;
+
+        let env = |s: &str| EnvVarName::new(s).expect("valid env var");
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.guest_env.insert(env("ONLY_CFG"), "cfg".to_string());
+
+        let cli = vec![(env("FROM_CLI"), "cli".to_string())];
+        let merged = super::merge_runtime_guest_env(&mut cfg, &cli, None);
+
+        assert_eq!(merged, cli.into_iter().collect());
+        assert_eq!(
+            cfg.guest_env.get(&env("FROM_CLI")).map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            cfg.guest_env.get(&env("ONLY_CFG")).map(String::as_str),
+            Some("cfg")
         );
     }
 
