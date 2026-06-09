@@ -157,7 +157,7 @@ fn refresh_github_from_disk(cfg: &mut CoopConfig, config_path: &Path) -> Result<
 
 fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) -> Result<()> {
     let opts = SetupOpts {
-        repo: Some(repo.as_str()),
+        repo: Some(repo.clone()),
         config_path,
     };
     match github_pat::run_setup_pat(cfg, &opts) {

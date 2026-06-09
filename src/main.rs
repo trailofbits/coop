@@ -147,7 +147,7 @@ enum Commands {
         guest_env: Vec<(guest_env_state::EnvVarName, String)>,
         /// Explicit path to a `devcontainer.json` to use (skips discovery).
         #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<String>,
+        devcontainer: Option<PathBuf>,
         /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
         #[arg(long)]
         no_devcontainer: bool,
@@ -224,7 +224,7 @@ enum Commands {
         workspace: Option<String>,
         /// Explicit path to a `devcontainer.json` to use (skips discovery).
         #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<String>,
+        devcontainer: Option<PathBuf>,
         /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
         #[arg(long)]
         no_devcontainer: bool,
@@ -274,7 +274,7 @@ enum Commands {
         guest_env: Vec<(guest_env_state::EnvVarName, String)>,
         /// Explicit path to a `devcontainer.json` to use (skips discovery).
         #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<String>,
+        devcontainer: Option<PathBuf>,
         /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
         #[arg(long)]
         no_devcontainer: bool,
@@ -473,8 +473,8 @@ enum Commands {
         )]
         name: Option<config::InstanceName>,
         /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
-        #[arg(long, required = true)]
-        size: String,
+        #[arg(long, required = true, value_parser = config::DiskSize::parse)]
+        size: config::DiskSize,
     },
     /// List or inspect available profiles
     Profiles {
@@ -568,14 +568,14 @@ enum GithubAction {
     /// Run the fine-grained PAT wizard for a repo
     SetupPat {
         /// Repo slug to scope to (auto-detected if omitted)
-        #[arg(long)]
-        repo: Option<String>,
+        #[arg(long, value_parser = github_repo::RepoSlug::parse_cli)]
+        repo: Option<github_repo::RepoSlug>,
     },
     /// Re-run the wizard against an existing entry
     RotatePat {
         /// Repo slug to rotate
-        #[arg(long, required = true)]
-        repo: String,
+        #[arg(long, required = true, value_parser = github_repo::RepoSlug::parse_cli)]
+        repo: github_repo::RepoSlug,
     },
     /// Print configured PAT entries and their validation state
     Status {
@@ -587,8 +587,8 @@ enum GithubAction {
     /// Remove a configured PAT entry and its stored secret
     ForgetPat {
         /// Repo slug whose entry should be removed
-        #[arg(long, required = true)]
-        repo: String,
+        #[arg(long, required = true, value_parser = github_repo::RepoSlug::parse_cli)]
+        repo: github_repo::RepoSlug,
     },
 }
 
@@ -796,10 +796,7 @@ fn main() -> Result<()> {
                     guest_env,
                 },
                 devcontainer: UpDevcontainerOpts {
-                    input: DevcontainerInput::from_flags(
-                        devcontainer.map(PathBuf::from),
-                        no_devcontainer,
-                    ),
+                    input: DevcontainerInput::from_flags(devcontainer, no_devcontainer),
                     dry_run,
                 },
             };
@@ -842,8 +839,7 @@ fn main() -> Result<()> {
                 cli_guest_user: guest_user.clone(),
                 ..devcontainer::TranslatorInputs::default()
             };
-            let dc_input =
-                DevcontainerInput::from_flags(devcontainer.map(PathBuf::from), no_devcontainer);
+            let dc_input = DevcontainerInput::from_flags(devcontainer, no_devcontainer);
             let translation = resolve_devcontainer(
                 &DevcontainerOpts {
                     input: &dc_input,
@@ -930,10 +926,7 @@ fn main() -> Result<()> {
                     ..devcontainer::TranslatorInputs::default()
                 };
                 let ws_path = workspace.as_deref().map(Path::new);
-                let dc_input = DevcontainerInput::from_flags(
-                    devcontainer.clone().map(PathBuf::from),
-                    no_devcontainer,
-                );
+                let dc_input = DevcontainerInput::from_flags(devcontainer.clone(), no_devcontainer);
                 let _ = resolve_devcontainer(
                     &DevcontainerOpts {
                         input: &dc_input,
@@ -963,7 +956,7 @@ fn main() -> Result<()> {
                 config_path: &cli.config,
                 post_start_override: post_start.as_deref(),
                 persisted_guest_env: std::collections::BTreeMap::new(),
-                devcontainer_path: devcontainer.as_deref().map(Path::new),
+                devcontainer_path: devcontainer.as_deref(),
                 applied_devcontainer: None,
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
@@ -1053,11 +1046,11 @@ fn main() -> Result<()> {
             workspace::vscode(&running, Some(&project), editor.as_deref())
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
-        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), &size),
+        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
         Commands::Profiles { action } => {
             cmd_profiles(&cfg, &action.unwrap_or(ProfilesAction::List))
         }
-        Commands::Github { action } => cmd_github(&cfg, &cli.config, &action),
+        Commands::Github { action } => cmd_github(&cfg, &cli.config, action),
         Commands::Validate { probe } => cmd_validate(&cfg, &be, probe),
         Commands::Init
         | Commands::Update { .. }
@@ -1068,13 +1061,10 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_github(cfg: &config::CoopConfig, config_path: &Path, action: &GithubAction) -> Result<()> {
+fn cmd_github(cfg: &config::CoopConfig, config_path: &Path, action: GithubAction) -> Result<()> {
     match action {
         GithubAction::SetupPat { repo } => {
-            let opts = github_pat::SetupOpts {
-                repo: repo.as_deref(),
-                config_path,
-            };
+            let opts = github_pat::SetupOpts { repo, config_path };
             github_pat::run_setup_pat(cfg, &opts)
         }
         GithubAction::RotatePat { repo } => {
@@ -1085,13 +1075,10 @@ fn cmd_github(cfg: &config::CoopConfig, config_path: &Path, action: &GithubActio
             github_pat::run_rotate_pat(cfg, &opts)
         }
         GithubAction::Status { probe } => {
-            github_pat::run_status(cfg, *probe);
+            github_pat::run_status(cfg, probe);
             Ok(())
         }
-        GithubAction::ForgetPat { repo } => {
-            let slug = github_repo::RepoSlug::new(repo)?;
-            github_pat::run_forget_pat(cfg, &slug, config_path)
-        }
+        GithubAction::ForgetPat { repo } => github_pat::run_forget_pat(cfg, &repo, config_path),
     }
 }
 
@@ -3693,10 +3680,9 @@ fn cmd_resize(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
-    size: &str,
+    disk_size: config::DiskSize,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
-    let disk_size = config::DiskSize::parse(size)?;
 
     let stopped = be.as_stopped(inst)?;
     let current = current_disk_gib(be, stopped.instance())?;

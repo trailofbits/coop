@@ -46,6 +46,14 @@ impl RepoSlug {
         Ok(Self(s.to_string()))
     }
 
+    /// Parse a slug from a CLI argument, trimming surrounding whitespace first.
+    ///
+    /// Used as a clap `value_parser` so `--repo`/positional repo args become a
+    /// validated [`RepoSlug`] at the parse boundary instead of a raw `String`.
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        Self::new(s.trim())
+    }
+
     /// Borrow the slug as `&str` (for formatting / passing to `&str` APIs).
     pub fn as_str(&self) -> &str {
         &self.0
@@ -372,6 +380,17 @@ mod tests {
     fn from_str_round_trips() {
         let s: RepoSlug = "trailofbits/coop".parse().unwrap();
         assert_eq!(s.as_str(), "trailofbits/coop");
+    }
+
+    #[test]
+    fn parse_cli_trims_surrounding_whitespace() {
+        let s = RepoSlug::parse_cli("  trailofbits/coop\n").unwrap();
+        assert_eq!(s.as_str(), "trailofbits/coop");
+    }
+
+    #[test]
+    fn parse_cli_rejects_invalid_slug() {
+        assert!(RepoSlug::parse_cli("not-a-slug").is_err());
     }
 
     #[test]

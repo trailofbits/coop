@@ -38,7 +38,7 @@ const PAT_NEW_URL: &str = "https://github.com/settings/personal-access-tokens/ne
 
 /// Options resolved by clap for `coop github setup-pat`.
 pub struct SetupOpts<'a> {
-    pub repo: Option<&'a str>,
+    pub repo: Option<RepoSlug>,
     pub config_path: &'a Path,
 }
 
@@ -47,7 +47,7 @@ pub struct SetupOpts<'a> {
 /// On success, the on-disk config has a fresh `[github.pat."owner/repo"]`
 /// entry and any matching skip-marker is removed.
 pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
-    let repo = resolve_target_repo(opts.repo)?;
+    let repo = resolve_target_repo(opts.repo.as_ref())?;
 
     let prediscovered = prefetch_submodules(&repo);
     print_form_instructions(&repo, prediscovered.as_ref());
@@ -83,7 +83,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
 /// `coop github rotate-pat` — same wizard, but messaging hints that
 /// we're replacing an existing entry.
 pub fn run_rotate_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
-    let repo = resolve_target_repo(opts.repo)?;
+    let repo = resolve_target_repo(opts.repo.as_ref())?;
     if cfg
         .github
         .as_ref()
@@ -184,9 +184,9 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> 
 
 /// Resolve the target repo from explicit `--repo`, fall back to a
 /// best-effort scan of the current working directory.
-fn resolve_target_repo(repo_arg: Option<&str>) -> Result<RepoSlug> {
+fn resolve_target_repo(repo_arg: Option<&RepoSlug>) -> Result<RepoSlug> {
     if let Some(repo) = repo_arg {
-        return RepoSlug::new(repo.trim());
+        return Ok(repo.clone());
     }
     if let Ok(cwd) = std::env::current_dir()
         && let Some(slug) = detect_workspace_repo(&cwd)?
