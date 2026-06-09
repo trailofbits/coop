@@ -255,64 +255,8 @@ fn write_stdin_and_close(child: &mut std::process::Child, bytes: &[u8], desc: &s
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
-#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Trait for executing commands, enabling test doubles.
-    ///
-    /// When production code starts accepting `&dyn CommandRunner`,
-    /// move this out of `#[cfg(test)]`.
-    trait CommandRunner: Send + Sync {
-        fn run(&self, program: &str, args: &[&str], sudo: bool) -> Result<()>;
-    }
-
-    /// Recorded invocation from [`MockRunner`].
-    #[derive(Debug, Clone)]
-    struct Invocation {
-        program: String,
-        args: Vec<String>,
-        sudo: bool,
-    }
-
-    /// Test double that records invocations and returns configured
-    /// responses. All methods succeed by default.
-    struct MockRunner {
-        invocations: Mutex<Vec<Invocation>>,
-        fail_run: Mutex<Option<String>>,
-    }
-
-    impl MockRunner {
-        fn new() -> Self {
-            Self {
-                invocations: Mutex::new(Vec::new()),
-                fail_run: Mutex::new(None),
-            }
-        }
-
-        fn invocations(&self) -> Vec<Invocation> {
-            self.invocations.lock().expect("lock").clone()
-        }
-
-        fn record(&self, program: &str, args: &[&str], sudo: bool) {
-            self.invocations.lock().expect("lock").push(Invocation {
-                program: program.to_string(),
-                args: args.iter().map(|s| (*s).to_string()).collect(),
-                sudo,
-            });
-        }
-    }
-
-    impl CommandRunner for MockRunner {
-        fn run(&self, program: &str, args: &[&str], sudo: bool) -> Result<()> {
-            self.record(program, args, sudo);
-            if let Some(msg) = self.fail_run.lock().expect("lock").as_ref() {
-                bail!("{msg}");
-            }
-            Ok(())
-        }
-    }
 
     #[test]
     fn cmd_describe_without_sudo() {
@@ -378,34 +322,5 @@ mod tests {
             .stdin_input(b"data".to_vec())
             .run()
             .expect("cat run");
-    }
-
-    #[test]
-    fn mock_runner_records_invocations() {
-        let runner = MockRunner::new();
-        runner
-            .run("mount", &["-o", "loop", "/dev/sda1"], true)
-            .expect("should succeed");
-
-        let inv = runner.invocations();
-        assert_eq!(inv.len(), 1);
-        assert_eq!(inv[0].program, "mount");
-        assert_eq!(inv[0].args, vec!["-o", "loop", "/dev/sda1"]);
-        assert!(inv[0].sudo);
-    }
-
-    #[test]
-    fn mock_runner_can_fail() {
-        let runner = MockRunner::new();
-        *runner.fail_run.lock().expect("lock") = Some("simulated failure".into());
-
-        let result = runner.run("rm", &["-rf", "/"], false);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("simulated failure")
-        );
     }
 }

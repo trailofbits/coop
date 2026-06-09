@@ -574,11 +574,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Build the conventional account name for a repo's PAT entry.
-pub fn account_for_repo(repo: &RepoSlug) -> AccountName {
-    AccountName::from_repo(repo)
-}
-
 /// Conventional service name used across all backends.
 pub const SERVICE: &str = "coop-github-pat";
 
@@ -609,7 +604,7 @@ mod tests {
     #[test]
     fn account_replaces_slash() {
         let slug = RepoSlug::new("trailofbits/coop").unwrap();
-        assert_eq!(account_for_repo(&slug).as_str(), "trailofbits-coop");
+        assert_eq!(AccountName::from_repo(&slug).as_str(), "trailofbits-coop");
     }
 
     #[test]

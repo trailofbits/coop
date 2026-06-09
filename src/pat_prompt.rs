@@ -20,7 +20,7 @@ use crate::github_repo::RepoSlug;
 
 /// Effective answer to "should we offer the user a PAT wizard right now?"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
+pub(crate) enum Decision {
     /// Nothing to do — proceed with the start as-is.
     Skip,
     /// Show the prompt; the user decides.
@@ -31,13 +31,13 @@ pub enum Decision {
 /// offered. Grouped into a struct so call sites name each flag at the
 /// keyword position rather than relying on positional booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PromptContext {
+pub(crate) struct PromptContext {
     /// Whether stdin is attached to an interactive terminal.
-    pub is_tty: bool,
+    pub(crate) is_tty: bool,
     /// Whether the `CI` env var is set (non-interactive batch run).
-    pub is_ci: bool,
+    pub(crate) is_ci: bool,
     /// Whether the caller passed `--no-prompt`.
-    pub no_prompt_flag: bool,
+    pub(crate) no_prompt_flag: bool,
 }
 
 impl Decision {
@@ -45,7 +45,7 @@ impl Decision {
     ///
     /// `repo` is the resolved `owner/repo` slug, if any.
     /// `ctx` carries the TTY / CI / `--no-prompt` flags.
-    pub fn resolve(cfg: &CoopConfig, repo: Option<&RepoSlug>, ctx: PromptContext) -> Self {
+    pub(crate) fn resolve(cfg: &CoopConfig, repo: Option<&RepoSlug>, ctx: PromptContext) -> Self {
         // No repo → nothing to scope to.
         let Some(repo) = repo else {
             return Self::Skip;

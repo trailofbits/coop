@@ -600,7 +600,7 @@ fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
     args
 }
 
-pub fn rsync_push(
+pub(crate) fn rsync_push(
     target: &SshTarget,
     source: &Path,
     guest_path: &GuestPath,

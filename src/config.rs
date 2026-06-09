@@ -1403,11 +1403,6 @@ impl InstanceName {
         Ok(Self(name.to_string()))
     }
 
-    /// Clap `value_parser` entry point for instance-name arguments.
-    pub fn parse(s: &str) -> Result<Self> {
-        Self::new(s)
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1478,11 +1473,6 @@ impl ImageName {
     pub fn new(name: &str) -> Result<Self> {
         validate_image_name(name)?;
         Ok(Self(name.to_string()))
-    }
-
-    /// Clap `value_parser` entry point for `--image` arguments.
-    pub fn parse(s: &str) -> Result<Self> {
-        Self::new(s)
     }
 
     pub fn as_str(&self) -> &str {

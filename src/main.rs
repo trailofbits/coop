@@ -81,7 +81,7 @@ enum Commands {
         /// Project directory (default: current directory)
         dir: Option<String>,
         /// Instance name to use when creating the project environment
-        #[arg(long, value_parser = config::InstanceName::parse)]
+        #[arg(long, value_parser = config::InstanceName::new)]
         name: Option<config::InstanceName>,
         /// Copy/sync DIR into the guest as /workspace (default)
         #[arg(long, conflicts_with = "mount")]
@@ -110,7 +110,7 @@ enum Commands {
         /// Named image to use when creating a new instance (default: "default")
         #[arg(
             long,
-            value_parser = config::ImageName::parse,
+            value_parser = config::ImageName::new,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: Option<config::ImageName>,
@@ -204,7 +204,7 @@ enum Commands {
         #[arg(
             long,
             default_value = config::DEFAULT_IMAGE,
-            value_parser = config::ImageName::parse,
+            value_parser = config::ImageName::new,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         image: config::ImageName,
@@ -241,7 +241,7 @@ enum Commands {
     /// Restart a stopped VM
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
-        #[arg(value_parser = config::InstanceName::parse)]
+        #[arg(value_parser = config::InstanceName::new)]
         name: Option<config::InstanceName>,
         /// Project directory used to select an associated stopped instance
         #[arg(long)]
@@ -288,7 +288,7 @@ enum Commands {
     Shell {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -300,7 +300,7 @@ enum Commands {
     Claude {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -319,7 +319,7 @@ enum Commands {
     ClaudeAgents {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -331,7 +331,7 @@ enum Commands {
     Codex {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -343,7 +343,7 @@ enum Commands {
     Stop {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -352,7 +352,7 @@ enum Commands {
     Destroy {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -367,7 +367,7 @@ enum Commands {
     Status {
         /// Instance name (shows all if omitted)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -376,7 +376,7 @@ enum Commands {
     Logs {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -388,7 +388,7 @@ enum Commands {
     Push {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -406,7 +406,7 @@ enum Commands {
     Pull {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -428,7 +428,7 @@ enum Commands {
     Exec {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -440,7 +440,7 @@ enum Commands {
     Vscode {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
@@ -459,7 +459,7 @@ enum Commands {
         /// Delete a named image
         #[arg(
             long,
-            value_parser = config::ImageName::parse,
+            value_parser = config::ImageName::new,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
         delete: Option<config::ImageName>,
@@ -468,7 +468,7 @@ enum Commands {
     Resize {
         /// Instance name (required if multiple instances exist)
         #[arg(
-            value_parser = config::InstanceName::parse,
+            value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,

@@ -24,10 +24,10 @@ use thiserror::Error;
 
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
-use crate::github_repo::{RepoSlug, detect_workspace_repo, parse_repo_slug_from_url};
+use crate::github_repo::{RepoSlug, detect_workspace_repo};
 use crate::github_submodules::{SubmoduleDiscovery, classify_urls, extract_urls};
 use crate::secret_store::{
-    CmdToken, SERVICE, account_for_repo, available_backends, delete_secret, store_secret,
+    AccountName, CmdToken, SERVICE, available_backends, delete_secret, store_secret,
 };
 
 /// Prefix every fine-grained PAT starts with. Surfaced as `pub const` so
@@ -47,7 +47,7 @@ pub struct SetupOpts<'a> {
 /// On success, the on-disk config has a fresh `[github.pat."owner/repo"]`
 /// entry and any matching skip-marker is removed.
 pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
-    let repo = resolve_target_repo(opts.repo, None)?;
+    let repo = resolve_target_repo(opts.repo)?;
 
     let prediscovered = prefetch_submodules(&repo);
     print_form_instructions(&repo, prediscovered.as_ref());
@@ -61,7 +61,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     let token = handle_submodules(token, &repo, prediscovered)?;
 
     let backend = pick_backend()?;
-    let account = account_for_repo(&repo);
+    let account = AccountName::from_repo(&repo);
     let state_dir = cfg.data_dir.join("state");
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
@@ -83,7 +83,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
 /// `coop github rotate-pat` — same wizard, but messaging hints that
 /// we're replacing an existing entry.
 pub fn run_rotate_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
-    let repo = resolve_target_repo(opts.repo, None)?;
+    let repo = resolve_target_repo(opts.repo)?;
     if cfg
         .github
         .as_ref()
@@ -158,7 +158,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> 
             format!("No PAT entry for '{repo}' — nothing to forget. Run `coop github status`.")
         })?;
     let backend = CmdToken::parse(entry.token.expose()).map(|t| t.backend());
-    let account = account_for_repo(repo);
+    let account = AccountName::from_repo(repo);
     let state_dir = cfg.data_dir.join("state");
     if let Some(b) = backend {
         if let Err(e) = delete_secret(b, SERVICE, &account, &state_dir) {
@@ -184,14 +184,9 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> 
 
 /// Resolve the target repo from explicit `--repo`, fall back to a
 /// best-effort scan of the current working directory.
-fn resolve_target_repo(repo_arg: Option<&str>, git_repo_url: Option<&str>) -> Result<RepoSlug> {
+fn resolve_target_repo(repo_arg: Option<&str>) -> Result<RepoSlug> {
     if let Some(repo) = repo_arg {
         return RepoSlug::new(repo.trim());
-    }
-    if let Some(url) = git_repo_url
-        && let Some(slug) = parse_repo_slug_from_url(url)
-    {
-        return Ok(slug);
     }
     if let Ok(cwd) = std::env::current_dir()
         && let Some(slug) = detect_workspace_repo(&cwd)?
