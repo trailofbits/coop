@@ -946,40 +946,29 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     step("Fetching guest kernel");
 
     let arch = Architecture::current()?;
+    let start = FcVersion::parse(&discover_latest_fc_version()?)?;
 
-    let latest = discover_latest_fc_version()?;
-    let ci_version = FcVersion::parse(&latest)?.ci_dirname();
+    eprintln!(
+        "  Looking for kernels in CI bucket (latest: {})...",
+        start.ci_dirname()
+    );
 
-    eprintln!("  Looking for kernels in CI bucket (version {ci_version})...");
-    let prefix = format!("firecracker-ci/{ci_version}/{arch}/vmlinux-");
-    let list_url = format!("{S3_LIST}/?prefix={prefix}&list-type=2");
-
-    let output = Command::new("curl")
-        .args(["-sf", &list_url])
-        .output()
-        .context("Failed to list kernel artifacts from S3")?;
-    let body = String::from_utf8_lossy(&output.stdout);
-
-    let keys: Vec<&str> = body
-        .split("<Key>")
-        .skip(1)
-        .filter_map(|s| s.split("</Key>").next())
-        .filter(|k| k.contains("vmlinux-") && !k.ends_with(".config"))
-        .collect();
-
-    if keys.is_empty() {
-        bail!(
-            "No kernels found in Firecracker CI bucket for {ci_version}/{arch}.\n\
-             The S3 listing URL was: {list_url}\n\
-             You may need to build a kernel manually."
-        );
-    }
+    let (ci_version, keys) = find_latest_ci_assets(
+        start,
+        arch,
+        "vmlinux-",
+        |k| k.contains("vmlinux-") && !k.ends_with(".config"),
+        s3_list_keys,
+    )?;
 
     let kernel_key = keys.into_iter().max().context("No kernel keys found")?;
     let kernel_url = format!("{S3_BUCKET}/{kernel_key}");
     let kernel_name = kernel_key.rsplit('/').next().unwrap_or("vmlinux");
 
-    eprintln!("  Found kernel: {kernel_name}");
+    eprintln!(
+        "  Found kernel: {kernel_name} (from {})",
+        ci_version.ci_dirname()
+    );
     eprintln!("  URL: {kernel_url}");
     eprintln!("  Output: {}", cfg.vm.kernel_path.display());
 
@@ -1006,38 +995,118 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
 fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
     let arch = Architecture::current()?;
-    let latest = discover_latest_fc_version()?;
-    let ci_version = FcVersion::parse(&latest)?.ci_dirname();
+    let start = FcVersion::parse(&discover_latest_fc_version()?)?;
 
-    eprintln!("  Looking for rootfs in CI bucket (version {ci_version})...");
-    let prefix = format!("firecracker-ci/{ci_version}/{arch}/ubuntu-");
+    eprintln!(
+        "  Looking for rootfs in CI bucket (latest: {})...",
+        start.ci_dirname()
+    );
+
+    let (ci_version, keys) = find_latest_ci_assets(
+        start,
+        arch,
+        "ubuntu-",
+        |k| k.ends_with(".squashfs"),
+        s3_list_keys,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n\nYou can build one manually with:\n\n  sudo bash scripts/build-rootfs.sh {}",
+            cfg.template_path().display()
+        )
+    })?;
+
+    let rootfs_key = keys.into_iter().max().context("No rootfs keys found")?;
+    eprintln!("  Found rootfs in {}", ci_version.ci_dirname());
+    Ok(format!("{S3_BUCKET}/{rootfs_key}"))
+}
+
+/// Maximum number of older minor versions to try when the latest
+/// Firecracker release has no CI assets in S3.
+///
+/// CI assets typically lag a release by days to weeks (the GitHub release
+/// is cut before the Buildkite pipeline publishes the matching
+/// `firecracker-ci/vX.Y/` directory). Walking back too far risks pulling
+/// a rootfs/kernel built for a Firecracker that has diverged in API.
+const FC_CI_FALLBACK_MINORS: u16 = 4;
+
+/// List S3 keys under a given prefix in the Firecracker CI bucket.
+///
+/// Returns the raw `<Key>` strings parsed out of the S3 `ListObjectsV2`
+/// XML response. An empty response (the prefix has no objects) returns
+/// an empty Vec rather than an error.
+fn s3_list_keys(prefix: &str) -> Result<Vec<String>> {
     let list_url = format!("{S3_LIST}/?prefix={prefix}&list-type=2");
-
     let output = Command::new("curl")
         .args(["-sf", &list_url])
         .output()
-        .context("Failed to list rootfs artifacts from S3")?;
+        .with_context(|| format!("Failed to list S3 artifacts under {prefix}"))?;
     let body = String::from_utf8_lossy(&output.stdout);
-
-    let keys: Vec<&str> = body
+    Ok(body
         .split("<Key>")
         .skip(1)
         .filter_map(|s| s.split("</Key>").next())
-        .filter(|k| k.ends_with(".squashfs"))
-        .collect();
+        .map(str::to_owned)
+        .collect())
+}
 
-    if keys.is_empty() {
-        bail!(
-            "No rootfs found in Firecracker CI bucket for {ci_version}/{arch}.\n\
-             You can build one manually with:\n\
-             \n\
-               sudo bash scripts/build-rootfs.sh {}\n",
-            cfg.template_path().display()
-        );
+/// Walk back minor versions from `start` until a CI bucket with matching
+/// assets is found, returning the version used and the matching keys.
+///
+/// CI assets for the latest Firecracker release can lag the GitHub
+/// release by days. Rather than failing setup when that happens, fall
+/// back to the next older minor (still within the same major). The
+/// first version whose listing contains at least one key matching
+/// `filter` is returned. A WARN is logged whenever a fallback is used
+/// so the user knows the CI bucket is behind.
+///
+/// `list_keys` is injected so unit tests can exercise the walk without
+/// touching the network.
+fn find_latest_ci_assets(
+    start: FcVersion,
+    arch: Architecture,
+    prefix_suffix: &str,
+    filter: impl Fn(&str) -> bool,
+    list_keys: impl Fn(&str) -> Result<Vec<String>>,
+) -> Result<(FcVersion, Vec<String>)> {
+    let mut tried = Vec::with_capacity(usize::from(FC_CI_FALLBACK_MINORS));
+    for back in 0..FC_CI_FALLBACK_MINORS {
+        let Some(minor) = start.minor.checked_sub(back) else {
+            break;
+        };
+        let candidate = FcVersion {
+            major: start.major,
+            minor,
+        };
+        let ci_dir = candidate.ci_dirname();
+        let prefix = format!("firecracker-ci/{ci_dir}/{arch}/{prefix_suffix}");
+        let matches: Vec<String> = list_keys(&prefix)?
+            .into_iter()
+            .filter(|k| filter(k))
+            .collect();
+        if !matches.is_empty() {
+            if back > 0 {
+                tracing::warn!(
+                    latest = %start.ci_dirname(),
+                    using = %ci_dir,
+                    "Firecracker CI bucket has no '{prefix_suffix}' assets for the latest release; \
+                     falling back to {ci_dir}"
+                );
+                eprintln!(
+                    "  Warning: CI bucket has no '{prefix_suffix}' assets for {} \
+                     — using {ci_dir} instead",
+                    start.ci_dirname()
+                );
+            }
+            return Ok((candidate, matches));
+        }
+        tried.push(ci_dir);
     }
-
-    let rootfs_key = keys.into_iter().max().context("No rootfs keys found")?;
-    Ok(format!("{S3_BUCKET}/{rootfs_key}"))
+    bail!(
+        "No Firecracker CI assets matching '{prefix_suffix}' found for {arch} \
+         in any of: {}",
+        tried.join(", ")
+    );
 }
 
 fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str, rootfs_name: &str) -> Result<()> {
@@ -1389,7 +1458,7 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -1627,5 +1696,172 @@ mod tests {
     fn fc_version_rejects_empty_segments() {
         let err = FcVersion::parse("v.15").unwrap_err().to_string();
         assert!(err.contains("missing MAJOR"), "{err}");
+    }
+
+    fn keys_with(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn find_latest_ci_assets_returns_first_when_present() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            assert!(
+                prefix.starts_with("firecracker-ci/v1.16/"),
+                "expected to query v1.16 first, got {prefix}"
+            );
+            Ok(keys_with(&[
+                "firecracker-ci/v1.16/x86_64/ubuntu-24.04.squashfs",
+            ]))
+        };
+        let (version, matches) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(version, start);
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_falls_back_one_minor() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            if prefix.starts_with("firecracker-ci/v1.16/") {
+                Ok(Vec::new())
+            } else if prefix.starts_with("firecracker-ci/v1.15/") {
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs",
+                ]))
+            } else {
+                panic!("unexpected prefix: {prefix}")
+            }
+        };
+        let (version, matches) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(
+            version,
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+        );
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_filter_drops_non_matching_keys() {
+        // Bucket has objects but none match the filter — keep walking.
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            if prefix.starts_with("firecracker-ci/v1.16/") {
+                // Has files but none are .squashfs (e.g. only manifests/configs).
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.16/x86_64/ubuntu-24.04.manifest",
+                ]))
+            } else if prefix.starts_with("firecracker-ci/v1.15/") {
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs",
+                ]))
+            } else {
+                panic!("unexpected prefix: {prefix}")
+            }
+        };
+        let (version, _) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(version.minor, 15);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_bails_when_all_empty() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |_: &str| -> Result<Vec<String>> { Ok(Vec::new()) };
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap_err()
+        .to_string();
+        // Should mention each version it attempted, up to FC_CI_FALLBACK_MINORS.
+        for minor in (16 - i32::from(FC_CI_FALLBACK_MINORS) + 1)..=16 {
+            assert!(err.contains(&format!("v1.{minor}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn find_latest_ci_assets_stops_at_minor_zero() {
+        use std::cell::RefCell;
+
+        // Don't underflow when start.minor < FC_CI_FALLBACK_MINORS.
+        let start = FcVersion { major: 1, minor: 2 };
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            |prefix: &str| -> Result<Vec<String>> {
+                seen.borrow_mut().push(prefix.to_string());
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        let seen = seen.into_inner();
+        // We should have tried exactly minors 2, 1, 0 — three calls, not four.
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0].contains("v1.2/"), "{}", seen[0]);
+        assert!(seen[1].contains("v1.1/"), "{}", seen[1]);
+        assert!(seen[2].contains("v1.0/"), "{}", seen[2]);
+        assert!(err.contains("v1.0"), "{err}");
+    }
+
+    #[test]
+    fn find_latest_ci_assets_propagates_lookup_error() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |_: &str| -> Result<Vec<String>> { anyhow::bail!("network is on fire") };
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("network is on fire"), "{err}");
     }
 }
