@@ -1936,7 +1936,7 @@ pub fn clone_git_repo(
         }
     })?;
 
-    tracing::info!("Repository cloned to /workspace/repo");
+    tracing::info!("Repository cloned to /workspace");
     Ok(())
 }
 
@@ -1976,8 +1976,8 @@ fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
     let cmd = format!(
         "sudo mkdir -p /workspace && \
          sudo chown $(whoami):$(whoami) /workspace && \
-         git clone {} /workspace/repo && \
-         echo 'Repository cloned to /workspace/repo'",
+         git clone {} /workspace && \
+         echo 'Repository cloned to /workspace'",
         shell_escape(repo_url),
     );
     target.exec(&cmd)
@@ -2007,8 +2007,8 @@ fn build_clone_with_token_script(repo_url: &str) -> String {
          export GH_TOKEN\n\
          sudo mkdir -p /workspace\n\
          sudo chown \"$(whoami):$(whoami)\" /workspace\n\
-         git -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GH_TOKEN\"; }}; f' clone {url} /workspace/repo\n\
-         echo 'Repository cloned to /workspace/repo'\n",
+         git -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GH_TOKEN\"; }}; f' clone {url} /workspace\n\
+         echo 'Repository cloned to /workspace'\n",
         url = shell_escape(repo_url),
     )
 }
@@ -2505,7 +2505,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             "credential helper malformed: {script}"
         );
         assert!(
-            script.contains(" clone 'https://github.com/owner/repo.git' /workspace/repo\n"),
+            script.contains(" clone 'https://github.com/owner/repo.git' /workspace\n"),
             "missing escaped clone target: {script}"
         );
     }
