@@ -211,11 +211,19 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
 
 // ── Mount guard (RAII) ─────────────────────────────────────────
 
+/// How a [`MountGuard`] was set up, selecting the matching teardown on drop.
+enum MountKind {
+    /// Single loop mount of the rootfs.
+    Simple,
+    /// Full chroot: rootfs plus proc/sys/dev/devpts/tmp.
+    Chroot,
+}
+
 /// RAII guard that unmounts a filesystem on drop, preventing leaked
 /// mounts if an operation between mount and unmount fails.
 struct MountGuard {
     mount_path: String,
-    is_chroot: bool,
+    kind: MountKind,
 }
 
 impl MountGuard {
@@ -229,7 +237,7 @@ impl MountGuard {
             .context("Failed to mount rootfs")?;
         Ok(Self {
             mount_path: mount_path.to_string(),
-            is_chroot: false,
+            kind: MountKind::Simple,
         })
     }
 
@@ -238,24 +246,25 @@ impl MountGuard {
         mount_chroot(rootfs, mount_path)?;
         Ok(Self {
             mount_path: mount_path.to_string(),
-            is_chroot: true,
+            kind: MountKind::Chroot,
         })
     }
 }
 
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        if self.is_chroot {
-            unmount_chroot(&self.mount_path);
-        } else {
-            if let Err(e) = Cmd::new("umount").arg(&self.mount_path).sudo().run() {
-                tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
-            }
-            if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
-                tracing::warn!(
-                    "Failed to remove mount dir {} (non-fatal): {e}",
-                    self.mount_path
-                );
+        match self.kind {
+            MountKind::Chroot => unmount_chroot(&self.mount_path),
+            MountKind::Simple => {
+                if let Err(e) = Cmd::new("umount").arg(&self.mount_path).sudo().run() {
+                    tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
+                }
+                if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
+                    tracing::warn!(
+                        "Failed to remove mount dir {} (non-fatal): {e}",
+                        self.mount_path
+                    );
+                }
             }
         }
     }

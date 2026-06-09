@@ -111,11 +111,10 @@ enum Commands {
         /// Named image to use when creating a new instance (default: "default")
         #[arg(
             long,
-            default_value = config::DEFAULT_IMAGE,
             value_parser = config::ImageName::parse,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
-        image: config::ImageName,
+        image: Option<config::ImageName>,
         /// Build or reuse a profile-derived image when creating a new instance
         #[arg(
             long,
@@ -283,11 +282,10 @@ enum Commands {
         /// Explicit named image; rejected by `coop start`
         #[arg(
             long,
-            default_value = config::DEFAULT_IMAGE,
             value_parser = config::ImageName::parse,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
-        image: config::ImageName,
+        image: Option<config::ImageName>,
         /// Creation-time option; rejected by `coop start`
         #[arg(long, conflicts_with = "git_repo")]
         exclude_git: bool,
@@ -693,15 +691,6 @@ where
         .any(|a| a.as_ref() == "--no-claude" || a.as_ref().starts_with("--no-claude="))
 }
 
-fn raw_args_use_long_flag<I, S>(args: I, flag: &str) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    args.into_iter()
-        .any(|a| a.as_ref() == flag || a.as_ref().starts_with(&format!("{flag}=")))
-}
-
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
 fn main() -> Result<()> {
     // Dynamic shell completion: when invoked with COMPLETE=<shell>, compute
@@ -806,17 +795,14 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let validated = cfg.validate_and_warn()?;
-            let transport = if mount {
-                ProjectTransport::Mount
-            } else {
-                let _ = copy;
-                ProjectTransport::Copy
+            let transport = match (copy, mount) {
+                (_, true) => ProjectTransport::Mount,
+                (_, false) => ProjectTransport::Copy,
             };
-            let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
             let profile_target = if profile.is_empty() {
                 None
             } else {
-                if image_explicit {
+                if let Some(image) = &image {
                     bail!(
                         "`coop up --profile` derives the image name from the sorted profile list; \
                          use `coop setup --image {image} --profile ...` and then `coop up --image {image}` \
@@ -825,9 +811,6 @@ fn main() -> Result<()> {
                 }
                 Some(ProfileImageTarget::new(&profile)?)
             };
-            let effective_image = profile_target
-                .as_ref()
-                .map_or_else(|| image.clone(), |target| target.image.clone());
             let opts = UpOpts {
                 dir: dir.as_deref(),
                 name: name.as_ref(),
@@ -837,8 +820,7 @@ fn main() -> Result<()> {
                 vcpus,
                 mem,
                 disk,
-                image: effective_image,
-                image_explicit,
+                image,
                 profile_target,
                 runtime: UpRuntimeOpts {
                     no_agents,
@@ -849,8 +831,10 @@ fn main() -> Result<()> {
                     guest_env,
                 },
                 devcontainer: UpDevcontainerOpts {
-                    path: devcontainer,
-                    no_devcontainer,
+                    input: DevcontainerInput::from_flags(
+                        devcontainer.map(PathBuf::from),
+                        no_devcontainer,
+                    ),
                     dry_run,
                 },
             };
@@ -893,10 +877,11 @@ fn main() -> Result<()> {
                 cli_guest_user: guest_user.clone(),
                 ..devcontainer::TranslatorInputs::default()
             };
+            let dc_input =
+                DevcontainerInput::from_flags(devcontainer.map(PathBuf::from), no_devcontainer);
             let translation = resolve_devcontainer(
                 &DevcontainerOpts {
-                    explicit_path: devcontainer.as_deref().map(Path::new),
-                    no_devcontainer,
+                    input: &dc_input,
                     dry_run,
                     workspace: ws_path,
                     mounts: &[],
@@ -987,9 +972,10 @@ fn main() -> Result<()> {
                     canonical_profile_list(&profile).join(","),
                 );
             }
-            let image_explicit = raw_args_use_long_flag(&raw_args, "--image");
+            let image_explicit = image.is_some();
             if dry_run {
                 let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
+                let dry_run_image = image.clone().unwrap_or_else(config::default_image_name);
                 let inputs = devcontainer::TranslatorInputs {
                     cli_vcpus: vcpus,
                     cli_mem_mib: mem,
@@ -998,15 +984,18 @@ fn main() -> Result<()> {
                     cli_guest_env_keys: cli_env_keys,
                     cli_forward_ports: forward_ports.clone(),
                     cli_mounts: mounts.clone(),
-                    persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &image)),
+                    persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &dry_run_image)),
                     cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
                     ..devcontainer::TranslatorInputs::default()
                 };
                 let ws_path = workspace.as_deref().map(Path::new);
+                let dc_input = DevcontainerInput::from_flags(
+                    devcontainer.clone().map(PathBuf::from),
+                    no_devcontainer,
+                );
                 let _ = resolve_devcontainer(
                     &DevcontainerOpts {
-                        explicit_path: devcontainer.as_deref().map(Path::new),
-                        no_devcontainer,
+                        input: &dc_input,
                         dry_run,
                         workspace: ws_path,
                         mounts: &mounts,
@@ -1293,11 +1282,25 @@ struct UpOpts<'a> {
     vcpus: Option<u8>,
     mem: Option<config::MiB>,
     disk: Option<config::GiB>,
-    image: config::ImageName,
-    image_explicit: bool,
+    /// Explicit `--image NAME`, or `None` when unset. `None` selects the
+    /// profile-derived image when `--profile` is given, else the default.
+    image: Option<config::ImageName>,
     profile_target: Option<ProfileImageTarget>,
     runtime: UpRuntimeOpts,
     devcontainer: UpDevcontainerOpts,
+}
+
+impl UpOpts<'_> {
+    /// The image a newly-created instance should use: the profile-derived
+    /// image if `--profile` was given, else the explicit `--image`, else the
+    /// default image.
+    fn effective_image(&self) -> config::ImageName {
+        self.profile_target
+            .as_ref()
+            .map(|t| t.image.clone())
+            .or_else(|| self.image.clone())
+            .unwrap_or_else(config::default_image_name)
+    }
 }
 
 struct UpRuntimeOpts {
@@ -1310,8 +1313,7 @@ struct UpRuntimeOpts {
 }
 
 struct UpDevcontainerOpts {
-    path: Option<String>,
-    no_devcontainer: bool,
+    input: DevcontainerInput,
     dry_run: bool,
 }
 
@@ -1355,8 +1357,7 @@ fn cmd_up(
         let inputs = up_translator_inputs(cfg, opts);
         resolve_devcontainer(
             &DevcontainerOpts {
-                explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
-                no_devcontainer: opts.devcontainer.no_devcontainer,
+                input: &opts.devcontainer.input,
                 dry_run: true,
                 workspace: Some(&project_dir),
                 mounts: discovery_mounts,
@@ -1415,8 +1416,7 @@ fn cmd_up_git_repo(
         let inputs = up_translator_inputs(cfg, opts);
         resolve_devcontainer(
             &DevcontainerOpts {
-                explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
-                no_devcontainer: opts.devcontainer.no_devcontainer,
+                input: &opts.devcontainer.input,
                 dry_run: true,
                 workspace: None,
                 mounts: &[],
@@ -1471,7 +1471,7 @@ fn up_translator_inputs(
             .as_ref()
             .map(|target| target.profiles.clone())
             .unwrap_or_default(),
-        persisted_guest_user: Some(backend::persisted_guest_user(cfg, &opts.image)),
+        persisted_guest_user: Some(backend::persisted_guest_user(cfg, &opts.effective_image())),
         cli_workspace_or_git_repo: true,
         ..devcontainer::TranslatorInputs::default()
     }
@@ -1489,8 +1489,7 @@ fn create_up_instance(
     let inputs = up_translator_inputs(cfg, opts);
     let translation = resolve_devcontainer(
         &DevcontainerOpts {
-            explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
-            no_devcontainer: opts.devcontainer.no_devcontainer,
+            input: &opts.devcontainer.input,
             dry_run: false,
             workspace: Some(project_dir),
             mounts: discovery_mounts,
@@ -1548,7 +1547,7 @@ fn create_up_instance(
     let start_opts = StartOpts {
         name: None,
         image: StartImage {
-            explicit: opts.image_explicit,
+            explicit: opts.image.is_some(),
         },
         workspace_dir: workspace_dir.as_deref(),
         git_repo: None,
@@ -1569,7 +1568,7 @@ fn create_up_instance(
         be,
         cfg,
         opts.name,
-        &opts.image,
+        &opts.effective_image(),
         Some(project_dir),
         &start_opts,
     )
@@ -1586,8 +1585,7 @@ fn create_git_repo_instance(
     let inputs = up_translator_inputs(cfg, opts);
     let translation = resolve_devcontainer(
         &DevcontainerOpts {
-            explicit_path: opts.devcontainer.path.as_deref().map(Path::new),
-            no_devcontainer: opts.devcontainer.no_devcontainer,
+            input: &opts.devcontainer.input,
             dry_run: false,
             workspace: None,
             mounts: &[],
@@ -1637,7 +1635,7 @@ fn create_git_repo_instance(
     let start_opts = StartOpts {
         name: None,
         image: StartImage {
-            explicit: opts.image_explicit,
+            explicit: opts.image.is_some(),
         },
         workspace_dir: None,
         git_repo: Some(repo_url),
@@ -1662,7 +1660,7 @@ fn create_git_repo_instance(
         be,
         cfg,
         derived_name.as_ref(),
-        &opts.image,
+        &opts.effective_image(),
         None,
         &start_opts,
     )
@@ -1774,14 +1772,16 @@ fn ensure_up_existing_inputs_are_compatible(
     transport: ProjectTransport,
     opts: &UpOpts<'_>,
 ) -> Result<()> {
-    if opts.image_explicit && inst.image != opts.image {
+    if let Some(image) = &opts.image
+        && inst.image != *image
+    {
         bail!(
             "Instance '{}' already exists for this project using image '{}'. \
              `coop up --image {}` only applies when creating a new instance.\n\
              Use `coop destroy {}` first to recreate it with a different image.",
             inst.name,
             inst.image,
-            opts.image,
+            image,
             inst.name,
         );
     }
@@ -1804,7 +1804,7 @@ fn ensure_up_existing_inputs_are_compatible(
         || opts.mem.is_some()
         || !opts.extra_mount.is_empty()
         || opts.runtime.exclude_git
-        || opts.devcontainer.path.is_some()
+        || matches!(opts.devcontainer.input, DevcontainerInput::Explicit(_))
     {
         bail!(
             "Instance '{}' already exists for this project. \
@@ -1850,14 +1850,16 @@ fn ensure_up_existing_inputs_are_compatible_for_git_repo(
     inst: &config::Instance,
     opts: &UpOpts<'_>,
 ) -> Result<()> {
-    if opts.image_explicit && inst.image != opts.image {
+    if let Some(image) = &opts.image
+        && inst.image != *image
+    {
         bail!(
             "Instance '{}' already exists for this git repo using image '{}'. \
              `coop up --image {}` only applies when creating a new instance.\n\
              Use `coop destroy {}` first to recreate it with a different image.",
             inst.name,
             inst.image,
-            opts.image,
+            image,
             inst.name,
         );
     }
@@ -1879,7 +1881,7 @@ fn ensure_up_existing_inputs_are_compatible_for_git_repo(
         || opts.vcpus.is_some()
         || opts.mem.is_some()
         || !opts.extra_mount.is_empty()
-        || opts.devcontainer.path.is_some()
+        || matches!(opts.devcontainer.input, DevcontainerInput::Explicit(_))
     {
         bail!(
             "Instance '{}' already exists for this git repo. \
@@ -2107,10 +2109,10 @@ fn quickstart_fresh_start(
         cli_workspace_or_git_repo: workspace_dir.is_some(),
         ..devcontainer::TranslatorInputs::default()
     };
+    let dc_input = DevcontainerInput::from_flags(None, no_devcontainer);
     let translation = resolve_devcontainer(
         &DevcontainerOpts {
-            explicit_path: None,
-            no_devcontainer,
+            input: &dc_input,
             dry_run: false,
             workspace: workspace_dir,
             mounts: &[],
@@ -2339,14 +2341,41 @@ fn apply_vm_overrides(
     Ok(())
 }
 
+/// Whether and how a `devcontainer.json` should be resolved.
+///
+/// Models the mutually exclusive `--devcontainer PATH` and `--no-devcontainer`
+/// flags as a single value, so "explicit path *and* disabled" cannot be
+/// represented.
+enum DevcontainerInput {
+    /// `--devcontainer PATH`: use this exact file, skipping discovery and the
+    /// prompt.
+    Explicit(PathBuf),
+    /// `--no-devcontainer`: skip discovery entirely.
+    Disabled,
+    /// Default: discover a `devcontainer.json`, then prompt before applying.
+    Discover,
+}
+
+impl DevcontainerInput {
+    /// Build from the parsed `--devcontainer` / `--no-devcontainer` flags.
+    ///
+    /// clap enforces their mutual exclusion at parse time; should both ever
+    /// arrive, `--no-devcontainer` wins (matching the opt-out's precedence).
+    fn from_flags(path: Option<PathBuf>, no_devcontainer: bool) -> Self {
+        match (path, no_devcontainer) {
+            (_, true) => Self::Disabled,
+            (Some(p), false) => Self::Explicit(p),
+            (None, false) => Self::Discover,
+        }
+    }
+}
+
 /// CLI surface controlling devcontainer.json discovery and apply.
 ///
-/// `explicit_path` opts the caller in to a specific file (skips the
-/// prompt). `no_devcontainer` opts out entirely (skips discovery).
-/// `dry_run` prints the report and exits before any side effects.
+/// `input` selects an explicit file, opts out entirely, or requests
+/// discovery. `dry_run` prints the report and exits before any side effects.
 struct DevcontainerOpts<'a> {
-    explicit_path: Option<&'a Path>,
-    no_devcontainer: bool,
+    input: &'a DevcontainerInput,
     dry_run: bool,
     workspace: Option<&'a Path>,
     mounts: &'a [config::Mount],
@@ -2364,7 +2393,8 @@ enum DevcontainerSource {
 }
 
 fn discovered_local_devcontainer(opts: &DevcontainerOpts<'_>, source: &DevcontainerSource) -> bool {
-    opts.explicit_path.is_none() && matches!(source, DevcontainerSource::Path(_))
+    matches!(opts.input, DevcontainerInput::Discover)
+        && matches!(source, DevcontainerSource::Path(_))
 }
 
 fn maybe_skip_stored_devcontainer_opt_out(
@@ -2434,12 +2464,12 @@ fn resolve_devcontainer(
 ) -> Result<Option<devcontainer::Translation>> {
     use std::io::IsTerminal as _;
 
-    if opts.no_devcontainer {
+    if matches!(opts.input, DevcontainerInput::Disabled) {
         return Ok(None);
     }
 
-    let (source, losers) = if let Some(p) = opts.explicit_path {
-        (DevcontainerSource::Path(p.to_path_buf()), Vec::new())
+    let (source, losers) = if let DevcontainerInput::Explicit(p) = opts.input {
+        (DevcontainerSource::Path(p.clone()), Vec::new())
     } else {
         let found = devcontainer::discover(opts.workspace, opts.mounts);
         if let Some((winner, losers)) = devcontainer::pick_winner(found) {
@@ -2469,7 +2499,7 @@ fn resolve_devcontainer(
 
     // When discovery (not an explicit flag) found the file, defer to the
     // user. CI/scripted callers must pass --devcontainer or --no-devcontainer.
-    if opts.explicit_path.is_none() && !opts.dry_run {
+    if matches!(opts.input, DevcontainerInput::Discover) && !opts.dry_run {
         if !std::io::stdin().is_terminal() {
             match &source {
                 DevcontainerSource::Path(_) => bail!(
@@ -2578,9 +2608,9 @@ fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
 fn cmd_devcontainer_check(command: &DevcontainerCommands) -> Result<()> {
     match command {
         DevcontainerCommands::Check { path, stage } => {
+            let dc_input = DevcontainerInput::Explicit(path.clone());
             let opts = DevcontainerOpts {
-                explicit_path: Some(path.as_path()),
-                no_devcontainer: false,
+                input: &dc_input,
                 dry_run: true,
                 workspace: None,
                 mounts: &[],
@@ -3199,7 +3229,7 @@ fn start_instance(
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
-    let workspace_source_written = if let Some(ws_dir) = opts.workspace_dir {
+    let workspace_state = if let Some(ws_dir) = opts.workspace_dir {
         let ws_path = std::path::Path::new(ws_dir);
         anyhow::ensure!(
             ws_path.is_dir(),
@@ -3219,7 +3249,7 @@ fn start_instance(
             },
         };
         state.save(inst)?;
-        true
+        Some(state)
     } else if let Some(repo_url) = opts.git_repo {
         backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url)?;
 
@@ -3230,9 +3260,9 @@ fn start_instance(
             },
         };
         state.save(inst)?;
-        true
+        Some(state)
     } else {
-        false
+        None
     };
 
     if !opts.mounts.is_empty() {
@@ -3240,12 +3270,12 @@ fn start_instance(
             // Lima: virtiofs already serves the host directory live. No
             // sync step, but we still record state so `push`/`pull` and
             // PAT slug detection work for follow-up commands.
-            if !workspace_source_written {
+            if workspace_state.is_none() {
                 workspace::record_mount_state(inst, &opts.mounts)?;
             }
             warn_on_live_git_mounts(&opts.mounts);
         } else {
-            if workspace_source_written {
+            if workspace_state.is_some() {
                 workspace::sync_mount_contents(&target, &opts.mounts, opts.exclude_git)?;
             } else {
                 workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
@@ -5081,8 +5111,7 @@ mod tests {
             vcpus: None,
             mem: None,
             disk: None,
-            image: super::config::default_image_name(),
-            image_explicit: false,
+            image: None,
             profile_target: None,
             runtime: super::UpRuntimeOpts {
                 no_agents: false,
@@ -5093,11 +5122,48 @@ mod tests {
                 guest_env: Vec::new(),
             },
             devcontainer: super::UpDevcontainerOpts {
-                path: None,
-                no_devcontainer: true,
+                input: super::DevcontainerInput::Disabled,
                 dry_run: false,
             },
         }
+    }
+
+    #[test]
+    fn devcontainer_input_from_flags_precedence() {
+        let path = std::path::PathBuf::from("/tmp/devcontainer.json");
+        assert!(matches!(
+            super::DevcontainerInput::from_flags(Some(path.clone()), false),
+            super::DevcontainerInput::Explicit(p) if p == path
+        ));
+        assert!(matches!(
+            super::DevcontainerInput::from_flags(None, false),
+            super::DevcontainerInput::Discover
+        ));
+        assert!(matches!(
+            super::DevcontainerInput::from_flags(None, true),
+            super::DevcontainerInput::Disabled
+        ));
+        // --no-devcontainer wins even if a path is also present.
+        assert!(matches!(
+            super::DevcontainerInput::from_flags(Some(path), true),
+            super::DevcontainerInput::Disabled
+        ));
+    }
+
+    #[test]
+    fn effective_image_prefers_profile_then_explicit_then_default() {
+        let mut opts = up_opts_for_tests(None);
+        assert_eq!(opts.effective_image(), super::config::default_image_name());
+
+        let explicit = super::config::ImageName::new("custom").expect("image");
+        opts.image = Some(explicit.clone());
+        assert_eq!(opts.effective_image(), explicit);
+
+        let target = super::ProfileImageTarget::new(&["node".to_string(), "python".to_string()])
+            .expect("profile target");
+        let profile_image = target.image.clone();
+        opts.profile_target = Some(target);
+        assert_eq!(opts.effective_image(), profile_image);
     }
 
     #[test]
@@ -5137,7 +5203,6 @@ mod tests {
             super::ProfileImageTarget::new(&["python".to_string(), "node".to_string()])
                 .expect("profile target"),
         );
-        opts.image = opts.profile_target.as_ref().unwrap().image.clone();
 
         let err = super::ensure_up_existing_inputs_are_compatible(
             &inst,

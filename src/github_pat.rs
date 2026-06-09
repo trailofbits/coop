@@ -584,6 +584,24 @@ fn probe_same_owner_coverage(token: &str, expected: &[RepoSlug]) -> Result<Vec<R
     Ok(failed)
 }
 
+/// Where the submodule discovery in [`handle_submodules`] came from.
+///
+/// The cross-owner / non-GitHub advice is printed by the form before paste
+/// when pre-discovery ran, so it must not be repeated here; that advice is
+/// emitted only for [`Self::FromPastedToken`].
+enum DiscoverySource {
+    PreDiscovered(SubmoduleDiscovery),
+    FromPastedToken(SubmoduleDiscovery),
+}
+
+impl DiscoverySource {
+    fn discovery(&self) -> &SubmoduleDiscovery {
+        match self {
+            Self::PreDiscovered(d) | Self::FromPastedToken(d) => d,
+        }
+    }
+}
+
 /// Surface the discovery to the user and, when same-owner submodules
 /// exist, loop until the pasted token covers them all.
 ///
@@ -604,12 +622,12 @@ fn handle_submodules(
     parent: &RepoSlug,
     prediscovered: Option<SubmoduleDiscovery>,
 ) -> Result<String> {
-    let used_prediscovery = prediscovered.is_some();
-    let discovery = match prediscovered {
-        Some(d) => d,
-        None => discover_from_pasted_token(&token, parent)?,
+    let source = match prediscovered {
+        Some(d) => DiscoverySource::PreDiscovered(d),
+        None => DiscoverySource::FromPastedToken(discover_from_pasted_token(&token, parent)?),
     };
 
+    let discovery = source.discovery();
     if discovery.is_empty() {
         return Ok(token);
     }
@@ -631,7 +649,7 @@ fn handle_submodules(
         }
     }
 
-    if !used_prediscovery {
+    if let DiscoverySource::FromPastedToken(discovery) = &source {
         if !discovery.cross_owner.is_empty() {
             eprintln!(
                 "\nNote: submodules under other resource owners need their own \
