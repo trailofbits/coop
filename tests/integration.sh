@@ -1906,6 +1906,120 @@ test_up_project_workflow() {
     rm -rf "$mount_ws"
 }
 
+# ── git-repo source (--full only) ─────────────────────────────
+
+# Exercise `coop up --git-repo`: the clone runs inside the guest, so this
+# needs guest network access (already required by test_network). Uses
+# octocat/Hello-World, GitHub's canonical tiny public repo, cloned
+# anonymously (no [github] config). Instance-name derivation is covered
+# by unit tests; here we pass --name for deterministic cleanup.
+test_git_repo() {
+    echo ""
+    echo "=== Phase: up --git-repo (clone) ==="
+
+    local repo_url="https://github.com/octocat/Hello-World.git"
+    local gr_instance="${INSTANCE}-gitrepo"
+    local data_dir
+    data_dir=$(mktemp -d "$tmpdir/gitrepo-data-XXXXXX")
+    echo "extra-mount-marker" > "$data_dir/marker.txt"
+
+    # --git-repo conflicts with the local-directory sources (arg parsing,
+    # no VM boot).
+    local some_dir
+    some_dir=$(mktemp -d "$tmpdir/gitrepo-dir-XXXXXX")
+    if moat_fails up "$some_dir" --git-repo "$repo_url" --no-devcontainer; then
+        pass "up --git-repo conflicts with a positional directory"
+    else
+        fail "up --git-repo conflicts with a positional directory" "should have failed"
+    fi
+    if moat_fails up --git-repo "$repo_url" --mount --no-devcontainer; then
+        pass "up --git-repo conflicts with --mount"
+    else
+        fail "up --git-repo conflicts with --mount" "should have failed"
+    fi
+    rm -rf "$some_dir"
+
+    # --extra-mount targeting /workspace collides with the clone; rejected
+    # before boot (--no-devcontainer avoids remote devcontainer discovery).
+    if moat_fails up --git-repo "$repo_url" --name "$gr_instance" \
+            --extra-mount "$data_dir:/workspace" --no-agents --no-devcontainer; then
+        if echo "$HARNESS_ERR" | grep -q "/workspace"; then
+            pass "up --git-repo rejects --extra-mount at /workspace"
+        else
+            fail "up --git-repo rejects --extra-mount at /workspace" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "up --git-repo rejects --extra-mount at /workspace" \
+            "command unexpectedly succeeded"
+    fi
+
+    # Clone happy path plus an extra data mount in a single boot. The
+    # git-repo + extra-mount combination is the workspace-sync path that
+    # regressed on Firecracker before this change.
+    if coop up --git-repo "$repo_url" --name "$gr_instance" \
+            --extra-mount "$data_dir:/data" --no-agents --no-devcontainer; then
+        STARTED_INSTANCES+=("$gr_instance")
+        pass "up --git-repo creates an instance"
+    else
+        fail "up --git-repo creates an instance" "exit code: $? stderr: $HARNESS_ERR"
+        rm -rf "$data_dir"
+        return
+    fi
+
+    GUEST_INSTANCE="$gr_instance"
+
+    if guest_exec test -d /workspace/.git; then
+        pass "up --git-repo clones the repository into /workspace"
+    else
+        fail "up --git-repo clones the repository into /workspace" \
+            "no .git at /workspace; stderr: $(guest_stderr)"
+    fi
+
+    local head
+    if head=$(guest_exec git -C /workspace rev-parse HEAD); then
+        if [[ -n "$head" ]]; then
+            pass "cloned repository has a valid HEAD"
+        else
+            fail "cloned repository has a valid HEAD" "empty rev-parse output"
+        fi
+    else
+        fail "cloned repository has a valid HEAD" "git rev-parse failed: $(guest_stderr)"
+    fi
+
+    local marker
+    if marker=$(guest_exec cat /data/marker.txt); then
+        if [[ "$marker" == "extra-mount-marker" ]]; then
+            pass "up --git-repo also syncs --extra-mount data"
+        else
+            fail "up --git-repo also syncs --extra-mount data" "got: $marker"
+        fi
+    else
+        fail "up --git-repo also syncs --extra-mount data" "file not found at /data"
+    fi
+
+    unset GUEST_INSTANCE
+
+    # Re-running while the instance is up reuses it: exit 0, no new instance.
+    local pre_list post_list
+    pre_list=$("$BINARY" list 2>/dev/null | sort)
+    if coop up --git-repo "$repo_url" --name "$gr_instance" --no-devcontainer; then
+        pass "up --git-repo re-run exits 0 while running"
+    else
+        fail "up --git-repo re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
+    fi
+    post_list=$("$BINARY" list 2>/dev/null | sort)
+    if [[ "$pre_list" == "$post_list" ]]; then
+        pass "up --git-repo reuses the running instance"
+    else
+        fail "up --git-repo reuses the running instance" \
+            "list changed: $(diff <(echo "$pre_list") <(echo "$post_list"))"
+    fi
+
+    coop destroy "$gr_instance" 2>/dev/null || true
+    untrack_instance "$gr_instance"
+    rm -rf "$data_dir"
+}
+
 # ── Workspace sync tests (--full only) ────────────────────────
 
 test_workspace_sync() {
@@ -3941,6 +4055,7 @@ main() {
     if [[ "$FULL" == "1" ]]; then
         test_quickstart
         test_up_project_workflow
+        test_git_repo
         test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
