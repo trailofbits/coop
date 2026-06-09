@@ -175,16 +175,17 @@ pub fn available_backends() -> Vec<Backend> {
 
 /// Store `token` in `backend` keyed by `(service, account)`.
 ///
-/// Returns a `cmd:`-prefixed string suitable for the `token = ...` field
-/// in `[github.pat."owner/repo"]`. The returned command, when evaluated by
-/// `resolve_cmd_value`, must print the token on stdout.
+/// Returns the [`CmdToken`] describing how to read the secret back. Its
+/// `Display` renders the `cmd:`-prefixed string written to the `token = ...`
+/// field in `[github.pat."owner/repo"]`; when evaluated by
+/// `resolve_cmd_value`, that command prints the token on stdout.
 pub fn store_secret(
     backend: Backend,
     service: &str,
     account: &AccountName,
     token: &str,
     state_dir: &Path,
-) -> Result<String> {
+) -> Result<CmdToken> {
     match backend {
         #[cfg(target_os = "macos")]
         Backend::MacosKeychain => store_keychain(service, account, token),
@@ -251,44 +252,205 @@ pub fn delete_secret(
     }
 }
 
-/// Recognise a `cmd:` invocation as the backend that wrote it.
+/// A structured description of the `cmd:` invocation coop stores in the
+/// config to read a PAT back from its secret store.
 ///
-/// Used by `coop github status` to display the storage location without
-/// reading the secret. Returns `None` for opaque commands *and* for entries
-/// produced by a system keychain that the current build cannot represent
-/// (e.g. a `security find-generic-password …` entry seen by a Linux binary
-/// — the secret itself is unreachable from this host anyway, so we treat
-/// it as unknown rather than describing a variant that doesn't exist here).
+/// [`Display`](fmt::Display) renders the `cmd:`-prefixed form written to the
+/// config file; [`CmdToken::parse`] recovers the token from that form. The
+/// two are exact inverses (round-trip tested), so the stored command string
+/// and the backend it denotes can never silently diverge — there is one
+/// encoding of the format, not two.
 ///
-/// The File-backend match requires the path to end in `/github-pat/<name>.txt`
-/// (the canonical layout coop writes) so user-supplied `cmd:cat …` paths
-/// that don't follow that shape correctly fall through to `unknown`.
-pub fn infer_backend(cmd: &str) -> Option<Backend> {
-    let cmd_str = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
+/// System-keychain variants are `cfg`-gated for the same reason as
+/// [`Backend`]: a binary built for one OS cannot represent — let alone read —
+/// the other's keychain entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CmdToken {
+    /// macOS Keychain lookup via `security find-generic-password`.
     #[cfg(target_os = "macos")]
-    if cmd_str.starts_with("security find-generic-password") {
-        return Some(Backend::MacosKeychain);
-    }
+    Keychain { service: String, account: String },
+    /// Linux Secret Service lookup via `secret-tool lookup`.
     #[cfg(target_os = "linux")]
-    if cmd_str.starts_with("secret-tool lookup") {
-        return Some(Backend::LinuxSecretService);
+    SecretService { service: String, account: String },
+    /// 1Password item read via `op item get`.
+    OnePassword { title: String },
+    /// Plain-file read via `cat`, under `<state>/github-pat/<name>.txt`.
+    File { path: PathBuf },
+}
+
+impl CmdToken {
+    /// The backend that produced (and can read) this token.
+    pub fn backend(&self) -> Backend {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Keychain { .. } => Backend::MacosKeychain,
+            #[cfg(target_os = "linux")]
+            Self::SecretService { .. } => Backend::LinuxSecretService,
+            Self::OnePassword { .. } => Backend::OnePassword,
+            Self::File { .. } => Backend::File,
+        }
     }
-    if cmd_str.starts_with("op read") || cmd_str.starts_with("op item get") {
-        Some(Backend::OnePassword)
-    } else if cmd_str.starts_with("cat ")
-        && cmd_str.contains("github-pat/")
-        && cmd_str.contains(".txt")
-    {
-        Some(Backend::File)
-    } else {
-        None
+
+    /// Recover a `CmdToken` from a stored `cmd:` string, or `None` if the
+    /// command is not one coop produces.
+    ///
+    /// Used by `coop github status` to name the storage location and by
+    /// `forget-pat` to pick the deletion backend, both without reading the
+    /// secret. Returns `None` for opaque commands *and* for system-keychain
+    /// entries the current build cannot represent (e.g. a
+    /// `security find-generic-password …` entry seen by a Linux binary — its
+    /// secret is unreachable from this host anyway).
+    ///
+    /// The match is the exact inverse of [`Display`](fmt::Display): a command
+    /// that does not follow the canonical shape coop writes (including a
+    /// `cat` path not laid out as `…/github-pat/<name>.txt`) falls through to
+    /// `None` rather than being misattributed to a backend.
+    pub fn parse(cmd: &str) -> Option<Self> {
+        let body = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
+        let words = shell_split(body)?;
+        Self::from_words(&words)
     }
+
+    fn from_words(words: &[String]) -> Option<Self> {
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        match words.as_slice() {
+            #[cfg(target_os = "macos")]
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+            ] => Some(Self::Keychain {
+                service: (*service).to_string(),
+                account: (*account).to_string(),
+            }),
+            #[cfg(target_os = "linux")]
+            [
+                "secret-tool",
+                "lookup",
+                "service",
+                service,
+                "account",
+                account,
+            ] => Some(Self::SecretService {
+                service: (*service).to_string(),
+                account: (*account).to_string(),
+            }),
+            [
+                "op",
+                "item",
+                "get",
+                title,
+                "--fields",
+                "password",
+                "--reveal",
+            ] => Some(Self::OnePassword {
+                title: (*title).to_string(),
+            }),
+            ["cat", path] if is_pat_file(Path::new(path)) => Some(Self::File {
+                path: PathBuf::from(path),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CmdToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Keychain { service, account } => write!(
+                f,
+                "cmd:security find-generic-password -s {} -a {} -w",
+                shell_quote(service),
+                shell_quote(account),
+            ),
+            #[cfg(target_os = "linux")]
+            Self::SecretService { service, account } => write!(
+                f,
+                "cmd:secret-tool lookup service {} account {}",
+                shell_quote(service),
+                shell_quote(account),
+            ),
+            Self::OnePassword { title } => write!(
+                f,
+                "cmd:op item get {} --fields password --reveal",
+                shell_quote(title),
+            ),
+            Self::File { path } => {
+                write!(f, "cmd:cat {}", shell_quote(&path.to_string_lossy()))
+            }
+        }
+    }
+}
+
+/// Does `path` follow the canonical `…/github-pat/<name>.txt` layout coop
+/// writes for the file backend?
+fn is_pat_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "txt")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|dir| dir == PAT_DIR)
+}
+
+/// Split a `cmd:` body into shell words, inverting [`shell_quote`].
+///
+/// Handles the only constructs `shell_quote` can emit — single-quoted
+/// segments and backslash-escaped characters (the `'\''` idiom) — alongside
+/// plain unquoted runs. Returns `None` on an unterminated single quote.
+fn shell_split(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                let mut closed = false;
+                for qc in chars.by_ref() {
+                    if qc == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(qc);
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
 }
 
 // ── Backend impls ──────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
-fn store_keychain(service: &str, account: &AccountName, token: &str) -> Result<String> {
+fn store_keychain(service: &str, account: &AccountName, token: &str) -> Result<CmdToken> {
     // macOS `security` lacks a stdin-driven write for generic passwords:
     // `-w <password>` reads the secret from argv. The bytes are briefly
     // visible to local `ps`-equivalent observers — an unavoidable cost
@@ -306,15 +468,14 @@ fn store_keychain(service: &str, account: &AccountName, token: &str) -> Result<S
         .redacted_arg(token)
         .run()
         .context("Failed to write secret to macOS Keychain")?;
-    Ok(format!(
-        "cmd:security find-generic-password -s {} -a {} -w",
-        shell_quote(service),
-        shell_quote(account.as_str()),
-    ))
+    Ok(CmdToken::Keychain {
+        service: service.to_string(),
+        account: account.as_str().to_string(),
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn store_secret_service(service: &str, account: &AccountName, token: &str) -> Result<String> {
+fn store_secret_service(service: &str, account: &AccountName, token: &str) -> Result<CmdToken> {
     // `secret-tool store` reads the password from stdin.
     Cmd::new("secret-tool")
         .arg("store")
@@ -327,14 +488,13 @@ fn store_secret_service(service: &str, account: &AccountName, token: &str) -> Re
         .stdin_input(token.as_bytes().to_vec())
         .run()
         .context("Failed to write secret to Linux Secret Service")?;
-    Ok(format!(
-        "cmd:secret-tool lookup service {} account {}",
-        shell_quote(service),
-        shell_quote(account.as_str()),
-    ))
+    Ok(CmdToken::SecretService {
+        service: service.to_string(),
+        account: account.as_str().to_string(),
+    })
 }
 
-fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Result<String> {
+fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Result<CmdToken> {
     // `op item create` reads field values from argv. The token is briefly
     // visible to local observers via /proc; redacted from coop's own
     // debug log via `redacted_arg`. 1Password rejects duplicate titles, so
@@ -356,10 +516,7 @@ fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Resul
         .redacted_arg(password_field)
         .run()
         .context("Failed to create 1Password item")?;
-    let title_quoted = shell_quote(&title);
-    Ok(format!(
-        "cmd:op item get {title_quoted} --fields password --reveal"
-    ))
+    Ok(CmdToken::OnePassword { title })
 }
 
 fn store_file(
@@ -367,8 +524,8 @@ fn store_file(
     account: &AccountName,
     token: &str,
     state_dir: &Path,
-) -> Result<String> {
-    let dir = state_dir.join("github-pat");
+) -> Result<CmdToken> {
+    let dir = state_dir.join(PAT_DIR);
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     set_dir_mode(&dir, 0o700)?;
     let path = file_backend_path(state_dir, account);
@@ -388,11 +545,11 @@ fn store_file(
     }
     // Suppress unused-warning for `service` when the file backend ignores it.
     let _ = service;
-    Ok(format!("cmd:cat {}", shell_quote(&path.to_string_lossy())))
+    Ok(CmdToken::File { path })
 }
 
 fn file_backend_path(state_dir: &Path, account: &AccountName) -> PathBuf {
-    state_dir.join("github-pat").join(format!("{account}.txt"))
+    state_dir.join(PAT_DIR).join(format!("{account}.txt"))
 }
 
 fn set_dir_mode(path: &Path, mode: u32) -> Result<()> {
@@ -402,9 +559,14 @@ fn set_dir_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 /// POSIX shell-quote `s` for safe embedding in a `cmd:` invocation.
+///
+/// The empty string takes the quoted path (`''`): an unquoted empty string
+/// is dropped entirely by both `sh -c` (in `resolve_cmd_value`) and
+/// [`shell_split`], so the fast path must not swallow it.
 fn shell_quote(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '='))
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '='))
     {
         return s.to_string();
     }
@@ -419,6 +581,9 @@ pub fn account_for_repo(repo: &RepoSlug) -> AccountName {
 
 /// Conventional service name used across all backends.
 pub const SERVICE: &str = "coop-github-pat";
+
+/// Directory under `<data>/state/` holding file-backend PAT secrets.
+const PAT_DIR: &str = "github-pat";
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
@@ -498,11 +663,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_quote_quotes_empty_string() {
+        // An unquoted empty string is dropped by both `sh -c` and
+        // `shell_split`; it must take the quoted path.
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(
+            shell_split("a '' b"),
+            Some(vec!["a".into(), String::new(), "b".into()])
+        );
+    }
+
+    #[test]
     fn file_backend_round_trip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let acc = account("trailofbits/coop");
         let cmd = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
-        assert!(cmd.starts_with("cmd:cat "));
+        assert!(cmd.to_string().starts_with("cmd:cat "));
+        assert_eq!(cmd.backend(), Backend::File);
         // Verify the file exists with the right contents and mode.
         let path = file_backend_path(tmp.path(), &acc);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -521,65 +698,146 @@ mod tests {
         assert!(!path.exists());
     }
 
+    fn backend_of(cmd: &str) -> Option<Backend> {
+        CmdToken::parse(cmd).map(|t| t.backend())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn infer_backend_recognises_macos_keychain() {
+    fn parse_recognises_macos_keychain() {
         assert_eq!(
-            infer_backend("cmd:security find-generic-password -s coop-github-pat -a x -w"),
+            backend_of("cmd:security find-generic-password -s coop-github-pat -a x -w"),
             Some(Backend::MacosKeychain)
         );
         // Non-target keychain invocations are opaque to this build.
         assert_eq!(
-            infer_backend("cmd:secret-tool lookup service coop-github-pat account x"),
+            backend_of("cmd:secret-tool lookup service coop-github-pat account x"),
             None
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn infer_backend_recognises_linux_secret_service() {
+    fn parse_recognises_linux_secret_service() {
         assert_eq!(
-            infer_backend("cmd:secret-tool lookup service coop-github-pat account x"),
+            backend_of("cmd:secret-tool lookup service coop-github-pat account x"),
             Some(Backend::LinuxSecretService)
         );
         // Non-target keychain invocations are opaque to this build.
         assert_eq!(
-            infer_backend("cmd:security find-generic-password -s coop-github-pat -a x -w"),
+            backend_of("cmd:security find-generic-password -s coop-github-pat -a x -w"),
             None
         );
     }
 
     #[test]
-    fn infer_backend_recognises_cross_platform_backends() {
+    fn parse_recognises_cross_platform_backends() {
         assert_eq!(
-            infer_backend("cmd:op read op://Private/coop/token"),
+            backend_of("cmd:op item get 'foo' --fields password --reveal"),
             Some(Backend::OnePassword)
         );
         assert_eq!(
-            infer_backend("cmd:op item get 'foo' --fields password --reveal"),
-            Some(Backend::OnePassword)
-        );
-        assert_eq!(
-            infer_backend("cmd:cat ~/.coop/state/github-pat/x.txt"),
+            backend_of("cmd:cat ~/.coop/state/github-pat/x.txt"),
             Some(Backend::File)
         );
-        assert_eq!(infer_backend("cmd:echo opaque"), None);
+        assert_eq!(backend_of("cmd:echo opaque"), None);
     }
 
     #[test]
-    fn infer_backend_rejects_cat_without_canonical_layout() {
+    fn parse_rejects_non_canonical_onepassword() {
+        // coop only ever writes `op item get … --fields password --reveal`.
+        // A hand-written `op read` reference is not a form coop can read back
+        // by title, so it is treated as opaque rather than misattributed.
+        assert_eq!(backend_of("cmd:op read op://Private/coop/token"), None);
+    }
+
+    #[test]
+    fn parse_rejects_cat_without_canonical_layout() {
         // A `cat` invocation that doesn't follow the `…/github-pat/<x>.txt`
         // layout should not be reported as the File backend — otherwise
         // `forget-pat` would happily try to delete a file coop never wrote.
         assert_eq!(
-            infer_backend("cmd:cat ~/some/path/secret.txt"),
+            backend_of("cmd:cat ~/some/path/secret.txt"),
             None,
             "cat invocation without github-pat in the path must not match File"
         );
         assert_eq!(
-            infer_backend("cmd:cat ~/.coop/state/github-pat/x.bin"),
+            backend_of("cmd:cat ~/.coop/state/github-pat/x.bin"),
             None,
             "non-.txt suffix must not match File"
         );
+    }
+
+    #[test]
+    fn parse_strips_and_trims_cmd_prefix() {
+        // `resolve_cmd_value` tolerates `cmd:` with leading space; parsing
+        // must recover the same backend whether or not the space is present.
+        assert_eq!(
+            backend_of("cmd: op item get foo --fields password --reveal"),
+            Some(Backend::OnePassword)
+        );
+    }
+
+    #[test]
+    fn cmd_token_round_trips_through_display_and_parse() {
+        // The whole point of CmdToken: Display and parse are exact inverses,
+        // so the stored string and the recognised backend cannot diverge.
+        // Titles and paths exercise shell-quoting (spaces, parens, quotes).
+        let tokens = vec![
+            #[cfg(target_os = "macos")]
+            CmdToken::Keychain {
+                service: "coop-github-pat".to_string(),
+                account: "trailofbits-coop".to_string(),
+            },
+            #[cfg(target_os = "linux")]
+            CmdToken::SecretService {
+                service: "coop-github-pat".to_string(),
+                account: "trailofbits-coop".to_string(),
+            },
+            CmdToken::OnePassword {
+                title: "coop-github-pat (trailofbits-coop)".to_string(),
+            },
+            CmdToken::OnePassword {
+                title: "weird 'quoted' title".to_string(),
+            },
+            CmdToken::File {
+                path: PathBuf::from("/home/u/.coop/state/github-pat/a-b.txt"),
+            },
+            CmdToken::File {
+                path: PathBuf::from("/tmp/space dir/github-pat/x.txt"),
+            },
+        ];
+        for token in tokens {
+            let rendered = token.to_string();
+            assert_eq!(
+                CmdToken::parse(&rendered),
+                Some(token.clone()),
+                "round-trip failed for {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_outputs_round_trip_through_parse() {
+        // The cmd string a backend actually writes must parse back to the
+        // backend that wrote it — this is the divergence the type prevents.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acc = account("trailofbits/coop");
+        let token = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
+        let rendered = token.to_string();
+        assert_eq!(CmdToken::parse(&rendered), Some(token));
+    }
+
+    #[test]
+    fn shell_split_handles_quotes_and_escapes() {
+        assert_eq!(
+            shell_split("a b c"),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(shell_split("'a b' c"), Some(vec!["a b".into(), "c".into()]));
+        // `shell_quote("a'b")` emits `'a'\''b'`, which must split back to `a'b`.
+        assert_eq!(shell_split(r"'a'\''b'"), Some(vec!["a'b".into()]));
+        // Unterminated single quote is rejected.
+        assert_eq!(shell_split("'unterminated"), None);
     }
 }

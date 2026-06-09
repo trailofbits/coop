@@ -26,7 +26,7 @@ use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
 use crate::github_repo::{RepoSlug, detect_workspace_repo, parse_repo_slug_from_url};
 use crate::github_submodules::{SubmoduleDiscovery, classify_urls, extract_urls};
 use crate::secret_store::{
-    SERVICE, account_for_repo, available_backends, delete_secret, infer_backend, store_secret,
+    CmdToken, SERVICE, account_for_repo, available_backends, delete_secret, store_secret,
 };
 
 /// Prefix every fine-grained PAT starts with. Surfaced as `pub const` so
@@ -65,15 +65,15 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
 
-    let cmd_str = store_secret(backend, SERVICE, &account, &token, &state_dir)
+    let cmd_token = store_secret(backend, SERVICE, &account, &token, &state_dir)
         .context("Failed to store secret in chosen backend")?;
 
-    upsert_pat_entry(opts.config_path, &repo, &cmd_str)?;
+    upsert_pat_entry(opts.config_path, &repo, &cmd_token.to_string())?;
 
     eprintln!(
         "\nWrote {}:\n  github.mode = \"pat\"\n  [github.pat.\"{repo}\"]\n  token = \"{}\"",
         opts.config_path.display(),
-        cmd_str,
+        cmd_token,
     );
     eprintln!("\nDone. VM startups for https://github.com/{repo} will use this token.");
     Ok(())
@@ -123,8 +123,10 @@ pub fn run_status(cfg: &CoopConfig, probe: bool) {
     println!("github mode: pat");
     println!("entries ({}):", pat.entries.len());
     for (repo, entry) in &pat.entries {
-        let backend_label = infer_backend(entry.token.expose())
-            .map_or_else(|| "unknown".to_string(), |b| b.label().to_string());
+        let backend_label = CmdToken::parse(entry.token.expose()).map_or_else(
+            || "unknown".to_string(),
+            |t| t.backend().label().to_string(),
+        );
         println!("  {repo}");
         println!("    storage: {backend_label}");
         if probe {
@@ -154,7 +156,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> 
         .with_context(|| {
             format!("No PAT entry for '{repo}' — nothing to forget. Run `coop github status`.")
         })?;
-    let backend = infer_backend(entry.token.expose());
+    let backend = CmdToken::parse(entry.token.expose()).map(|t| t.backend());
     let account = account_for_repo(repo);
     let state_dir = cfg.data_dir.join("state");
     if let Some(b) = backend {
