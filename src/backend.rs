@@ -757,16 +757,19 @@ pub trait VmBackend: std::fmt::Display {
         new_size: crate::config::GiB,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
-    /// Probe the live state of `inst` and return a `RunningInstance`
-    /// if it is running. This is the single chokepoint for "is this
-    /// VM alive?" — call sites that need to operate on a running VM
+    /// Probe the live state of `inst`, returning a `RunningInstance`
+    /// when it is up. This is the single chokepoint for "is this VM
+    /// alive?" — call sites that need to operate on a running VM
     /// should ask via this method rather than open-coding the check.
     ///
-    /// Returns `Err` when the instance is not running or when the
-    /// backend lookup itself fails (e.g. `limactl list` errors). The
-    /// `Instance` is consumed; on `Err` callers can clone before
-    /// calling if they need to keep working with it.
-    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance>;
+    /// The two failure modes are kept distinct so callers probe once
+    /// and never conflate them: `Ok(None)` means the instance is
+    /// confirmed *not running*, while `Err` means the probe itself
+    /// failed (e.g. `limactl list` errored, or the SSH target could
+    /// not be built for a VM that *is* running). The `Instance` is
+    /// consumed; callers that need it in the not-running branch can
+    /// clone before calling.
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>>;
     /// Probe the live state of `inst` and return a [`StoppedInstance`]
     /// if it is not running. The dual of [`Self::as_running`] — used
     /// to gate operations (like `resize_disk`) that require the VM to
@@ -926,17 +929,12 @@ impl VmBackend for FirecrackerBackend {
         inst.is_running()
     }
 
-    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance> {
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
         if !inst.is_running() {
-            bail!(
-                "Instance '{}' is not running (no live Firecracker process \
-                 for PID file {})",
-                inst.name,
-                inst.pid_file_path().display(),
-            );
+            return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
-        Ok(RunningInstance::new(inst, target))
+        Ok(Some(RunningInstance::new(inst, target)))
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
@@ -1079,15 +1077,12 @@ impl VmBackend for LimaBackend {
         crate::lima::is_running(inst)
     }
 
-    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance> {
+    fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
         if !crate::lima::is_running(&inst) {
-            bail!(
-                "Instance '{}' is not running (Lima reports state != Running)",
-                inst.name,
-            );
+            return Ok(None);
         }
         let target = crate::lima::ssh_target(cfg, &inst)?;
-        Ok(RunningInstance::new(inst, target))
+        Ok(Some(RunningInstance::new(inst, target)))
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
