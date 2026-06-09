@@ -17,11 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::cmd::Cmd;
 use crate::fs_util::atomic_write_json;
 use crate::prompt::confirm;
+use crate::sha256_hash::Sha256Hash;
 
 const REPO: &str = "trailofbits/coop";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -332,11 +332,14 @@ fn gh_release_download(tag: &str, asset_name: &str, dest: &Path) -> Result<()> {
 
 // ── Checksum verification ────────────────────────────────────────────────────
 
-/// Parse a `sha256sum`-style `SHA256SUMS` file and return the hex digest for
+/// Parse a `sha256sum`-style `SHA256SUMS` file and return the digest for
 /// `target_filename`. Handles both `<hash>  <file>` (binary mode) and
 /// `<hash> *<file>` variants; tolerates blank lines and `#` comments.
+///
+/// Malformed digests for the target filename are skipped (parsing
+/// continues), so the first well-formed entry wins.
 #[must_use]
-pub fn parse_sha256sums(content: &str, target_filename: &str) -> Option<String> {
+pub fn parse_sha256sums(content: &str, target_filename: &str) -> Option<Sha256Hash> {
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -345,25 +348,21 @@ pub fn parse_sha256sums(content: &str, target_filename: &str) -> Option<String> 
         let (hash, rest) = line.split_once(|c: char| c.is_ascii_whitespace())?;
         let file = rest.trim_start().trim_start_matches('*');
         if file == target_filename
-            && hash.len() == 64
-            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(parsed) = hash.parse::<Sha256Hash>()
         {
-            return Some(hash.to_ascii_lowercase());
+            return Some(parsed);
         }
     }
     None
 }
 
-fn verify_sha256(file: &Path, expected_hex: &str) -> Result<()> {
+fn verify_sha256(file: &Path, expected: &Sha256Hash) -> Result<()> {
     let bytes = fs::read(file)
         .with_context(|| format!("Failed to read {} for checksum", file.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let digest = hasher.finalize();
-    let actual = hex::encode(digest);
+    let actual = Sha256Hash::of(&bytes);
     ensure!(
-        actual.eq_ignore_ascii_case(expected_hex),
-        "SHA-256 mismatch for {}: expected {expected_hex}, got {actual}",
+        actual == *expected,
+        "SHA-256 mismatch for {}: expected {expected}, got {actual}",
         file.display()
     );
     Ok(())
@@ -776,7 +775,7 @@ mod tests {
         );
         let got = parse_sha256sums(content, "coop-v1.tar.gz").unwrap();
         assert_eq!(
-            got,
+            got.to_string(),
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
     }
@@ -787,7 +786,11 @@ mod tests {
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc *coop.tar.gz\n";
         assert_eq!(
             parse_sha256sums(content, "coop.tar.gz"),
-            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string())
+            Some(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .parse()
+                    .unwrap()
+            )
         );
     }
 
@@ -800,7 +803,11 @@ mod tests {
         );
         assert_eq!(
             parse_sha256sums(content, "x.tar.gz"),
-            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string())
+            Some(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    .parse()
+                    .unwrap()
+            )
         );
     }
 
@@ -871,9 +878,13 @@ mod tests {
         fs::write(&path, b"hello world").unwrap();
 
         // sha256("hello world") = b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
-        let correct = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        verify_sha256(&path, correct).unwrap();
-        verify_sha256(&path, &"0".repeat(64)).unwrap_err();
+        let correct: Sha256Hash =
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+                .parse()
+                .unwrap();
+        verify_sha256(&path, &correct).unwrap();
+        let wrong: Sha256Hash = "0".repeat(64).parse().unwrap();
+        verify_sha256(&path, &wrong).unwrap_err();
     }
 
     #[test]
@@ -884,7 +895,11 @@ mod tests {
         );
         assert_eq!(
             parse_sha256sums(content, "x.tar.gz"),
-            Some("1111111111111111111111111111111111111111111111111111111111111111".to_string())
+            Some(
+                "1111111111111111111111111111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap()
+            )
         );
     }
 
@@ -894,7 +909,11 @@ mod tests {
             "3333333333333333333333333333333333333333333333333333333333333333  x.tar.gz\r\n";
         assert_eq!(
             parse_sha256sums(content, "x.tar.gz"),
-            Some("3333333333333333333333333333333333333333333333333333333333333333".to_string())
+            Some(
+                "3333333333333333333333333333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap()
+            )
         );
     }
 

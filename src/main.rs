@@ -2273,7 +2273,7 @@ fn find_git_repo_instance(
                 .is_some_and(|s| {
                     matches!(
                         s.source,
-                        workspace::WorkspaceSource::GitRepo { ref url } if url == repo_url
+                        workspace::WorkspaceSource::GitRepo { ref url } if url.as_str() == repo_url
                     )
                 })
         })
@@ -2552,7 +2552,7 @@ fn resolve_oci_feature_requests(translation: &mut devcontainer::Translation) {
                     key,
                     devcontainer::ReportStatus::Applied,
                     devcontainer::ReportSource::Devcontainer,
-                    feature.installed.digest.clone(),
+                    feature.installed.digest.to_string(),
                     format!(
                         "OCI feature '{}' install.sh sha256 {} will run during setup",
                         feature.installed.id, feature.installed.install_script_hash
@@ -3226,7 +3226,7 @@ fn start_instance(
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
             source: workspace::WorkspaceSource::GitRepo {
-                url: repo_url.to_string(),
+                url: github_repo::GitRepoUrl::new(repo_url),
             },
         };
         state.save(inst)?;
@@ -5018,7 +5018,7 @@ mod tests {
             let state = super::workspace::WorkspaceState {
                 guest_path: super::workspace::default_workspace_path(),
                 source: super::workspace::WorkspaceSource::GitRepo {
-                    url: repo_url.to_string(),
+                    url: super::github_repo::GitRepoUrl::new(repo_url),
                 },
             };
             state.save(&inst).expect("save workspace state");
@@ -5179,7 +5179,7 @@ mod tests {
         let state = super::workspace::WorkspaceState {
             guest_path: super::workspace::default_workspace_path(),
             source: super::workspace::WorkspaceSource::GitRepo {
-                url: repo_url.to_string(),
+                url: super::github_repo::GitRepoUrl::new(repo_url),
             },
         };
         state.save(&inst).expect("save workspace state");

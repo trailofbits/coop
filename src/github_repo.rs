@@ -166,6 +166,71 @@ pub fn detect_workspace_repo(git_dir: &Path) -> Result<Option<RepoSlug>> {
     Ok(parse_repo_slug_from_url(&url))
 }
 
+/// A clone URL passed to `coop up --git-repo`, paired with the
+/// `owner/repo` slug derived from it once at construction.
+///
+/// The slug is computed by [`parse_repo_slug_from_url`] exactly once —
+/// when the value is built or deserialized — rather than re-parsed on
+/// every read. `slug` is `None` for clone URLs that are not GitHub
+/// `owner/repo` URLs (e.g. another host, or a local path); such repos
+/// still clone, they just carry no slug for PAT routing.
+///
+/// On disk the value is a plain URL string (the slug is derived, never
+/// persisted), so `workspace.json` files round-trip unchanged.
+#[derive(Debug, Clone)]
+pub struct GitRepoUrl {
+    url: String,
+    slug: Option<RepoSlug>,
+}
+
+impl GitRepoUrl {
+    /// Build from a clone URL, deriving the slug once.
+    pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        let slug = parse_repo_slug_from_url(&url);
+        Self { url, slug }
+    }
+
+    /// The original clone URL.
+    pub fn as_str(&self) -> &str {
+        &self.url
+    }
+
+    /// The `owner/repo` slug derived from the URL, if it is a GitHub URL.
+    pub fn slug(&self) -> Option<&RepoSlug> {
+        self.slug.as_ref()
+    }
+}
+
+/// Two `GitRepoUrl`s are equal when their clone URLs match; the slug is
+/// derived and never diverges for a given URL.
+impl PartialEq for GitRepoUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+
+impl Eq for GitRepoUrl {}
+
+impl fmt::Display for GitRepoUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.url)
+    }
+}
+
+impl Serialize for GitRepoUrl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.url)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitRepoUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let url = String::deserialize(deserializer)?;
+        Ok(Self::new(url))
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -329,5 +394,46 @@ mod tests {
         let s = slug("a/b");
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, "\"a/b\"");
+    }
+
+    #[test]
+    fn git_repo_url_derives_slug_for_github_url() {
+        let url = GitRepoUrl::new("https://github.com/trailofbits/coop.git");
+        assert_eq!(url.as_str(), "https://github.com/trailofbits/coop.git");
+        assert_eq!(url.slug(), Some(&slug("trailofbits/coop")));
+    }
+
+    #[test]
+    fn git_repo_url_has_no_slug_for_non_github_url() {
+        let url = GitRepoUrl::new("https://gitlab.com/group/project.git");
+        assert_eq!(url.slug(), None);
+        // A repo with no slug still round-trips its clone URL.
+        assert_eq!(url.as_str(), "https://gitlab.com/group/project.git");
+    }
+
+    #[test]
+    fn git_repo_url_serializes_as_bare_string() {
+        let url = GitRepoUrl::new("https://github.com/a/b.git");
+        let json = serde_json::to_string(&url).unwrap();
+        assert_eq!(json, "\"https://github.com/a/b.git\"");
+    }
+
+    #[test]
+    fn git_repo_url_deserializes_and_reparses_slug() {
+        let url: GitRepoUrl = serde_json::from_str("\"https://github.com/a/b\"").unwrap();
+        assert_eq!(url.as_str(), "https://github.com/a/b");
+        assert_eq!(url.slug(), Some(&slug("a/b")));
+    }
+
+    #[test]
+    fn git_repo_url_equality_is_by_url() {
+        assert_eq!(
+            GitRepoUrl::new("https://github.com/a/b"),
+            GitRepoUrl::new("https://github.com/a/b")
+        );
+        assert_ne!(
+            GitRepoUrl::new("https://github.com/a/b"),
+            GitRepoUrl::new("https://github.com/a/c")
+        );
     }
 }

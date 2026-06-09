@@ -208,6 +208,15 @@ impl Hostname {
     }
 }
 
+impl From<std::net::Ipv4Addr> for Hostname {
+    /// An IPv4 literal is always a valid hostname (printable ASCII, no
+    /// whitespace, well under the length cap), so this conversion is
+    /// infallible.
+    fn from(ip: std::net::Ipv4Addr) -> Self {
+        Self(ip.to_string())
+    }
+}
+
 impl std::fmt::Display for Hostname {
     #[mutants::skip] // equivalent: trivial forwarder over self.0
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -967,7 +976,7 @@ impl VmBackend for FirecrackerBackend {
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         let guest_user = persisted_guest_user(cfg, &inst.image);
         Ok(SshTarget {
-            host: Hostname::new(inst.guest_ip())?,
+            host: Hostname::from(inst.guest_ip()),
             port: cfg.ssh_port,
             user: SshUser::new(guest_user.as_str())?,
             key_path: cfg.ssh_key_path(),
@@ -1159,7 +1168,7 @@ pub fn detect_instance_repo(
         "GitHub repo detection is disabled (pat-mode tokens will not be forwarded)",
     )?;
     match &state.source {
-        WorkspaceSource::GitRepo { url } => crate::github_repo::parse_repo_slug_from_url(url),
+        WorkspaceSource::GitRepo { url } => url.slug().cloned(),
         WorkspaceSource::Workspace { host_path } | WorkspaceSource::Mount { host_path } => {
             crate::github_repo::detect_workspace_repo(host_path)
                 .ok()

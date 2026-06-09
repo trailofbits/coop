@@ -47,7 +47,7 @@ pub struct WorkspaceState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceSource {
     Workspace { host_path: PathBuf },
-    GitRepo { url: String },
+    GitRepo { url: crate::github_repo::GitRepoUrl },
     Mount { host_path: PathBuf },
 }
 
@@ -1176,14 +1176,14 @@ mod tests {
         let state = WorkspaceState {
             guest_path: GuestPath::absolute(GUEST_WORKSPACE).unwrap(),
             source: WorkspaceSource::GitRepo {
-                url: "https://github.com/x/y.git".to_string(),
+                url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
             },
         };
         state.save(&inst).expect("save");
         let loaded = try_load_or_warn(&inst, "test").expect("state should load");
         assert!(matches!(
             loaded.source,
-            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
+            WorkspaceSource::GitRepo { ref url } if url.as_str() == "https://github.com/x/y.git"
         ));
     }
 
@@ -1194,7 +1194,7 @@ mod tests {
         let state = WorkspaceState {
             guest_path: GuestPath::absolute("/custom").unwrap(),
             source: WorkspaceSource::GitRepo {
-                url: "https://github.com/x/y.git".to_string(),
+                url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
             },
         };
         state.save(&inst).expect("save");
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(loaded.guest_path.to_string(), "/custom");
         assert!(matches!(
             loaded.source,
-            WorkspaceSource::GitRepo { ref url } if url == "https://github.com/x/y.git"
+            WorkspaceSource::GitRepo { ref url } if url.as_str() == "https://github.com/x/y.git"
         ));
     }
 
@@ -1449,5 +1449,31 @@ Host coop-0\n\
             msg.contains("coop start") || msg.contains("coop destroy"),
             "expected remediation pointer: {msg}"
         );
+    }
+
+    #[test]
+    fn git_repo_source_persists_url_as_bare_string() {
+        // The on-disk format must not change when the url field became a
+        // `GitRepoUrl` newtype: it must still serialize as the tagged
+        // enum with a bare `url` string, and a file written in that exact
+        // shape must still load.
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute(GUEST_WORKSPACE).unwrap(),
+            source: WorkspaceSource::GitRepo {
+                url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
+            },
+        };
+        let value: serde_json::Value = serde_json::to_value(&state).expect("serialize to value");
+        assert_eq!(value["source"]["kind"], "git_repo");
+        assert_eq!(value["source"]["url"], "https://github.com/x/y.git");
+
+        let from_disk: WorkspaceState = serde_json::from_str(&format!(
+            r#"{{"guest_path": "{GUEST_WORKSPACE}", "source": {{"kind": "git_repo", "url": "https://github.com/x/y.git"}}}}"#
+        ))
+        .expect("load on-disk shape");
+        assert!(matches!(
+            from_disk.source,
+            WorkspaceSource::GitRepo { ref url } if url.as_str() == "https://github.com/x/y.git"
+        ));
     }
 }

@@ -2145,8 +2145,15 @@ impl Instance {
         format!("tap{}", self.index)
     }
 
-    pub fn guest_ip(&self) -> String {
-        format!("172.16.0.{}", self.index.as_u32() + 2)
+    /// The guest's IPv4 address on the `172.16.0.0/24` host network.
+    ///
+    /// Derived from the validated [`InstanceIndex`] (`0..=252`), so the
+    /// last octet is always in `2..=254` and the address never fails to
+    /// form — callers receive an [`Ipv4Addr`] directly rather than a
+    /// string they have to re-parse.
+    pub fn guest_ip(&self) -> std::net::Ipv4Addr {
+        let base = u32::from(std::net::Ipv4Addr::new(172, 16, 0, 2));
+        std::net::Ipv4Addr::from(base + self.index.as_u32())
     }
 
     pub fn guest_mac(&self) -> String {
@@ -2413,13 +2420,13 @@ mod tests {
     #[test]
     fn instance_network_derivations_at_boundaries() {
         let lo = test_inst("test", idx(0), PathBuf::from("/tmp/fake"));
-        assert_eq!(lo.guest_ip(), "172.16.0.2");
+        assert_eq!(lo.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 2));
         assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
         assert_eq!(lo.tap_device(), "tap0");
         assert_eq!(lo.vsock_cid(), 3);
 
         let hi = test_inst("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
-        assert_eq!(hi.guest_ip(), "172.16.0.254");
+        assert_eq!(hi.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 254));
         assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
         assert_eq!(hi.tap_device(), "tap252");
         assert_eq!(hi.vsock_cid(), 255);

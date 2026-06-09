@@ -6,11 +6,13 @@
 //! `ghcr.io/devcontainers/features/*`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::cmd::Cmd;
 use crate::sha256_hash::Sha256Hash;
@@ -30,11 +32,70 @@ pub struct FeatureRequest {
     pub options: BTreeMap<String, String>,
 }
 
+/// An OCI content digest restricted to the sha256 algorithm.
+///
+/// Parses and renders as `sha256:<64 lowercase hex>`. The algorithm
+/// prefix is part of the wire form (it is what registry URLs and the
+/// `@digest` reference syntax use), so it is preserved on `Display`; the
+/// hex payload is validated once via [`Sha256Hash`] at parse time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciDigest(Sha256Hash);
+
+impl fmt::Display for OciDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sha256:{}", self.0)
+    }
+}
+
+impl FromStr for OciDigest {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let hex = s
+            .strip_prefix("sha256:")
+            .with_context(|| format!("OCI digest must start with 'sha256:': {s:?}"))?;
+        Ok(Self(hex.parse()?))
+    }
+}
+
+impl Serialize for OciDigest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for OciDigest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        s.parse()
+            .map_err(|e: anyhow::Error| serde::de::Error::custom(format!("{e:#}")))
+    }
+}
+
+/// How a feature pins its registry artifact: a mutable `:tag` or an
+/// immutable `@sha256:` digest. The two have different syntax and
+/// different guarantees (a digest is content-addressable), so they are
+/// kept distinct rather than conflated in one string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OciRef {
+    Tag(String),
+    Digest(OciDigest),
+}
+
+impl fmt::Display for OciRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tag(tag) => f.write_str(tag),
+            Self::Digest(digest) => write!(f, "{digest}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciReference {
     pub host: String,
     pub repository: String,
-    pub reference: String,
+    pub reference: OciRef,
 }
 
 impl OciReference {
@@ -48,7 +109,7 @@ impl OciReference {
 pub struct InstalledFeature {
     pub id: String,
     pub reference: String,
-    pub digest: String,
+    pub digest: OciDigest,
     pub install_script_hash: Sha256Hash,
 }
 
@@ -125,13 +186,19 @@ fn parse_supported_reference(raw_id: &str) -> Result<Option<OciReference>> {
         return Ok(None);
     };
     let (name, reference) = if let Some((name, digest)) = repo_and_ref.split_once('@') {
-        (name, digest)
+        let digest: OciDigest = digest
+            .parse()
+            .with_context(|| format!("invalid feature digest in {raw_id:?}"))?;
+        (name, OciRef::Digest(digest))
     } else if let Some((name, tag)) = repo_and_ref.rsplit_once(':') {
-        (name, tag)
+        if tag.is_empty() {
+            bail!("expected ghcr.io/devcontainers/features/<name>[:tag|@digest]");
+        }
+        (name, OciRef::Tag(tag.to_string()))
     } else {
-        (repo_and_ref, "latest")
+        (repo_and_ref, OciRef::Tag("latest".to_string()))
     };
-    if name.is_empty() || reference.is_empty() {
+    if name.is_empty() {
         bail!("expected ghcr.io/devcontainers/features/<name>[:tag|@digest]");
     }
     if !name
@@ -143,7 +210,7 @@ fn parse_supported_reference(raw_id: &str) -> Result<Option<OciReference>> {
     Ok(Some(OciReference {
         host: GHCR_HOST.to_string(),
         repository: format!("{SUPPORTED_REPO_PREFIX}{name}"),
-        reference: reference.to_string(),
+        reference,
     }))
 }
 
@@ -223,11 +290,14 @@ fn resolved_feature_from_archive(
     if install_script.trim().is_empty() {
         bail!("feature install.sh is empty");
     }
+    let digest: OciDigest = manifest_digest.parse().with_context(|| {
+        format!("registry returned unexpected manifest digest {manifest_digest:?}")
+    })?;
     Ok(ResolvedFeature {
         installed: InstalledFeature {
             id,
             reference: req.raw_id.clone(),
-            digest: manifest_digest.to_string(),
+            digest,
             install_script_hash: Sha256Hash::of(&install_script),
         },
         install_script,
@@ -435,6 +505,10 @@ fn shell_single_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    // A syntactically valid sha256 OCI digest for fixtures.
+    const SAMPLE_DIGEST: &str =
+        "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
     #[test]
     fn parse_supported_reference_defaults_to_latest() {
         let req = parse_feature_request(
@@ -447,7 +521,7 @@ mod tests {
             req.reference.repository,
             "devcontainers/features/github-cli"
         );
-        assert_eq!(req.reference.reference, "latest");
+        assert_eq!(req.reference.reference, OciRef::Tag("latest".to_string()));
     }
 
     #[test]
@@ -458,7 +532,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(req.reference.reference, "1.2.3");
+        assert_eq!(req.reference.reference, OciRef::Tag("1.2.3".to_string()));
         assert_eq!(req.options["version"], "1.24");
         assert_eq!(req.options["moby"], "true");
     }
@@ -479,7 +553,7 @@ mod tests {
             installed: InstalledFeature {
                 id: "github-cli".to_string(),
                 reference: "ghcr.io/devcontainers/features/github-cli:1".to_string(),
-                digest: "sha256:abc".to_string(),
+                digest: SAMPLE_DIGEST.parse().unwrap(),
                 install_script_hash: Sha256Hash::of("echo install"),
             },
             install_script: "echo \"$VERSION\"".to_string(),
@@ -553,13 +627,13 @@ mod tests {
             reference: OciReference {
                 host: GHCR_HOST.to_string(),
                 repository: "devcontainers/features/sample".to_string(),
-                reference: "1".to_string(),
+                reference: OciRef::Tag("1".to_string()),
             },
             options: BTreeMap::new(),
         };
         let resolved = resolved_feature_from_archive(
             &req,
-            "sha256:manifest",
+            SAMPLE_DIGEST,
             FeatureMetadata {
                 id: Some("sample".to_string()),
                 name: None,
@@ -569,7 +643,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.installed.id, "sample");
-        assert_eq!(resolved.installed.digest, "sha256:manifest");
+        assert_eq!(resolved.installed.digest.to_string(), SAMPLE_DIGEST);
         assert!(resolved.install_script.contains("./helper.sh"));
         assert_eq!(resolved.archive, std::fs::read(&archive).unwrap());
         assert!(compose_install_snippet(&resolved).contains(&base64_encode(&resolved.archive)));
@@ -582,5 +656,66 @@ mod tests {
             parse_docker_content_digest(headers).as_deref(),
             Some("sha256:manifest")
         );
+    }
+
+    #[test]
+    fn oci_digest_round_trips_with_prefix() {
+        let digest: OciDigest = SAMPLE_DIGEST.parse().unwrap();
+        assert_eq!(digest.to_string(), SAMPLE_DIGEST);
+    }
+
+    #[test]
+    fn oci_digest_rejects_missing_prefix() {
+        let bare = SAMPLE_DIGEST.strip_prefix("sha256:").unwrap();
+        assert!(bare.parse::<OciDigest>().is_err());
+    }
+
+    #[test]
+    fn oci_digest_rejects_bad_hex() {
+        assert!("sha256:not-hex".parse::<OciDigest>().is_err());
+        assert!("sha256:abc".parse::<OciDigest>().is_err());
+    }
+
+    #[test]
+    fn oci_digest_serde_round_trips_as_string() {
+        let digest: OciDigest = SAMPLE_DIGEST.parse().unwrap();
+        let json = serde_json::to_string(&digest).unwrap();
+        assert_eq!(json, format!("\"{SAMPLE_DIGEST}\""));
+        let parsed: OciDigest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, digest);
+    }
+
+    #[test]
+    fn parse_supported_reference_accepts_digest() {
+        let req = parse_feature_request(
+            &format!("ghcr.io/devcontainers/features/go@{SAMPLE_DIGEST}"),
+            &serde_json::json!({}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            req.reference.reference,
+            OciRef::Digest(SAMPLE_DIGEST.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_supported_reference_rejects_malformed_digest() {
+        let err = parse_feature_request(
+            "ghcr.io/devcontainers/features/go@sha256:nope",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("digest"),
+            "expected digest error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oci_ref_display_matches_wire_form() {
+        assert_eq!(OciRef::Tag("1.2.3".to_string()).to_string(), "1.2.3");
+        let digest: OciDigest = SAMPLE_DIGEST.parse().unwrap();
+        assert_eq!(OciRef::Digest(digest).to_string(), SAMPLE_DIGEST);
     }
 }
