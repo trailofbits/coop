@@ -112,9 +112,32 @@ pub fn project_preference_key(project: &Path) -> Result<String> {
 pub fn project_preference_lookup_key(project: &Path) -> Result<String> {
     match project_preference_key(project) {
         Ok(key) => Ok(key),
-        Err(_) if project.is_absolute() => Ok(project.to_string_lossy().into_owned()),
+        Err(_) if project.is_absolute() => Ok(canonicalize_deleted_project(project)
+            .to_string_lossy()
+            .into_owned()),
         Err(e) => Err(e),
     }
+}
+
+/// Best-effort canonical path for a project whose directory no longer exists.
+///
+/// Opt-outs are stored under the canonical project path, but `canonicalize`
+/// fails once the directory is deleted. Resolving symlinks only in the
+/// longest existing ancestor (on macOS `/var` is a symlink to `/private/var`)
+/// and re-appending the missing tail keeps the lookup key aligned with the
+/// key recorded at `ignore` time. Falls back to the path as given when no
+/// ancestor resolves.
+fn canonicalize_deleted_project(project: &Path) -> PathBuf {
+    for ancestor in project.ancestors() {
+        let Ok(canonical) = ancestor.canonicalize() else {
+            continue;
+        };
+        return match project.strip_prefix(ancestor) {
+            Ok(tail) => canonical.join(tail),
+            Err(_) => canonical,
+        };
+    }
+    project.to_path_buf()
 }
 
 // ── Parsing ──────────────────────────────────────────────────
@@ -2286,6 +2309,31 @@ mod tests {
             Some(key.as_str())
         );
         assert!(prefs.clear(Path::new(&key)).unwrap());
+        assert!(prefs.ignored_projects().next().is_none());
+    }
+
+    #[test]
+    fn devcontainer_preferences_clear_deleted_project_through_symlinked_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let project = link.join("project");
+        fs::create_dir(&project).unwrap();
+
+        let mut prefs = DevcontainerPreferences::default();
+        let key = prefs.set_ignored(&project).unwrap();
+        // The stored key resolves the symlink: it points through `real`,
+        // not the `link` path used to record it.
+        let canonical_project = real.canonicalize().unwrap().join("project");
+        assert_eq!(key, canonical_project.to_string_lossy());
+
+        fs::remove_dir(&project).unwrap();
+
+        // Clearing through the original symlinked path must resolve to the
+        // same canonical key recorded at ignore time, even after deletion.
+        assert!(prefs.clear(&project).unwrap());
         assert!(prefs.ignored_projects().next().is_none());
     }
 }
