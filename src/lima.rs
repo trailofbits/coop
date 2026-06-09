@@ -102,9 +102,9 @@ pub fn create_and_start(
     };
 
     // Clean up leftover Lima instance from a previous failed start
-    if let Some(status) = lima_status(&inst.name) {
+    if let Some(state) = lima_state(&inst.name) {
         tracing::warn!(
-            "Lima instance '{name}' already exists (status: {status}) — \
+            "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
         if let Err(e) = Command::new("limactl")
@@ -239,7 +239,7 @@ pub fn destroy(inst: &Instance) -> Result<()> {
     tracing::info!("Deleting Lima instance '{name}'");
 
     // If the instance doesn't exist in Lima, nothing to do
-    if lima_status(&inst.name).is_none() {
+    if lima_state(&inst.name).is_none() {
         tracing::debug!("Lima instance '{name}' not found — already deleted");
         return Ok(());
     }
@@ -334,19 +334,59 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
     Ok(dir.join("diffdisk"))
 }
 
+/// The lifecycle state Lima reports for an instance.
+///
+/// `limactl list --json` emits a free-form `status` string; this enum
+/// captures the values we act on (`Running`, `Stopped`, `Broken`) and
+/// preserves anything else verbatim in `Unknown` so a new Lima state
+/// can't be silently misread as "not running".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LimaState {
+    Running,
+    Stopped,
+    Broken,
+    Unknown(String),
+}
+
+impl LimaState {
+    fn from_status_str(s: &str) -> Self {
+        match s {
+            "Running" => Self::Running,
+            "Stopped" => Self::Stopped,
+            "Broken" => Self::Broken,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            Self::Running => true,
+            Self::Stopped | Self::Broken | Self::Unknown(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for LimaState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => f.write_str("Running"),
+            Self::Stopped => f.write_str("Stopped"),
+            Self::Broken => f.write_str("Broken"),
+            Self::Unknown(s) => f.write_str(s),
+        }
+    }
+}
+
 /// Check if a Lima instance is running.
 pub fn is_running(inst: &Instance) -> bool {
-    match lima_status(&inst.name) {
-        Some(s) => s == "Running",
-        None => false,
-    }
+    lima_state(&inst.name).is_some_and(|s| s.is_running())
 }
 
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let info = limactl_info(&inst.name)?;
 
-    let status_str = info["status"].as_str().unwrap_or("Unknown");
+    let state = LimaState::from_status_str(info["status"].as_str().unwrap_or("Unknown"));
     let arch = info["arch"].as_str().unwrap_or("unknown");
     let cpus = info["cpus"].as_u64().unwrap_or(0);
     let memory_bytes = info["memory"].as_u64().unwrap_or(0);
@@ -362,7 +402,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let ssh_port = info["sshLocalPort"].as_u64().unwrap_or(0);
 
     let mut out = format!(
-        "Instance '{}' ({status_str})\n\
+        "Instance '{}' ({state})\n\
          \x20 Backend: lima\n\
          \x20 Arch: {arch}\n\
          \x20 vCPUs: {cpus}\n\
@@ -373,7 +413,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         cfg.ssh_key_path().display(),
     );
 
-    if status_str == "Running"
+    if state.is_running()
         && let Ok(target) = ssh_target(cfg, inst)
         && let Some(usage) = crate::backend::query_resource_usage(&target)
     {
@@ -1548,10 +1588,11 @@ fn lima_home() -> Result<PathBuf> {
     Ok(home.join(".lima"))
 }
 
-/// Get the status string for a Lima instance ("Running", "Stopped", etc.).
-fn lima_status(name: &InstanceName) -> Option<String> {
+/// Get the lifecycle state for a Lima instance, or `None` if the
+/// instance is not present in `limactl list`.
+fn lima_state(name: &InstanceName) -> Option<LimaState> {
     let info = limactl_info(name).ok()?;
-    info["status"].as_str().map(String::from)
+    info["status"].as_str().map(LimaState::from_status_str)
 }
 
 /// Get full instance info from limactl for a coop instance.
@@ -1956,5 +1997,39 @@ Host h
     fn parse_ssh_config_port_out_of_range_rejected() {
         let content = "Host h\n  Port 99999\n";
         assert!(super::parse_ssh_config_port(content).is_none());
+    }
+
+    #[test]
+    fn lima_state_parses_known_states() {
+        assert_eq!(LimaState::from_status_str("Running"), LimaState::Running);
+        assert_eq!(LimaState::from_status_str("Stopped"), LimaState::Stopped);
+        assert_eq!(LimaState::from_status_str("Broken"), LimaState::Broken);
+    }
+
+    #[test]
+    fn lima_state_preserves_unknown_status() {
+        assert_eq!(
+            LimaState::from_status_str("Restarting"),
+            LimaState::Unknown("Restarting".to_string()),
+        );
+    }
+
+    #[test]
+    fn lima_state_only_running_is_running() {
+        assert!(LimaState::Running.is_running());
+        assert!(!LimaState::Stopped.is_running());
+        assert!(!LimaState::Broken.is_running());
+        assert!(!LimaState::Unknown("Restarting".to_string()).is_running());
+    }
+
+    #[test]
+    fn lima_state_display_roundtrips_status_text() {
+        assert_eq!(LimaState::Running.to_string(), "Running");
+        assert_eq!(LimaState::Stopped.to_string(), "Stopped");
+        assert_eq!(LimaState::Broken.to_string(), "Broken");
+        assert_eq!(
+            LimaState::Unknown("Restarting".to_string()).to_string(),
+            "Restarting"
+        );
     }
 }

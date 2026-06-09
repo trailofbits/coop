@@ -3745,8 +3745,16 @@ fn cmd_status(
 ) -> Result<()> {
     if let Some(name) = name {
         let inst = cfg.resolve_instance(Some(name))?;
-        let status = be.status(cfg, &inst)?;
-        writeln!(std::io::stdout(), "{status}")
+        let report = if be.is_running(&inst) {
+            let running = be.as_running(cfg, inst)?;
+            be.status(cfg, &running)?
+        } else {
+            format!(
+                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}",
+                inst.name, inst.image,
+            )
+        };
+        writeln!(std::io::stdout(), "{report}")
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
     } else {
         let instances = cfg.list_instances()?;
@@ -3756,16 +3764,16 @@ fn cmd_status(
             return Ok(());
         }
         for inst in &instances {
-            let running = be.is_running(inst);
-            let state = if running { "running" } else { "stopped" };
-            let usage_str = if running {
-                be.ssh_target(cfg, inst)
+            let (state, usage_str) = if be.is_running(inst) {
+                let usage = be
+                    .as_running(cfg, inst.clone())
                     .ok()
-                    .and_then(|t| backend::query_resource_usage(&t))
+                    .and_then(|running| backend::query_resource_usage(running.target()))
                     .map(|u| format!("  {}", u.summary()))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                ("running", usage)
             } else {
-                String::new()
+                ("stopped", String::new())
             };
             writeln!(
                 std::io::stdout(),
@@ -3790,10 +3798,11 @@ fn cmd_resize(
     let inst = cfg.resolve_instance(name)?;
     let disk_size = config::DiskSize::parse(size)?;
 
-    let current = current_disk_gib(be, &inst)?;
+    let stopped = be.as_stopped(inst)?;
+    let current = current_disk_gib(be, stopped.instance())?;
     let new_size = disk_size.resolve(current)?;
 
-    be.resize_disk(cfg, &inst, new_size)
+    be.resize_disk(cfg, &stopped, new_size)
 }
 
 fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {

@@ -140,6 +140,36 @@ impl RunningInstance {
     }
 }
 
+// ── Stopped instance ──────────────────────────────────────────
+
+/// Proof that an instance is currently *not* running. Construct via
+/// [`VmBackend::as_stopped`] — like [`RunningInstance`], the
+/// constructor is the single place that probes live state, so
+/// operations taking a `StoppedInstance` can rely on the precondition
+/// without re-checking.
+///
+/// No SSH target is carried: a stopped VM has nothing to connect to.
+/// The field is private so a `StoppedInstance` cannot be forged; the
+/// only way to obtain one is through a backend method that verified
+/// the instance is not alive.
+pub struct StoppedInstance {
+    inst: Instance,
+}
+
+impl StoppedInstance {
+    /// Mint a `StoppedInstance` after a successful live-state probe.
+    ///
+    /// Crate-private so only backend impls can construct one. Callers
+    /// use [`VmBackend::as_stopped`] (which delegates here).
+    pub(crate) fn new(inst: Instance) -> Self {
+        Self { inst }
+    }
+
+    pub fn instance(&self) -> &Instance {
+        &self.inst
+    }
+}
+
 // ── SSH target ────────────────────────────────────────────────
 
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -717,10 +747,13 @@ pub trait VmBackend: std::fmt::Display {
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
+    /// Resize a stopped instance's disk. Takes a [`StoppedInstance`]
+    /// proof so the "must be stopped" precondition is enforced by the
+    /// type system rather than a runtime guard.
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
-        inst: &Instance,
+        stopped: &StoppedInstance,
         new_size: crate::config::GiB,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
@@ -734,7 +767,16 @@ pub trait VmBackend: std::fmt::Display {
     /// `Instance` is consumed; on `Err` callers can clone before
     /// calling if they need to keep working with it.
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<RunningInstance>;
-    fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String>;
+    /// Probe the live state of `inst` and return a [`StoppedInstance`]
+    /// if it is not running. The dual of [`Self::as_running`] — used
+    /// to gate operations (like `resize_disk`) that require the VM to
+    /// be stopped. Returns `Err` when the instance is running.
+    fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance>;
+    /// Render a human-readable status report for a running instance.
+    /// Takes `&RunningInstance` so the precondition is part of the
+    /// signature — status reporting probes the live guest (load,
+    /// memory) and only makes sense while the VM is up.
+    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String>;
     /// Stream logs from a running instance.
     ///
     /// Takes `&RunningInstance` so the running precondition is part
@@ -873,19 +915,11 @@ impl VmBackend for FirecrackerBackend {
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
-        inst: &Instance,
+        stopped: &StoppedInstance,
         new_size: crate::config::GiB,
     ) -> Result<()> {
-        if self.is_running(inst) {
-            bail!(
-                "Instance '{}' is running — stop it first with \
-                 `coop stop {}`",
-                inst.name,
-                inst.name,
-            );
-        }
         let _ = cfg;
-        crate::setup::resize_rootfs(inst, new_size)
+        crate::setup::resize_rootfs(stopped.instance(), new_size)
     }
 
     fn is_running(&self, inst: &Instance) -> bool {
@@ -905,8 +939,20 @@ impl VmBackend for FirecrackerBackend {
         Ok(RunningInstance::new(inst, target))
     }
 
-    fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-        let vm = crate::vm::FirecrackerVm::from_running(cfg, inst)?;
+    fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
+        if inst.is_running() {
+            bail!(
+                "Instance '{}' is running — stop it first with \
+                 `coop stop {}`",
+                inst.name,
+                inst.name,
+            );
+        }
+        Ok(StoppedInstance::new(inst))
+    }
+
+    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
+        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
         vm.status()
     }
 
@@ -1023,18 +1069,10 @@ impl VmBackend for LimaBackend {
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
-        inst: &Instance,
+        stopped: &StoppedInstance,
         new_size: crate::config::GiB,
     ) -> Result<()> {
-        if self.is_running(inst) {
-            bail!(
-                "Instance '{}' is running — stop it first with \
-                 `coop stop {}`",
-                inst.name,
-                inst.name,
-            );
-        }
-        crate::lima::resize_disk(cfg, inst, new_size)
+        crate::lima::resize_disk(cfg, stopped.instance(), new_size)
     }
 
     fn is_running(&self, inst: &Instance) -> bool {
@@ -1052,8 +1090,20 @@ impl VmBackend for LimaBackend {
         Ok(RunningInstance::new(inst, target))
     }
 
-    fn status(&self, cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-        crate::lima::status(cfg, inst)
+    fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
+        if crate::lima::is_running(&inst) {
+            bail!(
+                "Instance '{}' is running — stop it first with \
+                 `coop stop {}`",
+                inst.name,
+                inst.name,
+            );
+        }
+        Ok(StoppedInstance::new(inst))
+    }
+
+    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
+        crate::lima::status(cfg, running.instance())
     }
 
     fn stream_logs(
