@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use thiserror::Error;
 
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
@@ -377,24 +378,66 @@ fn probe_user(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn probe_repo(token: &str, repo: &RepoSlug) -> Result<()> {
+/// Distinct outcomes of probing `GET /repos/{owner}/{repo}` with a PAT.
+///
+/// The recovery path ([`crate::pat_prompt`]) branches on these: a 404
+/// usually means the slug is wrong or the token's resource owner doesn't
+/// match, while a 403 is almost always the org's fine-grained-PAT policy
+/// blocking an otherwise-valid token. Folding both into one `bail!` string
+/// forced recovery to string-match the message; the enum lets it react per
+/// case. Errors propagate through `anyhow` and are recovered with
+/// `downcast_ref::<ProbeError>()`.
+#[derive(Debug, Error)]
+pub enum ProbeError {
+    /// HTTP 403 — typically the org's fine-grained-PAT approval policy.
+    #[error(
+        "GET /repos/{repo} returned 403. This is often the org's \
+         fine-grained PAT policy: ask an org admin to approve \
+         fine-grained PATs, or to approve your specific token."
+    )]
+    OrgPolicyBlock { repo: RepoSlug },
+    /// HTTP 404 — wrong slug, or the PAT's resource owner doesn't match.
+    #[error(
+        "GET /repos/{repo} returned 404. Check the repo slug and \
+         that the PAT was generated with the right resource owner."
+    )]
+    NotFound { repo: RepoSlug },
+    /// Any other non-200 status.
+    #[error("GET /repos/{repo} returned HTTP {status}")]
+    Unexpected { repo: RepoSlug, status: u16 },
+    /// The request itself failed (curl error or an unparsable response).
+    #[error("failed to query GET /repos/{repo}")]
+    Transport {
+        repo: RepoSlug,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+fn probe_repo(token: &str, repo: &RepoSlug) -> Result<(), ProbeError> {
     let url = format!("https://api.github.com/repos/{repo}");
-    let (status, _body) = curl_with_token(token, &url)?;
+    let (status, _body) = curl_with_token(token, &url).map_err(|source| ProbeError::Transport {
+        repo: repo.clone(),
+        source: source.into(),
+    })?;
+    classify_repo_probe(status, repo)?;
+    eprintln!("  ✓ /repos/{repo}");
+    Ok(())
+}
+
+/// Map an HTTP status from `GET /repos/{repo}` to a [`ProbeError`].
+///
+/// Pure (no I/O) so the status-to-variant mapping can be unit-tested
+/// without shelling out to `curl`.
+fn classify_repo_probe(status: u16, repo: &RepoSlug) -> Result<(), ProbeError> {
     match status {
-        200 => {
-            eprintln!("  ✓ /repos/{repo}");
-            Ok(())
-        }
-        403 => bail!(
-            "GET /repos/{repo} returned 403. This is often the org's \
-             fine-grained PAT policy: ask an org admin to approve \
-             fine-grained PATs, or to approve your specific token."
-        ),
-        404 => bail!(
-            "GET /repos/{repo} returned 404. Check the repo slug and \
-             that the PAT was generated with the right resource owner."
-        ),
-        other => bail!("GET /repos/{repo} returned HTTP {other}"),
+        200 => Ok(()),
+        403 => Err(ProbeError::OrgPolicyBlock { repo: repo.clone() }),
+        404 => Err(ProbeError::NotFound { repo: repo.clone() }),
+        other => Err(ProbeError::Unexpected {
+            repo: repo.clone(),
+            status: other,
+        }),
     }
 }
 
@@ -939,6 +982,32 @@ mod tests {
 
     fn slug(s: &str) -> RepoSlug {
         RepoSlug::new(s).unwrap()
+    }
+
+    #[test]
+    fn classify_repo_probe_ok_on_200() {
+        assert!(classify_repo_probe(200, &slug("trailofbits/coop")).is_ok());
+    }
+
+    #[test]
+    fn classify_repo_probe_403_is_org_policy_block() {
+        let err = classify_repo_probe(403, &slug("trailofbits/coop")).unwrap_err();
+        assert!(matches!(err, ProbeError::OrgPolicyBlock { .. }));
+        assert!(err.to_string().contains("fine-grained PAT policy"));
+    }
+
+    #[test]
+    fn classify_repo_probe_404_is_not_found() {
+        let err = classify_repo_probe(404, &slug("trailofbits/nope")).unwrap_err();
+        assert!(matches!(err, ProbeError::NotFound { .. }));
+        assert!(err.to_string().contains("Check the repo slug"));
+    }
+
+    #[test]
+    fn classify_repo_probe_other_status_is_unexpected() {
+        let err = classify_repo_probe(500, &slug("trailofbits/coop")).unwrap_err();
+        assert!(matches!(err, ProbeError::Unexpected { status: 500, .. }));
+        assert!(err.to_string().contains("HTTP 500"));
     }
 
     #[test]

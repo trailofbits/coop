@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::{CoopConfig, GitHubAuth};
-use crate::github_pat::{self, SetupOpts};
+use crate::github_pat::{self, ProbeError, SetupOpts};
 use crate::github_repo::RepoSlug;
 
 /// Effective answer to "should we offer the user a PAT wizard right now?"
@@ -163,6 +163,7 @@ fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) 
     match github_pat::run_setup_pat(cfg, &opts) {
         Ok(()) => Ok(()),
         Err(e) => {
+            explain_probe_failure(&e);
             tracing::warn!("PAT setup failed ({e}); falling back to unauthenticated start");
             eprint!("continue without GitHub auth? [y/N] ");
             std::io::stderr().flush().ok();
@@ -174,6 +175,31 @@ fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) 
                 Err(e)
             }
         }
+    }
+}
+
+/// Print recovery guidance tailored to a [`ProbeError`], if that is what
+/// the wizard failed on. A 404 means the slug or resource owner is wrong —
+/// continuing unauthenticated won't help a private repo, so the user should
+/// fix and retry. A 403 means the token is valid but the org blocks it —
+/// public clones still work, only private operations fail. Other failures
+/// fall through to the generic continue prompt with no extra guidance.
+fn explain_probe_failure(err: &anyhow::Error) {
+    match err.downcast_ref::<ProbeError>() {
+        Some(ProbeError::NotFound { repo }) => {
+            eprintln!(
+                "'{repo}' wasn't found with this token. Check the slug and that the \
+                 PAT's resource owner matches, then retry: coop github setup-pat --repo {repo}"
+            );
+        }
+        Some(ProbeError::OrgPolicyBlock { .. }) => {
+            eprintln!(
+                "The token is valid but the org blocks fine-grained PATs. Public repos \
+                 still clone unauthenticated; private pushes will fail until an org admin \
+                 approves the token."
+            );
+        }
+        _ => {}
     }
 }
 
