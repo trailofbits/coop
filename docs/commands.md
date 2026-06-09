@@ -178,16 +178,6 @@ coop setup -y --workspace . --devcontainer .devcontainer/devcontainer.json
 
 See [docs/devcontainer.md](devcontainer.md) for the subset of `devcontainer.json` coop reads.
 
-### `build`
-
-Rebuild the rootfs image and fetch the kernel. Use `setup` for first-time installation; `build` handles subsequent rebuilds.
-
-```
-coop build
-```
-
-No additional flags.
-
 ### `devcontainer check`
 
 Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM. Setup-stage checks resolve supported public GHCR OCI Features so the report can show the digest and `install.sh` hash that would run.
@@ -243,16 +233,9 @@ instances, pass the instance name.
 | Flag | Description |
 |------|-------------|
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
-| `--workspace <dir>` | Restart the stopped instance associated with this project path (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Deprecated creation option; rejected on restart |
-| `--vcpus <N>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--mem <MiB>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--disk <GiB>` | Creation-time option retained only for compatibility; rejected on restart |
+| `--workspace <dir>` | Restart the stopped instance associated with this project path |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
-| `--image <name>` | Creation-time option retained only for compatibility; rejected on restart |
-| `--mount <spec>` | Creation-time option retained only for compatibility; rejected on restart |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
-| `--exclude-git` | Creation-time option retained only for compatibility; rejected on restart |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |

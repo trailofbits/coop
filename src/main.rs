@@ -27,7 +27,6 @@ mod lima;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod network;
 mod prompt;
-mod rootfs;
 mod signal;
 // Setup is an interactive CLI workflow — stderr output is intentional user communication.
 #[cfg_attr(
@@ -234,8 +233,6 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Build rootfs image and fetch kernel (use `setup` for first-time install)
-    Build,
     /// Inspect devcontainer.json support without starting setup or a VM
     Devcontainer {
         #[command(subcommand)]
@@ -246,49 +243,17 @@ enum Commands {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
         #[arg(value_parser = config::InstanceName::parse)]
         name: Option<config::InstanceName>,
-        /// Deprecated profile shorthand; use `coop up --profile`.
-        #[arg(long, value_delimiter = ',', hide = true)]
-        profile: Vec<String>,
         /// Project directory used to select an associated stopped instance
-        #[arg(long, conflicts_with = "git_repo")]
-        workspace: Option<String>,
-        /// Deprecated creation option; rejected by `coop start`
-        #[arg(long, conflicts_with = "workspace")]
-        git_repo: Option<String>,
-        /// Creation-time option; rejected by `coop start`
         #[arg(long)]
-        vcpus: Option<u8>,
-        /// Creation-time option; rejected by `coop start`
-        #[arg(long, value_parser = config::MiB::parse_cli)]
-        mem: Option<config::MiB>,
-        /// Creation-time option; rejected by `coop start`
-        #[arg(long, value_parser = config::GiB::parse_cli)]
-        disk: Option<config::GiB>,
+        workspace: Option<String>,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
-        /// Creation-time option; rejected by `coop start`
-        #[arg(
-            long,
-            conflicts_with_all = ["workspace", "git_repo"],
-            value_parser = config::Mount::parse,
-        )]
-        mount: Vec<config::Mount>,
         /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
         /// `--forward-port 3000` forwards guest 3000 to host 3000;
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
         #[arg(long, value_parser = config::PortForward::parse)]
         forward_port: Vec<config::PortForward>,
-        /// Explicit named image; rejected by `coop start`
-        #[arg(
-            long,
-            value_parser = config::ImageName::parse,
-            add = ArgValueCandidates::new(completions::image_candidates),
-        )]
-        image: Option<config::ImageName>,
-        /// Creation-time option; rejected by `coop start`
-        #[arg(long, conflicts_with = "git_repo")]
-        exclude_git: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
         /// when one is missing for the resolved repo.
         #[arg(long)]
@@ -934,23 +899,11 @@ fn main() -> Result<()> {
                 },
             )
         }
-        Commands::Build => {
-            let validated = cfg.validate_and_warn()?;
-            cmd_build(&cfg, &validated)
-        }
         Commands::Devcontainer { command } => cmd_devcontainer(&cfg, &command),
         Commands::Start {
             name,
-            profile,
             workspace,
-            git_repo,
-            vcpus,
-            mem,
-            disk,
             no_agents,
-            mount: mounts,
-            image,
-            exclude_git,
             no_prompt,
             post_start,
             guest_env,
@@ -965,27 +918,15 @@ fn main() -> Result<()> {
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            if !profile.is_empty() {
-                bail!(
-                    "`coop start --profile` has moved to `coop up --profile`.\n\
-                     Run `coop up --profile {}` to create or reuse a project environment with that profile-derived image.",
-                    canonical_profile_list(&profile).join(","),
-                );
-            }
-            let image_explicit = image.is_some();
             if dry_run {
                 let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
-                let dry_run_image = image.clone().unwrap_or_else(config::default_image_name);
+                let dry_run_image = config::default_image_name();
                 let inputs = devcontainer::TranslatorInputs {
-                    cli_vcpus: vcpus,
-                    cli_mem_mib: mem,
-                    cli_disk_gib: disk,
                     cli_post_start: post_start.clone(),
                     cli_guest_env_keys: cli_env_keys,
                     cli_forward_ports: forward_ports.clone(),
-                    cli_mounts: mounts.clone(),
                     persisted_guest_user: Some(backend::persisted_guest_user(&cfg, &dry_run_image)),
-                    cli_workspace_or_git_repo: workspace.is_some() || git_repo.is_some(),
+                    cli_workspace_or_git_repo: workspace.is_some(),
                     ..devcontainer::TranslatorInputs::default()
                 };
                 let ws_path = workspace.as_deref().map(Path::new);
@@ -998,8 +939,8 @@ fn main() -> Result<()> {
                         input: &dc_input,
                         dry_run,
                         workspace: ws_path,
-                        mounts: &mounts,
-                        git_repo: git_repo.as_deref(),
+                        mounts: &[],
+                        git_repo: None,
                         github_auth: cfg.github.as_ref(),
                         preference_path: Some(&cfg.devcontainer_preferences_path()),
                     },
@@ -1009,24 +950,15 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            if vcpus.is_some() || mem.is_some() {
-                bail!(
-                    "`coop start` only starts stopped instances; VM sizing options belong to `coop up`."
-                );
-            }
-
             let mut start_opts = StartOpts {
                 name: name.as_ref(),
-                image: StartImage {
-                    explicit: image_explicit,
-                },
                 workspace_dir: workspace.as_deref(),
-                git_repo: git_repo.as_deref(),
+                git_repo: None,
                 no_agents,
                 no_prompt,
-                disk,
-                mounts,
-                exclude_git,
+                disk: None,
+                mounts: Vec::new(),
+                exclude_git: false,
                 forward_ports,
                 config_path: &cli.config,
                 post_start_override: post_start.as_deref(),
@@ -1035,7 +967,6 @@ fn main() -> Result<()> {
                 applied_devcontainer: None,
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
-            apply_vm_overrides(&mut cfg, vcpus, mem, None)?;
             apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
             cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
         }
@@ -1546,9 +1477,6 @@ fn create_up_instance(
 
     let start_opts = StartOpts {
         name: None,
-        image: StartImage {
-            explicit: opts.image.is_some(),
-        },
         workspace_dir: workspace_dir.as_deref(),
         git_repo: None,
         no_agents: opts.runtime.no_agents,
@@ -1634,9 +1562,6 @@ fn create_git_repo_instance(
 
     let start_opts = StartOpts {
         name: None,
-        image: StartImage {
-            explicit: opts.image.is_some(),
-        },
         workspace_dir: None,
         git_repo: Some(repo_url),
         no_agents: opts.runtime.no_agents,
@@ -1720,7 +1645,6 @@ fn project_dir_to_str(project_dir: &Path) -> Result<String> {
 fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -> StartOpts<'a> {
     StartOpts {
         name: None,
-        image: StartImage { explicit: false },
         workspace_dir: None,
         git_repo: None,
         no_agents: opts.runtime.no_agents,
@@ -2057,7 +1981,6 @@ fn cmd_quickstart(
                 &validated,
                 &StartOpts {
                     name: Some(&inst.name),
-                    image: StartImage { explicit: false },
                     workspace_dir: None,
                     git_repo: None,
                     no_agents: false,
@@ -2157,7 +2080,6 @@ fn quickstart_fresh_start(
 
     let start_opts = StartOpts {
         name: None,
-        image: StartImage { explicit: false },
         workspace_dir: workspace_str,
         git_repo: None,
         no_agents: false,
@@ -2738,13 +2660,6 @@ fn devcontainer_check_assumed_guest_user(
         .unwrap_or_default()
 }
 
-fn cmd_build(cfg: &config::CoopConfig, _: &config::Validated) -> Result<()> {
-    tracing::info!("Building rootfs and fetching kernel");
-    rootfs::build(cfg)?;
-    tracing::info!("Build complete");
-    Ok(())
-}
-
 struct ProfileImageTarget {
     profiles: Vec<String>,
     image: config::ImageName,
@@ -2763,10 +2678,6 @@ impl ProfileImageTarget {
     }
 }
 
-struct StartImage {
-    explicit: bool,
-}
-
 fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
     let mut names = profiles.to_vec();
     names.sort();
@@ -2776,7 +2687,6 @@ fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
 
 struct StartOpts<'a> {
     name: Option<&'a config::InstanceName>,
-    image: StartImage,
     workspace_dir: Option<&'a str>,
     git_repo: Option<&'a str>,
     no_agents: bool,
@@ -2807,13 +2717,7 @@ struct StartOpts<'a> {
 
 fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
     let workspace_was_restart_key = opts.name.is_none() && opts.workspace_dir.is_some();
-    !opts.mounts.is_empty()
-        || opts.image.explicit
-        || (opts.workspace_dir.is_some() && !workspace_was_restart_key)
-        || opts.git_repo.is_some()
-        || opts.disk.is_some()
-        || opts.exclude_git
-        || opts.devcontainer_path.is_some()
+    opts.devcontainer_path.is_some() || (opts.workspace_dir.is_some() && !workspace_was_restart_key)
 }
 
 fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Path>) -> String {
@@ -2828,13 +2732,7 @@ fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Pat
         "No stopped instances exist.".to_string()
     };
 
-    if !opts.mounts.is_empty()
-        || opts.git_repo.is_some()
-        || opts.disk.is_some()
-        || opts.image.explicit
-        || opts.exclude_git
-        || opts.devcontainer_path.is_some()
-    {
+    if opts.devcontainer_path.is_some() {
         msg.push_str(
             "\n`coop start` only starts stopped instances; creation options belong to `coop up`.",
         );
@@ -4167,12 +4065,28 @@ mod tests {
     }
 
     #[test]
-    fn start_profile_flag_parses_for_migration_hint() {
-        let cli = parse(&["start", "--profile", "python,node"]);
-        let super::Commands::Start { profile, .. } = cli.command else {
-            panic!("expected Start variant");
-        };
-        assert_eq!(profile, vec!["python", "node"]);
+    fn start_rejects_creation_flags_at_clap_time() {
+        use clap::Parser as _;
+        for flag in [
+            ["--profile", "python"],
+            ["--git-repo", "https://github.com/o/r"],
+            ["--vcpus", "4"],
+            ["--mem", "2048"],
+            ["--disk", "16"],
+            ["--mount", "/tmp"],
+            ["--image", "default"],
+        ] {
+            let argv = ["coop", "start", flag[0], flag[1]];
+            assert!(
+                super::Cli::try_parse_from(argv).is_err(),
+                "`coop start {}` should be rejected by clap",
+                flag[0],
+            );
+        }
+        assert!(
+            super::Cli::try_parse_from(["coop", "start", "--exclude-git"]).is_err(),
+            "`coop start --exclude-git` should be rejected by clap",
+        );
     }
 
     #[test]
@@ -4782,7 +4696,6 @@ mod tests {
     ) -> super::StartOpts<'_> {
         super::StartOpts {
             name: None,
-            image: super::StartImage { explicit: false },
             workspace_dir: None,
             git_repo: None,
             no_agents: false,
@@ -4875,12 +4788,9 @@ mod tests {
     #[test]
     fn no_stopped_instance_message_points_creation_to_up() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mount = super::config::Mount {
-            host_path: tmp.path().to_path_buf(),
-            guest_path: super::workspace::default_workspace_path(),
-        };
         let cfg_path = tmp.path().join("config.toml");
-        let opts = start_opts(vec![mount], &cfg_path);
+        let mut opts = start_opts(Vec::new(), &cfg_path);
+        opts.devcontainer_path = Some(std::path::Path::new("/tmp/devcontainer.json"));
         let msg = super::no_stopped_instance_message(&opts, None);
         assert!(msg.contains("only starts stopped instances"));
         assert!(msg.contains("coop up [DIR]"));

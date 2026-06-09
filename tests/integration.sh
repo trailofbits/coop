@@ -1499,17 +1499,17 @@ test_restart_rejects_ignored_flags() {
     echo ""
     echo "=== Phase: restart rejects ignored flags ==="
 
-    # Instance is stopped from previous phase. Restarting with creation-time
-    # flags (--mount, --workspace, --git-repo, --disk) should fail with a
-    # clear error instead of silently ignoring them.
+    # Instance is stopped from previous phase. Restarting with a --workspace
+    # that does not match the named instance's restart key should fail with a
+    # clear error instead of silently ignoring it.
 
     local mount_dir
     mount_dir=$(mktemp -d)
 
-    if moat_fails start "$INSTANCE" --no-agents --mount "$mount_dir"; then
-        pass "restart with --mount rejected"
+    if moat_fails start "$INSTANCE" --no-agents --workspace "$mount_dir"; then
+        pass "restart with --workspace rejected"
     else
-        fail "restart with --mount rejected" "should have failed"
+        fail "restart with --workspace rejected" "should have failed"
         coop stop "$INSTANCE" 2>/dev/null || true
     fi
 
@@ -1519,33 +1519,19 @@ test_restart_rejects_ignored_flags() {
         fail "error message suggests destroy first" "stderr: $HARNESS_ERR"
     fi
 
-    if moat_fails start "$INSTANCE" --no-agents --workspace "$mount_dir"; then
-        pass "restart with --workspace rejected"
-    else
-        fail "restart with --workspace rejected" "should have failed"
-        coop stop "$INSTANCE" 2>/dev/null || true
-    fi
-
-    if moat_fails start "$INSTANCE" --no-agents --disk 20; then
-        pass "restart with --disk rejected"
-    else
-        fail "restart with --disk rejected" "should have failed"
-        coop stop "$INSTANCE" 2>/dev/null || true
-    fi
-
-    if moat_fails start "$INSTANCE" --no-agents --vcpus 4; then
-        pass "restart with --vcpus rejected"
-    else
-        fail "restart with --vcpus rejected" "should have failed"
-        coop stop "$INSTANCE" 2>/dev/null || true
-    fi
-
-    if moat_fails start "$INSTANCE" --no-agents --exclude-git; then
-        pass "restart with --exclude-git rejected"
-    else
-        fail "restart with --exclude-git rejected" "should have failed"
-        coop stop "$INSTANCE" 2>/dev/null || true
-    fi
+    # Creation-time flags no longer exist on `coop start`; clap rejects them as
+    # unknown arguments. (`--mount`, `--git-repo`, `--vcpus`, `--mem`, `--disk`,
+    # `--image`, `--exclude-git`, `--profile` all live on `coop up`.)
+    local flag
+    for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-git; do
+        # shellcheck disable=SC2086
+        if moat_fails start "$INSTANCE" --no-agents $flag; then
+            pass "start ${flag%% *} rejected by clap"
+        else
+            fail "start ${flag%% *} rejected by clap" "should have failed"
+            coop stop "$INSTANCE" 2>/dev/null || true
+        fi
+    done
 
     # Plain restart (no conflicting flags) should still work
     if coop start "$INSTANCE" --no-agents; then
@@ -2737,32 +2723,6 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
     coop destroy "$fwd_instance" 2>/dev/null || true
     untrack_instance "$fwd_instance"
     rm -f "$content_file" "$content_file.got"
-}
-
-test_mount_conflicts() {
-    echo ""
-    echo "=== Phase: mount CLI conflicts ==="
-
-    local mount_dir
-    mount_dir=$(mktemp -d)
-
-    # --mount should conflict with --workspace
-    if moat_fails start "${INSTANCE}-conflict" --no-agents --mount "$mount_dir" --workspace "$mount_dir"; then
-        pass "--mount conflicts with --workspace"
-    else
-        fail "--mount conflicts with --workspace" "should have failed"
-        coop destroy "${INSTANCE}-conflict" 2>/dev/null || true
-    fi
-
-    # --mount should conflict with --git-repo
-    if moat_fails start "${INSTANCE}-conflict2" --no-agents --mount "$mount_dir" --git-repo "https://example.com/repo.git"; then
-        pass "--mount conflicts with --git-repo"
-    else
-        fail "--mount conflicts with --git-repo" "should have failed"
-        coop destroy "${INSTANCE}-conflict2" 2>/dev/null || true
-    fi
-
-    rm -rf "$mount_dir"
 }
 
 # ── Destroy --all test (--full only) ──────────────────────────
@@ -4056,7 +4016,6 @@ main() {
         test_quickstart
         test_up_project_workflow
         test_git_repo
-        test_mount_conflicts
         test_host_mount
         test_host_mount_custom_guest_path
         test_port_forwards

@@ -25,7 +25,7 @@ For CI or scripted use, pass one of:
 - `--dry-run` — print the report and exit before any VM work
 - `coop devcontainer check <path>` — print setup/start translation reports for a file without loading coop config or touching VM state
 
-A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `coop up --git-repo <url>` and `coop start --dry-run --git-repo <url>`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`. Normal `coop start --git-repo` is rejected because `--git-repo` moved to `coop up --git-repo`.
+A non-TTY invocation that discovers a `devcontainer.json` without any of these flags errors out rather than silently choosing. For `coop up --git-repo <url>`, remote discovery is best-effort and currently limited to GitHub URLs that resolve to `owner/repo`; unsupported hosts continue without devcontainer translation unless you pass an explicit local `--devcontainer <path>`. `--git-repo` lives on `coop up`, not `coop start`.
 
 ## Persistent project opt-outs
 
