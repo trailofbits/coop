@@ -20,7 +20,7 @@ Every template installs these packages regardless of profile selection.
 
 **Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `unzip`, `zip`, `file`, `less`
 
-**Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-compose-plugin`
+**Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
 **GitHub CLI:** `gh`
 
