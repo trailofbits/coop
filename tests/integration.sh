@@ -3397,7 +3397,7 @@ EOF
 
     if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref" \
         --dry-run --no-agents; then
-        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
             && ! grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
             pass "stored devcontainer opt-out skips discovery"
         else
@@ -3408,7 +3408,7 @@ EOF
     fi
 
     if coop --config "$pref_cfg" setup --workspace "$dcdir" --dry-run; then
-        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
             && ! grep -q "setup-stage translation" <<< "$HARNESS_ERR"; then
             pass "stored devcontainer opt-out skips setup --workspace dry-run discovery"
         else
@@ -3419,7 +3419,7 @@ EOF
     fi
 
     if coop --config "$pref_cfg" start --workspace "$dcdir" --dry-run; then
-        if grep -q "stored opt-out" <<< "$HARNESS_ERR" \
+        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
             && ! grep -q "start-stage translation" <<< "$HARNESS_ERR"; then
             pass "stored devcontainer opt-out skips start --workspace dry-run discovery"
         else
