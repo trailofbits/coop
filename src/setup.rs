@@ -7,9 +7,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd::Cmd;
+use crate::cmd::{Cmd, command_exists};
 use crate::config::{CoopConfig, ImageName, Instance};
-use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
+use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
@@ -314,20 +314,26 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let template = cfg.template_path_for(image);
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
-    // Compose recipe and compute hashes
-    let recipe = compose_recipe(
+    // Compose the install recipe and compute its hashes.
+    let recipe_script = compose_recipe(
         &profiles,
         &opts.oci_features,
         &extra_packages,
         &opts.guest_user,
     );
-    let script_hash = Sha256Hash::of(&recipe);
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
-    let post_install_hash = post_install_content.as_ref().map(Sha256Hash::of);
+    let recipe = BuildRecipe {
+        profiles: &profiles,
+        extra_packages: &extra_packages,
+        script_hash: Sha256Hash::of(&recipe_script),
+        post_install_hash: post_install_content.as_ref().map(Sha256Hash::of),
+        script: &recipe_script,
+        post_install_content: post_install_content.as_deref(),
+    };
 
     // Check existing template — rebuild automatically if stale
     if template.exists() && !opts.rebuild {
-        if !needs_rebuild(cfg, image, script_hash, post_install_hash) {
+        if !needs_rebuild(cfg, image, recipe.script_hash, recipe.post_install_hash) {
             step("Template rootfs: up to date");
             return Ok(());
         }
@@ -346,18 +352,23 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
-    let result = build_template(
-        cfg,
-        opts,
-        image,
-        &profiles,
-        &extra_packages,
-        &recipe,
-        script_hash,
-        post_install_content.as_deref(),
-        post_install_hash,
-        &staging,
-    );
+    // Build the persisted config once: `build_template` embeds it as the
+    // in-guest version marker, and we save the same value after the image
+    // swap. Constructing it once also pins a single `created` timestamp.
+    let template_config = TemplateConfig {
+        version: TEMPLATE_VERSION,
+        created: utc_timestamp(),
+        install_script_hash: recipe.script_hash,
+        profiles: profile_names(recipe.profiles),
+        extra_packages: recipe.extra_packages.to_vec(),
+        post_install_hash: recipe.post_install_hash,
+        marketplaces: Vec::new(),
+        plugins: Vec::new(),
+        guest_user: opts.guest_user.clone(),
+        oci_features: installed_features(&opts.oci_features),
+    };
+
+    let result = build_template(cfg, opts, image, &recipe, &template_config, &staging);
 
     if let Err(e) = result {
         // Clean up failed staging image
@@ -378,18 +389,6 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     // Write template config only after image swap succeeds.
     // If we crash between swap and config write, staleness
     // detection triggers a rebuild on next run (safe).
-    let template_config = TemplateConfig {
-        version: TEMPLATE_VERSION,
-        created: utc_timestamp(),
-        install_script_hash: script_hash,
-        profiles: profile_names(&profiles),
-        extra_packages,
-        post_install_hash,
-        marketplaces: Vec::new(),
-        plugins: Vec::new(),
-        guest_user: opts.guest_user.clone(),
-        oci_features: installed_features(&opts.oci_features),
-    };
     template_config.save_for(cfg, image)?;
 
     Ok(())
@@ -397,10 +396,6 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
 
 fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
     profiles.iter().map(|p| p.name.clone()).collect()
-}
-
-fn installed_features(features: &[ResolvedFeature]) -> Vec<InstalledFeature> {
-    features.iter().map(|f| f.installed.clone()).collect()
 }
 
 /// Returns `true` if the template needs rebuilding.
@@ -420,17 +415,24 @@ fn needs_rebuild(
     existing.install_script_hash != current_hash || existing.post_install_hash != current_post_hash
 }
 
-#[expect(clippy::too_many_arguments, reason = "template build orchestration")]
+/// The recipe inputs for a template build: the composed install script,
+/// its hash, the resolved profiles and extra packages (for display), and
+/// the optional post-install script and its hash.
+struct BuildRecipe<'a> {
+    profiles: &'a [ProfileDef],
+    extra_packages: &'a [String],
+    script: &'a str,
+    script_hash: Sha256Hash,
+    post_install_content: Option<&'a str>,
+    post_install_hash: Option<Sha256Hash>,
+}
+
 fn build_template(
     cfg: &CoopConfig,
     opts: &SetupOptions,
     image: &ImageName,
-    profiles: &[ProfileDef],
-    extra_packages: &[String],
-    recipe: &str,
-    script_hash: Sha256Hash,
-    post_install_content: Option<&str>,
-    post_install_hash: Option<Sha256Hash>,
+    recipe: &BuildRecipe,
+    template_config: &TemplateConfig,
     output_path: &Path,
 ) -> Result<()> {
     step("Building template rootfs");
@@ -440,8 +442,8 @@ fn build_template(
 
     eprintln!("  Found rootfs: {rootfs_name}");
     eprintln!("  URL: {rootfs_url}");
-    if !profiles.is_empty() {
-        eprintln!("  Profiles: {}", profile_names(profiles).join(", "));
+    if !recipe.profiles.is_empty() {
+        eprintln!("  Profiles: {}", profile_names(recipe.profiles).join(", "));
     }
     if !opts.oci_features.is_empty() {
         let features = opts
@@ -452,10 +454,10 @@ fn build_template(
             .join(", ");
         eprintln!("  Devcontainer OCI features: {features}");
     }
-    if !extra_packages.is_empty() {
-        eprintln!("  Extra packages: {}", extra_packages.join(", "));
+    if !recipe.extra_packages.is_empty() {
+        eprintln!("  Extra packages: {}", recipe.extra_packages.join(", "));
     }
-    if post_install_content.is_some() {
+    if recipe.post_install_content.is_some() {
         eprintln!("  Post-install script: yes");
     }
     eprintln!();
@@ -483,22 +485,11 @@ fn build_template(
     create_ext4_image(cfg, output_path)?;
     crate::signal::check_shutdown()?;
 
-    // Compose and execute install script
-    let marker_config = TemplateConfig {
-        version: TEMPLATE_VERSION,
-        created: utc_timestamp(),
-        install_script_hash: script_hash,
-        profiles: profile_names(profiles),
-        extra_packages: extra_packages.to_vec(),
-        post_install_hash,
-        marketplaces: Vec::new(),
-        plugins: Vec::new(),
-        guest_user: opts.guest_user.clone(),
-        oci_features: installed_features(&opts.oci_features),
-    };
-    let marker_json = serde_json::to_string_pretty(&marker_config)
+    // Compose and execute install script. The in-guest version marker is
+    // the same `TemplateConfig` we persist on the host after the swap.
+    let marker_json = serde_json::to_string_pretty(template_config)
         .context("Failed to serialize version marker")?;
-    let full_script = compose_full_script(recipe, &marker_json, post_install_content);
+    let full_script = compose_full_script(recipe.script, &marker_json, recipe.post_install_content);
     install_guest_packages(cfg, output_path, &full_script, &opts.guest_user)?;
 
     // Clean up intermediate files
@@ -760,7 +751,7 @@ fn has_kvm_access(kvm: &Path) -> bool {
 
 fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
     // Prefer setfacl (immediate, no re-login needed)
-    if which("setfacl").is_some() {
+    if command_exists("setfacl") {
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
         let cmd = format!("sudo setfacl -m u:{user}:rw /dev/kvm");
         if !confirm(&cmd, skip_confirm)? {
@@ -799,22 +790,22 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
 fn install_system_packages(skip_confirm: bool) -> Result<()> {
     let mut missing = Vec::new();
 
-    if which("setfacl").is_none() {
+    if !command_exists("setfacl") {
         missing.push("acl");
     }
-    if which("debootstrap").is_none() {
+    if !command_exists("debootstrap") {
         missing.push("debootstrap");
     }
-    if which("unsquashfs").is_none() {
+    if !command_exists("unsquashfs") {
         missing.push("squashfs-tools");
     }
-    if which("mkfs.ext4").is_none() {
+    if !command_exists("mkfs.ext4") {
         missing.push("e2fsprogs");
     }
-    if which("ssh").is_none() {
+    if !command_exists("ssh") {
         missing.push("openssh-client");
     }
-    if which("rsync").is_none() {
+    if !command_exists("rsync") {
         missing.push("rsync");
     }
 
@@ -1182,29 +1173,12 @@ fn install_guest_packages(
 /// host filesystem where the target doesn't exist. A symlink being
 /// present is sufficient — it will resolve correctly inside the guest.
 fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()> {
-    use crate::guest::required_guest_binaries;
-
-    eprintln!("  Verifying installed binaries...");
-    let mut missing: Vec<String> = Vec::new();
-
-    for path in required_guest_binaries(guest_user) {
-        let full_path = format!("{mount_str}{path}");
-        let exists = std::fs::symlink_metadata(&full_path).is_ok();
-        if !exists {
-            missing.push(path.to_string());
-        }
-    }
-
-    if !missing.is_empty() {
-        bail!(
-            "Golden image is missing required binaries: {}\n\
-             The install script completed but these tools were \
-             not installed correctly.",
-            missing.join(", "),
-        );
-    }
-
-    Ok(())
+    crate::guest::verify_required_binaries(
+        guest_user,
+        "install script",
+        |path| std::fs::symlink_metadata(format!("{mount_str}{path}")).is_ok(),
+        String::new,
+    )
 }
 
 fn mount_chroot(rootfs: &str, mount_str: &str) -> Result<()> {
@@ -1389,17 +1363,8 @@ impl fmt::Display for Architecture {
     }
 }
 
-fn which(program: &str) -> Option<PathBuf> {
-    Command::new("which")
-        .arg(program)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
-}
-
 fn require_command(name: &str, purpose: &str) -> Result<()> {
-    if which(name).is_some() {
+    if command_exists(name) {
         eprintln!("  {name}: OK");
         Ok(())
     } else {

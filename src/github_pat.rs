@@ -19,7 +19,7 @@ use std::io::{BufRead as _, Write as _};
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use thiserror::Error;
 
 use crate::cmd::Cmd;
@@ -361,14 +361,25 @@ fn warn_token_format(token: &str) {
     }
 }
 
-fn probe_user(token: &str) -> Result<()> {
+/// Issue `GET https://api.github.com/user` with `token` and return the
+/// authenticated user's login.
+///
+/// Errors if the request fails, the status is non-200 (token invalid or
+/// revoked), or the response carries no `login` field.
+pub fn probe_user_login(token: &str) -> Result<String> {
     let (status, body) = curl_with_token(token, "https://api.github.com/user")?;
     if status != 200 {
         bail!("GET /user returned HTTP {status} (token may be invalid or revoked)");
     }
-    if !body.contains("\"login\"") {
-        bail!("Token authentication failed: /user returned unexpected response");
-    }
+    body.split("\"login\"")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Token authentication failed: /user returned unexpected response"))
+}
+
+fn probe_user(token: &str) -> Result<()> {
+    probe_user_login(token)?;
     eprintln!("  ✓ /user");
     Ok(())
 }

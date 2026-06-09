@@ -1521,7 +1521,19 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
     };
 
     let staged = stage_allowed_files(&source_dir).context("Failed to stage Claude config files")?;
+    copy_staged_to_guest(target, &staged, ".claude", "Claude")
+}
 
+/// Copy every entry staged in `staged` into the guest's `~/<guest_subdir>/`,
+/// creating the directory first. Files go via `scp_to`, subdirectories via
+/// `scp_to_recursive`. An empty staging dir is a no-op (debug-logged).
+/// `label` names the config in the log lines (e.g. "Claude", "Codex").
+fn copy_staged_to_guest(
+    target: &SshTarget,
+    staged: &tempfile::TempDir,
+    guest_subdir: &str,
+    label: &str,
+) -> Result<()> {
     let staging_path = staged.path();
     let has_entries = staging_path
         .read_dir()
@@ -1530,29 +1542,29 @@ fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> 
         .is_some();
 
     if !has_entries {
-        tracing::debug!("No allowlisted files found in {}", source_dir.display());
+        tracing::debug!("No {label} config content to copy");
         return Ok(());
     }
 
-    target.exec("mkdir -p ~/.claude")?;
+    target.exec(&format!("mkdir -p ~/{guest_subdir}"))?;
 
-    let guest_claude = GuestPath::new("./.claude");
+    let guest_dir = GuestPath::new(format!("./{guest_subdir}"));
     for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
         let entry = entry.context("Failed to read staging entry")?;
         let path = entry.path();
         let local = HostPath::new(&path);
         if path.is_dir() {
             target
-                .scp_to_recursive(&local, &guest_claude)
+                .scp_to_recursive(&local, &guest_dir)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         } else {
             target
-                .scp_to(&local, &guest_claude)
+                .scp_to(&local, &guest_dir)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
         }
     }
 
-    tracing::info!("Copied Claude config from {}", source_dir.display());
+    tracing::info!("Copied {label} config into guest");
     Ok(())
 }
 
@@ -1605,39 +1617,7 @@ fn copy_codex_config(
 ) -> Result<()> {
     let staged = stage_codex_files(source_dir, &codex.mcp_servers)
         .context("Failed to stage Codex config files")?;
-
-    let staging_path = staged.path();
-    let has_entries = staging_path
-        .read_dir()
-        .context("Failed to read staging directory")?
-        .next()
-        .is_some();
-
-    if !has_entries {
-        tracing::debug!("No Codex config content to copy");
-        return Ok(());
-    }
-
-    target.exec("mkdir -p ~/.codex")?;
-
-    let guest_codex = GuestPath::new("./.codex");
-    for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
-        let entry = entry.context("Failed to read staging entry")?;
-        let path = entry.path();
-        let local = HostPath::new(&path);
-        if path.is_dir() {
-            target
-                .scp_to_recursive(&local, &guest_codex)
-                .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
-        } else {
-            target
-                .scp_to(&local, &guest_codex)
-                .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
-        }
-    }
-
-    tracing::info!("Copied Codex config into guest");
-    Ok(())
+    copy_staged_to_guest(target, &staged, ".codex", "Codex")
 }
 
 fn resolve_config_source_dir(

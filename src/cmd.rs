@@ -235,6 +235,17 @@ impl Cmd {
     }
 }
 
+/// Returns `true` if `program` is found on the current `PATH`.
+///
+/// Uses the portable `command -v` shell builtin rather than the `which`
+/// binary, which need not be installed on every host.
+pub fn command_exists(program: &str) -> bool {
+    Cmd::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {program} >/dev/null 2>&1"))
+        .status_ok()
+}
+
 /// Write `bytes` to the child's stdin, then close it so the child sees EOF.
 ///
 /// Used by [`Cmd::run`] and [`Cmd::capture`] when [`Cmd::stdin_input`] was
@@ -322,5 +333,14 @@ mod tests {
             .stdin_input(b"data".to_vec())
             .run()
             .expect("cat run");
+    }
+
+    #[test]
+    fn command_exists_detects_present_and_absent_programs() {
+        assert!(command_exists("sh"), "sh must be on PATH in any POSIX env");
+        assert!(
+            !command_exists("coop-definitely-not-a-real-binary-xyz"),
+            "a nonexistent program must not be reported as present",
+        );
     }
 }

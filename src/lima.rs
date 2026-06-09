@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
 use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName};
-use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature};
+use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
@@ -699,10 +699,6 @@ fn build_golden_image(
     Ok(())
 }
 
-fn installed_features(features: &[ResolvedFeature]) -> Vec<InstalledFeature> {
-    features.iter().map(|f| f.installed.clone()).collect()
-}
-
 /// Start the builder VM, install marketplaces/plugins, clean
 /// cloud-init, stop it, and extract the disk image to `output_path`.
 fn run_builder_vm(
@@ -1021,59 +1017,55 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 /// image. Catches silent install failures (e.g. network timeouts)
 /// that cloud-init doesn't flag as errors.
 fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
-    use crate::guest::required_guest_binaries;
+    crate::guest::verify_required_binaries(
+        guest_user,
+        "provision script",
+        |path| {
+            Command::new("limactl")
+                .args([
+                    "shell",
+                    BUILDER_NAME,
+                    "--",
+                    "bash",
+                    "-c",
+                    &format!("test -x {path}"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        },
+        builder_log_tail,
+    )
+}
 
-    eprintln!("  Verifying installed binaries...");
-    let mut missing: Vec<String> = Vec::new();
+/// Tail of the builder's cloud-init log, formatted as a trailing section for
+/// the missing-binaries error. Empty when the log is unavailable or blank.
+fn builder_log_tail() -> String {
+    let log_tail = Command::new("limactl")
+        .args([
+            "shell",
+            BUILDER_NAME,
+            "--",
+            "sudo",
+            "tail",
+            "-n",
+            "50",
+            "/var/log/cloud-init-output.log",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
 
-    for path in required_guest_binaries(guest_user) {
-        let check_cmd = format!("test -x {path}");
-        let status = Command::new("limactl")
-            .args(["shell", BUILDER_NAME, "--", "bash", "-c", &check_cmd])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        if !status.is_ok_and(|s| s.success()) {
-            missing.push(path.to_string());
-        }
+    if log_tail.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nLast 50 lines of cloud-init-output.log:\n{}",
+            log_tail.trim()
+        )
     }
-
-    if !missing.is_empty() {
-        let log_tail = Command::new("limactl")
-            .args([
-                "shell",
-                BUILDER_NAME,
-                "--",
-                "sudo",
-                "tail",
-                "-n",
-                "50",
-                "/var/log/cloud-init-output.log",
-            ])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-
-        let log_section = if log_tail.trim().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nLast 50 lines of cloud-init-output.log:\n{}",
-                log_tail.trim()
-            )
-        };
-
-        bail!(
-            "Golden image is missing required binaries: {}\n\
-             The provision script completed but these tools were \
-             not installed correctly.{log_section}",
-            missing.join(", "),
-        );
-    }
-
-    Ok(())
 }
 
 fn generate_start_template(cfg: &CoopConfig, image: &ImageName) -> Result<()> {

@@ -174,6 +174,44 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 4] {
     ]
 }
 
+/// Verify that every required guest binary is present, bailing with a
+/// uniform error if any are missing.
+///
+/// `probe` answers "does this binary exist in the image?" — its mechanism
+/// differs per backend (a chroot `symlink_metadata` for Firecracker, a
+/// `test -x` over `limactl shell` for Lima). `source_label` names what
+/// produced the image ("install script" vs "provision script"), and
+/// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
+/// evaluated lazily only when something is missing.
+#[expect(
+    clippy::print_stderr,
+    reason = "verification progress is interactive CLI — stderr is user communication"
+)]
+pub fn verify_required_binaries(
+    guest_user: &GuestUser,
+    source_label: &str,
+    probe: impl Fn(&GuestPath) -> bool,
+    diagnostics: impl FnOnce() -> String,
+) -> Result<()> {
+    eprintln!("  Verifying installed binaries...");
+    let missing: Vec<String> = required_guest_binaries(guest_user)
+        .into_iter()
+        .filter(|path| !probe(path))
+        .map(|path| path.to_string())
+        .collect();
+
+    if !missing.is_empty() {
+        bail!(
+            "Golden image is missing required binaries: {}\n\
+             The {source_label} completed but these tools were \
+             not installed correctly.{}",
+            missing.join(", "),
+            diagnostics(),
+        );
+    }
+    Ok(())
+}
+
 pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh");
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
@@ -556,5 +594,59 @@ mod tests {
             bins.iter().any(|b| b.to_string() == "/usr/local/bin/codex"),
             "guest image should include codex in the default PATH",
         );
+    }
+
+    #[test]
+    fn verify_required_binaries_ok_when_all_present_and_skips_diagnostics() {
+        let user = GuestUser::default();
+        let diag_called = std::cell::Cell::new(false);
+        let result = verify_required_binaries(
+            &user,
+            "install script",
+            |_path| true,
+            || {
+                diag_called.set(true);
+                String::new()
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            !diag_called.get(),
+            "diagnostics must not be evaluated when nothing is missing",
+        );
+    }
+
+    #[test]
+    fn verify_required_binaries_bails_with_missing_names_and_diagnostics() {
+        let user = GuestUser::default();
+        let result = verify_required_binaries(
+            &user,
+            "provision script",
+            |path| path.to_string() != "/usr/bin/docker",
+            || "\n\ntail of log".to_string(),
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("/usr/bin/docker"),
+            "missing binary listed: {err}"
+        );
+        assert!(
+            err.contains("provision script"),
+            "source label included: {err}"
+        );
+        assert!(
+            err.contains("tail of log"),
+            "diagnostics suffix appended: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_required_binaries_lists_every_missing_binary() {
+        let user = GuestUser::default();
+        let result = verify_required_binaries(&user, "install script", |_path| false, String::new);
+        let err = result.unwrap_err().to_string();
+        for expected in ["/usr/bin/docker", "/usr/bin/gh", "/usr/local/bin/codex"] {
+            assert!(err.contains(expected), "{expected} missing from: {err}");
+        }
     }
 }

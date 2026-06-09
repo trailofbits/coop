@@ -121,6 +121,13 @@ pub struct ResolvedFeature {
     pub options: BTreeMap<String, String>,
 }
 
+/// Project the persistable [`InstalledFeature`] records out of resolved
+/// features, dropping the install scripts and archives that are not part
+/// of the persisted template config.
+pub fn installed_features(features: &[ResolvedFeature]) -> Vec<InstalledFeature> {
+    features.iter().map(|f| f.installed.clone()).collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     token: String,

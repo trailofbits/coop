@@ -1152,7 +1152,7 @@ fn cmd_validate(
                         .ok();
                     }
                     if probe {
-                        match probe_pat_token(&token) {
+                        match github_pat::probe_user_login(&token) {
                             Ok(login) => {
                                 writeln!(std::io::stdout(), "    probe: /user as '{login}'").ok();
                             }
@@ -1175,28 +1175,6 @@ fn cmd_validate(
 
     writeln!(std::io::stdout(), "Config OK").ok();
     Ok(())
-}
-
-/// Issue `GET https://api.github.com/user` with `token`. Returns the
-/// authenticated user's login on success.
-fn probe_pat_token(token: &str) -> Result<String> {
-    let body = cmd::Cmd::new("curl")
-        .arg("-fsSL")
-        .arg("-H")
-        .arg("Accept: application/vnd.github+json")
-        .arg("-H")
-        .arg("@-")
-        .stdin_input(format!("Authorization: token {token}\n"))
-        .arg("https://api.github.com/user")
-        .capture()
-        .context("curl /user failed")?;
-    // Naive extraction: grab the first `"login": "..."`. Avoids a JSON dep.
-    let login = body
-        .split("\"login\"")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .unwrap_or("?");
-    Ok(login.to_string())
 }
 
 struct QuickstartOpts {

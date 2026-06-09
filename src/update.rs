@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::cmd::Cmd;
+use crate::cmd::{Cmd, command_exists};
 use crate::fs_util::atomic_write_json;
 use crate::prompt::confirm;
 use crate::sha256_hash::Sha256Hash;
@@ -235,7 +235,7 @@ fn select_auth_strategy(
 
 fn select_auth_strategy_from_env() -> AuthStrategy {
     let overridden = api_base_overridden();
-    let has_gh = !overridden && has_command("gh");
+    let has_gh = !overridden && command_exists("gh");
     let gh_authed = has_gh && gh_authenticated();
     let token = env::var("GITHUB_TOKEN").ok();
     select_auth_strategy(overridden, has_gh, gh_authed, token.as_deref())
@@ -370,13 +370,6 @@ fn verify_sha256(file: &Path, expected: &Sha256Hash) -> Result<()> {
 
 // ── Attestation verification (best-effort) ───────────────────────────────────
 
-fn has_command(prog: &str) -> bool {
-    Cmd::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {prog} >/dev/null 2>&1"))
-        .status_ok()
-}
-
 fn verify_attestation(tarball: &Path) -> Result<()> {
     // Skip when the API base is overridden — the local test fixture serves
     // synthetic artifacts that have no provenance in GitHub's attestation
@@ -385,7 +378,7 @@ fn verify_attestation(tarball: &Path) -> Result<()> {
     if api_base_overridden() {
         return Ok(());
     }
-    if !has_command("gh") {
+    if !command_exists("gh") {
         tracing::info!(
             "Note: `gh` not installed — skipped cryptographic attestation verification. \
              The download was verified against the published `SHA256SUMS` checksum, which \
