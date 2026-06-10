@@ -437,7 +437,7 @@ fn build_template(
 ) -> Result<()> {
     step("Building template rootfs");
 
-    let rootfs_url = discover_ci_rootfs(cfg)?;
+    let rootfs_url = discover_ci_rootfs()?;
     let rootfs_name = rootfs_url.rsplit('/').next().unwrap_or("rootfs");
 
     eprintln!("  Found rootfs: {rootfs_name}");
@@ -993,7 +993,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
 // ── Rootfs build helpers ──────────────────────────────────────
 
-fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
+fn discover_ci_rootfs() -> Result<String> {
     let arch = Architecture::current()?;
     let start = FcVersion::parse(&discover_latest_fc_version()?)?;
 
@@ -1009,12 +1009,11 @@ fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
         |k| k.ends_with(".squashfs"),
         s3_list_keys,
     )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "{e}\n\nYou can build one manually with:\n\n  sudo bash scripts/build-rootfs.sh {}",
-            cfg.template_path().display()
-        )
-    })?;
+    .context(
+        "Could not find a Firecracker CI rootfs in S3. CI assets lag a \
+         Firecracker release by days to weeks; retry later once the matching \
+         firecracker-ci/vX.Y/ directory is published.",
+    )?;
 
     let rootfs_key = keys.into_iter().max().context("No rootfs keys found")?;
     eprintln!("  Found rootfs in {}", ci_version.ci_dirname());

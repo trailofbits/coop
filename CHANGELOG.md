@@ -12,6 +12,17 @@
   port changes per boot), so it stays valid across restarts;
   `coop destroy` and `--clean` remove it.
 
+### Removed
+
+- **`scripts/build-rootfs.sh`** (#293) — the standalone `debootstrap`
+  rootfs builder is removed. Image creation runs through `coop setup`,
+  which downloads a Firecracker CI squashfs and provisions it with
+  `scripts/guest/guest-config.sh`; the standalone script duplicated that
+  provisioning, omitted the CI-kernel workarounds (iptables-legacy,
+  static `resolv.conf`, Docker's `DOCKER_INSECURE_NO_IPTABLES_RAW`), and
+  produced an image the current flow does not consume. The rootfs
+  discovery error no longer points at it.
+
 ## v0.5.0
 
 ### Breaking changes
