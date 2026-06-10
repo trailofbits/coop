@@ -624,6 +624,64 @@ test_ssh_alias() {
     fi
 }
 
+# Exercises `coop ssh-config`: it installs a `coop-<name>` alias into
+# ~/.ssh/config, the alias works with plain ssh, the block survives `stop`
+# and is refreshed on `start` (the Lima port changes per boot), and
+# `--clean` removes it. Self-contained: leaves the instance running.
+test_ssh_config() {
+    echo ""
+    echo "=== Phase: ssh-config alias ==="
+
+    local marker="# coop START coop-$INSTANCE"
+    local ssh_cfg="$HOME/.ssh/config"
+
+    if coop ssh-config "$INSTANCE"; then
+        pass "ssh-config exits 0"
+    else
+        fail "ssh-config exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    if grep -qF "$marker" "$ssh_cfg" 2>/dev/null; then
+        pass "ssh-config writes marker block"
+    else
+        fail "ssh-config writes marker block" "no marker in $ssh_cfg"
+    fi
+
+    if _timeout 30 ssh "coop-$INSTANCE" echo "ssh-config-ok" 2>/dev/null | grep -q "ssh-config-ok"; then
+        pass "plain ssh via coop-$INSTANCE alias connects"
+    else
+        fail "plain ssh via coop-$INSTANCE alias connects" "ssh through alias failed"
+    fi
+
+    coop stop "$INSTANCE" || true
+    if grep -qF "$marker" "$ssh_cfg" 2>/dev/null; then
+        pass "ssh-config block survives stop"
+    else
+        fail "ssh-config block survives stop" "marker removed by stop"
+    fi
+
+    if coop start "$INSTANCE" --no-agents; then
+        if _timeout 30 ssh "coop-$INSTANCE" echo "refreshed-ok" 2>/dev/null | grep -q "refreshed-ok"; then
+            pass "ssh alias works after restart (block refreshed)"
+        else
+            fail "ssh alias works after restart (block refreshed)" "alias stale after restart"
+        fi
+    else
+        fail "restart for ssh-config refresh exits 0" "stderr: $HARNESS_ERR"
+    fi
+
+    if coop ssh-config "$INSTANCE" --clean; then
+        if grep -qF "$marker" "$ssh_cfg" 2>/dev/null; then
+            fail "ssh-config --clean removes block" "marker still present"
+        else
+            pass "ssh-config --clean removes block"
+        fi
+    else
+        fail "ssh-config --clean exits 0" "stderr: $HARNESS_ERR"
+    fi
+}
+
 test_exec() {
     echo ""
     echo "=== Phase: exec ==="
@@ -3982,6 +4040,7 @@ main() {
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
+    test_ssh_config
     test_exec
     test_claude_bin_path
     test_codex_bin_path

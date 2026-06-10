@@ -522,24 +522,74 @@ pub fn vscode(
     editor: Option<&str>,
 ) -> Result<()> {
     let inst = running.instance();
-    let target = running.target();
     let remote_path = match project {
         Some(p) => GuestPath::absolute(p)
             .with_context(|| format!("--project must be an absolute guest path: {p:?}"))?,
         None => default_workspace_path(),
     };
 
-    update_ssh_config(target, inst)?;
+    write_ssh_config(running)?;
     launch_editor(inst, &remote_path, editor)?;
+    Ok(())
+}
 
+/// Install (or refresh) the `coop-<name>` SSH alias and print it.
+///
+/// Writes the `Host coop-<name>` block to `~/.ssh/config` idempotently,
+/// then prints the block plus `ssh`/`scp`/`rsync` usage hints to stderr.
+/// Shared by `coop vscode` (which also launches an editor) and the
+/// standalone `coop ssh-config` command.
+///
+/// Takes a `RunningInstance` so the SSH target is proven live by the
+/// type — a stale alias is worse than none.
+pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
+    let inst = running.instance();
+    let target = running.target();
+
+    update_ssh_config(target, inst)?;
+
+    let host = ssh_config_host(inst);
     let block = ssh_config_block(target, inst);
     writeln!(
         std::io::stderr(),
-        "\nSSH config entry (for manual editor connections):\n\n{block}"
+        "\nSSH alias '{host}' is ready:\n\n{block}\n\n\
+         Use it with ssh/scp/rsync, e.g.:\n\
+         \x20   ssh {host}\n\
+         \x20   scp ./file {host}:/workspace/\n\
+         \x20   rsync -az ./dir/ {host}:/workspace/dir/\n\n\
+         These connections skip host-key verification \
+         (the VM's keys are ephemeral)."
     )
     .context("Failed to write SSH config info")?;
 
     Ok(())
+}
+
+/// Refresh an already-installed `coop-<name>` alias after a restart.
+///
+/// Only rewrites the block if one already exists for this instance, so a
+/// restart never installs SSH config for a user who never ran
+/// `coop ssh-config`. Keeps a Lima alias current across stop/start, where
+/// the forwarded port changes (Firecracker ports are stable, so this is a
+/// no-op rewrite there).
+pub fn refresh_ssh_config_if_present(target: &SshTarget, inst: &Instance) -> Result<()> {
+    let ssh_config = ssh_config_path()?;
+    if !ssh_config.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&ssh_config).context("Failed to read ~/.ssh/config")?;
+    if !marker_block_present(&content, &ssh_config_host(inst)) {
+        return Ok(());
+    }
+
+    update_ssh_config(target, inst)
+}
+
+/// Whether `~/.ssh/config` content already holds a coop block for `host`.
+fn marker_block_present(content: &str, host: &str) -> bool {
+    let marker = format!("{MARKER_PREFIX} {host}");
+    content.lines().any(|line| line.trim() == marker)
 }
 
 /// Remove SSH config blocks for all instances from ~/.ssh/config.
@@ -1318,6 +1368,62 @@ Host coop-b\n\
         let input = "Host something\n    HostName 1.2.3.4\n";
         let result = remove_named_marker_block(input, "coop-x");
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn marker_block_present_detects_matching_host() {
+        let input = "\
+# coop START coop-a\n\
+Host coop-a\n\
+    HostName 172.16.0.2\n\
+# coop END\n";
+        assert!(marker_block_present(input, "coop-a"));
+    }
+
+    #[test]
+    fn marker_block_present_false_for_other_host() {
+        let input = "\
+# coop START coop-a\n\
+Host coop-a\n\
+    HostName 172.16.0.2\n\
+# coop END\n";
+        // A different instance's block must not count as present, or
+        // restart would refresh an alias the user never installed.
+        assert!(!marker_block_present(input, "coop-b"));
+    }
+
+    #[test]
+    fn marker_block_present_false_for_empty_config() {
+        assert!(!marker_block_present("", "coop-a"));
+    }
+
+    #[test]
+    fn marker_block_present_ignores_host_substring() {
+        // `coop-a` is a prefix of `coop-app`; a substring match would
+        // wrongly report the block present.
+        let input = "\
+# coop START coop-app\n\
+Host coop-app\n\
+    HostName 172.16.0.2\n\
+# coop END\n";
+        assert!(!marker_block_present(input, "coop-a"));
+    }
+
+    #[test]
+    fn ssh_config_block_has_expected_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let block = ssh_config_block(&fake_ssh_target(), &inst);
+
+        assert!(block.starts_with("# coop START coop-test"));
+        assert!(block.trim_end().ends_with("# coop END"));
+        assert!(block.contains("Host coop-test"));
+        assert!(block.contains("HostName 127.0.0.1"));
+        assert!(block.contains("Port 2222"));
+        assert!(block.contains("User ubuntu"));
+        assert!(block.contains("IdentityFile /tmp/key"));
+        assert!(block.contains("StrictHostKeyChecking no"));
+        assert!(block.contains("UserKnownHostsFile /dev/null"));
     }
 
     #[test]

@@ -74,6 +74,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `status` | Show instance status and resource usage |
 | `logs` | Stream VM serial console output |
 | `vscode` | Open VS Code connected to the guest |
+| `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
 | `images` | List or delete template images |
 | `resize` | Grow a stopped instance's disk |
 | `validate` | Check config and prerequisites |

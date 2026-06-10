@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+- **`coop ssh-config` — install a `coop-<name>` SSH alias** (#294) —
+  Writes the same `~/.ssh/config` block `coop vscode` produces, but
+  without launching an editor, so plain `ssh`, `scp`, and `rsync` reach
+  the guest by alias. `--clean` removes the block. The alias now
+  survives `coop stop` and is refreshed on `coop start` (the Lima SSH
+  port changes per boot), so it stays valid across restarts;
+  `coop destroy` and `--clean` remove it.
+
 ## v0.5.0
 
 ### Breaking changes

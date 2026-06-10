@@ -454,6 +454,18 @@ enum Commands {
         #[arg(long)]
         clean: bool,
     },
+    /// Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync
+    SshConfig {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Remove the SSH config entry for this instance and exit
+        #[arg(long)]
+        clean: bool,
+    },
     /// List or manage golden images
     Images {
         /// Delete a named image
@@ -1044,6 +1056,16 @@ fn main() -> Result<()> {
             }
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::vscode(&running, Some(&project), editor.as_deref())
+        }
+        Commands::SshConfig { name, clean } => {
+            if clean {
+                let inst = cfg.resolve_instance(name.as_ref())?;
+                workspace::remove_ssh_config(&inst)?;
+                tracing::info!("Removed SSH config for '{}'", inst.name);
+                return Ok(());
+            }
+            let running = resolve_running(&be, &cfg, name.as_ref())?;
+            workspace::write_ssh_config(&running)
         }
         Commands::Images { delete } => cmd_images(&be, &cfg, delete.as_ref()),
         Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
@@ -2953,6 +2975,13 @@ fn restart_instance(
 
     signal::check_shutdown()?;
 
+    // Keep an already-installed `coop-<name>` alias current. On Lima the
+    // forwarded port changes across stop/start; this is a no-op rewrite on
+    // Firecracker. Never installs a block the user didn't ask for.
+    if let Err(e) = workspace::refresh_ssh_config_if_present(&target, inst) {
+        tracing::warn!("Failed to refresh SSH config for '{}': {e}", inst.name);
+    }
+
     port_forward::ForwardsState {
         forwards: forwards.clone(),
     }
@@ -3359,9 +3388,10 @@ fn cmd_stop(
             port_forward::teardown_ssh_forwards(inst, &target);
         }
     }
-    if let Err(e) = workspace::remove_ssh_config(inst) {
-        tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
-    }
+    // The `coop-<name>` SSH alias is left in place across stop: a stale
+    // entry has no effect while the VM is down, and `coop start` refreshes
+    // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
+    // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
     Ok(())
 }
@@ -3945,6 +3975,39 @@ mod tests {
     fn ssh_alias_parses_as_shell() {
         let cli = parse(&["ssh"]);
         assert!(matches!(cli.command, super::Commands::Shell { .. }));
+    }
+
+    #[test]
+    fn ssh_config_subcommand_parses() {
+        let cli = parse(&["ssh-config", "myvm"]);
+        let super::Commands::SshConfig { name, clean } = cli.command else {
+            panic!("expected SshConfig variant");
+        };
+        assert_eq!(name.expect("name").as_str(), "myvm");
+        assert!(!clean);
+    }
+
+    #[test]
+    fn ssh_config_clean_flag_parses() {
+        let cli = parse(&["ssh-config", "--clean"]);
+        let super::Commands::SshConfig { name, clean } = cli.command else {
+            panic!("expected SshConfig variant");
+        };
+        assert!(name.is_none());
+        assert!(clean);
+    }
+
+    #[test]
+    fn ssh_config_does_not_collide_with_ssh_shell_alias() {
+        // `ssh` is an alias for `shell`; `ssh-config` is its own command.
+        assert!(matches!(
+            parse(&["ssh"]).command,
+            super::Commands::Shell { .. }
+        ));
+        assert!(matches!(
+            parse(&["ssh-config"]).command,
+            super::Commands::SshConfig { .. }
+        ));
     }
 
     #[test]

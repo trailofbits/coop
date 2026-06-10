@@ -57,14 +57,14 @@ Host coop-my-instance
 # coop END
 ```
 
-Each run of `coop vscode` replaces the existing block for that instance, or creates one if none exists.
+Each run of `coop vscode` replaces the existing block for that instance, or creates one if none exists. To install the same block without launching an editor — for plain `ssh`/`scp`/`rsync` — use [`coop ssh-config`](commands.md#ssh-config).
 
 ### Cleanup
 
-- **`coop vscode NAME --clean`** removes the SSH config entry for the specified instance and exits. This cleans up the config without destroying the instance.
+- **`coop vscode NAME --clean`** (or **`coop ssh-config NAME --clean`**) removes the SSH config entry for the specified instance and exits. This cleans up the config without destroying the instance.
 - **`coop destroy`** removes the SSH config block for the destroyed instance.
 - **`coop destroy --all`** removes all coop SSH config blocks.
-- **`coop stop`** leaves the SSH config block in place. A stale entry has no effect when the VM is not running, and keeping it avoids churn on restart.
+- **`coop stop`** leaves the SSH config block in place. A stale entry has no effect when the VM is not running, and `coop start` refreshes it on the next boot (the Lima SSH port changes per start).
 
 ## Other editors
 

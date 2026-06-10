@@ -507,6 +507,46 @@ coop vscode my-project --editor code
 coop vscode my-project --clean
 ```
 
+### `ssh-config`
+
+Install a `coop-<name>` alias into `~/.ssh/config` so plain `ssh`, `scp`, and
+`rsync` reach the guest without remembering its host, port, user, or key. This
+is the same SSH config block `coop vscode` writes, but without launching an
+editor.
+
+```
+coop ssh-config [NAME] [--clean]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--clean` | Remove the SSH config entry for this instance and exit |
+
+```
+coop ssh-config
+coop ssh-config my-project
+ssh coop-my-project
+scp ./file coop-my-project:/workspace/
+rsync -az ./dir/ coop-my-project:/workspace/dir/
+coop ssh-config my-project --clean
+```
+
+The alias is created only when you run `coop ssh-config` (or `coop vscode`).
+The lifecycle keeps it tidy: `coop stop` and `coop destroy` remove the block,
+and `coop start` refreshes an already-installed block so it stays valid across
+a restart. On macOS/Lima the forwarded SSH port changes on each start; the
+refresh keeps the alias current without you re-running the command. On
+Linux/Firecracker the host and port are stable, so the refresh is a no-op.
+
+The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
+so `ssh coop-*` connections skip host-key verification. This is intentional —
+these VMs regenerate their host keys, so pinning them would only produce
+spurious mismatch warnings.
+
+Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
+workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.
+
 ### `images`
 
 List or delete golden images. Without flags, prints every image with its profiles, creation date, and size.
