@@ -1,18 +1,302 @@
 # Changelog
 
-## v0.4.4
+## v0.5.0
 
 ### Breaking changes
 
-- **tmux session wrapping removed** (#183) — `coop shell`, `coop claude`,
-  and `coop codex` no longer wrap the remote session in tmux, and the
-  `--session <name>` / `--no-tmux` flags are gone. `tmux` is no longer
-  installed in the guest image either. Users who want detachable sessions
-  can run `coop shell` and start tmux themselves, after installing it as
-  an extra package (`--extra-packages tmux` on `coop setup`) or via a
-  custom post-install script. Claude Code's background-agent daemon
-  (`coop claude-agents`) already provides session persistence without a
-  terminal multiplexer.
+- **`coop build` removed; creation flags moved off `coop start`** (#269,
+  #281) — `coop start` no longer accepts `--profile`, `--git-repo`,
+  `--vcpus`, `--mem`, `--disk`, `--mount`, `--image`, or `--exclude-git`;
+  those flags now live on `coop up`. clap reports them as unexpected
+  arguments instead of accepting them and bailing at runtime. The
+  standalone `coop build` command and the `scripts/fetch-kernel.sh`
+  helper are removed — `coop setup` and `coop up --profile` cover image
+  creation end-to-end. `scripts/build-rootfs.sh` stays as a documented
+  manual fallback. Restart still works against existing instances; the
+  flags above only take effect at create time (via `coop up`).
+
+- **`--git-repo` moved from `coop start` to `coop up`** (#264) —
+  `coop up --git-repo <url>` clones a remote repository into
+  `/workspace` and is idempotent across re-runs, matching the rest of
+  `up`: an instance already associated with the URL is reused if
+  running, restarted if stopped, and created otherwise. The instance
+  name is derived from the repo basename when `--name` is not given.
+
+- **tmux session wrapping removed** (#183, #184) — `coop shell`,
+  `coop claude`, and `coop codex` no longer wrap the remote session in
+  tmux, and the `--session <name>` / `--no-tmux` flags are gone. The
+  `tmux` package is also dropped from the guest base image. Claude
+  Code's `claude agents` daemon (`coop claude-agents`) already
+  provides session persistence without a terminal multiplexer; users
+  who still want detachable terminals can install tmux themselves via
+  `coop setup --extra-packages tmux` and start it manually inside
+  `coop shell`.
+
+- **Devcontainer auto-discovery prompts on `up` / `setup --workspace`**
+  (#129, #130, #242) — When the workspace contains
+  `.devcontainer/devcontainer.json` and no escape hatch flag is set,
+  coop prompts before applying it. Non-TTY callers must pass
+  `--devcontainer <path>`, `--no-devcontainer`, or `--dry-run`; the
+  prompt never silently chooses. Precedence is
+  `CLI > devcontainer.json > defaults`, and the report column makes
+  overrides explicit.
+
+### New features
+
+- **`coop up` — project-oriented environment command** (#230, #264) —
+  `coop up [DIR]` ensures an environment for a project directory
+  exists and is running, idempotently. `DIR` defaults to the current
+  directory and is canonicalized for affinity; a matching instance is
+  reconnected if running, restarted if stopped, or created otherwise.
+  `--git-repo <url>` uses a remote repository as the workspace instead
+  of a local directory. Creation-time flags (`--vcpus`, `--mem`,
+  `--disk`, `--image`, `--profile`, `--extra-mount`,
+  `--devcontainer`, `--exclude-git`) only take effect when the
+  instance is created and are rejected against existing instances with
+  a `coop destroy` hint; runtime flags (`--forward-port`,
+  `--post-start`, `--env`) take effect on create or restart but are
+  ignored when reconnecting to a running VM.
+
+- **`coop quickstart` — one-shot setup + start + claude** (#74, #213)
+  — Chains `ensure-image → ensure-instance → launch-claude`,
+  short-circuiting any step that's already done. Setup runs only when
+  the `default` template image is missing; workspace affinity
+  reconnects to a running instance for the current directory (or
+  restarts a stopped one) instead of allocating fresh. `--no-workspace`
+  opts out of the cwd mount; sensitive directories (`$HOME`, `/`)
+  prompt default-no on a TTY and bail non-interactively.
+
+- **`devcontainer.json` support** (#129, #130, #131, #134) — A new
+  translator maps recognised keys to coop's existing primitives:
+  `hostRequirements` → `--vcpus`/`--mem`/`--disk`, `containerEnv` →
+  guest env, `forwardPorts` → `--forward-port`, `postStartCommand` →
+  `post_start`, `features` → built-in profiles, `mounts` →
+  `--mount`, `remoteUser` → `--guest-user`. New flags on
+  `setup` / `up`: `--devcontainer PATH` (opt in to a specific file),
+  `--no-devcontainer` (opt out entirely), and `--dry-run` (print the
+  per-key report and exit before any side effects). JSONC (`//`,
+  `/* */` comments, trailing commas) parses cleanly. CLI `--env` and
+  devcontainer `containerEnv` are persisted to `guest_env.json` so
+  `coop shell` / `coop exec` see the same values without re-parsing
+  config.
+
+- **OCI devcontainer features** (#245) — Supported public
+  `ghcr.io/devcontainers/features/*` entries declared in
+  `devcontainer.json` are resolved at `coop setup` and baked into the
+  image alongside the existing built-in profiles. `coop up --profile`
+  continues to compose the built-in profile set.
+
+- **`coop devcontainer` subcommands** (#234, #247, #287) —
+  `coop devcontainer check <path>` translates a `devcontainer.json`
+  and prints the report without running any setup or VM work
+  (`--stage setup|start|both`). `coop devcontainer ignore <project>`
+  persistently opts a project out of discovery; `... status` lists
+  current opt-outs; `... clear` removes one. Symlinked project
+  prefixes are resolved when clearing, so a directory that was moved
+  or unlinked doesn't leave a stale opt-out behind.
+
+- **`coop setup --guest-user` and `remoteUser` handling** (#217, #218)
+  — Bake a configurable guest username (default `ubuntu`, validated
+  against POSIX rules and not `root`) into the image at setup time.
+  `start`/`shell`/`exec` read the value from the image's
+  `template_config.json`. A `devcontainer.json` that declares a
+  different `remoteUser` is honored when its value matches the
+  persisted setup user; mismatches surface an actionable diagnostic
+  instead of silently writing a wrong home path. Backward-compatible
+  for pre-existing images.
+
+- **`--forward-port` / `forward_ports` config** (#125, #128) — Forward
+  guest TCP ports to the host for the lifetime of the VM.
+  `coop up --forward-port 3000` exposes guest 3000 on host 3000;
+  `3000:18080` remaps to a different host port. The flag is
+  repeatable, supported by a config-level `forward_ports = [...]`
+  default, persisted across `stop`/`start`, and torn down cleanly on
+  `coop stop`. Collision with an already-bound host port fails fast
+  before the VM is created.
+
+- **`post_start` hook** (#123, #126) — `post_start` in `config.toml`
+  (or `--post-start <cmd>` on `coop up` / `coop start`) runs a shell
+  command in the guest after SSH is ready and before any interactive
+  shell or agent launch. Maps to `postStartCommand` in
+  `devcontainer.json`. Failure is logged at WARN and does not fail
+  the start, so a transient hook problem can't strand the VM.
+
+- **`[guest_env]` config block + `--env KEY=VALUE`** (#127, #131,
+  #134) — Set literal env vars inside the guest without forwarding
+  from the host. CLI overrides win over config and devcontainer
+  values; `--env` is persisted to `guest_env.json` so
+  `coop shell` / `coop exec` see the same values without rerunning
+  `start`. `coop start --env` and `--devcontainer`-derived
+  `containerEnv` survive `stop`/`start` cycles.
+
+- **Build profile images on demand from `coop up`** (#235) —
+  `coop up --profile <list>` derives an image name from the sorted
+  profile list, runs the same stale-image check as `coop setup`, and
+  builds or rebuilds that image if needed. Explicit named images
+  (`--image`) are unchanged.
+
+- **Submodule discovery in `coop github setup-pat`** (#219, #221,
+  #223) — The wizard pre-discovers submodule repositories via the
+  local `gh` install (no network round-trip per submodule) and offers
+  to set up a PAT for each one.
+
+- **Guest PATH set via `/etc/environment`** (#248, #249) —
+  `~/.local/bin` is now reliably on `PATH` for non-interactive SSH
+  sessions, including `coop claude` and Claude Code's Bash-tool
+  subshells. Previously these sessions skipped `~/.profile` and
+  `~/.bashrc`'s PATH export, hiding `uv`/`pipx`/user tools and
+  triggering `claude doctor` warnings. `pam_env` reads
+  `/etc/environment` for every PAM session regardless of shell mode,
+  so the prepend reaches remote commands, their subshells, and
+  VS Code remote sessions.
+
+- **Docker buildx in guest images** (#288) — `docker buildx` is
+  installed in every coop image so multi-arch and `buildkit`-driven
+  builds work without manual setup.
+
+- **Secrets redacted from `Debug` output** (#79, #121, #262) — A new
+  `Secret<T>` newtype with redacting `Debug`, transparent serde, and
+  an explicit `expose()` accessor wraps `ClaudeConfig.api_key`,
+  `CodexConfig.api_key`, and `PatEntry.token`. MCP header secrets
+  and forwarded env values render as `<redacted>` in error chains,
+  tracing events, `dbg!`, and panics.
+
+- **Hint at `--workspace`/`--mount` when `start` name looks like a
+  path** (#226) — Running `coop start ./my-project` now surfaces a
+  hint to use `coop up` (which interprets `DIR` correctly) instead of
+  failing with an opaque "instance not found".
+
+- **Warn when `--mount` source is a live git repo** (#102, #122) —
+  Live mounts share filesystem state with the host, so in-guest
+  changes affect the host checkout immediately. coop now warns when
+  the mount source looks like a working tree.
+
+### Fixes
+
+- **Survive mid-session SSH exit 255 in interactive sessions** (#224,
+  #227) — A network blip that produced SSH exit 255 mid-session no
+  longer kills the wrapping coop process; the session reattaches.
+
+- **Interactive SSH escape path hardened** (#232) — Closes a regression
+  in escape-sequence handling on the interactive path.
+
+- **`workspace.json` parse errors surfaced** (#225) — Three call sites
+  previously swallowed parse errors; all now report them with context.
+
+- **Bare `coop start --mount` allocates a fresh instance** (#214,
+  #215) — Earlier this collided with the auto-resolve path and
+  produced a confusing error.
+
+- **`coop up` workspace sync no longer drops `--extra-mount` on
+  Firecracker** (#264) — The workspace-sync block now always syncs
+  extra mounts; only mount-only instances record the workspace
+  identity. Also fixes a tar-pipe fallback that extracted to
+  `/workspace` regardless of the mount's guest path.
+
+- **`coop start` devcontainer lifecycle ordering** (#241) — Devcontainer
+  translation now runs before the SSH-ready probe, so per-key
+  reporting reflects what will actually be applied.
+
+- **Skip redundant `is_running()` in stop / stream-logs** (#195,
+  #205) — These were probing the running state twice on the
+  SSH-readiness path; collapsed to a single probe.
+
+- **Direct-probe `resolve_instance` fast path for by-name lookups**
+  (#202, #203, #211, #212) — Defers `CoopConfig::validate` until
+  commands that touch probed paths actually need it, and skips the
+  generic search when an instance name is supplied.
+
+- **Lima SSH-readiness probe via `ssh.config` instead of
+  `limactl list`** (#201, #210) — Cuts a 0.4–1.5 s `limactl`
+  invocation off the resolve fast path on macOS.
+
+- **Firecracker CI kernel fallback** (#290) — When the latest
+  Firecracker CI minor has no assets published yet (transient
+  release-pipeline gap), setup falls back to the previous minor
+  instead of failing.
+
+- **Integration tests** — Forward-port test uses a `python3` listener
+  instead of `nc` (Firecracker CI rootfs ships no netcat) (#132).
+  `test_list_empty` tolerates pre-existing instances on a shared
+  host (#133). `--forward-port` collision test reads `$HARNESS_ERR`
+  instead of an outer redirect (#135). Devcontainer opt-out test
+  assertions match the actual message text (#286). Stop idempotency
+  test reuses a stopped instance (#240). Bare `coop start --mount`
+  `pipefail`+`grep -q` race fixed (#220).
+
+### Internal
+
+- **VM lifecycle type-state** (#153, #180, #275) — `RunningInstance`
+  and `StoppedInstance` carry lifecycle state in the type, eliminating
+  runtime state checks on operations like `resize_disk`, `status`,
+  and `stop`. The `RunningInstance` proof extends across both
+  backends.
+
+- **Newtype / enum survey across module boundaries** —
+  `InstanceName` (#192, #199), `RepoSlug` (#149, #171),
+  `ImageName` (#157, #181), `Hostname` and `SshUser` (#154, #187),
+  `GuestUser` (#217, #218), `ToolName` and `AccountName` (#165,
+  #190), `EnvVarName` (#151, #177, #196, #206), `MemorySpec` (#163,
+  #188), `MiB`/`GiB` (#194, #207), `Sha256Hash` (#161, #189),
+  `Architecture` (#169, #173), `PortForward` and `Mount` (#179),
+  `HostInterface` (#159, #186), `SubnetMask(u8)` (#150, #176),
+  `InstanceIndex` 0..=252 bound (#162, #175), `TmuxSessionName` +
+  `RemoteCommand` (#166, #182, later removed with #183),
+  `GuestPath` round-trips dropped (#193, #204). Profile names
+  resolved at the config boundary (#156, #172).
+  `--mount`/`--env`/`--forward-port` and disk size / devcontainer
+  path / repo slug parsed by clap value-parsers (#179, #285).
+  `redacted_args: Vec<usize>` replaced with typed `Arg` variants
+  (#160, #185). `McpServerDef` replaced with a transport-tagged
+  enum (#148, #178). `WorkspaceState` optionals collapsed into
+  `WorkspaceSource` variants (#170). `restart: bool` and
+  `follow: bool` replaced with two-variant enums (#174).
+  Correlated `bool` fields replaced with enums (#266, #280).
+  `cmd:` string reverse-parsing replaced with a structured
+  `CmdToken` (#277). Guest-env precedence merge unified (#276).
+  PAT repo probe typed with a `ProbeError` enum (#282). Dead
+  wrappers removed and over-broad visibility tightened (#283).
+  Near-identical function pairs extracted into shared helpers
+  (#284). Newtypes threaded through boundaries instead of decaying
+  to `String` (#279). A four-PR survey of smaller newtype / struct
+  refactors (#191).
+
+- **Mutation-testing baseline on `config.rs`** (#136, #137, #138,
+  #139, #140, #141, #143, #144, #145, #146) — Adds the
+  mutation-testing guidance now in `CLAUDE.md`, pins
+  `CoopConfig::validate`, `Instance::is_running`,
+  `is_firecracker_process`, and `MiB::as_gib_f64` with tests, and
+  annotates equivalent mutants (`fmt::Display` impls, default-value
+  getters, serde `Visitor` methods) with `#[mutants::skip]` and a
+  one-line justification.
+
+- **Port-forward integration test covers restart re-establishment**
+  (#260).
+
+- **`[guest_env]` config block integration phase** (#263).
+
+- **OCI devcontainer feature install integration phase** (#261).
+
+### Documentation
+
+- **`coop up`, `coop quickstart`, and the devcontainer workflow**
+  documented in `docs/commands.md`, `docs/getting-started.md`, and
+  `docs/devcontainer.md` (#213, #230, #234, #257).
+
+- **Guest user, guest PATH, and startup flag pointers** (#259).
+
+- **Submodule discovery in setup-pat wizard** (#258).
+
+- **Mutation-testing guidance** (#136) added to `CLAUDE.md`.
+
+### Dependencies
+
+- `serde_json` 1.0.149 → 1.0.150 (#228)
+- `zizmorcore/zizmor-action` 0.5.3 → 0.5.5 → 0.5.6 (#198, #229)
+
+## v0.4.4
+
+### Breaking changes
 
 - **`coop push` / `coop pull` / `coop exec` take the instance name as a
   positional argument** (#90) — these three commands previously accepted
@@ -26,14 +310,6 @@
   `coop exec my-vm -- ls -la`.
 
 ### New features
-
-- **`--forward-port` / `forward_ports` config** (#125) — Forward guest
-  TCP ports to the host for the lifetime of the VM. `coop start
-  --forward-port 3000` exposes guest 3000 on host 3000; `3000:18080`
-  remaps to a different host port. The flag is repeatable, supported
-  by a config-level `forward_ports = [...]` default, persisted across
-  `stop`/`start`, and torn down cleanly on `coop stop`. Collision with
-  an already-bound host port fails fast before the VM is created.
 
 - **`coop ca` / `coop claude-agents` shortcut** (#80, #82, #99, #100, #101) —
   Runs `claude agents` inside the VM in one command. Claude Code's daemon
