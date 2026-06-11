@@ -147,10 +147,10 @@ impl AccountName {
     /// component and keeps [`CmdToken::parse`] an unambiguous inverse. A
     /// recovered `File` token is only used to name the backend and to
     /// round-trip through its `Display`; it never drives a filesystem write,
-    /// so a
-    /// stem coop would not itself have written is harmless to accept (and a
-    /// stem outside the class — spaces, quotes, a `/` — is still rejected,
-    /// falling through to `None` rather than being misattributed to `File`).
+    /// so a stem coop would not itself have written is harmless to accept
+    /// (and a stem outside the class — spaces, quotes, a `/` — is still
+    /// rejected, falling through to `None` rather than being misattributed to
+    /// `File`).
     pub fn new(s: &str) -> Result<Self> {
         if s.is_empty() {
             bail!("Account name is empty");
