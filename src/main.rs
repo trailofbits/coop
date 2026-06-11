@@ -33,6 +33,7 @@ mod workspace;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -108,6 +109,9 @@ enum Commands {
         /// Named image to build (default: "default")
         #[arg(long, default_value = config::DEFAULT_IMAGE)]
         image: String,
+        /// Duration to wait for the setup builder VM to finish provisioning
+        #[arg(long, value_parser = parse_duration)]
+        builder_timeout: Option<Duration>,
     },
     /// Build rootfs image and fetch kernel (use `setup` for first-time install)
     Build,
@@ -365,6 +369,7 @@ fn main() -> Result<()> {
             post_install,
             template_size,
             image,
+            builder_timeout,
         } => {
             apply_vm_overrides(&mut cfg, vcpus, mem, template_size)?;
             let _guard = signal::install_handlers();
@@ -377,6 +382,7 @@ fn main() -> Result<()> {
                     extra_packages,
                     post_install: post_install.map(PathBuf::from),
                     image,
+                    builder_timeout,
                 },
             )
         }
@@ -1302,9 +1308,39 @@ fn dir_size_display(dir: &std::path::Path) -> String {
     format!("{gib:.1} GiB")
 }
 
+fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration cannot be empty".to_string());
+    }
+
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else {
+        (value, 1)
+    };
+
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration {value:?}; use seconds, or suffix s/m/h"))?;
+    let seconds = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration {value:?} is too large"))?;
+    if seconds == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
 
     use super::Cli;
@@ -1356,6 +1392,18 @@ mod tests {
     fn shell_session_and_no_tmux_conflict() {
         let err = parse_err(&["shell", "--session", "x", "--no-tmux"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn setup_builder_timeout_parses() {
+        let cli = parse(&["setup", "--builder-timeout", "60m"]);
+        let super::Commands::Setup {
+            builder_timeout, ..
+        } = cli.command
+        else {
+            panic!("expected Setup variant");
+        };
+        assert_eq!(builder_timeout, Some(Duration::from_secs(3600)));
     }
 
     #[test]

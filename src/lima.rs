@@ -38,7 +38,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         if base_img.exists() && !opts.rebuild {
             eprintln!("\n=> Golden image '{image}' is stale — rebuilding");
         }
-        build_golden_image(cfg, image, &opts.profiles)?;
+        build_golden_image(cfg, image, &opts.profiles, opts.builder_timeout)?;
     }
 
     generate_start_template(cfg, image)?;
@@ -497,7 +497,12 @@ fn needs_rebuild(cfg: &CoopConfig, image: &str, profiles: &[String]) -> bool {
     existing.marketplaces != wanted_m || existing.plugins != wanted_p
 }
 
-fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Result<()> {
+fn build_golden_image(
+    cfg: &CoopConfig,
+    image: &str,
+    profiles: &[String],
+    builder_timeout: Option<Duration>,
+) -> Result<()> {
     eprintln!(
         "\n=> Building golden VM image \
          (this takes a few minutes on first run)"
@@ -540,7 +545,7 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
     }
 
     // Build to staging path — old image is never touched
-    let result = run_builder_vm(cfg, profiles, &staging, &builder_template);
+    let result = run_builder_vm(cfg, profiles, &staging, &builder_template, builder_timeout);
 
     // Always clean up builder resources
     eprintln!("  Cleaning up builder VM...");
@@ -596,6 +601,10 @@ fn build_golden_image(cfg: &CoopConfig, image: &str, profiles: &[String]) -> Res
     Ok(())
 }
 
+fn format_duration(duration: Duration) -> String {
+    format!("{}s", duration.as_secs().max(1))
+}
+
 /// Start the builder VM, install marketplaces/plugins, clean
 /// cloud-init, stop it, and extract the disk image to `output_path`.
 fn run_builder_vm(
@@ -603,10 +612,15 @@ fn run_builder_vm(
     profiles: &[String],
     output_path: &std::path::Path,
     builder_template: &std::path::Path,
+    builder_timeout: Option<Duration>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     eprintln!("  Starting builder VM and installing packages...");
-    let status = Command::new("limactl")
-        .arg("start")
+    let mut command = Command::new("limactl");
+    command.arg("start");
+    if let Some(timeout) = builder_timeout {
+        command.arg("--timeout").arg(format_duration(timeout));
+    }
+    let status = command
         .arg(builder_template)
         .arg(format!("--name={BUILDER_NAME}"))
         .arg("--tty=false")

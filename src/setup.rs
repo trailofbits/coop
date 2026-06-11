@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,7 @@ pub struct SetupOptions {
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
     pub image: String,
+    pub builder_timeout: Option<Duration>,
 }
 
 /// Persisted template configuration (profiles, packages, hashes).
