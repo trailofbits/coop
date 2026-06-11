@@ -29,7 +29,11 @@ const GIT_EXCLUDE: &str = ".git/";
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
-    /// Path inside the guest VM. Always absolute by construction.
+    /// Path inside the guest VM. Always absolute — enforced on
+    /// deserialize so a hand-edited or pre-migration `workspace.json`
+    /// with a relative path is rejected at load time rather than
+    /// flowing into the remote shell commands that interpolate it.
+    #[serde(deserialize_with = "deserialize_absolute_guest_path")]
     pub guest_path: GuestPath,
     /// How the workspace was created. Variant-specific fields (host
     /// path, original repo URL) live inside the source so invalid
@@ -62,6 +66,29 @@ impl WorkspaceSource {
             Self::GitRepo { .. } => None,
         }
     }
+}
+
+/// Deserialize a `guest_path`, routing through [`GuestPath::absolute`].
+///
+/// `GuestPath` deserializes transparently (any string), which would let a
+/// relative or empty `guest_path` in a hand-edited `workspace.json` bypass
+/// the absolute-path invariant the rest of the code relies on. Enforcing it
+/// here keeps the invariant true for every loaded `WorkspaceState`.
+fn deserialize_absolute_guest_path<'de, D>(deserializer: D) -> Result<GuestPath, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = String::deserialize(deserializer)?;
+    GuestPath::absolute(raw).map_err(D::Error::custom)
+}
+
+/// Single-quote a guest path for safe interpolation into a remote shell
+/// command. The path can originate from a hand-edited `workspace.json`, so it
+/// must never be spliced into an `ssh` command line unquoted — absolute-path
+/// validation alone does not neutralize shell metacharacters.
+fn shell_quote_guest(guest_path: &GuestPath) -> String {
+    crate::shell::shell_escape(&guest_path.to_string())
 }
 
 impl WorkspaceState {
@@ -176,7 +203,7 @@ pub fn tar_pipe_transfer_to(
         .take()
         .context("Failed to get tar stderr")?;
 
-    let extract_cmd = format!("tar xf - -C {guest_path}");
+    let extract_cmd = tar_extract_cmd(guest_path);
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
     ssh_args.push(extract_cmd);
@@ -477,8 +504,9 @@ pub fn sync_mount_contents(
 ) -> Result<()> {
     for m in mounts {
         let guest = &m.guest_path;
+        let guest_q = shell_quote_guest(guest);
         target.exec(&format!(
-            "sudo mkdir -p {guest} && sudo chown ubuntu:ubuntu {guest}"
+            "sudo mkdir -p {guest_q} && sudo chown ubuntu:ubuntu {guest_q}"
         ))?;
 
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
@@ -695,12 +723,20 @@ fn rsync_pull(
 
 // ── Transport: tar-pipe ───────────────────────────────────────
 
-fn tar_pipe_pull(
-    target: &SshTarget,
-    guest_path: &GuestPath,
-    dest: &Path,
-    exclude_git: bool,
-) -> Result<()> {
+/// Remote command that extracts a streamed tar archive into `guest_path`.
+///
+/// `guest_path` is shell-quoted so it is treated as a single, literal
+/// directory argument regardless of its contents.
+fn tar_extract_cmd(guest_path: &GuestPath) -> String {
+    format!("tar xf - -C {}", shell_quote_guest(guest_path))
+}
+
+/// Remote command that streams a tar archive of `guest_path` to stdout,
+/// applying the same exclusions as a push.
+///
+/// `guest_path` is shell-quoted (see [`shell_quote_guest`]); the exclude
+/// patterns are fixed constants, not user input.
+fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> String {
     let mut excludes: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(|exc| format!("--exclude={exc}"))
@@ -709,8 +745,19 @@ fn tar_pipe_pull(
         excludes.push(format!("--exclude={GIT_EXCLUDE}"));
     }
     let exclude_str = excludes.join(" ");
+    format!(
+        "tar cf - -C {} {exclude_str} .",
+        shell_quote_guest(guest_path)
+    )
+}
 
-    let remote_cmd = format!("tar cf - -C {guest_path} {exclude_str} .");
+fn tar_pipe_pull(
+    target: &SshTarget,
+    guest_path: &GuestPath,
+    dest: &Path,
+    exclude_git: bool,
+) -> Result<()> {
+    let remote_cmd = tar_pull_cmd(guest_path, exclude_git);
 
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
@@ -831,6 +878,7 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // edits made inside the guest. Modified tracked files and unpushed
     // commits are the real signal that an agent has done work the host
     // doesn't yet know about.
+    let guest_path = shell_quote_guest(guest_path);
     let check_cmd = format!(
         "if [ -d {guest_path}/.git ]; then \
             cd {guest_path} && \
@@ -1097,6 +1145,7 @@ fn launch_editor(inst: &Instance, remote_path: &GuestPath, editor: Option<&str>)
 mod tests {
     use super::*;
     use crate::config::{ImageName, InstanceIndex, InstanceName};
+    use proptest::prelude::*;
 
     fn temp_instance(dir: &Path) -> Instance {
         Instance {
@@ -1105,6 +1154,46 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    /// Run `f` with a thread-local WARN-level subscriber and return its
+    /// result alongside the captured log output. Lets a test assert that a
+    /// warning was emitted, not just that an error was swallowed.
+    fn capture_warn<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(Arc::clone(&buf)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.lock().expect("log buffer lock").clone())
+            .expect("log output is utf-8");
+        (result, logs)
     }
 
     #[test]
@@ -1205,36 +1294,48 @@ mod tests {
     }
 
     #[test]
-    fn try_load_or_warn_returns_none_when_missing() {
+    fn try_load_or_warn_swallows_parse_error_and_warns() {
+        // `try_load_or_warn` wraps `try_load`: it must pass a present state
+        // through untouched, and turn a parse error into `None` while logging
+        // a WARN that names the degraded feature (`consequence`) and the
+        // instance. Both arms are pinned here so a mutant that drops either
+        // the pass-through or the warning is caught.
         let dir = tempfile::tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
-        assert!(try_load_or_warn(&inst, "test").is_none());
-    }
 
-    #[test]
-    fn try_load_or_warn_returns_none_on_parse_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let inst = temp_instance(dir.path());
-        fs::write(inst.workspace_state_path(), "not json").expect("write");
-        assert!(try_load_or_warn(&inst, "test").is_none());
-    }
-
-    #[test]
-    fn try_load_or_warn_returns_state_when_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let inst = temp_instance(dir.path());
-        let state = WorkspaceState {
-            guest_path: GuestPath::absolute(GUEST_WORKSPACE).unwrap(),
-            source: WorkspaceSource::GitRepo {
-                url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
+        // Present: the loaded state flows through unchanged, no warning.
+        let saved = WorkspaceState {
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: PathBuf::from("/host/dir"),
             },
         };
-        state.save(&inst).expect("save");
-        let loaded = try_load_or_warn(&inst, "test").expect("state should load");
+        saved.save(&inst).expect("save");
+        let (loaded, ok_logs) =
+            capture_warn(|| try_load_or_warn(&inst, "token forwarding skipped"));
+        let loaded = loaded.expect("present state must pass through");
         assert!(matches!(
             loaded.source,
-            WorkspaceSource::GitRepo { ref url } if url.as_str() == "https://github.com/x/y.git"
+            WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")
         ));
+        assert!(
+            !ok_logs.contains("WARN"),
+            "successful load must not warn: {ok_logs}"
+        );
+
+        // Parse error: swallowed to `None`, with an actionable warning.
+        fs::write(inst.workspace_state_path(), "not json").expect("write");
+        let (result, logs) = capture_warn(|| try_load_or_warn(&inst, "token forwarding skipped"));
+
+        assert!(result.is_none(), "parse error must not propagate");
+        assert!(
+            logs.contains("token forwarding skipped"),
+            "warning must name the degraded feature: {logs}"
+        );
+        assert!(
+            logs.contains(&inst.name.to_string()),
+            "warning must name the instance: {logs}"
+        );
     }
 
     #[test]
@@ -1309,6 +1410,47 @@ mod tests {
                 .is_none(),
             "empty mounts should not write state"
         );
+    }
+
+    fn arb_mount() -> impl Strategy<Value = crate::config::Mount> {
+        // `record_mount_state` copies fields verbatim; it never touches the
+        // filesystem, so arbitrary (but absolute) paths are fine here.
+        ("/[A-Za-z0-9_/]{0,16}", "[A-Za-z0-9_/.-]{0,16}").prop_map(|(guest, host)| {
+            crate::config::Mount {
+                host_path: PathBuf::from(host),
+                guest_path: GuestPath::absolute(format!("/m{guest}")).expect("absolute"),
+            }
+        })
+    }
+
+    fn read_state_json(inst: &Instance) -> String {
+        fs::read_to_string(inst.workspace_state_path()).expect("state file present")
+    }
+
+    proptest! {
+        /// Recording mount state is an idempotent overwrite: recording the
+        /// same primary mount twice yields the same on-disk bytes, and
+        /// recording a different mount replaces the previous one wholesale.
+        #[test]
+        fn record_mount_state_is_idempotent_and_replacing(
+            m1 in arb_mount(),
+            m2 in arb_mount(),
+        ) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let inst = temp_instance(dir.path());
+
+            record_mount_state(&inst, std::slice::from_ref(&m1)).expect("record m1");
+            let after_first = read_state_json(&inst);
+            record_mount_state(&inst, std::slice::from_ref(&m1)).expect("record m1 again");
+            prop_assert_eq!(&after_first, &read_state_json(&inst));
+
+            record_mount_state(&inst, std::slice::from_ref(&m2)).expect("record m2");
+            let replaced = WorkspaceState::try_load(&inst)
+                .expect("no IO error")
+                .expect("state present");
+            prop_assert_eq!(&replaced.guest_path, &m2.guest_path);
+            prop_assert_eq!(replaced.source.host_path(), Some(m2.host_path.as_path()));
+        }
     }
 
     #[test]
@@ -1463,73 +1605,92 @@ Host coop-0\n\
         assert_eq!(GIT_EXCLUDE, ".git/");
     }
 
-    #[test]
-    fn rsync_args_include_git_by_default() {
-        let args = rsync_base_args(&fake_ssh_target(), false);
-        // The protective filter must precede the .gitignore merge so
-        // first-match-wins doesn't let a user's .gitignore strip .git/.
-        let protect_idx = args
-            .iter()
-            .position(|a| a == "--filter=+ /.git/***")
-            .expect("expected protective .git/ include filter");
-        let gitignore_idx = args
-            .iter()
-            .position(|a| a == "--filter=:- .gitignore")
-            .expect("expected .gitignore merge filter");
-        assert!(
-            protect_idx < gitignore_idx,
-            "protective filter must come before .gitignore merge: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "--exclude=.git/"),
-            "default rsync must not exclude .git/: {args:?}"
-        );
-    }
+    proptest! {
+        /// For either `exclude_git` value, `rsync_base_args` must emit every
+        /// `DEFAULT_EXCLUDES` member, choose exactly one git rule keyed on the
+        /// flag, and place that rule before the `.gitignore` merge so
+        /// rsync's first-match-wins ordering can't let a user's `.gitignore`
+        /// strip git state. Replaces the two earlier per-flag example tests
+        /// and closes the gap where membership of every exclude went
+        /// unchecked.
+        #[test]
+        fn rsync_base_args_membership_and_git_filter_ordering(exclude_git in any::<bool>()) {
+            let args = rsync_base_args(&fake_ssh_target(), exclude_git);
 
-    #[test]
-    fn rsync_args_exclude_git_when_requested() {
-        let args = rsync_base_args(&fake_ssh_target(), true);
-        // Opt-out path: no protective filter, explicit exclude before the
-        // .gitignore merge so the exclude wins.
-        let exclude_idx = args
-            .iter()
-            .position(|a| a == "--exclude=.git/")
-            .expect("expected --exclude=.git/");
-        let gitignore_idx = args
-            .iter()
-            .position(|a| a == "--filter=:- .gitignore")
-            .expect("expected .gitignore merge filter");
-        assert!(
-            exclude_idx < gitignore_idx,
-            "explicit --exclude=.git/ must precede .gitignore merge: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "--filter=+ /.git/***"),
-            "exclude_git=true must drop the protective filter: {args:?}"
-        );
+            for exc in DEFAULT_EXCLUDES {
+                let needle = format!("--exclude={exc}");
+                prop_assert!(
+                    args.iter().any(|a| a == &needle),
+                    "missing default exclude {needle:?}: {args:?}"
+                );
+            }
+
+            let has_protect = args.iter().any(|a| a == "--filter=+ /.git/***");
+            let has_exclude_git = args.iter().any(|a| a == "--exclude=.git/");
+            // Exactly one git rule, selected by the flag.
+            prop_assert_eq!(has_protect, !exclude_git);
+            prop_assert_eq!(has_exclude_git, exclude_git);
+
+            let gitignore_idx = args
+                .iter()
+                .position(|a| a == "--filter=:- .gitignore")
+                .expect("expected .gitignore merge filter");
+            let git_rule_idx = args
+                .iter()
+                .position(|a| a == "--filter=+ /.git/***" || a == "--exclude=.git/")
+                .expect("expected a git rule");
+            prop_assert!(
+                git_rule_idx < gitignore_idx,
+                "git rule must precede the .gitignore merge: {:?}",
+                args
+            );
+        }
     }
 
     // ── WorkspaceState serialization ──────────────────────────
 
     #[test]
-    fn workspace_state_round_trip_workspace() {
-        // The only direct serde test for the Workspace variant; the
-        // other variants are exercised end-to-end through
-        // `record_mount_state_persists_first_mount` (Mount) and
-        // `load_or_default_uses_saved_state` (GitRepo).
-        let state = WorkspaceState {
-            guest_path: GuestPath::absolute("/workspace").unwrap(),
-            source: WorkspaceSource::Workspace {
-                host_path: PathBuf::from("/host/dir"),
-            },
-        };
-        let json = serde_json::to_string(&state).expect("serialize");
-        let back: WorkspaceState = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.guest_path.to_string(), "/workspace");
-        assert!(matches!(
-            back.source,
-            WorkspaceSource::Workspace { ref host_path } if host_path == Path::new("/host/dir")
-        ));
+    fn try_load_rejects_relative_guest_path() {
+        // A hand-edited or pre-migration workspace.json with a relative
+        // guest_path must be rejected at load — `GuestPath`'s transparent
+        // deserialize would otherwise accept it and let it flow into the
+        // remote shell commands that interpolate the path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        fs::write(
+            inst.workspace_state_path(),
+            r#"{"guest_path": "relative/dir", "source": {"kind": "workspace", "host_path": "/h"}}"#,
+        )
+        .expect("write");
+
+        let err =
+            WorkspaceState::try_load(&inst).expect_err("relative guest_path must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute"),
+            "expected absolute-path error: {msg}"
+        );
+    }
+
+    #[test]
+    fn tar_remote_cmds_quote_guest_path_metacharacters() {
+        // An absolute path still satisfies `GuestPath::absolute` while
+        // carrying shell metacharacters, so the remote tar commands must
+        // single-quote it. The injected `;` and `$()` must appear only
+        // inside the quoted argument, never as live shell syntax.
+        let evil = GuestPath::absolute("/work; rm -rf / $(touch pwned)").expect("absolute");
+
+        let extract = tar_extract_cmd(&evil);
+        assert_eq!(
+            extract, "tar xf - -C '/work; rm -rf / $(touch pwned)'",
+            "extract command must single-quote the guest path"
+        );
+
+        let pull = tar_pull_cmd(&evil, false);
+        assert!(
+            pull.starts_with("tar cf - -C '/work; rm -rf / $(touch pwned)' "),
+            "pull command must single-quote the guest path: {pull}"
+        );
     }
 
     #[test]
