@@ -13,6 +13,7 @@ use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
     SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
 };
+use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
 use crate::sha256_hash::Sha256Hash;
 
@@ -1448,7 +1449,7 @@ fn wait_for_lima_ssh(
             }
             return Ok(());
         }
-        if target.exec_ok("true") {
+        if target.exec_ok(RemoteCommand::new().literal("true")) {
             tracing::info!("SSH ready on port {port}");
             return Ok(());
         }

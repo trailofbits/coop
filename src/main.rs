@@ -16,6 +16,7 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod remote_command;
 mod secret_store;
 mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
@@ -990,20 +991,17 @@ fn main() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), args))
+            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), args))
+            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
-            ssh::run_interactive(
-                &sess,
-                &prepend_binary(&guest::codex_bin().to_string(), args),
-            )
+            ssh::run_interactive(&sess, &prepend_binary(guest::codex_bin().as_ref(), args))
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1998,7 +1996,7 @@ fn cmd_quickstart(
 
     let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
     let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-    ssh::run_interactive(&sess, &prepend_binary(&claude_bin.to_string(), Vec::new()))
+    ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
 }
 
 /// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no

@@ -14,8 +14,8 @@ use crate::config::{
     ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef, Validated,
 };
 use crate::paths::{GuestPath, HostPath};
+use crate::remote_command::RemoteCommand;
 use crate::setup::SetupOptions;
-use crate::shell::shell_escape;
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -396,10 +396,11 @@ impl SshTarget {
     }
 
     /// Run a command on the guest via SSH.
-    pub fn exec(&self, cmd: &str) -> Result<()> {
+    pub fn exec(&self, command: RemoteCommand) -> Result<()> {
+        let cmd = command.into_string();
         let mut args = self.ssh_opts();
         args.push(self.addr());
-        args.push(cmd.to_string());
+        args.push(cmd.clone());
 
         let status = Command::new("ssh")
             .args(&args)
@@ -417,10 +418,11 @@ impl SshTarget {
     /// The bytes are written to ssh's stdin and forwarded to the remote shell.
     /// Use this when the command needs to consume secrets that must not appear
     /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
-    pub fn exec_with_stdin(&self, cmd: &str, stdin: Vec<u8>) -> Result<()> {
+    pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: Vec<u8>) -> Result<()> {
+        let cmd = command.into_string();
         let mut args = self.ssh_opts();
         args.push(self.addr());
-        args.push(cmd.to_string());
+        args.push(cmd.clone());
         Cmd::new("ssh")
             .args(args)
             .stdin_input(stdin)
@@ -429,10 +431,10 @@ impl SshTarget {
     }
 
     /// Check if a command succeeds on the guest.
-    pub fn exec_ok(&self, cmd: &str) -> bool {
+    pub fn exec_ok(&self, command: RemoteCommand) -> bool {
         let mut args = self.ssh_opts();
         args.push(self.addr());
-        args.push(cmd.to_string());
+        args.push(command.into_string());
 
         Command::new("ssh")
             .args(&args)
@@ -443,10 +445,10 @@ impl SshTarget {
     }
 
     /// Like `exec_ok` but uses connection multiplexing for fast retries.
-    fn probe_ok_mux(&self, cmd: &str) -> bool {
+    fn probe_ok_mux(&self, command: RemoteCommand) -> bool {
         let mut args = self.ssh_opts_mux();
         args.push(self.addr());
-        args.push(cmd.to_string());
+        args.push(command.into_string());
 
         Command::new("ssh")
             .args(&args)
@@ -472,7 +474,7 @@ impl SshTarget {
         tracing::info!("Probing SSH readiness (timeout: {timeout:?})");
 
         loop {
-            if self.probe_ok_mux("true") {
+            if self.probe_ok_mux(RemoteCommand::new().literal("true")) {
                 tracing::info!("SSH is ready");
                 self.close_mux();
                 return Ok(());
@@ -590,10 +592,11 @@ impl SshSession {
     }
 
     /// Run a command on the guest via SSH with env forwarding.
-    pub fn exec(&self, cmd: &str) -> Result<()> {
+    pub fn exec(&self, command: RemoteCommand) -> Result<()> {
+        let cmd = command.into_string();
         let mut args = self.ssh_opts();
         args.push(self.target.addr());
-        args.push(cmd.to_string());
+        args.push(cmd.clone());
 
         let status = Command::new("ssh")
             .args(&args)
@@ -1256,7 +1259,7 @@ pub fn run_post_start(session: &SshSession, command: &str) {
     tracing::info!("Running post_start hook in guest");
     tracing::debug!("post_start: {command}");
 
-    match session.exec(command) {
+    match session.exec(RemoteCommand::new().literal(command)) {
         Ok(()) => tracing::debug!("post_start hook completed"),
         Err(e) => tracing::warn!("post_start hook failed (continuing): {e}"),
     }
@@ -1309,7 +1312,11 @@ fn bootstrap_claude(
             || !claude.plugins.is_empty()
             || !claude.mcp_servers.is_empty();
 
-        if needs_claude_cli && !session.target.exec_ok(&format!("test -x {claude_bin}")) {
+        if needs_claude_cli
+            && !session
+                .target
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))
+        {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
                  The golden image may have been built before the \
@@ -1364,10 +1371,11 @@ fn bootstrap_codex(session: &SshSession, cfg: &CoopConfig, mode: BootMode) -> Re
         return Ok(());
     }
 
-    if !session
-        .target
-        .exec_ok(&format!("test -x {}", crate::guest::codex_bin()))
-    {
+    if !session.target.exec_ok(
+        RemoteCommand::new()
+            .literal("test -x ")
+            .arg(crate::guest::codex_bin()),
+    ) {
         bail!("{}", codex_missing_guest_cli_message());
     }
 
@@ -1504,7 +1512,7 @@ fn resolve_pat_token(
 
 fn setup_github_auth(session: &SshSession) -> Result<()> {
     session
-        .exec("gh auth setup-git")
+        .exec(RemoteCommand::new().literal("gh auth setup-git"))
         .context("Failed to configure git credential helper in guest")
 }
 
@@ -1546,7 +1554,7 @@ fn copy_staged_to_guest(
         return Ok(());
     }
 
-    target.exec(&format!("mkdir -p ~/{guest_subdir}"))?;
+    target.exec(RemoteCommand::new().literal(format!("mkdir -p ~/{guest_subdir}")))?;
 
     let guest_dir = GuestPath::new(format!("./{guest_subdir}"));
     for entry in std::fs::read_dir(staging_path).context("Failed to read staging directory")? {
@@ -1599,10 +1607,10 @@ fn managed_claude_settings_json() -> String {
 /// is small and owned by coop; users wanting per-VM customization should
 /// extend coop's config rather than editing the guest file in place.
 fn write_managed_claude_settings(target: &SshTarget) -> Result<()> {
-    target.exec("mkdir -p ~/.claude")?;
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
     target
         .exec_with_stdin(
-            "cat > ~/.claude/settings.json",
+            RemoteCommand::new().literal("cat > ~/.claude/settings.json"),
             managed_claude_settings_json().into_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
@@ -1833,9 +1841,9 @@ pub(crate) fn install_marketplaces(
         let local_path = Path::new(source);
         let guest_source = if local_path.is_absolute() && local_path.is_dir() {
             if !has_local {
-                session
-                    .target
-                    .exec(&format!("mkdir -p {GUEST_MARKETPLACE_DIR}"))?;
+                session.target.exec(
+                    RemoteCommand::new().literal(format!("mkdir -p {GUEST_MARKETPLACE_DIR}")),
+                )?;
                 has_local = true;
             }
             let dir_name = local_path
@@ -1862,12 +1870,13 @@ pub(crate) fn install_marketplaces(
         };
 
         tracing::info!("Adding marketplace: {guest_source}");
-        let cmd = format!(
-            "{claude_bin} plugin marketplace add {} --scope user",
-            shell_escape(&guest_source),
-        );
+        let cmd = RemoteCommand::new()
+            .arg(claude_bin)
+            .literal(" plugin marketplace add ")
+            .arg(&guest_source)
+            .literal(" --scope user");
         session
-            .exec(&cmd)
+            .exec(cmd)
             .with_context(|| format!("Failed to add marketplace '{source}'"))?;
     }
     Ok(())
@@ -1880,12 +1889,13 @@ pub(crate) fn install_plugins(
 ) -> Result<()> {
     for plugin in plugins {
         tracing::info!("Installing plugin: {plugin}");
-        let cmd = format!(
-            "{claude_bin} plugin install {} -s user",
-            shell_escape(plugin),
-        );
+        let cmd = RemoteCommand::new()
+            .arg(claude_bin)
+            .literal(" plugin install ")
+            .arg(plugin)
+            .literal(" -s user");
         session
-            .exec(&cmd)
+            .exec(cmd)
             .with_context(|| format!("Failed to install plugin '{plugin}'"))?;
     }
     Ok(())
@@ -1904,13 +1914,14 @@ fn register_mcp_servers(
 
         let json = serde_json::to_string(&resolved)
             .context("Failed to serialize MCP server definition")?;
-        let cmd = format!(
-            "{claude_bin} mcp add-json -s user {} {}",
-            shell_escape(name),
-            shell_escape(&json),
-        );
+        let cmd = RemoteCommand::new()
+            .arg(claude_bin)
+            .literal(" mcp add-json -s user ")
+            .arg(name)
+            .literal(" ")
+            .arg(&json);
         session
-            .exec(&cmd)
+            .exec(cmd)
             .with_context(|| format!("Failed to register MCP server '{name}'"))?;
     }
     Ok(())
@@ -2007,21 +2018,25 @@ fn resolve_clone_token(strategy: Option<&GitHubAuth>, repo_url: &str) -> Result<
 }
 
 fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
-    let cmd = format!(
-        "sudo mkdir -p /workspace && \
-         sudo chown $(whoami):$(whoami) /workspace && \
-         git clone {} /workspace && \
-         echo 'Repository cloned to /workspace'",
-        shell_escape(repo_url),
-    );
-    target.exec(&cmd)
+    let cmd = RemoteCommand::new()
+        .literal(
+            "sudo mkdir -p /workspace && \
+             sudo chown $(whoami):$(whoami) /workspace && \
+             git clone ",
+        )
+        .arg(repo_url)
+        .literal(
+            " /workspace && \
+             echo 'Repository cloned to /workspace'",
+        );
+    target.exec(cmd)
 }
 
 fn clone_with_token(target: &SshTarget, repo_url: &str, token: &str) -> Result<()> {
     let mut stdin = Vec::with_capacity(token.len() + 1);
     stdin.extend_from_slice(token.as_bytes());
     stdin.push(b'\n');
-    target.exec_with_stdin(&build_clone_with_token_script(repo_url), stdin)
+    target.exec_with_stdin(build_clone_with_token_script(repo_url), stdin)
 }
 
 /// Build the remote shell script that reads a GitHub token from stdin and
@@ -2029,22 +2044,26 @@ fn clone_with_token(target: &SshTarget, repo_url: &str, token: &str) -> Result<(
 ///
 /// Separated from `clone_with_token` so the script template can be
 /// unit-tested without spawning ssh.
-fn build_clone_with_token_script(repo_url: &str) -> String {
+fn build_clone_with_token_script(repo_url: &str) -> RemoteCommand {
     // The remote shell reads the token from stdin into GH_TOKEN, exports it
     // so the credential helper subshell inherits it, then clones with a
     // one-shot helper that returns the token to git. The single quotes
     // around the helper preserve `$GH_TOKEN` for expansion inside the
     // helper's subshell (not at script-parse time).
-    format!(
-        "set -eu\n\
-         IFS= read -r GH_TOKEN\n\
-         export GH_TOKEN\n\
-         sudo mkdir -p /workspace\n\
-         sudo chown \"$(whoami):$(whoami)\" /workspace\n\
-         git -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GH_TOKEN\"; }}; f' clone {url} /workspace\n\
-         echo 'Repository cloned to /workspace'\n",
-        url = shell_escape(repo_url),
-    )
+    RemoteCommand::new()
+        .literal(
+            "set -eu\n\
+             IFS= read -r GH_TOKEN\n\
+             export GH_TOKEN\n\
+             sudo mkdir -p /workspace\n\
+             sudo chown \"$(whoami):$(whoami)\" /workspace\n\
+             git -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f' clone ",
+        )
+        .arg(repo_url)
+        .literal(
+            " /workspace\n\
+             echo 'Repository cloned to /workspace'\n",
+        )
 }
 
 /// Returns true when `url` is an `https://github.com/...` URL with no userinfo.
@@ -2521,7 +2540,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn build_clone_with_token_script_contains_required_pieces() {
-        let script = build_clone_with_token_script("https://github.com/owner/repo.git");
+        let script =
+            build_clone_with_token_script("https://github.com/owner/repo.git").into_string();
         assert!(script.starts_with("set -eu\n"), "script: {script}");
         assert!(
             script.contains("IFS= read -r GH_TOKEN\n"),
@@ -2548,7 +2568,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     fn build_clone_with_token_script_escapes_repo_url() {
         // A URL with a single quote would otherwise break out of the
         // surrounding `'...'` argument. `shell_escape` must apply.
-        let script = build_clone_with_token_script("https://github.com/o'wner/repo");
+        let script = build_clone_with_token_script("https://github.com/o'wner/repo").into_string();
         // Embedded quote must be escaped via the standard `'\''` trick.
         assert!(
             script.contains("'https://github.com/o'\\''wner/repo'"),

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{RunningInstance, SshTarget};
 use crate::config::Instance;
 use crate::paths::GuestPath;
+use crate::remote_command::RemoteCommand;
 
 const GUEST_WORKSPACE: &str = "/workspace";
 
@@ -81,14 +82,6 @@ where
     use serde::de::Error as _;
     let raw = String::deserialize(deserializer)?;
     GuestPath::absolute(raw).map_err(D::Error::custom)
-}
-
-/// Single-quote a guest path for safe interpolation into a remote shell
-/// command. The path can originate from a hand-edited `workspace.json`, so it
-/// must never be spliced into an `ssh` command line unquoted — absolute-path
-/// validation alone does not neutralize shell metacharacters.
-fn shell_quote_guest(guest_path: &GuestPath) -> String {
-    crate::shell::shell_escape(&guest_path.to_string())
 }
 
 impl WorkspaceState {
@@ -206,7 +199,7 @@ pub fn tar_pipe_transfer_to(
     let extract_cmd = tar_extract_cmd(guest_path);
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
-    ssh_args.push(extract_cmd);
+    ssh_args.push(extract_cmd.into_string());
 
     let mut ssh_child = Command::new("ssh")
         .args(&ssh_args)
@@ -432,7 +425,7 @@ pub fn push(
         state.guest_path
     );
 
-    if target.exec_ok("which rsync") {
+    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
@@ -471,7 +464,7 @@ pub fn pull(
         dest_dir.display()
     );
 
-    if target.exec_ok("which rsync") {
+    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
         rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
@@ -504,14 +497,17 @@ pub fn sync_mount_contents(
 ) -> Result<()> {
     for m in mounts {
         let guest = &m.guest_path;
-        let guest_q = shell_quote_guest(guest);
-        target.exec(&format!(
-            "sudo mkdir -p {guest_q} && sudo chown ubuntu:ubuntu {guest_q}"
-        ))?;
+        target.exec(
+            RemoteCommand::new()
+                .literal("sudo mkdir -p ")
+                .arg(guest)
+                .literal(" && sudo chown ubuntu:ubuntu ")
+                .arg(guest),
+        )?;
 
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
-        if target.exec_ok("which rsync") {
+        if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
             rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
@@ -725,18 +721,18 @@ fn rsync_pull(
 
 /// Remote command that extracts a streamed tar archive into `guest_path`.
 ///
-/// `guest_path` is shell-quoted so it is treated as a single, literal
-/// directory argument regardless of its contents.
-fn tar_extract_cmd(guest_path: &GuestPath) -> String {
-    format!("tar xf - -C {}", shell_quote_guest(guest_path))
+/// `guest_path` is shell-escaped (via [`RemoteCommand::arg`]) so it is treated
+/// as a single, literal directory argument regardless of its contents.
+fn tar_extract_cmd(guest_path: &GuestPath) -> RemoteCommand {
+    RemoteCommand::new().literal("tar xf - -C ").arg(guest_path)
 }
 
 /// Remote command that streams a tar archive of `guest_path` to stdout,
 /// applying the same exclusions as a push.
 ///
-/// `guest_path` is shell-quoted (see [`shell_quote_guest`]); the exclude
+/// `guest_path` is shell-escaped (via [`RemoteCommand::arg`]); the exclude
 /// patterns are fixed constants, not user input.
-fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> String {
+fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
     let mut excludes: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(|exc| format!("--exclude={exc}"))
@@ -745,10 +741,10 @@ fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> String {
         excludes.push(format!("--exclude={GIT_EXCLUDE}"));
     }
     let exclude_str = excludes.join(" ");
-    format!(
-        "tar cf - -C {} {exclude_str} .",
-        shell_quote_guest(guest_path)
-    )
+    RemoteCommand::new()
+        .literal("tar cf - -C ")
+        .arg(guest_path)
+        .literal(format!(" {exclude_str} ."))
 }
 
 fn tar_pipe_pull(
@@ -757,7 +753,7 @@ fn tar_pipe_pull(
     dest: &Path,
     exclude_git: bool,
 ) -> Result<()> {
-    let remote_cmd = tar_pull_cmd(guest_path, exclude_git);
+    let remote_cmd = tar_pull_cmd(guest_path, exclude_git).into_string();
 
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
@@ -878,23 +874,26 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // edits made inside the guest. Modified tracked files and unpushed
     // commits are the real signal that an agent has done work the host
     // doesn't yet know about.
-    let guest_path = shell_quote_guest(guest_path);
-    let check_cmd = format!(
-        "if [ -d {guest_path}/.git ]; then \
-            cd {guest_path} && \
-            git status --porcelain --untracked-files=no && \
-            if git rev-parse --abbrev-ref '@{{u}}' >/dev/null 2>&1; then \
-                ahead=$(git rev-list --count '@{{u}}..HEAD' 2>/dev/null); \
-                if [ \"${{ahead:-0}}\" -gt 0 ]; then \
-                    echo \"AHEAD $ahead\"; \
-                fi; \
-            fi; \
-         fi"
-    );
+    let check_cmd = RemoteCommand::new()
+        .literal("if [ -d ")
+        .arg(guest_path)
+        .literal("/.git ]; then cd ")
+        .arg(guest_path)
+        .literal(
+            " && \
+             git status --porcelain --untracked-files=no && \
+             if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
+                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null); \
+                 if [ \"${ahead:-0}\" -gt 0 ]; then \
+                     echo \"AHEAD $ahead\"; \
+                 fi; \
+             fi; \
+          fi",
+        );
 
     let mut args = target.ssh_opts();
     args.push(target.addr());
-    args.push(check_cmd);
+    args.push(check_cmd.into_string());
 
     let output = Command::new("ssh")
         .args(&args)
@@ -1680,13 +1679,13 @@ Host coop-0\n\
         // inside the quoted argument, never as live shell syntax.
         let evil = GuestPath::absolute("/work; rm -rf / $(touch pwned)").expect("absolute");
 
-        let extract = tar_extract_cmd(&evil);
+        let extract = tar_extract_cmd(&evil).into_string();
         assert_eq!(
             extract, "tar xf - -C '/work; rm -rf / $(touch pwned)'",
             "extract command must single-quote the guest path"
         );
 
-        let pull = tar_pull_cmd(&evil, false);
+        let pull = tar_pull_cmd(&evil, false).into_string();
         assert!(
             pull.starts_with("tar cf - -C '/work; rm -rf / $(touch pwned)' "),
             "pull command must single-quote the guest path: {pull}"

@@ -51,6 +51,12 @@ impl std::fmt::Display for GuestPath {
     }
 }
 
+impl AsRef<str> for GuestPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 // ── Host path ─────────────────────────────────────────────────
 
 /// Path on the host. Pairs with [`GuestPath`] so scp call sites
