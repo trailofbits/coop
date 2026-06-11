@@ -1,6 +1,6 @@
 # Images and Profiles
 
-coop builds **golden images** (templates) once and copies them to create VM instances. `coop setup` builds the template. `coop start` copies it. Profiles control which development tools go into the template.
+coop builds **golden images** (templates) once and copies them to create VM instances. `coop setup` builds the template. `coop up` copies it when creating a project instance. Profiles control which development tools go into the template.
 
 ## How templates work
 
@@ -12,15 +12,15 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 4. Applies requested profiles and extra packages
 5. Runs post-install scripts if provided
 
-coop stores the result under `~/.coop/images/<name>/`. On `coop start`, it copies the template to create an instance-specific rootfs. The copy uses `cp --reflink=auto` on Linux. On filesystems that support reflinks (btrfs, XFS), this shares storage blocks until written, making the copy fast and space-efficient.
+coop stores the result under `~/.coop/images/<name>/`. When creating an instance, coop copies the template to create an instance-specific rootfs. The copy uses `cp --reflink=auto` on Linux. On filesystems that support reflinks (btrfs, XFS), this shares storage blocks until written, making the copy fast and space-efficient.
 
 ## What every template includes
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `tmux`, `unzip`, `zip`, `file`, `less`
+**Base packages:** `openssh-server`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `unzip`, `zip`, `file`, `less`
 
-**Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-compose-plugin`
+**Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
 **GitHub CLI:** `gh`
 
@@ -78,6 +78,30 @@ coop setup --profile ml
 coop setup --profile ml,node
 ```
 
+## Build-on-demand from `up`
+
+For profile-only workflows, `coop up --profile <list>` builds the matching
+image automatically before starting a new instance. The image name is derived
+from the sorted profile list, so these commands all target the same
+`node-python` image:
+
+```bash
+coop up --profile python,node
+coop up --profile node,python
+```
+
+coop runs the same recipe-hash staleness check used by `coop setup`. If the
+derived image is missing or stale, it is built or rebuilt first; if it is
+current, startup reuses it.
+
+Explicitly named images are not affected by this shorthand. To choose the
+image name yourself, build it with `setup` and start a project from that image:
+
+```bash
+coop setup --image ml-dev --profile python,node
+coop up . --image ml-dev
+```
+
 ## Extra packages
 
 For one-off additions without a full profile, use `--extra-packages`:
@@ -106,8 +130,8 @@ By default, coop builds an image called `default`. Build multiple images with di
 coop setup --profile python --image py-dev
 coop setup --profile python,node,rust --image polyglot
 
-coop start --image py-dev
-coop start --image polyglot
+coop up . --image py-dev
+coop up . --image polyglot
 ```
 
 Each named image lives in its own directory under `~/.coop/images/<name>/` with independent versioning and staleness tracking.
@@ -138,7 +162,7 @@ coop records what went into each template in a `template-config.json` file along
 - **Install script hash**: SHA-256 of the composed install recipe (base + profile + extra packages). Changing profiles or extra packages changes this hash.
 - **Post-install script hash**: SHA-256 of the post-install script content, if one was provided.
 - **Profile list and extra packages**: the exact inputs used to build the template.
-- **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On `coop start`, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
+- **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On VM startup, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
 - **Creation timestamp**: when the template was built.
 
 On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, the template is stale and coop rebuilds it. A missing config file (orphaned image) also triggers a rebuild.
@@ -158,7 +182,7 @@ The build is crash-safe. coop writes the new template to a staging path (`rootfs
 
 ## Instance creation from templates
 
-`coop start` creates an instance from a template:
+`coop up` creates an instance from a template when no project instance exists:
 
 1. Copies the template rootfs to an instance-specific path
 2. Resizes the disk if `--disk` exceeds the template size
@@ -166,9 +190,9 @@ The build is crash-safe. coop writes the new template to a staging path (`rootfs
 4. Boots the VM
 
 ```bash
-coop start
-coop start --disk 50
-coop start --image py-dev --disk 100
+coop up .
+coop up . --disk 50
+coop up . --image py-dev --disk 100
 ```
 
 If `--disk` is smaller than the template size, coop logs a warning and uses the template size (shrinking is not supported). If larger, coop extends the image with `truncate` and grows the filesystem with `resize2fs`.

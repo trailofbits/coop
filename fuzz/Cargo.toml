@@ -1,0 +1,41 @@
+[package]
+name = "coop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# `coop` exposes a library target (`src/lib.rs`), so fuzz targets depend on it
+# directly and import the parser under test with `use coop::…` — no `#[path]`
+# includes. `toml` is needed by the config-loader target to deserialize a
+# `CoopConfig` from fuzzer input.
+[dependencies]
+libfuzzer-sys = "0.4"
+coop = { path = ".." }
+toml = "1.1.2"
+
+[[bin]]
+name = "parse_repo_slug"
+path = "fuzz_targets/parse_repo_slug.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonc_to_json"
+path = "fuzz_targets/jsonc_to_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_load"
+path = "fuzz_targets/config_load.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent package so `cargo fuzz` resolves this as its own root.
+[workspace]

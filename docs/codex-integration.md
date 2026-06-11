@@ -1,6 +1,6 @@
 # Codex Integration
 
-coop installs Codex into every guest image and gives you a dedicated `coop codex` launcher. This guide covers the `coop codex` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs at `coop start`.
+coop installs Codex into every guest image and gives you a dedicated `coop codex` launcher. This guide covers the `coop codex` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs when a VM starts.
 
 ## Launching Codex
 
@@ -14,16 +14,6 @@ Trailing arguments go straight through to the `codex` CLI:
 
 ```bash
 coop codex -- --model gpt-5
-```
-
-### tmux session persistence
-
-`coop codex` runs inside a tmux session named `codex` by default. If the SSH connection drops, the Codex process survives in the guest. Running `coop codex` again reattaches to the existing session rather than starting a new one.
-
-To bypass tmux and get a raw SSH session:
-
-```bash
-coop codex --no-tmux
 ```
 
 ## Configuration
@@ -107,7 +97,7 @@ If `config_dir` also provides a `config.toml`, coop preserves its other settings
 
 ## Bootstrap sequence
 
-When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
+When `coop up` creates/restarts a project VM or `coop start` restarts a stopped VM (without `--no-agents`), coop executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest.
@@ -117,9 +107,10 @@ On restart (`coop start` of a stopped instance), the same Codex config files are
 
 ### Skipping bootstrap
 
-To start a VM without any Claude Code or Codex configuration:
+To create or restart a VM without any Claude Code or Codex configuration:
 
 ```bash
+coop up . --no-agents
 coop start --no-agents
 ```
 

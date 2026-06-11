@@ -62,8 +62,13 @@ trap 'ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
 scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$REMOTE_HOST:$REMOTE_DIR/"
 
-# Build the remote command as an array, then printf %q to safely quote for ssh
-REMOTE_CMD=("$REMOTE_DIR/integration.sh" --binary "$REMOTE_DIR/coop"
+# Build the remote command as an array, then printf %q to safely quote for ssh.
+# ssh doesn't forward arbitrary env vars, so pass opt-in flags explicitly.
+REMOTE_CMD=()
+if [[ -n "${COOP_TEST_DESTRUCTIVE:-}" ]]; then
+    REMOTE_CMD+=("COOP_TEST_DESTRUCTIVE=$COOP_TEST_DESTRUCTIVE")
+fi
+REMOTE_CMD+=("$REMOTE_DIR/integration.sh" --binary "$REMOTE_DIR/coop"
     "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}")
 
 echo "Running tests on $REMOTE_HOST..."

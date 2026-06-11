@@ -31,19 +31,20 @@ Set up the VM template, start an instance, and launch an agent CLI:
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-proj-...
 coop setup
-coop start my-project --workspace ~/code/my-project
+cd ~/code/my-project
+coop up
 coop claude
 # or
 coop codex
 ```
 
-That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. By default, `coop claude` launches with `--dangerously-skip-permissions` since the VM is the isolation boundary. Pass `--ask` to prompt for permissions instead.
+That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. `coop up` is re-runnable: it creates an environment for the current project the first time, reuses it if it is already running, and restarts it after `coop stop`. During startup, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Pass `--ask` to `coop claude` to restore prompts for that session (`--permission-mode default`).
 
 ## Features
 
 - **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
-- **Workspace sync**: push a local directory into the VM, or clone a git repo directly with `--git-repo`
-- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing
+- **Workspace sync**: copy or mount a local project directory into the VM with `coop up`
+- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing; `coop up --profile python,node` builds the matching image on demand
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
 - **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
@@ -56,24 +57,35 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 
 | Command | Description |
 |---------|-------------|
+| `up` | Ensure a project environment exists and is running |
 | `setup` | Install backend runtime, fetch kernel, build template rootfs |
 | `build` | Rebuild rootfs image and fetch kernel |
-| `start` | Launch a new VM instance |
+| `start` | Restart a stopped VM |
 | `stop` | Stop a running VM (preserves disk) |
 | `destroy` | Stop and remove a VM instance |
 | `shell` | Interactive shell session in a running VM |
 | `claude` | Launch Claude Code inside the VM |
+| `claude-agents` (`ca`) | Open the Claude Code agent view inside the VM |
 | `codex` | Launch Codex inside the VM |
 | `exec` | Run a command in the VM non-interactively |
 | `push` | Sync local directory into the VM |
 | `pull` | Sync VM workspace back to the host |
+| `list` (`ls`) | List instances by name and state |
 | `status` | Show instance status and resource usage |
 | `logs` | Stream VM serial console output |
 | `vscode` | Open VS Code connected to the guest |
+| `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
 | `images` | List or delete template images |
 | `resize` | Grow a stopped instance's disk |
 | `validate` | Check config and prerequisites |
 | `update` | Self-update coop to the latest GitHub release |
+| `uninstall` | Remove the coop binary and (optionally) its data directories |
+| `completions` | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
+| `github` | Manage GitHub fine-grained PATs (`setup-pat`, `status`, `rotate-pat`, `forget-pat`) |
+
+## Shell completion
+
+`coop completions <bash|zsh|fish|powershell|elvish>` prints a static completion script. Adding `source <(COMPLETE=<shell> coop)` to your rc additionally completes instance, image, and profile names live. Full setup recipes are in [docs/shell-completion.md](docs/shell-completion.md).
 
 ## Updating
 
@@ -82,6 +94,11 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 host triple, verifies the SHA-256 against the release's `SHA256SUMS`, and
 (when `gh` is installed) verifies the GitHub build-provenance attestation
 before swapping the binary atomically.
+
+While `trailofbits/coop` is private, `coop update` requires either
+[`gh`](https://cli.github.com/) authenticated against `github.com` or
+`GITHUB_TOKEN` in the environment to reach the API and download release
+assets. Once the repository is public, no auth is needed.
 
 ```sh
 coop update --check             # report whether a newer release exists
@@ -151,3 +168,4 @@ Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are a
 - [VS Code integration](docs/vscode.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)
+- [Shell completion](docs/shell-completion.md)

@@ -1,11 +1,14 @@
 set -euo pipefail
 
+# GUEST_USER is exported by the orchestrator (setup.rs / lima.rs).
+: "${GUEST_USER:?GUEST_USER must be set by the orchestrator}"
+
 # Skip if a profile already provided a claude binary (e.g. stub-claude
 # for testing). Profile post_install scripts run before this script.
 # Using if/else (not early `exit 0`) because this file is concatenated
 # with codex.sh into a single shell invocation; an unconditional exit
 # would skip the codex installer too.
-if [ -x /home/ubuntu/.local/bin/claude ]; then
+if [ -x "/home/${GUEST_USER}/.local/bin/claude" ]; then
     echo '  [guest] Claude Code CLI already installed, skipping.'
 else
     echo '  [guest] Installing Claude Code CLI...'
@@ -42,5 +45,5 @@ else
         RETRY_DELAY=$((RETRY_DELAY * 2))
     done
 
-    su - ubuntu -c "bash '$INSTALLER'" </dev/null
+    su - "${GUEST_USER}" -c "bash '$INSTALLER'" </dev/null
 fi

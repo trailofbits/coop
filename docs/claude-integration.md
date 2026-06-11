@@ -1,6 +1,6 @@
 # Claude Code Integration
 
-coop sets up Claude Code inside guest VMs and gives you a single command to launch it. This guide covers the `coop claude` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs at `coop start`.
+coop sets up Claude Code inside guest VMs and gives you a single command to launch it. This guide covers the `coop claude` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs when a VM starts.
 
 ## Launching Claude Code
 
@@ -8,9 +8,9 @@ coop sets up Claude Code inside guest VMs and gives you a single command to laun
 coop claude [instance-name] [-- extra-args...]
 ```
 
-This SSHes into the guest and runs the `claude` CLI. By default, coop passes `--dangerously-skip-permissions` so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
+This SSHes into the guest and runs the `claude` CLI. The guest's managed `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
 
-To restore permission prompts:
+To restore permission prompts for a single session, pass `--ask`. coop then launches `claude` with `--permission-mode default`, overriding the guest default:
 
 ```bash
 coop claude --ask
@@ -22,15 +22,31 @@ Trailing arguments go straight through to the `claude` CLI:
 coop claude -- --model sonnet --verbose
 ```
 
-### tmux session persistence
-
-`coop claude` runs inside a tmux session named `claude` by default. If the SSH connection drops, the Claude process survives in the guest. Running `coop claude` again reattaches to the existing session rather than starting a new one.
-
-To bypass tmux and get a raw SSH session:
+## Managing background agents
 
 ```bash
-coop claude --no-tmux
+coop claude-agents [instance-name] [-- extra-args...]
+# or the short alias:
+coop ca
 ```
+
+This runs `claude agents` in the guest, which opens the agent view — an interactive TUI for monitoring background agent sessions. Background sessions are managed by Claude Code (not by coop), so closing the TUI and reconnecting later with `coop ca` keeps you in sync with whatever is still running.
+
+If the remote TUI appears stuck or stops responding, use OpenSSH's local escape: type Enter, then `~.` to disconnect. coop forces the interactive SSH escape character to `~`, so the escape path is available even if your user SSH config changes or disables `EscapeChar`. If your terminal remains in raw/no-echo mode after the disconnect, run:
+
+```bash
+stty sane
+```
+
+This is separate from SSH startup failures that exit with code 255. coop already restores the terminal after those failures; the escape sequence is for sessions where SSH is still connected and forwarding keystrokes to the remote TUI.
+
+`claude agents` accepts `--cwd <path>` (filter sessions by working directory) and `--setting-sources <sources>`; pass them after `--`:
+
+```bash
+coop ca -- --cwd /workspace
+```
+
+Closing the TUI does not stop background sessions; reopening `coop ca` reattaches to whatever Claude Code's daemon is still running.
 
 ## Configuration
 
@@ -76,6 +92,7 @@ The `github` field controls how coop obtains a `GITHUB_TOKEN` for the guest. Thi
 | `"auto"` | Check the `GITHUB_TOKEN` env var first. If unset, run `gh auth token` on the host to extract a token from the GitHub CLI. |
 | `"env"`  | Require `GITHUB_TOKEN` in the host environment. Warns if missing. |
 | `"off"`  | Skip GitHub token forwarding entirely. This is the default when `github` is unset. |
+| `"pat"`  | Use a per-repo fine-grained PAT from `[github.pat]`. Scope is server-enforced to one repo. Run `coop github setup-pat --repo owner/name` to add an entry; see [configuration.md](configuration.md#fine-grained-pat-github--pat) for the full reference. |
 
 When a token is available, coop runs `gh auth setup-git` in the guest during bootstrap. This configures the git credential helper so `git clone` works against private repositories without further setup.
 
@@ -159,21 +176,23 @@ Server definitions can include an `env` map for environment variable name mappin
 
 ## Bootstrap sequence
 
-When `coop start` runs (without `--no-agents`), it executes the following steps after the VM boots and SSH becomes available:
+When `coop up` creates/restarts a project VM or `coop start` restarts a stopped VM (without `--no-agents`), coop executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
 2. **User content**: Copy the allowlisted entries (`CLAUDE.md`, `rules/`, `commands/`) from `config_dir` to `~/.claude/` in the guest.
-3. **Marketplaces**: Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
-4. **Plugins**: Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
-5. **MCP servers**: Register each MCP server definition.
+3. **Managed permissions**: Write a coop-managed `~/.claude/settings.json` in the guest containing `permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. This file is overwritten on every VM startup; per-VM customization belongs in coop's config, not in the guest file.
+4. **Marketplaces**: Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
+5. **Plugins**: Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
+6. **MCP servers**: Register each MCP server definition.
 
-On restart (`coop start` of a stopped instance), only ephemeral state is refreshed: GitHub auth (step 1) and config directory contents (step 2). Marketplaces, plugins, and MCP servers persist on the guest disk and are not re-installed.
+On restart (`coop start` of a stopped instance), only ephemeral state is refreshed: GitHub auth (step 1), config directory contents (step 2), and the managed `~/.claude/settings.json` (step 3). Marketplaces, plugins, and MCP servers persist on the guest disk and are not re-installed.
 
 ### Skipping bootstrap
 
-To start a VM without any Claude Code configuration:
+To create or restart a VM without any Claude Code configuration:
 
 ```bash
+coop up . --no-agents
 coop start --no-agents
 ```
 

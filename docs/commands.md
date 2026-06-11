@@ -14,11 +14,126 @@ coop creates isolated VM environments for running Claude Code and Codex. It runs
 
 Most commands accept an optional instance name. coop resolves the target instance with three rules:
 
-- **Zero instances exist.** The command fails and tells you to run `coop start`.
+- **Zero instances exist.** The command fails and tells you to run `coop up`.
 - **One instance exists.** The name is optional. coop selects it automatically.
 - **Multiple instances exist.** The name is required. coop lists available instances on error.
 
 ## Commands
+
+### `up`
+
+Ensure an environment exists and is running for a project directory.
+
+```
+coop up [DIR] [FLAGS]
+```
+
+`DIR` defaults to the current directory. coop canonicalizes it and uses it as
+the project identity for instance naming, devcontainer discovery, GitHub PAT
+lookup, and future `coop up DIR` affinity. If a matching instance is already
+running, `up` reports success without creating another VM. If a matching
+instance is stopped, `up` restarts it. If no matching instance exists, `up`
+creates one.
+
+By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
+to use the mount transport for the project at `/workspace` instead. On
+macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
+one-time sync. `--copy` is accepted as an explicit spelling of the default.
+Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
+`/workspace` inside the guest.
+
+| Flag | Description |
+|------|-------------|
+| `DIR` | Project directory (default: current directory) |
+| `--name <name>` | Instance name to use when creating the project environment |
+| `--copy` | Copy/sync `DIR` into `/workspace` (default) |
+| `--mount` | Mount `DIR` at `/workspace` instead of using `--copy` |
+| `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`) |
+| `--git-repo <url>` | Clone a git repository into `/workspace` instead of copying a local project directory |
+| `--vcpus <N>` | Number of vCPUs when creating a new instance |
+| `--mem <MiB>` | Memory in MiB when creating a new instance |
+| `--disk <GiB>` | Instance disk size when creating a new instance |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--image <name>` | Named image to use when creating a new instance (default: `default`) |
+| `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
+| `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
+| `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
+| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work |
+
+```
+coop up .
+coop up ~/code/my-project --mount
+coop up . --profile python,node
+coop up . --copy --forward-port 3000
+coop up . --extra-mount ~/data:/data
+coop up --git-repo https://github.com/trailofbits/coop.git
+```
+
+Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
+`--profile`, `--extra-mount`, `--git-repo`, `--exclude-git`, and
+`--devcontainer` are applied only when `up` creates a new instance. `coop up
+--profile <list>`
+derives an image name from the sorted profile list, runs the same stale-image
+check as `coop setup`, and builds or rebuilds that image if needed. Explicit
+named images are unchanged: use `coop setup --image <name> --profile ...`
+followed by `coop up --image <name>` when you want to choose the image name
+yourself. If a matching project instance already exists, destroy it first to
+recreate it with different creation options. Runtime startup options such as
+`--forward-port`, `--post-start`, and `--env` can be used when `up` creates or
+restarts an instance; if the matching instance is already running, stop it
+first so those options can take effect.
+
+When a local `devcontainer.json` was applied while creating the instance, coop stores
+its path and content hash. Later `coop up` reconnects or restarts warn if that
+file changed, but the existing VM is not mutated automatically. Destroy and
+recreate the instance to apply creation-time devcontainer changes such as
+`features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`.
+
+### `quickstart`
+
+One-shot entry point: ensure the default image exists, bring up an instance for
+the current directory, and launch Claude Code inside it. Runs `setup`, `up`, and
+`claude` in sequence, short-circuiting any step that is already done.
+
+```
+coop quickstart [FLAGS]
+```
+
+`quickstart` resolves the workspace to the current directory (unless
+`--no-workspace`) and uses it as the project identity, the same way `coop up`
+does. It then takes one of three branches based on the instance for that
+workspace:
+
+- **A running instance exists.** coop reconnects to it and launches Claude Code —
+  no setup, restart, or recreation.
+- **A stopped instance exists.** coop restarts it (reusing the instance's own
+  image, not necessarily `default`) and launches Claude Code.
+- **No instance exists.** coop creates one for the workspace, folding in any
+  discovered `devcontainer.json`, then launches Claude Code.
+
+Image setup runs only when the `default` template image is missing; otherwise it
+is skipped. Setup runs non-interactively (no confirmation prompts).
+
+| Flag | Description |
+|------|-------------|
+| `--no-workspace` | Skip mounting the current directory as the workspace. Without a workspace there is no instance to match, so quickstart always creates a fresh instance rather than reusing an existing one. |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
+
+```
+coop quickstart
+coop quickstart --no-devcontainer
+coop quickstart --no-workspace
+```
+
+`quickstart` takes no instance name or per-instance tuning flags. For control
+over profiles, mounts, image, resources, or named instances, use `coop setup`
+and `coop up` directly. When run from your `$HOME` or `/`, coop prompts before
+mounting (or bails in a non-TTY); pass `--no-workspace` to skip the mount.
 
 ### `init`
 
@@ -49,49 +164,97 @@ coop setup [FLAGS]
 | `--post-install <path>` | Path to a post-install script to run in the chroot |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
+| `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
+| `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. Supported public `ghcr.io/devcontainers/features/*` entries are resolved and baked into the image. |
+| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation. |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any setup work. |
 
 ```
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
+coop setup -y --workspace . --devcontainer .devcontainer/devcontainer.json
 ```
 
-### `build`
+See [docs/devcontainer.md](devcontainer.md) for the subset of `devcontainer.json` coop reads.
 
-Rebuild the rootfs image and fetch the kernel. Use `setup` for first-time installation; `build` handles subsequent rebuilds.
+### `devcontainer check`
+
+Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM. Setup-stage checks resolve supported public GHCR OCI Features so the report can show the digest and `install.sh` hash that would run.
 
 ```
-coop build
+coop devcontainer check <path> [--stage setup|start|both]
 ```
 
-No additional flags.
+| Flag | Description |
+|------|-------------|
+| `<path>` | Path to the `devcontainer.json` file to inspect |
+| `--stage <stage>` | Which lifecycle translation to report: `setup`, `start`, or `both` (default: `both`) |
+
+Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirements.cpus`, `hostRequirements.memory`, and `remoteUser`. Use `--stage start` to inspect start-time keys such as `postStartCommand`, `containerEnv`, `forwardPorts`, `mounts`, and `hostRequirements.storage`.
+
+### `devcontainer ignore`
+
+Record a persistent opt-out for a project directory. Future automatic discovery for that project skips `.devcontainer/devcontainer.json` and reports that the stored preference was used. Explicit `--devcontainer <path>` still applies a file for that run.
+
+```
+coop devcontainer ignore <project-dir>
+```
+
+### `devcontainer status`
+
+Inspect persistent devcontainer opt-outs. With no project argument, this lists all stored opt-outs.
+
+```
+coop devcontainer status [project-dir]
+```
+
+### `devcontainer clear`
+
+Remove a persistent devcontainer opt-out for a project. If the project directory was moved or deleted, use the absolute path shown by `coop devcontainer status`.
+
+```
+coop devcontainer clear <project-dir>
+```
 
 ### `start`
 
-Launch a new VM instance.
+Restart a stopped VM.
 
 ```
 coop start [NAME] [FLAGS]
 ```
 
+`start` normally restarts existing stopped instances. Use `coop up [DIR]` to
+create or reconnect to a project environment. Without `NAME`, `start` restarts
+the only stopped instance if exactly one exists; with multiple stopped
+instances, pass the instance name.
+
 | Flag | Description |
 |------|-------------|
-| `NAME` | Instance name (auto-generated if omitted) |
-| `--workspace <dir>` | Local directory to sync into the VM (conflicts with `--git-repo`) |
-| `--git-repo <url>` | Git repository URL to clone inside the VM (conflicts with `--workspace`) |
-| `--vcpus <N>` | Number of vCPUs (overrides config) |
-| `--mem <MiB>` | Memory in MiB (overrides config) |
-| `--disk <GiB>` | Instance disk size in GiB (grows from template size if larger) |
+| `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
+| `--workspace <dir>` | Restart the stopped instance associated with this project path |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
-| `--image <name>` | Named image to use (default: `default`) |
-| `--mount <spec>` | Mount host directory into guest (`HOST_PATH[:GUEST_PATH]`, repeatable). Conflicts with `--workspace` and `--git-repo`. |
+| `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
+| `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
+| `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
+| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation (escape hatch for CI). |
+| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
 
-`--workspace` and `--git-repo` are mutually exclusive. Use `--workspace` to tar-pipe a local directory into the guest. Use `--git-repo` to clone a repository inside the VM at boot.
+Normal `start` restarts an existing VM without re-reading or re-applying
+`devcontainer.json`. If the instance was created with a devcontainer file, coop
+warns when the recorded file path now has different contents. See
+[docs/devcontainer.md](devcontainer.md) for the supported keys, discovery
+rules, and recreate guidance.
 
 ```
-coop start my-project --workspace ./src --vcpus 4 --mem 8192
-coop start --git-repo https://github.com/org/repo.git --disk 50
-coop start --image ml-dev --no-agents
-coop start --mount ~/data:/mnt/data
+coop start
+coop start my-project
+coop start my-project --no-agents
+coop start --env RUST_LOG=info --env MY_FLAG=1
+coop start --forward-port 3000 --forward-port 8080:18080
 ```
 
 `--no-claude` is accepted as a deprecated alias for `--no-agents` and will be removed in a future release. Using it prints a deprecation warning.
@@ -107,24 +270,19 @@ coop shell [NAME] [FLAGS] [-- COMMAND...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--session <name>` | tmux session name (default: `main`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
-Without a trailing command, `shell` drops you into a tmux session named `main` (or the name given by `--session`). With a trailing command, it executes the command and returns its exit code.
-
-`--session` and `--no-tmux` are mutually exclusive.
+Without a trailing command, `shell` drops you into an interactive shell at `/workspace`. With a trailing command, it executes the command and returns its exit code.
 
 ```
 coop shell
-coop shell my-project --no-tmux
-coop shell my-project --session work
+coop shell my-project
 coop shell my-project -- cat /etc/os-release
 ```
 
 ### `claude`
 
-Launch Claude Code inside the VM. By default, coop passes `--dangerously-skip-permissions` because the VM itself is the isolation boundary. Use `--ask` to restore the permissions prompt.
+Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
 
 ```
 coop claude [NAME] [FLAGS] [ARGS...]
@@ -134,16 +292,36 @@ coop claude [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Prompt for permissions instead of skipping them |
-| `--session <name>` | tmux session name (default: `claude`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `claude` |
-
-The session runs inside tmux under the name `claude` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
 
 ```
 coop claude
 coop claude my-project --ask
 coop claude my-project -- --model sonnet
+```
+
+### `claude-agents`
+
+Open the Claude Code agent view (`claude agents`) inside the VM. Claude Code's background agents are managed by its own daemon, so closing the terminal does not stop in-flight sessions; reconnect with `coop claude-agents` to see them again.
+
+If the remote TUI stops responding, type Enter, then `~.` to disconnect the SSH session. coop forces OpenSSH's interactive escape character to `~`, so this works even if your user SSH config disables or changes `EscapeChar`. If the terminal remains in a broken raw/no-echo state afterward, run `stty sane`.
+
+```
+coop claude-agents [NAME] [FLAGS] [ARGS...]
+coop ca [NAME] [FLAGS] [ARGS...]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `ARGS...` | Extra arguments passed through to `claude agents` |
+
+Alias: `ca`.
+
+```
+coop claude-agents
+coop ca my-project
+coop ca my-project -- --cwd /workspace
 ```
 
 ### `codex`
@@ -157,11 +335,7 @@ coop codex [NAME] [FLAGS] [ARGS...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--session <name>` | tmux session name (default: `codex`) |
-| `--no-tmux` | Skip tmux session persistence (raw SSH connection) |
 | `ARGS...` | Extra arguments passed through to `codex` |
-
-The session runs inside tmux under the name `codex` (or the name given by `--session`). `--session` and `--no-tmux` are mutually exclusive.
 
 ```
 coop codex
@@ -172,18 +346,20 @@ coop codex my-project -- --model gpt-5
 
 Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `shell` for interactive work.
 
+The command and its arguments must follow `--` so they are not mistaken for the instance name.
+
 ```
-coop exec [--name NAME] COMMAND...
+coop exec [NAME] -- COMMAND...
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `COMMAND...` | Command and arguments to run (required) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `COMMAND...` | Command and arguments to run after `--` (required) |
 
 ```
-coop exec uname -a
-coop exec --name my-project docker ps
+coop exec -- uname -a
+coop exec my-project -- docker ps
 ```
 
 ### `stop`
@@ -220,6 +396,17 @@ coop destroy [NAME] [FLAGS]
 coop destroy my-project
 coop destroy --all
 ```
+
+### `list`
+
+Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+
+```
+coop list
+coop ls
+```
+
+Alias: `ls`.
 
 ### `status`
 
@@ -258,40 +445,44 @@ coop logs my-project -f
 
 ### `push`
 
-Copy a local directory into the running VM at `/workspace`. Defaults to the host path recorded when the instance was started with `--workspace`.
+Copy a local directory into the running VM at `/workspace`. Defaults to the
+host path recorded when the instance was created with `coop up`.
 
 ```
-coop push [--name NAME] [DIR] [FLAGS]
+coop push [NAME] [FLAGS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `DIR` | Local directory to push (defaults to the workspace host path) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--dir <dir>` | Local directory to push (defaults to the workspace host path) |
 | `--force` | Overwrite guest changes without confirmation |
+| `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop push
-coop push --name my-project ./src --force
+coop push my-project --dir ./src --force
 ```
 
 ### `pull`
 
-Copy the VM's `/workspace` to a local directory. Defaults to the host path recorded when the instance was started with `--workspace`.
+Copy the VM's `/workspace` to a local directory. Defaults to the host path
+recorded when the instance was created with `coop up`.
 
 ```
-coop pull [--name NAME] [DIR] [FLAGS]
+coop pull [NAME] [FLAGS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Instance name (required if multiple instances exist) |
-| `DIR` | Local directory to pull into (defaults to the workspace host path) |
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--dir <dir>` | Local directory to pull into (defaults to the workspace host path) |
 | `--force` | Overwrite local changes without confirmation |
+| `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 ```
 coop pull
-coop pull --name my-project ./local-copy --force
+coop pull my-project --dir ./local-copy --force
 ```
 
 ### `vscode`
@@ -315,6 +506,46 @@ coop vscode my-project --project /workspace/subdir
 coop vscode my-project --editor code
 coop vscode my-project --clean
 ```
+
+### `ssh-config`
+
+Install a `coop-<name>` alias into `~/.ssh/config` so plain `ssh`, `scp`, and
+`rsync` reach the guest without remembering its host, port, user, or key. This
+is the same SSH config block `coop vscode` writes, but without launching an
+editor.
+
+```
+coop ssh-config [NAME] [--clean]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--clean` | Remove the SSH config entry for this instance and exit |
+
+```
+coop ssh-config
+coop ssh-config my-project
+ssh coop-my-project
+scp ./file coop-my-project:/workspace/
+rsync -az ./dir/ coop-my-project:/workspace/dir/
+coop ssh-config my-project --clean
+```
+
+The alias is created only when you run `coop ssh-config` (or `coop vscode`).
+The lifecycle keeps it tidy: `coop stop` and `coop destroy` remove the block,
+and `coop start` refreshes an already-installed block so it stays valid across
+a restart. On macOS/Lima the forwarded SSH port changes on each start; the
+refresh keeps the alias current without you re-running the command. On
+Linux/Firecracker the host and port are stable, so the refresh is a no-op.
+
+The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
+so `ssh coop-*` connections skip host-key verification. This is intentional —
+these VMs regenerate their host keys, so pinning them would only produce
+spurious mismatch warnings.
+
+Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
+workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.
 
 ### `images`
 
@@ -378,6 +609,8 @@ coop profiles show rust
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
 
+While `trailofbits/coop` is private, `coop update` requires either [`gh`](https://cli.github.com/) authenticated against `github.com` or `GITHUB_TOKEN` in the environment to reach the API and download release assets. Once the repository is public, no auth is needed.
+
 ```
 coop update [FLAGS]
 ```
@@ -401,12 +634,82 @@ coop update --force
 
 See also the [`updates` section](configuration.md#updates-section) of the configuration reference for the background-notification settings.
 
+### `uninstall`
+
+Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
+
+```
+coop uninstall [FLAGS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-y`, `--yes` | Skip interactive confirmation prompts. Removes data unless `--keep-data` is set. |
+| `--keep-data` | Remove only the binary; preserve `~/.coop` and the update-check state. Conflicts with `--purge`. |
+| `--purge` | Also remove `~/.coop` and the update-check state without prompting. Conflicts with `--keep-data`. Pairs with `--yes` for CI. |
+
+Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
+
+If the binary lives in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. A config file outside the data directory is left in place and a note is printed.
+
+```
+coop uninstall                       # interactive: prompts for binary and data
+coop uninstall --yes                 # CI: remove binary and data, no prompts
+coop uninstall --yes --keep-data     # CI: remove binary only
+coop uninstall --yes --purge         # CI: remove binary and data, explicit
+```
+
+### `completions`
+
+Print a static shell completion script. Pair with `source <(COMPLETE=<shell> coop)` in your shell rc for dynamic completion of live instance, image, and profile names. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
+
+```
+coop completions <SHELL>
+```
+
+| Argument | Description |
+|----------|-------------|
+| `SHELL` | Target shell: `bash`, `zsh`, `fish`, `powershell`, or `elvish` |
+
+```
+coop completions bash | sudo tee /etc/bash_completion.d/coop > /dev/null
+coop completions bash > ~/.local/share/bash-completion/completions/coop
+coop completions zsh > ~/.zfunc/_coop
+coop completions fish > ~/.config/fish/completions/coop.fish
+```
+
+### `github`
+
+Manage GitHub authentication. Specifically, the scoped fine-grained PAT (FGPAT) workflow that pairs `github = "pat"` mode with per-repo `[github.pat."owner/repo"]` entries in `config.toml`. See the [GitHub auth section](configuration.md#github-auth) of the configuration reference for the full data model.
+
+```
+coop github <subcommand>
+```
+
+| Subcommand | Effect |
+|------------|--------|
+| `setup-pat [--repo owner/name]` | Run the wizard end-to-end: open the GitHub PAT-creation form, validate the pasted token against `api.github.com`, store it in a chosen secret manager (Keychain / Secret Service / 1Password / file), and write a `[github.pat."owner/repo"]` entry. The repo is auto-detected from `git remote get-url origin` when `--repo` is omitted. |
+| `rotate-pat --repo owner/name` | Re-run the wizard for an existing entry (FGPATs expire — max 1 year). |
+| `status [--probe]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. |
+| `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
+
+```
+coop github setup-pat --repo trailofbits/coop
+coop github status
+coop github status --probe
+coop github rotate-pat --repo trailofbits/coop
+coop github forget-pat --repo trailofbits/coop
+```
+
 ### `validate`
 
-Check the configuration file and prerequisites. Prints warnings and confirms the config loads correctly.
+Check the configuration file and prerequisites. Prints warnings and confirms the config loads correctly. With `--probe`, also exercises each `[github.pat]` entry against `api.github.com` to confirm the token is still live.
 
 ```
 coop validate
+coop validate --probe
 ```
 
-No additional flags.
+| Flag | Description |
+|------|-------------|
+| `--probe` | For each `[github.pat]` entry, resolve the token and call `GET /user` on `api.github.com` to confirm it authenticates. Network-dependent; may trigger Keychain / 1Password prompts on macOS. |

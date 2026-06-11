@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
+use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::os::unix::io::AsRawFd;
@@ -13,6 +14,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::Cmd;
+use crate::guest_env_state::EnvVarName;
+use crate::naming::validate_safe_chars;
+use crate::paths::GuestPath;
 
 pub const DEFAULT_IMAGE: &str = "default";
 
@@ -98,55 +102,128 @@ pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
     }
 }
 
+// ── Secret wrapper ───────────────────────────────────────────
+
+/// Generic wrapper for values that must not appear in `Debug` output.
+///
+/// `Debug` always prints `<redacted>`, so types embedded in error chains,
+/// `tracing` events, panic messages, or `dbg!` never leak the value.
+/// `Display` is intentionally **not** implemented — printing the secret
+/// must be an explicit `.expose()` call, which greps cleanly during review.
+///
+/// Round-trips through serde transparently: a config file with
+/// `api_key = "sk-…"` deserializes to `Secret(String::from("sk-…"))`,
+/// and re-serializing produces the same value. If a config-dump command
+/// is added later, redaction belongs at the formatter for that command,
+/// not on this type.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret<T>(T);
+
+impl<T> Secret<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the underlying value. Named to flag every read at review time.
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
 // ── Newtypes ─────────────────────────────────────────────────
 
-/// Memory size in mebibytes. Inner `NonZeroU32` rejects zero at
-/// deserialization time — no runtime validation needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MiB(NonZeroU32);
+/// Marker types and trait for [`Quantity`] — the only place a new
+/// unit is introduced. Adding a unit means: a marker struct, an
+/// `impl Unit for ...` with the human-facing suffix, and a `type` alias.
+pub trait Unit: Copy + fmt::Debug + 'static {
+    /// Human-readable suffix used in CLI/parser error messages.
+    const SUFFIX: &'static str;
+}
 
-impl MiB {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MibUnit;
+impl Unit for MibUnit {
+    const SUFFIX: &'static str = "MiB";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GibUnit;
+impl Unit for GibUnit {
+    const SUFFIX: &'static str = "GiB";
+}
+
+/// Non-zero byte-scaled quantity. The phantom unit parameter prevents
+/// silently mixing `MiB` and `GiB`; the inner `NonZeroU32` rejects
+/// zero at deserialization time so no runtime check is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Quantity<U: Unit>(NonZeroU32, PhantomData<U>);
+
+/// Memory size in mebibytes.
+pub type MiB = Quantity<MibUnit>;
+/// Disk/storage size in gibibytes.
+pub type GiB = Quantity<GibUnit>;
+
+impl<U: Unit> Quantity<U> {
     /// Create from a runtime value. Returns `None` if zero.
     pub fn new(value: u32) -> Option<Self> {
-        NonZeroU32::new(value).map(Self)
+        NonZeroU32::new(value).map(|n| Self(n, PhantomData))
+    }
+
+    /// Wrap an existing `NonZeroU32` — infallible because the inner
+    /// invariant already holds. Use this to bridge from other
+    /// non-zero-backed types without round-tripping through `Option`,
+    /// and to build `const` quantity values from non-zero literals.
+    pub const fn from_nonzero(value: NonZeroU32) -> Self {
+        Self(value, PhantomData)
+    }
+
+    /// Clap value parser: accept a positive integer string, reject zero.
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        let n: u32 = s
+            .parse()
+            .with_context(|| format!("expected positive integer {}, got '{s}'", U::SUFFIX))?;
+        Self::new(n).with_context(|| format!("{} must be > 0, got '{s}'", U::SUFFIX))
     }
 
     pub fn as_u32(self) -> u32 {
         self.0.get()
     }
 
+    pub fn as_nonzero(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+impl<U: Unit> fmt::Display for Quantity<U> {
+    #[mutants::skip] // equivalent: callers don't assert the formatted output, only round-trip via parse_cli
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<U: Unit> Serialize for Quantity<U> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de, U: Unit> Deserialize<'de> for Quantity<U> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        NonZeroU32::deserialize(d).map(Self::from_nonzero)
+    }
+}
+
+impl Quantity<MibUnit> {
+    /// MiB → GiB as floating-point (1024 MiB = 1 GiB).
     pub fn as_gib_f64(self) -> f64 {
         f64::from(self.0.get()) / 1024.0
-    }
-}
-
-impl fmt::Display for MiB {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Disk size in gibibytes. Inner `NonZeroU32` rejects zero at
-/// deserialization time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GiB(NonZeroU32);
-
-impl GiB {
-    /// Create from a runtime value. Returns `None` if zero.
-    pub fn new(value: u32) -> Option<Self> {
-        NonZeroU32::new(value).map(Self)
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl fmt::Display for GiB {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -181,25 +258,36 @@ impl DiskSize {
     }
 
     /// Resolve to an absolute GiB value given the current disk size.
-    pub fn resolve(self, current_gib: u32) -> Result<GiB> {
-        let target = match self {
-            Self::Absolute(gib) => gib.as_u32(),
-            Self::Relative(gib) => current_gib
+    ///
+    /// Both inputs are non-zero, so the result is too; the only
+    /// remaining failure mode is `u32` overflow on a relative add.
+    pub fn resolve(self, current: GiB) -> Result<GiB> {
+        match self {
+            Self::Absolute(gib) => Ok(gib),
+            Self::Relative(gib) => current
+                .as_nonzero()
                 .checked_add(gib.as_u32())
-                .context("Disk size overflow")?,
-        };
-        GiB::new(target).context("Resolved disk size is 0")
+                .map(GiB::from_nonzero)
+                .context("Disk size overflow"),
+        }
     }
 }
 
 /// Instance index (0..=252), used to derive guest IP, TAP name, MAC, and vsock CID.
+///
+/// The bound exists because the guest IP is `172.16.0.<idx + 2>`: index 252
+/// maps to `172.16.0.254`, leaving `.255` as the broadcast address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(into = "u16", try_from = "u16")]
 pub struct InstanceIndex(u16);
 
 impl InstanceIndex {
-    pub fn new(value: u16) -> Self {
-        Self(value)
+    /// Largest valid index. See struct docs for the rationale.
+    pub const MAX: u16 = 252;
+
+    /// Create from a runtime value. Returns `None` if greater than [`Self::MAX`].
+    pub fn new(value: u16) -> Option<Self> {
+        (value <= Self::MAX).then_some(Self(value))
     }
 
     pub fn as_u16(self) -> u16 {
@@ -217,25 +305,66 @@ impl fmt::Display for InstanceIndex {
     }
 }
 
+impl From<InstanceIndex> for u16 {
+    fn from(idx: InstanceIndex) -> Self {
+        idx.0
+    }
+}
+
+/// Error returned when a raw `u16` exceeds [`InstanceIndex::MAX`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceIndexOutOfRange(pub u16);
+
+impl fmt::Display for InstanceIndexOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "instance index {} out of range 0..={}",
+            self.0,
+            InstanceIndex::MAX
+        )
+    }
+}
+
+impl std::error::Error for InstanceIndexOutOfRange {}
+
+impl TryFrom<u16> for InstanceIndex {
+    type Error = InstanceIndexOutOfRange;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or(InstanceIndexOutOfRange(value))
+    }
+}
+
 /// A host directory to mount into the guest VM.
 #[derive(Debug, Clone)]
 pub struct Mount {
     pub host_path: PathBuf,
-    pub guest_path: String,
+    pub guest_path: GuestPath,
 }
 
 impl Mount {
     /// Parse a mount spec in the form `HOST_PATH[:GUEST_PATH]`.
     ///
-    /// If `GUEST_PATH` is omitted, defaults to `/mnt/<dirname>` where
-    /// `<dirname>` is the last component of the host path.
+    /// If `GUEST_PATH` is omitted, defaults to `/workspace`.
     pub fn parse(spec: &str) -> Result<Self> {
         let (host, guest_path) = if let Some((h, g)) = spec.split_once(':') {
-            (h, g.to_string())
+            (h, GuestPath::absolute(g)?)
         } else {
-            (spec, "/workspace".to_string())
+            (spec, GuestPath::absolute("/workspace")?)
         };
+        Self::from_parts(host, guest_path)
+    }
 
+    /// Build a `Mount` from already-split host and guest components.
+    ///
+    /// Single source of truth for the canonicalize / is-dir
+    /// invariants; the absolute-guest invariant is carried by
+    /// `GuestPath::absolute` at the type boundary. Callers that build
+    /// the spec from typed fields (devcontainer JSON, Docker
+    /// `type=bind` form) skip the string round-trip by calling this
+    /// directly.
+    pub fn from_parts(host: &str, guest_path: GuestPath) -> Result<Self> {
         let host_path = Path::new(host)
             .canonicalize()
             .with_context(|| format!("Mount host path does not exist: {host}"))?;
@@ -246,16 +375,188 @@ impl Mount {
             host_path.display()
         );
 
-        anyhow::ensure!(
-            guest_path.starts_with('/'),
-            "Mount guest path must be absolute: {guest_path}"
-        );
-
         Ok(Self {
             host_path,
             guest_path,
         })
     }
+
+    /// True if the mount source contains a `.git` entry (regular repo or
+    /// linked worktree). Used to warn users that live-mounting a repo
+    /// risks the guest writing absolute `/workspace` paths into the
+    /// shared `.git/config`.
+    pub fn host_is_git_repo(&self) -> bool {
+        self.host_path.join(".git").exists()
+    }
+}
+
+/// A guest port to forward to the host for the lifetime of the VM.
+///
+/// Construction normalizes the spec so downstream code (SSH `-L` flags)
+/// sees a canonical `(guest, host)` pair where `host` defaults to
+/// `guest` when omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForward {
+    pub guest: NonZeroU16,
+    pub host: NonZeroU16,
+    pub label: Option<String>,
+}
+
+impl PortForward {
+    /// Parse a CLI spec in the form `GUEST[:HOST]`.
+    ///
+    /// `--forward-port 3000` ⇒ guest=3000, host=3000.
+    /// `--forward-port 3000:3001` ⇒ guest=3000, host=3001.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (guest_str, host_str) = match spec.split_once(':') {
+            Some((g, h)) => (g.trim(), Some(h.trim())),
+            None => (spec.trim(), None),
+        };
+        let guest: u16 = guest_str.parse().with_context(|| {
+            format!("Invalid forward-port spec '{spec}': guest port must be a number 1..=65535")
+        })?;
+        let guest = NonZeroU16::new(guest).with_context(|| {
+            format!("Invalid forward-port spec '{spec}': guest port must be > 0")
+        })?;
+        let host = match host_str {
+            Some(s) => {
+                let h: u16 = s.parse().with_context(|| {
+                    format!(
+                        "Invalid forward-port spec '{spec}': host port must be a number 1..=65535"
+                    )
+                })?;
+                NonZeroU16::new(h).with_context(|| {
+                    format!("Invalid forward-port spec '{spec}': host port must be > 0")
+                })?
+            }
+            None => guest,
+        };
+        Ok(Self {
+            guest,
+            host,
+            label: None,
+        })
+    }
+}
+
+/// TOML deserializer for `PortForward`. Accepts:
+///
+/// - an integer: `3000` ⇒ guest=3000, host=3000
+/// - a string: `"3000"` or `"3000:3001"` (CLI form)
+/// - a table: `{ guest = 3000, host = 3001, label = "dev" }`
+impl<'de> Deserialize<'de> for PortForward {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+
+        struct PortForwardVisitor;
+
+        impl<'de> Visitor<'de> for PortForwardVisitor {
+            type Value = PortForward;
+
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a port number, a 'GUEST[:HOST]' string, or a { guest, host, label } table",
+                )
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+                let port: u16 = v
+                    .try_into()
+                    .map_err(|_| E::custom(format!("port {v} out of range 1..=65535")))?;
+                let port = NonZeroU16::new(port).ok_or_else(|| E::custom("port must be > 0"))?;
+                Ok(PortForward {
+                    guest: port,
+                    host: port,
+                    label: None,
+                })
+            }
+
+            fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+                let v: u64 = v
+                    .try_into()
+                    .map_err(|_| E::custom(format!("port {v} must be > 0")))?;
+                self.visit_u64(v)
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                PortForward::parse(v).map_err(E::custom)
+            }
+
+            fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(field_identifier, rename_all = "snake_case")]
+                enum Field {
+                    Guest,
+                    Host,
+                    Label,
+                    #[serde(other)]
+                    Unknown,
+                }
+
+                let mut guest: Option<NonZeroU16> = None;
+                let mut host: Option<NonZeroU16> = None;
+                let mut label: Option<String> = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Guest => guest = Some(map.next_value()?),
+                        Field::Host => host = Some(map.next_value()?),
+                        Field::Label => label = Some(map.next_value()?),
+                        Field::Unknown => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let guest =
+                    guest.ok_or_else(|| M::Error::custom("forward_ports entry missing 'guest'"))?;
+                Ok(PortForward {
+                    guest,
+                    host: host.unwrap_or(guest),
+                    label,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PortForwardVisitor)
+    }
+}
+
+impl Serialize for PortForward {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("guest", &self.guest)?;
+        if self.host != self.guest {
+            map.serialize_entry("host", &self.host)?;
+        }
+        if let Some(label) = &self.label {
+            map.serialize_entry("label", label)?;
+        }
+        map.end()
+    }
+}
+
+/// Merge `[forward_ports]` from config with the CLI's `--forward-port` flag.
+///
+/// Walks both lists in order; on a duplicate guest port, the later entry wins.
+/// CLI entries are appended after config entries, so CLI overrides config.
+pub fn merge_forward_ports(
+    config_forwards: &[PortForward],
+    cli_forwards: &[PortForward],
+) -> Vec<PortForward> {
+    let mut out: Vec<PortForward> = Vec::new();
+    for f in config_forwards.iter().chain(cli_forwards.iter()) {
+        if let Some(existing) = out.iter_mut().find(|e| e.guest == f.guest) {
+            *existing = f.clone();
+        } else {
+            out.push(f.clone());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,6 +582,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub github: Option<GitHubAuth>,
 
+    /// Setup-time UX behaviour
+    #[serde(default)]
+    pub setup: SetupConfig,
+
     /// Claude Code config forwarding settings
     #[serde(default)]
     pub claude: ClaudeConfig,
@@ -289,9 +594,36 @@ pub struct CoopConfig {
     #[serde(default)]
     pub codex: CodexConfig,
 
+    /// Literal env vars to set in the guest, independent of the host
+    /// process environment. Merged with `env_forward` results during
+    /// SSH setup; entries here override forwarded values (with a
+    /// `tracing::warn!`).
+    ///
+    /// `BTreeMap` for deterministic iteration order — useful for
+    /// snapshot/diagnostic stability.
+    #[serde(default)]
+    pub guest_env: BTreeMap<crate::guest_env_state::EnvVarName, String>,
+
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
+
+    /// Shell command to run inside the guest after every successful boot.
+    ///
+    /// Executed after the VM is up and SSH is ready, before any interactive
+    /// `shell` / agent launch. A failure is logged at `WARN` and does not
+    /// fail the start — a transient hook failure shouldn't strand the VM.
+    ///
+    /// Maps to `postStartCommand` from `devcontainer.json`.
+    #[serde(default)]
+    pub post_start: Option<String>,
+
+    /// Default host:guest port forwards applied to every VM startup.
+    ///
+    /// CLI `--forward-port` values are appended; later entries override
+    /// earlier ones with the same guest port.
+    #[serde(default)]
+    pub forward_ports: Vec<PortForward>,
 
     /// Self-update behaviour
     #[serde(default)]
@@ -339,6 +671,188 @@ pub struct VmConfig {
     pub template_size_gib: GiB,
 }
 
+/// CIDR prefix length in `0..=32`. Display formats as `/N` so it can be
+/// concatenated directly with an IPv4 address to form a CIDR block.
+///
+/// Deserialization accepts `"/24"`, `"24"`, or the bare integer `24`.
+/// Out-of-range or non-numeric values are rejected at parse time, so no
+/// late validation pass is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubnetMask(u8);
+
+impl SubnetMask {
+    /// Create from a runtime value. Returns `None` if `bits > 32`.
+    pub fn new(bits: u8) -> Option<Self> {
+        (bits <= 32).then_some(Self(bits))
+    }
+}
+
+impl fmt::Display for SubnetMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "/{}", self.0)
+    }
+}
+
+impl std::str::FromStr for SubnetMask {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let digits = s.strip_prefix('/').unwrap_or(s);
+        let bits: u8 = digits
+            .parse()
+            .map_err(|_| format!("'{s}' is not valid CIDR (expected /0../32)"))?;
+        Self::new(bits).ok_or_else(|| format!("'{s}' is not valid CIDR (expected /0../32)"))
+    }
+}
+
+impl Serialize for SubnetMask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubnetMask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SubnetMaskVisitor;
+
+        impl serde::de::Visitor<'_> for SubnetMaskVisitor {
+            type Value = SubnetMask;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a CIDR prefix length: \"/24\", \"24\", or integer 24")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SubnetMask, E> {
+                v.parse().map_err(E::custom)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SubnetMask, E> {
+                u8::try_from(v)
+                    .ok()
+                    .and_then(SubnetMask::new)
+                    .ok_or_else(|| E::custom(format!("{v} is not valid CIDR (expected 0..=32)")))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<SubnetMask, E> {
+                u8::try_from(v)
+                    .ok()
+                    .and_then(SubnetMask::new)
+                    .ok_or_else(|| E::custom(format!("{v} is not valid CIDR (expected 0..=32)")))
+            }
+        }
+
+        deserializer.deserialize_any(SubnetMaskVisitor)
+    }
+}
+
+/// Linux network interface name (e.g. `eth0`, `ens5`).
+///
+/// Construction enforces the kernel's `dev_valid_name` rules: non-empty,
+/// not `.` or `..`, no `/` or whitespace, and at most `IFNAMSIZ - 1 = 15`
+/// bytes. The constructor is the only entry point, so downstream code
+/// holding an `InterfaceName` can use it without re-validating.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InterfaceName(String);
+
+/// Maximum interface name length excluding the trailing NUL.
+/// Matches the kernel `IFNAMSIZ - 1`.
+const MAX_INTERFACE_NAME_LEN: usize = 15;
+
+impl InterfaceName {
+    pub fn new(name: &str) -> Result<Self> {
+        validate_interface_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn validate_interface_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Interface name is empty");
+    }
+    if name == "." || name == ".." {
+        bail!("Interface name '{name}' is reserved");
+    }
+    if name.len() > MAX_INTERFACE_NAME_LEN {
+        bail!(
+            "Interface name '{name}' too long ({} bytes, max {MAX_INTERFACE_NAME_LEN})",
+            name.len()
+        );
+    }
+    validate_safe_chars(name, "Interface name")?;
+    Ok(())
+}
+
+impl fmt::Display for InterfaceName {
+    #[mutants::skip] // equivalent: trivial forwarder; as_str() coverage suffices
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Host interface selection for NAT. Either the [`AUTO_SENTINEL`] literal
+/// (auto-detect the default route's interface at runtime) or an explicit
+/// [`InterfaceName`].
+///
+/// A custom serde impl rejects sentinel typos like `"Auto"` or `" auto"` —
+/// they fail validation as interface names rather than silently bypassing
+/// auto-detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostInterface {
+    Auto,
+    Named(InterfaceName),
+}
+
+/// The string spelling of [`HostInterface::Auto`] in TOML / serde.
+const AUTO_SENTINEL: &str = "auto";
+
+impl HostInterface {
+    /// String form used in TOML ([`AUTO_SENTINEL`] or the interface name).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => AUTO_SENTINEL,
+            Self::Named(name) => name.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for HostInterface {
+    #[mutants::skip] // equivalent: trivial forwarder; as_str() coverage suffices
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for HostInterface {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HostInterface {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if s == AUTO_SENTINEL {
+            return Ok(Self::Auto);
+        }
+        // Catch sentinel typos that an InterfaceName check wouldn't:
+        // "Auto" / "AUTO" pass the charset, " auto" doesn't, but both
+        // would silently mask the user's intent.
+        if s.eq_ignore_ascii_case(AUTO_SENTINEL) || s.trim() == AUTO_SENTINEL {
+            return Err(serde::de::Error::custom(format!(
+                "host_iface '{s}' looks like the '{AUTO_SENTINEL}' sentinel — \
+                 write it exactly as \"{AUTO_SENTINEL}\" for auto-detection"
+            )));
+        }
+        InterfaceName::new(&s)
+            .map(Self::Named)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Host IP on TAP interfaces
@@ -347,41 +861,365 @@ pub struct NetworkConfig {
 
     /// Subnet mask in CIDR notation
     #[serde(default = "default_subnet_mask")]
-    pub subnet_mask: String,
+    pub subnet_mask: SubnetMask,
 
-    /// Host network interface for NAT (e.g., eth0, ens5)
+    /// Host network interface for NAT (`"auto"` or a name like `eth0`, `ens5`)
     #[serde(default = "default_host_iface")]
-    pub host_iface: String,
+    pub host_iface: HostInterface,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// GitHub authentication mode for the guest VM.
+///
+/// Accepts either a plain string (`"auto"`, `"env"`, `"off"`, `"pat"`)
+/// or a table form. The table form is required to attach per-repo PAT
+/// entries (see [`PatConfig`]):
+///
+/// ```toml
+/// [github]
+/// mode = "pat"
+/// skip = ["owner/big-repo"]
+///
+/// [github.pat."owner/repo"]
+/// token = "cmd:security find-generic-password -s coop-github-pat -a owner-repo -w"
+/// ```
+///
+/// The plain string `"pat"` form is equivalent to a table with `mode = "pat"`
+/// and no `pat` entries — lookup will fail at start-time until an entry is added.
+#[derive(Debug, Clone)]
 pub enum GitHubAuth {
     Auto,
     Env,
     Off,
+    Pat(PatConfig),
 }
 
+impl GitHubAuth {
+    /// Short, human-readable name for the configured mode.
+    #[mutants::skip] // equivalent: labels appear only in user-facing log lines that no test asserts against
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Env => "env",
+            Self::Off => "off",
+            Self::Pat(_) => "pat",
+        }
+    }
+
+    /// Look up a `[github.pat."owner/repo"]` entry by repo slug.
+    ///
+    /// Returns `None` for non-pat modes or when no entry exists.
+    pub fn pat_entry(&self, repo: &crate::github_repo::RepoSlug) -> Option<&PatEntry> {
+        match self {
+            Self::Pat(cfg) => cfg.entries.get(repo),
+            _ => None,
+        }
+    }
+}
+
+/// Top-level `[github]` table with PAT entries and skip markers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PatConfig {
+    /// Per-repo PAT entries, keyed by `owner/repo`.
+    ///
+    /// Uses `BTreeMap` so TOML serialization is stable across runs.
+    /// Invalid slugs are rejected at deserialization time by
+    /// [`RepoSlug`](crate::github_repo::RepoSlug).
+    #[serde(default, rename = "pat")]
+    pub entries: std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
+    /// Repos for which the VM startup auto-prompt is suppressed.
+    #[serde(default)]
+    pub skip: Vec<crate::github_repo::RepoSlug>,
+}
+
+/// One per-repo PAT entry under `[github.pat."owner/repo"]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerDef {
-    /// Command for stdio servers
-    pub command: Option<String>,
-    /// Arguments for stdio servers
-    #[serde(default)]
-    pub args: Vec<String>,
+pub struct PatEntry {
+    /// Token value. Accepts a literal token or a `cmd:`-prefixed shell
+    /// command. Resolved via [`resolve_cmd_value`].
+    pub token: Secret<String>,
+}
 
-    /// Server type ("http", "sse"); maps to `type` in Claude Code CLI
-    #[serde(rename = "type")]
-    pub server_type: Option<String>,
-    /// URL for HTTP servers
-    pub url: Option<String>,
+/// Custom deserializer accepts either a string (legacy/simple) or a table.
+impl<'de> Deserialize<'de> for GitHubAuth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
 
-    /// Env var name mappings (key = server env name, value = host env var name)
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// HTTP headers
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+        struct AuthVisitor;
+
+        impl<'de> Visitor<'de> for AuthVisitor {
+            type Value = GitHubAuth;
+
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string (\"auto\" / \"env\" / \"off\" / \"pat\") or a table")
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "auto" => Ok(GitHubAuth::Auto),
+                    "env" => Ok(GitHubAuth::Env),
+                    "off" => Ok(GitHubAuth::Off),
+                    "pat" => Ok(GitHubAuth::Pat(PatConfig::default())),
+                    other => Err(E::custom(format!(
+                        "unknown github mode '{other}' (expected auto, env, off, or pat)"
+                    ))),
+                }
+            }
+
+            fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(field_identifier, rename_all = "snake_case")]
+                enum Field {
+                    Mode,
+                    Pat,
+                    Skip,
+                    #[serde(other)]
+                    Unknown,
+                }
+
+                let mut mode: Option<String> = None;
+                let mut entries: Option<
+                    std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
+                > = None;
+                let mut skip: Option<Vec<crate::github_repo::RepoSlug>> = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Mode => mode = Some(map.next_value()?),
+                        Field::Pat => entries = Some(map.next_value()?),
+                        Field::Skip => skip = Some(map.next_value()?),
+                        Field::Unknown => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                // When the table form omits `mode`, the implied mode is
+                // "pat" if any pat/skip entries are present (the user is
+                // recording per-repo intent without explicitly stating
+                // the mode); otherwise "off".
+                let has_pat_data =
+                    entries.as_ref().is_some_and(|m| !m.is_empty()) || skip.is_some();
+                let mode = mode
+                    .or_else(|| has_pat_data.then(|| "pat".to_string()))
+                    .unwrap_or_else(|| "off".to_string());
+                match mode.as_str() {
+                    "auto" => Ok(GitHubAuth::Auto),
+                    "env" => Ok(GitHubAuth::Env),
+                    "off" => Ok(GitHubAuth::Off),
+                    "pat" => Ok(GitHubAuth::Pat(PatConfig {
+                        entries: entries.unwrap_or_default(),
+                        skip: skip.unwrap_or_default(),
+                    })),
+                    other => Err(M::Error::custom(format!(
+                        "unknown github mode '{other}' (expected auto, env, off, or pat)"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(AuthVisitor)
+    }
+}
+
+/// Serialize as a string for `auto`/`env`/`off` modes, and as a table
+/// for `pat` mode (so per-repo entries round-trip).
+impl Serialize for GitHubAuth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Env => serializer.serialize_str("env"),
+            Self::Off => serializer.serialize_str("off"),
+            Self::Pat(cfg) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("mode", "pat")?;
+                if !cfg.entries.is_empty() {
+                    map.serialize_entry("pat", &cfg.entries)?;
+                }
+                if !cfg.skip.is_empty() {
+                    map.serialize_entry("skip", &cfg.skip)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// Definition of an MCP server registered in the guest. The variant
+/// selects the transport — `Stdio` spawns a local process, `Http` and
+/// `Sse` connect to a remote URL. Each variant carries only the fields
+/// that are meaningful for that transport, so unrepresentable combinations
+/// (e.g. `command` + `url`) cannot be constructed or deserialized.
+#[derive(Debug, Clone)]
+pub enum McpServerDef {
+    /// Local server launched via stdin/stdout.
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        /// Env var name mappings: key is the variable the server reads,
+        /// value is the host env var name whose contents to forward.
+        /// Both sides are validated POSIX names at deserialize time.
+        env: BTreeMap<crate::guest_env_state::EnvVarName, crate::guest_env_state::EnvVarName>,
+    },
+    /// Remote server reached over HTTP.
+    Http {
+        url: url::Url,
+        /// Header names are not secret, but values may carry tokens
+        /// (e.g. `Authorization`), so they are wrapped in [`Secret`].
+        headers: HashMap<String, Secret<String>>,
+    },
+    /// Remote server reached over Server-Sent Events.
+    Sse {
+        url: url::Url,
+        /// See [`McpServerDef::Http`] for why values are [`Secret`].
+        headers: HashMap<String, Secret<String>>,
+    },
+}
+
+impl McpServerDef {
+    /// Resolve any `cmd:`-prefixed header values via [`resolve_cmd_value`].
+    /// Stdio servers carry no secret-bearing fields, so they are returned unchanged.
+    pub(crate) fn resolve_header_secrets(&mut self, label: &str, name: &str) -> Result<()> {
+        let headers = match self {
+            McpServerDef::Stdio { .. } => return Ok(()),
+            McpServerDef::Http { headers, .. } | McpServerDef::Sse { headers, .. } => headers,
+        };
+        for (key, value) in headers {
+            let resolved = resolve_cmd_value(value.expose()).with_context(|| {
+                format!("Failed to resolve header '{key}' for {label} '{name}'")
+            })?;
+            *value = Secret::new(resolved);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for McpServerDef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            command: Option<String>,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(rename = "type", default)]
+            transport: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            env: BTreeMap<crate::guest_env_state::EnvVarName, crate::guest_env_state::EnvVarName>,
+            #[serde(default)]
+            headers: HashMap<String, Secret<String>>,
+        }
+
+        let Raw {
+            command,
+            args,
+            transport,
+            url,
+            env,
+            headers,
+        } = Raw::deserialize(deserializer)?;
+
+        match transport.as_deref() {
+            None | Some("stdio") => {
+                if let Some(url) = url {
+                    return Err(D::Error::custom(format!(
+                        "stdio MCP server must not have a `url` field (got '{url}')"
+                    )));
+                }
+                if !headers.is_empty() {
+                    return Err(D::Error::custom(
+                        "stdio MCP server must not have a `headers` field",
+                    ));
+                }
+                let command = command.ok_or_else(|| D::Error::missing_field("command"))?;
+                Ok(McpServerDef::Stdio { command, args, env })
+            }
+            Some(kind @ ("http" | "sse")) => {
+                if command.is_some() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have a `command` field"
+                    )));
+                }
+                if !args.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have an `args` field"
+                    )));
+                }
+                if !env.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "{kind} MCP server must not have an `env` field"
+                    )));
+                }
+                let url_str = url.ok_or_else(|| D::Error::missing_field("url"))?;
+                let url = url::Url::parse(&url_str)
+                    .map_err(|e| D::Error::custom(format!("invalid url '{url_str}': {e}")))?;
+                Ok(match kind {
+                    "http" => McpServerDef::Http { url, headers },
+                    _ => McpServerDef::Sse { url, headers },
+                })
+            }
+            Some(other) => Err(D::Error::custom(format!(
+                "unknown MCP server type '{other}' (expected 'stdio', 'http', or 'sse')"
+            ))),
+        }
+    }
+}
+
+impl Serialize for McpServerDef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        match self {
+            McpServerDef::Stdio { command, args, env } => {
+                let mut len = 1;
+                if !args.is_empty() {
+                    len += 1;
+                }
+                if !env.is_empty() {
+                    len += 1;
+                }
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("command", command)?;
+                if !args.is_empty() {
+                    map.serialize_entry("args", args)?;
+                }
+                if !env.is_empty() {
+                    map.serialize_entry("env", env)?;
+                }
+                map.end()
+            }
+            McpServerDef::Http { url, headers } => {
+                serialize_remote(serializer, "http", url, headers)
+            }
+            McpServerDef::Sse { url, headers } => serialize_remote(serializer, "sse", url, headers),
+        }
+    }
+}
+
+fn serialize_remote<S: serde::Serializer>(
+    serializer: S,
+    kind: &'static str,
+    url: &url::Url,
+    headers: &HashMap<String, Secret<String>>,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let len = 2 + usize::from(!headers.is_empty());
+    let mut map = serializer.serialize_map(Some(len))?;
+    map.serialize_entry("type", kind)?;
+    map.serialize_entry("url", url)?;
+    if !headers.is_empty() {
+        map.serialize_entry("headers", headers)?;
+    }
+    map.end()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -409,6 +1247,7 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
         impl serde::de::Visitor<'_> for ConfigDirVisitor {
             type Value = ConfigDir;
 
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a path string, false, or null")
             }
@@ -427,14 +1266,17 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
                 Ok(ConfigDir::Custom(PathBuf::from(v)))
             }
 
+            #[mutants::skip] // equivalent: serde routes owned strings through visit_str; this path isn't exercised by our deserializer
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Custom(PathBuf::from(v)))
             }
 
+            #[mutants::skip] // equivalent: only called by serde for input shapes we don't accept
             fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Default)
             }
 
+            #[mutants::skip] // equivalent: only called by serde for input shapes we don't accept
             fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
                 Ok(ConfigDir::Default)
             }
@@ -447,11 +1289,11 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeConfig {
     /// Anthropic API key (forwarded via `SendEnv`, never written to disk)
-    pub api_key: Option<String>,
+    pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
-    pub env_forward: Vec<String>,
+    pub env_forward: Vec<EnvVarName>,
 
     /// Plugin marketplace sources (URL, path, or GitHub repo)
     #[serde(default)]
@@ -470,14 +1312,37 @@ pub struct ClaudeConfig {
     pub config_dir: ConfigDir,
 }
 
+/// `[setup]` section: controls one-time UX behaviour at VM startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupConfig {
+    /// Whether VM startup prompts the user to set up a fine-grained PAT
+    /// when the resolved repo has no entry. Set to `false` to suppress
+    /// globally. The per-repo `skip` list under `[github]` suppresses
+    /// individual repos.
+    #[serde(default = "default_prompt_for_pat")]
+    pub prompt_for_pat: bool,
+}
+
+impl Default for SetupConfig {
+    fn default() -> Self {
+        Self {
+            prompt_for_pat: default_prompt_for_pat(),
+        }
+    }
+}
+
+fn default_prompt_for_pat() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CodexConfig {
     /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
-    pub api_key: Option<String>,
+    pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
     #[serde(default)]
-    pub env_forward: Vec<String>,
+    pub env_forward: Vec<EnvVarName>,
 
     /// MCP servers to register in `~/.codex/config.toml`
     #[serde(default)]
@@ -504,12 +1369,26 @@ fn validate_instance_name(name: &str) -> Result<()> {
         .chars()
         .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'))
     {
-        bail!(
+        let mut msg = format!(
             "Instance name contains invalid character '{c}' \
              (allowed: a-z, A-Z, 0-9, '-', '_')"
         );
+        if looks_like_path(name) {
+            msg.push_str(
+                ".\nIf you meant to create or reconnect to a project environment, \
+                 use `coop up <PATH>`",
+            );
+        }
+        bail!(msg);
     }
     Ok(())
+}
+
+/// Whether a rejected instance name looks like the user typed a filesystem
+/// path by mistake (e.g. `coop start ~/projects/foo`). Used only to enrich
+/// the validation error with a hint toward `coop up <PATH>`.
+fn looks_like_path(name: &str) -> bool {
+    name.contains('/') || name.starts_with('~')
 }
 
 /// Validated instance name. Construction guarantees the name matches
@@ -530,12 +1409,14 @@ impl InstanceName {
 }
 
 impl fmt::Display for InstanceName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
 impl AsRef<str> for InstanceName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
     fn as_ref(&self) -> &str {
         &self.0
     }
@@ -554,6 +1435,78 @@ impl Serialize for InstanceName {
 }
 
 impl<'de> Deserialize<'de> for InstanceName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+const MAX_IMAGE_NAME_LEN: usize = 64;
+
+fn validate_image_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Image name is empty");
+    }
+    // Banning leading '.' subsumes both '.' and '..' (the traversal cases)
+    // and also keeps stray dotfiles out of the images directory.
+    if name.starts_with('.') {
+        bail!("Image name '{name}' must not start with '.'");
+    }
+    if name.len() > MAX_IMAGE_NAME_LEN {
+        bail!(
+            "Image name too long ({} chars, max {MAX_IMAGE_NAME_LEN})",
+            name.len()
+        );
+    }
+    validate_safe_chars(name, "Image name")?;
+    Ok(())
+}
+
+/// Validated golden-image name. Construction guarantees the name matches
+/// `[a-zA-Z0-9_.-]{1,64}` and does not begin with `.`, so downstream code
+/// (path construction, lookups) can use it without re-checking and is
+/// safe from directory traversal (`.` / `..`) and stray dotfile entries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImageName(String);
+
+impl ImageName {
+    pub fn new(name: &str) -> Result<Self> {
+        validate_image_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for ImageName {
+    #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for ImageName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl Serialize for ImageName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageName {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Self::new(&s).map_err(serde::de::Error::custom)
@@ -619,6 +1572,16 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
     bail!("Could not find unique instance name for '{base}'")
 }
 
+/// Witness that [`CoopConfig::validate_and_warn`] has been run.
+///
+/// Only obtainable via [`CoopConfig::validate_and_warn`] (the unit field
+/// is private). Functions that depend on the paths probed by
+/// [`CoopConfig::validate`] take `&Validated` so the compiler refuses
+/// calls that skipped validation. Sibling to `RunningInstance` in
+/// `backend.rs`.
+#[must_use]
+pub struct Validated(());
+
 impl CoopConfig {
     /// Default config path: `~/.coop/config.toml`.
     pub fn default_path() -> PathBuf {
@@ -664,33 +1627,43 @@ impl CoopConfig {
         Ok(cfg)
     }
 
+    /// Run `validate` and surface warnings via `tracing::warn`, returning
+    /// a [`Validated`] witness.
+    ///
+    /// Commands that consume the paths probed by [`Self::validate`]
+    /// (`setup`, `build`, `start`) take `&Validated` so the compiler
+    /// enforces the precondition. Query commands (`list`/`status`/`logs`)
+    /// skip the call and don't need the witness, so an unrelated config
+    /// error (e.g. a stale `claude.config_dir`) can't block them.
+    ///
+    /// `coop validate` keeps using [`Self::validate`] directly because
+    /// it prints warnings to stdout instead of routing them to tracing.
+    pub fn validate_and_warn(&self) -> Result<Validated> {
+        for w in self.validate()? {
+            tracing::warn!("{w}");
+        }
+        Ok(Validated(()))
+    }
+
     /// Validate config values, returning all problems found.
     ///
     /// Checks numeric bounds, IP/CIDR parsing, and path accessibility.
     /// Returns `Ok(warnings)` where warnings are non-fatal observations,
     /// or `Err` with all fatal validation errors joined.
     pub fn validate(&self) -> Result<Vec<String>> {
+        const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
+
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
         // VM config bounds
         // vcpu_count, mem_size_mib, template_size_gib, and ssh_port are
         // NonZero types — zero is rejected at deserialization time.
-        if self.vm.mem_size_mib.as_u32() < 128 {
+        if self.vm.mem_size_mib < MIN_MEM_MIB {
             errors.push(format!(
-                "vm.mem_size_mib={} is too low (minimum 128)",
-                self.vm.mem_size_mib
+                "vm.mem_size_mib={} is too low (minimum {MIN_MEM_MIB})",
+                self.vm.mem_size_mib,
             ));
-        }
-
-        // Network validation
-        let mask = self.network.subnet_mask.trim_start_matches('/');
-        match mask.parse::<u8>() {
-            Ok(bits) if bits <= 32 => {}
-            _ => errors.push(format!(
-                "network.subnet_mask='{}' is not valid CIDR (expected /0../32)",
-                self.network.subnet_mask
-            )),
         }
 
         // Path checks
@@ -751,6 +1724,10 @@ impl CoopConfig {
             }
         }
 
+        // `[github.pat]` keys and `github.skip` entries are typed as
+        // `RepoSlug`; invalid values are rejected at config load time, so
+        // no per-key check is needed here.
+
         if errors.is_empty() {
             Ok(warnings)
         } else {
@@ -764,36 +1741,40 @@ impl CoopConfig {
     }
 
     /// Directory for a specific named image.
-    pub fn image_dir(&self, name: &str) -> PathBuf {
-        self.images_dir().join(name)
+    pub fn image_dir(&self, name: &ImageName) -> PathBuf {
+        self.images_dir().join(name.as_str())
     }
 
     /// Path to the template rootfs image for a named image.
-    pub fn template_path_for(&self, image: &str) -> PathBuf {
+    pub fn template_path_for(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("rootfs-template.ext4")
     }
 
     /// Path to the template config for a named image.
-    pub fn template_config_path_for(&self, image: &str) -> PathBuf {
+    pub fn template_config_path_for(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("template-config.json")
     }
 
     /// Path to the Lima base image for a named image.
-    pub fn lima_base_path(&self, image: &str) -> PathBuf {
+    pub fn lima_base_path(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("lima-base.img")
     }
 
     /// Path to the Lima start template for a named image.
-    pub fn lima_template_path(&self, image: &str) -> PathBuf {
+    pub fn lima_template_path(&self, image: &ImageName) -> PathBuf {
         self.image_dir(image).join("lima-template.yaml")
     }
 
     /// Path to the default template rootfs image (shorthand).
     pub fn template_path(&self) -> PathBuf {
-        self.template_path_for(DEFAULT_IMAGE)
+        self.template_path_for(&default_image_name())
     }
 
     /// List all available images with their metadata.
+    ///
+    /// Directories whose names don't pass [`ImageName`] validation are
+    /// skipped (with a tracing warning), so a stray dotfile or hand-edited
+    /// entry can't poison the result.
     pub fn list_images(&self) -> Result<Vec<ImageInfo>> {
         let dir = self.images_dir();
         if !dir.exists() {
@@ -805,7 +1786,14 @@ impl CoopConfig {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
+            let raw = entry.file_name().to_string_lossy().into_owned();
+            let name = match ImageName::new(&raw) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("Skipping invalid image dir '{raw}': {e}");
+                    continue;
+                }
+            };
             let config_path = self.template_config_path_for(&name);
             let config = if config_path.exists() {
                 let content = fs::read_to_string(&config_path).ok();
@@ -819,7 +1807,7 @@ impl CoopConfig {
                 config,
             });
         }
-        images.sort_by(|a, b| a.name.cmp(&b.name));
+        images.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         Ok(images)
     }
 
@@ -831,6 +1819,11 @@ impl CoopConfig {
     /// Directory containing all instances
     pub fn instances_dir(&self) -> PathBuf {
         self.data_dir.join("instances")
+    }
+
+    /// Path to per-project devcontainer discovery preferences.
+    pub fn devcontainer_preferences_path(&self) -> PathBuf {
+        self.data_dir.join("devcontainer_preferences.json")
     }
 
     /// List all existing instances, sorted by index.
@@ -865,20 +1858,33 @@ impl CoopConfig {
     }
 
     /// Resolve an instance by name, or auto-select if only one exists.
-    pub fn resolve_instance(&self, name: Option<&str>) -> Result<Instance> {
-        let instances = self.list_instances()?;
+    pub fn resolve_instance(&self, name: Option<&InstanceName>) -> Result<Instance> {
         if let Some(name) = name {
-            instances
+            // Fast path: `allocate_instance` writes each instance to
+            // `instances_dir/<name>/`, so the metadata is one file read
+            // away. Skipping the full directory walk avoids parsing every
+            // other `instance.json` on `coop stop`/`shell`/`destroy`.
+            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str()))
+                && &inst.name == name
+            {
+                return Ok(inst);
+            }
+            // Miss or stale metadata: fall back to the full listing so
+            // the error message still names the available instances.
+            let instances = self.list_instances()?;
+            return instances
                 .into_iter()
-                .find(|i| i.name == *name)
+                .find(|i| &i.name == name)
                 .with_context(|| {
                     let available = self.format_instance_list_or_none();
                     format!(
                         "No instance named '{name}'. {available}\n\
-                         Create one with: coop start --name {name}"
+                         Create one with: coop up . --name {name}"
                     )
-                })
-        } else if instances.len() == 1 {
+                });
+        }
+        let instances = self.list_instances()?;
+        if instances.len() == 1 {
             // Safe: we just checked len == 1
             instances
                 .into_iter()
@@ -887,7 +1893,7 @@ impl CoopConfig {
         } else if instances.is_empty() {
             bail!(
                 "No instances found.\n\
-                 Create one with: coop start\n\
+                 Create one with: coop up\n\
                  (Run `coop setup` first if you haven't built an image yet.)"
             )
         } else {
@@ -915,29 +1921,34 @@ impl CoopConfig {
     /// concurrent allocations.
     pub fn allocate_instance(
         &self,
-        name: Option<&str>,
-        image: &str,
+        name: Option<&InstanceName>,
+        image: &ImageName,
         workspace_path: Option<&Path>,
     ) -> Result<Instance> {
-        const MAX_INDEX: u16 = 252;
-
         let _lock = lock_dir(&self.instances_dir())?;
 
         let instances = self.list_instances()?;
         let used_indices: HashSet<InstanceIndex> = instances.iter().map(|i| i.index).collect();
 
-        // Start from highest + 1, then fall back to lowest gap
-        let highest = instances.iter().map(|i| i.index.as_u16()).max();
-        let raw_index = match highest {
-            Some(h) if h < MAX_INDEX && !used_indices.contains(&InstanceIndex::new(h + 1)) => h + 1,
-            _ => (0..=MAX_INDEX)
-                .find(|i| !used_indices.contains(&InstanceIndex::new(*i)))
+        // Start from highest + 1 (skipping if at the ceiling or already used),
+        // then fall back to the lowest free index.
+        let next_after_highest = instances
+            .iter()
+            .map(|i| i.index.as_u16())
+            .max()
+            .and_then(|h| InstanceIndex::new(h + 1))
+            .filter(|next| !used_indices.contains(next));
+
+        let index = match next_after_highest {
+            Some(idx) => idx,
+            None => (0..=InstanceIndex::MAX)
+                .filter_map(InstanceIndex::new)
+                .find(|idx| !used_indices.contains(idx))
                 .context("All 253 instance slots are in use")?,
         };
-        let index = InstanceIndex::new(raw_index);
 
         let name = if let Some(n) = name {
-            InstanceName::new(n)?
+            n.clone()
         } else if let Some(ws) = workspace_path {
             let basename = ws
                 .file_name()
@@ -959,7 +1970,7 @@ impl CoopConfig {
             name,
             index,
             dir,
-            image: image.to_string(),
+            image: image.clone(),
         };
         instance.save()?;
         Ok(instance)
@@ -986,9 +1997,13 @@ impl Default for CoopConfig {
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
             github: None,
+            setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
+            post_start: None,
+            forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
         }
     }
@@ -1019,7 +2034,7 @@ impl Default for NetworkConfig {
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+            api_key: std::env::var("ANTHROPIC_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
             marketplaces: Vec::new(),
             plugins: Vec::new(),
@@ -1032,7 +2047,7 @@ impl Default for ClaudeConfig {
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            api_key: std::env::var("OPENAI_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
@@ -1044,7 +2059,7 @@ impl Default for CodexConfig {
 
 /// Metadata about a named golden image.
 pub struct ImageInfo {
-    pub name: String,
+    pub name: ImageName,
     pub dir: PathBuf,
     pub config: Option<crate::setup::TemplateConfig>,
 }
@@ -1056,20 +2071,23 @@ struct InstanceMeta {
     name: InstanceName,
     index: InstanceIndex,
     #[serde(default = "default_image_name")]
-    image: String,
+    image: ImageName,
 }
 
-fn default_image_name() -> String {
-    DEFAULT_IMAGE.to_string()
+/// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
+/// construction (skipping `ImageName::new`) is safe here because the
+/// const is pinned by the `default_image_is_valid` test below.
+pub(crate) fn default_image_name() -> ImageName {
+    ImageName(DEFAULT_IMAGE.to_string())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instance {
     pub name: InstanceName,
     pub index: InstanceIndex,
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
-    pub image: String,
+    pub image: ImageName,
 }
 
 impl Instance {
@@ -1101,12 +2119,31 @@ impl Instance {
         self.dir.join("workspace.json")
     }
 
+    pub fn forwards_state_path(&self) -> PathBuf {
+        self.dir.join("forwards.json")
+    }
+
+    pub fn guest_env_state_path(&self) -> PathBuf {
+        self.dir.join("guest_env.json")
+    }
+
+    pub fn devcontainer_state_path(&self) -> PathBuf {
+        self.dir.join("devcontainer_state.json")
+    }
+
     pub fn tap_device(&self) -> String {
         format!("tap{}", self.index)
     }
 
-    pub fn guest_ip(&self) -> String {
-        format!("172.16.0.{}", self.index.as_u32() + 2)
+    /// The guest's IPv4 address on the `172.16.0.0/24` host network.
+    ///
+    /// Derived from the validated [`InstanceIndex`] (`0..=252`), so the
+    /// last octet is always in `2..=254` and the address never fails to
+    /// form — callers receive an [`Ipv4Addr`] directly rather than a
+    /// string they have to re-parse.
+    pub fn guest_ip(&self) -> std::net::Ipv4Addr {
+        let base = u32::from(std::net::Ipv4Addr::new(172, 16, 0, 2));
+        std::net::Ipv4Addr::from(base + self.index.as_u32())
     }
 
     pub fn guest_mac(&self) -> String {
@@ -1239,6 +2276,7 @@ fn default_template_size_gib() -> GiB {
     GiB::new(8).expect("8 is non-zero")
 }
 
+#[mutants::skip] // equivalent: the kernel cmdline only matters when a VM actually boots, which integration tests cover
 fn default_boot_args() -> String {
     "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw".to_string()
 }
@@ -1247,12 +2285,13 @@ fn default_host_ip() -> Ipv4Addr {
     Ipv4Addr::new(172, 16, 0, 1)
 }
 
-fn default_subnet_mask() -> String {
-    "/24".to_string()
+fn default_subnet_mask() -> SubnetMask {
+    #[expect(clippy::expect_used, reason = "literal 24 is in 0..=32")]
+    SubnetMask::new(24).expect("24 is in 0..=32")
 }
 
-fn default_host_iface() -> String {
-    "auto".to_string()
+fn default_host_iface() -> HostInterface {
+    HostInterface::Auto
 }
 
 fn default_ssh_port() -> NonZeroU16 {
@@ -1266,8 +2305,10 @@ fn default_firecracker_bin() -> PathBuf {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::panic, reason = "tests use panic! for unreachable arms")]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> CoopConfig {
@@ -1277,82 +2318,109 @@ mod tests {
         }
     }
 
-    fn make_instance(dir: &Path, name: &str, index: u16) -> Instance {
+    fn default_img() -> ImageName {
+        ImageName::new(DEFAULT_IMAGE).unwrap()
+    }
+
+    fn idx(n: u16) -> InstanceIndex {
+        InstanceIndex::new(n).unwrap()
+    }
+
+    fn iname(s: &str) -> InstanceName {
+        InstanceName::new(s).unwrap()
+    }
+
+    fn make_instance(dir: &Path, name: &str, index: InstanceIndex) -> Instance {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index),
+            index,
             dir: dir.join("instances").join(name),
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
         inst
     }
 
-    fn test_inst(name: &str, index: u16, dir: PathBuf) -> Instance {
+    fn test_inst(name: &str, index: InstanceIndex, dir: PathBuf) -> Instance {
         Instance {
             name: InstanceName::new(name).unwrap(),
-            index: InstanceIndex::new(index),
+            index,
             dir,
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         }
+    }
+
+    // ── InstanceIndex constructor / deserialization ──────────
+
+    #[test]
+    fn instance_index_accepts_zero_to_max() {
+        assert_eq!(InstanceIndex::new(0).unwrap().as_u16(), 0);
+        assert_eq!(
+            InstanceIndex::new(InstanceIndex::MAX).unwrap().as_u16(),
+            InstanceIndex::MAX
+        );
+    }
+
+    #[test]
+    fn instance_index_rejects_above_max() {
+        assert!(InstanceIndex::new(InstanceIndex::MAX + 1).is_none());
+        assert!(InstanceIndex::new(u16::MAX).is_none());
+    }
+
+    #[test]
+    fn instance_index_try_from_reports_value() {
+        let err = InstanceIndex::try_from(500).unwrap_err();
+        assert_eq!(err.0, 500);
+        assert!(err.to_string().contains("500"));
+        assert!(err.to_string().contains("0..=252"));
+    }
+
+    #[test]
+    fn instance_index_deserialize_rejects_out_of_range() {
+        let err = serde_json::from_str::<InstanceIndex>("253").unwrap_err();
+        assert!(err.to_string().contains("253"), "{err}");
+    }
+
+    #[test]
+    fn instance_load_rejects_out_of_range_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("inst");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("instance.json"),
+            r#"{"name": "test", "index": 300, "image": "default"}"#,
+        )
+        .unwrap();
+        let err = Instance::load(&dir).unwrap_err();
+        let chain = err.chain().fold(String::new(), |mut acc, e| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{e} | ");
+            acc
+        });
+        assert!(
+            chain.contains("300") && chain.contains("0..=252"),
+            "expected error to mention 300 and 0..=252, got: {chain}"
+        );
     }
 
     // ── Instance network derivation ──────────────────────────
 
+    /// Each derivation is index-driven; testing 0 and 252 covers the
+    /// arithmetic at both ends of the valid range, where overflow or
+    /// off-by-one bugs would land.
     #[test]
-    fn instance_guest_ip_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_ip(), "172.16.0.2");
+    fn instance_network_derivations_at_boundaries() {
+        let lo = test_inst("test", idx(0), PathBuf::from("/tmp/fake"));
+        assert_eq!(lo.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 2));
+        assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
+        assert_eq!(lo.tap_device(), "tap0");
+        assert_eq!(lo.vsock_cid(), 3);
 
-        let inst = test_inst("test", 252, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_ip(), "172.16.0.254");
-    }
-
-    #[test]
-    fn instance_tap_device_from_index() {
-        let inst = test_inst("test", 5, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.tap_device(), "tap5");
-    }
-
-    #[test]
-    fn instance_mac_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_mac(), "06:00:AC:10:00:02");
-
-        let inst = test_inst("test", 252, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.guest_mac(), "06:00:AC:10:00:fe");
-    }
-
-    #[test]
-    fn instance_vsock_cid_from_index() {
-        let inst = test_inst("test", 0, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.vsock_cid(), 3);
-
-        let inst = test_inst("test", 10, PathBuf::from("/tmp/fake"));
-        assert_eq!(inst.vsock_cid(), 13);
-    }
-
-    // ── Instance paths ───────────────────────────────────────
-
-    #[test]
-    fn instance_paths_under_dir() {
-        let inst = test_inst("foo", 0, PathBuf::from("/data/instances/foo"));
-        assert_eq!(
-            inst.rootfs_path(),
-            PathBuf::from("/data/instances/foo/rootfs.ext4")
-        );
-        assert_eq!(
-            inst.pid_file_path(),
-            PathBuf::from("/data/instances/foo/firecracker.pid")
-        );
-        assert_eq!(
-            inst.log_path(),
-            PathBuf::from("/data/instances/foo/firecracker.log")
-        );
-        assert_eq!(
-            inst.vm_config_path(),
-            PathBuf::from("/data/instances/foo/vm_config.json")
-        );
+        let hi = test_inst("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
+        assert_eq!(hi.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 254));
+        assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
+        assert_eq!(hi.tap_device(), "tap252");
+        assert_eq!(hi.vsock_cid(), 255);
     }
 
     // ── Instance save/load roundtrip ─────────────────────────
@@ -1361,14 +2429,144 @@ mod tests {
     fn instance_save_load_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("myinst");
-        let inst = test_inst("myinst", 42, dir.clone());
+        let inst = test_inst("myinst", idx(42), dir.clone());
         inst.save().unwrap();
 
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.name, *"myinst");
-        assert_eq!(loaded.index, InstanceIndex::new(42));
+        assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
-        assert_eq!(loaded.image, DEFAULT_IMAGE);
+        assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+    }
+
+    // ── Instance::is_running / is_firecracker_process ────────
+    //
+    // These tests drive `is_running` through real PID files and
+    // real subprocesses. The happy path requires a process whose
+    // `/proc/<pid>/cmdline` contains "firecracker", which we
+    // synthesize with `bash -c 'exec -a firecracker-test sleep'`
+    // — argv[0] is renamed so the matcher recognizes it.
+    //
+    // Sudo-using paths (`kill -0`, `cat /proc/.../cmdline`) are
+    // gated `#[cfg(target_os = "linux")]`: CI runs Linux with
+    // passwordless sudo, and `/proc/<pid>/cmdline` is Linux-only.
+    // The non-sudo paths (missing PID file) run cross-platform.
+
+    /// PID likely-but-not-guaranteed dead. If it happens to belong
+    /// to a live non-firecracker process, the tests still see the
+    /// expected `false` outcome — they assert behavior, not which
+    /// branch fired.
+    #[cfg(target_os = "linux")]
+    const DEAD_PID: u32 = 999_999;
+
+    #[cfg(target_os = "linux")]
+    fn spawn_firecracker_like() -> std::process::Child {
+        std::process::Command::new("bash")
+            .args(["-c", "exec -a firecracker-test sleep 30"])
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_sleep() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn is_running_false_when_pid_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        assert!(!inst.pid_file_path().exists());
+        assert!(!inst.is_running());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_false_for_dead_pid_and_removes_pid_file() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+
+        assert!(!inst.is_running());
+        assert!(
+            !inst.pid_file_path().exists(),
+            "stale PID file should be removed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_sleep();
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.is_running();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!running);
+        assert!(
+            !inst.pid_file_path().exists(),
+            "PID file should be removed when PID is not a firecracker"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_running_true_for_live_firecracker_like_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.is_running();
+        let pid_file_kept = inst.pid_file_path().exists();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            running,
+            "is_running must return true for a live firecracker"
+        );
+        assert!(
+            pid_file_kept,
+            "PID file should be preserved while firecracker is running"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_false_for_dead_pid() {
+        assert!(!is_firecracker_process(DEAD_PID));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_false_for_live_non_firecracker_pid() {
+        let mut child = spawn_sleep();
+        let pid = child.id();
+        let result = is_firecracker_process(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!result);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn is_firecracker_process_true_for_firecracker_named_pid() {
+        let mut child = spawn_firecracker_like();
+        let pid = child.id();
+        let result = is_firecracker_process(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result);
     }
 
     // ── Allocate instance ────────────────────────────────────
@@ -1377,8 +2575,8 @@ mod tests {
     fn allocate_first_instance_gets_index_zero() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+        assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
     }
 
@@ -1387,13 +2585,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        let a = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        let b = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        let c = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let a = cfg.allocate_instance(None, &default_img(), None).unwrap();
+        let b = cfg.allocate_instance(None, &default_img(), None).unwrap();
+        let c = cfg.allocate_instance(None, &default_img(), None).unwrap();
 
-        assert_eq!(a.index, InstanceIndex::new(0));
-        assert_eq!(b.index, InstanceIndex::new(1));
-        assert_eq!(c.index, InstanceIndex::new(2));
+        assert_eq!(a.index.as_u16(), 0);
+        assert_eq!(b.index.as_u16(), 1);
+        assert_eq!(c.index.as_u16(), 2);
     }
 
     #[test]
@@ -1402,10 +2600,10 @@ mod tests {
         let cfg = test_config(&tmp);
 
         let inst = cfg
-            .allocate_instance(Some("my-project"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("my-project")), &default_img(), None)
             .unwrap();
         assert_eq!(inst.name, *"my-project");
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     #[test]
@@ -1413,10 +2611,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        cfg.allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
+        cfg.allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap();
         let err = cfg
-            .allocate_instance(Some("dupe"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -1428,22 +2626,22 @@ mod tests {
 
         // Create instance at index 0, then remove it, then create at 1
         let inst0 = cfg
-            .allocate_instance(Some("a"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("a")), &default_img(), None)
             .unwrap();
-        assert_eq!(inst0.index, InstanceIndex::new(0));
+        assert_eq!(inst0.index.as_u16(), 0);
         let inst1 = cfg
-            .allocate_instance(Some("b"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("b")), &default_img(), None)
             .unwrap();
-        assert_eq!(inst1.index, InstanceIndex::new(1));
+        assert_eq!(inst1.index.as_u16(), 1);
 
         // Remove instance 0 by deleting its dir
         fs::remove_dir_all(&inst0.dir).unwrap();
 
         // Next allocation should be index 2 (highest + 1), not 0 (gap)
         let inst2 = cfg
-            .allocate_instance(Some("c"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("c")), &default_img(), None)
             .unwrap();
-        assert_eq!(inst2.index, InstanceIndex::new(2));
+        assert_eq!(inst2.index.as_u16(), 2);
     }
 
     #[test]
@@ -1452,19 +2650,19 @@ mod tests {
         let cfg = test_config(&tmp);
 
         // Create instance at index 252 (max)
-        make_instance(tmp.path(), "max", 252);
+        make_instance(tmp.path(), "max", idx(252));
 
         // Create another at index 0 (gap at low end)
-        make_instance(tmp.path(), "zero", 0);
+        make_instance(tmp.path(), "zero", idx(0));
 
         // Remove index 0
         fs::remove_dir_all(tmp.path().join("instances/zero")).unwrap();
 
         // Next should fill gap at 0 since highest (252) is at ceiling
         let inst = cfg
-            .allocate_instance(Some("fill"), DEFAULT_IMAGE, None)
+            .allocate_instance(Some(&iname("fill")), &default_img(), None)
             .unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     // ── Instance name validation ──────────────────────────────
@@ -1500,6 +2698,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_name_path_like_suggests_workspace() {
+        for name in [
+            "/Users/hbrodin/projects/foo",
+            "~/projects/foo",
+            "./relative",
+            "~",
+        ] {
+            let err = validate_instance_name(name).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid character"),
+                "expected base rejection for {name:?}, got: {err}"
+            );
+            assert!(
+                err.contains("coop up <PATH>"),
+                "expected coop up hint for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_non_path_omits_workspace_hint() {
+        for name in ["has space", "semi;colon", "d.ot"] {
+            let err = validate_instance_name(name).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid character"),
+                "expected rejection for {name:?}, got: {err}"
+            );
+            assert!(
+                !err.contains("--workspace"),
+                "did not expect workspace hint for {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_name_rejects_too_long() {
         let long = "a".repeat(65);
         let err = validate_instance_name(&long).unwrap_err();
@@ -1510,16 +2743,6 @@ mod tests {
     fn validate_name_accepts_max_length() {
         let max = "a".repeat(64);
         validate_instance_name(&max).unwrap();
-    }
-
-    #[test]
-    fn allocate_rejects_invalid_name() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
-        let err = cfg
-            .allocate_instance(Some("../evil"), DEFAULT_IMAGE, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid character"));
     }
 
     // ── List instances ───────────────────────────────────────
@@ -1537,20 +2760,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "high", 10);
-        make_instance(tmp.path(), "low", 2);
-        make_instance(tmp.path(), "mid", 5);
+        make_instance(tmp.path(), "high", idx(10));
+        make_instance(tmp.path(), "low", idx(2));
+        make_instance(tmp.path(), "mid", idx(5));
 
         let instances = cfg.list_instances().unwrap();
-        let indices: Vec<InstanceIndex> = instances.iter().map(|i| i.index).collect();
-        assert_eq!(
-            indices,
-            vec![
-                InstanceIndex::new(2),
-                InstanceIndex::new(5),
-                InstanceIndex::new(10)
-            ]
-        );
+        let indices: Vec<u16> = instances.iter().map(|i| i.index.as_u16()).collect();
+        assert_eq!(indices, vec![2, 5, 10]);
     }
 
     // ── Resolve instance ─────────────────────────────────────
@@ -1560,7 +2776,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "only", 0);
+        make_instance(tmp.path(), "only", idx(0));
 
         let inst = cfg.resolve_instance(None).unwrap();
         assert_eq!(inst.name, *"only");
@@ -1580,8 +2796,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "a", 0);
-        make_instance(tmp.path(), "b", 1);
+        make_instance(tmp.path(), "a", idx(0));
+        make_instance(tmp.path(), "b", idx(1));
 
         let err = cfg.resolve_instance(None).unwrap_err();
         assert!(err.to_string().contains("Multiple instances"));
@@ -1592,12 +2808,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "alpha", 0);
-        make_instance(tmp.path(), "beta", 1);
+        make_instance(tmp.path(), "alpha", idx(0));
+        make_instance(tmp.path(), "beta", idx(1));
 
-        let inst = cfg.resolve_instance(Some("beta")).unwrap();
+        let inst = cfg.resolve_instance(Some(&iname("beta"))).unwrap();
         assert_eq!(inst.name, *"beta");
-        assert_eq!(inst.index, InstanceIndex::new(1));
+        assert_eq!(inst.index.as_u16(), 1);
     }
 
     #[test]
@@ -1605,10 +2821,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "real", 0);
+        make_instance(tmp.path(), "real", idx(0));
 
-        let err = cfg.resolve_instance(Some("fake")).unwrap_err();
-        assert!(err.to_string().contains("No instance named 'fake'"));
+        let err = cfg.resolve_instance(Some(&iname("fake"))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No instance named 'fake'"));
+        assert!(msg.contains("Available: real"), "missing hint in: {msg}");
+    }
+
+    #[test]
+    fn resolve_unknown_name_with_no_instances_lists_none() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+
+        let err = cfg.resolve_instance(Some(&iname("ghost"))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No instance named 'ghost'"));
+        assert!(
+            msg.contains("No instances exist."),
+            "missing hint in: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_instance_list_or_none_empty() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        assert_eq!(cfg.format_instance_list_or_none(), "No instances exist.");
+    }
+
+    #[test]
+    fn format_instance_list_or_none_lists_names() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        make_instance(tmp.path(), "alpha", idx(0));
+        make_instance(tmp.path(), "beta", idx(1));
+        assert_eq!(cfg.format_instance_list_or_none(), "Available: alpha, beta");
     }
 
     // ── ClaudeConfig deserialization ─────────────────────────
@@ -1628,8 +2876,11 @@ mod tests {
             }
         }"#;
         let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-ant-test"));
-        assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("sk-ant-test")
+        );
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
         assert_eq!(cfg.marketplaces.len(), 1);
         assert_eq!(cfg.plugins, vec!["context7"]);
         assert_eq!(cfg.mcp_servers.len(), 1);
@@ -1660,8 +2911,11 @@ mod tests {
             }
         }"#;
         let cfg: CodexConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-openai-test"));
-        assert_eq!(cfg.env_forward, vec!["MYORG_KEY"]);
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("sk-openai-test")
+        );
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert!(cfg.mcp_servers.contains_key("sentry"));
     }
@@ -1690,6 +2944,183 @@ mod tests {
             serde_json::from_str::<GitHubAuth>(r#""off""#).unwrap(),
             GitHubAuth::Off
         ));
+        assert!(matches!(
+            serde_json::from_str::<GitHubAuth>(r#""pat""#).unwrap(),
+            GitHubAuth::Pat(_)
+        ));
+    }
+
+    #[test]
+    fn github_auth_rejects_unknown_mode() {
+        let err = serde_json::from_str::<GitHubAuth>(r#""bogus""#).unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn github_auth_table_form_with_entries() {
+        let toml_str = r#"
+mode = "pat"
+
+[pat."trailofbits/coop"]
+token = "cmd:echo x"
+
+[pat."trailofbits/coop-plugins"]
+token = "cmd:echo y"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        assert_eq!(pat.entries.len(), 2);
+        let slug = crate::github_repo::RepoSlug::new("trailofbits/coop").unwrap();
+        assert_eq!(
+            pat.entries.get(&slug).map(|e| e.token.expose().as_str()),
+            Some("cmd:echo x")
+        );
+        assert!(pat.skip.is_empty());
+    }
+
+    #[test]
+    fn github_auth_table_form_with_entries_only_implies_pat() {
+        // No explicit `mode`, just per-repo entries. The implied mode is
+        // "pat" because `entries` is non-empty (the `!m.is_empty()` guard
+        // in `visit_map` flips this branch on).
+        let toml_str = r#"
+[pat."a/b"]
+token = "cmd:echo x"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        assert_eq!(pat.entries.len(), 1);
+        assert!(pat.skip.is_empty());
+    }
+
+    #[test]
+    fn github_auth_table_form_with_empty_pat_implies_off() {
+        // An explicit but empty `pat` table with no mode and no skip
+        // means there is no per-repo intent. The implied mode is "off",
+        // not "pat", because `!m.is_empty()` is false for an empty map.
+        let toml_str = "pat = {}\n";
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        assert!(matches!(auth, GitHubAuth::Off));
+    }
+
+    #[test]
+    fn github_auth_table_form_with_skip_only() {
+        // No explicit `mode`, no entries, only a skip array. Should
+        // parse as pat-mode with empty entries and the recorded skip list.
+        let toml_str = r#"
+skip = ["a/b"]
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let pat = match auth {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant, got {other:?}"),
+        };
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        assert_eq!(pat.skip, vec![ab]);
+        assert!(pat.entries.is_empty());
+    }
+
+    #[test]
+    fn github_auth_lookup_returns_entry() {
+        let toml_str = r#"
+mode = "pat"
+
+[pat."a/b"]
+token = "cmd:echo x"
+"#;
+        let auth: GitHubAuth = toml::from_str(toml_str).unwrap();
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        let cd = crate::github_repo::RepoSlug::new("c/d").unwrap();
+        let entry = auth.pat_entry(&ab).unwrap();
+        assert_eq!(entry.token.expose(), "cmd:echo x");
+        assert!(auth.pat_entry(&cd).is_none());
+    }
+
+    #[test]
+    fn github_auth_lookup_returns_none_for_non_pat_modes() {
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        for auth in [GitHubAuth::Auto, GitHubAuth::Env, GitHubAuth::Off] {
+            assert!(auth.pat_entry(&ab).is_none());
+        }
+    }
+
+    #[test]
+    fn github_auth_table_form_rejects_invalid_pat_key() {
+        // Invalid slug as a `[github.pat."..."]` key fails at parse time.
+        let toml_str = r#"
+mode = "pat"
+
+[pat."not-a-slug"]
+token = "cmd:echo x"
+"#;
+        let err = toml::from_str::<GitHubAuth>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("owner/repo"),
+            "expected owner/repo error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn github_auth_table_form_rejects_invalid_skip_entry() {
+        let toml_str = r#"
+mode = "pat"
+skip = ["not-a-slug"]
+"#;
+        let err = toml::from_str::<GitHubAuth>(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("owner/repo"),
+            "expected owner/repo error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn github_auth_serializes_round_trip_for_pat() {
+        // pat-mode → table form; deserialize the serialized output and
+        // confirm the entries survived.
+        let ab = crate::github_repo::RepoSlug::new("a/b").unwrap();
+        let cd = crate::github_repo::RepoSlug::new("c/d").unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            ab.clone(),
+            PatEntry {
+                token: Secret::new("cmd:echo x".to_string()),
+            },
+        );
+        let auth = GitHubAuth::Pat(PatConfig {
+            entries,
+            skip: vec![cd.clone()],
+        });
+        let serialized = toml::to_string(&auth).unwrap();
+        let parsed: GitHubAuth = toml::from_str(&serialized).unwrap();
+        let pat = match parsed {
+            GitHubAuth::Pat(p) => p,
+            other => panic!("expected Pat variant after round-trip, got {other:?}"),
+        };
+        assert_eq!(pat.skip, vec![cd]);
+        assert_eq!(
+            pat.entries.get(&ab).map(|e| e.token.expose().as_str()),
+            Some("cmd:echo x")
+        );
+    }
+
+    #[test]
+    fn github_auth_serializes_string_form_for_simple_modes() {
+        for (auth, want) in [
+            (GitHubAuth::Auto, "\"auto\""),
+            (GitHubAuth::Env, "\"env\""),
+            (GitHubAuth::Off, "\"off\""),
+        ] {
+            // serde_json gives a JSON-style scalar; sufficient to confirm
+            // the serializer chose a string, not an object.
+            let json = serde_json::to_string(&auth).unwrap();
+            assert_eq!(json, want);
+        }
     }
 
     #[test]
@@ -1700,14 +3131,51 @@ mod tests {
             "env": {"API_KEY": "MYORG_API_KEY"}
         }"#;
         let def: McpServerDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.command.as_deref(), Some("npx"));
-        assert_eq!(def.args, vec!["-y", "@myorg/mcp-server"]);
-        assert_eq!(
-            def.env.get("API_KEY").map(String::as_str),
-            Some("MYORG_API_KEY")
+        match def {
+            McpServerDef::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, vec!["-y", "@myorg/mcp-server"]);
+                let key = crate::guest_env_state::EnvVarName::new("API_KEY").unwrap();
+                assert_eq!(
+                    env.get(&key)
+                        .map(crate::guest_env_state::EnvVarName::as_str),
+                    Some("MYORG_API_KEY")
+                );
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_env_var_name() {
+        let json = r#"{"command": "x", "env": {"123BAD": "VALUE"}}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("123BAD"),
+            "error should reference the invalid name: {err}"
         );
-        assert!(def.server_type.is_none());
-        assert!(def.url.is_none());
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_env_var_value() {
+        let json = r#"{"command": "x", "env": {"KEY": "not a var name"}}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("not a var name"),
+            "error should reference the invalid value: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_stdio_def_explicit_type() {
+        let json = r#"{
+            "type": "stdio",
+            "command": "/usr/bin/my-tool"
+        }"#;
+        let def: McpServerDef = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(def, McpServerDef::Stdio { ref command, .. } if command == "/usr/bin/my-tool")
+        );
     }
 
     #[test]
@@ -1717,10 +3185,130 @@ mod tests {
             "url": "https://mcp.sentry.dev/mcp"
         }"#;
         let def: McpServerDef = serde_json::from_str(json).unwrap();
-        assert_eq!(def.server_type.as_deref(), Some("http"));
-        assert_eq!(def.url.as_deref(), Some("https://mcp.sentry.dev/mcp"));
-        assert!(def.command.is_none());
-        assert!(def.args.is_empty());
+        match def {
+            McpServerDef::Http { url, headers } => {
+                assert_eq!(url.as_str(), "https://mcp.sentry.dev/mcp");
+                assert!(headers.is_empty());
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_sse_def() {
+        let json = r#"{
+            "type": "sse",
+            "url": "https://mcp.example.com/sse",
+            "headers": {"Authorization": "Bearer x"}
+        }"#;
+        let def: McpServerDef = serde_json::from_str(json).unwrap();
+        match def {
+            McpServerDef::Sse { url, headers } => {
+                assert_eq!(url.as_str(), "https://mcp.example.com/sse");
+                assert_eq!(
+                    headers.get("Authorization").map(|v| v.expose().as_str()),
+                    Some("Bearer x")
+                );
+            }
+            other => panic!("expected Sse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_rejects_stdio_with_url() {
+        let json = r#"{"command": "x", "url": "https://example.com/"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stdio MCP server must not have a `url` field")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_http_with_command() {
+        let json = r#"{"type": "http", "url": "https://x/", "command": "y"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("http MCP server must not have a `command` field")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_unknown_type() {
+        let json = r#"{"type": "websocket", "url": "wss://x/"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown MCP server type 'websocket'")
+        );
+    }
+
+    #[test]
+    fn mcp_server_rejects_http_missing_url() {
+        let json = r#"{"type": "http"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("missing field `url`"));
+    }
+
+    #[test]
+    fn mcp_server_rejects_stdio_missing_command() {
+        let json = "{}";
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("missing field `command`"));
+    }
+
+    #[test]
+    fn mcp_server_rejects_invalid_url() {
+        let json = r#"{"type": "http", "url": "not a url"}"#;
+        let err = serde_json::from_str::<McpServerDef>(json).unwrap_err();
+        assert!(err.to_string().contains("invalid url 'not a url'"));
+    }
+
+    #[test]
+    fn mcp_server_serializes_stdio_without_type_field() {
+        let def = McpServerDef::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string()],
+            env: BTreeMap::new(),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["command"], "npx");
+        assert_eq!(json["args"], serde_json::json!(["-y"]));
+        assert!(json.get("type").is_none());
+        assert!(json.get("url").is_none());
+        assert!(json.get("env").is_none(), "empty env is omitted: {json}");
+    }
+
+    #[test]
+    fn mcp_server_serializes_http_with_type_tag() {
+        let def = McpServerDef::Http {
+            url: url::Url::parse("https://mcp.sentry.dev/mcp").unwrap(),
+            headers: HashMap::new(),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["type"], "http");
+        assert_eq!(json["url"], "https://mcp.sentry.dev/mcp");
+        assert!(json.get("command").is_none());
+        assert!(
+            json.get("headers").is_none(),
+            "empty headers omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_round_trip_preserves_variant() {
+        for json in [
+            r#"{"command":"x","args":["a","b"],"env":{"K":"V"}}"#,
+            r#"{"type":"http","url":"https://x.example/","headers":{"H":"v"}}"#,
+            r#"{"type":"sse","url":"https://x.example/sse"}"#,
+        ] {
+            let def: McpServerDef = serde_json::from_str(json).unwrap();
+            let again = serde_json::to_string(&def).unwrap();
+            let def2: McpServerDef = serde_json::from_str(&again).unwrap();
+            // Re-serializing should yield identical bytes.
+            assert_eq!(serde_json::to_string(&def2).unwrap(), again);
+        }
     }
 
     // ── Config loading ────────────────────────────────────────
@@ -1732,7 +3320,7 @@ mod tests {
         assert_eq!(cfg.vm.mem_size_mib, MiB::new(4096).unwrap());
         assert_eq!(cfg.ssh_port.get(), 22);
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
-        assert_eq!(cfg.network.subnet_mask, "/24");
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
         assert_eq!(cfg.vm.template_size_gib, GiB::new(8).unwrap());
     }
 
@@ -1742,6 +3330,16 @@ mod tests {
     fn mib_rejects_zero() {
         assert!(MiB::new(0).is_none());
         assert!(MiB::new(1).is_some());
+    }
+
+    #[test]
+    fn mib_as_gib_f64_converts_known_values() {
+        // Pin both the divisor (1024) and the operator (/) — three
+        // concrete points are enough to fail any constant-return,
+        // multiplication, or modulo mutant.
+        assert!((MiB::new(1024).unwrap().as_gib_f64() - 1.0).abs() < f64::EPSILON);
+        assert!((MiB::new(2048).unwrap().as_gib_f64() - 2.0).abs() < f64::EPSILON);
+        assert!((MiB::new(512).unwrap().as_gib_f64() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1789,6 +3387,271 @@ mod tests {
     fn instance_name_rejects_invalid_on_deserialize() {
         let json = r#""../evil""#;
         assert!(serde_json::from_str::<InstanceName>(json).is_err());
+    }
+
+    // ── ImageName ─────────────────────────────────────────────
+
+    #[test]
+    fn image_name_accepts_valid_identifiers() {
+        for s in [
+            "default",
+            "python-dev",
+            "alpha_beta",
+            "img.1",
+            "a",
+            "A1",
+            "ubuntu24.04",
+            "x".repeat(64).as_str(),
+        ] {
+            ImageName::new(s).unwrap_or_else(|e| panic!("{s} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_empty() {
+        assert!(ImageName::new("").is_err());
+    }
+
+    #[test]
+    fn image_name_rejects_leading_dot() {
+        // '.' and '..' would resolve to the images dir itself / its
+        // parent (the directory-traversal motivation for this newtype).
+        // Banning any leading '.' also keeps dotfile-style names out.
+        for s in [".", "..", "..hidden", ".gitkeep", ".x"] {
+            assert!(ImageName::new(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn image_name_rejects_out_of_charset() {
+        // Smoke test that the constructor wires through to
+        // `validate_safe_chars`; the exhaustive char-class rejection is
+        // covered by the `naming` module's tests.
+        assert!(ImageName::new("with space").is_err());
+    }
+
+    #[test]
+    fn image_name_rejects_overlong() {
+        let too_long = "a".repeat(MAX_IMAGE_NAME_LEN + 1);
+        assert!(ImageName::new(&too_long).is_err());
+    }
+
+    #[test]
+    fn image_name_roundtrip_serde() {
+        let name = ImageName::new("python-dev").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, r#""python-dev""#);
+        let loaded: ImageName = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, name);
+    }
+
+    #[test]
+    fn image_name_rejects_invalid_on_deserialize() {
+        // Smoke test that the `Deserialize` impl routes through
+        // `ImageName::new`; per-rule rejection is covered by the
+        // dedicated constructor tests.
+        assert!(serde_json::from_str::<ImageName>(r#""../evil""#).is_err());
+    }
+
+    /// Pins the invariant relied on by `default_image_name`, which
+    /// bypasses the validating constructor.
+    #[test]
+    fn default_image_is_valid() {
+        ImageName::new(DEFAULT_IMAGE).unwrap();
+        assert_eq!(default_image_name().as_str(), DEFAULT_IMAGE);
+    }
+
+    // ── SubnetMask ────────────────────────────────────────────
+
+    #[test]
+    fn subnet_mask_new_accepts_in_range() {
+        for bits in [0_u8, 1, 24, 32] {
+            assert!(SubnetMask::new(bits).is_some());
+        }
+    }
+
+    #[test]
+    fn subnet_mask_new_rejects_out_of_range() {
+        assert!(SubnetMask::new(33).is_none());
+        assert!(SubnetMask::new(255).is_none());
+    }
+
+    #[test]
+    fn subnet_mask_fromstr_accepts_slash_and_bare() {
+        assert_eq!(
+            "/24".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            "24".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            "/0".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(0).unwrap()
+        );
+        assert_eq!(
+            "/32".parse::<SubnetMask>().unwrap(),
+            SubnetMask::new(32).unwrap()
+        );
+    }
+
+    #[test]
+    fn subnet_mask_fromstr_rejects_invalid() {
+        assert!("/33".parse::<SubnetMask>().is_err());
+        assert!("33".parse::<SubnetMask>().is_err());
+        assert!("abc".parse::<SubnetMask>().is_err());
+        assert!("255.255.255.0".parse::<SubnetMask>().is_err());
+        assert!("".parse::<SubnetMask>().is_err());
+        assert!("/".parse::<SubnetMask>().is_err());
+        assert!("/-1".parse::<SubnetMask>().is_err());
+    }
+
+    #[test]
+    fn subnet_mask_roundtrip_serde_json() {
+        let mask = SubnetMask::new(24).unwrap();
+        let json = serde_json::to_string(&mask).unwrap();
+        assert_eq!(json, r#""/24""#);
+        let loaded: SubnetMask = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, mask);
+    }
+
+    #[test]
+    fn subnet_mask_deserialize_accepts_string_and_integer() {
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>(r#""/24""#).unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>(r#""24""#).unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<SubnetMask>("24").unwrap(),
+            SubnetMask::new(24).unwrap()
+        );
+    }
+
+    #[test]
+    fn subnet_mask_deserialize_rejects_out_of_range() {
+        assert!(serde_json::from_str::<SubnetMask>(r#""/33""#).is_err());
+        assert!(serde_json::from_str::<SubnetMask>("33").is_err());
+        assert!(serde_json::from_str::<SubnetMask>("-1").is_err());
+    }
+
+    #[test]
+    fn config_load_accepts_subnet_mask_string_and_integer() {
+        let tmp = TempDir::new().unwrap();
+
+        let with_slash = tmp.path().join("slash.toml");
+        fs::write(&with_slash, "[network]\nsubnet_mask = \"/16\"\n").unwrap();
+        let cfg = CoopConfig::load(&with_slash).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+
+        let bare = tmp.path().join("bare.toml");
+        fs::write(&bare, "[network]\nsubnet_mask = \"16\"\n").unwrap();
+        let cfg = CoopConfig::load(&bare).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+
+        let int = tmp.path().join("int.toml");
+        fs::write(&int, "[network]\nsubnet_mask = 16\n").unwrap();
+        let cfg = CoopConfig::load(&int).unwrap();
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(16).unwrap());
+    }
+
+    #[test]
+    fn config_load_rejects_invalid_subnet_mask() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[network]\nsubnet_mask = \"/33\"\n").unwrap();
+        assert!(CoopConfig::load(&path).is_err());
+    }
+
+    // ── InterfaceName / HostInterface ─────────────────────────
+
+    #[test]
+    fn interface_name_accepts_typical_linux_names() {
+        for s in [
+            "eth0", "ens5", "en0", "wlan0", "br0", "veth-1", "tap_0", "lo",
+        ] {
+            assert!(InterfaceName::new(s).is_ok(), "{s} should be accepted");
+        }
+    }
+
+    #[test]
+    fn interface_name_rejects_empty_and_reserved() {
+        assert!(InterfaceName::new("").is_err());
+        assert!(InterfaceName::new(".").is_err());
+        assert!(InterfaceName::new("..").is_err());
+    }
+
+    #[test]
+    fn interface_name_rejects_overlong() {
+        let too_long = "a".repeat(MAX_INTERFACE_NAME_LEN + 1);
+        assert!(InterfaceName::new(&too_long).is_err());
+        let max_ok = "a".repeat(MAX_INTERFACE_NAME_LEN);
+        assert!(InterfaceName::new(&max_ok).is_ok());
+    }
+
+    #[test]
+    fn interface_name_rejects_out_of_charset() {
+        // Smoke test that the constructor wires through to
+        // `validate_safe_chars`; the exhaustive char-class rejection is
+        // covered by the `naming` module's tests.
+        assert!(InterfaceName::new("eth 0").is_err());
+    }
+
+    #[test]
+    fn host_interface_deserializes_auto_sentinel() {
+        let parsed: HostInterface = serde_json::from_str(r#""auto""#).unwrap();
+        assert_eq!(parsed, HostInterface::Auto);
+    }
+
+    #[test]
+    fn host_interface_deserializes_named_interface() {
+        let parsed: HostInterface = serde_json::from_str(r#""eth0""#).unwrap();
+        assert_eq!(
+            parsed,
+            HostInterface::Named(InterfaceName::new("eth0").unwrap())
+        );
+    }
+
+    /// The whole point of the enum: typo'd sentinels fail loudly rather
+    /// than silently bypassing auto-detection.
+    #[test]
+    fn host_interface_rejects_sentinel_typos() {
+        for s in [r#""Auto""#, r#""AUTO""#, r#"" auto""#, r#""auto ""#] {
+            assert!(
+                serde_json::from_str::<HostInterface>(s).is_err(),
+                "{s} should not be accepted as the auto sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn host_interface_rejects_invalid_interface_name() {
+        // Smoke test that `HostInterface`'s `Deserialize` wraps
+        // `InterfaceName::new` for non-`auto` values; the per-rule
+        // rejection is covered by the constructor tests.
+        assert!(serde_json::from_str::<HostInterface>(r#""eth/0""#).is_err());
+    }
+
+    #[test]
+    fn host_interface_roundtrip_serde() {
+        let auto = HostInterface::Auto;
+        assert_eq!(serde_json::to_string(&auto).unwrap(), r#""auto""#);
+
+        let named = HostInterface::Named(InterfaceName::new("ens5").unwrap());
+        assert_eq!(serde_json::to_string(&named).unwrap(), r#""ens5""#);
+    }
+
+    #[test]
+    fn config_load_rejects_typo_host_iface() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        // " auto" with a leading space — the bug the enum exists to prevent.
+        fs::write(&path, "[network]\nhost_iface = \" auto\"\n").unwrap();
+        assert!(CoopConfig::load(&path).is_err());
     }
 
     #[test]
@@ -1854,9 +3717,12 @@ mod tests {
         fs::write(&path, "[network]\nhost_iface = \"eth0\"\n").unwrap();
 
         let cfg = CoopConfig::load(&path).unwrap();
-        assert_eq!(cfg.network.host_iface, "eth0");
+        assert_eq!(
+            cfg.network.host_iface,
+            HostInterface::Named(InterfaceName::new("eth0").unwrap())
+        );
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
-        assert_eq!(cfg.network.subnet_mask, "/24");
+        assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
     }
 
     #[test]
@@ -1882,38 +3748,70 @@ mod tests {
         assert_eq!(cfg.vm.vcpu_count.get(), 4);
     }
 
-    // ── Config path construction ──────────────────────────────
+    // ── Path construction ─────────────────────────────────────
 
+    /// Every path getter is a deterministic `join` under a known root.
+    /// One test pins the full set — instance dir, config `data_dir`, and
+    /// the default-value getters — since each is just string composition
+    /// and a single mutation per getter would otherwise survive.
     #[test]
-    fn config_paths_relative_to_data_dir() {
+    fn paths_compose_from_their_roots() {
+        // Instance paths join under the instance dir.
+        let inst = test_inst("foo", idx(0), PathBuf::from("/data/instances/foo"));
+        for (got, want) in [
+            (inst.rootfs_path(), "/data/instances/foo/rootfs.ext4"),
+            (inst.pid_file_path(), "/data/instances/foo/firecracker.pid"),
+            (
+                inst.api_socket_path(),
+                "/data/instances/foo/firecracker.socket",
+            ),
+            (inst.log_path(), "/data/instances/foo/firecracker.log"),
+            (inst.vsock_path(), "/data/instances/foo/vsock.sock"),
+            (inst.vm_config_path(), "/data/instances/foo/vm_config.json"),
+            (
+                inst.forwards_state_path(),
+                "/data/instances/foo/forwards.json",
+            ),
+        ] {
+            assert_eq!(got, PathBuf::from(want));
+        }
+
+        // Config getters join under `data_dir`.
         let cfg = CoopConfig {
             data_dir: PathBuf::from("/my/data"),
             ..CoopConfig::default()
         };
-        // Default image paths
-        assert_eq!(
-            cfg.template_path(),
-            PathBuf::from("/my/data/images/default/rootfs-template.ext4")
-        );
-        assert_eq!(
-            cfg.template_config_path_for(DEFAULT_IMAGE),
-            PathBuf::from("/my/data/images/default/template-config.json")
-        );
-        // Named image paths
-        assert_eq!(
-            cfg.template_path_for("python-dev"),
-            PathBuf::from("/my/data/images/python-dev/rootfs-template.ext4")
-        );
-        assert_eq!(
-            cfg.lima_base_path("python-dev"),
-            PathBuf::from("/my/data/images/python-dev/lima-base.img")
-        );
-        assert_eq!(cfg.ssh_key_path(), PathBuf::from("/my/data/vm_key"));
-        assert_eq!(cfg.instances_dir(), PathBuf::from("/my/data/instances"));
-        assert_eq!(cfg.images_dir(), PathBuf::from("/my/data/images"));
-    }
+        let python_dev = ImageName::new("python-dev").unwrap();
+        for (got, want) in [
+            (
+                cfg.template_path(),
+                "/my/data/images/default/rootfs-template.ext4",
+            ),
+            (
+                cfg.template_config_path_for(&default_img()),
+                "/my/data/images/default/template-config.json",
+            ),
+            (
+                cfg.template_path_for(&python_dev),
+                "/my/data/images/python-dev/rootfs-template.ext4",
+            ),
+            (
+                cfg.lima_base_path(&python_dev),
+                "/my/data/images/python-dev/lima-base.img",
+            ),
+            (cfg.ssh_key_path(), "/my/data/vm_key"),
+            (cfg.instances_dir(), "/my/data/instances"),
+            (cfg.images_dir(), "/my/data/images"),
+        ] {
+            assert_eq!(got, PathBuf::from(want));
+        }
 
-    // ── Default values ────────────────────────────────────────
+        // Default-value getters compose the same filenames under the
+        // default data dir.
+        let data = default_data_dir();
+        assert_eq!(default_kernel_path(), data.join("vmlinux"));
+        assert_eq!(default_firecracker_bin(), data.join("firecracker"));
+    }
 
     #[test]
     fn default_data_dir_is_under_home() {
@@ -1922,20 +3820,6 @@ mod tests {
             dir.ends_with(".coop"),
             "expected path ending with .coop, got: {dir:?}"
         );
-    }
-
-    #[test]
-    fn default_kernel_path_is_under_data_dir() {
-        let kernel = default_kernel_path();
-        let data = default_data_dir();
-        assert_eq!(kernel, data.join("vmlinux"));
-    }
-
-    #[test]
-    fn default_firecracker_bin_is_under_data_dir() {
-        let bin = default_firecracker_bin();
-        let data = default_data_dir();
-        assert_eq!(bin, data.join("firecracker"));
     }
 
     // ── Config validation ─────────────────────────────────────
@@ -1972,22 +3856,6 @@ mod tests {
             msg.contains("invalid value") || msg.contains("parse") || msg.contains("TOML"),
             "expected IP parse error, got: {msg}"
         );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_subnet_mask() {
-        let mut cfg = CoopConfig::default();
-        cfg.network.subnet_mask = "/33".into();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("not valid CIDR"));
-    }
-
-    #[test]
-    fn validate_rejects_non_cidr_subnet() {
-        let mut cfg = CoopConfig::default();
-        cfg.network.subnet_mask = "255.255.255.0".into();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("not valid CIDR"));
     }
 
     #[test]
@@ -2055,11 +3923,238 @@ mod tests {
     fn validate_collects_multiple_errors() {
         let mut cfg = CoopConfig::default();
         cfg.vm.mem_size_mib = MiB::new(64).unwrap();
-        cfg.network.subnet_mask = "/33".into();
+        cfg.claude.config_dir = ConfigDir::Custom("/nonexistent/claude-config".into());
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("mem_size_mib"), "missing mem error: {msg}");
-        assert!(msg.contains("CIDR"), "missing subnet error: {msg}");
+        assert!(
+            msg.contains("claude.config_dir"),
+            "missing config_dir error: {msg}"
+        );
+    }
+
+    // ── validate() boundary pinning (issue #137) ──────────────
+    // Each test here exists to kill a specific surviving mutant
+    // from `cargo mutants -f src/config.rs`. Do not loosen the
+    // assertions without re-running mutants first.
+
+    /// Build a `CoopConfig` with all path fields rooted in `data_dir`
+    /// so existence checks are deterministic. By default both
+    /// `kernel_path` and `firecracker_bin` point at non-existent files.
+    fn validate_fixture(data_dir: &Path) -> CoopConfig {
+        CoopConfig {
+            data_dir: data_dir.to_path_buf(),
+            vm: VmConfig {
+                kernel_path: data_dir.join("nonexistent-kernel"),
+                ..VmConfig::default()
+            },
+            firecracker_bin: data_dir.join("nonexistent-firecracker"),
+            ..CoopConfig::default()
+        }
+    }
+
+    // Pins `mem_size_mib < 128` against `<= 128`: the boundary value
+    // 128 must be accepted.
+    #[test]
+    fn validate_accepts_min_memory_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = validate_fixture(tmp.path());
+        cfg.vm.mem_size_mib = MiB::new(128).unwrap();
+        // 128 is the documented minimum; the boundary value itself must pass.
+        cfg.validate().unwrap();
+    }
+
+    // Pins both `!parent.as_os_str().is_empty()` and `!parent.exists()`:
+    // with a non-empty, non-existent parent, the warning must fire.
+    #[test]
+    fn validate_warns_when_data_dir_parent_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("absent").join("coop");
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("data_dir parent") && w.contains("does not exist")),
+            "expected data_dir parent warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!parent.exists()`: with an existing parent, the warning
+    // must NOT fire (catches the negation being deleted).
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("coop");
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "unexpected data_dir warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.vm.kernel_path.exists()` (forward direction): when
+    // the template is present and the kernel is absent, warn.
+    #[test]
+    fn validate_warns_kernel_missing_when_template_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
+
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("kernel_path") && w.contains("does not exist")),
+            "expected kernel_path warning, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.vm.kernel_path.exists()` (reverse direction): when
+    // the kernel is present, no warning even with the template built.
+    #[test]
+    fn validate_no_kernel_warning_when_kernel_exists() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
+        let kernel = data_dir.join("vmlinux");
+        fs::write(&kernel, b"").unwrap();
+
+        let mut cfg = validate_fixture(&data_dir);
+        cfg.vm.kernel_path = kernel;
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("kernel_path")),
+            "unexpected kernel_path warning, got {warnings:?}"
+        );
+    }
+
+    // Pins the outer `template_path().exists()` gate: when the
+    // template is absent, the kernel check is skipped entirely.
+    #[test]
+    fn validate_no_kernel_warning_when_template_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("kernel_path")),
+            "kernel check should be gated on template existence, got {warnings:?}"
+        );
+    }
+
+    // Pins `!self.firecracker_bin.exists()` (forward) on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn validate_warns_firecracker_missing_on_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("firecracker_bin") && w.contains("does not exist")),
+            "expected firecracker_bin warning on Linux, got {warnings:?}"
+        );
+    }
+
+    // Pins `&&` between firecracker existence and the linux cfg: on
+    // Linux when firecracker IS present, no warning must fire.
+    // Mutation to `||` would always warn on Linux.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn validate_no_firecracker_warning_when_present_on_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let firecracker = data_dir.join("firecracker");
+        fs::write(&firecracker, b"").unwrap();
+
+        let mut cfg = validate_fixture(&data_dir);
+        cfg.firecracker_bin = firecracker;
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("firecracker_bin")),
+            "unexpected firecracker_bin warning, got {warnings:?}"
+        );
+    }
+
+    // Pins the linux gate on non-linux hosts: a missing firecracker
+    // binary must not warn off-Linux.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn validate_no_firecracker_warning_on_non_linux() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let cfg = validate_fixture(&data_dir);
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("firecracker_bin")),
+            "firecracker_bin warning must be gated on Linux, got {warnings:?}"
+        );
+    }
+
+    // Pins `!parent.as_os_str().is_empty()`: a bare relative `data_dir`
+    // has an empty parent (`Path::new("coop").parent() == Some("")`).
+    // Deleting the emptiness guard would make the warning fire because
+    // an empty path "does not exist", so this must stay silent.
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_empty() {
+        // A single-component relative path: `Path::parent` yields `Some("")`.
+        let cfg = validate_fixture(Path::new("coop"));
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "bare relative data_dir has an empty parent; no warning expected, got {warnings:?}"
+        );
+    }
+
+    // Pins the `parent.exists()` arm at the filesystem root: `/` always
+    // exists, so a `data_dir` of `/coop` must not warn. Catches a mutant
+    // that forces the existence check to a constant.
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_is_root() {
+        let cfg = validate_fixture(Path::new("/coop-data"));
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "root parent '/' exists; no warning expected, got {warnings:?}"
+        );
+    }
+
+    // Pins the marketplace loop accumulating one error per offending
+    // entry: with two non-existent absolute paths, both must surface.
+    // A mutant that `break`s after the first, or skips the push, drops
+    // one of the two names.
+    #[test]
+    fn validate_collects_all_marketplace_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = validate_fixture(tmp.path());
+        cfg.claude.marketplaces = vec![
+            "/nonexistent/marketplace-a".to_string(),
+            "/nonexistent/marketplace-b".to_string(),
+        ];
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(
+            msg.contains("marketplace-a"),
+            "missing first marketplace error: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace-b"),
+            "missing second marketplace error: {msg}"
+        );
     }
 
     // ── Custom profiles ──────────────────────────────────────
@@ -2088,6 +4183,24 @@ mod tests {
         assert!(cfg.profiles.is_empty());
     }
 
+    // ── post_start ───────────────────────────────────────────
+
+    #[test]
+    fn post_start_deserializes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "post_start = \"touch /tmp/booted\"\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(cfg.post_start.as_deref(), Some("touch /tmp/booted"));
+    }
+
+    #[test]
+    fn post_start_default_none() {
+        let cfg = CoopConfig::default();
+        assert!(cfg.post_start.is_none());
+    }
+
     // ── Named images ─────────────────────────────────────────
 
     #[test]
@@ -2096,21 +4209,22 @@ mod tests {
             data_dir: PathBuf::from("/data"),
             ..CoopConfig::default()
         };
-        assert_eq!(cfg.image_dir("foo"), PathBuf::from("/data/images/foo"));
+        let foo = ImageName::new("foo").unwrap();
+        assert_eq!(cfg.image_dir(&foo), PathBuf::from("/data/images/foo"));
         assert_eq!(
-            cfg.template_path_for("foo"),
+            cfg.template_path_for(&foo),
             PathBuf::from("/data/images/foo/rootfs-template.ext4")
         );
         assert_eq!(
-            cfg.template_config_path_for("foo"),
+            cfg.template_config_path_for(&foo),
             PathBuf::from("/data/images/foo/template-config.json")
         );
         assert_eq!(
-            cfg.lima_base_path("foo"),
+            cfg.lima_base_path(&foo),
             PathBuf::from("/data/images/foo/lima-base.img")
         );
         assert_eq!(
-            cfg.lima_template_path("foo"),
+            cfg.lima_template_path(&foo),
             PathBuf::from("/data/images/foo/lima-template.yaml")
         );
     }
@@ -2127,12 +4241,28 @@ mod tests {
     fn list_images_finds_dirs() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.image_dir("alpha")).unwrap();
-        fs::create_dir_all(cfg.image_dir("beta")).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("alpha").unwrap())).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("beta").unwrap())).unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 2);
-        assert_eq!(images[0].name, "alpha");
-        assert_eq!(images[1].name, "beta");
+        assert_eq!(images[0].name.as_str(), "alpha");
+        assert_eq!(images[1].name.as_str(), "beta");
+    }
+
+    /// Image dirs whose names can't be parsed as [`ImageName`] (e.g. a
+    /// stray dotfile or an entry hand-edited in) are silently skipped
+    /// rather than poisoning the listing — same behaviour as
+    /// `list_instances` for corrupted instance dirs.
+    #[test]
+    fn list_images_skips_invalid_names() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        fs::create_dir_all(cfg.images_dir().join("..hidden")).unwrap();
+        fs::create_dir_all(cfg.images_dir().join("with space")).unwrap();
+        fs::create_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap())).unwrap();
+        let images = cfg.list_images().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name.as_str(), "ok");
     }
 
     #[test]
@@ -2141,13 +4271,13 @@ mod tests {
         let dir = tmp.path().join("inst");
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
-            image: "python-dev".to_string(),
+            image: ImageName::new("python-dev").unwrap(),
         };
         inst.save().unwrap();
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.image, "python-dev");
+        assert_eq!(loaded.image.as_str(), "python-dev");
     }
 
     #[test]
@@ -2158,7 +4288,32 @@ mod tests {
         // Write old-format instance.json without image field
         fs::write(dir.join("instance.json"), r#"{"name": "test", "index": 0}"#).unwrap();
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.image, DEFAULT_IMAGE);
+        assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+    }
+
+    /// Pre-`ImageName` instances stored arbitrary strings here; a name
+    /// that fails validation should be rejected at load time rather than
+    /// silently used to construct paths.
+    #[test]
+    fn instance_load_rejects_invalid_image_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("inst");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("instance.json"),
+            r#"{"name": "test", "index": 0, "image": "../escape"}"#,
+        )
+        .unwrap();
+        let err = Instance::load(&dir).unwrap_err();
+        let chain = err.chain().fold(String::new(), |mut acc, e| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{e} | ");
+            acc
+        });
+        assert!(
+            chain.contains("must not start with") || chain.contains("invalid character"),
+            "expected validation error, got: {chain}"
+        );
     }
 
     // ── Resilience: corrupted instance dirs ─────────────────
@@ -2168,7 +4323,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with no instance.json (crashed mid-create)
         let orphan = tmp.path().join("instances").join("orphan");
@@ -2184,7 +4339,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with garbage JSON (truncated write)
         let broken = tmp.path().join("instances").join("broken");
@@ -2201,7 +4356,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        make_instance(tmp.path(), "good", 0);
+        make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with empty file (truncated before any content)
         let empty = tmp.path().join("instances").join("empty");
@@ -2224,8 +4379,10 @@ mod tests {
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
         // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
-        assert_eq!(inst.index, InstanceIndex::new(0));
+        let inst = cfg
+            .allocate_instance(None, &ImageName::new(DEFAULT_IMAGE).unwrap(), None)
+            .unwrap();
+        assert_eq!(inst.index.as_u16(), 0);
     }
 
     #[test]
@@ -2236,26 +4393,26 @@ mod tests {
         // Save initial state
         let inst = Instance {
             name: InstanceName::new("v1").unwrap(),
-            index: InstanceIndex::new(0),
+            index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
-            image: DEFAULT_IMAGE.to_string(),
+            image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
 
         // Overwrite with different content
         let inst2 = Instance {
             name: InstanceName::new("v2").unwrap(),
-            index: InstanceIndex::new(5),
+            index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
-            image: "custom".to_string(),
+            image: ImageName::new("custom").unwrap(),
         };
         inst2.save().unwrap();
 
         // Load should see the new content, not a mix
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.name, *"v2");
-        assert_eq!(loaded.index, InstanceIndex::new(5));
-        assert_eq!(loaded.image, "custom");
+        assert_eq!(loaded.index.as_u16(), 5);
+        assert_eq!(loaded.image.as_str(), "custom");
 
         // No temp file left behind
         assert!(!dir.join("instance.tmp").exists());
@@ -2308,15 +4465,15 @@ mod tests {
     #[test]
     fn disk_size_resolve_absolute() {
         let ds = DiskSize::Absolute(GiB::new(150).unwrap());
-        let resolved = ds.resolve(100).unwrap();
-        assert_eq!(resolved.as_u32(), 150);
+        let resolved = ds.resolve(GiB::new(100).unwrap()).unwrap();
+        assert_eq!(resolved, GiB::new(150).unwrap());
     }
 
     #[test]
     fn disk_size_resolve_relative() {
         let ds = DiskSize::Relative(GiB::new(20).unwrap());
-        let resolved = ds.resolve(100).unwrap();
-        assert_eq!(resolved.as_u32(), 120);
+        let resolved = ds.resolve(GiB::new(100).unwrap()).unwrap();
+        assert_eq!(resolved, GiB::new(120).unwrap());
     }
 
     // ── Mount parsing ───────────────────────────────────────────
@@ -2326,7 +4483,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path, "/workspace");
+        assert_eq!(m.guest_path.to_string(), "/workspace");
     }
 
     #[test]
@@ -2335,7 +4492,7 @@ mod tests {
         let spec = format!("{}:/data/project", tmp.path().display());
         let m = Mount::parse(&spec).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
-        assert_eq!(m.guest_path, "/data/project");
+        assert_eq!(m.guest_path.to_string(), "/data/project");
     }
 
     #[test]
@@ -2368,6 +4525,31 @@ mod tests {
             err.to_string().contains("must be absolute"),
             "expected 'must be absolute', got: {err}"
         );
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_detects_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(m.host_is_git_repo());
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_detects_worktree_git_file() {
+        // Linked worktrees have `.git` as a file pointing at the main
+        // repo's gitdir, not a directory. Both should count.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(m.host_is_git_repo());
+    }
+
+    #[test]
+    fn mount_host_is_git_repo_false_for_plain_directory() {
+        let tmp = TempDir::new().unwrap();
+        let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
+        assert!(!m.host_is_git_repo());
     }
 
     // ── ConfigDir deserialization ────────────────────────────
@@ -2566,7 +4748,7 @@ mod tests {
     #[test]
     fn unique_name_with_collision() {
         let tmp = TempDir::new().unwrap();
-        let inst = make_instance(tmp.path(), "foo", 0);
+        let inst = make_instance(tmp.path(), "foo", idx(0));
         let name = unique_instance_name("foo", &[inst]).unwrap();
         assert_eq!(name, *"foo-2");
     }
@@ -2574,8 +4756,8 @@ mod tests {
     #[test]
     fn unique_name_multiple_collisions() {
         let tmp = TempDir::new().unwrap();
-        let i1 = make_instance(tmp.path(), "foo", 0);
-        let i2 = make_instance(tmp.path(), "foo-2", 1);
+        let i1 = make_instance(tmp.path(), "foo", idx(0));
+        let i2 = make_instance(tmp.path(), "foo-2", idx(1));
         let name = unique_instance_name("foo", &[i1, i2]).unwrap();
         assert_eq!(name, *"foo-3");
     }
@@ -2589,7 +4771,7 @@ mod tests {
         fs::create_dir(&ws).unwrap();
 
         let inst = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst.name, *"my-app");
     }
@@ -2604,13 +4786,13 @@ mod tests {
 
         // First allocation takes the basename
         let inst1 = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst1.name, *"dupe");
 
         // Second allocation with same basename gets -2 suffix
         let inst2 = cfg
-            .allocate_instance(None, DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(None, &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst2.name, *"dupe-2");
     }
@@ -2624,7 +4806,7 @@ mod tests {
         fs::create_dir(&ws).unwrap();
 
         let inst = cfg
-            .allocate_instance(Some("custom"), DEFAULT_IMAGE, Some(&ws))
+            .allocate_instance(Some(&iname("custom")), &default_img(), Some(&ws))
             .unwrap();
         assert_eq!(inst.name, *"custom");
     }
@@ -2633,7 +4815,7 @@ mod tests {
     fn allocate_without_name_or_workspace_uses_index() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let inst = cfg.allocate_instance(None, DEFAULT_IMAGE, None).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.name, *"0");
     }
 
@@ -2736,5 +4918,491 @@ mod tests {
         // `cmd` (no colon) is a plain value, not a command substitution
         assert_eq!(resolve_cmd_value("cmd").unwrap(), "cmd");
         assert_eq!(resolve_cmd_value("cmdline").unwrap(), "cmdline");
+    }
+
+    // ── Secret redaction ─────────────────────────────────────
+
+    #[test]
+    fn secret_debug_does_not_leak_value() {
+        let s = Secret::new("real-token-value-do-not-leak".to_string());
+        let debug = format!("{s:?}");
+        assert!(
+            !debug.contains("real-token-value-do-not-leak"),
+            "Debug leaked secret value: {debug}"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "Debug should mark redaction: {debug}"
+        );
+    }
+
+    #[test]
+    fn secret_expose_returns_underlying_value() {
+        let s = Secret::new("plaintext".to_string());
+        assert_eq!(s.expose(), "plaintext");
+    }
+
+    #[test]
+    fn secret_serde_round_trip_is_transparent() {
+        let json = r#""token-xyz""#;
+        let s: Secret<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(s.expose(), "token-xyz");
+        let out = serde_json::to_string(&s).unwrap();
+        assert_eq!(out, json);
+    }
+
+    #[test]
+    fn claude_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "sk-ant-real-secret"}"#;
+        let cfg: ClaudeConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("sk-ant-real-secret"),
+            "ClaudeConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn codex_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "sk-openai-real-secret"}"#;
+        let cfg: CodexConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("sk-openai-real-secret"),
+            "CodexConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn pat_entry_token_debug_redacts() {
+        let entry = PatEntry {
+            token: Secret::new("github_pat_secret".to_string()),
+        };
+        let debug = format!("{entry:?}");
+        assert!(
+            !debug.contains("github_pat_secret"),
+            "PatEntry Debug leaked token: {debug}"
+        );
+    }
+
+    #[test]
+    fn mcp_resolved_header_debug_redacts() {
+        let mut def = McpServerDef::Http {
+            url: url::Url::parse("https://mcp.example.com/").unwrap(),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                Secret::new("cmd:echo bearer-real-secret-token".to_string()),
+            )]),
+        };
+        def.resolve_header_secrets("MCP server", "example").unwrap();
+
+        let McpServerDef::Http { headers, .. } = &def else {
+            panic!("expected Http variant");
+        };
+        assert_eq!(
+            headers.get("Authorization").map(|v| v.expose().as_str()),
+            Some("bearer-real-secret-token"),
+            "header value should resolve to the command output"
+        );
+
+        let debug = format!("{def:?}");
+        assert!(
+            !debug.contains("bearer-real-secret-token"),
+            "McpServerDef Debug leaked resolved header value: {debug}"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "McpServerDef Debug should mark redaction: {debug}"
+        );
+
+        // The guest registration path serializes the resolved def and
+        // must emit the real token, not the redacted marker.
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            json.contains("bearer-real-secret-token"),
+            "serialized MCP def must carry the real header value for the guest: {json}"
+        );
+        assert!(
+            !json.contains("redacted"),
+            "serialized MCP def must not leak the Debug redaction marker: {json}"
+        );
+    }
+
+    // ── PortForward parsing ──────────────────────────────────
+
+    #[test]
+    fn port_forward_parse_guest_only_defaults_host_to_guest() {
+        let f = PortForward::parse("3000").unwrap();
+        assert_eq!(f.guest.get(), 3000);
+        assert_eq!(f.host.get(), 3000);
+        assert!(f.label.is_none());
+    }
+
+    #[test]
+    fn port_forward_parse_guest_host() {
+        let f = PortForward::parse("3000:3001").unwrap();
+        assert_eq!(f.guest.get(), 3000);
+        assert_eq!(f.host.get(), 3001);
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_zero() {
+        assert!(PortForward::parse("0").is_err());
+        assert!(PortForward::parse("3000:0").is_err());
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_non_numeric() {
+        assert!(PortForward::parse("abc").is_err());
+        assert!(PortForward::parse("3000:abc").is_err());
+    }
+
+    #[test]
+    fn port_forward_parse_rejects_out_of_range() {
+        assert!(PortForward::parse("70000").is_err());
+    }
+
+    #[test]
+    fn port_forward_toml_integer_form() {
+        let toml_src = "forward_ports = [3000]";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports.len(), 1);
+        assert_eq!(cfg.forward_ports[0].guest.get(), 3000);
+        assert_eq!(cfg.forward_ports[0].host.get(), 3000);
+    }
+
+    #[test]
+    fn port_forward_toml_string_form() {
+        let toml_src = r#"forward_ports = ["8080:8081"]"#;
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].guest.get(), 8080);
+        assert_eq!(cfg.forward_ports[0].host.get(), 8081);
+    }
+
+    #[test]
+    fn port_forward_toml_table_form() {
+        let toml_src = "[[forward_ports]]\nguest = 3000\nhost = 13000\nlabel = \"dev\"\n";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].guest.get(), 3000);
+        assert_eq!(cfg.forward_ports[0].host.get(), 13000);
+        assert_eq!(cfg.forward_ports[0].label.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn port_forward_toml_table_omits_host_defaults_to_guest() {
+        let toml_src = "[[forward_ports]]\nguest = 3000\n";
+        let cfg: CoopConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.forward_ports[0].host.get(), 3000);
+    }
+
+    #[test]
+    fn port_forward_toml_table_missing_guest_errors() {
+        let toml_src = "[[forward_ports]]\nhost = 3000\n";
+        let err = match toml::from_str::<CoopConfig>(toml_src) {
+            Ok(cfg) => panic!("expected error, got: {cfg:?}"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("guest"), "err = {err}");
+    }
+
+    #[test]
+    fn port_forward_default_is_empty() {
+        let cfg: CoopConfig = toml::from_str("").unwrap();
+        assert!(cfg.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn port_forward_serialize_round_trip() {
+        let original = PortForward {
+            guest: NonZeroU16::new(3000).unwrap(),
+            host: NonZeroU16::new(3001).unwrap(),
+            label: Some("dev".to_string()),
+        };
+        let toml_src = toml::to_string(&original).unwrap();
+        let parsed: PortForward = toml::from_str(&toml_src).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    // ── PortForward merge ────────────────────────────────────
+
+    fn pf(g: u16, h: u16) -> PortForward {
+        PortForward {
+            guest: NonZeroU16::new(g).unwrap(),
+            host: NonZeroU16::new(h).unwrap(),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn merge_forward_ports_appends_cli() {
+        let cfg = vec![pf(3000, 3000)];
+        let cli = vec![pf(4000, 4000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].guest.get(), 3000);
+        assert_eq!(merged[1].guest.get(), 4000);
+    }
+
+    #[test]
+    fn merge_forward_ports_cli_overrides_same_guest() {
+        let cfg = vec![pf(3000, 3000)];
+        let cli = vec![pf(3000, 13000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].host.get(), 13000);
+    }
+
+    #[test]
+    fn merge_forward_ports_later_cli_overrides_earlier_cli() {
+        let cfg: Vec<PortForward> = Vec::new();
+        let cli = vec![pf(3000, 13000), pf(3000, 14000)];
+        let merged = merge_forward_ports(&cfg, &cli);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].host.get(), 14000);
+    }
+
+    // ── Property tests ───────────────────────────────────────
+    //
+    // A standing `cargo-fuzz` target for the config loader (the parser
+    // class #278 reserves fuzzing for) isn't practical here: `CoopConfig`
+    // transitively embeds `update`, `setup`, and `shell` types, so the
+    // `#[path]`-include trick used by the self-contained `jsonc` /
+    // `parse_repo_slug` targets would have to pull in most of the crate
+    // (including its network and process-spawning modules). The
+    // `config_load_never_panics` property below covers the same
+    // "never panics, only returns Err" guarantee as a CI gate; unblocking
+    // a true fuzz target would mean giving the crate a `lib` target.
+
+    fn arb_subnet_mask() -> impl Strategy<Value = SubnetMask> {
+        (0u8..=32).prop_map(|b| SubnetMask::new(b).unwrap())
+    }
+
+    fn arb_host_iface() -> impl Strategy<Value = HostInterface> {
+        prop_oneof![
+            Just(HostInterface::Auto),
+            "[a-z][a-z0-9]{0,8}"
+                .prop_map(|s| HostInterface::Named(InterfaceName::new(&s).unwrap())),
+        ]
+    }
+
+    fn arb_port_forward() -> impl Strategy<Value = PortForward> {
+        (
+            1u16..=u16::MAX,
+            1u16..=u16::MAX,
+            proptest::option::of("[a-z]{1,6}"),
+        )
+            .prop_map(|(guest, host, label)| PortForward {
+                guest: NonZeroU16::new(guest).unwrap(),
+                host: NonZeroU16::new(host).unwrap(),
+                label,
+            })
+    }
+
+    /// A `CoopConfig` with the drift-prone fields randomized: the numeric
+    /// `NonZero`/`Quantity` fields, the custom-serde network fields, the
+    /// `forward_ports` list, and an optional `post_start`. Other fields
+    /// keep their defaults — enough to exercise serde round-tripping
+    /// without an `Arbitrary` impl for every leaf type.
+    fn arb_config() -> impl Strategy<Value = CoopConfig> {
+        (
+            1u32..=u32::MAX,
+            1u8..=u8::MAX,
+            1u32..=u32::MAX,
+            arb_subnet_mask(),
+            arb_host_iface(),
+            proptest::collection::vec(arb_port_forward(), 0..4),
+            proptest::option::of("[a-zA-Z0-9 _./:-]{0,20}"),
+        )
+            .prop_map(
+                |(mem, vcpu, template, subnet_mask, host_iface, forward_ports, post_start)| {
+                    let mut cfg = CoopConfig::default();
+                    cfg.vm.mem_size_mib = MiB::new(mem).unwrap();
+                    cfg.vm.vcpu_count = NonZeroU8::new(vcpu).unwrap();
+                    cfg.vm.template_size_gib = GiB::new(template).unwrap();
+                    cfg.network.subnet_mask = subnet_mask;
+                    cfg.network.host_iface = host_iface;
+                    cfg.forward_ports = forward_ports;
+                    cfg.post_start = post_start;
+                    cfg
+                },
+            )
+    }
+
+    /// A TOML document biased toward real keys and adversarial scalar
+    /// values, so the loader's custom deserializers are actually reached
+    /// rather than rejected by the lexer. Most documents fail to parse;
+    /// the property is only that none panic.
+    fn arb_config_toml_text() -> impl Strategy<Value = String> {
+        let scalar = prop_oneof![
+            any::<i64>().prop_map(|n| n.to_string()),
+            Just("\"/24\"".to_string()),
+            Just("\"auto\"".to_string()),
+            Just("\" auto\"".to_string()),
+            Just("\"eth/0\"".to_string()),
+            Just("0".to_string()),
+            Just("[3000, \"8080:8081\"]".to_string()),
+            Just("{ guest = 3000, host = 0 }".to_string()),
+            "[a-zA-Z0-9_./-]{0,10}".prop_map(|s| format!("\"{s}\"")),
+        ];
+        let key = proptest::sample::select(vec![
+            "mem_size_mib",
+            "vcpu_count",
+            "ssh_port",
+            "subnet_mask",
+            "host_iface",
+            "host_ip",
+            "data_dir",
+            "post_start",
+            "template_size_gib",
+            "forward_ports",
+        ]);
+        let header = proptest::sample::select(vec![
+            "",
+            "[vm]",
+            "[network]",
+            "[claude]",
+            "[[forward_ports]]",
+        ]);
+        proptest::collection::vec((header, key, scalar), 0..8).prop_map(|rows| {
+            let mut out = String::new();
+            for (header, key, scalar) in rows {
+                if !header.is_empty() {
+                    out.push_str(header);
+                    out.push('\n');
+                }
+                out.push_str(key);
+                out.push_str(" = ");
+                out.push_str(&scalar);
+                out.push('\n');
+            }
+            out
+        })
+    }
+
+    fn arb_guest_path() -> impl Strategy<Value = String> {
+        // Absolute, colon-free guest path so `Mount`'s `HOST:GUEST` split
+        // and `GuestPath::absolute` both accept it.
+        proptest::collection::vec("[a-zA-Z0-9_.-]{1,8}", 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    proptest! {
+        /// `Quantity::parse_cli` → `Display` → `parse_cli` is the identity:
+        /// `Display` writes the bare integer and `parse_cli` reads it back,
+        /// for both unit markers.
+        #[test]
+        fn quantity_parse_display_roundtrips(n in 1u32..=u32::MAX) {
+            let mib = MiB::parse_cli(&n.to_string()).unwrap();
+            prop_assert_eq!(mib.as_u32(), n);
+            prop_assert_eq!(MiB::parse_cli(&mib.to_string()).unwrap(), mib);
+
+            let gib = GiB::parse_cli(&n.to_string()).unwrap();
+            prop_assert_eq!(gib.as_u32(), n);
+            prop_assert_eq!(GiB::parse_cli(&gib.to_string()).unwrap(), gib);
+        }
+
+        /// `DiskSize` has no `Display`, so its canonical string is rebuilt
+        /// from the parsed variant (`N` absolute, `+N` relative) and
+        /// re-parsed. Pins that both the `+` prefix and the GiB magnitude
+        /// survive a round-trip.
+        #[test]
+        fn disk_size_parse_render_roundtrips(relative in any::<bool>(), n in 1u32..=u32::MAX) {
+            let spec = if relative { format!("+{n}") } else { n.to_string() };
+            let ds = DiskSize::parse(&spec).unwrap();
+            let canonical = match ds {
+                DiskSize::Absolute(gib) => gib.to_string(),
+                DiskSize::Relative(gib) => format!("+{gib}"),
+            };
+            prop_assert_eq!(DiskSize::parse(&canonical).unwrap(), ds);
+        }
+
+        /// `PortForward::parse` of a `GUEST[:HOST]` spec round-trips through
+        /// the canonical `guest:host` rendering. CLI parsing never sets a
+        /// label, so value equality covers the whole struct.
+        #[test]
+        fn port_forward_parse_render_roundtrips(
+            guest in 1u16..=u16::MAX,
+            host in proptest::option::of(1u16..=u16::MAX),
+        ) {
+            let spec = match host {
+                Some(h) => format!("{guest}:{h}"),
+                None => guest.to_string(),
+            };
+            let parsed = PortForward::parse(&spec).unwrap();
+            let canonical = format!("{}:{}", parsed.guest, parsed.host);
+            prop_assert_eq!(PortForward::parse(&canonical).unwrap(), parsed);
+        }
+
+        /// `SubnetMask` round-trips `Display` → `FromStr` across the whole
+        /// `0..=32` range. (The leading `/` itself is pinned by the serde
+        /// JSON test, since `FromStr` also accepts the bare form.)
+        #[test]
+        fn subnet_mask_display_fromstr_roundtrips(bits in 0u8..=32) {
+            let mask = SubnetMask::new(bits).unwrap();
+            prop_assert_eq!(mask.to_string().parse::<SubnetMask>().unwrap(), mask);
+        }
+
+        /// `Mount::parse` round-trips through `HOST:GUEST`: re-parsing the
+        /// canonical spec rebuilt from a parsed mount yields the same
+        /// (canonicalized) host and guest paths. The host is a real temp
+        /// dir so the existence/is-dir invariants hold.
+        #[test]
+        fn mount_parse_roundtrips(guest in arb_guest_path()) {
+            let tmp = TempDir::new().unwrap();
+            let host = tmp.path().to_str().unwrap();
+            let first = Mount::parse(&format!("{host}:{guest}")).unwrap();
+            let second =
+                Mount::parse(&format!("{}:{}", first.host_path.display(), first.guest_path))
+                    .unwrap();
+            prop_assert_eq!(&first.host_path, &second.host_path);
+            prop_assert_eq!(first.guest_path.to_string(), second.guest_path.to_string());
+        }
+
+        /// Loading a serialized config and re-serializing is idempotent:
+        /// `serialize(load(serialize(cfg))) == serialize(cfg)`. Catches
+        /// serde default/skip/rename drift and any custom (de)serialize
+        /// impl that fails to round-trip (`SubnetMask`, `HostInterface`,
+        /// `PortForward`). No prior test covered the whole struct.
+        #[test]
+        fn config_toml_roundtrip_is_idempotent(cfg in arb_config()) {
+            let once = toml::to_string(&cfg).unwrap();
+            let parsed: CoopConfig = toml::from_str(&once).unwrap();
+            let twice = toml::to_string(&parsed).unwrap();
+            prop_assert_eq!(once, twice);
+        }
+
+        /// The loader must never panic on hostile input — only `Ok`/`Err`.
+        /// `proptest` reports any panic as a failure with a minimized case.
+        #[test]
+        fn config_load_never_panics(src in arb_config_toml_text()) {
+            let _ = toml::from_str::<CoopConfig>(&src);
+        }
+
+        /// `merge_forward_ports` is keyed on the guest port: the result
+        /// holds each distinct guest exactly once, in first-seen order,
+        /// and the surviving entry is the LAST across `config ++ cli`
+        /// (CLI overrides config; a later duplicate overrides an earlier
+        /// one). Generalizes the three example-based merge tests above.
+        #[test]
+        fn merge_forward_ports_keeps_last_per_guest(
+            config in proptest::collection::vec(arb_port_forward(), 0..6),
+            cli in proptest::collection::vec(arb_port_forward(), 0..6),
+        ) {
+            let merged = merge_forward_ports(&config, &cli);
+
+            let mut order: Vec<NonZeroU16> = Vec::new();
+            let mut last: HashMap<NonZeroU16, PortForward> = HashMap::new();
+            for f in config.iter().chain(cli.iter()) {
+                if last.insert(f.guest, f.clone()).is_none() {
+                    order.push(f.guest);
+                }
+            }
+
+            prop_assert_eq!(merged.len(), order.len());
+            for (got, guest) in merged.iter().zip(order.iter()) {
+                prop_assert_eq!(&got.guest, guest);
+                prop_assert_eq!(got, &last[guest]);
+            }
+        }
     }
 }

@@ -1,15 +1,16 @@
 [package]
 name = "coop"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Isolated VM environment for running Claude Code"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 dirs = "6.0.0"
 indexmap = "2"
-libc = "0.2.185"
+libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.2"
@@ -17,8 +18,14 @@ tracing = "0.1"
 semver = "1"
 sha2 = "0.11"
 tempfile = "3"
+thiserror = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
+mutants = "0.0.4"
+url = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+proptest = "1.11.0"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -38,3 +45,10 @@ exit = "deny"
 mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
+# coop is an application; src/lib.rs exists only so in-repo fuzz targets and
+# integration tests can import internals (e.g. coop::config::CoopConfig). The
+# pub modules are not a curated public API, so the public-API documentation and
+# ergonomics lints are noise here.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

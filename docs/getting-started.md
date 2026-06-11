@@ -47,6 +47,8 @@ template_size_gib = 20
 
 All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
 
+The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
+
 ### Claude Code and Codex integration
 
 Forward your API keys and GitHub credentials into the guest:
@@ -70,16 +72,24 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 - `"off"` (default): disables GitHub auth forwarding
 - `"auto"`: checks `$GITHUB_TOKEN` env var first, falls back to `gh auth token` if unset
 - `"env"`: requires `GITHUB_TOKEN` in your environment
+- `"pat"`: forwards a per-repo fine-grained PAT recorded under `[github.pat."owner/repo"]`. GitHub enforces the token's scope server-side — see [GitHub auth](configuration.md#fine-grained-pat-github--pat) for the full reference.
 
-GitHub auth is off by default. Set `github = "auto"` explicitly to enable it.
+GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
 
 coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
 
 ## First run
 
+In a hurry? From your project directory, `coop quickstart` runs setup, brings up
+an instance, and launches Claude Code in one command — building the default
+image only if it is missing and reconnecting to an existing instance when one is
+already running. The steps below walk through the same flow one command at a
+time and give you per-instance control. See the [`quickstart`
+reference](commands.md#quickstart) for details.
+
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, tmux, and others), the GitHub CLI, Claude Code, and Codex.
+`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
 
 ```
 coop setup
@@ -93,6 +103,15 @@ coop setup --profile python,node
 
 Built-in profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go`. Combine them with commas (e.g. `--profile python,node,rust`). Use `coop profiles list` to inspect what each one installs.
 
+You can also let `up` build a profile-derived image on demand:
+
+```
+coop up --profile python,node
+```
+
+This creates or refreshes an image named from the sorted profile list
+(`node-python` here), then creates the project instance from it.
+
 Skip confirmation prompts with `-y`:
 
 ```
@@ -101,51 +120,85 @@ coop setup -y --profile python
 
 Setup is idempotent. Rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
 
-### 2. Start an instance
+### 2. Bring up a project environment
+
+For normal project work, use `coop up` from your project directory:
+
+```
+cd ~/code/my-project
+coop up
+```
+
+`coop up` is project-oriented and re-runnable. It creates an instance the
+first time, reuses it if it is already running, and restarts it after
+`coop stop`. By default it copies/syncs the project into `/workspace`.
+
+Choose mount transport explicitly:
+
+```
+coop up . --mount
+```
+
+On macOS/Lima this is live filesystem sharing. On Linux/Firecracker it is a
+one-time sync.
+
+Mount additional data directories when creating the project instance:
+
+```
+coop up . --extra-mount ~/data:/data
+```
+
+Or clone a remote repository directly into `/workspace` inside the guest:
+
+```
+coop up --git-repo https://github.com/trailofbits/coop.git
+```
+
+Tune a project environment at startup (each flag is repeatable where it makes sense, and works on both `coop up` and `coop start`):
+
+```
+coop up --forward-port 3000        # tunnel a guest port to the host
+coop up --env RUST_LOG=debug       # set a guest env var
+coop up --post-start "npm install" # run a command after every boot
+```
+
+See the [command reference](commands.md) and [configuration reference](configuration.md) for the full behavior of `--forward-port`, `--env`, and `--post-start`.
+After the environment is running, connect to it:
+
+```
+coop shell
+coop claude
+coop codex
+```
+
+### 3. Restart a stopped instance
 
 ```
 coop start
 ```
 
-This creates a VM instance from the template, boots it, waits for SSH, and injects Claude Code and Codex credentials/config. The instance gets an auto-generated name.
+`coop start` starts existing stopped instances. Use it after `coop stop` when
+you want to boot the same VM disk again. If exactly one stopped instance
+exists, the name is optional.
 
-Name it explicitly:
+Restart a specific stopped instance:
 
 ```
 coop start my-project
 ```
 
-Sync a local directory into the VM as `/workspace`:
+Restart by project path when the instance was created for that project:
 
 ```
-coop start my-project --workspace ~/code/my-project
+coop start --workspace ~/code/my-project
 ```
 
-Clone a git repository inside the VM instead:
+Project creation options belong to `coop up`, not `coop start`:
 
 ```
-coop start my-project --git-repo https://github.com/user/repo
-```
-
-Set a custom disk size for the instance (must be >= template size):
-
-```
-coop start my-project --disk 40
-```
-
-Mount host directories into the VM:
-
-```
-coop start my-project --mount ~/data
-coop start my-project --mount ~/data:/guest/data --mount ~/models:/guest/models
-```
-
-`--mount HOST_PATH[:GUEST_PATH]` is repeatable. On macOS/Lima, mounts are live virtiofs mounts. On Linux/Firecracker, mounts are a one-time rsync sync. Conflicts with `--workspace` and `--git-repo`.
-
-Start from a specific named image:
-
-```
-coop start my-project --image python-dev
+coop up ~/code/my-project --disk 40 --mount
+coop up ~/code/my-project --profile python,node
+coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 Skip Claude Code and Codex credential/config injection:
@@ -154,7 +207,7 @@ Skip Claude Code and Codex credential/config injection:
 coop start my-project --no-agents
 ```
 
-### 3. Connect
+### 4. Connect
 
 **Launch Claude Code inside the VM:**
 
@@ -162,7 +215,7 @@ coop start my-project --no-agents
 coop claude
 ```
 
-This runs Claude Code with `--dangerously-skip-permissions` by default. The VM itself is the isolation boundary. For permission prompts:
+During VM startup, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts by default. The VM itself is the isolation boundary. For permission prompts (coop launches `claude` with `--permission-mode default`):
 
 ```
 coop claude --ask
@@ -192,8 +245,6 @@ coop codex -- --model gpt-5
 coop shell
 ```
 
-`coop shell`, `coop claude`, and `coop codex` attach to persistent tmux sessions. Use `--no-tmux` for a raw SSH connection, or `--session <name>` to pick a named session.
-
 **Run a command non-interactively:**
 
 ```
@@ -201,7 +252,7 @@ coop shell -- ls /workspace
 coop exec -- docker ps
 ```
 
-### 4. Check status
+### 5. Check status
 
 ```
 coop status
@@ -215,7 +266,7 @@ coop status my-project
 
 Running instances report resource usage: load average, memory, and disk.
 
-### 5. Sync files
+### 6. Sync files
 
 Push local changes into a running VM:
 
@@ -229,11 +280,11 @@ Pull guest changes back to the host:
 coop pull
 ```
 
-Both commands default to the workspace path from `coop start --workspace`. Override with a positional argument:
+Both commands default to the workspace path recorded by `coop up`. Override with `--dir`:
 
 ```
-coop push ~/other-dir
-coop pull ~/other-dir
+coop push --dir ~/other-dir
+coop pull --dir ~/other-dir
 ```
 
 ### 6. Tear down
@@ -265,10 +316,10 @@ coop setup --image python-dev --profile python
 coop setup --image polyglot --profile python,node,rust
 ```
 
-Start an instance from a specific image:
+Create a project environment from a specific image:
 
 ```
-coop start --image python-dev
+coop up . --image python-dev
 ```
 
 List images:
@@ -290,6 +341,7 @@ coop images --delete python-dev
 | `coop validate` | Check config and prerequisites without changing anything |
 | `coop logs` | Stream VM serial console logs (`-f` to follow) |
 | `coop vscode` | Open VS Code connected to the guest via SSH |
+| `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |
 

@@ -3,7 +3,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::cmd::Cmd;
-use crate::config::{Instance, NetworkConfig};
+use crate::config::{HostInterface, Instance, NetworkConfig};
 
 const BRIDGE_NAME: &str = "br0";
 
@@ -256,11 +256,11 @@ fn bridge_is_empty() -> bool {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-fn resolve_host_iface(configured: &str) -> Result<String> {
-    if configured != "auto" {
-        return Ok(configured.to_string());
+fn resolve_host_iface(configured: &HostInterface) -> Result<String> {
+    match configured {
+        HostInterface::Auto => detect_default_iface(),
+        HostInterface::Named(name) => Ok(name.as_str().to_string()),
     }
-    detect_default_iface()
 }
 
 fn detect_default_iface() -> Result<String> {

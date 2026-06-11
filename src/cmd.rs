@@ -1,7 +1,40 @@
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+
+/// A command-line argument paired with its redaction status.
+///
+/// Pairing the value with the variant means a redacted arg cannot be
+/// silently separated from its redaction marker by reordering or
+/// insertion — the contract travels with the value.
+enum Arg {
+    Public(OsString),
+    Redacted(OsString),
+}
+
+impl Arg {
+    fn value(&self) -> &OsStr {
+        match self {
+            Self::Public(v) | Self::Redacted(v) => v,
+        }
+    }
+
+    /// String form for human-facing output. Redacted args yield the
+    /// placeholder, so the redaction policy lives with the type instead
+    /// of being re-derived at every formatting site.
+    ///
+    /// Not `Display` on purpose: a `Display` impl that silently swaps
+    /// content is a footgun for any future caller who reaches for `{}`.
+    fn display(&self) -> Cow<'_, str> {
+        match self {
+            Self::Public(v) => v.to_string_lossy(),
+            Self::Redacted(_) => Cow::Borrowed("<redacted>"),
+        }
+    }
+}
 
 /// Builder for running external commands with consistent logging,
 /// error checking, and optional sudo elevation.
@@ -10,8 +43,9 @@ use anyhow::{Context, Result, bail};
 /// `Command::new()` patterns with a single fluent API.
 pub struct Cmd {
     program: OsString,
-    args: Vec<OsString>,
+    args: Vec<Arg>,
     sudo: bool,
+    stdin: Option<Vec<u8>>,
 }
 
 impl Cmd {
@@ -20,11 +54,22 @@ impl Cmd {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
             sudo: false,
+            stdin: None,
         }
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
-        self.args.push(arg.as_ref().to_owned());
+        self.args.push(Arg::Public(arg.as_ref().to_owned()));
+        self
+    }
+
+    /// Add an argument that holds a secret, redacted in [`Cmd::describe`]
+    /// (and therefore in debug logs). The bytes still appear on argv —
+    /// callers should prefer [`Cmd::stdin_input`] when the tool supports
+    /// reading from stdin. Use this only for tools that have no
+    /// stdin-friendly path (e.g. macOS `security add-generic-password -w`).
+    pub fn redacted_arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(Arg::Redacted(arg.as_ref().to_owned()));
         self
     }
 
@@ -34,7 +79,7 @@ impl Cmd {
         S: AsRef<OsStr>,
     {
         self.args
-            .extend(args.into_iter().map(|s| s.as_ref().to_owned()));
+            .extend(args.into_iter().map(|s| Arg::Public(s.as_ref().to_owned())));
         self
     }
 
@@ -44,17 +89,31 @@ impl Cmd {
         self
     }
 
+    /// Pipe `bytes` to the child's stdin instead of inheriting the parent's.
+    ///
+    /// Use this for any data that must NOT appear on argv — secrets, tokens,
+    /// or large payloads. The bytes are written and stdin is closed before
+    /// the child exits, so the child sees EOF without further input.
+    ///
+    /// Compatible with [`Cmd::run`] and [`Cmd::capture`]; the existing
+    /// [`Cmd::stdin_write`] takes its data per-call instead.
+    pub fn stdin_input(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
+    }
+
     /// Build the underlying `Command` for complex use cases that
     /// need custom stdio, spawn, or other `Command` methods.
     pub fn build(&self) -> Command {
+        let raw_args = self.args.iter().map(Arg::value);
         if self.sudo {
             let mut cmd = Command::new("sudo");
             cmd.arg(&self.program);
-            cmd.args(&self.args);
+            cmd.args(raw_args);
             cmd
         } else {
             let mut cmd = Command::new(&self.program);
-            cmd.args(&self.args);
+            cmd.args(raw_args);
             cmd
         }
     }
@@ -65,7 +124,7 @@ impl Cmd {
         if self.args.is_empty() {
             format!("{prefix}{prog}")
         } else {
-            let args: Vec<_> = self.args.iter().map(|a| a.to_string_lossy()).collect();
+            let args: Vec<Cow<'_, str>> = self.args.iter().map(Arg::display).collect();
             format!("{prefix}{prog} {}", args.join(" "))
         }
     }
@@ -74,10 +133,23 @@ impl Cmd {
     pub fn run(&self) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running: {desc}");
-        let status = self
-            .build()
-            .status()
-            .with_context(|| format!("Failed to execute {desc}"))?;
+        let status = match self.stdin.as_deref() {
+            None => self
+                .build()
+                .status()
+                .with_context(|| format!("Failed to execute {desc}"))?,
+            Some(bytes) => {
+                let mut child = self
+                    .build()
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("Failed to start {desc}"))?;
+                write_stdin_and_close(&mut child, bytes, &desc)?;
+                child
+                    .wait()
+                    .with_context(|| format!("Failed to wait for {desc}"))?
+            }
+        };
         if !status.success() {
             bail!("{desc} exited with {status}");
         }
@@ -86,8 +158,6 @@ impl Cmd {
 
     /// Pipe `data` into stdin, suppress stdout, and check exit status.
     pub fn stdin_write(&self, data: &[u8]) -> Result<()> {
-        use std::io::Write as _;
-
         let desc = self.describe();
         tracing::debug!("Running (stdin pipe): {desc}");
         let mut child = self
@@ -96,12 +166,7 @@ impl Cmd {
             .stdout(Stdio::null())
             .spawn()
             .with_context(|| format!("Failed to start {desc}"))?;
-
-        if let Some(ref mut stdin) = child.stdin {
-            stdin
-                .write_all(data)
-                .with_context(|| format!("Failed to write stdin for {desc}"))?;
-        }
+        write_stdin_and_close(&mut child, data, &desc)?;
         let status = child
             .wait()
             .with_context(|| format!("Failed to wait for {desc}"))?;
@@ -127,11 +192,26 @@ impl Cmd {
     pub fn capture(&self) -> Result<String> {
         let desc = self.describe();
         tracing::debug!("Running (capture): {desc}");
-        let output = self
-            .build()
-            .stderr(Stdio::null())
-            .output()
-            .with_context(|| format!("Failed to execute {desc}"))?;
+        let output = match self.stdin.as_deref() {
+            None => self
+                .build()
+                .stderr(Stdio::null())
+                .output()
+                .with_context(|| format!("Failed to execute {desc}"))?,
+            Some(bytes) => {
+                let mut child = self
+                    .build()
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .with_context(|| format!("Failed to start {desc}"))?;
+                write_stdin_and_close(&mut child, bytes, &desc)?;
+                child
+                    .wait_with_output()
+                    .with_context(|| format!("Failed to wait for {desc}"))?
+            }
+        };
         if !output.status.success() {
             bail!("{desc} exited with {}", output.status);
         }
@@ -141,6 +221,9 @@ impl Cmd {
 
     /// Run the command with stdout and stderr suppressed.
     /// Returns `true` if the exit status is success.
+    ///
+    /// `stdin_input` is ignored here — `status_ok` is used for probes
+    /// (`command -v gh`, `gh auth status`) that take no input.
     pub fn status_ok(&self) -> bool {
         let desc = self.describe();
         tracing::debug!("Running (status_ok): {desc}");
@@ -152,66 +235,39 @@ impl Cmd {
     }
 }
 
+/// Returns `true` if `program` is found on the current `PATH`.
+///
+/// Uses the portable `command -v` shell builtin rather than the `which`
+/// binary, which need not be installed on every host.
+pub fn command_exists(program: &str) -> bool {
+    Cmd::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {program} >/dev/null 2>&1"))
+        .status_ok()
+}
+
+/// Write `bytes` to the child's stdin, then close it so the child sees EOF.
+///
+/// Used by [`Cmd::run`] and [`Cmd::capture`] when [`Cmd::stdin_input`] was
+/// configured. Closing the handle is what curl `-H @-` and similar idioms
+/// rely on to know the input is complete.
+fn write_stdin_and_close(child: &mut std::process::Child, bytes: &[u8], desc: &str) -> Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .with_context(|| format!("stdin pipe missing for {desc}"))?;
+    stdin
+        .write_all(bytes)
+        .with_context(|| format!("Failed to write stdin for {desc}"))?;
+    // Dropping `stdin` closes the pipe so the child sees EOF.
+    drop(stdin);
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
-#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Trait for executing commands, enabling test doubles.
-    ///
-    /// When production code starts accepting `&dyn CommandRunner`,
-    /// move this out of `#[cfg(test)]`.
-    trait CommandRunner: Send + Sync {
-        fn run(&self, program: &str, args: &[&str], sudo: bool) -> Result<()>;
-    }
-
-    /// Recorded invocation from [`MockRunner`].
-    #[derive(Debug, Clone)]
-    struct Invocation {
-        program: String,
-        args: Vec<String>,
-        sudo: bool,
-    }
-
-    /// Test double that records invocations and returns configured
-    /// responses. All methods succeed by default.
-    struct MockRunner {
-        invocations: Mutex<Vec<Invocation>>,
-        fail_run: Mutex<Option<String>>,
-    }
-
-    impl MockRunner {
-        fn new() -> Self {
-            Self {
-                invocations: Mutex::new(Vec::new()),
-                fail_run: Mutex::new(None),
-            }
-        }
-
-        fn invocations(&self) -> Vec<Invocation> {
-            self.invocations.lock().expect("lock").clone()
-        }
-
-        fn record(&self, program: &str, args: &[&str], sudo: bool) {
-            self.invocations.lock().expect("lock").push(Invocation {
-                program: program.to_string(),
-                args: args.iter().map(|s| (*s).to_string()).collect(),
-                sudo,
-            });
-        }
-    }
-
-    impl CommandRunner for MockRunner {
-        fn run(&self, program: &str, args: &[&str], sudo: bool) -> Result<()> {
-            self.record(program, args, sudo);
-            if let Some(msg) = self.fail_run.lock().expect("lock").as_ref() {
-                bail!("{msg}");
-            }
-            Ok(())
-        }
-    }
 
     #[test]
     fn cmd_describe_without_sudo() {
@@ -232,31 +288,59 @@ mod tests {
     }
 
     #[test]
-    fn mock_runner_records_invocations() {
-        let runner = MockRunner::new();
-        runner
-            .run("mount", &["-o", "loop", "/dev/sda1"], true)
-            .expect("should succeed");
-
-        let inv = runner.invocations();
-        assert_eq!(inv.len(), 1);
-        assert_eq!(inv[0].program, "mount");
-        assert_eq!(inv[0].args, vec!["-o", "loop", "/dev/sda1"]);
-        assert!(inv[0].sudo);
+    fn cmd_describe_redacts_only_redacted_arg() {
+        let cmd = Cmd::new("op")
+            .arg("item")
+            .arg("create")
+            .redacted_arg("password=hunter2")
+            .arg("--title=demo");
+        assert_eq!(cmd.describe(), "op item create <redacted> --title=demo");
     }
 
     #[test]
-    fn mock_runner_can_fail() {
-        let runner = MockRunner::new();
-        *runner.fail_run.lock().expect("lock") = Some("simulated failure".into());
+    fn cmd_describe_redacts_each_redacted_arg() {
+        let cmd = Cmd::new("tool")
+            .redacted_arg("secret-a")
+            .arg("between")
+            .redacted_arg("secret-b");
+        assert_eq!(cmd.describe(), "tool <redacted> between <redacted>");
+    }
 
-        let result = runner.run("rm", &["-rf", "/"], false);
-        assert!(result.is_err());
+    #[test]
+    fn cmd_build_passes_redacted_value_to_command() {
+        let cmd = Cmd::new("echo")
+            .arg("public")
+            .redacted_arg("sensitive-payload");
+        let out = cmd.capture().expect("echo capture should succeed");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("simulated failure")
+            out.contains("public") && out.contains("sensitive-payload"),
+            "echo should receive both args verbatim: {out}",
+        );
+    }
+
+    #[test]
+    fn stdin_input_round_trips_through_capture() {
+        // `cat` echoes stdin to stdout — verifies the pipe is wired and closed.
+        let out = Cmd::new("cat").stdin_input(b"hello".to_vec()).capture();
+        assert_eq!(out.expect("cat capture"), "hello");
+    }
+
+    #[test]
+    fn stdin_input_run_succeeds_for_consumer_command() {
+        // `cat` exits 0 after consuming stdin; closing the pipe must signal EOF
+        // so it does not hang.
+        Cmd::new("cat")
+            .stdin_input(b"data".to_vec())
+            .run()
+            .expect("cat run");
+    }
+
+    #[test]
+    fn command_exists_detects_present_and_absent_programs() {
+        assert!(command_exists("sh"), "sh must be on PATH in any POSIX env");
+        assert!(
+            !command_exists("coop-definitely-not-a-real-binary-xyz"),
+            "a nonexistent program must not be reported as present",
         );
     }
 }

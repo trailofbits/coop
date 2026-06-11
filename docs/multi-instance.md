@@ -4,17 +4,17 @@ coop runs multiple VM instances simultaneously. Each instance gets its own name,
 
 ## Named vs. auto-named instances
 
-Every instance has a name. You provide one explicitly or let coop generate one from the allocated index.
+Every instance has a name. By default, `coop up` derives it from the project directory. You can provide one explicitly with `--name`.
 
 ```
-# Named instance
-coop start my-project
+# Project-derived instance
+coop up ./my-project
 
-# Auto-named instance (uses the allocated index, e.g. "0", "1")
-coop start
+# Explicit instance name
+coop up ./my-project --name my-project
 ```
 
-Named instances pay off when you have several running at once. The name appears in `coop status` output and targets commands at a specific instance.
+Named instances pay off when you have several running at once. The name appears in `coop list` / `coop status` output and targets commands at a specific instance.
 
 ### Name validation rules
 
@@ -29,7 +29,7 @@ Names that violate these rules are rejected at creation time.
 
 Most commands accept an optional instance name. Resolution follows three cases:
 
-- **Zero instances exist.** The command fails with a message to run `coop start`.
+- **Zero instances exist.** The command fails with a message to run `coop up`.
 - **Exactly one instance exists.** The name is optional. coop auto-selects it.
 - **Multiple instances exist.** The name is required. coop lists the available names in the error if you omit it.
 
@@ -47,9 +47,20 @@ This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pu
 
 ## Checking status
 
+### Just the names
+
+`coop list` (alias `ls`) prints a minimal name/state table. It reads from local on-disk state only, so it's fast and works even when VMs are unreachable. Use it when you just need to remember what's available:
+
+```
+$ coop list
+NAME             STATE
+another-project  stopped
+my-project       running
+```
+
 ### All instances
 
-`coop status` with no arguments lists every instance in a table:
+`coop status` with no arguments lists every instance in a richer table, including image, backend, and resource usage for running instances:
 
 ```
 $ coop status
@@ -71,14 +82,14 @@ The output format depends on the backend. It includes the full resource breakdow
 
 ## Per-instance image selection
 
-Each instance can use a different golden image. Build images with `coop setup --image <name>`, then select one at start time:
+Each instance can use a different golden image. Build images with `coop setup --image <name>`, then select one when creating the project instance:
 
 ```
 coop setup --image python --profile python
 coop setup --image node --profile node
 
-coop start py-work --image python
-coop start js-work --image node
+coop up ./py-work --image python
+coop up ./js-work --image node
 ```
 
 Omitting `--image` selects the image named `default`.
@@ -90,7 +101,7 @@ Omitting `--image` selects the image named `default`.
 `--disk` sets the instance disk size in GiB:
 
 ```
-coop start big-project --disk 100
+coop up ./big-project --disk 100
 ```
 
 The instance disk grows from the template size when the requested size is larger.
@@ -115,8 +126,8 @@ The instance must be stopped first. coop rejects the resize and tells you to sto
 Each instance is fully independent. Start, stop, and destroy instances without affecting others:
 
 ```
-coop start frontend
-coop start backend
+coop up ./frontend --name frontend
+coop up ./backend --name backend
 coop stop frontend        # backend keeps running
 coop destroy frontend     # backend unaffected
 ```
@@ -146,7 +157,7 @@ On Lima, the directory structure differs because Lima manages its own VM state. 
 
 ## Concurrent access and file locking
 
-When allocating a new instance, coop acquires an exclusive file lock (`flock`) on the instances directory. This prevents two concurrent `coop start` invocations from claiming the same index or name. The lock is held only during index allocation and released automatically when the operation completes.
+When allocating a new instance, coop acquires an exclusive file lock (`flock`) on the instances directory. This prevents two concurrent `coop up` invocations from claiming the same index or name. The lock is held only during index allocation and released automatically when the operation completes.
 
 ## Index allocation
 

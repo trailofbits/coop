@@ -6,3 +6,5 @@ firecracker
 .env
 *.swp
 *.swo
+/mutants.out
+/mutants.out.old

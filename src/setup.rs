@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::cmd::Cmd;
-use crate::config::{CoopConfig, CustomProfile, Instance};
+use crate::cmd::{Cmd, command_exists};
+use crate::config::{CoopConfig, ImageName, Instance};
+use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
-    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, SCRIPT_CLAUDE_CODE, SCRIPT_CODEX,
-    SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, lookup_profile,
+    BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
+    SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
 };
+use crate::sha256_hash::Sha256Hash;
 
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
 const S3_LIST: &str = "http://spec.ccfc.min.s3.amazonaws.com";
@@ -29,30 +30,42 @@ pub const TEMPLATE_VERSION: u32 = 1;
 pub struct SetupOptions {
     pub skip_confirm: bool,
     pub rebuild: bool,
-    pub profiles: Vec<String>,
+    pub profiles: Vec<ProfileDef>,
+    pub oci_features: Vec<ResolvedFeature>,
     pub extra_packages: Vec<String>,
     pub post_install: Option<PathBuf>,
-    pub image: String,
+    pub image: ImageName,
+    pub guest_user: GuestUser,
     pub builder_timeout: Option<Duration>,
 }
 
 /// Persisted template configuration (profiles, packages, hashes).
+///
+/// `guest_user` is set at setup time and immutable for the image's
+/// lifetime — `coop start`/`shell`/`exec` read it from here rather
+/// than accepting a flag. Existing `template_config.json` files
+/// without the field deserialize via `GuestUser::default()` to the
+/// historical `ubuntu` user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateConfig {
     pub version: u32,
     pub created: String,
-    pub install_script_hash: String,
+    pub install_script_hash: Sha256Hash,
     pub profiles: Vec<String>,
     pub extra_packages: Vec<String>,
-    pub post_install_hash: Option<String>,
+    pub post_install_hash: Option<Sha256Hash>,
     #[serde(default)]
     pub marketplaces: Vec<String>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub guest_user: GuestUser,
+    #[serde(default)]
+    pub oci_features: Vec<InstalledFeature>,
 }
 
 impl TemplateConfig {
-    pub fn load_for(cfg: &CoopConfig, image: &str) -> Result<Self> {
+    pub fn load_for(cfg: &CoopConfig, image: &ImageName) -> Result<Self> {
         let path = cfg.template_config_path_for(image);
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -60,7 +73,7 @@ impl TemplateConfig {
             .with_context(|| format!("Failed to parse {}", path.display()))
     }
 
-    pub fn save_for(&self, cfg: &CoopConfig, image: &str) -> Result<()> {
+    pub fn save_for(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()> {
         let path = cfg.template_config_path_for(image);
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize template config")?;
@@ -89,7 +102,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         "\nSetup complete. All artifacts are in {}/",
         cfg.data_dir.display()
     );
-    eprintln!("Run `coop start` to launch the VM.");
+    eprintln!("Run `coop up` in a project directory to launch a VM.");
     Ok(())
 }
 
@@ -200,11 +213,19 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
 
 // ── Mount guard (RAII) ─────────────────────────────────────────
 
+/// How a [`MountGuard`] was set up, selecting the matching teardown on drop.
+enum MountKind {
+    /// Single loop mount of the rootfs.
+    Simple,
+    /// Full chroot: rootfs plus proc/sys/dev/devpts/tmp.
+    Chroot,
+}
+
 /// RAII guard that unmounts a filesystem on drop, preventing leaked
 /// mounts if an operation between mount and unmount fails.
 struct MountGuard {
     mount_path: String,
-    is_chroot: bool,
+    kind: MountKind,
 }
 
 impl MountGuard {
@@ -218,7 +239,7 @@ impl MountGuard {
             .context("Failed to mount rootfs")?;
         Ok(Self {
             mount_path: mount_path.to_string(),
-            is_chroot: false,
+            kind: MountKind::Simple,
         })
     }
 
@@ -227,24 +248,25 @@ impl MountGuard {
         mount_chroot(rootfs, mount_path)?;
         Ok(Self {
             mount_path: mount_path.to_string(),
-            is_chroot: true,
+            kind: MountKind::Chroot,
         })
     }
 }
 
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        if self.is_chroot {
-            unmount_chroot(&self.mount_path);
-        } else {
-            if let Err(e) = Cmd::new("umount").arg(&self.mount_path).sudo().run() {
-                tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
-            }
-            if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
-                tracing::warn!(
-                    "Failed to remove mount dir {} (non-fatal): {e}",
-                    self.mount_path
-                );
+        match self.kind {
+            MountKind::Chroot => unmount_chroot(&self.mount_path),
+            MountKind::Simple => {
+                if let Err(e) = Cmd::new("umount").arg(&self.mount_path).sudo().run() {
+                    tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
+                }
+                if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
+                    tracing::warn!(
+                        "Failed to remove mount dir {} (non-fatal): {e}",
+                        self.mount_path
+                    );
+                }
             }
         }
     }
@@ -292,22 +314,28 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
 fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     let image = &opts.image;
     let template = cfg.template_path_for(image);
-    let (profiles, extra_packages) = resolve_template_config(cfg, opts);
+    let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
-    // Validate all profiles upfront
-    for name in &profiles {
-        lookup_profile(name, &cfg.profiles)?;
-    }
-
-    // Compose recipe and compute hashes
-    let recipe = compose_recipe(&profiles, &extra_packages, &cfg.profiles)?;
-    let script_hash = hash_string(&recipe);
+    // Compose the install recipe and compute its hashes.
+    let recipe_script = compose_recipe(
+        &profiles,
+        &opts.oci_features,
+        &extra_packages,
+        &opts.guest_user,
+    );
     let post_install_content = load_post_install(opts.post_install.as_ref())?;
-    let post_install_hash = post_install_content.as_ref().map(|s| hash_string(s));
+    let recipe = BuildRecipe {
+        profiles: &profiles,
+        extra_packages: &extra_packages,
+        script_hash: Sha256Hash::of(&recipe_script),
+        post_install_hash: post_install_content.as_ref().map(Sha256Hash::of),
+        script: &recipe_script,
+        post_install_content: post_install_content.as_deref(),
+    };
 
     // Check existing template — rebuild automatically if stale
     if template.exists() && !opts.rebuild {
-        if !needs_rebuild(cfg, image, &script_hash, post_install_hash.as_deref()) {
+        if !needs_rebuild(cfg, image, recipe.script_hash, recipe.post_install_hash) {
             step("Template rootfs: up to date");
             return Ok(());
         }
@@ -326,18 +354,23 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
-    let result = build_template(
-        cfg,
-        opts,
-        image,
-        &profiles,
-        &extra_packages,
-        &recipe,
-        &script_hash,
-        post_install_content.as_deref(),
-        post_install_hash.as_deref(),
-        &staging,
-    );
+    // Build the persisted config once: `build_template` embeds it as the
+    // in-guest version marker, and we save the same value after the image
+    // swap. Constructing it once also pins a single `created` timestamp.
+    let template_config = TemplateConfig {
+        version: TEMPLATE_VERSION,
+        created: utc_timestamp(),
+        install_script_hash: recipe.script_hash,
+        profiles: profile_names(recipe.profiles),
+        extra_packages: recipe.extra_packages.to_vec(),
+        post_install_hash: recipe.post_install_hash,
+        marketplaces: Vec::new(),
+        plugins: Vec::new(),
+        guest_user: opts.guest_user.clone(),
+        oci_features: installed_features(&opts.oci_features),
+    };
+
+    let result = build_template(cfg, opts, image, &recipe, &template_config, &staging);
 
     if let Err(e) = result {
         // Clean up failed staging image
@@ -358,19 +391,13 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     // Write template config only after image swap succeeds.
     // If we crash between swap and config write, staleness
     // detection triggers a rebuild on next run (safe).
-    let template_config = TemplateConfig {
-        version: TEMPLATE_VERSION,
-        created: utc_timestamp(),
-        install_script_hash: script_hash,
-        profiles,
-        extra_packages,
-        post_install_hash,
-        marketplaces: Vec::new(),
-        plugins: Vec::new(),
-    };
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
+    profiles.iter().map(|p| p.name.clone()).collect()
 }
 
 /// Returns `true` if the template needs rebuilding.
@@ -379,45 +406,60 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
 /// template image) or the install-script hash has changed.
 fn needs_rebuild(
     cfg: &CoopConfig,
-    image: &str,
-    current_hash: &str,
-    current_post_hash: Option<&str>,
+    image: &ImageName,
+    current_hash: Sha256Hash,
+    current_post_hash: Option<Sha256Hash>,
 ) -> bool {
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating template as stale");
         return true;
     };
-    existing.install_script_hash != current_hash
-        || existing.post_install_hash.as_deref() != current_post_hash
+    existing.install_script_hash != current_hash || existing.post_install_hash != current_post_hash
 }
 
-#[expect(clippy::too_many_arguments, reason = "template build orchestration")]
+/// The recipe inputs for a template build: the composed install script,
+/// its hash, the resolved profiles and extra packages (for display), and
+/// the optional post-install script and its hash.
+struct BuildRecipe<'a> {
+    profiles: &'a [ProfileDef],
+    extra_packages: &'a [String],
+    script: &'a str,
+    script_hash: Sha256Hash,
+    post_install_content: Option<&'a str>,
+    post_install_hash: Option<Sha256Hash>,
+}
+
 fn build_template(
     cfg: &CoopConfig,
     opts: &SetupOptions,
-    image: &str,
-    profiles: &[String],
-    extra_packages: &[String],
-    recipe: &str,
-    script_hash: &str,
-    post_install_content: Option<&str>,
-    post_install_hash: Option<&str>,
+    image: &ImageName,
+    recipe: &BuildRecipe,
+    template_config: &TemplateConfig,
     output_path: &Path,
 ) -> Result<()> {
     step("Building template rootfs");
 
-    let rootfs_url = discover_ci_rootfs(cfg)?;
+    let rootfs_url = discover_ci_rootfs()?;
     let rootfs_name = rootfs_url.rsplit('/').next().unwrap_or("rootfs");
 
     eprintln!("  Found rootfs: {rootfs_name}");
     eprintln!("  URL: {rootfs_url}");
-    if !profiles.is_empty() {
-        eprintln!("  Profiles: {}", profiles.join(", "));
+    if !recipe.profiles.is_empty() {
+        eprintln!("  Profiles: {}", profile_names(recipe.profiles).join(", "));
     }
-    if !extra_packages.is_empty() {
-        eprintln!("  Extra packages: {}", extra_packages.join(", "));
+    if !opts.oci_features.is_empty() {
+        let features = opts
+            .oci_features
+            .iter()
+            .map(|f| format!("{} ({})", f.installed.id, f.installed.digest))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("  Devcontainer OCI features: {features}");
     }
-    if post_install_content.is_some() {
+    if !recipe.extra_packages.is_empty() {
+        eprintln!("  Extra packages: {}", recipe.extra_packages.join(", "));
+    }
+    if recipe.post_install_content.is_some() {
         eprintln!("  Post-install script: yes");
     }
     eprintln!();
@@ -445,21 +487,12 @@ fn build_template(
     create_ext4_image(cfg, output_path)?;
     crate::signal::check_shutdown()?;
 
-    // Compose and execute install script
-    let marker_config = TemplateConfig {
-        version: TEMPLATE_VERSION,
-        created: utc_timestamp(),
-        install_script_hash: script_hash.to_string(),
-        profiles: profiles.to_vec(),
-        extra_packages: extra_packages.to_vec(),
-        post_install_hash: post_install_hash.map(String::from),
-        marketplaces: Vec::new(),
-        plugins: Vec::new(),
-    };
-    let marker_json = serde_json::to_string_pretty(&marker_config)
+    // Compose and execute install script. The in-guest version marker is
+    // the same `TemplateConfig` we persist on the host after the swap.
+    let marker_json = serde_json::to_string_pretty(template_config)
         .context("Failed to serialize version marker")?;
-    let full_script = compose_full_script(recipe, &marker_json, post_install_content);
-    install_guest_packages(cfg, output_path, &full_script)?;
+    let full_script = compose_full_script(recipe.script, &marker_json, recipe.post_install_content);
+    install_guest_packages(cfg, output_path, &full_script, &opts.guest_user)?;
 
     // Clean up intermediate files
     eprintln!("  Cleaning up...");
@@ -481,17 +514,23 @@ fn build_template(
 /// Resolve effective profiles and extra packages.
 ///
 /// If CLI flags provide profiles or packages, use those.
-/// Otherwise, reuse the previous template config.
-fn resolve_template_config(cfg: &CoopConfig, opts: &SetupOptions) -> (Vec<String>, Vec<String>) {
-    if !opts.profiles.is_empty() || !opts.extra_packages.is_empty() {
-        return (opts.profiles.clone(), opts.extra_packages.clone());
+/// Otherwise, reuse the previous template config (resolving the persisted
+/// profile names against the current builtin/custom set).
+fn resolve_template_config(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+) -> Result<(Vec<ProfileDef>, Vec<String>)> {
+    if !opts.profiles.is_empty() || !opts.extra_packages.is_empty() || !opts.oci_features.is_empty()
+    {
+        return Ok((opts.profiles.clone(), opts.extra_packages.clone()));
     }
 
     if let Ok(existing) = TemplateConfig::load_for(cfg, &opts.image) {
-        return (existing.profiles, existing.extra_packages);
+        let profiles = resolve_profiles(&existing.profiles, &cfg.profiles)?;
+        return Ok((profiles, existing.extra_packages));
     }
 
-    (Vec::new(), Vec::new())
+    Ok((Vec::new(), Vec::new()))
 }
 
 fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
@@ -512,17 +551,13 @@ fn load_post_install(path: Option<&PathBuf>) -> Result<Option<String>> {
 /// This portion is hashed for staleness detection.
 /// Does NOT include version marker, post-install script, or cleanup.
 fn compose_recipe(
-    profiles: &[String],
+    profiles: &[ProfileDef],
+    oci_features: &[ResolvedFeature],
     extra_packages: &[String],
-    custom: &HashMap<String, CustomProfile>,
-) -> Result<String> {
-    let profile_defs: Vec<_> = profiles
-        .iter()
-        .map(|name| lookup_profile(name, custom))
-        .collect::<Result<_>>()?;
-
+    guest_user: &GuestUser,
+) -> String {
     // Collect and deduplicate profile + extra apt packages
-    let mut extra_apt: Vec<&str> = profile_defs
+    let mut extra_apt: Vec<&str> = profiles
         .iter()
         .flat_map(|def| &def.apt_packages)
         .map(String::as_str)
@@ -531,11 +566,11 @@ fn compose_recipe(
     extra_apt.sort_unstable();
     extra_apt.dedup();
 
-    let pre_installs: Vec<&str> = profile_defs
+    let pre_installs: Vec<&str> = profiles
         .iter()
         .filter_map(|d| d.pre_install.as_deref())
         .collect();
-    let post_installs: Vec<&str> = profile_defs
+    let post_installs: Vec<&str> = profiles
         .iter()
         .filter_map(|d| d.post_install.as_deref())
         .collect();
@@ -544,6 +579,14 @@ fn compose_recipe(
 
     // Preamble (chroot workarounds + initial apt-get update)
     s.push_str(SCRIPT_PREAMBLE);
+
+    // Export GUEST_USER so the chroot scripts (`guest-config.sh`,
+    // `claude-code.sh`) and any user-supplied post-install can pick it
+    // up. `GuestUser::new` validated the name against POSIX-portable
+    // chars, so single-quoting is sufficient against shell injection.
+    s.push_str("\nexport GUEST_USER='");
+    s.push_str(guest_user.as_str());
+    s.push_str("'\n");
 
     // Install base packages first (provides curl/gpg for repo setup)
     s.push_str("echo '  [guest] Installing core tools...'\n");
@@ -610,14 +653,17 @@ fn compose_recipe(
         s.push_str("exit 1\n");
     }
 
-    // Guest config configures the ubuntu user — must come before claude-code.
+    // Guest config configures the guest user — must come before claude-code.
     s.push_str(SCRIPT_GUEST_CONFIG);
-    // Direct binary download (runs as root in chroot, installs for ubuntu user).
+    for feature in oci_features {
+        s.push_str(&crate::devcontainer_oci::compose_install_snippet(feature));
+    }
+    // Direct binary download (runs as root in chroot, installs for guest user).
     s.push_str(SCRIPT_CLAUDE_CODE);
     // Codex installs as a standalone binary under /usr/local/bin.
     s.push_str(SCRIPT_CODEX);
 
-    Ok(s)
+    s
 }
 
 /// Compose the full chroot script from recipe + marker + post-install + cleanup.
@@ -665,7 +711,7 @@ fn check_host_requirements() -> Result<()> {
     }
     eprintln!("  /dev/kvm: present");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
     eprintln!("  Architecture: {arch}");
 
     require_command("curl", "Required for downloading artifacts")?;
@@ -707,7 +753,7 @@ fn has_kvm_access(kvm: &Path) -> bool {
 
 fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
     // Prefer setfacl (immediate, no re-login needed)
-    if which("setfacl").is_some() {
+    if command_exists("setfacl") {
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
         let cmd = format!("sudo setfacl -m u:{user}:rw /dev/kvm");
         if !confirm(&cmd, skip_confirm)? {
@@ -746,22 +792,22 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
 fn install_system_packages(skip_confirm: bool) -> Result<()> {
     let mut missing = Vec::new();
 
-    if which("setfacl").is_none() {
+    if !command_exists("setfacl") {
         missing.push("acl");
     }
-    if which("debootstrap").is_none() {
+    if !command_exists("debootstrap") {
         missing.push("debootstrap");
     }
-    if which("unsquashfs").is_none() {
+    if !command_exists("unsquashfs") {
         missing.push("squashfs-tools");
     }
-    if which("mkfs.ext4").is_none() {
+    if !command_exists("mkfs.ext4") {
         missing.push("e2fsprogs");
     }
-    if which("ssh").is_none() {
+    if !command_exists("ssh") {
         missing.push("openssh-client");
     }
-    if which("rsync").is_none() {
+    if !command_exists("rsync") {
         missing.push("rsync");
     }
 
@@ -801,7 +847,7 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
     step("Installing Firecracker");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
 
     eprintln!("  Discovering latest Firecracker release...");
     let latest = discover_latest_fc_version()?;
@@ -901,41 +947,30 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
     step("Fetching guest kernel");
 
-    let arch = current_arch()?;
+    let arch = Architecture::current()?;
+    let start = FcVersion::parse(&discover_latest_fc_version()?)?;
 
-    let latest = discover_latest_fc_version()?;
-    let ci_version = derive_ci_version(&latest);
+    eprintln!(
+        "  Looking for kernels in CI bucket (latest: {})...",
+        start.ci_dirname()
+    );
 
-    eprintln!("  Looking for kernels in CI bucket (version {ci_version})...");
-    let prefix = format!("firecracker-ci/{ci_version}/{arch}/vmlinux-");
-    let list_url = format!("{S3_LIST}/?prefix={prefix}&list-type=2");
-
-    let output = Command::new("curl")
-        .args(["-sf", &list_url])
-        .output()
-        .context("Failed to list kernel artifacts from S3")?;
-    let body = String::from_utf8_lossy(&output.stdout);
-
-    let keys: Vec<&str> = body
-        .split("<Key>")
-        .skip(1)
-        .filter_map(|s| s.split("</Key>").next())
-        .filter(|k| k.contains("vmlinux-") && !k.ends_with(".config"))
-        .collect();
-
-    if keys.is_empty() {
-        bail!(
-            "No kernels found in Firecracker CI bucket for {ci_version}/{arch}.\n\
-             The S3 listing URL was: {list_url}\n\
-             You may need to build a kernel manually."
-        );
-    }
+    let (ci_version, keys) = find_latest_ci_assets(
+        start,
+        arch,
+        "vmlinux-",
+        |k| k.contains("vmlinux-") && !k.ends_with(".config"),
+        s3_list_keys,
+    )?;
 
     let kernel_key = keys.into_iter().max().context("No kernel keys found")?;
     let kernel_url = format!("{S3_BUCKET}/{kernel_key}");
     let kernel_name = kernel_key.rsplit('/').next().unwrap_or("vmlinux");
 
-    eprintln!("  Found kernel: {kernel_name}");
+    eprintln!(
+        "  Found kernel: {kernel_name} (from {})",
+        ci_version.ci_dirname()
+    );
     eprintln!("  URL: {kernel_url}");
     eprintln!("  Output: {}", cfg.vm.kernel_path.display());
 
@@ -960,40 +995,119 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
 // ── Rootfs build helpers ──────────────────────────────────────
 
-fn discover_ci_rootfs(cfg: &CoopConfig) -> Result<String> {
-    let arch = current_arch()?;
-    let latest = discover_latest_fc_version()?;
-    let ci_version = derive_ci_version(&latest);
+fn discover_ci_rootfs() -> Result<String> {
+    let arch = Architecture::current()?;
+    let start = FcVersion::parse(&discover_latest_fc_version()?)?;
 
-    eprintln!("  Looking for rootfs in CI bucket (version {ci_version})...");
-    let prefix = format!("firecracker-ci/{ci_version}/{arch}/ubuntu-");
+    eprintln!(
+        "  Looking for rootfs in CI bucket (latest: {})...",
+        start.ci_dirname()
+    );
+
+    let (ci_version, keys) = find_latest_ci_assets(
+        start,
+        arch,
+        "ubuntu-",
+        |k| k.ends_with(".squashfs"),
+        s3_list_keys,
+    )
+    .context(
+        "Could not find a Firecracker CI rootfs in S3. CI assets lag a \
+         Firecracker release by days to weeks; retry later once the matching \
+         firecracker-ci/vX.Y/ directory is published.",
+    )?;
+
+    let rootfs_key = keys.into_iter().max().context("No rootfs keys found")?;
+    eprintln!("  Found rootfs in {}", ci_version.ci_dirname());
+    Ok(format!("{S3_BUCKET}/{rootfs_key}"))
+}
+
+/// Maximum number of older minor versions to try when the latest
+/// Firecracker release has no CI assets in S3.
+///
+/// CI assets typically lag a release by days to weeks (the GitHub release
+/// is cut before the Buildkite pipeline publishes the matching
+/// `firecracker-ci/vX.Y/` directory). Walking back too far risks pulling
+/// a rootfs/kernel built for a Firecracker that has diverged in API.
+const FC_CI_FALLBACK_MINORS: u16 = 4;
+
+/// List S3 keys under a given prefix in the Firecracker CI bucket.
+///
+/// Returns the raw `<Key>` strings parsed out of the S3 `ListObjectsV2`
+/// XML response. An empty response (the prefix has no objects) returns
+/// an empty Vec rather than an error.
+fn s3_list_keys(prefix: &str) -> Result<Vec<String>> {
     let list_url = format!("{S3_LIST}/?prefix={prefix}&list-type=2");
-
     let output = Command::new("curl")
         .args(["-sf", &list_url])
         .output()
-        .context("Failed to list rootfs artifacts from S3")?;
+        .with_context(|| format!("Failed to list S3 artifacts under {prefix}"))?;
     let body = String::from_utf8_lossy(&output.stdout);
-
-    let keys: Vec<&str> = body
+    Ok(body
         .split("<Key>")
         .skip(1)
         .filter_map(|s| s.split("</Key>").next())
-        .filter(|k| k.ends_with(".squashfs"))
-        .collect();
+        .map(str::to_owned)
+        .collect())
+}
 
-    if keys.is_empty() {
-        bail!(
-            "No rootfs found in Firecracker CI bucket for {ci_version}/{arch}.\n\
-             You can build one manually with:\n\
-             \n\
-               sudo bash scripts/build-rootfs.sh {}\n",
-            cfg.template_path().display()
-        );
+/// Walk back minor versions from `start` until a CI bucket with matching
+/// assets is found, returning the version used and the matching keys.
+///
+/// CI assets for the latest Firecracker release can lag the GitHub
+/// release by days. Rather than failing setup when that happens, fall
+/// back to the next older minor (still within the same major). The
+/// first version whose listing contains at least one key matching
+/// `filter` is returned. A WARN is logged whenever a fallback is used
+/// so the user knows the CI bucket is behind.
+///
+/// `list_keys` is injected so unit tests can exercise the walk without
+/// touching the network.
+fn find_latest_ci_assets(
+    start: FcVersion,
+    arch: Architecture,
+    prefix_suffix: &str,
+    filter: impl Fn(&str) -> bool,
+    list_keys: impl Fn(&str) -> Result<Vec<String>>,
+) -> Result<(FcVersion, Vec<String>)> {
+    let mut tried = Vec::with_capacity(usize::from(FC_CI_FALLBACK_MINORS));
+    for back in 0..FC_CI_FALLBACK_MINORS {
+        let Some(minor) = start.minor.checked_sub(back) else {
+            break;
+        };
+        let candidate = FcVersion {
+            major: start.major,
+            minor,
+        };
+        let ci_dir = candidate.ci_dirname();
+        let prefix = format!("firecracker-ci/{ci_dir}/{arch}/{prefix_suffix}");
+        let matches: Vec<String> = list_keys(&prefix)?
+            .into_iter()
+            .filter(|k| filter(k))
+            .collect();
+        if !matches.is_empty() {
+            if back > 0 {
+                tracing::warn!(
+                    latest = %start.ci_dirname(),
+                    using = %ci_dir,
+                    "Firecracker CI bucket has no '{prefix_suffix}' assets for the latest release; \
+                     falling back to {ci_dir}"
+                );
+                eprintln!(
+                    "  Warning: CI bucket has no '{prefix_suffix}' assets for {} \
+                     — using {ci_dir} instead",
+                    start.ci_dirname()
+                );
+            }
+            return Ok((candidate, matches));
+        }
+        tried.push(ci_dir);
     }
-
-    let rootfs_key = keys.into_iter().max().context("No rootfs keys found")?;
-    Ok(format!("{S3_BUCKET}/{rootfs_key}"))
+    bail!(
+        "No Firecracker CI assets matching '{prefix_suffix}' found for {arch} \
+         in any of: {}",
+        tried.join(", ")
+    );
 }
 
 fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str, rootfs_name: &str) -> Result<()> {
@@ -1093,7 +1207,12 @@ fn create_ext4_image(cfg: &CoopConfig, output_path: &Path) -> Result<()> {
 }
 
 /// Mount the template rootfs and run the install script in a chroot.
-fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> Result<()> {
+fn install_guest_packages(
+    cfg: &CoopConfig,
+    image_path: &Path,
+    script: &str,
+    guest_user: &GuestUser,
+) -> Result<()> {
     eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
@@ -1109,7 +1228,7 @@ fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> 
         .run()
         .context("Guest package installation failed")?;
 
-    verify_chroot_binaries(&mount_str)?;
+    verify_chroot_binaries(&mount_str, guest_user)?;
 
     // _guard dropped here → unmount_chroot runs regardless of status
     Ok(())
@@ -1119,34 +1238,17 @@ fn install_guest_packages(cfg: &CoopConfig, image_path: &Path, script: &str) -> 
 ///
 /// Uses `symlink_metadata` (lstat) instead of `exists` (stat) because
 /// the Claude binary is a symlink with an absolute target
-/// (`/home/ubuntu/.local/share/claude/versions/X.Y.Z`). When checked
+/// (`/home/<user>/.local/share/claude/versions/X.Y.Z`). When checked
 /// from outside the chroot, `exists()` follows the symlink to the
 /// host filesystem where the target doesn't exist. A symlink being
 /// present is sufficient — it will resolve correctly inside the guest.
-fn verify_chroot_binaries(mount_str: &str) -> Result<()> {
-    use crate::guest::REQUIRED_GUEST_BINARIES;
-
-    eprintln!("  Verifying installed binaries...");
-    let mut missing = Vec::new();
-
-    for &path in REQUIRED_GUEST_BINARIES {
-        let full_path = format!("{mount_str}{path}");
-        let exists = std::fs::symlink_metadata(&full_path).is_ok();
-        if !exists {
-            missing.push(path);
-        }
-    }
-
-    if !missing.is_empty() {
-        bail!(
-            "Golden image is missing required binaries: {}\n\
-             The install script completed but these tools were \
-             not installed correctly.",
-            missing.join(", "),
-        );
-    }
-
-    Ok(())
+fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()> {
+    crate::guest::verify_required_binaries(
+        guest_user,
+        "install script",
+        |path| std::fs::symlink_metadata(format!("{mount_str}{path}")).is_ok(),
+        String::new,
+    )
 }
 
 fn mount_chroot(rootfs: &str, mount_str: &str) -> Result<()> {
@@ -1206,12 +1308,6 @@ fn unmount_chroot(mount_str: &str) {
 
 // ── General helpers ───────────────────────────────────────────
 
-pub fn hash_string(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
 pub fn utc_timestamp() -> String {
     Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
@@ -1250,36 +1346,95 @@ fn discover_latest_fc_version() -> Result<String> {
     Ok(version)
 }
 
-/// Derive the CI bucket version from a release version.
-/// e.g., "v1.15.0" -> "v1.15", "v1.14.2" -> "v1.14"
-fn derive_ci_version(release_version: &str) -> String {
-    let parts: Vec<&str> = release_version.split('.').collect();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[0], parts[1])
-    } else {
-        release_version.to_string()
+/// Parsed Firecracker release version (e.g. `v1.15`).
+///
+/// Carries the major and minor components so the CI bucket directory
+/// name is derived from a parsed value rather than re-slicing a string
+/// each time it's needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FcVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl FcVersion {
+    /// Parse a Firecracker release tag like `v1.15.0`.
+    ///
+    /// Accepts the GitHub release tag format: a leading `v` followed by
+    /// at least `MAJOR.MINOR` numeric components. Any trailing `.PATCH`
+    /// (or further) segments are tolerated but discarded — the CI bucket
+    /// is keyed by `vMAJOR.MINOR` only.
+    pub fn parse(release: &str) -> Result<Self> {
+        let rest = release
+            .strip_prefix('v')
+            .with_context(|| format!("Firecracker version must start with 'v': '{release}'"))?;
+        let mut parts = rest.split('.');
+        let major_str = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Firecracker version is missing MAJOR: '{release}'"))?;
+        let minor_str = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("Firecracker version is missing MINOR: '{release}'"))?;
+        let major = major_str.parse::<u16>().with_context(|| {
+            format!("Firecracker MAJOR is not a u16 in '{release}' (got '{major_str}')")
+        })?;
+        let minor = minor_str.parse::<u16>().with_context(|| {
+            format!("Firecracker MINOR is not a u16 in '{release}' (got '{minor_str}')")
+        })?;
+        Ok(Self { major, minor })
+    }
+
+    /// CI bucket directory name, e.g. `v1.15`.
+    pub fn ci_dirname(self) -> String {
+        format!("v{}.{}", self.major, self.minor)
     }
 }
 
-fn current_arch() -> Result<String> {
-    let output = Command::new("uname")
-        .arg("-m")
-        .output()
-        .context("Failed to get architecture")?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Host architectures supported by the Firecracker setup path.
+///
+/// A closed enum lets `match` arms stay exhaustive and prevents string typos
+/// from silently producing broken URLs or download paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    X86_64,
+    Aarch64,
 }
 
-fn which(program: &str) -> Option<PathBuf> {
-    Command::new("which")
-        .arg(program)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+impl Architecture {
+    /// Detect the architecture this binary was built for.
+    ///
+    /// Reads `std::env::consts::ARCH`, which is fixed at compile time and
+    /// matches the kernel's `uname -m` output for the targets coop supports.
+    pub fn current() -> Result<Self> {
+        Self::from_consts_str(std::env::consts::ARCH)
+    }
+
+    fn from_consts_str(s: &str) -> Result<Self> {
+        match s {
+            "x86_64" => Ok(Self::X86_64),
+            "aarch64" => Ok(Self::Aarch64),
+            other => bail!("Unsupported architecture: {other}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+}
+
+impl fmt::Display for Architecture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn require_command(name: &str, purpose: &str) -> Result<()> {
-    if which(name).is_some() {
+    if command_exists(name) {
         eprintln!("  {name}: OK");
         Ok(())
     } else {
@@ -1304,12 +1459,13 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+#[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
 
-    fn custom_profile(apt: &[&str], pre: Option<&str>, post: Option<&str>) -> CustomProfile {
-        CustomProfile {
+    fn profile(name: &str, apt: &[&str], pre: Option<&str>, post: Option<&str>) -> ProfileDef {
+        ProfileDef {
+            name: name.into(),
             apt_packages: apt.iter().map(|s| (*s).into()).collect(),
             pre_install: pre.map(Into::into),
             post_install: post.map(Into::into),
@@ -1330,10 +1486,7 @@ mod tests {
 
     #[test]
     fn compose_recipe_no_profiles_succeeds() {
-        let custom = HashMap::new();
-        let result = compose_recipe(&[], &[], &custom);
-        assert!(result.is_ok());
-        let script = result.unwrap();
+        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
         assert!(script.contains("apt-get"));
         assert!(
             script.contains("Installing Codex CLI"),
@@ -1343,13 +1496,36 @@ mod tests {
     }
 
     #[test]
-    fn compose_recipe_post_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&["curl"], None, Some("echo done")),
+    fn compose_recipe_exports_guest_user() {
+        let user = GuestUser::new("vscode").unwrap();
+        let script = compose_recipe(&[], &[], &[], &user);
+        assert!(
+            script.contains("export GUEST_USER='vscode'"),
+            "recipe must export GUEST_USER for the chroot scripts:\n{script}"
         );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+    }
+
+    #[test]
+    fn template_config_loads_legacy_json_without_guest_user_field() {
+        // Pre-PR images on disk have no `guest_user` field; the serde
+        // default keeps them deserializable as `ubuntu`. Regression
+        // guard against accidentally dropping the `#[serde(default)]`.
+        let json = r#"{
+            "version": 1,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null
+        }"#;
+        let tc: TemplateConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.guest_user, GuestUser::default());
+    }
+
+    #[test]
+    fn compose_recipe_post_install_without_trailing_newline() {
+        let profiles = vec![profile("test", &["curl"], None, Some("echo done"))];
+        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
 
         // The post_install "echo done" must be on its own line
         assert!(
@@ -1361,12 +1537,13 @@ mod tests {
 
     #[test]
     fn compose_recipe_pre_install_without_trailing_newline() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&[], Some("curl -fsSL https://example.com | bash"), None),
-        );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+        let profiles = vec![profile(
+            "test",
+            &[],
+            Some("curl -fsSL https://example.com | bash"),
+            None,
+        )];
+        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
 
         assert!(
             script.contains("| bash\n"),
@@ -1377,12 +1554,8 @@ mod tests {
 
     #[test]
     fn compose_recipe_scripts_with_trailing_newline_no_double() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "test".into(),
-            custom_profile(&[], Some("pre-cmd\n"), Some("post-cmd\n")),
-        );
-        let script = compose_recipe(&["test".into()], &[], &custom).unwrap();
+        let profiles = vec![profile("test", &[], Some("pre-cmd\n"), Some("post-cmd\n"))];
+        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
 
         // Should not produce triple+ newlines from double-adding
         assert!(
@@ -1394,10 +1567,11 @@ mod tests {
 
     #[test]
     fn compose_recipe_multiple_profiles_separated() {
-        let mut custom = HashMap::new();
-        custom.insert("a".into(), custom_profile(&[], None, Some("echo a-done")));
-        custom.insert("b".into(), custom_profile(&[], None, Some("echo b-done")));
-        let script = compose_recipe(&["a".into(), "b".into()], &[], &custom).unwrap();
+        let profiles = vec![
+            profile("a", &[], None, Some("echo a-done")),
+            profile("b", &[], None, Some("echo b-done")),
+        ];
+        let script = compose_recipe(&profiles, &[], &[], &GuestUser::default());
 
         // Each post_install must be on its own line
         assert!(script.contains("echo a-done\n"));
@@ -1428,5 +1602,267 @@ mod tests {
         assert!(script.contains("recipe-content\n"));
         assert!(script.contains("MARKEREOF"));
         assert!(!script.contains("post-install"));
+    }
+
+    #[test]
+    fn architecture_from_consts_str_known() {
+        assert!(matches!(
+            Architecture::from_consts_str("x86_64"),
+            Ok(Architecture::X86_64)
+        ));
+        assert!(matches!(
+            Architecture::from_consts_str("aarch64"),
+            Ok(Architecture::Aarch64)
+        ));
+    }
+
+    #[test]
+    fn architecture_from_consts_str_rejects_unknown() {
+        assert!(Architecture::from_consts_str("riscv64").is_err());
+        assert!(Architecture::from_consts_str("").is_err());
+        assert!(Architecture::from_consts_str("arm64").is_err());
+    }
+
+    #[test]
+    fn architecture_display_matches_as_str() {
+        assert_eq!(Architecture::X86_64.to_string(), "x86_64");
+        assert_eq!(Architecture::Aarch64.to_string(), "aarch64");
+    }
+
+    #[test]
+    fn architecture_current_returns_supported_variant() {
+        // cargo runs tests on the host arch, which must be one of the
+        // two supported variants.
+        assert!(matches!(
+            Architecture::current(),
+            Ok(Architecture::X86_64 | Architecture::Aarch64)
+        ));
+    }
+
+    #[test]
+    fn fc_version_parses_release_tag() {
+        let v = FcVersion::parse("v1.15.0").unwrap();
+        assert_eq!(
+            v,
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+        );
+    }
+
+    #[test]
+    fn fc_version_parses_double_digit_minor() {
+        let v = FcVersion::parse("v2.103.7").unwrap();
+        assert_eq!(
+            v,
+            FcVersion {
+                major: 2,
+                minor: 103,
+            }
+        );
+    }
+
+    #[test]
+    fn fc_version_ci_dirname_keeps_v_prefix() {
+        assert_eq!(
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+            .ci_dirname(),
+            "v1.15"
+        );
+    }
+
+    #[test]
+    fn fc_version_rejects_missing_v_prefix() {
+        let err = FcVersion::parse("1.15.0").unwrap_err().to_string();
+        assert!(err.contains("must start with 'v'"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_missing_minor() {
+        let err = FcVersion::parse("v1").unwrap_err().to_string();
+        assert!(err.contains("missing MINOR"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_non_numeric_major() {
+        let err = FcVersion::parse("vfoo.bar").unwrap_err().to_string();
+        assert!(err.contains("MAJOR is not a u16"), "{err}");
+    }
+
+    #[test]
+    fn fc_version_rejects_empty_segments() {
+        let err = FcVersion::parse("v.15").unwrap_err().to_string();
+        assert!(err.contains("missing MAJOR"), "{err}");
+    }
+
+    fn keys_with(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn find_latest_ci_assets_returns_first_when_present() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            assert!(
+                prefix.starts_with("firecracker-ci/v1.16/"),
+                "expected to query v1.16 first, got {prefix}"
+            );
+            Ok(keys_with(&[
+                "firecracker-ci/v1.16/x86_64/ubuntu-24.04.squashfs",
+            ]))
+        };
+        let (version, matches) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(version, start);
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_falls_back_one_minor() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            if prefix.starts_with("firecracker-ci/v1.16/") {
+                Ok(Vec::new())
+            } else if prefix.starts_with("firecracker-ci/v1.15/") {
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs",
+                ]))
+            } else {
+                panic!("unexpected prefix: {prefix}")
+            }
+        };
+        let (version, matches) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(
+            version,
+            FcVersion {
+                major: 1,
+                minor: 15
+            }
+        );
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_filter_drops_non_matching_keys() {
+        // Bucket has objects but none match the filter — keep walking.
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |prefix: &str| -> Result<Vec<String>> {
+            if prefix.starts_with("firecracker-ci/v1.16/") {
+                // Has files but none are .squashfs (e.g. only manifests/configs).
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.16/x86_64/ubuntu-24.04.manifest",
+                ]))
+            } else if prefix.starts_with("firecracker-ci/v1.15/") {
+                Ok(keys_with(&[
+                    "firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs",
+                ]))
+            } else {
+                panic!("unexpected prefix: {prefix}")
+            }
+        };
+        let (version, _) = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap();
+        assert_eq!(version.minor, 15);
+    }
+
+    #[test]
+    fn find_latest_ci_assets_bails_when_all_empty() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |_: &str| -> Result<Vec<String>> { Ok(Vec::new()) };
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap_err()
+        .to_string();
+        // Should mention each version it attempted, up to FC_CI_FALLBACK_MINORS.
+        for minor in (16 - i32::from(FC_CI_FALLBACK_MINORS) + 1)..=16 {
+            assert!(err.contains(&format!("v1.{minor}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn find_latest_ci_assets_stops_at_minor_zero() {
+        use std::cell::RefCell;
+
+        // Don't underflow when start.minor < FC_CI_FALLBACK_MINORS.
+        let start = FcVersion { major: 1, minor: 2 };
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            |prefix: &str| -> Result<Vec<String>> {
+                seen.borrow_mut().push(prefix.to_string());
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        let seen = seen.into_inner();
+        // We should have tried exactly minors 2, 1, 0 — three calls, not four.
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0].contains("v1.2/"), "{}", seen[0]);
+        assert!(seen[1].contains("v1.1/"), "{}", seen[1]);
+        assert!(seen[2].contains("v1.0/"), "{}", seen[2]);
+        assert!(err.contains("v1.0"), "{err}");
+    }
+
+    #[test]
+    fn find_latest_ci_assets_propagates_lookup_error() {
+        let start = FcVersion {
+            major: 1,
+            minor: 16,
+        };
+        let list = |_: &str| -> Result<Vec<String>> { anyhow::bail!("network is on fire") };
+        let err = find_latest_ci_assets(
+            start,
+            Architecture::X86_64,
+            "ubuntu-",
+            |k| k.ends_with(".squashfs"),
+            list,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("network is on fire"), "{err}");
     }
 }

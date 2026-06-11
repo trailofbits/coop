@@ -58,11 +58,15 @@ latest_version() {
         gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null && return
     fi
     local url="https://api.github.com/repos/${REPO}/releases/latest"
-    local auth_args=()
+    # Pass the auth header on stdin (`-H @-`) so $GITHUB_TOKEN never appears
+    # on argv where it would be visible in /proc/<pid>/cmdline or `set -x`.
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        auth_args=(-H "Authorization: token ${GITHUB_TOKEN}")
+        printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" \
+            | curl -fsSL -H @- "$url" \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+    else
+        curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
     fi
-    curl -fsSL "${auth_args[@]}" "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
 }
 
 # Download a release asset. Tries gh first, then curl with token, then plain curl.
@@ -77,13 +81,16 @@ download_asset() {
     fi
 
     local url="https://github.com/${REPO}/releases/download/${VERSION}/${filename}"
-    local auth_args=()
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        auth_args=(-H "Authorization: token ${GITHUB_TOKEN}")
-    fi
 
     info "Downloading ${filename}..."
-    curl -fsSL "${auth_args[@]}" -o "$dest" "$url"
+    # Pass the auth header on stdin (`-H @-`) so $GITHUB_TOKEN never appears
+    # on argv where it would be visible in /proc/<pid>/cmdline or `set -x`.
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" \
+            | curl -fsSL -H @- -o "$dest" "$url"
+    else
+        curl -fsSL -o "$dest" "$url"
+    fi
 }
 
 verify_checksum() {

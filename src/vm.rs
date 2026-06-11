@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::backend::LogMode;
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, Instance};
 
@@ -220,7 +221,10 @@ impl<'a> FirecrackerVm<'a, Running> {
     /// PID file.
     ///
     /// Validates that the PID is alive and belongs to a Firecracker
-    /// process, cleaning up stale PID files if not.
+    /// process, cleaning up stale PID files if not. Callers that
+    /// already hold a `RunningInstance` proof should use
+    /// [`Self::from_running_unchecked`] instead to avoid the
+    /// redundant live-state probe.
     pub fn from_running(cfg: &'a CoopConfig, inst: &'a Instance) -> Result<Self> {
         if !inst.is_running() {
             let pid_path = inst.pid_file_path();
@@ -232,12 +236,20 @@ impl<'a> FirecrackerVm<'a, Running> {
             );
         }
 
-        Ok(Self {
+        Ok(Self::from_running_unchecked(cfg, inst))
+    }
+
+    /// Attach to a Firecracker VM whose running state has already
+    /// been established by the caller (e.g. via a
+    /// [`crate::backend::RunningInstance`] proof). Skips the
+    /// `is_running()` probe that [`Self::from_running`] performs.
+    pub fn from_running_unchecked(cfg: &'a CoopConfig, inst: &'a Instance) -> Self {
+        Self {
             cfg,
             inst,
             fc_config: build_config(cfg, inst),
             _state: PhantomData,
-        })
+        }
     }
 
     /// Wait for the guest to become reachable via SSH.
@@ -366,10 +378,11 @@ impl<'a> FirecrackerVm<'a, Running> {
             self.cfg.ssh_port,
         );
 
+        let guest_user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
         let target = crate::backend::SshTarget {
-            host: self.inst.guest_ip(),
+            host: crate::backend::Hostname::from(self.inst.guest_ip()),
             port: self.cfg.ssh_port,
-            user: crate::guest::GUEST_USER.to_string(),
+            user: crate::backend::SshUser::new(guest_user.as_str())?,
             key_path: self.cfg.ssh_key_path(),
         };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
@@ -380,25 +393,28 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 
     /// Stream the Firecracker log file to stdout.
-    pub fn stream_logs(&self, follow: bool) -> Result<()> {
+    pub fn stream_logs(&self, mode: LogMode) -> Result<()> {
         let log_path = self.inst.log_path();
         if !log_path.exists() {
             bail!("No log file found at {}", log_path.display());
         }
 
-        if follow {
-            let mut child = Command::new("tail")
-                .arg("-f")
-                .arg(&log_path)
-                .spawn()
-                .context("Failed to tail log file")?;
-            child.wait().context("Log streaming interrupted")?;
-        } else {
-            let file = fs::File::open(&log_path).context("Failed to open log file")?;
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let line = line.context("Failed to read log line")?;
-                writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+        match mode {
+            LogMode::Follow => {
+                let mut child = Command::new("tail")
+                    .arg("-f")
+                    .arg(&log_path)
+                    .spawn()
+                    .context("Failed to tail log file")?;
+                child.wait().context("Log streaming interrupted")?;
+            }
+            LogMode::Snapshot => {
+                let file = fs::File::open(&log_path).context("Failed to open log file")?;
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let line = line.context("Failed to read log line")?;
+                    writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
+                }
             }
         }
         Ok(())

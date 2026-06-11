@@ -6,7 +6,25 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
-# github = "auto"               # "auto", "env", or "off"
+# GitHub auth strategy. Pick ONE of the two forms below — `github` cannot
+# be both a string and a table at the same time.
+#
+# Form A — simple string:
+# github = "auto"               # "auto", "env", "off", or "pat"
+#
+# Form B — table, required when you want per-repo PAT entries.
+# Run `coop github setup-pat --repo owner/name` to populate it via wizard.
+# Form B `mode = "pat"` is equivalent to form A `github = "pat"`.
+#
+# [github]
+# mode = "pat"
+# skip = ["owner/big-repo"]       # repos to skip the auto-prompt for
+#
+# [github.pat."trailofbits/coop"]
+# token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop -w"
+
+# [setup]
+# prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
 # [vm]
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
@@ -19,6 +37,13 @@
 # host_ip = "172.16.0.1"
 # subnet_mask = "/24"
 # host_iface = "auto"           # "auto" detects at runtime
+
+# [guest_env]                   # Literal env vars to set in the guest.
+#                               # Overrides forwarded values on key
+#                               # collision (warning logged). Avoid for
+#                               # secrets — use `env_forward` instead.
+# RUST_LOG = "info"
+# MY_FLAG = "1"
 
 # [claude]
 # config_dir = "~/.claude"  # path to copy CLAUDE.md, rules/, commands/ from (false to disable)

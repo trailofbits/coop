@@ -58,43 +58,65 @@ cat > /etc/systemd/system/docker.service.d/no-raw.conf <<'DROPINEOF'
 Environment="DOCKER_INSECURE_NO_IPTABLES_RAW=1"
 DROPINEOF
 
-echo '  [guest] Ensuring ubuntu user exists (uid 1000)...'
-if id ubuntu &>/dev/null; then
-    usermod -aG sudo,docker ubuntu
+# GUEST_USER is exported by the orchestrator before this script runs.
+: "${GUEST_USER:?GUEST_USER must be set by the orchestrator}"
+GUEST_HOME="/home/${GUEST_USER}"
+
+echo "  [guest] Ensuring ${GUEST_USER} user exists (uid 1000)..."
+if id "${GUEST_USER}" &>/dev/null; then
+    usermod -aG sudo,docker "${GUEST_USER}"
 else
-    # Remove any other user occupying uid 1000 (e.g. Lima's host-mirror user)
+    # Remove any other user occupying uid 1000 (e.g. the CI rootfs's ubuntu,
+    # or Lima's host-mirror user) before creating ours with the same uid.
     EXISTING=$(getent passwd 1000 | cut -d: -f1) || true
     if [[ -n "$EXISTING" ]]; then
         userdel "$EXISTING"
     fi
-    useradd -m -s /bin/bash --uid 1000 -G sudo,docker ubuntu
+    useradd -m -s /bin/bash --uid 1000 -G sudo,docker "${GUEST_USER}"
 fi
-echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
-chmod 440 /etc/sudoers.d/ubuntu
+echo "${GUEST_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${GUEST_USER}"
+chmod 440 "/etc/sudoers.d/${GUEST_USER}"
 
 # Ensure home directory exists with correct ownership
-mkdir -p /home/ubuntu
-chown ubuntu:ubuntu /home/ubuntu
-chmod 755 /home/ubuntu
+mkdir -p "${GUEST_HOME}"
+chown "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}"
+chmod 755 "${GUEST_HOME}"
 
 # Create .local tree — the Claude Code installer expects to write here
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local/bin
-install -d -o ubuntu -g ubuntu /home/ubuntu/.local/share
+install -d -o "${GUEST_USER}" -g "${GUEST_USER}" "${GUEST_HOME}/.local"
+install -d -o "${GUEST_USER}" -g "${GUEST_USER}" "${GUEST_HOME}/.local/bin"
+install -d -o "${GUEST_USER}" -g "${GUEST_USER}" "${GUEST_HOME}/.local/share"
 
-# Copy SSH authorized_keys to ubuntu user
-mkdir -p /home/ubuntu/.ssh
-cp /root/.ssh/authorized_keys /home/ubuntu/.ssh/authorized_keys
-chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-chmod 700 /home/ubuntu/.ssh
-chmod 600 /home/ubuntu/.ssh/authorized_keys
+# Copy SSH authorized_keys to the guest user
+mkdir -p "${GUEST_HOME}/.ssh"
+cp /root/.ssh/authorized_keys "${GUEST_HOME}/.ssh/authorized_keys"
+chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}/.ssh"
+chmod 700 "${GUEST_HOME}/.ssh"
+chmod 600 "${GUEST_HOME}/.ssh/authorized_keys"
 
-echo '  [guest] Configuring ubuntu user PATH...'
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.profile
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
+echo "  [guest] Adding ${GUEST_USER} ~/.local/bin to /etc/environment PATH..."
+# pam_env reads /etc/environment for every SSH session — login, non-login,
+# and non-interactive (`ssh host cmd`) alike — so this is the one layer that
+# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
+# Code remote sessions. The .profile/.bashrc appends did not: .profile is
+# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
+# pam_env does no variable expansion, so the home path is baked in literally.
+#
+# /etc/environment is system-wide, so this prepends the guest user's writable
+# ~/.local/bin to PATH for every account, including root. That's safe here:
+# sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
+# ~/.local/bin, and the guest is a single-user dev VM where that user already
+# has passwordless root — there is no privilege boundary to cross.
+if ! grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.local/bin:|" /etc/environment
+    else
+        echo "PATH=\"${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
+    fi
+fi
 
 echo '  [guest] Symlinking claude into system PATH...'
-ln -sf /home/ubuntu/.local/bin/claude /usr/local/bin/claude
+ln -sf "${GUEST_HOME}/.local/bin/claude" /usr/local/bin/claude
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -112,7 +134,7 @@ chmod 755 /usr/local/bin/codex-yolo
 
 echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace
-chown ubuntu:ubuntu /workspace
+chown "${GUEST_USER}:${GUEST_USER}" /workspace
 
 echo '  [guest] Enabling services...'
 systemctl enable docker ssh systemd-networkd serial-getty@ttyS0

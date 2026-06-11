@@ -1,36 +1,216 @@
 // Shared guest provisioning constants used by both Lima and Firecracker.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{CoopConfig, CustomProfile};
+use crate::paths::GuestPath;
 
-/// Username for the non-root guest user. Both backends ensure this user
-/// exists at uid 1000. On Firecracker's rootfs the `ubuntu` user already
-/// exists; on Lima, cloud-init may replace it with a host-mirror user,
-/// so the provisioning script evicts that user and recreates `ubuntu`.
-pub const GUEST_USER: &str = "ubuntu";
+/// Devcontainer feature ids (bare names) that map to builtin profiles.
+/// The id is the same string as the builtin name; this slice acts as the
+/// allow-list so an unknown feature returns `None` rather than silently
+/// resolving against an unrelated builtin added later.
+const FEATURE_IDS: &[&str] = &["python", "node", "c", "fuzz", "rust", "go"];
 
-/// Absolute path to the Claude Code binary in the guest.
+/// Look up a builtin profile by its devcontainer feature id (a bare
+/// name such as `rust`, after stripping any `ghcr.io/...:tag` prefix).
+pub fn builtin_for_feature(id: &str) -> Option<&'static BuiltinProfile> {
+    if FEATURE_IDS.contains(&id) {
+        lookup_builtin(id)
+    } else {
+        None
+    }
+}
+
+/// Default username when neither the CLI nor a devcontainer pins one.
+/// Matches the user that Firecracker's CI rootfs already ships with and
+/// that Lima's `useradd` block creates at uid 1000.
+pub const DEFAULT_GUEST_USER: &str = "ubuntu";
+
+const MAX_GUEST_USER_LEN: usize = 32;
+
+/// Validated guest username, persisted in `TemplateConfig` and threaded
+/// through both backends.
 ///
-/// The installer puts it under the user's home directory. Bootstrap
-/// commands and verification use this path directly rather than
-/// relying on PATH (non-interactive SSH sessions don't source
-/// `.bashrc`/`.profile`).
-pub const CLAUDE_BIN: &str = "/home/ubuntu/.local/bin/claude";
+/// Enforces the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}` and
+/// rejects `root` so the rest of coop can assume an unprivileged uid-1000
+/// account. The same rules as `backend::SshUser` plus the root exclusion,
+/// so callers can losslessly convert to an `SshUser` for SSH plumbing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GuestUser(String);
 
-/// Absolute path to the Codex CLI binary in the guest.
-///
-/// The installer places a standalone binary in `/usr/local/bin`, so
-/// both bootstrap and verification can rely on a stable path.
-pub const CODEX_BIN: &str = "/usr/local/bin/codex";
+impl GuestUser {
+    /// Construct a validated guest user. Returns an error when the name
+    /// is empty, exceeds 32 characters, contains characters outside the
+    /// portable POSIX set, or is `root`.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        Self::validate(&name)?;
+        Ok(Self(name))
+    }
+
+    /// `clap` value parser. Equivalent to `GuestUser::new` but with the
+    /// `(&str) -> Result<Self>` signature clap's `value_parser` expects.
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::new(s)
+    }
+
+    fn validate(name: &str) -> Result<()> {
+        if name.is_empty() {
+            bail!("guest user must not be empty");
+        }
+        if name.len() > MAX_GUEST_USER_LEN {
+            bail!(
+                "guest user too long ({} chars, max {MAX_GUEST_USER_LEN})",
+                name.len()
+            );
+        }
+        if name == "root" {
+            bail!("guest user must not be 'root'; coop requires an unprivileged uid-1000 account");
+        }
+        for (i, c) in name.chars().enumerate() {
+            let ok = if i == 0 {
+                matches!(c, 'a'..='z' | '_')
+            } else {
+                matches!(c, 'a'..='z' | '0'..='9' | '_' | '-')
+            };
+            if !ok {
+                if i == 0 {
+                    bail!("guest user must start with [a-z_], got {c:?}");
+                }
+                bail!(
+                    "guest user contains invalid character {c:?} \
+                     (allowed: a-z, 0-9, '_', '-')"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrow as a string slice for paths, scripts, and shell composition.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Absolute home directory of this user inside the guest. Returned
+    /// as a `GuestPath` so call sites can't accidentally confuse it
+    /// with a host `PathBuf` or another string. The result is absolute
+    /// by construction — `/home/<validated user>` — so we don't pay
+    /// for the runtime check on `GuestPath::absolute`.
+    pub fn home(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}", self.0))
+    }
+
+    /// Where the Claude Code installer places the per-user binary.
+    /// The installer writes to `~/.local/bin/claude`; coop calls this path
+    /// directly as belt-and-braces. (`~/.local/bin` is also on PATH for every
+    /// SSH session via `/etc/environment`, but the absolute path costs nothing
+    /// and removes any dependence on PATH resolution.)
+    pub fn claude_bin(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}/.local/bin/claude", self.0))
+    }
+}
+
+/// Where the Codex CLI installer places the system-wide binary.
+/// Independent of the guest user — Codex lives in `/usr/local/bin`,
+/// not in any user's home — so callers don't pass a `GuestUser`.
+pub fn codex_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex")
+}
+
+impl Default for GuestUser {
+    fn default() -> Self {
+        // Safe: DEFAULT_GUEST_USER ("ubuntu") satisfies the validator.
+        Self(DEFAULT_GUEST_USER.to_owned())
+    }
+}
+
+impl fmt::Display for GuestUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for GuestUser {
+    #[mutants::skip] // equivalent: trivial forwarder over self.0
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GuestUser {
+    type Error = anyhow::Error;
+    fn try_from(value: String) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<GuestUser> for String {
+    #[mutants::skip] // equivalent: trivial forwarder
+    fn from(value: GuestUser) -> Self {
+        value.0
+    }
+}
 
 /// Binaries that must exist in the guest image after provisioning.
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
-pub const REQUIRED_GUEST_BINARIES: &[&str] =
-    &["/usr/bin/docker", "/usr/bin/gh", CLAUDE_BIN, CODEX_BIN];
+///
+/// Returns `GuestPath`s rather than raw strings so call sites that
+/// build shell commands or inspect the chroot get path semantics for
+/// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
+/// mistaken for host paths).
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 4] {
+    [
+        GuestPath::new("/usr/bin/docker"),
+        GuestPath::new("/usr/bin/gh"),
+        user.claude_bin(),
+        codex_bin(),
+    ]
+}
+
+/// Verify that every required guest binary is present, bailing with a
+/// uniform error if any are missing.
+///
+/// `probe` answers "does this binary exist in the image?" — its mechanism
+/// differs per backend (a chroot `symlink_metadata` for Firecracker, a
+/// `test -x` over `limactl shell` for Lima). `source_label` names what
+/// produced the image ("install script" vs "provision script"), and
+/// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
+/// evaluated lazily only when something is missing.
+#[expect(
+    clippy::print_stderr,
+    reason = "verification progress is interactive CLI — stderr is user communication"
+)]
+pub fn verify_required_binaries(
+    guest_user: &GuestUser,
+    source_label: &str,
+    probe: impl Fn(&GuestPath) -> bool,
+    diagnostics: impl FnOnce() -> String,
+) -> Result<()> {
+    eprintln!("  Verifying installed binaries...");
+    let missing: Vec<String> = required_guest_binaries(guest_user)
+        .into_iter()
+        .filter(|path| !probe(path))
+        .map(|path| path.to_string())
+        .collect();
+
+    if !missing.is_empty() {
+        bail!(
+            "Golden image is missing required binaries: {}\n\
+             The {source_label} completed but these tools were \
+             not installed correctly.{}",
+            missing.join(", "),
+            diagnostics(),
+        );
+    }
+    Ok(())
+}
 
 pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh");
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
@@ -53,7 +233,6 @@ pub const BASE_PACKAGES: &[&str] = &[
     "procps",
     "jq",
     "rsync",
-    "tmux",
     "unzip",
     "zip",
     "file",
@@ -66,6 +245,7 @@ pub const DOCKER_PACKAGES: &[&str] = &[
     "docker-ce",
     "docker-ce-cli",
     "containerd.io",
+    "docker-buildx-plugin",
     "docker-compose-plugin",
 ];
 
@@ -83,9 +263,12 @@ pub struct BuiltinProfile {
     pub plugins: &'static [&'static str],
 }
 
-/// Owned profile definition produced by `lookup_profile`. Handles both
-/// builtin (converted from static data) and custom (cloned from config).
+/// Resolved profile definition. Carries the profile name alongside its
+/// effective contents so consumers don't need to re-look-up by name.
+/// Produced once at the config boundary by [`resolve_profiles`].
+#[derive(Debug, Clone)]
 pub struct ProfileDef {
+    pub name: String,
     pub apt_packages: Vec<String>,
     pub pre_install: Option<String>,
     pub post_install: Option<String>,
@@ -96,11 +279,25 @@ pub struct ProfileDef {
 impl From<&BuiltinProfile> for ProfileDef {
     fn from(bp: &BuiltinProfile) -> Self {
         Self {
+            name: bp.name.to_owned(),
             apt_packages: bp.apt_packages.iter().map(|s| (*s).to_owned()).collect(),
             pre_install: bp.pre_install.map(str::to_owned),
             post_install: bp.post_install.map(str::to_owned),
             marketplaces: bp.marketplaces.iter().map(|s| (*s).to_owned()).collect(),
             plugins: bp.plugins.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+}
+
+impl ProfileDef {
+    fn from_custom(name: &str, cp: &CustomProfile) -> Self {
+        Self {
+            name: name.to_owned(),
+            apt_packages: cp.apt_packages.clone(),
+            pre_install: cp.pre_install.clone(),
+            post_install: cp.post_install.clone(),
+            marketplaces: cp.marketplaces.clone(),
+            plugins: cp.plugins.clone(),
         }
     }
 }
@@ -160,47 +357,73 @@ fn lookup_builtin(name: &str) -> Option<&'static BuiltinProfile> {
     BUILTIN_PROFILES.iter().find(|bp| bp.name == name)
 }
 
-/// Look up a profile by name. Checks custom profiles first, then builtins.
-pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Result<ProfileDef> {
+fn resolve_one(name: &str, custom: &HashMap<String, CustomProfile>) -> Option<ProfileDef> {
     if let Some(cp) = custom.get(name) {
-        return Ok(ProfileDef {
-            apt_packages: cp.apt_packages.clone(),
-            pre_install: cp.pre_install.clone(),
-            post_install: cp.post_install.clone(),
-            marketplaces: cp.marketplaces.clone(),
-            plugins: cp.plugins.clone(),
-        });
+        return Some(ProfileDef::from_custom(name, cp));
     }
+    lookup_builtin(name).map(ProfileDef::from)
+}
 
-    if let Some(bp) = lookup_builtin(name) {
-        return Ok(ProfileDef::from(bp));
-    }
-
+fn available_profiles(custom: &HashMap<String, CustomProfile>) -> Vec<&str> {
     let mut available: Vec<&str> = BUILTIN_PROFILES.iter().map(|bp| bp.name).collect();
     let mut custom_names: Vec<&str> = custom.keys().map(String::as_str).collect();
     custom_names.sort_unstable();
     available.extend(custom_names);
+    available
+}
 
-    bail!(
-        "Unknown profile: {name}\n\
-         Available profiles: {}",
-        available.join(", ")
-    )
+/// Resolve a list of profile names into [`ProfileDef`] values.
+///
+/// All unknown names are collected and reported in a single error so
+/// the caller sees every offender at once. Custom profiles shadow
+/// builtins with the same name.
+pub fn resolve_profiles(
+    names: &[String],
+    custom: &HashMap<String, CustomProfile>,
+) -> Result<Vec<ProfileDef>> {
+    let mut resolved = Vec::with_capacity(names.len());
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in names {
+        match resolve_one(name, custom) {
+            Some(def) => resolved.push(def),
+            None => unknown.push(name.as_str()),
+        }
+    }
+    if !unknown.is_empty() {
+        bail!(
+            "Unknown profile(s): {}\n\
+             Available profiles: {}",
+            unknown.join(", "),
+            available_profiles(custom).join(", "),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Look up a single profile by name. Convenience wrapper around
+/// [`resolve_profiles`] for the `coop profiles show <name>` path.
+pub fn lookup_profile(name: &str, custom: &HashMap<String, CustomProfile>) -> Result<ProfileDef> {
+    resolve_one(name, custom).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown profile: {name}\n\
+             Available profiles: {}",
+            available_profiles(custom).join(", "),
+        )
+    })
 }
 
 /// Collect combined marketplace and plugin lists from global config
 /// and all active profiles. Results are sorted and deduplicated.
 pub fn collect_baked_lists(
     cfg: &CoopConfig,
-    profiles: &[String],
-) -> Result<(Vec<String>, Vec<String>)> {
+    profiles: &[ProfileDef],
+) -> (Vec<String>, Vec<String>) {
     let mut marketplaces = cfg.claude.marketplaces.clone();
     let mut plugins = cfg.claude.plugins.clone();
 
-    for name in profiles {
-        let def = lookup_profile(name, &cfg.profiles)?;
-        marketplaces.extend(def.marketplaces);
-        plugins.extend(def.plugins);
+    for def in profiles {
+        marketplaces.extend(def.marketplaces.iter().cloned());
+        plugins.extend(def.plugins.iter().cloned());
     }
 
     marketplaces.sort_unstable();
@@ -208,7 +431,7 @@ pub fn collect_baked_lists(
     plugins.sort_unstable();
     plugins.dedup();
 
-    Ok((marketplaces, plugins))
+    (marketplaces, plugins)
 }
 
 #[cfg(test)]
@@ -216,14 +439,6 @@ pub fn collect_baked_lists(
 #[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
 mod tests {
     use super::*;
-
-    #[test]
-    fn required_guest_binaries_include_codex() {
-        assert!(
-            REQUIRED_GUEST_BINARIES.contains(&"/usr/local/bin/codex"),
-            "guest image should include codex in the default PATH",
-        );
-    }
 
     #[test]
     fn codex_script_installs_extracted_binary_not_archive() {
@@ -239,6 +454,7 @@ mod tests {
         for bp in BUILTIN_PROFILES {
             let def = lookup_profile(bp.name, &custom)
                 .unwrap_or_else(|_| panic!("builtin '{}' failed to resolve", bp.name));
+            assert_eq!(def.name, bp.name);
             assert_eq!(def.apt_packages.len(), bp.apt_packages.len());
         }
     }
@@ -263,6 +479,175 @@ mod tests {
             },
         );
         let def = lookup_profile("python", &custom).unwrap();
+        assert_eq!(def.name, "python");
         assert_eq!(def.apt_packages, vec!["custom-python"]);
+    }
+
+    #[test]
+    fn resolve_profiles_reports_all_unknowns() {
+        let custom = HashMap::new();
+        let names = vec!["rust".to_owned(), "bogus1".to_owned(), "bogus2".to_owned()];
+        let err = resolve_profiles(&names, &custom).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bogus1"), "missing bogus1 in: {msg}");
+        assert!(msg.contains("bogus2"), "missing bogus2 in: {msg}");
+    }
+
+    #[test]
+    fn resolve_profiles_preserves_order_and_resolves_all() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "data".to_owned(),
+            CustomProfile {
+                apt_packages: vec!["pandas".to_owned()],
+                pre_install: None,
+                post_install: None,
+                marketplaces: vec![],
+                plugins: vec![],
+            },
+        );
+        let names = vec!["rust".to_owned(), "data".to_owned(), "node".to_owned()];
+        let defs = resolve_profiles(&names, &custom).unwrap();
+        let resolved_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(resolved_names, vec!["rust", "data", "node"]);
+    }
+
+    #[test]
+    fn builtin_for_feature_matches_known_ids() {
+        for id in FEATURE_IDS {
+            let bp = builtin_for_feature(id)
+                .unwrap_or_else(|| panic!("feature '{id}' should resolve to a builtin"));
+            assert_eq!(bp.name, *id);
+        }
+        assert!(builtin_for_feature("nonexistent").is_none());
+    }
+
+    #[test]
+    fn guest_user_default_is_ubuntu() {
+        assert_eq!(GuestUser::default().as_str(), DEFAULT_GUEST_USER);
+        assert_eq!(GuestUser::default().home().to_string(), "/home/ubuntu");
+    }
+
+    #[test]
+    fn guest_user_claude_bin_lives_under_home() {
+        let user = GuestUser::new("vscode").unwrap();
+        assert_eq!(
+            user.claude_bin().to_string(),
+            "/home/vscode/.local/bin/claude"
+        );
+    }
+
+    #[test]
+    fn guest_user_accepts_valid_names() {
+        for s in ["ubuntu", "vscode", "_dev", "u", "user_1", "ec2-user"] {
+            let u = GuestUser::new(s).unwrap_or_else(|e| panic!("rejected {s:?}: {e}"));
+            assert_eq!(u.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn guest_user_rejects_root() {
+        let err = GuestUser::new("root").unwrap_err().to_string();
+        assert!(err.contains("must not be 'root'"), "{err}");
+    }
+
+    #[test]
+    fn guest_user_rejects_empty_and_too_long() {
+        assert!(GuestUser::new("").is_err());
+        let long = "a".repeat(MAX_GUEST_USER_LEN + 1);
+        assert!(GuestUser::new(long).is_err());
+    }
+
+    #[test]
+    fn guest_user_rejects_invalid_chars() {
+        for s in [
+            "Ubuntu",
+            "0user",
+            "-user",
+            "user.name",
+            "user!",
+            "user name",
+        ] {
+            assert!(GuestUser::new(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn guest_user_serde_roundtrip() {
+        let u = GuestUser::new("vscode").unwrap();
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(json, "\"vscode\"");
+        let back: GuestUser = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn guest_user_serde_rejects_invalid() {
+        let err = serde_json::from_str::<GuestUser>("\"root\"").unwrap_err();
+        assert!(err.to_string().contains("root"), "{err}");
+    }
+
+    #[test]
+    fn required_guest_binaries_include_codex() {
+        let user = GuestUser::default();
+        let bins = required_guest_binaries(&user);
+        assert!(
+            bins.iter().any(|b| b.to_string() == "/usr/local/bin/codex"),
+            "guest image should include codex in the default PATH",
+        );
+    }
+
+    #[test]
+    fn verify_required_binaries_ok_when_all_present_and_skips_diagnostics() {
+        let user = GuestUser::default();
+        let diag_called = std::cell::Cell::new(false);
+        let result = verify_required_binaries(
+            &user,
+            "install script",
+            |_path| true,
+            || {
+                diag_called.set(true);
+                String::new()
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            !diag_called.get(),
+            "diagnostics must not be evaluated when nothing is missing",
+        );
+    }
+
+    #[test]
+    fn verify_required_binaries_bails_with_missing_names_and_diagnostics() {
+        let user = GuestUser::default();
+        let result = verify_required_binaries(
+            &user,
+            "provision script",
+            |path| path.to_string() != "/usr/bin/docker",
+            || "\n\ntail of log".to_string(),
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("/usr/bin/docker"),
+            "missing binary listed: {err}"
+        );
+        assert!(
+            err.contains("provision script"),
+            "source label included: {err}"
+        );
+        assert!(
+            err.contains("tail of log"),
+            "diagnostics suffix appended: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_required_binaries_lists_every_missing_binary() {
+        let user = GuestUser::default();
+        let result = verify_required_binaries(&user, "install script", |_path| false, String::new);
+        let err = result.unwrap_err().to_string();
+        for expected in ["/usr/bin/docker", "/usr/bin/gh", "/usr/local/bin/codex"] {
+            assert!(err.contains(expected), "{expected} missing from: {err}");
+        }
     }
 }
