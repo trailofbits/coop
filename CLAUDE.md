@@ -121,7 +121,7 @@ A kill rate around 70–80% on viable mutants is healthy for this code. Aim to d
 
 Fuzzing is reserved for parsers of **untrusted or user-editable input** — it finds panics/hangs/OOM, not correctness (there's no oracle), so a standing harness only earns its keep where input crosses a trust boundary. Like mutation testing, it's a manual check, not a CI gate. We use [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer), which needs a nightly toolchain.
 
-Targets live in `fuzz/fuzz_targets/`. Because `coop` is a binary-only crate (no lib target), a target cannot depend on it; instead it includes the module under test by `#[path]` (the `#[cfg(test)]` blocks stay inactive in a fuzz build). `fuzz/Cargo.toml` is its own workspace, so the main `cargo build`/`test`/`fmt`/`clippy`/`deny` never touch it.
+Targets live in `fuzz/fuzz_targets/`. `coop` exposes a library target (`src/lib.rs`), so a target depends on the crate directly and imports the parser under test with `use coop::…` — no `#[path]` includes. `fuzz/Cargo.toml` is its own workspace, so the main `cargo build`/`test`/`fmt`/`clippy`/`deny` never touch it.
 
 **Install once:** `cargo install cargo-fuzz --locked`
 
@@ -135,7 +135,9 @@ A crash is written to `fuzz/artifacts/<target>/`; reproduce it with `cargo +nigh
 
 **Current targets:**
 
-- `parse_repo_slug` — `github_repo::parse_repo_slug_from_url`, fed `git remote get-url` output and `--git-repo` CLI args. Property: never panics.
+- `parse_repo_slug` — `coop::github_repo::parse_repo_slug_from_url`, fed `git remote get-url` output and `--git-repo` CLI args. Property: never panics.
+- `jsonc_to_json` — `coop::jsonc::jsonc_to_json`, fed hand-authored `devcontainer.json` text. Property: never panics.
+- `config_load` — `toml::from_str` into `coop::config::CoopConfig` then `validate`, fed `config.toml` text. Exercises the custom `Deserialize`/`visit_map` impls (`SubnetMask`, `HostInterface`, `PortForward`). Property: never panics, only returns `Err`.
 
 ## Known workarounds (revisit later)
 

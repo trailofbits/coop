@@ -45,3 +45,10 @@ exit = "deny"
 mem_forget = "deny"
 module_name_repetitions = "allow"
 similar_names = "allow"
+# coop is an application; src/lib.rs exists only so in-repo fuzz targets and
+# integration tests can import internals (e.g. coop::config::CoopConfig). The
+# pub modules are not a curated public API, so the public-API documentation and
+# ergonomics lints are noise here.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

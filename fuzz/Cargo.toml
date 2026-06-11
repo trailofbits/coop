@@ -7,14 +7,14 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
-# `coop` is a binary-only crate (no lib target), so this crate cannot depend on
-# it. The fuzz target instead includes the parser module under test by path
-# (see `fuzz_targets/parse_repo_slug.rs`); these are the deps that module pulls
-# in, mirroring the main crate's versions.
+# `coop` exposes a library target (`src/lib.rs`), so fuzz targets depend on it
+# directly and import the parser under test with `use coop::…` — no `#[path]`
+# includes. `toml` is needed by the config-loader target to deserialize a
+# `CoopConfig` from fuzzer input.
 [dependencies]
 libfuzzer-sys = "0.4"
-anyhow = "1"
-serde = "1"
+coop = { path = ".." }
+toml = "1.1.2"
 
 [[bin]]
 name = "parse_repo_slug"
@@ -26,6 +26,13 @@ bench = false
 [[bin]]
 name = "jsonc_to_json"
 path = "fuzz_targets/jsonc_to_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_load"
+path = "fuzz_targets/config_load.rs"
 test = false
 doc = false
 bench = false
