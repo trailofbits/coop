@@ -1,0 +1,27 @@
+[package]
+name = "coop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# `coop` is a binary-only crate (no lib target), so this crate cannot depend on
+# it. The fuzz target instead includes the parser module under test by path
+# (see `fuzz_targets/parse_repo_slug.rs`); these are the deps that module pulls
+# in, mirroring the main crate's versions.
+[dependencies]
+libfuzzer-sys = "0.4"
+anyhow = "1"
+serde = "1"
+
+[[bin]]
+name = "parse_repo_slug"
+path = "fuzz_targets/parse_repo_slug.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent package so `cargo fuzz` resolves this as its own root.
+[workspace]

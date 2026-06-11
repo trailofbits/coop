@@ -117,6 +117,26 @@ A kill rate around 70–80% on viable mutants is healthy for this code. Aim to d
 
 **Baseline result on `config.rs` (recorded 2026-05-20):** 117 caught / 42 missed / 38 unviable. Real gaps were concentrated in `CoopConfig::validate` (5 survivors), `Instance::is_running` (4), `is_firecracker_process` (2), and `MiB::as_gib_f64` arithmetic. The rest were `fmt::Display` impls and default-value getters. Use this as a reference point — if a future run is much worse on these modules, treat it as a regression in test coverage.
 
+### Fuzzing
+
+Fuzzing is reserved for parsers of **untrusted or user-editable input** — it finds panics/hangs/OOM, not correctness (there's no oracle), so a standing harness only earns its keep where input crosses a trust boundary. Like mutation testing, it's a manual check, not a CI gate. We use [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer), which needs a nightly toolchain.
+
+Targets live in `fuzz/fuzz_targets/`. Because `coop` is a binary-only crate (no lib target), a target cannot depend on it; instead it includes the module under test by `#[path]` (the `#[cfg(test)]` blocks stay inactive in a fuzz build). `fuzz/Cargo.toml` is its own workspace, so the main `cargo build`/`test`/`fmt`/`clippy`/`deny` never touch it.
+
+**Install once:** `cargo install cargo-fuzz --locked`
+
+```bash
+cargo +nightly fuzz build                                  # compile all targets
+cargo +nightly fuzz run parse_repo_slug                    # fuzz until a crash (Ctrl-C to stop)
+cargo +nightly fuzz run parse_repo_slug -- -max_total_time=60   # bounded run
+```
+
+A crash is written to `fuzz/artifacts/<target>/`; reproduce it with `cargo +nightly fuzz run <target> <artifact-path>`.
+
+**Current targets:**
+
+- `parse_repo_slug` — `github_repo::parse_repo_slug_from_url`, fed `git remote get-url` output and `--git-repo` CLI args. Property: never panics.
+
 ## Known workarounds (revisit later)
 
 The Firecracker CI kernel (`vmlinux-6.1.155`) is minimal and missing several modules. Two workarounds are applied in the guest install script (`src/setup.rs`, `guest_install_script()`):

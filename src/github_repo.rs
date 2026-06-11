@@ -243,6 +243,7 @@ impl<'de> Deserialize<'de> for GitRepoUrl {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn slug(s: &str) -> RepoSlug {
         RepoSlug::new(s).unwrap()
@@ -326,16 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_url_with_bad_chars() {
-        // Canonicalisation strips trailing slashes and `.git`, but the
-        // segment-level character check still rejects invalid characters.
-        assert_eq!(
-            parse_repo_slug_from_url("https://github.com/owner!/repo"),
-            None
-        );
-    }
-
-    #[test]
     fn accepts_canonical_slug() {
         assert!(RepoSlug::new("trailofbits/coop").is_ok());
         assert!(RepoSlug::new("user-name/repo.name_v2").is_ok());
@@ -359,8 +350,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_chars() {
+        // Smoke test that `RepoSlug::new` wires through the shared safe-name
+        // char-class check; the class itself is exhaustively exercised by
+        // `naming::rejects_out_of_class_chars`.
         assert!(RepoSlug::new("owner!/repo").is_err());
-        assert!(RepoSlug::new("owner repo/x").is_err());
     }
 
     #[test]
@@ -368,17 +361,6 @@ mod tests {
         let s = slug("trailofbits/coop");
         assert_eq!(s.owner(), "trailofbits");
         assert_eq!(s.repo(), "coop");
-        assert_eq!(s.as_str(), "trailofbits/coop");
-    }
-
-    #[test]
-    fn display_matches_inner() {
-        assert_eq!(format!("{}", slug("a/b")), "a/b");
-    }
-
-    #[test]
-    fn from_str_round_trips() {
-        let s: RepoSlug = "trailofbits/coop".parse().unwrap();
         assert_eq!(s.as_str(), "trailofbits/coop");
     }
 
@@ -406,13 +388,6 @@ mod tests {
             err.to_string().contains("owner/repo"),
             "expected owner/repo error, got: {err}"
         );
-    }
-
-    #[test]
-    fn serialize_round_trips() {
-        let s = slug("a/b");
-        let json = serde_json::to_string(&s).unwrap();
-        assert_eq!(json, "\"a/b\"");
     }
 
     #[test]
@@ -454,5 +429,67 @@ mod tests {
             GitRepoUrl::new("https://github.com/a/b"),
             GitRepoUrl::new("https://github.com/a/c")
         );
+    }
+
+    // ── Property tests ─────────────────────────────────────────────
+    //
+    // These subsume the hand-picked round-trip examples (now removed) and
+    // the per-prefix URL examples above: each sampled a single instance of
+    // what the properties below assert over the whole safe-name input space.
+
+    /// A non-empty `owner`/`repo` segment drawn from the safe-name class
+    /// (`[a-zA-Z0-9_.-]`) — exactly what `RepoSlug::new` accepts per segment.
+    /// Shared by both properties.
+    const SEGMENT: &str = "[a-zA-Z0-9_.-]{1,30}";
+
+    proptest! {
+        /// Every `owner/repo` built from the safe-name class is accepted by
+        /// `RepoSlug::new` and round-trips through every representation: the
+        /// accessors recompose the input, and `Display`, `FromStr`, and the
+        /// serde string form all agree with it.
+        #[test]
+        fn valid_slug_round_trips(owner in SEGMENT, repo in SEGMENT) {
+            let raw = format!("{owner}/{repo}");
+            let parsed = RepoSlug::new(&raw).unwrap();
+
+            prop_assert_eq!(parsed.owner(), owner.as_str());
+            prop_assert_eq!(parsed.repo(), repo.as_str());
+            prop_assert_eq!(parsed.as_str(), raw.as_str());
+            prop_assert_eq!(parsed.to_string(), raw.clone());
+            prop_assert_eq!(raw.parse::<RepoSlug>().unwrap(), parsed.clone());
+
+            let json = serde_json::to_string(&parsed).unwrap();
+            prop_assert_eq!(json.clone(), format!("\"{raw}\""));
+            prop_assert_eq!(serde_json::from_str::<RepoSlug>(&json).unwrap(), parsed);
+        }
+
+        /// For every recognised prefix in `GITHUB_URL_PREFIXES`, a valid slug
+        /// survives optional `.git` and trailing-slash noise and parses back
+        /// to the same slug.
+        #[test]
+        fn url_round_trips_through_noise(
+            prefix_idx in 0..GITHUB_URL_PREFIXES.len(),
+            owner in SEGMENT,
+            repo in SEGMENT,
+            dot_git in any::<bool>(),
+            trailing_slash in any::<bool>(),
+        ) {
+            // A repo literally ending in `.git` collides with the suffix the
+            // parser strips, making the canonical target ambiguous; real repo
+            // names don't end in `.git`, so exclude that case. Mirror the
+            // parser's own (case-sensitive) `strip_suffix(".git")`.
+            prop_assume!(repo.strip_suffix(".git").is_none());
+
+            let mut url = format!("{}{owner}/{repo}", GITHUB_URL_PREFIXES[prefix_idx]);
+            if dot_git {
+                url.push_str(".git");
+            }
+            if trailing_slash {
+                url.push('/');
+            }
+
+            let expected = RepoSlug::new(&format!("{owner}/{repo}")).unwrap();
+            prop_assert_eq!(parse_repo_slug_from_url(&url), Some(expected));
+        }
     }
 }
