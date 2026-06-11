@@ -135,6 +135,19 @@ impl AccountName {
         Self(slug.as_str().replace('/', "-"))
     }
 
+    /// Validate `s` as an account name (non-empty, `[a-zA-Z0-9_.-]`) and wrap
+    /// it. This is the inverse boundary to [`from_repo`](Self::from_repo):
+    /// recovering a [`CmdToken::File`] from a stored `cmd:cat` path parses the
+    /// filename stem back into an `AccountName`, and only a stem in this
+    /// character class could have been produced by `from_repo`.
+    pub fn new(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            bail!("Account name is empty");
+        }
+        validate_safe_chars(s, "Account name")?;
+        Ok(Self(s.to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -274,8 +287,12 @@ pub enum CmdToken {
     SecretService { service: String, account: String },
     /// 1Password item read via `op item get`.
     OnePassword { title: String },
-    /// Plain-file read via `cat`, under `<state>/github-pat/<name>.txt`.
-    File { path: PathBuf },
+    /// Plain-file read via `cat`. Modelled by its varying parts — the state
+    /// directory and the [`AccountName`] — rather than a free `PathBuf`, so
+    /// the canonical `<dir>/github-pat/<account>.txt` layout holds by
+    /// construction and every representable value round-trips through
+    /// [`Display`](fmt::Display) / [`parse`](Self::parse).
+    File { dir: PathBuf, account: AccountName },
 }
 
 impl CmdToken {
@@ -350,9 +367,9 @@ impl CmdToken {
             ] => Some(Self::OnePassword {
                 title: (*title).to_string(),
             }),
-            ["cat", path] if is_pat_file(Path::new(path)) => Some(Self::File {
-                path: PathBuf::from(path),
-            }),
+            ["cat", path] => {
+                parse_pat_file(Path::new(path)).map(|(dir, account)| Self::File { dir, account })
+            }
             _ => None,
         }
     }
@@ -380,21 +397,32 @@ impl fmt::Display for CmdToken {
                 "cmd:op item get {} --fields password --reveal",
                 shell_quote(title),
             ),
-            Self::File { path } => {
+            Self::File { dir, account } => {
+                let path = file_backend_path(dir, account);
                 write!(f, "cmd:cat {}", shell_quote(&path.to_string_lossy()))
             }
         }
     }
 }
 
-/// Does `path` follow the canonical `…/github-pat/<name>.txt` layout coop
-/// writes for the file backend?
-fn is_pat_file(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "txt")
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|dir| dir == PAT_DIR)
+/// Decompose a `cat` path into the parts of a [`CmdToken::File`], or `None`
+/// if it does not follow the canonical `<dir>/github-pat/<account>.txt`
+/// layout coop writes for the file backend.
+///
+/// This is the exact inverse of joining those parts in
+/// [`file_backend_path`]: the `.txt` suffix and `github-pat` parent are
+/// stripped, and the filename stem must be a well-formed [`AccountName`].
+/// A path that fails any check is reported as `None` rather than being
+/// misattributed to the file backend.
+fn parse_pat_file(path: &Path) -> Option<(PathBuf, AccountName)> {
+    let stem = path.file_name()?.to_str()?.strip_suffix(".txt")?;
+    let parent = path.parent()?;
+    if parent.file_name()?.to_str()? != PAT_DIR {
+        return None;
+    }
+    let dir = parent.parent()?.to_path_buf();
+    let account = AccountName::new(stem).ok()?;
+    Some((dir, account))
 }
 
 /// Split a `cmd:` body into shell words, inverting [`shell_quote`].
@@ -545,7 +573,10 @@ fn store_file(
     }
     // Suppress unused-warning for `service` when the file backend ignores it.
     let _ = service;
-    Ok(CmdToken::File { path })
+    Ok(CmdToken::File {
+        dir: state_dir.to_path_buf(),
+        account: account.clone(),
+    })
 }
 
 fn file_backend_path(state_dir: &Path, account: &AccountName) -> PathBuf {
@@ -584,6 +615,7 @@ const PAT_DIR: &str = "github-pat";
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn file_backend_always_available() {
@@ -774,45 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn cmd_token_round_trips_through_display_and_parse() {
-        // The whole point of CmdToken: Display and parse are exact inverses,
-        // so the stored string and the recognised backend cannot diverge.
-        // Titles and paths exercise shell-quoting (spaces, parens, quotes).
-        let tokens = vec![
-            #[cfg(target_os = "macos")]
-            CmdToken::Keychain {
-                service: "coop-github-pat".to_string(),
-                account: "trailofbits-coop".to_string(),
-            },
-            #[cfg(target_os = "linux")]
-            CmdToken::SecretService {
-                service: "coop-github-pat".to_string(),
-                account: "trailofbits-coop".to_string(),
-            },
-            CmdToken::OnePassword {
-                title: "coop-github-pat (trailofbits-coop)".to_string(),
-            },
-            CmdToken::OnePassword {
-                title: "weird 'quoted' title".to_string(),
-            },
-            CmdToken::File {
-                path: PathBuf::from("/home/u/.coop/state/github-pat/a-b.txt"),
-            },
-            CmdToken::File {
-                path: PathBuf::from("/tmp/space dir/github-pat/x.txt"),
-            },
-        ];
-        for token in tokens {
-            let rendered = token.to_string();
-            assert_eq!(
-                CmdToken::parse(&rendered),
-                Some(token.clone()),
-                "round-trip failed for {rendered}"
-            );
-        }
-    }
-
-    #[test]
     fn store_outputs_round_trip_through_parse() {
         // The cmd string a backend actually writes must parse back to the
         // backend that wrote it — this is the divergence the type prevents.
@@ -834,5 +827,106 @@ mod tests {
         assert_eq!(shell_split(r"'a'\''b'"), Some(vec!["a'b".into()]));
         // Unterminated single quote is rejected.
         assert_eq!(shell_split("'unterminated"), None);
+    }
+
+    // ── Property tests ─────────────────────────────────────────────
+    //
+    // `proptest!` blocks live alongside the example tests above (per the
+    // testing conventions), each pinning an invariant the examples only
+    // sample.
+
+    /// A well-formed account name — non-empty and in the `[a-zA-Z0-9_.-]`
+    /// class, exactly what [`AccountName::from_repo`] can produce.
+    fn arb_account_name() -> impl Strategy<Value = AccountName> {
+        "[a-zA-Z0-9_.-]{1,20}".prop_map(|s| AccountName::new(&s).unwrap())
+    }
+
+    /// A state directory. Mixes genuinely path-shaped values — multiple
+    /// segments, separators, empty/trailing components, and segments that
+    /// collide with the canonical layout (`github-pat`, a `*.txt` stem) —
+    /// with free text (spaces, quotes, unicode, the empty path) so the
+    /// round-trip is exercised on the inputs most likely to confuse the
+    /// `parse_pat_file` decomposition, not just random bytes. The NUL byte is
+    /// excluded; no real filesystem path carries it.
+    fn arb_dir() -> impl Strategy<Value = PathBuf> {
+        prop_oneof![
+            prop::collection::vec("(github-pat|[^\u{0}/]{0,8})", 0..4)
+                .prop_map(|segs| segs.iter().collect::<PathBuf>()),
+            "[^\u{0}]{0,40}".prop_map(PathBuf::from),
+        ]
+    }
+
+    /// A string field embedded into a `cmd:` invocation. Biased toward the
+    /// values that could collide with the surrounding literal/flag words —
+    /// the empty string, flag-shaped tokens (`-w`, `--fields`), and the
+    /// command words themselves — alongside arbitrary text. `shell_quote`
+    /// renders each as exactly one word, so a collision would have to defeat
+    /// the fixed-length slice match in `from_words`, not just look like a
+    /// flag.
+    fn arb_field() -> impl Strategy<Value = String> {
+        prop_oneof![
+            any::<String>(),
+            prop::sample::select(vec![
+                String::new(),
+                "-s".to_string(),
+                "-a".to_string(),
+                "-w".to_string(),
+                "--fields".to_string(),
+                "password".to_string(),
+                "--reveal".to_string(),
+                "cat".to_string(),
+                "lookup".to_string(),
+                "a b".to_string(),
+                "'".to_string(),
+            ]),
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn arb_system_token() -> impl Strategy<Value = CmdToken> {
+        (arb_field(), arb_field())
+            .prop_map(|(service, account)| CmdToken::Keychain { service, account })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn arb_system_token() -> impl Strategy<Value = CmdToken> {
+        (arb_field(), arb_field())
+            .prop_map(|(service, account)| CmdToken::SecretService { service, account })
+    }
+
+    fn arb_cmd_token() -> impl Strategy<Value = CmdToken> {
+        prop_oneof![
+            arb_system_token(),
+            arb_field().prop_map(|title| CmdToken::OnePassword { title }),
+            (arb_dir(), arb_account_name())
+                .prop_map(|(dir, account)| CmdToken::File { dir, account }),
+        ]
+    }
+
+    proptest! {
+        /// `shell_quote` always produces exactly one shell word that splits
+        /// back to the original string — the "escaped string parses back as
+        /// exactly one literal argument" invariant the `cmd:` encoding rests
+        /// on.
+        #[test]
+        fn shell_quote_split_round_trips(s in any::<String>()) {
+            prop_assert_eq!(shell_split(&shell_quote(&s)), Some(vec![s]));
+        }
+
+        /// `Display` and `parse` are inverses (under `CmdToken`'s `PartialEq`)
+        /// for every representable token. For `File` this holds *by
+        /// construction* now that the variant is modelled by its varying parts
+        /// rather than a free path — the case the old hand-picked examples
+        /// could not exhaust, and which surfaced the empty-string quoting bug
+        /// in the #271/#277 review. `dir` round-trips up to `Path`'s
+        /// component-wise equality (a trailing or doubled separator
+        /// normalises away), which is exactly the equality the property
+        /// asserts and matches the normalised `state_dir` `store_file` feeds
+        /// in.
+        #[test]
+        fn cmd_token_round_trips(token in arb_cmd_token()) {
+            let rendered = token.to_string();
+            prop_assert_eq!(CmdToken::parse(&rendered), Some(token));
+        }
     }
 }

@@ -24,6 +24,9 @@ hex = "0.4.3"
 mutants = "0.0.4"
 url = { version = "2", features = ["serde"] }
 
+[dev-dependencies]
+proptest = "1.11.0"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
