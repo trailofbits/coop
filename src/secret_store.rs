@@ -136,10 +136,21 @@ impl AccountName {
     }
 
     /// Validate `s` as an account name (non-empty, `[a-zA-Z0-9_.-]`) and wrap
-    /// it. This is the inverse boundary to [`from_repo`](Self::from_repo):
-    /// recovering a [`CmdToken::File`] from a stored `cmd:cat` path parses the
-    /// filename stem back into an `AccountName`, and only a stem in this
-    /// character class could have been produced by `from_repo`.
+    /// it. Used when recovering a [`CmdToken::File`] from a stored `cmd:cat`
+    /// path: the filename stem is parsed back into an `AccountName`.
+    ///
+    /// This accepts a *superset* of what [`from_repo`](Self::from_repo) emits
+    /// — `from_repo` always inserts a `-` separator, so a dash-free name like
+    /// `"abc"` passes here yet no repo slug could have produced it. That is
+    /// deliberate: the character class (not the exact `from_repo` image) is
+    /// the invariant that matters, because it keeps the value a safe filename
+    /// component and keeps [`CmdToken::parse`] an unambiguous inverse. A
+    /// recovered `File` token is only used to name the backend and to
+    /// round-trip through its `Display`; it never drives a filesystem write,
+    /// so a
+    /// stem coop would not itself have written is harmless to accept (and a
+    /// stem outside the class — spaces, quotes, a `/` — is still rejected,
+    /// falling through to `None` rather than being misattributed to `File`).
     pub fn new(s: &str) -> Result<Self> {
         if s.is_empty() {
             bail!("Account name is empty");
