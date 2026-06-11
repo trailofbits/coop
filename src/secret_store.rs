@@ -640,6 +640,26 @@ mod tests {
     }
 
     #[test]
+    fn account_name_new_rejects_empty_and_slashes() {
+        // `new` is the parse-side smart constructor `parse_pat_file` relies
+        // on: a `/` (single, repeated, or leading) in the filename stem would
+        // make the path decomposition ambiguous, so it must be rejected here.
+        // This pins what keeps the `File` round-trip unambiguous, independent
+        // of `RepoSlug`'s own gating on the `from_repo` path.
+        assert!(AccountName::new("").is_err(), "empty must be rejected");
+        for bad in ["a/b", "/a", "a/", "a//b", "/"] {
+            assert!(
+                AccountName::new(bad).is_err(),
+                "slash-bearing '{bad}' must be rejected"
+            );
+        }
+        assert_eq!(
+            AccountName::new("trailofbits-coop").unwrap().as_str(),
+            "trailofbits-coop"
+        );
+    }
+
+    #[test]
     fn account_from_repo_uses_safe_chars_only() {
         // Constructor is infallible; result must consist only of the
         // [a-zA-Z0-9_.-] class so downstream filename / lookup-key use
