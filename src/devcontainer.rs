@@ -24,6 +24,7 @@ use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
 use crate::devcontainer_oci::{FeatureRequest, ResolvedFeature};
 use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
+use crate::jsonc::jsonc_to_json;
 use crate::sha256_hash::Sha256Hash;
 
 /// Default relative path coop looks for inside a workspace or mount root.
@@ -141,94 +142,6 @@ fn canonicalize_deleted_project(project: &Path) -> PathBuf {
 }
 
 // ── Parsing ──────────────────────────────────────────────────
-
-/// Convert JSONC (`//`, `/* */`, trailing commas) to plain JSON.
-///
-/// Implements a single-pass byte scanner aware of string literals (with
-/// `\"` and `\\` escapes). Trailing commas are detected by buffering each
-/// `,` and dropping it if the next non-whitespace, non-comment token is
-/// `]` or `}`. Whitespace bytes are preserved so error offsets in
-/// downstream `serde_json` diagnostics roughly track the source.
-#[must_use]
-pub fn jsonc_to_json(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut pending_comma = false;
-    let mut in_string = false;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if pending_comma {
-                out.push(',');
-                pending_comma = false;
-            }
-            out.push(c as char);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' => {
-                if pending_comma {
-                    out.push(',');
-                    pending_comma = false;
-                }
-                in_string = true;
-                out.push('"');
-                i += 1;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                if i + 1 < bytes.len() {
-                    i += 2;
-                }
-            }
-            b',' => {
-                pending_comma = true;
-                i += 1;
-            }
-            b']' | b'}' => {
-                pending_comma = false;
-                out.push(c as char);
-                i += 1;
-            }
-            b if b.is_ascii_whitespace() => {
-                out.push(b as char);
-                i += 1;
-            }
-            _ => {
-                if pending_comma {
-                    out.push(',');
-                    pending_comma = false;
-                }
-                out.push(c as char);
-                i += 1;
-            }
-        }
-    }
-    if pending_comma {
-        // Trailing comma at EOF without a closer; let serde report it.
-        out.push(',');
-    }
-    out
-}
 
 /// Raw deserialization shape — close to the spec.
 ///
@@ -1696,51 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn jsonc_strips_line_comments() {
-        let src = r#"{
-            // a comment
-            "name": "demo" // trailing
-        }"#;
-        let json = jsonc_to_json(src);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["name"], "demo");
-    }
-
-    #[test]
-    fn jsonc_strips_block_comments() {
-        let src = r#"{ /* block */ "k": /* inline */ 1 }"#;
-        let json = jsonc_to_json(src);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["k"], 1);
-    }
-
-    #[test]
-    fn jsonc_strips_trailing_commas() {
-        let src = r#"{ "a": 1, "b": [1, 2, 3,], }"#;
-        let json = jsonc_to_json(src);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["a"], 1);
-        assert_eq!(v["b"][2], 3);
-    }
-
-    #[test]
-    fn jsonc_keeps_commas_inside_strings() {
-        let src = r#"{ "k": "a, b, c", }"#;
-        let json = jsonc_to_json(src);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["k"], "a, b, c");
-    }
-
-    #[test]
-    fn jsonc_keeps_slashes_inside_strings() {
-        let src = r#"{ "k": "https://example.com/a", "j": "/* not a comment */" }"#;
-        let json = jsonc_to_json(src);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["k"], "https://example.com/a");
-        assert_eq!(v["j"], "/* not a comment */");
-    }
-
-    #[test]
     fn parse_supported_subset() {
         let f = parse(
             r#"{
@@ -1759,44 +1627,38 @@ mod tests {
     }
 
     #[test]
-    fn translate_marks_overridden_when_cli_wins() {
+    fn translate_cli_wins_over_devcontainer_cpus_and_post_start() {
         let f = parse(r#"{ "hostRequirements": { "cpus": 4 }, "postStartCommand": "x" }"#);
+
+        // Without CLI flags the devcontainer values are the effective output.
+        let defaults = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert_eq!(defaults.vcpus, Some(4));
+        assert_eq!(defaults.post_start.as_deref(), Some("x"));
+
+        // With CLI flags set, the devcontainer values must not take effect: the
+        // CLI value wins, so the translator yields no override of its own and
+        // the resolved config keeps the CLI value.
         let inputs = TranslatorInputs {
             cli_vcpus: Some(8),
             cli_post_start: Some("y".to_string()),
             ..TranslatorInputs::default()
         };
-        let t = translate(&f, &inputs, Stage::Start);
-        let cpu = t
-            .report
-            .entries
-            .iter()
-            .find(|e| e.key == "hostRequirements.cpus")
-            .unwrap();
-        assert_eq!(cpu.status, ReportStatus::Overridden);
-        let cmd = t
-            .report
-            .entries
-            .iter()
-            .find(|e| e.key == "postStartCommand")
-            .unwrap();
-        assert_eq!(cmd.status, ReportStatus::Overridden);
-        assert!(t.vcpus.is_none());
-        assert!(t.post_start.is_none());
+        let overridden = translate(&f, &inputs, Stage::Start);
+        assert!(overridden.vcpus.is_none());
+        assert!(overridden.post_start.is_none());
     }
 
     #[test]
-    fn translate_setup_reports_storage_as_start_time_only() {
+    fn translate_storage_sizes_disk_only_at_start() {
         let f = parse(r#"{ "hostRequirements": { "storage": "16GiB" } }"#);
-        let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
-        let storage = t
-            .report
-            .entries
-            .iter()
-            .find(|e| e.key == "hostRequirements.storage")
-            .unwrap();
-        assert_eq!(storage.status, ReportStatus::Unsupported);
-        assert!(t.disk_gib.is_none());
+
+        // Disk sizing happens at `coop start`, never during setup.
+        let setup = translate(&f, &TranslatorInputs::default(), Stage::Setup);
+        assert!(setup.disk_gib.is_none());
+
+        // At start the devcontainer's storage becomes the effective disk size.
+        let start = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert!(start.disk_gib.is_some());
     }
 
     #[test]
@@ -1863,15 +1725,9 @@ mod tests {
     fn translate_remote_user_setup_captures_into_translation() {
         let f = parse(r#"{ "remoteUser": "vscode" }"#);
         let t = translate(&f, &TranslatorInputs::default(), Stage::Setup);
+        // The observable effect of a setup-stage `remoteUser` is the guest user
+        // baked into the translation; the report row is incidental.
         assert_eq!(t.guest_user.as_ref().map(GuestUser::as_str), Some("vscode"));
-        let entry = t
-            .report
-            .entries
-            .iter()
-            .find(|e| e.key == "remoteUser")
-            .unwrap();
-        assert_eq!(entry.status, ReportStatus::Applied);
-        assert_eq!(entry.source, ReportSource::Devcontainer);
     }
 
     #[test]

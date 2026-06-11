@@ -198,6 +198,8 @@ pub fn parse_cli_env_arg(entry: &str) -> Result<(EnvVarName, String)> {
 mod tests {
     use std::path::PathBuf;
 
+    use proptest::prelude::*;
+
     use super::*;
     use crate::config::{ImageName, Instance, InstanceIndex, InstanceName};
 
@@ -215,13 +217,6 @@ mod tests {
     }
 
     // ── EnvVarName ───────────────────────────────────────────
-
-    #[test]
-    fn env_var_name_accepts_valid_forms() {
-        for s in ["FOO", "_BAR", "foo", "FOO_BAR_123", "_", "_0"] {
-            assert!(EnvVarName::new(s).is_ok(), "expected '{s}' to be valid");
-        }
-    }
 
     #[test]
     fn env_var_name_rejects_invalid_forms() {
@@ -334,5 +329,73 @@ mod tests {
         let (k, v) = parse_cli_env_arg("URL=https://x?a=b&c=d").unwrap();
         assert_eq!(k, env("URL"));
         assert_eq!(v, "https://x?a=b&c=d");
+    }
+
+    // ── property tests ───────────────────────────────────────
+
+    /// Keys drawn from a deliberately small space so independently generated
+    /// maps overlap often, exercising the CLI-wins-on-collision path rather
+    /// than only disjoint unions.
+    fn small_env_map() -> impl Strategy<Value = BTreeMap<EnvVarName, String>> {
+        prop::collection::btree_map(
+            "[A-E]".prop_map(|s| EnvVarName::new(&s).unwrap()),
+            any::<String>(),
+            0..6,
+        )
+    }
+
+    proptest! {
+        /// Every string matching the documented `[a-zA-Z_][a-zA-Z0-9_]*`
+        /// grammar parses, and the parsed name preserves the input verbatim.
+        #[test]
+        fn env_var_name_accepts_all_valid_forms(s in "[a-zA-Z_][a-zA-Z0-9_]*") {
+            let name = EnvVarName::new(&s).unwrap();
+            prop_assert_eq!(name.as_str(), s.as_str());
+        }
+
+        /// `merge_persisted_entries` keeps every key from both tiers (totality)
+        /// and resolves collisions in the CLI's favour (precedence). It is
+        /// intentionally not idempotent or associative across overlapping
+        /// tiers, so only these two invariants are asserted.
+        #[test]
+        fn merge_persisted_entries_is_total_and_cli_wins(
+            dc in small_env_map(),
+            cli in small_env_map(),
+        ) {
+            let merged = merge_persisted_entries(&dc, &cli);
+
+            // Totality: the key set is exactly the union — nothing dropped or
+            // invented.
+            let union: std::collections::BTreeSet<_> =
+                dc.keys().chain(cli.keys()).cloned().collect();
+            let got: std::collections::BTreeSet<_> = merged.keys().cloned().collect();
+            prop_assert_eq!(got, union);
+
+            // Precedence: CLI wins on collision; devcontainer fills the rest.
+            for (k, v) in &merged {
+                let expected = cli.get(k).or_else(|| dc.get(k)).unwrap();
+                prop_assert_eq!(v, expected);
+            }
+        }
+
+        /// A `GuestEnvState` round-trips through disk unchanged: save → load
+        /// yields the same entries, and a second save → load is identical to
+        /// the first (deterministic `BTreeMap` ordering). An empty map is not
+        /// persisted (see `save`), so loading then yields `None`, which decodes
+        /// back to the empty snapshot it represents.
+        #[test]
+        fn guest_env_state_round_trips_through_disk(entries in small_env_map()) {
+            let tmp = tempfile::tempdir().unwrap();
+            let inst = fake_instance(tmp.path().to_path_buf());
+            let state = GuestEnvState { entries: entries.clone() };
+
+            state.save(&inst).unwrap();
+            let loaded = GuestEnvState::try_load(&inst).unwrap().unwrap_or_default();
+            prop_assert_eq!(&loaded.entries, &entries);
+
+            loaded.save(&inst).unwrap();
+            let reloaded = GuestEnvState::try_load(&inst).unwrap().unwrap_or_default();
+            prop_assert_eq!(reloaded.entries, entries);
+        }
     }
 }

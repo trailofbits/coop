@@ -11,6 +11,7 @@ mod github_repo;
 mod github_submodules;
 mod guest;
 mod guest_env_state;
+mod jsonc;
 mod naming;
 mod pat_prompt;
 mod paths;
@@ -3951,6 +3952,7 @@ fn dir_size_display(dir: &std::path::Path) -> String {
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use clap::Parser;
+    use proptest::prelude::*;
 
     use super::Cli;
 
@@ -4335,6 +4337,74 @@ mod tests {
             cfg.guest_env.get(&env("ONLY_CFG")).map(String::as_str),
             Some("cfg")
         );
+    }
+
+    /// Guest-env maps keyed in a deliberately small space so the three tiers
+    /// overlap often, exercising the precedence path rather than only disjoint
+    /// unions.
+    fn small_env_map()
+    -> impl Strategy<Value = std::collections::BTreeMap<super::guest_env_state::EnvVarName, String>>
+    {
+        prop::collection::btree_map(
+            "[A-E]".prop_map(|s| {
+                super::guest_env_state::EnvVarName::new(&s)
+                    .expect("single uppercase letter is valid")
+            }),
+            any::<String>(),
+            0..6,
+        )
+    }
+
+    proptest! {
+        /// `merge_runtime_guest_env` resolves all three tiers with
+        /// CLI > devcontainer.json > config.toml precedence. The returned map
+        /// carries exactly the devcontainer ∪ CLI entries (config-only keys
+        /// stay in `cfg.guest_env` but are never re-added to the persisted
+        /// map), and `cfg.guest_env` reflects the full three-tier merge.
+        #[test]
+        fn merge_runtime_guest_env_precedence_holds(
+            cfg_env in small_env_map(),
+            dc in small_env_map(),
+            cli_map in small_env_map(),
+        ) {
+            use super::guest_env_state::EnvVarName;
+
+            let mut cfg = super::config::CoopConfig::default();
+            for (k, v) in &cfg_env {
+                cfg.guest_env.insert(k.clone(), v.clone());
+            }
+            let cli: Vec<(EnvVarName, String)> =
+                cli_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+            let merged = super::merge_runtime_guest_env(&mut cfg, &cli, Some(&dc));
+
+            // Returned map = devcontainer ∪ CLI (CLI wins); no config-only keys.
+            let persisted_union: std::collections::BTreeSet<_> =
+                dc.keys().chain(cli_map.keys()).cloned().collect();
+            let got: std::collections::BTreeSet<_> = merged.keys().cloned().collect();
+            prop_assert_eq!(got, persisted_union);
+            for (k, v) in &merged {
+                let expected = cli_map.get(k).or_else(|| dc.get(k)).expect("key from a tier");
+                prop_assert_eq!(v, expected);
+            }
+
+            // cfg.guest_env now reflects the full three-tier precedence over
+            // every key seen in any tier.
+            let all_keys: std::collections::BTreeSet<_> = cfg_env
+                .keys()
+                .chain(dc.keys())
+                .chain(cli_map.keys())
+                .cloned()
+                .collect();
+            for k in &all_keys {
+                let expected = cli_map
+                    .get(k)
+                    .or_else(|| dc.get(k))
+                    .or_else(|| cfg_env.get(k))
+                    .expect("key from a tier");
+                prop_assert_eq!(cfg.guest_env.get(k).expect("merged key present"), expected);
+            }
+        }
     }
 
     #[test]

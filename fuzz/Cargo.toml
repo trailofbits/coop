@@ -23,5 +23,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "jsonc_to_json"
+path = "fuzz_targets/jsonc_to_json.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent package so `cargo fuzz` resolves this as its own root.
 [workspace]
