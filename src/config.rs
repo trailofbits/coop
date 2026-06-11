@@ -2308,6 +2308,7 @@ fn default_firecracker_bin() -> PathBuf {
 #[expect(clippy::panic, reason = "tests use panic! for unreachable arms")]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> CoopConfig {
@@ -2420,41 +2421,6 @@ mod tests {
         assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
         assert_eq!(hi.tap_device(), "tap252");
         assert_eq!(hi.vsock_cid(), 255);
-    }
-
-    // ── Instance paths ───────────────────────────────────────
-
-    #[test]
-    fn instance_paths_under_dir() {
-        let inst = test_inst("foo", idx(0), PathBuf::from("/data/instances/foo"));
-        assert_eq!(
-            inst.rootfs_path(),
-            PathBuf::from("/data/instances/foo/rootfs.ext4")
-        );
-        assert_eq!(
-            inst.pid_file_path(),
-            PathBuf::from("/data/instances/foo/firecracker.pid")
-        );
-        assert_eq!(
-            inst.api_socket_path(),
-            PathBuf::from("/data/instances/foo/firecracker.socket")
-        );
-        assert_eq!(
-            inst.log_path(),
-            PathBuf::from("/data/instances/foo/firecracker.log")
-        );
-        assert_eq!(
-            inst.vsock_path(),
-            PathBuf::from("/data/instances/foo/vsock.sock")
-        );
-        assert_eq!(
-            inst.vm_config_path(),
-            PathBuf::from("/data/instances/foo/vm_config.json")
-        );
-        assert_eq!(
-            inst.forwards_state_path(),
-            PathBuf::from("/data/instances/foo/forwards.json")
-        );
     }
 
     // ── Instance save/load roundtrip ─────────────────────────
@@ -3511,13 +3477,6 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn subnet_mask_display_includes_slash() {
-        assert_eq!(SubnetMask::new(24).unwrap().to_string(), "/24");
-        assert_eq!(SubnetMask::new(0).unwrap().to_string(), "/0");
-        assert_eq!(SubnetMask::new(32).unwrap().to_string(), "/32");
-    }
-
-    #[test]
     fn subnet_mask_fromstr_accepts_slash_and_bare() {
         assert_eq!(
             "/24".parse::<SubnetMask>().unwrap(),
@@ -3687,15 +3646,6 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn host_interface_display_matches_as_str() {
-        assert_eq!(HostInterface::Auto.to_string(), "auto");
-        assert_eq!(
-            HostInterface::Named(InterfaceName::new("eth0").unwrap()).to_string(),
-            "eth0"
-        );
-    }
-
-    #[test]
     fn config_load_rejects_typo_host_iface() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
@@ -3798,39 +3748,70 @@ skip = ["not-a-slug"]
         assert_eq!(cfg.vm.vcpu_count.get(), 4);
     }
 
-    // ── Config path construction ──────────────────────────────
+    // ── Path construction ─────────────────────────────────────
 
+    /// Every path getter is a deterministic `join` under a known root.
+    /// One test pins the full set — instance dir, config `data_dir`, and
+    /// the default-value getters — since each is just string composition
+    /// and a single mutation per getter would otherwise survive.
     #[test]
-    fn config_paths_relative_to_data_dir() {
+    fn paths_compose_from_their_roots() {
+        // Instance paths join under the instance dir.
+        let inst = test_inst("foo", idx(0), PathBuf::from("/data/instances/foo"));
+        for (got, want) in [
+            (inst.rootfs_path(), "/data/instances/foo/rootfs.ext4"),
+            (inst.pid_file_path(), "/data/instances/foo/firecracker.pid"),
+            (
+                inst.api_socket_path(),
+                "/data/instances/foo/firecracker.socket",
+            ),
+            (inst.log_path(), "/data/instances/foo/firecracker.log"),
+            (inst.vsock_path(), "/data/instances/foo/vsock.sock"),
+            (inst.vm_config_path(), "/data/instances/foo/vm_config.json"),
+            (
+                inst.forwards_state_path(),
+                "/data/instances/foo/forwards.json",
+            ),
+        ] {
+            assert_eq!(got, PathBuf::from(want));
+        }
+
+        // Config getters join under `data_dir`.
         let cfg = CoopConfig {
             data_dir: PathBuf::from("/my/data"),
             ..CoopConfig::default()
         };
-        // Default image paths
-        assert_eq!(
-            cfg.template_path(),
-            PathBuf::from("/my/data/images/default/rootfs-template.ext4")
-        );
-        assert_eq!(
-            cfg.template_config_path_for(&default_img()),
-            PathBuf::from("/my/data/images/default/template-config.json")
-        );
-        // Named image paths
         let python_dev = ImageName::new("python-dev").unwrap();
-        assert_eq!(
-            cfg.template_path_for(&python_dev),
-            PathBuf::from("/my/data/images/python-dev/rootfs-template.ext4")
-        );
-        assert_eq!(
-            cfg.lima_base_path(&python_dev),
-            PathBuf::from("/my/data/images/python-dev/lima-base.img")
-        );
-        assert_eq!(cfg.ssh_key_path(), PathBuf::from("/my/data/vm_key"));
-        assert_eq!(cfg.instances_dir(), PathBuf::from("/my/data/instances"));
-        assert_eq!(cfg.images_dir(), PathBuf::from("/my/data/images"));
-    }
+        for (got, want) in [
+            (
+                cfg.template_path(),
+                "/my/data/images/default/rootfs-template.ext4",
+            ),
+            (
+                cfg.template_config_path_for(&default_img()),
+                "/my/data/images/default/template-config.json",
+            ),
+            (
+                cfg.template_path_for(&python_dev),
+                "/my/data/images/python-dev/rootfs-template.ext4",
+            ),
+            (
+                cfg.lima_base_path(&python_dev),
+                "/my/data/images/python-dev/lima-base.img",
+            ),
+            (cfg.ssh_key_path(), "/my/data/vm_key"),
+            (cfg.instances_dir(), "/my/data/instances"),
+            (cfg.images_dir(), "/my/data/images"),
+        ] {
+            assert_eq!(got, PathBuf::from(want));
+        }
 
-    // ── Default values ────────────────────────────────────────
+        // Default-value getters compose the same filenames under the
+        // default data dir.
+        let data = default_data_dir();
+        assert_eq!(default_kernel_path(), data.join("vmlinux"));
+        assert_eq!(default_firecracker_bin(), data.join("firecracker"));
+    }
 
     #[test]
     fn default_data_dir_is_under_home() {
@@ -3839,20 +3820,6 @@ skip = ["not-a-slug"]
             dir.ends_with(".coop"),
             "expected path ending with .coop, got: {dir:?}"
         );
-    }
-
-    #[test]
-    fn default_kernel_path_is_under_data_dir() {
-        let kernel = default_kernel_path();
-        let data = default_data_dir();
-        assert_eq!(kernel, data.join("vmlinux"));
-    }
-
-    #[test]
-    fn default_firecracker_bin_is_under_data_dir() {
-        let bin = default_firecracker_bin();
-        let data = default_data_dir();
-        assert_eq!(bin, data.join("firecracker"));
     }
 
     // ── Config validation ─────────────────────────────────────
@@ -4136,6 +4103,57 @@ skip = ["not-a-slug"]
         assert!(
             !warnings.iter().any(|w| w.contains("firecracker_bin")),
             "firecracker_bin warning must be gated on Linux, got {warnings:?}"
+        );
+    }
+
+    // Pins `!parent.as_os_str().is_empty()`: a bare relative `data_dir`
+    // has an empty parent (`Path::new("coop").parent() == Some("")`).
+    // Deleting the emptiness guard would make the warning fire because
+    // an empty path "does not exist", so this must stay silent.
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_empty() {
+        // A single-component relative path: `Path::parent` yields `Some("")`.
+        let cfg = validate_fixture(Path::new("coop"));
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "bare relative data_dir has an empty parent; no warning expected, got {warnings:?}"
+        );
+    }
+
+    // Pins the `parent.exists()` arm at the filesystem root: `/` always
+    // exists, so a `data_dir` of `/coop` must not warn. Catches a mutant
+    // that forces the existence check to a constant.
+    #[test]
+    fn validate_no_data_dir_warning_when_parent_is_root() {
+        let cfg = validate_fixture(Path::new("/coop-data"));
+        let warnings = cfg.validate().unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("data_dir parent")),
+            "root parent '/' exists; no warning expected, got {warnings:?}"
+        );
+    }
+
+    // Pins the marketplace loop accumulating one error per offending
+    // entry: with two non-existent absolute paths, both must surface.
+    // A mutant that `break`s after the first, or skips the push, drops
+    // one of the two names.
+    #[test]
+    fn validate_collects_all_marketplace_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = validate_fixture(tmp.path());
+        cfg.claude.marketplaces = vec![
+            "/nonexistent/marketplace-a".to_string(),
+            "/nonexistent/marketplace-b".to_string(),
+        ];
+        let msg = cfg.validate().unwrap_err().to_string();
+        assert!(
+            msg.contains("marketplace-a"),
+            "missing first marketplace error: {msg}"
+        );
+        assert!(
+            msg.contains("marketplace-b"),
+            "missing second marketplace error: {msg}"
         );
     }
 
@@ -5141,5 +5159,250 @@ skip = ["not-a-slug"]
         let merged = merge_forward_ports(&cfg, &cli);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].host.get(), 14000);
+    }
+
+    // ── Property tests ───────────────────────────────────────
+    //
+    // A standing `cargo-fuzz` target for the config loader (the parser
+    // class #278 reserves fuzzing for) isn't practical here: `CoopConfig`
+    // transitively embeds `update`, `setup`, and `shell` types, so the
+    // `#[path]`-include trick used by the self-contained `jsonc` /
+    // `parse_repo_slug` targets would have to pull in most of the crate
+    // (including its network and process-spawning modules). The
+    // `config_load_never_panics` property below covers the same
+    // "never panics, only returns Err" guarantee as a CI gate; unblocking
+    // a true fuzz target would mean giving the crate a `lib` target.
+
+    fn arb_subnet_mask() -> impl Strategy<Value = SubnetMask> {
+        (0u8..=32).prop_map(|b| SubnetMask::new(b).unwrap())
+    }
+
+    fn arb_host_iface() -> impl Strategy<Value = HostInterface> {
+        prop_oneof![
+            Just(HostInterface::Auto),
+            "[a-z][a-z0-9]{0,8}"
+                .prop_map(|s| HostInterface::Named(InterfaceName::new(&s).unwrap())),
+        ]
+    }
+
+    fn arb_port_forward() -> impl Strategy<Value = PortForward> {
+        (
+            1u16..=u16::MAX,
+            1u16..=u16::MAX,
+            proptest::option::of("[a-z]{1,6}"),
+        )
+            .prop_map(|(guest, host, label)| PortForward {
+                guest: NonZeroU16::new(guest).unwrap(),
+                host: NonZeroU16::new(host).unwrap(),
+                label,
+            })
+    }
+
+    /// A `CoopConfig` with the drift-prone fields randomized: the numeric
+    /// `NonZero`/`Quantity` fields, the custom-serde network fields, the
+    /// `forward_ports` list, and an optional `post_start`. Other fields
+    /// keep their defaults — enough to exercise serde round-tripping
+    /// without an `Arbitrary` impl for every leaf type.
+    fn arb_config() -> impl Strategy<Value = CoopConfig> {
+        (
+            1u32..=u32::MAX,
+            1u8..=u8::MAX,
+            1u32..=u32::MAX,
+            arb_subnet_mask(),
+            arb_host_iface(),
+            proptest::collection::vec(arb_port_forward(), 0..4),
+            proptest::option::of("[a-zA-Z0-9 _./:-]{0,20}"),
+        )
+            .prop_map(
+                |(mem, vcpu, template, subnet_mask, host_iface, forward_ports, post_start)| {
+                    let mut cfg = CoopConfig::default();
+                    cfg.vm.mem_size_mib = MiB::new(mem).unwrap();
+                    cfg.vm.vcpu_count = NonZeroU8::new(vcpu).unwrap();
+                    cfg.vm.template_size_gib = GiB::new(template).unwrap();
+                    cfg.network.subnet_mask = subnet_mask;
+                    cfg.network.host_iface = host_iface;
+                    cfg.forward_ports = forward_ports;
+                    cfg.post_start = post_start;
+                    cfg
+                },
+            )
+    }
+
+    /// A TOML document biased toward real keys and adversarial scalar
+    /// values, so the loader's custom deserializers are actually reached
+    /// rather than rejected by the lexer. Most documents fail to parse;
+    /// the property is only that none panic.
+    fn arb_config_toml_text() -> impl Strategy<Value = String> {
+        let scalar = prop_oneof![
+            any::<i64>().prop_map(|n| n.to_string()),
+            Just("\"/24\"".to_string()),
+            Just("\"auto\"".to_string()),
+            Just("\" auto\"".to_string()),
+            Just("\"eth/0\"".to_string()),
+            Just("0".to_string()),
+            Just("[3000, \"8080:8081\"]".to_string()),
+            Just("{ guest = 3000, host = 0 }".to_string()),
+            "[a-zA-Z0-9_./-]{0,10}".prop_map(|s| format!("\"{s}\"")),
+        ];
+        let key = proptest::sample::select(vec![
+            "mem_size_mib",
+            "vcpu_count",
+            "ssh_port",
+            "subnet_mask",
+            "host_iface",
+            "host_ip",
+            "data_dir",
+            "post_start",
+            "template_size_gib",
+            "forward_ports",
+        ]);
+        let header = proptest::sample::select(vec![
+            "",
+            "[vm]",
+            "[network]",
+            "[claude]",
+            "[[forward_ports]]",
+        ]);
+        proptest::collection::vec((header, key, scalar), 0..8).prop_map(|rows| {
+            let mut out = String::new();
+            for (header, key, scalar) in rows {
+                if !header.is_empty() {
+                    out.push_str(header);
+                    out.push('\n');
+                }
+                out.push_str(key);
+                out.push_str(" = ");
+                out.push_str(&scalar);
+                out.push('\n');
+            }
+            out
+        })
+    }
+
+    fn arb_guest_path() -> impl Strategy<Value = String> {
+        // Absolute, colon-free guest path so `Mount`'s `HOST:GUEST` split
+        // and `GuestPath::absolute` both accept it.
+        proptest::collection::vec("[a-zA-Z0-9_.-]{1,8}", 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    proptest! {
+        /// `Quantity::parse_cli` → `Display` → `parse_cli` is the identity:
+        /// `Display` writes the bare integer and `parse_cli` reads it back,
+        /// for both unit markers.
+        #[test]
+        fn quantity_parse_display_roundtrips(n in 1u32..=u32::MAX) {
+            let mib = MiB::parse_cli(&n.to_string()).unwrap();
+            prop_assert_eq!(mib.as_u32(), n);
+            prop_assert_eq!(MiB::parse_cli(&mib.to_string()).unwrap(), mib);
+
+            let gib = GiB::parse_cli(&n.to_string()).unwrap();
+            prop_assert_eq!(gib.as_u32(), n);
+            prop_assert_eq!(GiB::parse_cli(&gib.to_string()).unwrap(), gib);
+        }
+
+        /// `DiskSize` has no `Display`, so its canonical string is rebuilt
+        /// from the parsed variant (`N` absolute, `+N` relative) and
+        /// re-parsed. Pins that both the `+` prefix and the GiB magnitude
+        /// survive a round-trip.
+        #[test]
+        fn disk_size_parse_render_roundtrips(relative in any::<bool>(), n in 1u32..=u32::MAX) {
+            let spec = if relative { format!("+{n}") } else { n.to_string() };
+            let ds = DiskSize::parse(&spec).unwrap();
+            let canonical = match ds {
+                DiskSize::Absolute(gib) => gib.to_string(),
+                DiskSize::Relative(gib) => format!("+{gib}"),
+            };
+            prop_assert_eq!(DiskSize::parse(&canonical).unwrap(), ds);
+        }
+
+        /// `PortForward::parse` of a `GUEST[:HOST]` spec round-trips through
+        /// the canonical `guest:host` rendering. CLI parsing never sets a
+        /// label, so value equality covers the whole struct.
+        #[test]
+        fn port_forward_parse_render_roundtrips(
+            guest in 1u16..=u16::MAX,
+            host in proptest::option::of(1u16..=u16::MAX),
+        ) {
+            let spec = match host {
+                Some(h) => format!("{guest}:{h}"),
+                None => guest.to_string(),
+            };
+            let parsed = PortForward::parse(&spec).unwrap();
+            let canonical = format!("{}:{}", parsed.guest, parsed.host);
+            prop_assert_eq!(PortForward::parse(&canonical).unwrap(), parsed);
+        }
+
+        /// `SubnetMask` round-trips `Display` → `FromStr` across the whole
+        /// `0..=32` range. (The leading `/` itself is pinned by the serde
+        /// JSON test, since `FromStr` also accepts the bare form.)
+        #[test]
+        fn subnet_mask_display_fromstr_roundtrips(bits in 0u8..=32) {
+            let mask = SubnetMask::new(bits).unwrap();
+            prop_assert_eq!(mask.to_string().parse::<SubnetMask>().unwrap(), mask);
+        }
+
+        /// `Mount::parse` round-trips through `HOST:GUEST`: re-parsing the
+        /// canonical spec rebuilt from a parsed mount yields the same
+        /// (canonicalized) host and guest paths. The host is a real temp
+        /// dir so the existence/is-dir invariants hold.
+        #[test]
+        fn mount_parse_roundtrips(guest in arb_guest_path()) {
+            let tmp = TempDir::new().unwrap();
+            let host = tmp.path().to_str().unwrap();
+            let first = Mount::parse(&format!("{host}:{guest}")).unwrap();
+            let second =
+                Mount::parse(&format!("{}:{}", first.host_path.display(), first.guest_path))
+                    .unwrap();
+            prop_assert_eq!(&first.host_path, &second.host_path);
+            prop_assert_eq!(first.guest_path.to_string(), second.guest_path.to_string());
+        }
+
+        /// Loading a serialized config and re-serializing is idempotent:
+        /// `serialize(load(serialize(cfg))) == serialize(cfg)`. Catches
+        /// serde default/skip/rename drift and any custom (de)serialize
+        /// impl that fails to round-trip (`SubnetMask`, `HostInterface`,
+        /// `PortForward`). No prior test covered the whole struct.
+        #[test]
+        fn config_toml_roundtrip_is_idempotent(cfg in arb_config()) {
+            let once = toml::to_string(&cfg).unwrap();
+            let parsed: CoopConfig = toml::from_str(&once).unwrap();
+            let twice = toml::to_string(&parsed).unwrap();
+            prop_assert_eq!(once, twice);
+        }
+
+        /// The loader must never panic on hostile input — only `Ok`/`Err`.
+        /// `proptest` reports any panic as a failure with a minimized case.
+        #[test]
+        fn config_load_never_panics(src in arb_config_toml_text()) {
+            let _ = toml::from_str::<CoopConfig>(&src);
+        }
+
+        /// `merge_forward_ports` is keyed on the guest port: the result
+        /// holds each distinct guest exactly once, in first-seen order,
+        /// and the surviving entry is the LAST across `config ++ cli`
+        /// (CLI overrides config; a later duplicate overrides an earlier
+        /// one). Generalizes the three example-based merge tests above.
+        #[test]
+        fn merge_forward_ports_keeps_last_per_guest(
+            config in proptest::collection::vec(arb_port_forward(), 0..6),
+            cli in proptest::collection::vec(arb_port_forward(), 0..6),
+        ) {
+            let merged = merge_forward_ports(&config, &cli);
+
+            let mut order: Vec<NonZeroU16> = Vec::new();
+            let mut last: HashMap<NonZeroU16, PortForward> = HashMap::new();
+            for f in config.iter().chain(cli.iter()) {
+                if last.insert(f.guest, f.clone()).is_none() {
+                    order.push(f.guest);
+                }
+            }
+
+            prop_assert_eq!(merged.len(), order.len());
+            for (got, guest) in merged.iter().zip(order.iter()) {
+                prop_assert_eq!(&got.guest, guest);
+                prop_assert_eq!(got, &last[guest]);
+            }
+        }
     }
 }
