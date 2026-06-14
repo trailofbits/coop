@@ -52,3 +52,8 @@ similar_names = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[lints.rust]
+# `cfg(kani)` is set by `cargo kani` (the bounded-proof toolchain), never by a
+# normal build. Register it so the `proofs` module doesn't trip unexpected-cfgs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

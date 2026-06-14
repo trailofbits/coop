@@ -2303,6 +2303,76 @@ fn default_firecracker_bin() -> PathBuf {
     default_data_dir().join("firecracker")
 }
 
+/// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
+/// `clippy` never compile them. Run manually with `cargo kani`; see the
+/// "Formal verification" section in `CLAUDE.md`.
+///
+/// Kani is a narrow fit in a string-heavy CLI — the type system carries
+/// most invariants here. These proofs target the only genuine fit:
+/// bounded integer/float arithmetic where a wrap or overflow would panic.
+/// The `InstanceIndex` IP-derivation range is verified instead by the
+/// exhaustive `0..=252` unit test (`instance_network_derivations_over_full_range`),
+/// and `SubnetMask` carries no arithmetic to verify — it is stored and
+/// rendered as `/N`, with the `0..=32` bound enforced by its constructor.
+#[cfg(kani)]
+mod proofs {
+    use super::{GiB, InstanceIndex, MiB};
+
+    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch:
+    /// `current.checked_add(delta)`. Over every pair of non-zero `u32`
+    /// sizes it yields `Some(current + delta)` exactly when the sum fits,
+    /// and `None` otherwise — it never wraps and never panics.
+    ///
+    /// This proves the kernel directly rather than through `resolve`,
+    /// because `resolve` wraps the `None` case with `anyhow`'s
+    /// heap-allocating error construction, which CBMC cannot model
+    /// tractably. `resolve` adds only that infallible `.context()` wrapper
+    /// on top of this kernel; its end-to-end behavior — including the
+    /// overflow → `Err` path — is pinned by the deterministic unit tests
+    /// `disk_size_resolve_relative` and `disk_size_resolve_relative_overflows`.
+    #[kani::proof]
+    fn disk_relative_add_never_wraps() {
+        let current_raw: u32 = kani::any();
+        let delta_raw: u32 = kani::any();
+        let (Some(current), Some(delta)) = (GiB::new(current_raw), GiB::new(delta_raw)) else {
+            return;
+        };
+        match current
+            .as_nonzero()
+            .checked_add(delta.as_u32())
+            .map(GiB::from_nonzero)
+        {
+            Some(sum) => assert_eq!(sum.as_u32(), current_raw + delta_raw),
+            None => assert!(current_raw.checked_add(delta_raw).is_none()),
+        }
+    }
+
+    /// `MiB::as_gib_f64` divides a non-zero `u32` by 1024.0, so the result
+    /// is always finite and strictly positive across the whole range.
+    #[kani::proof]
+    fn mib_as_gib_f64_is_finite_and_positive() {
+        let raw: u32 = kani::any();
+        let Some(mib) = MiB::new(raw) else { return };
+        let gib = mib.as_gib_f64();
+        assert!(gib.is_finite());
+        assert!(gib > 0.0);
+    }
+
+    /// The guest IP/MAC last octet is `index + 2`. For every valid index
+    /// (`0..=252`) that sum stays within `2..=254`, so it never overflows
+    /// `u32` and always fits the final IPv4/MAC octet (`u8`).
+    #[kani::proof]
+    fn instance_index_octet_stays_in_range() {
+        let raw: u16 = kani::any();
+        let Some(index) = InstanceIndex::new(raw) else {
+            return;
+        };
+        let octet = index.as_u32() + 2;
+        assert!((2..=254).contains(&octet));
+        assert!(u8::try_from(octet).is_ok());
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 #[expect(clippy::panic, reason = "tests use panic! for unreachable arms")]
@@ -2405,22 +2475,35 @@ mod tests {
 
     // ── Instance network derivation ──────────────────────────
 
-    /// Each derivation is index-driven; testing 0 and 252 covers the
-    /// arithmetic at both ends of the valid range, where overflow or
-    /// off-by-one bugs would land.
+    /// Every derivation is driven by the index. Exhaustively checking all
+    /// 253 valid indices (`0..=252`) pins the arithmetic across the full
+    /// range with no toolchain cost, so overflow, wrap, or off-by-one bugs
+    /// at any point — not just the endpoints — fail the test. This is the
+    /// zero-dependency guarantee preferred over a bounded model check for
+    /// `InstanceIndex` (see #303).
     #[test]
-    fn instance_network_derivations_at_boundaries() {
-        let lo = test_inst("test", idx(0), PathBuf::from("/tmp/fake"));
-        assert_eq!(lo.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 2));
-        assert_eq!(lo.guest_mac(), "06:00:AC:10:00:02");
-        assert_eq!(lo.tap_device(), "tap0");
-        assert_eq!(lo.vsock_cid(), 3);
+    fn instance_network_derivations_over_full_range() {
+        for n in 0..=InstanceIndex::MAX {
+            let inst = test_inst("test", idx(n), PathBuf::from("/tmp/fake"));
+            let octet = u8::try_from(n + 2).unwrap();
 
-        let hi = test_inst("test", idx(InstanceIndex::MAX), PathBuf::from("/tmp/fake"));
-        assert_eq!(hi.guest_ip(), std::net::Ipv4Addr::new(172, 16, 0, 254));
-        assert_eq!(hi.guest_mac(), "06:00:AC:10:00:fe");
-        assert_eq!(hi.tap_device(), "tap252");
-        assert_eq!(hi.vsock_cid(), 255);
+            assert_eq!(
+                inst.guest_ip(),
+                std::net::Ipv4Addr::new(172, 16, 0, octet),
+                "guest_ip at index {n}"
+            );
+            assert_eq!(
+                inst.guest_mac(),
+                format!("06:00:AC:10:00:{octet:02x}"),
+                "guest_mac at index {n}"
+            );
+            assert_eq!(
+                inst.tap_device(),
+                format!("tap{n}"),
+                "tap_device at index {n}"
+            );
+            assert_eq!(inst.vsock_cid(), u32::from(n) + 3, "vsock_cid at index {n}");
+        }
     }
 
     // ── Instance save/load roundtrip ─────────────────────────
@@ -4474,6 +4557,13 @@ skip = ["not-a-slug"]
         let ds = DiskSize::Relative(GiB::new(20).unwrap());
         let resolved = ds.resolve(GiB::new(100).unwrap()).unwrap();
         assert_eq!(resolved, GiB::new(120).unwrap());
+    }
+
+    #[test]
+    fn disk_size_resolve_relative_overflows() {
+        let ds = DiskSize::Relative(GiB::new(u32::MAX).unwrap());
+        let err = ds.resolve(GiB::new(1).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     // ── Mount parsing ───────────────────────────────────────────

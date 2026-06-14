@@ -139,6 +139,29 @@ A crash is written to `fuzz/artifacts/<target>/`; reproduce it with `cargo +nigh
 - `jsonc_to_json` — `coop::jsonc::jsonc_to_json`, fed hand-authored `devcontainer.json` text. Property: never panics.
 - `config_load` — `toml::from_str` into `coop::config::CoopConfig` then `validate`, fed `config.toml` text. Exercises the custom `Deserialize`/`visit_map` impls (`SubnetMask`, `HostInterface`, `PortForward`). Property: never panics, only returns `Err`.
 
+### Formal verification (kani)
+
+[Kani](https://model-checking.github.io/kani/) is a bounded model checker that proves the *absence* of a property (here: arithmetic overflow / panics) over all inputs in a range, rather than sampling like proptest. It is a **narrow fit** in this crate — the type system already makes most illegal states unrepresentable, so kani earns its keep only on bounded integer/float arithmetic. Like mutation testing and fuzzing, it is a manual check, not a CI gate; it needs its own toolchain.
+
+Proofs live in a `#[cfg(kani)]` module so the normal `cargo build`/`test`/`fmt`/`clippy` never compile them. They run as one module in `src/config.rs`.
+
+**Install once:** `cargo install --locked kani-verifier && cargo kani setup`
+
+```bash
+cargo kani                                       # run every proof harness (~5s total)
+cargo kani --harness disk_relative_add_never_wraps   # one harness
+```
+
+**Current proofs (`src/config.rs`, `mod proofs`):**
+
+- `disk_relative_add_never_wraps` — the arithmetic kernel of `DiskSize::resolve`'s relative branch (`current.checked_add(delta)`): for any two non-zero `u32` sizes it yields `Some(current + delta)` exactly when the sum fits, and `None` otherwise — never wraps, never panics.
+- `mib_as_gib_f64_is_finite_and_positive` — `MiB::as_gib_f64` is finite and strictly positive across the whole non-zero range.
+- `instance_index_octet_stays_in_range` — the guest IP/MAC last octet (`index + 2`) stays in `2..=254` for every valid `InstanceIndex` (`0..=252`).
+
+A note on the disk proof: the harness verifies the `checked_add` kernel directly rather than calling `DiskSize::resolve`, because `resolve` wraps the overflow case with `anyhow`'s heap-allocating error construction, which CBMC cannot model tractably (it does not terminate). `resolve` adds only that infallible `.context()` on top of the kernel; its end-to-end behavior — including overflow → `Err` — is pinned by the deterministic unit tests `disk_size_resolve_relative` / `disk_size_resolve_relative_overflows`. This is the general rule for kani here: prove the arithmetic kernel, not code paths that route through `anyhow`/allocation.
+
+The `InstanceIndex` range is also pinned the cheaper way — by the exhaustive `0..=252` unit test `instance_network_derivations_over_full_range`, which the kani harness above demonstrates rather than replaces. `SubnetMask` was considered (#303) but carries no arithmetic: it is stored and rendered as `/N`, with the `0..=32` bound enforced by its constructor, so there is nothing for a model checker to prove.
+
 ## Known workarounds (revisit later)
 
 The Firecracker CI kernel (`vmlinux-6.1.155`) is minimal and missing several modules. Two workarounds are applied in the guest install script (`src/setup.rs`, `guest_install_script()`):
