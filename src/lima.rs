@@ -709,10 +709,6 @@ fn build_golden_image(
     Ok(())
 }
 
-fn format_duration(duration: Duration) -> String {
-    format!("{}s", duration.as_secs().max(1))
-}
-
 /// Start the builder VM, install marketplaces/plugins, clean
 /// cloud-init, stop it, and extract the disk image to `output_path`.
 fn run_builder_vm(
@@ -727,7 +723,9 @@ fn run_builder_vm(
     let mut command = Command::new("limactl");
     command.arg("start");
     if let Some(timeout) = builder_timeout {
-        command.arg("--timeout").arg(format_duration(timeout));
+        command
+            .arg("--timeout")
+            .arg(crate::format_duration(timeout));
     }
     let status = command
         .arg(builder_template)
@@ -744,7 +742,7 @@ fn run_builder_vm(
     // limactl start returns exit 0 even when the provision script
     // fails — it only waits for SSH, not cloud-init completion.
     // Verify cloud-init finished successfully before proceeding.
-    verify_cloud_init_status()?;
+    verify_cloud_init_status(builder_timeout)?;
 
     // Verify critical binaries are installed before extracting the
     // image. Cloud-init can report "done" even if individual install
@@ -937,23 +935,44 @@ fn dump_builder_logs() {
 /// `limactl start` returns exit 0 as soon as SSH is reachable, even
 /// if the provision script failed. `cloud-init status --wait` blocks
 /// until cloud-init finishes and returns exit 1 on error.
-fn verify_cloud_init_status() -> Result<()> {
+fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     eprintln!("  Verifying provision script completed...");
+    let mut args = vec![
+        "shell".to_string(),
+        BUILDER_NAME.to_string(),
+        "--".to_string(),
+    ];
+    if let Some(timeout) = builder_timeout {
+        args.push("timeout".to_string());
+        args.push(crate::format_duration(timeout));
+    }
+    args.extend([
+        "cloud-init".to_string(),
+        "status".to_string(),
+        "--wait".to_string(),
+    ]);
+
     let output = Command::new("limactl")
-        .args([
-            "shell",
-            BUILDER_NAME,
-            "--",
-            "cloud-init",
-            "status",
-            "--wait",
-        ])
+        .args(args)
         .output()
         .context("Failed to check cloud-init status in builder VM")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if let Err(e) = check_cloud_init_output(output.status.code(), &stdout) {
+    let status = output.status.code();
+    let cloud_init_result = if status == Some(124) {
+        match builder_timeout {
+            Some(timeout) => Err(anyhow::anyhow!(
+                "Builder provisioning timed out after {}",
+                crate::format_duration(timeout),
+            )),
+            None => check_cloud_init_output(status, &stdout),
+        }
+    } else {
+        check_cloud_init_output(status, &stdout)
+    };
+
+    if let Err(e) = cloud_init_result {
         // Grab diagnostics from both cloud-init logs
         let grab_log = |path: &str| -> String {
             Command::new("limactl")

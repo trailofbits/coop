@@ -227,8 +227,8 @@ enum Commands {
         /// images).
         #[arg(long, value_name = "NAME", value_parser = guest::GuestUser::parse)]
         guest_user: Option<guest::GuestUser>,
-        /// Duration to wait for the setup builder VM to finish provisioning
-        #[arg(long, value_parser = parse_duration)]
+        /// Duration to wait for setup image build commands before timing out
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         builder_timeout: Option<Duration>,
         /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
         /// When present (and `--no-devcontainer` is not set), coop offers to
@@ -3994,6 +3994,10 @@ fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+fn format_duration(duration: Duration) -> String {
+    format!("{}s", duration.as_secs())
+}
+
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for unreachable branches")]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
@@ -4027,6 +4031,21 @@ mod tests {
             panic!("expected Setup variant");
         };
         assert_eq!(builder_timeout, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn setup_builder_timeout_rejects_invalid_durations() {
+        for value in ["", "0m", "abc", "18446744073709551615h"] {
+            assert!(
+                super::parse_duration(value).is_err(),
+                "{value:?} should not parse as a duration",
+            );
+        }
+    }
+
+    #[test]
+    fn format_duration_outputs_seconds() {
+        assert_eq!(super::format_duration(Duration::from_secs(90)), "90s");
     }
 
     #[test]

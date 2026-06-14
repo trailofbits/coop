@@ -492,7 +492,13 @@ fn build_template(
     let marker_json = serde_json::to_string_pretty(template_config)
         .context("Failed to serialize version marker")?;
     let full_script = compose_full_script(recipe.script, &marker_json, recipe.post_install_content);
-    install_guest_packages(cfg, output_path, &full_script, &opts.guest_user)?;
+    install_guest_packages(
+        cfg,
+        output_path,
+        &full_script,
+        &opts.guest_user,
+        opts.builder_timeout,
+    )?;
 
     // Clean up intermediate files
     eprintln!("  Cleaning up...");
@@ -1212,6 +1218,7 @@ fn install_guest_packages(
     image_path: &Path,
     script: &str,
     guest_user: &GuestUser,
+    builder_timeout: Option<Duration>,
 ) -> Result<()> {
     eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
     eprintln!("  This requires sudo and may take several minutes.");
@@ -1222,9 +1229,15 @@ fn install_guest_packages(
 
     let _guard = MountGuard::chroot(&template_str, &mount_str)?;
 
-    Cmd::new("chroot")
-        .args([&mount_str, "bash", "-c", script])
+    let mut command = Cmd::new("chroot").arg(&mount_str);
+    if let Some(timeout) = builder_timeout {
+        let timeout_arg = crate::format_duration(timeout);
+        command = command.args(["timeout", timeout_arg.as_str()]);
+    }
+    command
+        .args(["bash", "-s"])
         .sudo()
+        .stdin_input(script.as_bytes().to_vec())
         .run()
         .context("Guest package installation failed")?;
 

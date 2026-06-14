@@ -165,6 +165,7 @@ coop setup [FLAGS]
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
+| `--builder-timeout <duration>` | Duration to wait for setup image build commands before timing out. Accepts seconds by default, or `s`, `m`, and `h` suffixes. |
 | `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. Supported public `ghcr.io/devcontainers/features/*` entries are resolved and baked into the image. |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation. |
