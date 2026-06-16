@@ -2192,4 +2192,306 @@ mod tests {
         assert!(prefs.clear(&project).unwrap());
         assert!(prefs.ignored_projects().next().is_none());
     }
+
+    // ── Pure-logic application functions ─────────────────────
+
+    #[test]
+    fn apply_to_config_writes_every_field() {
+        let mut cfg = CoopConfig::default();
+        // Pick values that differ from the defaults (vcpus 2, mem 4096 MiB,
+        // no post_start, empty guest_env) so a stubbed body is observable.
+        let mut guest_env = BTreeMap::new();
+        guest_env.insert(EnvVarName::new("FOO").unwrap(), "bar".to_string());
+        let t = Translation {
+            vcpus: Some(6),
+            mem_mib: MiB::new(2048),
+            post_start: Some("echo go".to_string()),
+            guest_env,
+            ..Translation::default()
+        };
+
+        apply_to_config(&mut cfg, &t).unwrap();
+
+        assert_eq!(cfg.vm.vcpu_count.get(), 6);
+        assert_eq!(cfg.vm.mem_size_mib.as_u32(), 2048);
+        assert_eq!(cfg.post_start.as_deref(), Some("echo go"));
+        assert_eq!(
+            cfg.guest_env
+                .get(&EnvVarName::new("FOO").unwrap())
+                .map(String::as_str),
+            Some("bar"),
+        );
+    }
+
+    #[test]
+    fn effective_disk_cli_wins_then_translation_then_none() {
+        let cli = GiB::new(20).unwrap();
+        let with_disk = Translation {
+            disk_gib: GiB::new(10),
+            ..Translation::default()
+        };
+        let without_disk = Translation::default();
+
+        // CLI value wins over the translation's disk.
+        assert_eq!(effective_disk(Some(cli), &with_disk), Some(cli));
+        // No CLI value falls back to the translation's disk.
+        assert_eq!(effective_disk(None, &with_disk), GiB::new(10));
+        // Neither set yields no override.
+        assert_eq!(effective_disk(None, &without_disk), None);
+    }
+
+    #[test]
+    fn merge_into_forward_ports_merges_with_translation_override() {
+        let cfg_forwards = vec![
+            PortForward::parse("3000").unwrap(),
+            PortForward::parse("4000").unwrap(),
+        ];
+        // Translation forwards: override guest 4000's host, add 6000.
+        let t_forwards = vec![
+            PortForward::parse("4000:5000").unwrap(),
+            PortForward::parse("6000").unwrap(),
+        ];
+
+        let merged = merge_into_forward_ports(&cfg_forwards, &t_forwards);
+
+        assert_eq!(merged.len(), 3);
+        let guest4000 = merged.iter().find(|p| p.guest.get() == 4000).unwrap();
+        // Translation entry replaced the config entry for the same guest port.
+        assert_eq!(guest4000.host.get(), 5000);
+        assert!(merged.iter().any(|p| p.guest.get() == 3000));
+        assert!(merged.iter().any(|p| p.guest.get() == 6000));
+    }
+
+    #[test]
+    fn discover_finds_workspace_first_then_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mnt = tmp.path().join("mnt");
+        for root in [&ws, &mnt] {
+            let dc = root.join(DEFAULT_DEVCONTAINER_REL_PATH);
+            fs::create_dir_all(dc.parent().unwrap()).unwrap();
+            fs::write(&dc, "{}").unwrap();
+        }
+        let mount = Mount::from_parts(
+            mnt.to_str().unwrap(),
+            crate::paths::GuestPath::absolute("/m").unwrap(),
+        )
+        .unwrap();
+
+        let found = discover(Some(&ws), std::slice::from_ref(&mount));
+
+        assert_eq!(found.len(), 2);
+        // Workspace match comes first.
+        assert_eq!(found[0].origin, DiscoveryOrigin::Workspace);
+        assert_eq!(found[0].path, ws.join(DEFAULT_DEVCONTAINER_REL_PATH));
+        // Mount match follows, anchored on the mount's (canonicalised) host path.
+        assert_eq!(found[1].origin, DiscoveryOrigin::Mount);
+        assert_eq!(
+            found[1].path,
+            mount.host_path.join(DEFAULT_DEVCONTAINER_REL_PATH)
+        );
+    }
+
+    // ── Size parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_size_bytes_rejects_negative_and_non_finite() {
+        // Negative magnitudes are rejected before the byte cast (which would
+        // otherwise saturate to 0). Tested at the parser directly so the
+        // rejection is observable rather than masked by the zero check.
+        assert!(parse_size_bytes("-1GB").is_err());
+        assert!(parse_size_bytes("infGB").is_err());
+        // Zero magnitude is accepted here (zero is rejected later, in
+        // `MemorySpec::parse`), pinning `< 0.0` against a `<= 0.0` mutant.
+        assert_eq!(parse_size_bytes("0GB").unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_spec_parses_tib_and_kib_multipliers() {
+        // 1 TiB = 2^40 bytes = 2^20 MiB.
+        assert_eq!(
+            MemorySpec::parse("1TiB").unwrap().as_mib().as_u32(),
+            1024 * 1024,
+        );
+        // 2048 KiB = 2 MiB exactly.
+        assert_eq!(MemorySpec::parse("2048KiB").unwrap().as_mib().as_u32(), 2);
+    }
+
+    // ── Translator guards ────────────────────────────────────
+
+    #[test]
+    fn translate_host_requirements_rejects_zero_cpus() {
+        let f = parse(r#"{ "hostRequirements": { "cpus": 0 } }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let row = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "hostRequirements.cpus")
+            .unwrap();
+        assert_eq!(row.status, ReportStatus::Invalid);
+        assert!(t.vcpus.is_none());
+    }
+
+    #[test]
+    fn translate_remote_user_start_match_applies() {
+        let f = parse(r#"{ "remoteUser": "vscode" }"#);
+        let inputs = TranslatorInputs {
+            persisted_guest_user: Some(GuestUser::new("vscode").unwrap()),
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Start);
+        let entry = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "remoteUser")
+            .unwrap();
+        // A persisted user that matches the devcontainer's `remoteUser` must
+        // report `Applied`, not `Unsupported`.
+        assert_eq!(entry.status, ReportStatus::Applied);
+    }
+
+    #[test]
+    fn translate_container_env_all_overridden_emits_no_zero_count_rows() {
+        // Every key is CLI-overridden, so the applied/invalid buckets are
+        // empty. The empty-bucket guards must suppress spurious zero-count
+        // `Applied`/`Invalid` rows while still emitting the `Overridden` row.
+        let f = parse(r#"{ "containerEnv": { "FOO": "x" } }"#);
+        let inputs = TranslatorInputs {
+            cli_guest_env_keys: vec![EnvVarName::new("FOO").unwrap()],
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Start);
+        let rows: Vec<_> = t
+            .report
+            .entries
+            .iter()
+            .filter(|e| e.key == "containerEnv")
+            .collect();
+        assert!(rows.iter().any(|e| e.status == ReportStatus::Overridden));
+        assert!(!rows.iter().any(|e| e.status == ReportStatus::Applied));
+        assert!(!rows.iter().any(|e| e.status == ReportStatus::Invalid));
+    }
+
+    #[test]
+    fn translate_forward_ports_all_overridden_emits_no_zero_count_applied_row() {
+        // The only forwarded port is CLI-overridden, leaving the applied
+        // bucket empty. No zero-count `Applied` row may appear; the
+        // `Overridden` row must.
+        let f = parse(r#"{ "forwardPorts": [3000] }"#);
+        let inputs = TranslatorInputs {
+            cli_forward_ports: vec![PortForward::parse("3000").unwrap()],
+            ..TranslatorInputs::default()
+        };
+        let t = translate(&f, &inputs, Stage::Start);
+        let rows: Vec<_> = t
+            .report
+            .entries
+            .iter()
+            .filter(|e| e.key == "forwardPorts")
+            .collect();
+        assert!(rows.iter().any(|e| e.status == ReportStatus::Overridden));
+        assert!(!rows.iter().any(|e| e.status == ReportStatus::Applied));
+    }
+
+    #[test]
+    fn translate_mounts_all_invalid_emits_no_zero_count_applied_row() {
+        // The single mount fails to parse (unsupported type), leaving the
+        // applied bucket empty. An `Invalid` row must appear and there must
+        // be no zero-count `Applied` row.
+        let f = parse(r#"{ "mounts": [{ "type": "volume", "source": "v", "target": "/b" }] }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let rows: Vec<_> = t
+            .report
+            .entries
+            .iter()
+            .filter(|e| e.key == "mounts")
+            .collect();
+        assert!(rows.iter().any(|e| e.status == ReportStatus::Invalid));
+        assert!(!rows.iter().any(|e| e.status == ReportStatus::Applied));
+    }
+
+    // ── Report rendering ─────────────────────────────────────
+
+    #[test]
+    fn render_value_renders_numbers_and_unquoted_strings() {
+        let f = parse(r#"{ "wackyNum": 1, "wackyStr": "hello" }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let num = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "wackyNum")
+            .unwrap();
+        assert_eq!(num.value, "1");
+        let s = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "wackyStr")
+            .unwrap();
+        // String values render bare — no surrounding JSON quotes.
+        assert_eq!(s.value, "hello");
+    }
+
+    #[test]
+    fn render_value_opt_renders_image_value() {
+        let f = parse(r#"{ "image": "ignored" }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let img = t.report.entries.iter().find(|e| e.key == "image").unwrap();
+        assert_eq!(img.value, "ignored");
+    }
+
+    #[test]
+    fn format_pf_renders_applied_forward_ports_value() {
+        let f = parse(r#"{ "forwardPorts": [3000, "8080:9090"] }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        let applied = t
+            .report
+            .entries
+            .iter()
+            .find(|e| e.key == "forwardPorts" && e.status == ReportStatus::Applied)
+            .unwrap();
+        // Equal guest/host renders as a bare port; differing ports render
+        // as `guest:host`. Order follows the array.
+        assert_eq!(applied.value, "3000,8080:9090");
+    }
+
+    #[test]
+    fn report_render_separates_columns_with_two_spaces() {
+        let mut report = Report::default();
+        report.push("name", ReportStatus::Invalid, ReportSource::Cli, "v", "x");
+        let rendered = report.render();
+        // The row begins with the first column (no leading separator); a
+        // `i >= 0`/`true` mutant would prefix it with two spaces, so this
+        // `find` would fail to match.
+        let data_row = rendered.lines().find(|l| l.starts_with("name")).unwrap();
+        // Columns are left-padded to their width and joined by exactly two
+        // spaces. Trailing pad on the final column is irrelevant to the
+        // separator guard, so compare against the trimmed row.
+        assert_eq!(data_row.trim_end(), "name  invalid  CLI     v      x");
+    }
+
+    // ── Preference key resolution ────────────────────────────
+
+    #[test]
+    fn project_preference_lookup_key_propagates_error_for_relative_missing_path() {
+        // The deleted-project fallback is gated on `is_absolute()`: a
+        // relative path that cannot be canonicalised must surface the error
+        // rather than be resolved through `canonicalize_deleted_project`.
+        let rel = Path::new("coop-nonexistent-relative-xyzzy/sub");
+        assert!(!rel.is_absolute());
+        assert!(project_preference_lookup_key(rel).is_err());
+    }
+
+    #[test]
+    fn parse_mount_entry_string_form_delegates_to_mount_parse() {
+        // The string-valued JSON arm must route through `parse_mount_string`;
+        // deleting it would reject every string-form mount as malformed.
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = serde_json::Value::String(format!("{}:/g", tmp.path().display()));
+        let m = parse_mount_entry(&spec).unwrap();
+        assert_eq!(m.guest_path.to_string(), "/g");
+    }
 }
