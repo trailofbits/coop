@@ -7,6 +7,9 @@ set -euo pipefail
 # jobs (fmt, clippy, test, deny, the lightweight integration scripts) so a
 # doomed tag is never pushed, and adds the checks CI does not perform:
 #   - Cargo.toml / Cargo.lock / CHANGELOG / git-tag version agreement
+#   - release builds of all three target binaries (CI builds only the native
+#     target; a cross-compile break otherwise first surfaces on the tag, which
+#     burns the version under immutable releases)
 #   - formal verification (kani), and opt-in mutation testing and fuzzing
 #   - the cross-platform VM integration suite, driven over SSH the same way
 #     tests/run-integration.sh does (these need Firecracker/Lima hardware and
@@ -189,6 +192,62 @@ run_fuzz() {
   done
 }
 
+# Release-build targets, matching the matrix in .github/workflows/release.yml.
+RELEASE_TARGETS=(aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
+
+# Offer to install missing rustup targets (interactively), and always explain
+# how. `rustup target add` installs only the std library — cross-LINKING also
+# needs platform tools, so spell that out too.
+offer_install_targets() {
+  local targets=("$@")
+  printf '\nMissing rustup targets for the release build: %s\n' "${targets[*]}"
+  printf 'Install the standard libraries with:\n'
+  printf '  rustup target add %s\n' "${targets[*]}"
+  printf 'Cross-LINKING also needs platform tools (musl-cross on macOS; musl-tools\n'
+  printf '+ gcc-aarch64-linux-gnu on Linux) — see .github/workflows/release.yml.\n'
+  if [[ ! -t 0 ]]; then
+    return
+  fi
+  printf 'Run rustup target add for %s now? [y/N] ' "${targets[*]}"
+  local ans
+  read -r ans || true
+  if [[ "$ans" =~ ^[Yy] ]]; then
+    rustup target add "${targets[@]}" || warn "rustup target add failed for: ${targets[*]}"
+  fi
+}
+
+# Build each release target whose toolchain is installed. CI only builds the
+# native target, so a cross-compile break otherwise first surfaces on the tag —
+# which, with immutable releases, burns the version.
+build_release_targets() {
+  if ! have rustup; then
+    warn "rustup not found — release targets not built locally; release.yml builds them on the tag (a failure there burns the version)."
+    return 0
+  fi
+  local installed target built=0 missing=()
+  installed="$(rustup target list --installed 2>/dev/null || true)"
+  for target in "${RELEASE_TARGETS[@]}"; do
+    grep -qx "$target" <<<"$installed" || missing+=("$target")
+  done
+  if ((${#missing[@]})); then
+    offer_install_targets "${missing[@]}"
+    installed="$(rustup target list --installed 2>/dev/null || true)"
+  fi
+  for target in "${RELEASE_TARGETS[@]}"; do
+    if grep -qx "$target" <<<"$installed"; then
+      printf 'Building %s...\n' "$target"
+      cargo build --release --target "$target" || return 1
+      built=$((built + 1))
+    else
+      warn "release target $target not built locally (toolchain absent) — release.yml builds it on the tag, uncaught here."
+    fi
+  done
+  if [[ "$built" -eq 0 ]]; then
+    warn "no release targets built locally — cross-compile breakage won't surface until the tag is pushed. Run the preflight from a host that can cross-compile all three (macOS + musl-cross)."
+  fi
+  return 0
+}
+
 prompt_for_remote() {
   if [[ -n "$REMOTE" || "$QUICK" == 1 ]]; then
     return
@@ -211,6 +270,7 @@ step "Version consistency" check_versions
 step "Format (cargo fmt --check)" cargo fmt -- --check
 step "Clippy" cargo clippy --all-targets --all-features -- -D warnings
 step "Unit tests" cargo test
+step "Release target builds" build_release_targets
 step "Supply chain (cargo deny)" run_deny
 step "Workflow audit (zizmor)" run_zizmor
 step "Integration — coop update" ./tests/integration-update.sh

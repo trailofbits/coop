@@ -26,6 +26,7 @@ push succeeds and ships something correct.
 | `cargo deny`, `zizmor` | ✓ | ✓ (if installed) | |
 | `integration-update` / `-uninstall` | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
+| Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
 | Formal verification (`cargo kani`) | | ✓ (if installed) | |
 | Full VM integration, both platforms | | ✓ (local + 1 remote) | pick remote host |
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
@@ -106,16 +107,11 @@ version and cut a fresh release** — go back to step 2 with `vX.Y.(Z+1)`.
 
 This is why the preflight matters: `release.yml` re-runs CI and then builds the
 three target binaries, and a failure in *either* burns the version. Run
-`./scripts/preflight-release.sh` (which mirrors the CI checks) before every tag
-so the only thing left to fail on the tag is the cross-compile build matrix —
-and consider building the release targets locally first to catch even that:
-
-```bash
-# from a macOS/Lima box with musl-cross set up, all three targets build locally
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
-```
+`./scripts/preflight-release.sh` before every tag — it mirrors the CI checks
+**and** builds the three release targets locally (for each rustup toolchain you
+have installed, offering to `rustup target add` any that are missing), so the
+cross-compile matrix is exercised before the tag rather than after. Run it from
+a macOS/Lima box with `musl-cross` set up to cover all three targets at once.
 
 Do **not** attempt `git push origin :refs/tags/vX.Y.Z` to delete and reuse a
 tag — immutable releases reject it, and reusing a spent version is not allowed.
