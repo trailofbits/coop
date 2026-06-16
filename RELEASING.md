@@ -27,7 +27,7 @@ push succeeds and ships something correct.
 | `integration-update` / `-uninstall` | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Formal verification (`cargo kani`) | | ✓ (if installed) | |
-| Full VM integration, both platforms | | ✓ (over SSH) | decide hosts |
+| Full VM integration, both platforms | | ✓ (local + 1 remote) | pick remote host |
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
 | Fuzzing (`--fuzz`) | | opt-in | when a parser changed |
 
@@ -57,12 +57,13 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    ./scripts/preflight-release.sh
    ```
 
-   It prompts for the `user@host` targets to run the cross-platform VM suite on
-   — give it both a **Linux/Firecracker** host and a **macOS/Lima** host. Or
-   pass them up front:
+   The full VM suite runs on **this machine** (one platform) plus **one remote
+   host** you give for the other platform — so run the preflight from a
+   macOS/Lima box and point `--remote` at a Linux/Firecracker box, or vice
+   versa. It prompts for the host, or pass it up front:
 
    ```bash
-   ./scripts/preflight-release.sh --remote you@linux-box --remote you@mac-box
+   ./scripts/preflight-release.sh --remote you@other-platform-box
    ```
 
 6. **Run the deep checks when the diff warrants it** (these are slow and not CI
@@ -73,7 +74,7 @@ CI can't run the full VM integration suite or the extra-toolchain checks
      (`parse_repo_slug`, `jsonc_to_json`, `config_load`).
 
    ```bash
-   ./scripts/preflight-release.sh --remote you@linux-box --remote you@mac-box --mutants --fuzz
+   ./scripts/preflight-release.sh --remote you@other-platform-box --mutants --fuzz
    ```
 
 7. **Open the bump PR** (`Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`), get it

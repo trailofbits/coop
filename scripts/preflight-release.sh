@@ -12,14 +12,16 @@ set -euo pipefail
 #     tests/run-integration.sh does (these need Firecracker/Lima hardware and
 #     cannot run in GitHub-hosted CI)
 #
+# The full integration suite runs on THIS machine (one platform) plus one
+# remote host you specify for the other platform.
+#
 # Usage:
 #   ./scripts/preflight-release.sh [options]
 #
 # Options:
-#   --remote USER@HOST   Run the full integration suite on this host. Repeatable
-#                        (run once for a Linux/Firecracker host and once for a
-#                        macOS/Lima host). If omitted, you are prompted.
-#   --local-integration  Also run the full integration suite on this machine.
+#   --remote USER@HOST   Run the full integration suite on this remote host (the
+#                        other platform). Local always runs too. If omitted and
+#                        running interactively, you are prompted for it.
 #   --mutants            Run mutation testing on lines changed since the last tag.
 #   --fuzz               Build and briefly run every fuzz target (needs nightly).
 #   --quick              Skip the slow gates: full integration, mutants, fuzz.
@@ -32,20 +34,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
-REMOTES=()
-LOCAL_INTEGRATION=0
+REMOTE=""
 RUN_MUTANTS=0
 RUN_FUZZ=0
 QUICK=0
 
 usage() {
-  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '/^# Release preflight/,/^# *FUZZ_SECONDS/p' "${BASH_SOURCE[0]}" |
+    sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --remote) REMOTES+=("$2"); shift 2 ;;
-    --local-integration) LOCAL_INTEGRATION=1; shift ;;
+    --remote) REMOTE="$2"; shift 2 ;;
     --mutants) RUN_MUTANTS=1; shift ;;
     --fuzz) RUN_FUZZ=1; shift ;;
     --quick) QUICK=1; shift ;;
@@ -188,25 +189,19 @@ run_fuzz() {
   done
 }
 
-prompt_for_hosts() {
-  if [[ ${#REMOTES[@]} -gt 0 || "$LOCAL_INTEGRATION" == 1 || "$QUICK" == 1 ]]; then
+prompt_for_remote() {
+  if [[ -n "$REMOTE" || "$QUICK" == 1 ]]; then
     return
   fi
   if [[ ! -t 0 ]]; then
-    warn "No --remote host and not a TTY — cross-platform integration NOT run. Run ./tests/run-integration.sh --remote user@host on both a Linux and a macOS host."
+    warn "No --remote host and not a TTY — the other platform's integration suite is NOT run. Pass --remote user@host, or run ./tests/run-integration.sh --remote user@host yourself."
     return
   fi
-  printf '\nThe full integration suite needs VM hardware (Firecracker on Linux, Lima on macOS).\n'
-  printf 'Enter user@host targets, space-separated (blank to skip): '
+  printf '\nThe full suite runs here (this platform). Enter a remote user@host for\n'
+  printf 'the other platform (Firecracker on Linux, Lima on macOS), blank to skip: '
   local line
   read -r line || true
-  if [[ -n "$line" ]]; then
-    read -r -a REMOTES <<<"$line"
-  fi
-  printf 'Also run the full suite on THIS host? [y/N] '
-  local ans
-  read -r ans || true
-  [[ "$ans" =~ ^[Yy] ]] && LOCAL_INTEGRATION=1
+  REMOTE="$line"
 }
 
 # ── Run ──────────────────────────────────────────────────────────
@@ -237,14 +232,12 @@ fi
 if [[ "$QUICK" == 1 ]]; then
   warn "--quick: full cross-platform integration suite skipped"
 else
-  prompt_for_hosts
-  if [[ "$LOCAL_INTEGRATION" == 1 ]]; then
-    step "Full integration (local host)" ./tests/run-integration.sh
-  fi
-  if ((${#REMOTES[@]})); then
-    for host in "${REMOTES[@]}"; do
-      step "Full integration ($host)" ./tests/run-integration.sh --remote "$host"
-    done
+  prompt_for_remote
+  step "Full integration (local host)" ./tests/run-integration.sh
+  if [[ -n "$REMOTE" ]]; then
+    step "Full integration ($REMOTE)" ./tests/run-integration.sh --remote "$REMOTE"
+  else
+    warn "No remote host given — only the local platform's integration suite ran; the other platform was not covered."
   fi
 fi
 
