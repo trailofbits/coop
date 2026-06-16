@@ -12,6 +12,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::InstanceName;
 use crate::naming::is_safe_name_char;
 
 /// A validated `owner/repo` GitHub slug.
@@ -144,6 +145,40 @@ fn canonicalize(path: &str) -> Option<RepoSlug> {
     RepoSlug::new(&format!("{owner}/{repo}")).ok()
 }
 
+/// Derive a default instance name from a git repo URL.
+///
+/// Prefers the canonical GitHub slug's repo segment; otherwise falls back to
+/// the URL's trailing path segment (with any `.git` suffix stripped). The
+/// basename is sanitized to the instance-name charset and capped at 60 chars.
+/// Returns `None` when nothing usable remains.
+pub(crate) fn git_repo_default_instance_name(repo_url: &str) -> Option<InstanceName> {
+    let base = parse_repo_slug_from_url(repo_url)
+        .and_then(|slug| slug.as_str().rsplit('/').next().map(ToOwned::to_owned))
+        .or_else(|| {
+            repo_url
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .map(|s| s.trim_end_matches(".git").to_string())
+        })?;
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        return None;
+    }
+    let max = 60.min(sanitized.len());
+    InstanceName::new(&sanitized[..max]).ok()
+}
+
 /// Detect the `owner/repo` slug for the GitHub remote of `git_dir`.
 ///
 /// Runs `git -C <git_dir> remote get-url origin` and parses the output.
@@ -247,6 +282,46 @@ mod tests {
 
     fn slug(s: &str) -> RepoSlug {
         RepoSlug::new(s).unwrap()
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_uses_repo_basename() {
+        let name =
+            git_repo_default_instance_name("https://github.com/trailofbits/coop.git").unwrap();
+        assert_eq!(name.as_str(), "coop");
+
+        let name = git_repo_default_instance_name("git@example.com:org/my.repo.git").unwrap();
+        assert_eq!(name.as_str(), "my-repo");
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_handles_url_edges() {
+        // Trailing slash, no `.git` suffix.
+        let name = git_repo_default_instance_name("https://example.com/org/widget/").unwrap();
+        assert_eq!(name.as_str(), "widget");
+
+        // scp-style without a `.git` suffix.
+        let name = git_repo_default_instance_name("git@example.com:org/tools").unwrap();
+        assert_eq!(name.as_str(), "tools");
+
+        // Bare path with no host.
+        let name = git_repo_default_instance_name("/srv/git/repo.git").unwrap();
+        assert_eq!(name.as_str(), "repo");
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_rejects_unusable_basenames() {
+        // A basename that sanitizes to nothing has no usable instance name.
+        assert!(git_repo_default_instance_name("https://example.com/org/.git").is_none());
+        assert!(git_repo_default_instance_name("https://example.com/org/---").is_none());
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_caps_long_basenames() {
+        let long = format!("https://example.com/org/{}.git", "a".repeat(200));
+        let name = git_repo_default_instance_name(&long).unwrap();
+        assert_eq!(name.as_str().len(), 60);
+        assert!(name.as_str().chars().all(|c| c == 'a'));
     }
 
     #[test]

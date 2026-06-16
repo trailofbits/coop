@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{RunningInstance, SshTarget};
-use crate::config::Instance;
+use crate::config::{Instance, Mount};
 use crate::paths::GuestPath;
 use crate::remote_command::RemoteCommand;
 
@@ -375,6 +375,22 @@ fn format_pull_failure(ssh_stderr: &[u8], tar_stderr: &[u8]) -> String {
 )]
 pub(crate) fn default_workspace_path() -> GuestPath {
     GuestPath::absolute(GUEST_WORKSPACE).expect("GUEST_WORKSPACE constant is absolute")
+}
+
+/// Reject an extra mount that would collide with the `/workspace` path a
+/// `coop up --git-repo` clone occupies.
+pub(crate) fn validate_git_repo_workspace_mounts(mounts: &[Mount]) -> Result<()> {
+    let workspace_path = default_workspace_path().to_string();
+    if mounts
+        .iter()
+        .any(|mount| mount.guest_path.to_string() == workspace_path)
+    {
+        bail!(
+            "`coop up --git-repo` clones into /workspace. \
+             Give --extra-mount an explicit non-/workspace guest path."
+        );
+    }
+    Ok(())
 }
 
 fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
@@ -1153,6 +1169,18 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    #[test]
+    fn git_repo_rejects_extra_mount_at_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).expect("data");
+        let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
+
+        let err =
+            validate_git_repo_workspace_mounts(&mounts).expect_err("expected /workspace collision");
+        assert!(format!("{err}").contains("/workspace"));
     }
 
     /// Run `f` with a thread-local WARN-level subscriber and return its

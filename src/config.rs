@@ -390,6 +390,18 @@ impl Mount {
     }
 }
 
+/// Reject a mount set in which two mounts target the same guest path.
+pub(crate) fn validate_unique_guest_paths(mounts: &[Mount]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for mount in mounts {
+        let guest_path = mount.guest_path.to_string();
+        if !seen.insert(guest_path.clone()) {
+            bail!("Duplicate mount guest path: {guest_path}");
+        }
+    }
+    Ok(())
+}
+
 /// A guest port to forward to the host for the lifetime of the VM.
 ///
 /// Construction normalizes the spec so downstream code (SSH `-L` flags)
@@ -2386,6 +2398,21 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             ..CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn validate_unique_guest_paths_rejects_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mounts = vec![
+            Mount::parse(&format!("{}:/data", a.display())).unwrap(),
+            Mount::parse(&format!("{}:/data", b.display())).unwrap(),
+        ];
+        let err = validate_unique_guest_paths(&mounts).unwrap_err();
+        assert!(format!("{err}").contains("/data"));
     }
 
     fn default_img() -> ImageName {

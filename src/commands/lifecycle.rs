@@ -307,7 +307,7 @@ fn create_up_instance(
         }
     };
     validate_copy_workspace_mounts(opts.transport, &mounts)?;
-    validate_unique_guest_paths(&mounts)?;
+    config::validate_unique_guest_paths(&mounts)?;
 
     let start_opts = StartOpts {
         name: None,
@@ -391,8 +391,8 @@ fn create_git_repo_instance(
         .map(|t| t.mounts.clone())
         .unwrap_or_default();
     mounts.extend(opts.extra_mount.clone());
-    validate_git_repo_workspace_mounts(&mounts)?;
-    validate_unique_guest_paths(&mounts)?;
+    workspace::validate_git_repo_workspace_mounts(&mounts)?;
+    config::validate_unique_guest_paths(&mounts)?;
 
     let start_opts = StartOpts {
         name: None,
@@ -414,7 +414,7 @@ fn create_git_repo_instance(
     let derived_name = opts
         .name
         .cloned()
-        .or_else(|| git_repo_default_instance_name(repo_url));
+        .or_else(|| github_repo::git_repo_default_instance_name(repo_url));
     allocate_and_start(
         be,
         cfg,
@@ -687,31 +687,6 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
     Ok(())
 }
 
-fn validate_unique_guest_paths(mounts: &[config::Mount]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for mount in mounts {
-        let guest_path = mount.guest_path.to_string();
-        if !seen.insert(guest_path.clone()) {
-            bail!("Duplicate mount guest path: {guest_path}");
-        }
-    }
-    Ok(())
-}
-
-fn validate_git_repo_workspace_mounts(mounts: &[config::Mount]) -> Result<()> {
-    let workspace_path = workspace::default_workspace_path().to_string();
-    if mounts
-        .iter()
-        .any(|mount| mount.guest_path.to_string() == workspace_path)
-    {
-        bail!(
-            "`coop up --git-repo` clones into /workspace. \
-             Give --extra-mount an explicit non-/workspace guest path."
-        );
-    }
-    Ok(())
-}
-
 fn validate_copy_workspace_mounts(
     transport: ProjectTransport,
     mounts: &[config::Mount],
@@ -799,34 +774,6 @@ fn find_git_repo_instance(
             )
         }
     }
-}
-
-fn git_repo_default_instance_name(repo_url: &str) -> Option<config::InstanceName> {
-    let base = github_repo::parse_repo_slug_from_url(repo_url)
-        .and_then(|slug| slug.as_str().rsplit('/').next().map(ToOwned::to_owned))
-        .or_else(|| {
-            repo_url
-                .trim_end_matches('/')
-                .rsplit(['/', ':'])
-                .next()
-                .map(|s| s.trim_end_matches(".git").to_string())
-        })?;
-    let sanitized: String = base
-        .chars()
-        .map(|c| {
-            if matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        return None;
-    }
-    let max = 60.min(sanitized.len());
-    config::InstanceName::new(&sanitized[..max]).ok()
 }
 
 pub(crate) fn apply_vm_overrides(
@@ -1969,61 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn git_repo_default_instance_name_uses_repo_basename() {
-        let name = super::git_repo_default_instance_name("https://github.com/trailofbits/coop.git")
-            .expect("name");
-        assert_eq!(name.as_str(), "coop");
-
-        let name =
-            super::git_repo_default_instance_name("git@example.com:org/my.repo.git").expect("name");
-        assert_eq!(name.as_str(), "my-repo");
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_handles_url_edges() {
-        // Trailing slash, no `.git` suffix.
-        let name =
-            super::git_repo_default_instance_name("https://example.com/org/widget/").expect("name");
-        assert_eq!(name.as_str(), "widget");
-
-        // scp-style without a `.git` suffix.
-        let name =
-            super::git_repo_default_instance_name("git@example.com:org/tools").expect("name");
-        assert_eq!(name.as_str(), "tools");
-
-        // Bare path with no host.
-        let name = super::git_repo_default_instance_name("/srv/git/repo.git").expect("name");
-        assert_eq!(name.as_str(), "repo");
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_rejects_unusable_basenames() {
-        // A basename that sanitizes to nothing has no usable instance name.
-        assert!(super::git_repo_default_instance_name("https://example.com/org/.git").is_none());
-        assert!(super::git_repo_default_instance_name("https://example.com/org/---").is_none());
-    }
-
-    #[test]
-    fn git_repo_default_instance_name_caps_long_basenames() {
-        let long = format!("https://example.com/org/{}.git", "a".repeat(200));
-        let name = super::git_repo_default_instance_name(&long).expect("name");
-        assert_eq!(name.as_str().len(), 60);
-        assert!(name.as_str().chars().all(|c| c == 'a'));
-    }
-
-    #[test]
-    fn git_repo_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let data = tmp.path().join("data");
-        std::fs::create_dir(&data).expect("data");
-        let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
-
-        let err = super::validate_git_repo_workspace_mounts(&mounts)
-            .expect_err("expected /workspace collision");
-        assert!(format!("{err}").contains("/workspace"));
-    }
-
-    #[test]
     fn find_git_repo_instance_returns_none_when_unmatched() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
@@ -2067,21 +1959,6 @@ mod tests {
         let err = super::ensure_up_git_repo_name_matches(&inst, repo_url, &opts)
             .expect_err("expected name mismatch");
         assert!(format!("{err}").contains("already associated"));
-    }
-
-    #[test]
-    fn validate_unique_guest_paths_rejects_duplicates() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
-        std::fs::create_dir(&a).expect("create a");
-        std::fs::create_dir(&b).expect("create b");
-        let mounts = vec![
-            super::config::Mount::parse(&format!("{}:/data", a.display())).expect("mount a"),
-            super::config::Mount::parse(&format!("{}:/data", b.display())).expect("mount b"),
-        ];
-        let err = super::validate_unique_guest_paths(&mounts).expect_err("expected duplicate");
-        assert!(format!("{err}").contains("/data"));
     }
 
     #[test]
