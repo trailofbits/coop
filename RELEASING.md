@@ -99,11 +99,23 @@ CI can't run the full VM integration suite or the extra-toolchain checks
 
 ## If the tag run fails
 
-`release.yml` re-runs CI before building, so a red tag run means a check the
-preflight would have caught was skipped (or the build matrix failed). Delete the
-tag, fix forward on `main`, and re-tag — don't move a published tag.
+**Immutable releases are enabled org-wide, so a version cannot be recovered.**
+Once `vX.Y.Z` is pushed, that version is spent: you cannot move or re-tag it and
+re-run the release. A red `release.yml` run means you **bump to the next patch
+version and cut a fresh release** — go back to step 2 with `vX.Y.(Z+1)`.
+
+This is why the preflight matters: `release.yml` re-runs CI and then builds the
+three target binaries, and a failure in *either* burns the version. Run
+`./scripts/preflight-release.sh` (which mirrors the CI checks) before every tag
+so the only thing left to fail on the tag is the cross-compile build matrix —
+and consider building the release targets locally first to catch even that:
 
 ```bash
-git push origin :refs/tags/vX.Y.Z   # delete remote tag
-git tag -d vX.Y.Z                    # delete local tag
+# from a macOS/Lima box with musl-cross set up, all three targets build locally
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
 ```
+
+Do **not** attempt `git push origin :refs/tags/vX.Y.Z` to delete and reuse a
+tag — immutable releases reject it, and reusing a spent version is not allowed.
