@@ -235,7 +235,9 @@ enum Commands {
         /// images).
         #[arg(long, value_name = "NAME", value_parser = guest::GuestUser::parse)]
         guest_user: Option<guest::GuestUser>,
-        /// Duration to wait for setup image build commands before timing out
+        /// Duration to wait for setup image build commands before timing
+        /// out. Accepts seconds by default, or an `s`/`m`/`h` suffix
+        /// (e.g. `90s`, `30m`, `2h`).
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         builder_timeout: Option<Duration>,
         /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
@@ -1177,8 +1179,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_accepts_suffixes_and_bare_seconds() {
+        assert_eq!(super::parse_duration("600"), Ok(Duration::from_secs(600)));
+        assert_eq!(super::parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(super::parse_duration("5m"), Ok(Duration::from_secs(300)));
+        assert_eq!(super::parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(super::parse_duration(" 30s "), Ok(Duration::from_secs(30)));
+    }
+
+    #[test]
     fn setup_builder_timeout_rejects_invalid_durations() {
-        for value in ["", "0m", "abc", "18446744073709551615h"] {
+        for value in ["", "0m", "abc", "1.5h", "18446744073709551615h"] {
             assert!(
                 super::parse_duration(value).is_err(),
                 "{value:?} should not parse as a duration",
@@ -1189,6 +1200,12 @@ mod tests {
     #[test]
     fn format_duration_outputs_seconds() {
         assert_eq!(super::format_duration(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn parse_then_format_normalizes_to_seconds() {
+        let parsed = super::parse_duration("1h").expect("1h parses");
+        assert_eq!(super::format_duration(parsed), "3600s");
     }
 
     #[test]

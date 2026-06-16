@@ -1235,9 +1235,8 @@ fn install_guest_packages(
         command = command.args(["timeout", timeout_arg.as_str()]);
     }
     command
-        .args(["bash", "-s"])
+        .args(["bash", "-c", script])
         .sudo()
-        .stdin_input(script.as_bytes().to_vec())
         .run()
         .context("Guest package installation failed")?;
 
