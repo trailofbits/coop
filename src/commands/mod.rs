@@ -55,7 +55,7 @@ pub(crate) fn cmd_init(config_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    std::fs::write(config_path, include_str!("../config.example.toml"))
+    std::fs::write(config_path, include_str!("../../config.example.toml"))
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
     writeln!(
         std::io::stdout(),
