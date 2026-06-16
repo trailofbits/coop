@@ -78,17 +78,20 @@ cargo install cargo-mutants --locked
 
 **Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`. These mostly shell out, run SSH, or talk to external services — unit tests can't catch behavioral changes there. `tests/integration.sh` does that job.
 
-**Running it.** Always scope with `-f`; the crate is a binary so pass `-- --bins`:
+**Running it.** Always scope with `-f`; all logic lives in the library crate
+(`src/lib.rs`; `main.rs` is a thin `coop::run()` shim), and every unit test runs
+in the lib target, so pass `-- --lib`. (`-- --bins` runs zero tests and reports
+every mutant as missed.)
 
 ```bash
 # One file
-cargo mutants -f src/config.rs -- --bins
+cargo mutants -f src/config.rs -- --lib
 
 # Several logic modules at once
-cargo mutants -f src/config.rs -f src/workspace.rs -f src/devcontainer.rs -- --bins
+cargo mutants -f src/config.rs -f src/workspace.rs -f src/devcontainer.rs -- --lib
 
 # PR-scoped: mutate only lines changed vs main
-cargo mutants --in-diff <(git diff origin/main -- 'src/*.rs') -- --bins
+cargo mutants --in-diff <(git diff origin/main -- 'src/*.rs') -- --lib
 
 # Estimate cost without running
 cargo mutants --list -f src/config.rs

@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Release preflight for coop.
+#
+# Runs every check that gates a release from one machine, mirroring the CI
+# jobs (fmt, clippy, test, deny, the lightweight integration scripts) so a
+# doomed tag is never pushed, and adds the checks CI does not perform:
+#   - Cargo.toml / Cargo.lock / CHANGELOG / git-tag version agreement
+#   - formal verification (kani), and opt-in mutation testing and fuzzing
+#   - the cross-platform VM integration suite, driven over SSH the same way
+#     tests/run-integration.sh does (these need Firecracker/Lima hardware and
+#     cannot run in GitHub-hosted CI)
+#
+# Usage:
+#   ./scripts/preflight-release.sh [options]
+#
+# Options:
+#   --remote USER@HOST   Run the full integration suite on this host. Repeatable
+#                        (run once for a Linux/Firecracker host and once for a
+#                        macOS/Lima host). If omitted, you are prompted.
+#   --local-integration  Also run the full integration suite on this machine.
+#   --mutants            Run mutation testing on lines changed since the last tag.
+#   --fuzz               Build and briefly run every fuzz target (needs nightly).
+#   --quick              Skip the slow gates: full integration, mutants, fuzz.
+#   -h, --help           Show this help.
+#
+# Environment:
+#   FUZZ_SECONDS   Per-target fuzz budget when --fuzz is set (default 30).
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
+
+REMOTES=()
+LOCAL_INTEGRATION=0
+RUN_MUTANTS=0
+RUN_FUZZ=0
+QUICK=0
+
+usage() {
+  sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remote) REMOTES+=("$2"); shift 2 ;;
+    --local-integration) LOCAL_INTEGRATION=1; shift ;;
+    --mutants) RUN_MUTANTS=1; shift ;;
+    --fuzz) RUN_FUZZ=1; shift ;;
+    --quick) QUICK=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+FAILURES=()
+WARNINGS=()
+
+section() { printf '\n========== %s ==========\n' "$1"; }
+warn() {
+  printf 'WARN: %s\n' "$1"
+  WARNINGS+=("$1")
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# step "Name" cmd args... — runs cmd, records a failure on non-zero exit but
+# keeps going so one preflight run reports every problem.
+step() {
+  local name="$1"
+  shift
+  section "$name"
+  if "$@"; then
+    printf 'PASS: %s\n' "$name"
+  else
+    printf 'FAIL: %s\n' "$name"
+    FAILURES+=("$name")
+  fi
+}
+
+cargo_toml_version() {
+  awk -F'"' '/^\[package\]/{p=1} p && /^version *=/{print $2; exit}' Cargo.toml
+}
+
+check_worktree() {
+  local dirty=0
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    printf 'Tracked changes are uncommitted:\n'
+    git status --short --untracked-files=no
+    dirty=1
+  fi
+  if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    warn "Untracked files present — confirm they are not meant for the release"
+  fi
+  return "$dirty"
+}
+
+check_versions() {
+  local v tag lockv
+  v="$(cargo_toml_version)"
+  if [[ -z "$v" ]]; then
+    echo "Could not read version from Cargo.toml" >&2
+    return 1
+  fi
+  tag="v$v"
+  printf 'Cargo.toml version: %s  (release tag: %s)\n' "$v" "$tag"
+
+  lockv="$(awk '/^name = "coop"$/{getline; gsub(/version = "|"/, ""); print; exit}' Cargo.lock)"
+  if [[ "$lockv" != "$v" ]]; then
+    printf 'Cargo.lock coop version (%s) != Cargo.toml (%s) — run cargo build to refresh the lockfile\n' "$lockv" "$v"
+    return 1
+  fi
+
+  # release.yml extracts notes with an exact whole-line match ($0 == "## vX.Y.Z"),
+  # so the header must match exactly — a trailing date would pass a looser check
+  # here yet make the release run find no notes. Mirror that exact-match.
+  if ! grep -qxF "## $tag" CHANGELOG.md; then
+    printf 'CHANGELOG.md has no exact "## %s" header — promote "## Unreleased" (header must be exactly "## %s", no trailing text)\n' "$tag" "$tag"
+    return 1
+  fi
+
+  if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+    printf 'Tag %s already exists — bump the version in Cargo.toml first\n' "$tag"
+    return 1
+  fi
+
+  printf 'Version sources agree; tag %s is free.\n' "$tag"
+}
+
+run_deny() {
+  if ! have cargo-deny; then
+    warn "cargo-deny not installed — supply-chain check skipped (CI still runs it; cargo install cargo-deny --locked)"
+    return 0
+  fi
+  cargo deny check
+}
+
+run_zizmor() {
+  if ! have zizmor; then
+    warn "zizmor not installed — workflow audit skipped (CI still runs it; pipx install zizmor)"
+    return 0
+  fi
+  zizmor .github/workflows/
+}
+
+run_kani() {
+  if ! have cargo-kani; then
+    warn "kani not installed — formal-verification proofs skipped (cargo install --locked kani-verifier && cargo kani setup)"
+    return 0
+  fi
+  cargo kani
+}
+
+run_mutants() {
+  if ! have cargo-mutants; then
+    warn "cargo-mutants not installed — mutation testing skipped (cargo install cargo-mutants --locked)"
+    return 0
+  fi
+  local lasttag
+  lasttag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+  if [[ -n "$lasttag" ]]; then
+    printf 'Mutating src/*.rs lines changed since %s\n' "$lasttag"
+    cargo mutants --in-diff <(git diff "$lasttag" -- 'src/*.rs') -- --lib
+  else
+    printf 'No prior tag found; mutating the logic-dense modules\n'
+    cargo mutants \
+      -f src/config.rs \
+      -f src/workspace.rs \
+      -f src/devcontainer.rs \
+      -f src/guest_env_state.rs \
+      -f src/github_repo.rs \
+      -f src/github_pat.rs \
+      -f src/secret_store.rs \
+      -f src/fs_util.rs \
+      -- --lib
+  fi
+}
+
+run_fuzz() {
+  if ! have cargo-fuzz; then
+    warn "cargo-fuzz not installed — fuzzing skipped (cargo install cargo-fuzz --locked)"
+    return 0
+  fi
+  cargo +nightly fuzz build
+  local target
+  for target in parse_repo_slug jsonc_to_json config_load; do
+    cargo +nightly fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-30}"
+  done
+}
+
+prompt_for_hosts() {
+  if [[ ${#REMOTES[@]} -gt 0 || "$LOCAL_INTEGRATION" == 1 || "$QUICK" == 1 ]]; then
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    warn "No --remote host and not a TTY — cross-platform integration NOT run. Run ./tests/run-integration.sh --remote user@host on both a Linux and a macOS host."
+    return
+  fi
+  printf '\nThe full integration suite needs VM hardware (Firecracker on Linux, Lima on macOS).\n'
+  printf 'Enter user@host targets, space-separated (blank to skip): '
+  local line
+  read -r line || true
+  if [[ -n "$line" ]]; then
+    read -r -a REMOTES <<<"$line"
+  fi
+  printf 'Also run the full suite on THIS host? [y/N] '
+  local ans
+  read -r ans || true
+  [[ "$ans" =~ ^[Yy] ]] && LOCAL_INTEGRATION=1
+}
+
+# ── Run ──────────────────────────────────────────────────────────
+
+step "Working tree clean" check_worktree
+step "Version consistency" check_versions
+step "Format (cargo fmt --check)" cargo fmt -- --check
+step "Clippy" cargo clippy --all-targets --all-features -- -D warnings
+step "Unit tests" cargo test
+step "Supply chain (cargo deny)" run_deny
+step "Workflow audit (zizmor)" run_zizmor
+step "Integration — coop update" ./tests/integration-update.sh
+step "Integration — coop uninstall" ./tests/integration-uninstall.sh
+step "Formal verification (kani)" run_kani
+
+if [[ "$RUN_MUTANTS" == 1 ]]; then
+  step "Mutation testing" run_mutants
+elif [[ "$QUICK" != 1 ]]; then
+  warn "Mutation testing not run — pass --mutants if this release touches logic/parsing modules"
+fi
+
+if [[ "$RUN_FUZZ" == 1 ]]; then
+  step "Fuzzing" run_fuzz
+elif [[ "$QUICK" != 1 ]]; then
+  warn "Fuzzing not run — pass --fuzz if this release touches parsers of user-editable input"
+fi
+
+if [[ "$QUICK" == 1 ]]; then
+  warn "--quick: full cross-platform integration suite skipped"
+else
+  prompt_for_hosts
+  if [[ "$LOCAL_INTEGRATION" == 1 ]]; then
+    step "Full integration (local host)" ./tests/run-integration.sh
+  fi
+  if ((${#REMOTES[@]})); then
+    for host in "${REMOTES[@]}"; do
+      step "Full integration ($host)" ./tests/run-integration.sh --remote "$host"
+    done
+  fi
+fi
+
+# ── Summary ──────────────────────────────────────────────────────
+
+section "Summary"
+if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+  printf 'Warnings (%d):\n' "${#WARNINGS[@]}"
+  printf '  - %s\n' "${WARNINGS[@]}"
+fi
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+  printf '\nFailed checks (%d):\n' "${#FAILURES[@]}"
+  printf '  - %s\n' "${FAILURES[@]}"
+  printf '\nPreflight FAILED — do not tag the release.\n'
+  exit 1
+fi
+version="$(cargo_toml_version)"
+printf 'All required checks passed for v%s.\n' "$version"
+printf 'Next: tag v%s on the merge commit and push to trigger release.yml.\n' "$version"
