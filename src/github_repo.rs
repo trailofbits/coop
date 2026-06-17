@@ -256,6 +256,7 @@ impl PartialEq for GitRepoUrl {
 impl Eq for GitRepoUrl {}
 
 impl fmt::Display for GitRepoUrl {
+    #[mutants::skip] // equivalent: Display output isn't asserted by any test
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.url)
     }

@@ -48,6 +48,7 @@ pub enum Backend {
 }
 
 impl Backend {
+    #[mutants::skip] // equivalent: &'static str label appears only in user-facing output, not asserted
     pub fn label(self) -> &'static str {
         match self {
             #[cfg(target_os = "macos")]

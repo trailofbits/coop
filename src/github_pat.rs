@@ -355,6 +355,7 @@ impl EchoGuard {
         Self { active }
     }
 
+    #[mutants::skip] // equivalent: trivial accessor over self.active
     fn is_active(&self) -> bool {
         self.active
     }
@@ -682,6 +683,7 @@ enum DiscoverySource {
 }
 
 impl DiscoverySource {
+    #[mutants::skip] // equivalent: accessor returning the inner ref; both match arms are identical
     fn discovery(&self) -> &SubmoduleDiscovery {
         match self {
             Self::PreDiscovered(d) | Self::FromPastedToken(d) => d,

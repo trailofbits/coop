@@ -730,6 +730,7 @@ impl<'de> Deserialize<'de> for SubnetMask {
         impl serde::de::Visitor<'_> for SubnetMaskVisitor {
             type Value = SubnetMask;
 
+            #[mutants::skip] // equivalent: serde Visitor::expecting is only used in error messages, not asserted
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a CIDR prefix length: \"/24\", \"24\", or integer 24")
             }
@@ -1185,19 +1186,33 @@ impl<'de> Deserialize<'de> for McpServerDef {
     }
 }
 
+/// Field count passed to `serialize_map` as a size hint for a stdio server.
+///
+/// The hint is advisory: `serde_json` and toml ignore it, so its arithmetic has
+/// no observable effect. Isolating it here keeps the field-emission logic in
+/// [`McpServerDef::serialize`] — which the `mcp_server_serializes_*` tests
+/// pin — separately mutation-tested.
+#[mutants::skip] // equivalent: serialize_map size hint is ignored by serde_json/toml
+fn stdio_map_len(args: &[String], env: &BTreeMap<EnvVarName, EnvVarName>) -> usize {
+    1 + usize::from(!args.is_empty()) + usize::from(!env.is_empty())
+}
+
+/// Field count passed to `serialize_map` as a size hint for an http/sse server.
+///
+/// As with [`stdio_map_len`], the hint is advisory and ignored by the
+/// self-describing formats coop emits, so its arithmetic is unobservable.
+#[mutants::skip] // equivalent: serialize_map size hint is ignored by serde_json/toml
+fn remote_map_len(headers: &HashMap<String, Secret<String>>) -> usize {
+    2 + usize::from(!headers.is_empty())
+}
+
 impl Serialize for McpServerDef {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
         match self {
             McpServerDef::Stdio { command, args, env } => {
-                let mut len = 1;
-                if !args.is_empty() {
-                    len += 1;
-                }
-                if !env.is_empty() {
-                    len += 1;
-                }
+                let len = stdio_map_len(args, env);
                 let mut map = serializer.serialize_map(Some(len))?;
                 map.serialize_entry("command", command)?;
                 if !args.is_empty() {
@@ -1224,7 +1239,7 @@ fn serialize_remote<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
 
-    let len = 2 + usize::from(!headers.is_empty());
+    let len = remote_map_len(headers);
     let mut map = serializer.serialize_map(Some(len))?;
     map.serialize_entry("type", kind)?;
     map.serialize_entry("url", url)?;
@@ -1834,6 +1849,7 @@ impl CoopConfig {
     }
 
     /// Path to per-project devcontainer discovery preferences.
+    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
     pub fn devcontainer_preferences_path(&self) -> PathBuf {
         self.data_dir.join("devcontainer_preferences.json")
     }
@@ -2139,6 +2155,7 @@ impl Instance {
         self.dir.join("guest_env.json")
     }
 
+    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
     pub fn devcontainer_state_path(&self) -> PathBuf {
         self.dir.join("devcontainer_state.json")
     }

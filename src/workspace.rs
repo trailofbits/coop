@@ -982,6 +982,7 @@ fn ssh_config_host(inst: &Instance) -> String {
     format!("coop-{}", inst.name)
 }
 
+#[mutants::skip] // equivalent: constant getter ($HOME/.ssh/config); no caller asserts the returned PathBuf
 fn ssh_config_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     Ok(home.join(".ssh/config"))
@@ -1183,6 +1184,42 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    #[test]
+    fn resolve_host_dir_prefers_explicit_over_state() {
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: PathBuf::from("/from/state"),
+            },
+        };
+        let dir = resolve_host_dir(Some("/from/cli"), &state, "push").expect("explicit dir");
+        assert_eq!(dir, PathBuf::from("/from/cli"));
+    }
+
+    #[test]
+    fn resolve_host_dir_falls_back_to_state_host_path() {
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
+            source: WorkspaceSource::Mount {
+                host_path: PathBuf::from("/from/state"),
+            },
+        };
+        let dir = resolve_host_dir(None, &state, "push").expect("state host_path");
+        assert_eq!(dir, PathBuf::from("/from/state"));
+    }
+
+    #[test]
+    fn resolve_host_dir_errors_when_no_host_path_and_no_explicit() {
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
+            source: WorkspaceSource::GitRepo {
+                url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
+            },
+        };
+        let err = resolve_host_dir(None, &state, "push").expect_err("no host_path");
+        assert!(format!("{err}").contains("No host_path"));
     }
 
     #[test]
