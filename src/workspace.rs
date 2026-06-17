@@ -634,16 +634,23 @@ fn marker_block_present(content: &str, host: &str) -> bool {
 
 /// Remove SSH config blocks for all instances from ~/.ssh/config.
 pub fn remove_all_ssh_config() -> Result<()> {
-    let ssh_config = ssh_config_path()?;
+    remove_all_ssh_config_at(&ssh_config_path()?)
+}
+
+/// Strip every coop marker block from `ssh_config`, rewriting it only when
+/// something was removed. A missing file is a no-op. Split from the public
+/// entry point so the read/clean/gated-write logic is testable against a
+/// temp path without mutating the process's `$HOME`.
+fn remove_all_ssh_config_at(ssh_config: &Path) -> Result<()> {
     if !ssh_config.exists() {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&ssh_config).context("Failed to read ~/.ssh/config")?;
+    let content = fs::read_to_string(ssh_config).context("Failed to read ~/.ssh/config")?;
 
     let cleaned = remove_marker_blocks(&content);
     if cleaned.len() != content.len() {
-        atomic_write(&ssh_config, &cleaned).context("Failed to write ~/.ssh/config")?;
+        atomic_write(ssh_config, &cleaned).context("Failed to write ~/.ssh/config")?;
         tracing::info!("Removed coop SSH config blocks");
     }
 
@@ -652,17 +659,24 @@ pub fn remove_all_ssh_config() -> Result<()> {
 
 /// Remove SSH config block for a specific instance.
 pub fn remove_ssh_config(inst: &Instance) -> Result<()> {
-    let ssh_config = ssh_config_path()?;
+    remove_ssh_config_at(&ssh_config_path()?, inst)
+}
+
+/// Strip the coop marker block for `inst` from `ssh_config`, rewriting it
+/// only when that block was present. A missing file is a no-op. Split from
+/// the public entry point for the same reason as
+/// [`remove_all_ssh_config_at`].
+fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
     if !ssh_config.exists() {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&ssh_config).context("Failed to read ~/.ssh/config")?;
+    let content = fs::read_to_string(ssh_config).context("Failed to read ~/.ssh/config")?;
     let host_name = ssh_config_host(inst);
 
     let cleaned = remove_named_marker_block(&content, &host_name);
     if cleaned.len() != content.len() {
-        atomic_write(&ssh_config, &cleaned).context("Failed to write ~/.ssh/config")?;
+        atomic_write(ssh_config, &cleaned).context("Failed to write ~/.ssh/config")?;
         tracing::info!("Removed SSH config block for instance '{}'", inst.name);
     }
 
@@ -1605,6 +1619,137 @@ Host coop-0\n\
 
         let result = remove_marker_blocks(input);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn remove_named_marker_block_removes_only_the_named_block() {
+        // `before`, `after`, and a second coop block bracket the target so the
+        // END-detection guard (`in_block && line == MARKER_END`) is exercised
+        // both inside and outside a block. A `&&`→`||` mutant would drop the
+        // surviving block's END line; a `==`→`!=` mutant would leave the
+        // target block's body behind. Asserting the exact result kills both.
+        let input = "\
+Host before\n\
+    HostName 1.1.1.1\n\
+# coop START coop-target\n\
+Host coop-target\n\
+    HostName 2.2.2.2\n\
+# coop END\n\
+Host after\n\
+    HostName 3.3.3.3\n\
+# coop START coop-other\n\
+Host coop-other\n\
+    HostName 4.4.4.4\n\
+# coop END\n";
+
+        let result = remove_named_marker_block(input, "coop-target");
+
+        let expected = "\
+Host before\n\
+    HostName 1.1.1.1\n\
+Host after\n\
+    HostName 3.3.3.3\n\
+# coop START coop-other\n\
+Host coop-other\n\
+    HostName 4.4.4.4\n\
+# coop END\n";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn remove_all_ssh_config_at_strips_coop_keeps_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config");
+        let original = "\
+Host keep\n\
+    HostName 9.9.9.9\n\
+# coop START coop-test\n\
+Host coop-test\n\
+    HostName 172.16.0.2\n\
+# coop END\n";
+        std::fs::write(&path, original).expect("write config");
+
+        remove_all_ssh_config_at(&path).expect("remove all");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            rewritten.contains("Host keep"),
+            "non-coop block dropped: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("coop-test"),
+            "coop block survived removal: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn remove_all_ssh_config_at_leaves_unrelated_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config");
+        let original = "Host keep\n    HostName 9.9.9.9\n";
+        std::fs::write(&path, original).expect("write config");
+
+        remove_all_ssh_config_at(&path).expect("remove all");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            rewritten, original,
+            "file with no coop block must be untouched"
+        );
+    }
+
+    #[test]
+    fn remove_ssh_config_at_removes_only_target_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config");
+        let inst = temp_instance(dir.path()); // host coop-test
+        let original = "\
+# coop START coop-test\n\
+Host coop-test\n\
+    HostName 172.16.0.2\n\
+# coop END\n\
+# coop START coop-other\n\
+Host coop-other\n\
+    HostName 172.16.0.3\n\
+# coop END\n";
+        std::fs::write(&path, original).expect("write config");
+
+        remove_ssh_config_at(&path, &inst).expect("remove one");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !rewritten.contains("coop-test"),
+            "target instance block survived: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("# coop START coop-other"),
+            "other instance block was dropped: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("HostName 172.16.0.3"),
+            "other block body dropped: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn remove_ssh_config_at_leaves_file_byte_identical_when_host_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config");
+        let inst = temp_instance(dir.path()); // host coop-test, absent below
+        let original = "\
+# coop START coop-other\n\
+Host coop-other\n\
+    HostName 172.16.0.3\n\
+# coop END\n";
+        std::fs::write(&path, original).expect("write config");
+
+        remove_ssh_config_at(&path, &inst).expect("remove one");
+
+        let rewritten = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            rewritten, original,
+            "removing an absent host must not rewrite the file"
+        );
     }
 
     // ── exclude_git policy ────────────────────────────────────
