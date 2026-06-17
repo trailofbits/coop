@@ -104,46 +104,64 @@ pub fn run_rotate_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
 /// confirm the secret store still serves it — this may trigger a
 /// Keychain dialog / `op` Touch-ID prompt per entry, so it is opt-in.
 pub fn run_status(cfg: &CoopConfig, probe: bool) {
+    print!("{}", render_status(cfg, probe));
+}
+
+/// Render the `coop github status` report as a string.
+///
+/// Pure for the non-probe path; when `probe` is true, each entry's
+/// `cmd:` invocation is resolved (running the underlying command) to
+/// confirm the secret store still serves it.
+fn render_status(cfg: &CoopConfig, probe: bool) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
     let pat = match cfg.github.as_ref() {
         Some(GitHubAuth::Pat(c)) => c,
         Some(other) => {
-            println!("github mode: {} (no PAT entries)", other.mode_name());
-            return;
+            let _ = writeln!(s, "github mode: {} (no PAT entries)", other.mode_name());
+            return s;
         }
         None => {
-            println!("github mode: off (no PAT entries)");
-            return;
+            let _ = writeln!(s, "github mode: off (no PAT entries)");
+            return s;
         }
     };
 
     if pat.entries.is_empty() && pat.skip.is_empty() {
-        println!("github mode: pat (no entries)");
-        return;
+        let _ = writeln!(s, "github mode: pat (no entries)");
+        return s;
     }
 
-    println!("github mode: pat");
-    println!("entries ({}):", pat.entries.len());
+    let _ = writeln!(s, "github mode: pat");
+    let _ = writeln!(s, "entries ({}):", pat.entries.len());
     for (repo, entry) in &pat.entries {
         let backend_label = CmdToken::parse(entry.token.expose()).map_or_else(
             || "unknown".to_string(),
             |t| t.backend().label().to_string(),
         );
-        println!("  {repo}");
-        println!("    storage: {backend_label}");
+        let _ = writeln!(s, "  {repo}");
+        let _ = writeln!(s, "    storage: {backend_label}");
         if probe {
-            let validity = match resolve_cmd_value(entry.token.expose()) {
-                Ok(token) if token.starts_with(TOKEN_PREFIX) => "resolves, format ok",
-                Ok(_) => "resolves but unexpected format",
-                Err(_) => "FAILED to resolve",
-            };
-            println!("    status:  {validity}");
+            let validity = probe_status_label(&resolve_cmd_value(entry.token.expose()));
+            let _ = writeln!(s, "    status:  {validity}");
         }
     }
     if !pat.skip.is_empty() {
-        println!("skip ({}):", pat.skip.len());
+        let _ = writeln!(s, "skip ({}):", pat.skip.len());
         for repo in &pat.skip {
-            println!("  {repo}");
+            let _ = writeln!(s, "  {repo}");
         }
+    }
+    s
+}
+
+/// Classify a resolved-token result into the one-line status label
+/// printed by `coop github status --probe`.
+fn probe_status_label(resolved: &Result<String>) -> &'static str {
+    match resolved {
+        Ok(token) if token.starts_with(TOKEN_PREFIX) => "resolves, format ok",
+        Ok(_) => "resolves but unexpected format",
+        Err(_) => "FAILED to resolve",
     }
 }
 
@@ -368,6 +386,14 @@ fn warn_token_format(token: &str) {
 /// revoked), or the response carries no `login` field.
 pub fn probe_user_login(token: &str) -> Result<String> {
     let (status, body) = curl_with_token(token, "https://api.github.com/user")?;
+    parse_user_login(status, &body)
+}
+
+/// Extract the authenticated user's `login` from a `GET /user` response.
+///
+/// Pure (no I/O) so the status check and the JSON extraction can be
+/// unit-tested without shelling out to `curl`.
+fn parse_user_login(status: u16, body: &str) -> Result<String> {
     if status != 200 {
         bail!("GET /user returned HTTP {status} (token may be invalid or revoked)");
     }
@@ -540,8 +566,20 @@ fn gh_auth_token() -> Option<String> {
         .arg("token")
         .capture()
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_gh_token(&s))
+}
+
+/// Trim `gh auth token` output and discard empty results.
+///
+/// Pure so the trim/empty-filter logic is unit-testable without invoking
+/// `gh`.
+fn parse_gh_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Pre-discover submodules using locally available credentials, before
@@ -783,6 +821,17 @@ fn pick_backend() -> Result<crate::secret_store::Backend> {
         .trim()
         .parse()
         .context("Backend choice must be a number")?;
+    select_backend(n, &backends)
+}
+
+/// Map a 1-based menu choice `n` to a backend.
+///
+/// Pure so the bounds check and the `n - 1` indexing are unit-testable
+/// without prompting on stdin.
+fn select_backend(
+    n: usize,
+    backends: &[crate::secret_store::Backend],
+) -> Result<crate::secret_store::Backend> {
     if n == 0 || n > backends.len() {
         bail!(
             "Backend choice out of range (got {n}, expected 1..={})",
@@ -985,6 +1034,7 @@ pub(crate) fn pat_config_at(path: &Path) -> Result<Option<crate::config::PatConf
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::secret_store::Backend;
 
     fn slug(s: &str) -> RepoSlug {
         RepoSlug::new(s).unwrap()
@@ -1109,6 +1159,30 @@ mod tests {
         let cfg = pat_config_at(&path).unwrap().unwrap();
         assert!(!cfg.entries.contains_key(&slug("a/b")));
         assert!(cfg.entries.contains_key(&slug("c/d")));
+    }
+
+    #[test]
+    fn upsert_replaces_non_table_pat_value() {
+        // A pre-existing `github.pat` that isn't a table must be upgraded to
+        // one (not left in place, which would fail the later `as_table_mut`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[github]\nmode = \"pat\"\npat = \"garbage\"\n").unwrap();
+        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
+        let cfg = pat_config_at(&path).unwrap().unwrap();
+        assert!(cfg.entries.contains_key(&slug("a/b")));
+    }
+
+    #[test]
+    fn skip_marker_replaces_non_array_skip_value() {
+        // A pre-existing `github.skip` that isn't an array must be replaced
+        // with one before the marker is appended.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[github]\nmode = \"pat\"\nskip = \"garbage\"\n").unwrap();
+        add_skip_marker(&path, &slug("a/b")).unwrap();
+        let cfg = pat_config_at(&path).unwrap().unwrap();
+        assert_eq!(cfg.skip, vec![slug("a/b")]);
     }
 
     #[test]
@@ -1239,5 +1313,195 @@ mod tests {
         let with_empty = build_form_instructions(&slug("acme/parent"), Some(&d));
         let without = build_form_instructions(&slug("acme/parent"), None);
         assert_eq!(with_empty, without);
+    }
+
+    // ── parse_curl_status_body ──────────────────────────────────
+
+    #[test]
+    fn parse_curl_status_body_splits_single_line_body() {
+        let (status, body) = parse_curl_status_body("hello\n200").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "hello");
+    }
+
+    #[test]
+    fn parse_curl_status_body_keeps_embedded_newlines_in_body() {
+        let (status, body) = parse_curl_status_body("a\nb\n404").unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(body, "a\nb");
+    }
+
+    #[test]
+    fn parse_curl_status_body_handles_status_only_no_newline() {
+        let (status, body) = parse_curl_status_body("200").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn parse_curl_status_body_errors_on_non_numeric_trailer() {
+        let err = parse_curl_status_body("body\nnotastatus").unwrap_err();
+        assert!(err.to_string().contains("Failed to parse HTTP status"));
+    }
+
+    // ── parse_user_login ────────────────────────────────────────
+
+    #[test]
+    fn parse_user_login_extracts_login_on_200() {
+        let login = parse_user_login(200, r#"{"login":"octocat","id":1}"#).unwrap();
+        assert_eq!(login, "octocat");
+    }
+
+    #[test]
+    fn parse_user_login_errors_on_200_without_login() {
+        let err = parse_user_login(200, r#"{"id":1}"#).unwrap_err();
+        assert!(err.to_string().contains("unexpected response"));
+    }
+
+    #[test]
+    fn parse_user_login_errors_on_non_200() {
+        let err = parse_user_login(401, r#"{"login":"octocat"}"#).unwrap_err();
+        assert!(err.to_string().contains("HTTP 401"));
+    }
+
+    // ── select_backend ──────────────────────────────────────────
+
+    #[test]
+    fn select_backend_rejects_zero() {
+        let backends = [Backend::File, Backend::OnePassword];
+        let err = select_backend(0, &backends).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn select_backend_returns_first_for_one() {
+        let backends = [Backend::File, Backend::OnePassword];
+        assert_eq!(select_backend(1, &backends).unwrap(), Backend::File);
+    }
+
+    #[test]
+    fn select_backend_returns_last_for_len() {
+        let backends = [Backend::File, Backend::OnePassword];
+        assert_eq!(select_backend(2, &backends).unwrap(), Backend::OnePassword);
+    }
+
+    #[test]
+    fn select_backend_rejects_past_end() {
+        let backends = [Backend::File, Backend::OnePassword];
+        let err = select_backend(3, &backends).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    // ── doc_contains_literal_token ──────────────────────────────
+
+    fn toml_doc(s: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(s).unwrap()
+    }
+
+    #[test]
+    fn doc_contains_literal_token_false_for_cmd_prefixed() {
+        let doc = toml_doc("[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n");
+        assert!(!doc_contains_literal_token(&doc));
+    }
+
+    #[test]
+    fn doc_contains_literal_token_true_for_literal() {
+        let doc = toml_doc("[github.pat.\"a/b\"]\ntoken = \"github_pat_literal\"\n");
+        assert!(doc_contains_literal_token(&doc));
+    }
+
+    #[test]
+    fn doc_contains_literal_token_false_without_pat_table() {
+        let doc = toml_doc("ssh_port = 2222\n");
+        assert!(!doc_contains_literal_token(&doc));
+    }
+
+    // ── probe_status_label ──────────────────────────────────────
+
+    #[test]
+    fn probe_status_label_ok_with_prefix_is_format_ok() {
+        let resolved: Result<String> = Ok(format!("{TOKEN_PREFIX}abc"));
+        assert_eq!(probe_status_label(&resolved), "resolves, format ok");
+    }
+
+    #[test]
+    fn probe_status_label_ok_without_prefix_is_unexpected() {
+        let resolved: Result<String> = Ok("ghp_classic".to_string());
+        assert_eq!(
+            probe_status_label(&resolved),
+            "resolves but unexpected format"
+        );
+    }
+
+    #[test]
+    fn probe_status_label_err_is_failed() {
+        let resolved: Result<String> = Err(anyhow!("boom"));
+        assert_eq!(probe_status_label(&resolved), "FAILED to resolve");
+    }
+
+    // ── render_status ───────────────────────────────────────────
+
+    fn config_from(s: &str) -> CoopConfig {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, s).unwrap();
+        CoopConfig::load(&path).unwrap()
+    }
+
+    #[test]
+    fn render_status_both_empty_reports_no_entries() {
+        let cfg = config_from("[github]\nmode = \"pat\"\n");
+        let out = render_status(&cfg, false);
+        assert_eq!(out, "github mode: pat (no entries)\n");
+    }
+
+    #[test]
+    fn render_status_entries_only_omits_skip_section() {
+        let cfg = config_from(
+            "[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n",
+        );
+        let out = render_status(&cfg, false);
+        assert!(out.contains("github mode: pat\n"));
+        assert!(out.contains("entries (1):"));
+        assert!(out.contains("  a/b"));
+        assert!(!out.contains("skip ("));
+        // probe disabled → no per-entry status line.
+        assert!(!out.contains("status:"));
+    }
+
+    #[test]
+    fn render_status_skip_only_shows_zero_entries_and_skip_section() {
+        let cfg = config_from("[github]\nmode = \"pat\"\nskip = [\"a/b\"]\n");
+        let out = render_status(&cfg, false);
+        // The `&&` guard must NOT short-circuit to "(no entries)" when only
+        // skip is populated.
+        assert!(!out.contains("(no entries)"));
+        assert!(out.contains("entries (0):"));
+        assert!(out.contains("skip (1):"));
+        assert!(out.contains("  a/b"));
+    }
+
+    #[test]
+    fn render_status_non_pat_mode_reports_no_pat_entries() {
+        let cfg = config_from("github = \"off\"\n");
+        let out = render_status(&cfg, false);
+        assert!(out.contains("(no PAT entries)"));
+    }
+
+    // ── parse_gh_token ──────────────────────────────────────────
+
+    #[test]
+    fn parse_gh_token_trims_surrounding_whitespace() {
+        assert_eq!(parse_gh_token("  ghp_x \n"), Some("ghp_x".to_string()));
+    }
+
+    #[test]
+    fn parse_gh_token_none_on_whitespace_only() {
+        assert_eq!(parse_gh_token("   \n\t"), None);
+    }
+
+    #[test]
+    fn parse_gh_token_none_on_empty() {
+        assert_eq!(parse_gh_token(""), None);
     }
 }
