@@ -109,7 +109,8 @@ This is why the preflight matters: `release.yml` re-runs CI and then builds the
 three target binaries, and a failure in *either* burns the version. Run
 `./scripts/preflight-release.sh` before every tag — it mirrors the CI checks
 **and** builds the three release targets locally (for each rustup toolchain you
-have installed, offering to `rustup target add` any that are missing), so the
+have installed; pass `--install-targets` to `rustup target add` any that are
+missing — the cross-linker tools must already be installed), so the
 cross-compile matrix is exercised before the tag rather than after. Run it from
 a macOS/Lima box with `musl-cross` set up to cover all three targets at once.
 

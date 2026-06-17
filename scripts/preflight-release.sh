@@ -27,6 +27,8 @@ set -euo pipefail
 #                        running interactively, you are prompted for it.
 #   --mutants            Run mutation testing on lines changed since the last tag.
 #   --fuzz               Build and briefly run every fuzz target (needs nightly).
+#   --install-targets    rustup target add any missing release targets (the
+#                        cross-linker tools must already be installed).
 #   --quick              Skip the slow gates: full integration, mutants, fuzz.
 #   -h, --help           Show this help.
 #
@@ -40,6 +42,7 @@ cd "$PROJECT_DIR"
 REMOTE=""
 RUN_MUTANTS=0
 RUN_FUZZ=0
+RUN_INSTALL_TARGETS=0
 QUICK=0
 
 usage() {
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --remote) REMOTE="$2"; shift 2 ;;
     --mutants) RUN_MUTANTS=1; shift ;;
     --fuzz) RUN_FUZZ=1; shift ;;
+    --install-targets) RUN_INSTALL_TARGETS=1; shift ;;
     --quick) QUICK=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -195,24 +199,21 @@ run_fuzz() {
 # Release-build targets, matching the matrix in .github/workflows/release.yml.
 RELEASE_TARGETS=(aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 
-# Offer to install missing rustup targets (interactively), and always explain
-# how. `rustup target add` installs only the std library — cross-LINKING also
-# needs platform tools, so spell that out too.
-offer_install_targets() {
+# Report missing rustup targets and always explain how to install them.
+# `rustup target add` installs only the std library — cross-LINKING also needs
+# platform tools, so spell that out too. With --install-targets, run the
+# install non-interactively; otherwise warn and continue (never block on stdin).
+handle_missing_targets() {
   local targets=("$@")
   printf '\nMissing rustup targets for the release build: %s\n' "${targets[*]}"
   printf 'Install the standard libraries with:\n'
   printf '  rustup target add %s\n' "${targets[*]}"
   printf 'Cross-LINKING also needs platform tools (musl-cross on macOS; musl-tools\n'
   printf '+ gcc-aarch64-linux-gnu on Linux) — see .github/workflows/release.yml.\n'
-  if [[ ! -t 0 ]]; then
-    return
-  fi
-  printf 'Run rustup target add for %s now? [y/N] ' "${targets[*]}"
-  local ans
-  read -r ans || true
-  if [[ "$ans" =~ ^[Yy] ]]; then
+  if [[ "$RUN_INSTALL_TARGETS" == 1 ]]; then
     rustup target add "${targets[@]}" || warn "rustup target add failed for: ${targets[*]}"
+  else
+    warn "missing release targets won't be built locally: ${targets[*]} — re-run with --install-targets (plus the cross-linker tools above) to cover them."
   fi
 }
 
@@ -230,7 +231,7 @@ build_release_targets() {
     grep -qx "$target" <<<"$installed" || missing+=("$target")
   done
   if ((${#missing[@]})); then
-    offer_install_targets "${missing[@]}"
+    handle_missing_targets "${missing[@]}"
     installed="$(rustup target list --installed 2>/dev/null || true)"
   fi
   for target in "${RELEASE_TARGETS[@]}"; do
