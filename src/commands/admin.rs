@@ -128,7 +128,7 @@ pub(crate) fn cmd_uninstall(
         return Ok(());
     }
 
-    let remove_data = decide_remove_data(cfg, opts)?;
+    let remove_data = decide_remove_data(cfg, opts, prompt::confirm)?;
 
     if remove_data {
         purge_all_data(be, cfg)?;
@@ -176,7 +176,16 @@ fn print_uninstall_summary(cfg: &config::CoopConfig, binary_path: &Path) {
     }
 }
 
-fn decide_remove_data(cfg: &config::CoopConfig, opts: &UninstallOpts) -> Result<bool> {
+/// Decide whether to wipe the data directory during uninstall.
+///
+/// `confirm` supplies the interactive answer when no flag forces the outcome —
+/// production passes [`prompt::confirm`]; tests pass a deterministic stub so the
+/// decision never depends on ambient TTY state or real stdin.
+fn decide_remove_data(
+    cfg: &config::CoopConfig,
+    opts: &UninstallOpts,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<bool> {
     if opts.keep_data {
         return Ok(false);
     }
@@ -185,7 +194,7 @@ fn decide_remove_data(cfg: &config::CoopConfig, opts: &UninstallOpts) -> Result<
     }
     let instance_count = cfg.list_instances().map(|v| v.len()).unwrap_or(0);
     let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
-    prompt::confirm(&format!(
+    confirm(&format!(
         "Also remove data directory {} ({instance_count} instance(s), {image_count} image(s))?",
         cfg.data_dir.display()
     ))
@@ -309,36 +318,75 @@ mod tests {
         )));
     }
 
+    /// Runs `decide_remove_data` with a confirmer that records whether it was
+    /// invoked, then asserts it stayed untouched — proving the flag-driven
+    /// branches short-circuit before consulting the interactive prompt. Returns
+    /// the decision so callers can assert on it too.
+    fn decide_without_consulting_confirmer(
+        cfg: &super::config::CoopConfig,
+        opts: &super::UninstallOpts,
+    ) -> bool {
+        let consulted = std::cell::Cell::new(false);
+        let decision = super::decide_remove_data(cfg, opts, |_| {
+            consulted.set(true);
+            Ok(true)
+        })
+        .unwrap();
+        assert!(
+            !consulted.get(),
+            "confirm must not be called when a flag forces the outcome"
+        );
+        decision
+    }
+
     #[test]
     fn decide_remove_data_keeps_data_when_keep_data_set() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(!super::decide_remove_data(&cfg, &opts(true, true, false)).unwrap());
-        assert!(!super::decide_remove_data(&cfg, &opts(false, true, false)).unwrap());
+        assert!(!decide_without_consulting_confirmer(
+            &cfg,
+            &opts(true, true, false)
+        ));
+        assert!(!decide_without_consulting_confirmer(
+            &cfg,
+            &opts(false, true, false)
+        ));
     }
 
     #[test]
     fn decide_remove_data_removes_when_yes_set() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(super::decide_remove_data(&cfg, &opts(true, false, false)).unwrap());
+        assert!(decide_without_consulting_confirmer(
+            &cfg,
+            &opts(true, false, false)
+        ));
     }
 
     #[test]
     fn decide_remove_data_removes_when_purge_set() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(super::decide_remove_data(&cfg, &opts(false, false, true)).unwrap());
-        assert!(super::decide_remove_data(&cfg, &opts(true, false, true)).unwrap());
+        assert!(decide_without_consulting_confirmer(
+            &cfg,
+            &opts(false, false, true)
+        ));
+        assert!(decide_without_consulting_confirmer(
+            &cfg,
+            &opts(true, false, true)
+        ));
     }
 
     #[test]
-    fn decide_remove_data_interactive_returns_false_without_tty() {
-        // In `cargo test` stdin is not a TTY, so `prompt::confirm` returns
-        // `Ok(false)` — exercising the interactive branch deterministically.
+    fn decide_remove_data_interactive_returns_confirmer_value() {
+        // With no flag set, the decision comes straight from the injected
+        // confirmer — hermetic, never touching real stdin or TTY state.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        assert!(!super::decide_remove_data(&cfg, &opts(false, false, false)).unwrap());
+        assert!(
+            !super::decide_remove_data(&cfg, &opts(false, false, false), |_| Ok(false)).unwrap()
+        );
+        assert!(super::decide_remove_data(&cfg, &opts(false, false, false), |_| Ok(true)).unwrap());
     }
 
     #[test]
