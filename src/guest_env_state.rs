@@ -271,6 +271,17 @@ mod tests {
     }
 
     #[test]
+    fn try_load_surfaces_non_not_found_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = fake_instance(tmp.path().to_path_buf());
+        // Put a directory where the JSON file is expected: reading it fails
+        // with a non-NotFound error kind, which must surface as Err rather
+        // than being swallowed as Ok(None).
+        fs::create_dir_all(inst.guest_env_state_path()).unwrap();
+        assert!(GuestEnvState::try_load(&inst).is_err());
+    }
+
+    #[test]
     fn save_empty_removes_existing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let inst = fake_instance(tmp.path().to_path_buf());
