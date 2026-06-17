@@ -747,6 +747,36 @@ mod tests {
     }
 
     #[test]
+    fn file_backend_appends_single_trailing_newline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acc = account("trailofbits/coop");
+        // A token without a trailing newline gets exactly one appended.
+        store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
+        let path = file_backend_path(tmp.path(), &acc);
+        assert_eq!(std::fs::read(&path).unwrap(), b"tok\n");
+    }
+
+    #[test]
+    fn file_backend_does_not_double_newline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acc = account("trailofbits/coop");
+        // A token already newline-terminated is stored verbatim, not doubled.
+        store_file(SERVICE, &acc, "tok\n", tmp.path()).unwrap();
+        let path = file_backend_path(tmp.path(), &acc);
+        assert_eq!(std::fs::read(&path).unwrap(), b"tok\n");
+    }
+
+    #[test]
+    fn file_backend_dir_mode_is_0700() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acc = account("trailofbits/coop");
+        store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
+        let dir = tmp.path().join(PAT_DIR);
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
     fn file_backend_delete_removes_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let acc = account("x/y");
