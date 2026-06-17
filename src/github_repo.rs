@@ -137,12 +137,11 @@ pub fn parse_repo_slug_from_url(url: &str) -> Option<RepoSlug> {
 fn canonicalize(path: &str) -> Option<RepoSlug> {
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, repo) = path.split_once('/')?;
-    // Reject anything past `owner/repo` (e.g. `owner/repo/pulls`).
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return None;
-    }
-    RepoSlug::new(&format!("{owner}/{repo}")).ok()
+    // `RepoSlug::new` enforces the full `owner/repo` shape: exactly one `/`
+    // separator (so deep paths like `owner/repo/pulls` are rejected),
+    // non-empty segments, and the allowed character class. No separate guard
+    // is needed here.
+    RepoSlug::new(path).ok()
 }
 
 /// Derive a default instance name from a git repo URL.
