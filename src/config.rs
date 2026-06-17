@@ -2836,8 +2836,8 @@ mod tests {
                 "expected rejection for {name:?}, got: {err}"
             );
             assert!(
-                !err.contains("--workspace"),
-                "did not expect workspace hint for {name:?}, got: {err}"
+                !err.contains("coop up <PATH>"),
+                "did not expect path hint for {name:?}, got: {err}"
             );
         }
     }
@@ -2951,6 +2951,38 @@ mod tests {
             msg.contains("No instances exist."),
             "missing hint in: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_ignores_stale_fast_path_dir() {
+        // The fast path reads `instances_dir/<name>/instance.json` and only
+        // returns it when the stored name matches the requested name. Here the
+        // directory `wanted` holds an instance whose stored name is `decoy`, so
+        // the fast path must reject it and the slow path must find the real
+        // `wanted` instance living under a differently-named directory.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let instances = tmp.path().join("instances");
+
+        let stale = Instance {
+            name: iname("decoy"),
+            index: idx(0),
+            dir: instances.join("wanted"),
+            image: default_img(),
+        };
+        stale.save().unwrap();
+
+        let real = Instance {
+            name: iname("wanted"),
+            index: idx(1),
+            dir: instances.join("elsewhere"),
+            image: default_img(),
+        };
+        real.save().unwrap();
+
+        let inst = cfg.resolve_instance(Some(&iname("wanted"))).unwrap();
+        assert_eq!(inst.name, *"wanted");
+        assert_eq!(inst.index.as_u16(), 1);
     }
 
     #[test]
@@ -3499,6 +3531,13 @@ skip = ["not-a-slug"]
         assert!(serde_json::from_str::<InstanceName>(json).is_err());
     }
 
+    #[test]
+    fn instance_name_compares_to_str() {
+        let name = InstanceName::new("foo").unwrap();
+        assert!(name == *"foo");
+        assert!(name != *"bar");
+    }
+
     // ── ImageName ─────────────────────────────────────────────
 
     #[test]
@@ -3544,6 +3583,13 @@ skip = ["not-a-slug"]
     fn image_name_rejects_overlong() {
         let too_long = "a".repeat(MAX_IMAGE_NAME_LEN + 1);
         assert!(ImageName::new(&too_long).is_err());
+    }
+
+    #[test]
+    fn image_name_compares_to_str() {
+        let name = ImageName::new("foo").unwrap();
+        assert!(name == *"foo");
+        assert!(name != *"bar");
     }
 
     #[test]
