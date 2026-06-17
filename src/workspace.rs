@@ -1187,6 +1187,19 @@ mod tests {
     }
 
     #[test]
+    fn vscode_strategies_first_is_code_cli() {
+        let path = GuestPath::new("/workspace");
+        let strategies = vscode_strategies("ssh-remote+coop-test", &path);
+        // The `code` CLI strategy is present on every platform (the macOS
+        // `open -a` fallback is appended after it).
+        let code = &strategies[0];
+        assert_eq!(code.name, "code CLI");
+        assert_eq!(code.cmd, "code");
+        let args: Vec<&str> = code.args.iter().map(String::as_str).collect();
+        assert_eq!(args, ["--remote", "ssh-remote+coop-test", "/workspace"]);
+    }
+
+    #[test]
     fn resolve_host_dir_prefers_explicit_over_state() {
         let state = WorkspaceState {
             guest_path: GuestPath::absolute("/workspace").unwrap(),

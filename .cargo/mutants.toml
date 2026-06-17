@@ -1,0 +1,134 @@
+# cargo-mutants configuration — see https://mutants.rs/
+#
+# Scopes shell-out / integration-only code and cfg(kani) proofs OUT of the
+# mutation sweep so the `missed` list means "real unit-test gap" rather than
+# "code a `--lib` unit test structurally cannot reach". The behaviors excluded
+# here are covered by `tests/integration.sh` (external processes, SSH, IO) or
+# by `cargo kani` (the proofs), neither of which a `cargo test` unit test can
+# stand in for. See issue #329 and the mutation-testing section of CLAUDE.md.
+#
+# What is NOT excluded: the pure-logic helpers the #321–#327 triage produced.
+# Those fixes EXTRACTED the testable logic out of shell-out/IO functions into
+# pure helpers, which stay in scope so a survivor on one reads as a genuine
+# coverage regression: parse_curl_status_body, parse_user_login (split from
+# probe_user_login), render_status (split from run_status), pick_backend,
+# doc_contains_literal_token, the SSH-config marker-block helpers
+# (remove_marker_blocks / remove_named_marker_block / remove_*_ssh_config_at,
+# split from remove_all_ssh_config / remove_ssh_config), CmdToken::from_words's
+# Linux/op arms, atomic_write_with_mode, and vscode_strategies. The thin
+# external-process / IO wrappers those helpers were carved out of ARE excluded
+# below — a `--lib` unit test cannot reach a wrapper without a real $HOME or
+# network, so its surviving body-replacement mutant is noise, not a gap.
+
+# Whole modules that only shell out, drive SSH, or talk to external services.
+# (CLAUDE.md "Don't bother with" list.) Unit tests cannot observe their effects.
+exclude_globs = [
+    "src/backend.rs",
+    "src/lima.rs",
+    "src/setup.rs",
+    "src/update.rs",
+    "src/shell.rs",
+    "src/port_forward.rs",
+    "src/cmd.rs",
+    "src/ssh.rs",
+    "src/vm.rs",
+]
+
+# Individual functions in otherwise-logic-bearing modules. Patterns match
+# against the full mutant name (`<file>:<line>:<col>: <description>`), so a
+# `\b`-anchored function name excludes both the whole-body replacement and the
+# operator/value mutants inside that function, without catching longer names
+# that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
+exclude_re = [
+    # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
+    # build, so every mutation is a silent no-op and always "missed". The
+    # proofs are exercised by `cargo kani`, not by mutation testing.
+    "proofs::",
+
+    # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
+    "\\brun_setup_pat\\b",
+    "\\brun_rotate_pat\\b",
+    "\\brun_forget_pat\\b",
+    "\\bprobe_user\\b",
+    "\\bprobe_repo\\b",
+    "\\bcurl_with_token\\b",
+    "\\bcurl_with_accept\\b",
+    "\\bcurl_anonymous\\b",
+    "\\bcurl_anonymous_with_accept\\b",
+    "\\bis_public_repo_anonymous\\b",
+    "\\bdiscover_submodule_repos\\b",
+    "\\bprobe_same_owner_coverage\\b",
+    "\\bread_token_no_echo\\b",
+    "\\bopen_browser_best_effort\\b",
+    "\\bprint_form_instructions\\b",
+    "\\bprint_widen_instructions\\b",
+    "\\bwarn_token_format\\b",
+    "impl Drop for EchoGuard",
+    # PAT-wizard submodule orchestration: curl prefetch, then terminal prompts
+    # (read_token_no_echo) and eprintln advice gated on the discovery result.
+    # The classification logic (classify_urls / extract_urls / drop_public) is
+    # factored out and stays in scope.
+    "\\bprefetch_submodules\\b",
+    "\\bhandle_submodules\\b",
+    "\\bdiscover_from_pasted_token\\b",
+    # gh_auth_token is a pure `gh auth token` shell-out that delegates trimming
+    # to parse_gh_token (#322, kept). Exclude only its whole-body replacement;
+    # this module-agnostic pattern also covers the identical gh_auth_token in
+    # git_repo_devcontainer.rs (whose logic lives in normalize_token, kept).
+    "replace gh_auth_token ->",
+    # Thin wrappers whose logic was extracted in #322: run_status just prints
+    # render_status(...) (kept); probe_user_login just curls then delegates to
+    # parse_user_login (kept). \b leaves render_status / parse_user_login alone.
+    "\\brun_status\\b",
+    "\\bprobe_user_login\\b",
+
+    # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
+    "\\btar_pipe_transfer\\b",
+    "\\btar_pipe_transfer_to\\b",
+    "\\btar_pipe_pull\\b",
+    "\\bjoin_drainer\\b",
+    "\\bsync_mounts\\b",
+    "\\bsync_mount_contents\\b",
+    "\\bvscode\\b",
+    "\\blaunch_editor\\b",
+    "\\brsync_push\\b",
+    "\\brsync_pull\\b",
+    "\\bcheck_guest_dirty\\b",
+    "\\bcheck_local_dirty\\b",
+    "\\batomic_write\\b",
+    "\\bwrite_ssh_config\\b",
+    "\\brefresh_ssh_config_if_present\\b",
+    "\\bupdate_ssh_config\\b",
+    # The bare `push`/`pull` free functions live in workspace.rs; anchor on the
+    # file so Report::push in devcontainer.rs (testable report logic) is kept.
+    "src/workspace\\.rs:.*\\bpush\\b",
+    "src/workspace\\.rs:.*\\bpull\\b",
+    # WorkspaceState persistence IO (same treatment as DevcontainerState).
+    "WorkspaceState::save",
+    "WorkspaceState::try_load",
+    # $HOME-resolving wrappers split out in #324; the read/clean/gated-write
+    # logic lives in remove_all_ssh_config_at / remove_ssh_config_at (kept by
+    # the `_at` suffix defeating the `\b` boundary) and remove_named_marker_block.
+    "\\bremove_all_ssh_config\\b",
+    "\\bremove_ssh_config\\b",
+
+    # devcontainer.rs — persistence IO and NotFound guards; tracing-only warn.
+    "DevcontainerPreferences::load",
+    "ParsedDevcontainer::load",
+    "AppliedDevcontainer::current_hash",
+    "DevcontainerState::save",
+    "DevcontainerState::try_load",
+    "\\bwarn_if_applied_devcontainer_changed\\b",
+
+    # secret_store.rs — $PATH probes and the macOS keychain write. The macOS
+    # `find-generic-password` arm of CmdToken::from_words is compiled out on the
+    # Linux sweep host (so its mutant is a no-op there) and pinned on macOS by
+    # parse_recognises_macos_keychain; its Linux/op arms stay as real gaps.
+    "Backend::is_available",
+    "\\btool_on_path\\b",
+    "\\bstore_keychain\\b",
+    "find-generic-password",
+
+    # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
+    "\\block_sibling\\b",
+]

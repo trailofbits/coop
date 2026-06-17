@@ -76,7 +76,15 @@ cargo install cargo-mutants --locked
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug parsing, secret routing
 - `src/fs_util.rs` — path manipulation helpers
 
-**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`. These mostly shell out, run SSH, or talk to external services — unit tests can't catch behavioral changes there. `tests/integration.sh` does that job.
+**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`. These mostly shell out, run SSH, or talk to external services — unit tests can't catch behavioral changes there. `tests/integration.sh` does that job. This list is enforced (not just advised) by `.cargo/mutants.toml` — see **Scoping** below.
+
+**Scoping (`.cargo/mutants.toml`).** The mutation surface is curated in `.cargo/mutants.toml` so the `missed` list means "real unit-test gap," not "code a `--lib` test structurally cannot reach." cargo-mutants reads this file automatically on every run (`--list` included). It scopes out three things:
+
+- **The "Don't bother with" modules above**, via `exclude_globs` — they only shell out, drive SSH, or hit external services.
+- **`cfg(kani)` proofs** (`config.rs mod proofs`), via `exclude_re = ["proofs::"]` — never compiled in a normal build, so every mutation is a silent no-op that always reports `missed`. They are exercised by `cargo kani`, not mutation testing.
+- **Individual shell-out / IO / terminal functions inside otherwise-logic-bearing modules** (`github_pat.rs`, `workspace.rs`, `devcontainer.rs`, `secret_store.rs`, `fs_util.rs`), via `exclude_re`. Each pattern is `\b`-anchored to a function name (or qualified `Type::method`) so it scopes the whole function without catching longer names that share a prefix. The module-agnostic `replace gh_auth_token ->` pattern also covers the identical `gh_auth_token` shell-out in `git_repo_devcontainer.rs`.
+
+What is deliberately *kept* (a survivor here is a genuine coverage regression, not noise): the pure-logic helpers the #321–#327 fixes carved the shell-out/IO functions down to. Those fixes extracted the testable logic into separate functions, which stay in scope: `parse_curl_status_body`, `parse_user_login` (split from `probe_user_login`), `render_status` (split from `run_status`), `parse_gh_token` / `normalize_token` (split from the two `gh_auth_token`s), `pick_backend`, `doc_contains_literal_token`, the SSH-config marker-block helpers (`remove_marker_blocks` / `remove_named_marker_block` / `remove_all_ssh_config_at` / `remove_ssh_config_at`, split from `remove_all_ssh_config` / `remove_ssh_config`), `CmdToken::from_words`'s Linux/`op`/`cat` arms (only the macOS keychain arm is scoped, since it is compiled out on the Linux sweep host and pinned on macOS by `parse_recognises_macos_keychain`), `Report::push`, `atomic_write_with_mode`, and `vscode_strategies`. The thin wrappers those helpers were split out of (`probe_user_login`, `run_status`, `remove_*_ssh_config`, `gh_auth_token`) are excluded — a `--lib` test cannot reach them without a real `$HOME` or network. When adding a new shell-out or IO function to one of these modules, add a matching `exclude_re` line; when adding logic, leave it in scope.
 
 **Running it.** Always scope with `-f`; all logic lives in the library crate
 (`src/lib.rs`; `main.rs` is a thin `coop::run()` shim), and every unit test runs
@@ -118,7 +126,7 @@ A kill rate around 70–80% on viable mutants is healthy for this code. Aim to d
     ```
 3. **Dead code.** If the function is genuinely unused, delete it (per the global "replace, don't deprecate" rule). Surviving mutants on truly dead code are a useful smell.
 
-**Baseline result on `config.rs` (recorded 2026-05-20):** 117 caught / 42 missed / 38 unviable. Real gaps were concentrated in `CoopConfig::validate` (5 survivors), `Instance::is_running` (4), `is_firecracker_process` (2), and `MiB::as_gib_f64` arithmetic. The rest were `fmt::Display` impls and default-value getters. Use this as a reference point — if a future run is much worse on these modules, treat it as a regression in test coverage.
+**Baseline (recorded 2026-06-17, after the #329 scoping and #321–#327 fixes).** A sweep of the eight logic modules (`config.rs`, `workspace.rs`, `devcontainer.rs`, `guest_env_state.rs`, `github_repo.rs`, `github_pat.rs`, `secret_store.rs`, `fs_util.rs`) under `.cargo/mutants.toml` reports **0 missed that are real gaps**. The only surviving `missed` mutants are the two equivalent `||`→`&&` mutations in `github_repo::canonicalize`: that guard (`owner.is_empty() || repo.is_empty() || repo.contains('/')`) is redundant with `RepoSlug::new`, which rejects the same inputs one line later, so no input distinguishes the mutants. Everything else is either caught or scoped out by the config. Treat any *new* survivor outside that pair as a coverage regression — first confirm it isn't a shell-out/IO function that belongs in `.cargo/mutants.toml`, then add a test.
 
 ### Fuzzing
 

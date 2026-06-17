@@ -2432,6 +2432,22 @@ mod tests {
         assert!(format!("{err}").contains("/data"));
     }
 
+    #[test]
+    fn validate_unique_guest_paths_accepts_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mounts = vec![
+            Mount::parse(&format!("{}:/data", a.display())).unwrap(),
+            Mount::parse(&format!("{}:/other", b.display())).unwrap(),
+        ];
+        validate_unique_guest_paths(&mounts).unwrap();
+        // The empty set is trivially conflict-free.
+        validate_unique_guest_paths(&[]).unwrap();
+    }
+
     fn default_img() -> ImageName {
         ImageName::new(DEFAULT_IMAGE).unwrap()
     }
