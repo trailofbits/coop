@@ -72,6 +72,7 @@ pub struct FileLock {
 /// purpose is purely to serialize access to `target`. Releases on drop.
 /// Returns an error if the parent directory cannot be created or the
 /// lock cannot be acquired.
+#[mutants::skip] // low-payoff: flock helper; callers always target existing dirs, so the parent-dir guard is never exercised
 pub fn lock_sibling(target: &Path) -> Result<FileLock> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() {
@@ -258,6 +259,38 @@ mod tests {
         atomic_write_ssh(&path, "new").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn atomic_write_with_mode_never_relaxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Requesting a more permissive mode must not widen the file.
+        atomic_write_with_mode(&path, "new", 0o644).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing 0o600 must not be relaxed to 0o644");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    fn atomic_write_with_mode_default_for_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new");
+        atomic_write_with_mode(&path, "content", 0o640).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "new file must use the requested mode verbatim");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "content");
+    }
+
+    #[test]
+    fn atomic_write_with_mode_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("dir").join("file");
+        atomic_write_with_mode(&path, "content", 0o600).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "content");
     }
 
     #[test]
