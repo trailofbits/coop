@@ -1,0 +1,36 @@
+# EditorConfig: https://editorconfig.org
+root = true
+
+# Defaults for every file. Mirrors the prek hooks (end-of-file-fixer,
+# trailing-whitespace) so the editor and the hooks never disagree.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust: 4-space indent, matching cargo fmt (rustfmt default).
+[*.rs]
+indent_size = 4
+
+# YAML: 2-space indent, matching .github/workflows and .pre-commit-config.yaml.
+[*.{yml,yaml}]
+indent_size = 2
+
+# TOML: 2-space indent, matching `taplo fmt` (the taplo prek hook enforces it).
+[*.toml]
+indent_size = 2
+
+# Markdown: 2-space indent for nested lists.
+[*.md]
+indent_size = 2
+
+# JSON: 2-space indent.
+[*.json]
+indent_size = 2
+
+# Shell: 4-space indent, matching the existing scripts.
+[*.sh]
+indent_size = 4
