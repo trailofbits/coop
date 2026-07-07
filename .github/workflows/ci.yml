@@ -61,6 +61,30 @@ jobs:
       - name: Check advisories, licenses, bans, sources
         run: cargo deny check
 
+  taplo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Cache the compiled binary keyed on the pinned version so only the first
+      # run (or a version bump) pays the compile cost. Keep the version here in
+      # sync with TAPLO_VERSION in scripts/install-dev-tools.sh.
+      - name: Cache taplo
+        id: cache-taplo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/taplo
+          key: ${{ runner.os }}-taplo-cli-0.10.0
+
+      - name: Install taplo
+        if: steps.cache-taplo.outputs.cache-hit != 'true'
+        run: cargo install taplo-cli --version '=0.10.0' --locked
+
+      - name: Check TOML formatting
+        run: taplo format --check
+
   zizmor:
     runs-on: ubuntu-latest
     permissions:

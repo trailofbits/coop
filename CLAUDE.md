@@ -14,7 +14,7 @@ Backend abstraction in `src/backend.rs` provides `SshTarget` and `Backend` enum.
 
 ## Before committing
 
-Pre-commit hooks (prek) run automatically: cargo fmt, clippy, test, `taplo format --check` (TOML), trailing whitespace, EOF fixer, large file check, merge conflict check. If hooks aren't installed, run `prek install`. The taplo hook needs the CLI on `PATH` — install once with `cargo install taplo-cli --locked`. Its 2-space indent (taplo's default, pinned in `.taplo.toml`) is what `.editorconfig` declares for editors.
+Pre-commit hooks (prek) run automatically: cargo fmt, clippy, test, `taplo format --check` (TOML — also enforced by the `taplo` CI job), trailing whitespace, EOF fixer, large file check, merge conflict check. Install the hook runner and formatter at pinned versions with `./scripts/install-dev-tools.sh` (the single source of truth for dev-tool versions), then `prek install`. taplo's 2-space indent (its default, pinned in `.taplo.toml`, which also excludes `revm-kani/`/`target/`) is what `.editorconfig` declares for editors.
 
 After hooks pass, run integration tests on **both platforms** — these are too slow for hooks:
 
@@ -60,7 +60,7 @@ When adding new features, consider whether they should be covered by the integra
 
 Mutation testing finds unit tests that pass even when the code is broken — i.e. real behavioral gaps. We use [`cargo-mutants`](https://mutants.rs/). It's a manual quality check, not a CI gate.
 
-**Install once:**
+**Install once** — via the pinned installer `./scripts/install-dev-tools.sh --all`, or directly:
 
 ```bash
 cargo install cargo-mutants --locked
@@ -148,7 +148,7 @@ Fuzzing is reserved for parsers of **untrusted or user-editable input** — it f
 
 Targets live in `fuzz/fuzz_targets/`. `coop` exposes a library target (`src/lib.rs`), so a target depends on the crate directly and imports the parser under test with `use coop::…` — no `#[path]` includes. `fuzz/Cargo.toml` is its own workspace, so the main `cargo build`/`test`/`fmt`/`clippy`/`deny` never touch it.
 
-**Install once:** `cargo install cargo-fuzz --locked`
+**Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install cargo-fuzz --locked`
 
 ```bash
 cargo +nightly fuzz build                                  # compile all targets
@@ -170,7 +170,7 @@ A crash is written to `fuzz/artifacts/<target>/`; reproduce it with `cargo +nigh
 
 Proofs live in a `#[cfg(kani)]` module so the normal `cargo build`/`test`/`fmt`/`clippy` never compile them. They run as one module in `src/config.rs`.
 
-**Install once:** `cargo install --locked kani-verifier && cargo kani setup`
+**Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install --locked kani-verifier && cargo kani setup`
 
 ```bash
 cargo kani                                       # run every proof harness (~5s total)

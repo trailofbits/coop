@@ -3,5 +3,11 @@
 # deterministic regardless of any global taplo config, and documents the
 # convention .editorconfig declares for editors (taplo does not read
 # .editorconfig).
+
+# Keep the formatter off vendored/build trees so a bare `taplo format` (no file
+# args) only touches this repo's own TOML. revm-kani is a gitignored vendored
+# checkout used for the kani proofs; target is build output.
+exclude = ["revm-kani/**", "target/**"]
+
 [formatting]
 indent_string = "  "
