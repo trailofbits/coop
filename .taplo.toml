@@ -1,0 +1,7 @@
+# Taplo TOML formatter config (used by the `taplo fmt` prek hook).
+# 2-space indent is taplo's default; pinning it here keeps the hook
+# deterministic regardless of any global taplo config, and documents the
+# convention .editorconfig declares for editors (taplo does not read
+# .editorconfig).
+[formatting]
+indent_string = "  "

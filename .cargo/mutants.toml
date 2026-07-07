@@ -23,23 +23,23 @@
 # Whole modules that only shell out, drive SSH, or talk to external services.
 # (CLAUDE.md "Don't bother with" list.) Unit tests cannot observe their effects.
 exclude_globs = [
-    "src/backend.rs",
-    "src/lima.rs",
-    "src/setup.rs",
-    "src/update.rs",
-    "src/shell.rs",
-    "src/port_forward.rs",
-    "src/cmd.rs",
-    "src/ssh.rs",
-    "src/vm.rs",
-    # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
-    "src/main.rs",
-    # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
-    # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
-    # and otherwise reads stdin; the trailing match on the reply is only
-    # reachable behind a real terminal, so a `--lib` test cannot observe any of
-    # it. Whole-module exclude (cf. read_line added for #352, issue #373).
-    "src/prompt.rs",
+  "src/backend.rs",
+  "src/lima.rs",
+  "src/setup.rs",
+  "src/update.rs",
+  "src/shell.rs",
+  "src/port_forward.rs",
+  "src/cmd.rs",
+  "src/ssh.rs",
+  "src/vm.rs",
+  # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
+  "src/main.rs",
+  # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
+  # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
+  # and otherwise reads stdin; the trailing match on the reply is only
+  # reachable behind a real terminal, so a `--lib` test cannot observe any of
+  # it. Whole-module exclude (cf. read_line added for #352, issue #373).
+  "src/prompt.rs",
 ]
 
 # Individual functions in otherwise-logic-bearing modules. Patterns match
@@ -48,252 +48,252 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
-    # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
-    # build, so every mutation is a silent no-op and always "missed". The
-    # proofs are exercised by `cargo kani`, not by mutation testing.
-    "proofs::",
+  # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
+  # build, so every mutation is a silent no-op and always "missed". The
+  # proofs are exercised by `cargo kani`, not by mutation testing.
+  "proofs::",
 
-    # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
-    "\\brun_setup_pat\\b",
-    "\\brun_rotate_pat\\b",
-    "\\brun_forget_pat\\b",
-    "\\bprobe_user\\b",
-    "\\bprobe_repo\\b",
-    "\\bcurl_with_token\\b",
-    "\\bcurl_with_accept\\b",
-    "\\bcurl_anonymous\\b",
-    "\\bcurl_anonymous_with_accept\\b",
-    "\\bis_public_repo_anonymous\\b",
-    "\\bdiscover_submodule_repos\\b",
-    "\\bprobe_same_owner_coverage\\b",
-    "\\bread_token_no_echo\\b",
-    "\\bopen_browser_best_effort\\b",
-    "\\bprint_form_instructions\\b",
-    "\\bprint_widen_instructions\\b",
-    "\\bwarn_token_format\\b",
-    "impl Drop for EchoGuard",
-    # PAT-wizard submodule orchestration: curl prefetch, then terminal prompts
-    # (read_token_no_echo) and eprintln advice gated on the discovery result.
-    # The classification logic (classify_urls / extract_urls / drop_public) is
-    # factored out and stays in scope.
-    "\\bprefetch_submodules\\b",
-    "\\bhandle_submodules\\b",
-    "\\bdiscover_from_pasted_token\\b",
-    # gh_auth_token is a pure `gh auth token` shell-out that delegates trimming
-    # to parse_gh_token (#322, kept). Exclude only its whole-body replacement;
-    # this module-agnostic pattern also covers the identical gh_auth_token in
-    # git_repo_devcontainer.rs (whose logic lives in normalize_token, kept).
-    "replace gh_auth_token ->",
-    # Thin wrappers whose logic was extracted in #322: run_status just renders
-    # build_status(...) as JSON or text (kept helpers below); probe_user_login
-    # just curls then delegates to parse_user_login (kept). \b leaves
-    # parse_user_login alone.
-    "\\brun_status\\b",
-    "\\bprobe_user_login\\b",
-    # build_status (#385, `github status --json` view builder): its `--probe`
-    # branch shells out via resolve_cmd_value, so a `--lib` test cannot observe
-    # it. The pure projections it calls — GithubMode::of, ProbeStatus::from_resolved
-    # — and format_status stay in scope, each unit-tested (a survivor there is a
-    # real gap). GithubMode::label carries an in-source `#[mutants::skip]`
-    # (equivalent: human label; the serde token is the tested contract).
-    "\\bbuild_status\\b",
+  # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
+  "\\brun_setup_pat\\b",
+  "\\brun_rotate_pat\\b",
+  "\\brun_forget_pat\\b",
+  "\\bprobe_user\\b",
+  "\\bprobe_repo\\b",
+  "\\bcurl_with_token\\b",
+  "\\bcurl_with_accept\\b",
+  "\\bcurl_anonymous\\b",
+  "\\bcurl_anonymous_with_accept\\b",
+  "\\bis_public_repo_anonymous\\b",
+  "\\bdiscover_submodule_repos\\b",
+  "\\bprobe_same_owner_coverage\\b",
+  "\\bread_token_no_echo\\b",
+  "\\bopen_browser_best_effort\\b",
+  "\\bprint_form_instructions\\b",
+  "\\bprint_widen_instructions\\b",
+  "\\bwarn_token_format\\b",
+  "impl Drop for EchoGuard",
+  # PAT-wizard submodule orchestration: curl prefetch, then terminal prompts
+  # (read_token_no_echo) and eprintln advice gated on the discovery result.
+  # The classification logic (classify_urls / extract_urls / drop_public) is
+  # factored out and stays in scope.
+  "\\bprefetch_submodules\\b",
+  "\\bhandle_submodules\\b",
+  "\\bdiscover_from_pasted_token\\b",
+  # gh_auth_token is a pure `gh auth token` shell-out that delegates trimming
+  # to parse_gh_token (#322, kept). Exclude only its whole-body replacement;
+  # this module-agnostic pattern also covers the identical gh_auth_token in
+  # git_repo_devcontainer.rs (whose logic lives in normalize_token, kept).
+  "replace gh_auth_token ->",
+  # Thin wrappers whose logic was extracted in #322: run_status just renders
+  # build_status(...) as JSON or text (kept helpers below); probe_user_login
+  # just curls then delegates to parse_user_login (kept). \b leaves
+  # parse_user_login alone.
+  "\\brun_status\\b",
+  "\\bprobe_user_login\\b",
+  # build_status (#385, `github status --json` view builder): its `--probe`
+  # branch shells out via resolve_cmd_value, so a `--lib` test cannot observe
+  # it. The pure projections it calls — GithubMode::of, ProbeStatus::from_resolved
+  # — and format_status stay in scope, each unit-tested (a survivor there is a
+  # real gap). GithubMode::label carries an in-source `#[mutants::skip]`
+  # (equivalent: human label; the serde token is the tested contract).
+  "\\bbuild_status\\b",
 
-    # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
-    "\\btar_pipe_transfer\\b",
-    "\\btar_pipe_transfer_to\\b",
-    "\\btar_pipe_pull\\b",
-    "\\bjoin_drainer\\b",
-    "\\bsync_mounts\\b",
-    "\\bsync_mount_contents\\b",
-    "\\bvscode\\b",
-    "\\blaunch_editor\\b",
-    "\\brsync_push\\b",
-    "\\brsync_pull\\b",
-    "\\bcheck_guest_dirty\\b",
-    "\\bcheck_local_dirty\\b",
-    "\\batomic_write\\b",
-    "\\bwrite_ssh_config\\b",
-    "\\brefresh_ssh_config_if_present\\b",
-    "\\bupdate_ssh_config\\b",
-    # The bare `push`/`pull` free functions live in workspace.rs; anchor on the
-    # file so Report::push in devcontainer.rs (testable report logic) is kept.
-    "src/workspace\\.rs:.*\\bpush\\b",
-    "src/workspace\\.rs:.*\\bpull\\b",
-    # WorkspaceState persistence IO (same treatment as DevcontainerState).
-    "WorkspaceState::save",
-    "WorkspaceState::try_load",
-    # $HOME-resolving wrappers split out in #324; the read/clean/gated-write
-    # logic lives in remove_all_ssh_config_at / remove_ssh_config_at (kept by
-    # the `_at` suffix defeating the `\b` boundary) and remove_named_marker_block.
-    "\\bremove_all_ssh_config\\b",
-    "\\bremove_ssh_config\\b",
+  # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
+  "\\btar_pipe_transfer\\b",
+  "\\btar_pipe_transfer_to\\b",
+  "\\btar_pipe_pull\\b",
+  "\\bjoin_drainer\\b",
+  "\\bsync_mounts\\b",
+  "\\bsync_mount_contents\\b",
+  "\\bvscode\\b",
+  "\\blaunch_editor\\b",
+  "\\brsync_push\\b",
+  "\\brsync_pull\\b",
+  "\\bcheck_guest_dirty\\b",
+  "\\bcheck_local_dirty\\b",
+  "\\batomic_write\\b",
+  "\\bwrite_ssh_config\\b",
+  "\\brefresh_ssh_config_if_present\\b",
+  "\\bupdate_ssh_config\\b",
+  # The bare `push`/`pull` free functions live in workspace.rs; anchor on the
+  # file so Report::push in devcontainer.rs (testable report logic) is kept.
+  "src/workspace\\.rs:.*\\bpush\\b",
+  "src/workspace\\.rs:.*\\bpull\\b",
+  # WorkspaceState persistence IO (same treatment as DevcontainerState).
+  "WorkspaceState::save",
+  "WorkspaceState::try_load",
+  # $HOME-resolving wrappers split out in #324; the read/clean/gated-write
+  # logic lives in remove_all_ssh_config_at / remove_ssh_config_at (kept by
+  # the `_at` suffix defeating the `\b` boundary) and remove_named_marker_block.
+  "\\bremove_all_ssh_config\\b",
+  "\\bremove_ssh_config\\b",
 
-    # devcontainer.rs — persistence IO and NotFound guards; tracing-only warn.
-    "DevcontainerPreferences::load",
-    "ParsedDevcontainer::load",
-    "AppliedDevcontainer::current_hash",
-    "DevcontainerState::save",
-    "DevcontainerState::try_load",
-    "\\bwarn_if_applied_devcontainer_changed\\b",
+  # devcontainer.rs — persistence IO and NotFound guards; tracing-only warn.
+  "DevcontainerPreferences::load",
+  "ParsedDevcontainer::load",
+  "AppliedDevcontainer::current_hash",
+  "DevcontainerState::save",
+  "DevcontainerState::try_load",
+  "\\bwarn_if_applied_devcontainer_changed\\b",
 
-    # secret_store.rs — $PATH probes and the macOS keychain write. The macOS
-    # `find-generic-password` arm of CmdToken::from_words is compiled out on the
-    # Linux sweep host (so its mutant is a no-op there) and pinned on macOS by
-    # parse_recognises_macos_keychain; its Linux/op arms stay as real gaps.
-    "Backend::is_available",
-    "\\btool_on_path\\b",
-    "\\bstore_keychain\\b",
-    "find-generic-password",
+  # secret_store.rs — $PATH probes and the macOS keychain write. The macOS
+  # `find-generic-password` arm of CmdToken::from_words is compiled out on the
+  # Linux sweep host (so its mutant is a no-op there) and pinned on macOS by
+  # parse_recognises_macos_keychain; its Linux/op arms stay as real gaps.
+  "Backend::is_available",
+  "\\btool_on_path\\b",
+  "\\bstore_keychain\\b",
+  "find-generic-password",
 
-    # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
-    "\\block_sibling\\b",
+  # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
+  "\\block_sibling\\b",
 
-    # ---- src/commands/ and the lib.rs/main.rs shims ----
-    # The #321-#327 refactor split every command handler out of lib.rs into
-    # src/commands/. Apply the SAME surgical treatment the flat shell-out
-    # modules got: scope out the dispatch entrypoints and the handlers whose
-    # effects a `--lib` test cannot observe (they take `&PlatformBackend` and
-    # drive VM/SSH/IO, or open a TTY prompt). tests/integration.sh covers them.
-    # The pure-logic helpers they call stay in scope — a survivor on one of
-    # THOSE is a real coverage gap. NOT a blanket `src/commands/**` exclude.
+  # ---- src/commands/ and the lib.rs/main.rs shims ----
+  # The #321-#327 refactor split every command handler out of lib.rs into
+  # src/commands/. Apply the SAME surgical treatment the flat shell-out
+  # modules got: scope out the dispatch entrypoints and the handlers whose
+  # effects a `--lib` test cannot observe (they take `&PlatformBackend` and
+  # drive VM/SSH/IO, or open a TTY prompt). tests/integration.sh covers them.
+  # The pure-logic helpers they call stay in scope — a survivor on one of
+  # THOSE is a real coverage gap. NOT a blanket `src/commands/**` exclude.
 
-    # All `coop <subcommand>` dispatch entrypoints across the command modules
-    # (lifecycle.rs, admin.rs, github.rs, profiles.rs, quickstart.rs,
-    # commands/devcontainer.rs). Every `cmd_*` only parses the dispatch and
-    # shells out to a backend; whole-body `-> Ok(())` mutants are unobservable.
-    "\\bcmd_[a-z_]+\\b",
+  # All `coop <subcommand>` dispatch entrypoints across the command modules
+  # (lifecycle.rs, admin.rs, github.rs, profiles.rs, quickstart.rs,
+  # commands/devcontainer.rs). Every `cmd_*` only parses the dispatch and
+  # shells out to a backend; whole-body `-> Ok(())` mutants are unobservable.
+  "\\bcmd_[a-z_]+\\b",
 
-    # lifecycle.rs — handlers taking `&PlatformBackend` (VM boot, SSH, disk IO)
-    # or resolving the cwd. Their decision logic is extracted into the pure
-    # helpers kept in scope below (no_stopped_instance_message,
-    # creation_options_rejected_message, restart_has_ignored_creation_flags,
-    # bytes_to_gib, …) or pinned by tests/integration.sh.
-    "\\bcreate_up_instance\\b",
-    "\\bcreate_git_repo_instance\\b",
-    "\\bensure_profile_image\\b",
-    "\\bapply_runtime_guest_env\\b",
-    "\\bapply_vm_overrides\\b",
-    "\\bfind_stopped_instance\\b",
-    "\\brestart_instance\\b",
-    "\\bstart_instance\\b",
-    "\\bwarn_on_live_git_mounts\\b",
-    "\\bresolve_running\\b",
-    "\\ballocate_and_start\\b",
-    "\\bopen_ssh_session\\b",
-    "\\bpreflight_start_target\\b",
-    "\\bresolve_project_dir\\b",
-    # current_disk_gib stats the disk image; its `/ 1 GiB` arithmetic kernel
-    # is extracted into bytes_to_gib (kept in scope, unit-tested).
-    "\\bcurrent_disk_gib\\b",
-    # instance_status (#385) runs as_running + query_resource_usage (SSH) to
-    # assemble the `status --json` shape; emit_up_dry_run (#385) drives the
-    # devcontainer collector + persisted_guest_user and renders the dry-run
-    # plan. Their pure inputs — InstanceState::from_running, BackendKind::of,
-    # up_translator_inputs — stay in scope and are unit-tested.
-    "\\binstance_status\\b",
-    "\\bemit_up_dry_run\\b",
+  # lifecycle.rs — handlers taking `&PlatformBackend` (VM boot, SSH, disk IO)
+  # or resolving the cwd. Their decision logic is extracted into the pure
+  # helpers kept in scope below (no_stopped_instance_message,
+  # creation_options_rejected_message, restart_has_ignored_creation_flags,
+  # bytes_to_gib, …) or pinned by tests/integration.sh.
+  "\\bcreate_up_instance\\b",
+  "\\bcreate_git_repo_instance\\b",
+  "\\bensure_profile_image\\b",
+  "\\bapply_runtime_guest_env\\b",
+  "\\bapply_vm_overrides\\b",
+  "\\bfind_stopped_instance\\b",
+  "\\brestart_instance\\b",
+  "\\bstart_instance\\b",
+  "\\bwarn_on_live_git_mounts\\b",
+  "\\bresolve_running\\b",
+  "\\ballocate_and_start\\b",
+  "\\bopen_ssh_session\\b",
+  "\\bpreflight_start_target\\b",
+  "\\bresolve_project_dir\\b",
+  # current_disk_gib stats the disk image; its `/ 1 GiB` arithmetic kernel
+  # is extracted into bytes_to_gib (kept in scope, unit-tested).
+  "\\bcurrent_disk_gib\\b",
+  # instance_status (#385) runs as_running + query_resource_usage (SSH) to
+  # assemble the `status --json` shape; emit_up_dry_run (#385) drives the
+  # devcontainer collector + persisted_guest_user and renders the dry-run
+  # plan. Their pure inputs — InstanceState::from_running, BackendKind::of,
+  # up_translator_inputs — stay in scope and are unit-tested.
+  "\\binstance_status\\b",
+  "\\bemit_up_dry_run\\b",
 
-    # ---- src/commands/json.rs (#385): --json output ----
-    # render_json is the single stdout JSON writer; a `--lib` test cannot
-    # observe its writes. Everything else in json.rs is pure view models and
-    # projections (InstanceState, BackendKind::of, the Serialize structs) kept
-    # in scope and pinned by the shape tests in that module.
-    "\\brender_json\\b",
+  # ---- src/commands/json.rs (#385): --json output ----
+  # render_json is the single stdout JSON writer; a `--lib` test cannot
+  # observe its writes. Everything else in json.rs is pure view models and
+  # projections (InstanceState, BackendKind::of, the Serialize structs) kept
+  # in scope and pinned by the shape tests in that module.
+  "\\brender_json\\b",
 
-    # commands/mod.rs — purges every instance + image (backend destroy calls).
-    "\\bpurge_all_data\\b",
+  # commands/mod.rs — purges every instance + image (backend destroy calls).
+  "\\bpurge_all_data\\b",
 
-    # admin.rs — uninstall/init IO: terminal summary, recursive data-dir wipe,
-    # self-binary removal. The decide_remove_data / config_path_is_under_data_dir
-    # / is_dev_target_path predicates are pure and stay in scope (unit-tested).
-    "\\bprint_uninstall_summary\\b",
-    "\\bwipe_data_dir\\b",
-    "\\bremove_self_binary\\b",
+  # admin.rs — uninstall/init IO: terminal summary, recursive data-dir wipe,
+  # self-binary removal. The decide_remove_data / config_path_is_under_data_dir
+  # / is_dev_target_path predicates are pure and stay in scope (unit-tested).
+  "\\bprint_uninstall_summary\\b",
+  "\\bwipe_data_dir\\b",
+  "\\bremove_self_binary\\b",
 
-    # profiles.rs — `read_dir` size walk (dir_size_bytes); its byte→GiB
-    # formatting kernel is extracted into format_dir_size (kept in scope,
-    # unit-tested). The summary builders (builtin_summary / format_custom_summary
-    # / script_summary), the JSON inventory builder (collect_profiles_list, #385),
-    # and the writeln!-based listers stay in scope. write_profiles_list /
-    # write_profile_show are IO writers and stay excluded.
-    "\\bdir_size_bytes\\b",
-    "\\bwrite_profiles_list\\b",
-    "\\bwrite_profile_show\\b",
+  # profiles.rs — `read_dir` size walk (dir_size_bytes); its byte→GiB
+  # formatting kernel is extracted into format_dir_size (kept in scope,
+  # unit-tested). The summary builders (builtin_summary / format_custom_summary
+  # / script_summary), the JSON inventory builder (collect_profiles_list, #385),
+  # and the writeln!-based listers stay in scope. write_profiles_list /
+  # write_profile_show are IO writers and stay excluded.
+  "\\bdir_size_bytes\\b",
+  "\\bwrite_profiles_list\\b",
+  "\\bwrite_profile_show\\b",
 
-    # commands/devcontainer.rs — discovery + interactive prompt + stderr report.
-    # The pure guard (discovered_local_devcontainer) and the assumed-guest-user
-    # helper stay in scope. resolve_oci_feature_requests drives the OCI feature
-    # resolver (network/registry) so its effects aren't `--lib`-observable.
-    # resolve_devcontainer (stderr wrapper) and resolve_devcontainer_collect
-    # (the quiet collector it delegates to, #385) both discover + prompt +
-    # drive the OCI resolver; \b leaves the pure discovered_local_devcontainer
-    # guard alone. check_render_json (#385) drives the collector and builds
-    # TranslatorInputs inline, so it carries an in-source `#[mutants::skip]`
-    # (see the TranslatorInputs note below), not an entry here.
-    "\\bresolve_devcontainer\\b",
-    "\\bresolve_devcontainer_collect\\b",
-    "\\bmaybe_skip_stored_devcontainer_opt_out\\b",
-    "\\bmaybe_record_devcontainer_opt_out\\b",
-    "\\bresolve_oci_feature_requests\\b",
+  # commands/devcontainer.rs — discovery + interactive prompt + stderr report.
+  # The pure guard (discovered_local_devcontainer) and the assumed-guest-user
+  # helper stay in scope. resolve_oci_feature_requests drives the OCI feature
+  # resolver (network/registry) so its effects aren't `--lib`-observable.
+  # resolve_devcontainer (stderr wrapper) and resolve_devcontainer_collect
+  # (the quiet collector it delegates to, #385) both discover + prompt +
+  # drive the OCI resolver; \b leaves the pure discovered_local_devcontainer
+  # guard alone. check_render_json (#385) drives the collector and builds
+  # TranslatorInputs inline, so it carries an in-source `#[mutants::skip]`
+  # (see the TranslatorInputs note below), not an entry here.
+  "\\bresolve_devcontainer\\b",
+  "\\bresolve_devcontainer_collect\\b",
+  "\\bmaybe_skip_stored_devcontainer_opt_out\\b",
+  "\\bmaybe_record_devcontainer_opt_out\\b",
+  "\\bresolve_oci_feature_requests\\b",
 
-    # quickstart.rs — cwd/TTY prompt resolution. is_sensitive_workspace (pure)
-    # stays in scope and is tested. quickstart_fresh_start is scoped out via an
-    # in-source `#[mutants::skip]` (see the TranslatorInputs note below).
-    "\\bresolve_quickstart_workspace\\b",
+  # quickstart.rs — cwd/TTY prompt resolution. is_sensitive_workspace (pure)
+  # stays in scope and is tested. quickstart_fresh_start is scoped out via an
+  # in-source `#[mutants::skip]` (see the TranslatorInputs note below).
+  "\\bresolve_quickstart_workspace\\b",
 
-    # lib.rs shim — tracing-subscriber install. (The `run` dispatch is scoped
-    # out via an in-source `#[mutants::skip]`; see the TranslatorInputs note.)
-    "\\binit_tracing\\b",
+  # lib.rs shim — tracing-subscriber install. (The `run` dispatch is scoped
+  # out via an in-source `#[mutants::skip]`; see the TranslatorInputs note.)
+  "\\binit_tracing\\b",
 
-    # ---- coop model (#352): local/cloud model switch ----
-    # The pure logic is extracted and unit-tested in scope: tools_needing_prompt,
-    # switch_report_lines, resolved_claude / resolved_codex, ModelMode::as_str
-    # (pinned by mode_as_str_round_trips), and the From<ModelAction> mapping
-    # (pinned by model_action_maps_to_mode in lib.rs). What is excluded below
-    # writes stdout, drives the backend over SSH, or reads a TTY —
-    # tests/integration.sh covers those, a `--lib` test cannot.
+  # ---- coop model (#352): local/cloud model switch ----
+  # The pure logic is extracted and unit-tested in scope: tools_needing_prompt,
+  # switch_report_lines, resolved_claude / resolved_codex, ModelMode::as_str
+  # (pinned by mode_as_str_round_trips), and the From<ModelAction> mapping
+  # (pinned by model_action_maps_to_mode in lib.rs). What is excluded below
+  # writes stdout, drives the backend over SSH, or reads a TTY —
+  # tests/integration.sh covers those, a `--lib` test cannot.
 
-    # commands/model.rs — stdout writers, the state-save + SSH-apply
-    # orchestrators (set_local/set_remote, including set_local's `&&` endpoint
-    # guard), the thin stdout wrapper over switch_report_lines (report_switch),
-    # the `&PlatformBackend` handler (apply_to_running), and the TTY prompt.
-    # render_status is file-anchored because github_pat.rs has a *pure* (kept,
-    # tested) render_status; a bare \brender_status\b would wrongly scope it out.
-    "src/commands/model\\.rs:.*\\brender_status\\b",
-    "\\bwrite_tool_line\\b",
-    "\\bset_local\\b",
-    "\\bset_remote\\b",
-    "\\breport_switch\\b",
-    "\\bapply_to_running\\b",
-    "\\bprompt_endpoint\\b",
+  # commands/model.rs — stdout writers, the state-save + SSH-apply
+  # orchestrators (set_local/set_remote, including set_local's `&&` endpoint
+  # guard), the thin stdout wrapper over switch_report_lines (report_switch),
+  # the `&PlatformBackend` handler (apply_to_running), and the TTY prompt.
+  # render_status is file-anchored because github_pat.rs has a *pure* (kept,
+  # tested) render_status; a bare \brender_status\b would wrongly scope it out.
+  "src/commands/model\\.rs:.*\\brender_status\\b",
+  "\\bwrite_tool_line\\b",
+  "\\bset_local\\b",
+  "\\bset_remote\\b",
+  "\\breport_switch\\b",
+  "\\bapply_to_running\\b",
+  "\\bprompt_endpoint\\b",
 
-    # (model_state.rs's load_or_default stays IN scope: it is tempdir-testable,
-    # and load_or_default_returns_saved_state kills its `Ok(Default::default())`
-    # mutant — which load_or_default_is_remote_when_missing alone cannot, since
-    # the default IS Remote on the missing-file path.)
+  # (model_state.rs's load_or_default stays IN scope: it is tempdir-testable,
+  # and load_or_default_returns_saved_state kills its `Ok(Default::default())`
+  # mutant — which load_or_default_is_remote_when_missing alone cannot, since
+  # the default IS Remote on the missing-file path.)
 
-    # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
-    # via exclude_globs above.)
+  # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
+  # via exclude_globs above.)
 
-    # lifecycle.rs — backend-driving session/bootstrap helpers. Both open an SSH
-    # session and bootstrap guest agents (prepare_session_from_target also reads
-    # persisted guest-env / model state from disk); their effects are observable
-    # only against a real VM.
-    "\\bbootstrap_and_post_start\\b",
-    "\\bprepare_session_from_target\\b",
+  # lifecycle.rs — backend-driving session/bootstrap helpers. Both open an SSH
+  # session and bootstrap guest agents (prepare_session_from_target also reads
+  # persisted guest-env / model state from disk); their effects are observable
+  # only against a real VM.
+  "\\bbootstrap_and_post_start\\b",
+  "\\bprepare_session_from_target\\b",
 
-    # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
-    # not honour exclude_re for these — the regex never matches their name (not
-    # by function, struct path, or even file:line). They are emitted only where
-    # a struct literal uses `..Default::default()`. In this crate that is
-    # `devcontainer::TranslatorInputs`, assembled in four places:
-    #   * up_translator_inputs (lifecycle.rs) — pure builder, KEPT in scope and
-    #     unit-tested (up_translator_inputs_maps_opts), which kills its
-    #     field-deletion mutants.
-    #   * run (lib.rs), cmd_devcontainer_check, check_render_json (#385),
-    #     quickstart_fresh_start — these are dispatch/shell-out handlers whose
-    #     assembled inputs only become observable once the (excluded) translator
-    #     + a real VM consume them, so a `--lib` test cannot kill the
-    #     field-deletions. Because exclude_re is powerless here, those carry an
-    #     in-source `#[mutants::skip]` with a back-reference to this note.
+  # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
+  # not honour exclude_re for these — the regex never matches their name (not
+  # by function, struct path, or even file:line). They are emitted only where
+  # a struct literal uses `..Default::default()`. In this crate that is
+  # `devcontainer::TranslatorInputs`, assembled in four places:
+  #   * up_translator_inputs (lifecycle.rs) — pure builder, KEPT in scope and
+  #     unit-tested (up_translator_inputs_maps_opts), which kills its
+  #     field-deletion mutants.
+  #   * run (lib.rs), cmd_devcontainer_check, check_render_json (#385),
+  #     quickstart_fresh_start — these are dispatch/shell-out handlers whose
+  #     assembled inputs only become observable once the (excluded) translator
+  #     + a real VM consume them, so a `--lib` test cannot kill the
+  #     field-deletions. Because exclude_re is powerless here, those carry an
+  #     in-source `#[mutants::skip]` with a back-reference to this note.
 ]
