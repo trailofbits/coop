@@ -227,6 +227,22 @@ impl Quantity<MibUnit> {
     }
 }
 
+/// Smallest guest memory that boots reliably. Below this the kernel
+/// fails to come up, so it is rejected both when validating the global
+/// config and when reconfiguring an existing instance via `coop resize`.
+pub const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
+
+/// Reject a requested memory size below [`MIN_MEM_MIB`].
+///
+/// Shared by `CoopConfig::validate` (global config) and `coop resize`
+/// (`--mem` on an existing instance) so both enforce the same floor.
+pub fn validate_mem_size(mem: MiB) -> Result<()> {
+    if mem < MIN_MEM_MIB {
+        bail!("mem_size_mib={mem} is too low (minimum {MIN_MEM_MIB})");
+    }
+    Ok(())
+}
+
 /// Disk size specification: absolute (`150`) or relative (`+20`), in GiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskSize {
@@ -1842,19 +1858,14 @@ impl CoopConfig {
     /// Returns `Ok(warnings)` where warnings are non-fatal observations,
     /// or `Err` with all fatal validation errors joined.
     pub fn validate(&self) -> Result<Vec<String>> {
-        const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
-
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
         // VM config bounds
         // vcpu_count, mem_size_mib, template_size_gib, and ssh_port are
         // NonZero types — zero is rejected at deserialization time.
-        if self.vm.mem_size_mib < MIN_MEM_MIB {
-            errors.push(format!(
-                "vm.mem_size_mib={} is too low (minimum {MIN_MEM_MIB})",
-                self.vm.mem_size_mib,
-            ));
+        if let Err(e) = validate_mem_size(self.vm.mem_size_mib) {
+            errors.push(e.to_string());
         }
 
         // Path checks
@@ -4300,6 +4311,18 @@ skip = ["not-a-slug"]
         cfg.vm.mem_size_mib = MiB::new(64).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("mem_size_mib=64 is too low"));
+    }
+
+    #[test]
+    fn validate_mem_size_rejects_below_minimum() {
+        let err = super::validate_mem_size(MiB::new(127).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("mem_size_mib=127 is too low"));
+    }
+
+    #[test]
+    fn validate_mem_size_accepts_minimum_and_above() {
+        super::validate_mem_size(super::MIN_MEM_MIB).unwrap();
+        super::validate_mem_size(MiB::new(4096).unwrap()).unwrap();
     }
 
     #[test]

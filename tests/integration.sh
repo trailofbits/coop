@@ -1719,6 +1719,60 @@ test_resize_status() {
     fi
 }
 
+test_reconfigure() {
+    echo ""
+    echo "=== Phase: resize changes memory and vCPUs ==="
+
+    # The instance is stopped here. Apply new mem/vcpu and boot in one
+    # step (--start) so the result can be read back via `coop status`,
+    # which needs a running VM on Firecracker. Values are small and safe
+    # to boot on any host, and differ from the defaults so a no-op would
+    # be caught.
+    local want_vcpus=1
+    local want_mem=2048
+
+    if coop resize "$INSTANCE" --vcpus "$want_vcpus" --mem "$want_mem" --start; then
+        pass "resize --vcpus/--mem --start exits 0"
+    else
+        fail "resize --vcpus/--mem --start exits 0" "exit code: $?"
+        return
+    fi
+
+    # On Firecracker, `--start` routes through configure(), which must
+    # preserve the freshly-written mem/vcpu instead of resetting them to
+    # the global config — so this single check also exercises the
+    # preserve-on-restart behavior. On Lima the values come from the
+    # re-read lima.yaml via limactl.
+    if ! coop status "$INSTANCE" 2>/dev/null; then
+        fail "status after reconfigure" "status unavailable for running instance"
+        return
+    fi
+
+    local got_vcpus got_mem
+    got_vcpus=$(echo "$HARNESS_OUT" | sed -n 's/.*vCPUs: \([0-9][0-9]*\).*/\1/p' | head -1)
+    got_mem=$(echo "$HARNESS_OUT" | sed -n 's/.*Memory: \([0-9][0-9]*\) MiB.*/\1/p' | head -1)
+
+    if [[ "$got_vcpus" == "$want_vcpus" ]]; then
+        pass "status reflects reconfigured vCPUs (${got_vcpus})"
+    else
+        fail "status reflects reconfigured vCPUs" "expected ${want_vcpus}, got ${got_vcpus}"
+    fi
+
+    if [[ "$got_mem" == "$want_mem" ]]; then
+        pass "status reflects reconfigured memory (${got_mem} MiB)"
+    else
+        fail "status reflects reconfigured memory" "expected ${want_mem} MiB, got ${got_mem}"
+    fi
+
+    # Return the instance to a stopped state for the phases that follow
+    # (commit/restore/restart all expect it stopped).
+    if coop stop "$INSTANCE" >/dev/null 2>&1; then
+        pass "stop after reconfigure exits 0"
+    else
+        fail "stop after reconfigure exits 0" "exit code: $?"
+    fi
+}
+
 test_commit_restore() {
     echo ""
     echo "=== Phase: commit + restore ==="
@@ -4756,6 +4810,7 @@ main() {
     test_status_stopped
     test_list_stopped
     test_resize_status
+    test_reconfigure
     test_commit_restore
     test_restart_stopped
     test_restart_rejects_ignored_flags

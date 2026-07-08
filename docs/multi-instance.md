@@ -108,18 +108,24 @@ The instance disk grows from the template size when the requested size is larger
 
 ### After creation
 
-`coop resize` changes the disk size of a stopped instance:
+`coop resize` changes the disk size, memory, or vCPU count of a stopped instance:
 
 ```
-# Absolute size
+# Absolute disk size
 coop resize --size 150
 coop resize my-project --size 150
 
-# Relative size (grow by 20 GiB)
+# Relative disk size (grow by 20 GiB)
 coop resize my-project --size +20
+
+# Memory and/or vCPUs (combine with disk if you like)
+coop resize my-project --mem 8192 --vcpus 4
+
+# Apply and boot in one step
+coop resize my-project --mem 4096 --start
 ```
 
-The instance must be stopped first. coop rejects the resize and tells you to stop the instance if it is running.
+The instance must be stopped first. coop rejects the resize and tells you to stop the instance if it is running. Memory and vCPU changes persist in the instance's backend config (authoritative over the global `[vm]` defaults, which only apply to new instances) and take effect on the next `coop start`, or immediately with `--start`.
 
 ## Independent lifecycle
 

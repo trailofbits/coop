@@ -533,7 +533,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Resize a stopped instance's disk
+    /// Resize a stopped instance's disk, memory, or vCPU count
+    #[command(group(clap::ArgGroup::new("resize_targets")
+        .required(true)
+        .multiple(true)
+        .args(["size", "mem", "vcpus"])))]
     Resize {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -541,9 +545,18 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// New size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
-        #[arg(long, required = true, value_parser = config::DiskSize::parse)]
-        size: config::DiskSize,
+        /// New disk size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
+        #[arg(long, value_parser = config::DiskSize::parse)]
+        size: Option<config::DiskSize>,
+        /// New memory in MiB (minimum 128)
+        #[arg(long, value_parser = config::MiB::parse_cli)]
+        mem: Option<config::MiB>,
+        /// New vCPU count
+        #[arg(long)]
+        vcpus: Option<std::num::NonZeroU8>,
+        /// Start the instance after applying the change instead of leaving it stopped
+        #[arg(long)]
+        start: bool,
     },
     /// Save a stopped instance's filesystem as a reusable image
     Commit {
@@ -1218,7 +1231,13 @@ pub fn run() -> Result<()> {
             workspace::write_ssh_config(&running)
         }
         Commands::Images { delete, json } => cmd_images(&be, &cfg, delete.as_ref(), json),
-        Commands::Resize { name, size } => cmd_resize(&be, &cfg, name.as_ref(), size),
+        Commands::Resize {
+            name,
+            size,
+            mem,
+            vcpus,
+            start,
+        } => cmd_resize(&be, &cfg, name.as_ref(), size, mem, vcpus, start),
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }

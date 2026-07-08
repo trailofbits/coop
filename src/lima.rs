@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
+use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Hostname, LogMode, SshTarget, SshUser};
-use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName};
+use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
@@ -325,6 +326,89 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
          (cloud-init growpart)."
     );
     Ok(())
+}
+
+/// Change a stopped Lima instance's cpus/memory by editing its
+/// `lima.yaml`, then validating the new spec with a start.
+///
+/// Lima re-reads `lima.yaml` on `limactl start`, so the edit is what
+/// applies the change. The edit is written atomically and the prior file
+/// restored if the start fails (limactl rejects a malformed or over-large
+/// spec). With `start_after` the instance is left running; otherwise it is
+/// stopped again after the validating boot so `coop resize` leaves it in
+/// the state it found it.
+pub fn set_machine_resources(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    mem: Option<MiB>,
+    vcpus: Option<NonZeroU8>,
+    start_after: bool,
+) -> Result<()> {
+    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
+    let original = fs::read_to_string(&yaml_path)
+        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+
+    let mut edited = original.clone();
+    if let Some(vcpus) = vcpus {
+        edited = set_yaml_scalar(&edited, "cpus", &vcpus.to_string())
+            .with_context(|| format!("No top-level 'cpus' key in {}", yaml_path.display()))?;
+    }
+    if let Some(mem) = mem {
+        let value = format!("\"{}GiB\"", mem.as_gib_f64());
+        edited = set_yaml_scalar(&edited, "memory", &value)
+            .with_context(|| format!("No top-level 'memory' key in {}", yaml_path.display()))?;
+    }
+
+    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
+
+    // Lima applies cpus/memory only at start, so boot to validate + apply.
+    if let Err(e) = start_existing(cfg, inst) {
+        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
+            tracing::error!(
+                "Failed to restore {} after a failed reconfigure: {restore}",
+                yaml_path.display()
+            );
+        }
+        return Err(e.context("Failed to apply new machine resources — reverted lima.yaml"));
+    }
+
+    if !start_after {
+        stop_running(inst)?;
+    }
+    Ok(())
+}
+
+/// Replace the value of a top-level scalar `key` in a YAML document,
+/// returning the edited document, or `None` if the key is absent.
+///
+/// Only an unindented `key:` line is matched, so nested keys of the same
+/// name are left untouched. coop always writes `cpus`/`memory` at the top
+/// level when creating an instance, so a `None` here means the file is not
+/// the expected shape and the caller should surface an error.
+fn set_yaml_scalar(yaml: &str, key: &str, value: &str) -> Option<String> {
+    let mut replaced = false;
+    let mut out = String::with_capacity(yaml.len() + value.len());
+    for line in yaml.lines() {
+        if !replaced && is_top_level_key(line, key) {
+            replaced = true;
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(value);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    replaced.then_some(out)
+}
+
+/// True if `line` is an unindented `key:` entry — the top-level scalar we
+/// rewrite — rather than a nested (indented) or differently-named key.
+fn is_top_level_key(line: &str, key: &str) -> bool {
+    match line.split_once(':') {
+        Some((name, _)) => name == key,
+        None => false,
+    }
 }
 
 /// Save a stopped instance's disk as image `image`'s base image.
@@ -1729,6 +1813,53 @@ mod tests {
     fn cloud_init_exit0_done_succeeds() {
         let result = check_cloud_init_output(Some(0), "status: done\n");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn set_yaml_scalar_replaces_top_level_cpus_and_memory() {
+        let yaml = "cpus: 2\nmemory: \"4GiB\"\ndisk: \"20GiB\"\n";
+        let edited = set_yaml_scalar(yaml, "cpus", "8").unwrap();
+        let edited = set_yaml_scalar(&edited, "memory", "\"16GiB\"").unwrap();
+        assert!(edited.contains("cpus: 8\n"), "cpus not updated: {edited}");
+        assert!(
+            edited.contains("memory: \"16GiB\"\n"),
+            "memory not updated: {edited}"
+        );
+        assert!(
+            edited.contains("disk: \"20GiB\"\n"),
+            "unrelated key changed: {edited}"
+        );
+    }
+
+    #[test]
+    fn set_yaml_scalar_returns_none_for_missing_key() {
+        assert!(set_yaml_scalar("cpus: 2\n", "memory", "\"4GiB\"").is_none());
+    }
+
+    #[test]
+    fn set_yaml_scalar_ignores_nested_keys() {
+        // A nested `cpus:` (indented) must not be mistaken for the
+        // top-level one; the top-level key is what limactl reads.
+        let yaml = "provision:\n  cpus: bogus\ncpus: 2\n";
+        let edited = set_yaml_scalar(yaml, "cpus", "8").unwrap();
+        assert!(
+            edited.contains("  cpus: bogus\n"),
+            "nested key edited: {edited}"
+        );
+        assert!(
+            edited.contains("cpus: 8\n"),
+            "top-level key not edited: {edited}"
+        );
+    }
+
+    #[test]
+    fn is_top_level_key_matches_only_unindented_exact_key() {
+        assert!(is_top_level_key("cpus: 2", "cpus"));
+        assert!(is_top_level_key("cpus: null", "cpus"));
+        assert!(!is_top_level_key("  cpus: 2", "cpus"));
+        assert!(!is_top_level_key("cpuset: 2", "cpus"));
+        assert!(!is_top_level_key("# cpus: 2", "cpus"));
+        assert!(!is_top_level_key("no colon here", "cpus"));
     }
 
     #[test]

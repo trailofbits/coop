@@ -123,8 +123,8 @@ VM resource allocation and boot configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `vcpu_count` | integer | `2` | Number of vCPUs. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. |
-| `mem_size_mib` | integer | `4096` | Memory in MiB. Must be >= 128. Overridable with `--mem` on `setup` and `up`. |
+| `vcpu_count` | integer | `2` | Number of vCPUs for **new** instances. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. Change an existing instance with `coop resize --vcpus`. |
+| `mem_size_mib` | integer | `4096` | Memory in MiB for **new** instances. Must be >= 128. Overridable with `--mem` on `setup` and `up`. Change an existing instance with `coop resize --mem`. |
 | `template_size_gib` | integer | `8` | Template rootfs disk size in GiB. Must be > 0. Overridable with `--template-size` on `setup`. |
 | `kernel_path` | string (path) | `~/.coop/vmlinux` | Path to the vmlinux kernel image. Linux/Firecracker only. |
 | `boot_args` | string | `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw` | Kernel boot arguments. Linux/Firecracker only. |

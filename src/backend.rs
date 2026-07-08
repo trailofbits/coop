@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::fs;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU8, NonZeroU16};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
 use crate::config::{
-    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel, McpServerDef,
+    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel, McpServerDef, MiB,
     NetworkConfig, Validated,
 };
 use crate::model_state::ModelState;
@@ -772,6 +772,26 @@ pub trait VmBackend: std::fmt::Display {
         stopped: &StoppedInstance,
         new_size: crate::config::GiB,
     ) -> Result<()>;
+    /// Change a stopped instance's memory and/or vCPU count. At least one
+    /// of `mem`/`vcpus` is `Some` (the caller enforces this). The new
+    /// value is written to the backend's authoritative artifact — the
+    /// per-instance Firecracker JSON or the Lima `lima.yaml` — so it
+    /// survives restarts rather than being reset from the global config.
+    ///
+    /// Firecracker writes the JSON atomically and does not boot the VM;
+    /// Lima must `limactl start` to validate and apply the new spec, and
+    /// restores the previous `lima.yaml` if that start fails. When
+    /// `start_after` is true the instance is left running; otherwise it
+    /// ends stopped (Lima stops it again after the validation boot).
+    /// Gated on a [`StoppedInstance`] like [`Self::resize_disk`].
+    fn set_machine_resources(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        mem: Option<MiB>,
+        vcpus: Option<NonZeroU8>,
+        start_after: bool,
+    ) -> Result<()>;
     /// Save a stopped instance's filesystem as image `image` (the
     /// backend-specific disk artifacts only — the caller carries over
     /// the shared `template-config.json`). Takes a [`StoppedInstance`]
@@ -968,6 +988,31 @@ impl VmBackend for FirecrackerBackend {
         crate::setup::resize_rootfs(stopped.instance(), new_size)
     }
 
+    fn set_machine_resources(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        mem: Option<MiB>,
+        vcpus: Option<NonZeroU8>,
+        start_after: bool,
+    ) -> Result<()> {
+        let inst = stopped.instance();
+        // Snapshot the prior spec so a failed validation boot can be rolled
+        // back — otherwise `configure()` would re-read the rejected value on
+        // every subsequent `coop start` and the instance would stay wedged.
+        let previous = crate::vm::machine_resources(inst)?;
+        crate::vm::set_machine_resources(inst, mem, vcpus)?;
+        if start_after && let Err(e) = self.start_existing(cfg, inst) {
+            if let Err(revert) =
+                crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
+            {
+                tracing::error!("Failed to revert machine config after failed start: {revert}");
+            }
+            return Err(e.context("Failed to start after reconfigure — reverted machine config"));
+        }
+        Ok(())
+    }
+
     fn commit_disk(
         &self,
         cfg: &CoopConfig,
@@ -1137,6 +1182,17 @@ impl VmBackend for LimaBackend {
         new_size: crate::config::GiB,
     ) -> Result<()> {
         crate::lima::resize_disk(cfg, stopped.instance(), new_size)
+    }
+
+    fn set_machine_resources(
+        &self,
+        cfg: &CoopConfig,
+        stopped: &StoppedInstance,
+        mem: Option<MiB>,
+        vcpus: Option<NonZeroU8>,
+        start_after: bool,
+    ) -> Result<()> {
+        crate::lima::set_machine_resources(cfg, stopped.instance(), mem, vcpus, start_after)
     }
 
     fn commit_disk(

@@ -584,7 +584,9 @@ fn ensure_up_existing_inputs_are_compatible(
             "Instance '{}' already exists for this project. \
              --vcpus, --mem, --disk, --extra-mount, --exclude-git, and \
              --devcontainer only apply when creating a new instance.\n\
-             Use `coop destroy {}` first to recreate it with those options.",
+             To change memory, vCPUs, or disk on the existing instance, \
+             stop it and run `coop resize`. Otherwise `coop destroy {}` \
+             first to recreate it with those options.",
             inst.name,
             inst.name,
         );
@@ -661,7 +663,9 @@ fn ensure_up_existing_inputs_are_compatible_for_git_repo(
             "Instance '{}' already exists for this git repo. \
              --vcpus, --mem, --disk, --extra-mount, and --devcontainer only \
              apply when creating a new instance.\n\
-             Use `coop destroy {}` first to recreate it with those options.",
+             To change memory, vCPUs, or disk on the existing instance, \
+             stop it and run `coop resize`. Otherwise `coop destroy {}` \
+             first to recreate it with those options.",
             inst.name,
             inst.name,
         );
@@ -1745,15 +1749,36 @@ pub(crate) fn cmd_resize(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
-    disk_size: config::DiskSize,
+    disk_size: Option<config::DiskSize>,
+    mem: Option<config::MiB>,
+    vcpus: Option<std::num::NonZeroU8>,
+    start: bool,
 ) -> Result<()> {
+    // Reject a below-minimum memory before touching any artifact, so a bad
+    // value never leaves a half-applied instance (the CLI ArgGroup already
+    // guarantees at least one of size/mem/vcpus is present).
+    if let Some(mem) = mem {
+        config::validate_mem_size(mem)?;
+    }
+
     let inst = cfg.resolve_instance(name)?;
-
     let stopped = be.as_stopped(inst)?;
-    let current = current_disk_gib(be, stopped.instance())?;
-    let new_size = disk_size.resolve(current)?;
 
-    be.resize_disk(cfg, &stopped, new_size)
+    if let Some(disk_size) = disk_size {
+        let current = current_disk_gib(be, stopped.instance())?;
+        let new_size = disk_size.resolve(current)?;
+        be.resize_disk(cfg, &stopped, new_size)?;
+    }
+
+    if mem.is_some() || vcpus.is_some() {
+        // The backend applies mem/vcpu and, for `--start`, boots the
+        // instance itself (Lima must boot to validate regardless).
+        be.set_machine_resources(cfg, &stopped, mem, vcpus, start)?;
+    } else if start {
+        be.start_existing(cfg, stopped.instance())?;
+    }
+
+    Ok(())
 }
 
 /// Save a stopped instance's filesystem as a reusable image.

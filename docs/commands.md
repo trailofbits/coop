@@ -662,22 +662,45 @@ Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 
 ### `resize`
 
-Resize a stopped instance's disk. The VM must be stopped first.
+Change a stopped instance's disk size, memory, or vCPU count. The VM must
+be stopped first. At least one of `--size`, `--mem`, or `--vcpus` is required;
+they can be combined in a single command.
 
 ```
-coop resize [NAME] --size <SIZE>
+coop resize [NAME] [--size <SIZE>] [--mem <MIB>] [--vcpus <N>] [--start]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--size <size>` | New size (required). Absolute: `150` or `150G`. Relative: `+20` or `+20G`. |
+| `--size <size>` | New disk size. Absolute: `150` or `150G`. Relative: `+20` or `+20G`. |
+| `--mem <mib>` | New memory in MiB (minimum 128). |
+| `--vcpus <n>` | New vCPU count (> 0). |
+| `--start` | Start the instance after applying the change instead of leaving it stopped. |
 
-Absolute values set the disk to that exact size. A `+` prefix adds to the current size.
+Absolute disk values set the disk to that exact size; a `+` prefix adds to the
+current size. Memory and vCPU changes are written to the instance's backend
+config (the Firecracker per-instance JSON or the Lima `lima.yaml`), which is
+authoritative — the value survives restarts and is reported by `coop status`.
+The global `[vm]` settings in `config.toml` only seed these values for *new*
+instances.
+
+By default the instance is left stopped and the change takes effect on the next
+`coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
+`--start` boot fails (e.g. more memory than the host has), the previous mem/vcpu
+is restored so a plain `coop start` still works; on Lima the `lima.yaml` is
+likewise restored.
+
+Combining `--size` with `--mem`/`--vcpus` applies the disk change first, then the
+machine-resource change; the two are separate artifacts and are not applied
+transactionally, so if the second step fails the disk change has already taken
+effect.
 
 ```
 coop resize my-project --size 150G
 coop resize --size +20
+coop resize my-project --mem 8192 --vcpus 4
+coop resize my-project --mem 4096 --start
 ```
 
 ### `commit`

@@ -344,6 +344,7 @@ coop images --delete python-dev
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |
+| `coop resize --mem 8192 --vcpus 4` | Change a stopped instance's memory and vCPUs |
 
 ## Further reading
 

@@ -3,15 +3,17 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::marker::PhantomData;
 use std::net::TcpStream;
+use std::num::NonZeroU8;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
-use crate::config::{CoopConfig, Instance};
+use crate::config::{CoopConfig, Instance, MiB};
 
 // ── Typestate markers ─────────────────────────────────────────
 
@@ -32,11 +34,10 @@ pub struct Running;
 pub struct FirecrackerVm<'a, S> {
     cfg: &'a CoopConfig,
     inst: &'a Instance,
-    fc_config: FirecrackerConfig,
     _state: PhantomData<S>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct FirecrackerConfig {
     #[serde(rename = "boot-source")]
     boot_source: BootSource,
@@ -48,13 +49,13 @@ struct FirecrackerConfig {
     vsock: Option<VsockConfig>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BootSource {
     kernel_image_path: String,
     boot_args: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Drive {
     #[serde(rename = "drive_id")]
     id: String,
@@ -63,20 +64,20 @@ struct Drive {
     is_read_only: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 struct MachineConfig {
     vcpu_count: u8,
     mem_size_mib: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct NetworkInterface {
     iface_id: String,
     guest_mac: String,
     host_dev_name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct VsockConfig {
     guest_cid: u32,
     uds_path: String,
@@ -110,6 +111,79 @@ fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
     }
 }
 
+/// Read the persisted machine config (mem/vcpu) from an instance's JSON.
+///
+/// Returns `None` if the file is missing or unparsable, letting callers
+/// fall back to the global config for a not-yet-created instance.
+fn read_machine_config(path: &Path) -> Option<MachineConfig> {
+    let json = fs::read_to_string(path).ok()?;
+    let config: FirecrackerConfig = serde_json::from_str(&json).ok()?;
+    Some(config.machine_config)
+}
+
+/// The instance's currently persisted memory and vCPU count, as the typed
+/// values `set_machine_resources` accepts.
+///
+/// Used to snapshot the prior values before a reconfigure so the caller
+/// can roll them back if a subsequent boot fails, leaving the instance
+/// bootable at its previous spec rather than wedged at the rejected one.
+pub fn machine_resources(inst: &Instance) -> Result<(MiB, NonZeroU8)> {
+    let path = inst.vm_config_path();
+    let machine = read_machine_config(&path)
+        .with_context(|| format!("Failed to read machine config from {}", path.display()))?;
+    let mem = MiB::new(machine.mem_size_mib)
+        .with_context(|| format!("Corrupt mem_size_mib=0 in {}", path.display()))?;
+    let vcpus = NonZeroU8::new(machine.vcpu_count)
+        .with_context(|| format!("Corrupt vcpu_count=0 in {}", path.display()))?;
+    Ok((mem, vcpus))
+}
+
+/// Overwrite the memory and/or vCPU fields left `Some`, in place.
+///
+/// Split out from [`set_machine_resources`] so the field-selection logic
+/// is unit-testable without touching the filesystem.
+fn apply_machine_resources(
+    machine: &mut MachineConfig,
+    mem: Option<MiB>,
+    vcpus: Option<NonZeroU8>,
+) {
+    if let Some(mem) = mem {
+        machine.mem_size_mib = mem.as_u32();
+    }
+    if let Some(vcpus) = vcpus {
+        machine.vcpu_count = vcpus.get();
+    }
+}
+
+/// Update a stopped instance's persisted mem/vcpu, writing atomically so
+/// a crash mid-write leaves the prior values intact.
+///
+/// The change takes effect on the next `coop start` (Firecracker re-reads
+/// the JSON on boot); [`FirecrackerVm::configure`] preserves these fields
+/// rather than resetting them to the global default.
+pub fn set_machine_resources(
+    inst: &Instance,
+    mem: Option<MiB>,
+    vcpus: Option<NonZeroU8>,
+) -> Result<()> {
+    let path = inst.vm_config_path();
+    let json = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read VM config {}", path.display()))?;
+    let mut config: FirecrackerConfig = serde_json::from_str(&json)
+        .with_context(|| format!("Failed to parse VM config {}", path.display()))?;
+    apply_machine_resources(&mut config.machine_config, mem, vcpus);
+    let out =
+        serde_json::to_string_pretty(&config).context("Failed to serialize Firecracker config")?;
+    crate::fs_util::atomic_write_json(&path, &out)?;
+    tracing::info!(
+        "Updated machine config for instance '{}': {} vCPUs, {} MiB",
+        inst.name,
+        config.machine_config.vcpu_count,
+        config.machine_config.mem_size_mib,
+    );
+    Ok(())
+}
+
 // ── Configured state ──────────────────────────────────────────
 
 impl<'a> FirecrackerVm<'a, Configured> {
@@ -117,17 +191,29 @@ impl<'a> FirecrackerVm<'a, Configured> {
         Self {
             cfg,
             inst,
-            fc_config: build_config(cfg, inst),
             _state: PhantomData,
         }
     }
 
     /// Write the Firecracker JSON config.
+    ///
+    /// Infra fields (kernel path, boot args, drive, network, vsock) are
+    /// regenerated from the global config every time so they roll forward
+    /// on restart (e.g. after a kernel upgrade). Machine resources
+    /// (mem/vcpu) are the exception: once an instance's config exists on
+    /// disk it is authoritative for those two fields, so a value set via
+    /// `coop resize` survives a restart instead of being reset to the
+    /// global default. A fresh instance (no config yet) seeds them from
+    /// the global config.
     pub fn configure(&self) -> Result<()> {
         fs::create_dir_all(&self.inst.dir).context("Failed to create instance directory")?;
 
         let config_path = self.inst.vm_config_path();
-        let config_json = serde_json::to_string_pretty(&self.fc_config)
+        let mut fc_config = build_config(self.cfg, self.inst);
+        if let Some(existing) = read_machine_config(&config_path) {
+            fc_config.machine_config = existing;
+        }
+        let config_json = serde_json::to_string_pretty(&fc_config)
             .context("Failed to serialize Firecracker config")?;
         fs::write(&config_path, config_json).context("Failed to write Firecracker config")?;
 
@@ -198,7 +284,6 @@ impl<'a> FirecrackerVm<'a, Configured> {
         let running = FirecrackerVm {
             cfg: self.cfg,
             inst: self.inst,
-            fc_config: self.fc_config,
             _state: PhantomData,
         };
 
@@ -247,7 +332,6 @@ impl<'a> FirecrackerVm<'a, Running> {
         Self {
             cfg,
             inst,
-            fc_config: build_config(cfg, inst),
             _state: PhantomData,
         }
     }
@@ -366,13 +450,20 @@ impl<'a> FirecrackerVm<'a, Running> {
             fs::read_to_string(self.inst.pid_file_path()).context("Failed to read PID file")?;
         let pid = pid_str.trim();
 
+        // Report the mem/vcpu the VM actually booted with, read from the
+        // authoritative per-instance config, not the global default.
+        let machine = read_machine_config(&self.inst.vm_config_path()).unwrap_or(MachineConfig {
+            vcpu_count: self.cfg.vm.vcpu_count.get(),
+            mem_size_mib: self.cfg.vm.mem_size_mib.as_u32(),
+        });
+
         let mut out = format!(
             "Instance '{}' running (PID: {pid})\n  \
              vCPUs: {}\n  Memory: {} MiB\n  \
              Guest IP: {}\n  SSH: {}:{}",
             self.inst.name,
-            self.cfg.vm.vcpu_count,
-            self.cfg.vm.mem_size_mib,
+            machine.vcpu_count,
+            machine.mem_size_mib,
             self.inst.guest_ip(),
             self.inst.guest_ip(),
             self.cfg.ssh_port,
@@ -477,4 +568,80 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(200));
     }
     false
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+mod tests {
+    use super::{MachineConfig, MiB, NonZeroU8, apply_machine_resources, read_machine_config};
+
+    const SAMPLE_CONFIG_JSON: &str = r#"{
+        "boot-source": {"kernel_image_path": "/k", "boot_args": "console=ttyS0"},
+        "drives": [{"drive_id": "rootfs", "path_on_host": "/r",
+                    "is_root_device": true, "is_read_only": false}],
+        "machine-config": {"vcpu_count": 6, "mem_size_mib": 5120},
+        "network-interfaces": [{"iface_id": "eth0", "guest_mac": "06:00:AC:10:00:02",
+                                "host_dev_name": "tap0"}],
+        "vsock": {"guest_cid": 3, "uds_path": "/v"}
+    }"#;
+
+    #[test]
+    fn read_machine_config_parses_persisted_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vm_config.json");
+        std::fs::write(&path, SAMPLE_CONFIG_JSON).unwrap();
+        let machine = read_machine_config(&path).unwrap();
+        assert_eq!(machine.vcpu_count, 6);
+        assert_eq!(machine.mem_size_mib, 5120);
+    }
+
+    #[test]
+    fn read_machine_config_returns_none_for_missing_or_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        assert!(read_machine_config(&missing).is_none(), "missing file");
+
+        let malformed = dir.path().join("bad.json");
+        std::fs::write(&malformed, "{ not json").unwrap();
+        assert!(read_machine_config(&malformed).is_none(), "malformed file");
+    }
+
+    #[test]
+    fn apply_machine_resources_updates_only_provided_fields() {
+        let mut machine = MachineConfig {
+            vcpu_count: 2,
+            mem_size_mib: 2048,
+        };
+
+        apply_machine_resources(&mut machine, MiB::new(4096), None);
+        assert_eq!(machine.mem_size_mib, 4096);
+        assert_eq!(machine.vcpu_count, 2, "vcpu untouched when mem-only");
+
+        apply_machine_resources(&mut machine, None, NonZeroU8::new(8));
+        assert_eq!(machine.vcpu_count, 8);
+        assert_eq!(machine.mem_size_mib, 4096, "mem untouched when vcpu-only");
+    }
+
+    #[test]
+    fn apply_machine_resources_is_noop_when_both_none() {
+        let mut machine = MachineConfig {
+            vcpu_count: 2,
+            mem_size_mib: 2048,
+        };
+        apply_machine_resources(&mut machine, None, None);
+        assert_eq!(machine.vcpu_count, 2);
+        assert_eq!(machine.mem_size_mib, 2048);
+    }
+
+    #[test]
+    fn machine_config_round_trips_through_json() {
+        let machine = MachineConfig {
+            vcpu_count: 4,
+            mem_size_mib: 3072,
+        };
+        let json = serde_json::to_string(&machine).unwrap();
+        let back: MachineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vcpu_count, 4);
+        assert_eq!(back.mem_size_mib, 3072);
+    }
 }

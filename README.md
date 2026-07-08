@@ -52,7 +52,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 - **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
 - **VS Code remote SSH**: `coop vscode` opens VS Code connected to the guest
 - **Multi-instance**: run multiple VMs side by side, each with its own name and disk
-- **Disk resize**: grow a stopped instance's disk with `coop resize --size +20`
+- **Reconfigure in place**: change a stopped instance's disk, memory, or vCPUs with `coop resize` (e.g. `coop resize --size +20 --mem 8192 --vcpus 4`) — no destroy/recreate
 - **Commit and restore**: save a stopped instance's filesystem as a reusable image with `coop commit`, and roll an instance back to it in place with `coop restore` — a `docker container commit`-style checkpoint for risky agent runs
 - **Config optional**: works with sensible defaults; customize via `~/.coop/config.toml` when needed
 
@@ -82,7 +82,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
 | `images` | List or delete template images |
 | `profiles` | List or inspect available profiles |
-| `resize` | Grow a stopped instance's disk |
+| `resize` | Change a stopped instance's disk, memory, or vCPUs |
 | `commit` | Save a stopped instance's filesystem as a reusable image |
 | `restore` | Roll a stopped instance back to an image's filesystem in place |
 | `init` | Generate a starter config file at ~/.coop/config.toml |
