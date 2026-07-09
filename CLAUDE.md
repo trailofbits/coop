@@ -14,7 +14,7 @@ Backend abstraction in `src/backend.rs` provides `SshTarget` and `Backend` enum.
 
 ## Before committing
 
-Pre-commit hooks (prek) run automatically: cargo fmt, clippy, test, `taplo format --check` (TOML — also enforced by the `taplo` CI job), trailing whitespace, EOF fixer, large file check, merge conflict check. Install the hook runner and formatter at pinned versions with `./scripts/install-dev-tools.sh` (the single source of truth for dev-tool versions), then `prek install`. taplo's 2-space indent (its default, pinned in `.taplo.toml`, which also excludes `revm-kani/`/`target/`) is what `.editorconfig` declares for editors.
+Pre-commit hooks (prek) run automatically: cargo fmt, clippy, test, `taplo format --check` (TOML — also enforced by the `taplo` CI job), trailing whitespace, EOF fixer, large file check, merge conflict check. Install the hook runner and formatter at pinned versions with `./scripts/install-dev-tools.sh` (the pinned installer for local dev tools; CI pins its own taplo/cargo-deny in `.github/workflows/ci.yml`), then `prek install`. taplo's 2-space indent (its default, pinned in `.taplo.toml`, which also excludes `revm-kani/`/`target/`) is what `.editorconfig` declares for editors.
 
 After hooks pass, run integration tests on **both platforms** — these are too slow for hooks:
 

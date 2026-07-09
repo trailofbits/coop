@@ -21,8 +21,9 @@ backend. The sections below note where that applies.
   ./scripts/install-dev-tools.sh --all    # also cargo-mutants, cargo-fuzz, kani
   ```
 
-  The script is the single source of truth for tool versions; bump a version
-  there rather than installing a floating `latest`.
+  The script pins the local dev-tool versions; bump a version there rather than
+  installing a floating `latest`. CI pins its own copies of taplo and cargo-deny
+  in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
     (`limactl` on your PATH).

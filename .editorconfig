@@ -31,6 +31,6 @@ indent_size = 2
 [*.json]
 indent_size = 2
 
-# Shell: 4-space indent, matching the existing scripts.
+# Shell: 4-space indent, matching most of the repo's scripts.
 [*.sh]
 indent_size = 4

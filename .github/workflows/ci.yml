@@ -55,32 +55,40 @@ jobs:
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@732870f031d2fb36309d0deaf36abcc704a7be65 # v1.20.1
 
+      # Pin to match CARGO_DENY_VERSION in scripts/install-dev-tools.sh so CI and
+      # local installs run the same version.
       - name: Install cargo-deny
-        run: cargo binstall --no-confirm cargo-deny
+        run: cargo binstall --no-confirm cargo-deny@0.19.9
 
       - name: Check advisories, licenses, bans, sources
         run: cargo deny check
 
   taplo:
     runs-on: ubuntu-latest
+    # Single version knob for this job; keep in sync with TAPLO_VERSION in
+    # scripts/install-dev-tools.sh. Used for both the cache key and the install,
+    # so the two can never drift (a bumped install with a stale key would
+    # silently keep checking with the cached old binary).
+    env:
+      TAPLO_VERSION: 0.10.0
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # Cache the compiled binary keyed on the pinned version so only the first
-      # run (or a version bump) pays the compile cost. Keep the version here in
-      # sync with TAPLO_VERSION in scripts/install-dev-tools.sh.
+      # taplo has no cargo-binstall prebuilts, so compile from crates.io
+      # (checksum-verified source) and cache the binary keyed on the pinned
+      # version — only the first run or a version bump pays the compile cost.
       - name: Cache taplo
         id: cache-taplo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/taplo
-          key: ${{ runner.os }}-taplo-cli-0.10.0
+          key: ${{ runner.os }}-taplo-cli-${{ env.TAPLO_VERSION }}
 
       - name: Install taplo
         if: steps.cache-taplo.outputs.cache-hit != 'true'
-        run: cargo install taplo-cli --version '=0.10.0' --locked
+        run: cargo install taplo-cli --version "=${TAPLO_VERSION}" --locked
 
       - name: Check TOML formatting
         run: taplo format --check
