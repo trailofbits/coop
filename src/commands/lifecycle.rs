@@ -1745,36 +1745,44 @@ pub(crate) fn cmd_status(
     Ok(())
 }
 
+/// Inputs to `coop resize`. At least one of `disk`/`mem`/`vcpus` is set;
+/// that invariant is enforced at the CLI boundary by the `resize_targets`
+/// arg group, so this is a plain data bundle (kept together to stay under
+/// the positional-parameter limit, like [`UpOpts`]/[`StartOpts`]).
+pub(crate) struct ResizeOpts<'a> {
+    pub(crate) name: Option<&'a config::InstanceName>,
+    pub(crate) disk: Option<config::DiskSize>,
+    pub(crate) mem: Option<config::MiB>,
+    pub(crate) vcpus: Option<std::num::NonZeroU8>,
+    pub(crate) start: bool,
+}
+
 pub(crate) fn cmd_resize(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    name: Option<&config::InstanceName>,
-    disk_size: Option<config::DiskSize>,
-    mem: Option<config::MiB>,
-    vcpus: Option<std::num::NonZeroU8>,
-    start: bool,
+    opts: &ResizeOpts<'_>,
 ) -> Result<()> {
     // Reject a below-minimum memory before touching any artifact, so a bad
     // value never leaves a half-applied instance (the CLI ArgGroup already
     // guarantees at least one of size/mem/vcpus is present).
-    if let Some(mem) = mem {
+    if let Some(mem) = opts.mem {
         config::validate_mem_size(mem)?;
     }
 
-    let inst = cfg.resolve_instance(name)?;
+    let inst = cfg.resolve_instance(opts.name)?;
     let stopped = be.as_stopped(inst)?;
 
-    if let Some(disk_size) = disk_size {
+    if let Some(disk_size) = opts.disk {
         let current = current_disk_gib(be, stopped.instance())?;
         let new_size = disk_size.resolve(current)?;
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
-    if mem.is_some() || vcpus.is_some() {
+    if opts.mem.is_some() || opts.vcpus.is_some() {
         // The backend applies mem/vcpu and, for `--start`, boots the
         // instance itself (Lima must boot to validate regardless).
-        be.set_machine_resources(cfg, &stopped, mem, vcpus, start)?;
-    } else if start {
+        be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
+    } else if opts.start {
         be.start_existing(cfg, stopped.instance())?;
     }
 

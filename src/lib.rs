@@ -67,12 +67,13 @@ use backend::VmBackend as _;
 use commands::json;
 use commands::{
     DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
-    StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
-    apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer, cmd_devcontainer_check,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart,
-    cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up,
-    cmd_validate, codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
+    ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer,
+    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
+    cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status,
+    cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
+    resolve_running,
 };
 
 #[derive(Parser)]
@@ -1237,7 +1238,17 @@ pub fn run() -> Result<()> {
             mem,
             vcpus,
             start,
-        } => cmd_resize(&be, &cfg, name.as_ref(), size, mem, vcpus, start),
+        } => cmd_resize(
+            &be,
+            &cfg,
+            &ResizeOpts {
+                name: name.as_ref(),
+                disk: size,
+                mem,
+                vcpus,
+                start,
+            },
+        ),
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }
