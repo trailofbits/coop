@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.5.3
+
+### New features
+
+- **`coop resize` changes memory and vCPUs in place** (#397) —
+  `coop resize` now accepts `--mem <MiB>` and `--vcpus <N>` alongside the
+  existing `--size`, so a stopped instance's RAM and vCPU count can be
+  changed without destroy-and-recreate. At least one of the three is
+  required; `--start` boots the instance after applying the change
+  instead of leaving it stopped. The backend config artifact is now the
+  source of truth for mem/vcpu (mirroring how disk already works): on
+  Firecracker the per-instance JSON is read back and only the infra
+  fields are regenerated on restart, so a change to the global `[vm]`
+  config no longer silently alters RAM for every existing instance; on
+  Lima the `cpus`/`memory` keys in `lima.yaml` are rewritten atomically.
+  `coop status` reads mem/vcpu from the artifact. A failed `--start`
+  boot rolls the values back so the instance stays bootable.
+
+- **`--json` output on read/query commands** (#386) — An opt-in `--json`
+  flag on the highest-value read commands emits machine-readable output
+  for reliable parsing; the human-readable default is unchanged. Covered:
+  `status`, `list`/`ls`, `images`, `devcontainer check`, `github status`,
+  `profiles list`, and `up`/`start --dry-run`. Each command builds one
+  `Serialize` view model and `--json` switches only the final render
+  step, so the human and JSON outputs cannot drift; absence is
+  `null`/`[]` rather than sentinel strings. For `devcontainer check` and
+  `up`/`start --dry-run` the JSON payload goes to stdout while the human
+  report stays on stderr, so `… --json | jq` stays clean. See
+  `docs/json-output-design.md`.
+
+### Fixes
+
+- **AppleDouble sidecars no longer copied on macOS hosts** (#376) —
+  macOS creates `._`-prefixed AppleDouble sidecar files when archiving
+  through the system `tar`. coop now sets `COPYFILE_DISABLE=1` when
+  creating workspace archives on macOS so these sidecars are not written
+  into the guest transfer.
+
+### Internal
+
+- **`.editorconfig`** (#395) — declares the repo's indentation and
+  whitespace rules so editors match the project's formatting.
+
+- **License field in `Cargo.toml`** (#387).
+
+- **Release workflow sets the release title** (#382).
+
+### Documentation
+
+- **`CONTRIBUTING.md`** (#393) and **`SECURITY.md`** (#394) added.
+
+- **Pronunciation guide in `README`** (#383).
+
+### Dependencies
+
+- `anyhow` 1.0.102 → 1.0.103 (#377)
+- `clap_complete` 4.6.5 → 4.6.7 (#398)
+- `actions/attest-build-provenance` 4.1.0 → 4.1.1 (#399)
+- `actions/cache` v5.0.5 → v6.1.0, `cargo-bins/cargo-binstall` v1.20.0 →
+  v1.20.1, `zizmorcore/zizmor-action` v0.5.6 → v0.5.7 (#384)
+
 ## v0.5.2
 
 ### New features
