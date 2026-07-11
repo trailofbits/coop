@@ -457,6 +457,51 @@ $ coop status my-project --json
 }
 ```
 
+### `agent update`
+
+Update the coding agents (Claude Code and Codex) installed inside a running VM
+to their latest versions, without rebuilding the golden image. Both agents are
+installed "latest at build time" during `coop setup`, so they can go stale in
+long-running VMs and in new VMs created from an old image. To refresh the image
+itself instead, rebuild it with `coop setup --rebuild`.
+
+```
+coop agent update [NAME] [--claude] [--codex] [--check] [-y]
+```
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--claude` | Update Claude Code |
+| `--codex` | Update Codex |
+| `--check` | Only report installed vs. latest versions — change nothing |
+| `-y`, `--yes` | Skip the confirmation prompt |
+
+With no agent flag, both agents are updated; passing both `--claude` and
+`--codex` is the same as passing neither. The VM must be running.
+
+Codex has no background updater, so `coop agent update --codex` re-runs coop's
+own installer inside the guest as root, overwriting `/usr/local/bin/codex` with
+the current release. Claude Code already auto-updates in the background;
+`coop agent update --claude` runs `claude update` now, synchronously — a
+convenience rather than a fix.
+
+`--check` reports each agent's installed version and, for Codex, the latest
+release on GitHub, changing nothing:
+
+```
+$ coop agent update my-project --check
+Claude Code  1.2.3            up to date (auto-updates in background)
+Codex        0.4.1 → 0.5.0    update available — run: coop agent update --codex
+```
+
+```
+coop agent update                 # both agents, resolved instance
+coop agent update my-project      # both agents, instance "my-project"
+coop agent update --codex         # Codex only
+coop agent update --check         # report versions, change nothing
+```
+
 ### `model`
 
 Show or switch a VM's model backend between cloud (Anthropic / OpenAI) and a

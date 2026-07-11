@@ -170,27 +170,40 @@ impl Release {
 }
 
 pub fn fetch_latest() -> Result<Release> {
-    fetch_release_metadata("latest").context("Failed to fetch latest release metadata")
+    fetch_release_metadata(REPO, "latest").context("Failed to fetch latest release metadata")
 }
 
 pub fn fetch_by_tag(tag: &str) -> Result<Release> {
-    fetch_release_metadata(&format!("tags/{tag}"))
+    fetch_release_metadata(REPO, &format!("tags/{tag}"))
         .with_context(|| format!("Failed to fetch release metadata for {tag}"))
 }
 
-/// Fetch release JSON for the given API path suffix (`latest` or `tags/<tag>`).
+/// Fetch the `tag_name` of another repository's latest release.
+///
+/// Used by `coop agent update` to compare the guest's installed Codex
+/// against the newest upstream tag. `repo` is a compile-time `owner/name`
+/// slug (e.g. `openai/codex`) — never user input — so it carries none of
+/// the path-traversal risk `coop update --version` guards against.
+pub(crate) fn latest_release_tag(repo: &str) -> Result<String> {
+    Ok(fetch_release_metadata(repo, "latest")
+        .with_context(|| format!("Failed to fetch latest release metadata for {repo}"))?
+        .tag)
+}
+
+/// Fetch release JSON for `repo` (an `owner/name` slug) and the given API
+/// path suffix (`latest` or `tags/<tag>`).
 ///
 /// Selects an auth strategy at call time so changes to `GITHUB_TOKEN` /
 /// `gh auth` between invocations take effect.
-fn fetch_release_metadata(path_suffix: &str) -> Result<Release> {
+fn fetch_release_metadata(repo: &str, path_suffix: &str) -> Result<Release> {
     let body = match select_auth_strategy_from_env() {
-        AuthStrategy::Gh => gh_api_capture(&format!("repos/{REPO}/releases/{path_suffix}"))?,
+        AuthStrategy::Gh => gh_api_capture(&format!("repos/{repo}/releases/{path_suffix}"))?,
         AuthStrategy::CurlBearer(token) => {
-            let url = format!("{}/repos/{REPO}/releases/{path_suffix}", api_base());
+            let url = format!("{}/repos/{repo}/releases/{path_suffix}", api_base());
             curl_capture(&url, Some(&token))?
         }
         AuthStrategy::CurlBare => {
-            let url = format!("{}/repos/{REPO}/releases/{path_suffix}", api_base());
+            let url = format!("{}/repos/{repo}/releases/{path_suffix}", api_base());
             curl_capture(&url, None)?
         }
     };

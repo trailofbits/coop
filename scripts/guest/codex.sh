@@ -3,7 +3,12 @@ set -euo pipefail
 # Using if/else (not early `exit 0`) because this file is concatenated
 # with claude-code.sh into a single shell invocation; an unconditional
 # exit would short-circuit anything appended after it.
-if [ -x /usr/local/bin/codex ]; then
+#
+# COOP_FORCE_INSTALL bypasses the "already installed" guard so `coop agent
+# update --codex` can re-run this same script to overwrite the root-owned
+# binary with the current release. Unset during normal setup, so the
+# skip-if-present behaviour is preserved there.
+if [ -z "${COOP_FORCE_INSTALL:-}" ] && [ -x /usr/local/bin/codex ]; then
     echo '  [guest] Codex CLI already installed, skipping.'
 else
     echo '  [guest] Installing Codex CLI...'

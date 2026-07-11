@@ -124,6 +124,17 @@ coop start --no-agents
 
 This skips the guest bootstrap sequence entirely. The VM still includes both CLIs because they are baked into the image during `coop setup`.
 
+## Updating Codex
+
+Codex is installed "latest at build time" during `coop setup` and has no background updater, so it stays at that version until the image is rebuilt. Unlike Claude Code, it does not refresh itself. To update Codex in a running VM without rebuilding the image:
+
+```bash
+coop agent update --codex          # update Codex to the latest release
+coop agent update --check          # report installed vs. latest, change nothing
+```
+
+This re-runs coop's own Codex installer inside the guest as root, overwriting `/usr/local/bin/codex` with the current release. To refresh the golden image so new VMs ship the latest Codex, rebuild it with `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
+
 ## Local model support
 
 A VM can route Codex at a host-side local model server (Ollama / LM Studio /

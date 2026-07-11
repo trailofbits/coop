@@ -28,6 +28,11 @@ Every template installs these packages regardless of profile selection.
 
 **Codex CLI:** installed as a standalone binary during the template build.
 
+Both agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
+
+- **A live instance:** `coop agent update [--claude] [--codex]` updates the binaries inside a running VM in place (see [`agent update`](commands.md#agent-update)). Claude Code also auto-updates itself in the background; Codex does not, so it is the one that typically needs this.
+- **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
+
 ## Built-in profiles
 
 Profiles layer language-specific toolchains on top of the base install. Pass them to `--profile` during setup:

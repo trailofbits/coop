@@ -5,6 +5,7 @@
 //! and holds the cross-domain orchestration helpers the submodules share.
 
 mod admin;
+mod agent;
 mod devcontainer;
 mod github;
 pub(crate) mod json;
@@ -14,6 +15,7 @@ mod profiles;
 mod quickstart;
 
 pub(crate) use admin::{UninstallOpts, cmd_init, cmd_uninstall, cmd_validate};
+pub(crate) use agent::{AgentSelection, AgentUpdateOpts, cmd_agent_update};
 pub(crate) use devcontainer::{
     DevcontainerInput, DevcontainerOpts, cmd_devcontainer, cmd_devcontainer_check,
     resolve_devcontainer, resolve_devcontainer_collect,

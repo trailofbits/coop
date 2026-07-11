@@ -1026,6 +1026,65 @@ test_codex_sandbox_bypass() {
     fi
 }
 
+# `coop agent update` refreshes the in-guest agent binaries (issue #402).
+# `--check` is cheap and network-tolerant (the Codex latest-version lookup
+# degrades to "unknown" on failure, so the command still exits 0). The actual
+# Codex reinstall downloads the release inside the guest, so it is gated behind
+# --full.
+test_agent_update() {
+    echo ""
+    echo "=== Phase: agent update ==="
+
+    if coop agent update "$INSTANCE" --check; then
+        if echo "$HARNESS_OUT" | grep -q "Claude Code" \
+            && echo "$HARNESS_OUT" | grep -q "Codex"; then
+            pass "agent update --check reports both agents"
+        else
+            fail "agent update --check reports both agents" "out: $HARNESS_OUT"
+        fi
+    else
+        fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
+    fi
+
+    if [[ "$FULL" == "1" ]]; then
+        if coop agent update "$INSTANCE" --codex -y; then
+            pass "agent update --codex exits 0"
+        else
+            fail "agent update --codex exits 0" "exit: $? stderr: $HARNESS_ERR"
+        fi
+
+        # The reinstall must leave an executable, correctly versioned binary.
+        local ver
+        if ver=$(guest_exec /usr/local/bin/codex --version) \
+            && [[ "$ver" =~ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            pass "codex is executable and versioned after update ($ver)"
+        else
+            fail "codex is executable and versioned after update" \
+                "got: $ver stderr: $(guest_stderr)"
+        fi
+    else
+        skip "agent update --codex" "use --full; downloads the release in-guest"
+    fi
+}
+
+# `coop agent update` requires a running VM; against a stopped instance it must
+# fail with the shared "not running" guidance and a non-zero exit (issue #402).
+test_agent_update_stopped() {
+    echo ""
+    echo "=== Phase: agent update (stopped instance) ==="
+
+    if coop_fails agent update "$INSTANCE" --check; then
+        if echo "$HARNESS_ERR" | grep -qi "not running"; then
+            pass "agent update on a stopped instance fails with 'not running'"
+        else
+            fail "agent update on a stopped instance fails with 'not running'" \
+                "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "agent update on a stopped instance exits non-zero" "out: $HARNESS_OUT"
+    fi
+}
+
 test_github_token_forwarding() {
     echo ""
     echo "=== Phase: github token forwarding ==="
@@ -4793,6 +4852,7 @@ main() {
     test_claude_onboarding_seed
     test_codex_bin_path
     test_codex_sandbox_bypass
+    test_agent_update
     test_github_token_forwarding
     test_term_handling
     test_guest_environment
@@ -4808,6 +4868,7 @@ main() {
     test_stop_idempotency
     test_auto_resolve_stopped
     test_status_stopped
+    test_agent_update_stopped
     test_list_stopped
     test_resize_status
     test_reconfigure

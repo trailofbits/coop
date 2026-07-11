@@ -282,6 +282,25 @@ exclude_re = [
   "\\bbootstrap_and_post_start\\b",
   "\\bprepare_session_from_target\\b",
 
+  # ---- coop agent update (#402): in-guest agent refresh ----
+  # The pure logic is extracted and unit-tested in scope: AgentSelection
+  # (from_flags / agents), Agent (display / strategy), AgentVersion::parse
+  # (+ from_token), check_status, check_report / check_line, outcome_line,
+  # and selection_phrase. What is excluded below drives SSH into the guest,
+  # hits the GitHub release API, writes stdout, or resolves a guest binary
+  # path from a live session — none observable from a `--lib` test.
+  # (cmd_agent_update itself is covered by the module-wide `\bcmd_[a-z_]+\b`.)
+  # tests/integration.sh exercises the end-to-end update/check on both backends.
+  "\\brun_updates\\b",
+  "\\brun_check\\b",
+  "\\bupdate_one\\b",
+  "\\breinstall_as_root\\b",
+  "\\bself_update\\b",
+  "\\bcheck_row\\b",
+  "\\bcodex_latest\\b",
+  "\\bcapture_version\\b",
+  "\\bagent_binary\\b",
+
   # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
   # not honour exclude_re for these — the regex never matches their name (not
   # by function, struct path, or even file:line). They are emitted only where

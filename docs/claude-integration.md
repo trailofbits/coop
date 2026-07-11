@@ -200,6 +200,18 @@ coop start --no-agents
 
 This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. You can still run `coop claude` afterward, and that session forwards `ANTHROPIC_API_KEY` and any `env_forward` variables via SSH. Plugins and MCP servers won't be available unless you configure them manually inside the guest.
 
+## Updating Claude Code
+
+Claude Code auto-updates in the background by default — it checks for a newer version on startup and periodically, and applies the update on the next launch. coop does not disable this and the guest has outbound network access, so Claude Code keeps itself current with no action from you.
+
+To force an update immediately rather than waiting for the background updater:
+
+```bash
+coop agent update --claude
+```
+
+This runs `claude update` synchronously inside the guest as the guest user. It is a convenience for when you want the newest version right now; for the recurring stale-agent problem, Codex is the one that needs attention (see [Updating Codex](codex-integration.md#updating-codex)). See [`agent update`](commands.md#agent-update).
+
 ## Local model support
 
 A VM can route Claude Code at a host-side local model server (Ollama / LM Studio

@@ -66,14 +66,14 @@ use clap_complete::engine::ArgValueCandidates;
 use backend::VmBackend as _;
 use commands::json;
 use commands::{
-    DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
-    ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_commit, cmd_destroy, cmd_devcontainer,
-    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
-    cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status,
-    cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, open_ssh_session,
-    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
-    resolve_running,
+    AgentUpdateOpts, DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport,
+    QuickstartOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
+    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
+    cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
+    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore,
+    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
+    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
+    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
 };
 
 #[derive(Parser)]
@@ -414,6 +414,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the coding agents installed inside a VM
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Show or switch a VM's model backend (cloud vs. local)
     Model {
         /// Instance name (required if multiple instances exist)
@@ -665,6 +670,34 @@ extra line in your shell rc:
   zsh:   source <(COMPLETE=zsh coop)
   fish:  source (COMPLETE=fish coop | psub)
 ";
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Update coding agent(s) to the latest version inside the VM.
+    ///
+    /// With no agent flag, both Claude Code and Codex are updated. The VM
+    /// must be running.
+    Update {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Update Claude Code (default: update both agents)
+        #[arg(long)]
+        claude: bool,
+        /// Update Codex (default: update both agents)
+        #[arg(long)]
+        codex: bool,
+        /// Only report installed vs. latest versions — change nothing
+        #[arg(long)]
+        check: bool,
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
 
 #[derive(Subcommand, Clone, Copy)]
 enum ModelAction {
@@ -1175,6 +1208,25 @@ pub fn run() -> Result<()> {
         }
         Commands::List { json } => cmd_list(&be, &cfg, json),
         Commands::Status { name, json } => cmd_status(&be, &cfg, name.as_ref(), json),
+        Commands::Agent {
+            action:
+                AgentAction::Update {
+                    name,
+                    claude,
+                    codex,
+                    check,
+                    yes,
+                },
+        } => cmd_agent_update(
+            &be,
+            &cfg,
+            name.as_ref(),
+            &AgentUpdateOpts {
+                selection: commands::AgentSelection::from_flags(claude, codex),
+                check,
+                yes,
+            },
+        ),
         Commands::Model { name, action } => {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
@@ -1362,6 +1414,64 @@ mod tests {
     fn parse_then_format_normalizes_to_seconds() {
         let parsed = super::parse_duration("1h").expect("1h parses");
         assert_eq!(super::format_duration(parsed), "3600s");
+    }
+
+    #[test]
+    fn agent_update_parses_name_and_flags() {
+        let cli = parse(&["agent", "update", "myvm", "--codex", "--check"]);
+        let super::Commands::Agent {
+            action:
+                super::AgentAction::Update {
+                    name,
+                    claude,
+                    codex,
+                    check,
+                    yes,
+                },
+        } = cli.command
+        else {
+            panic!("expected Agent::Update variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert!(!claude);
+        assert!(codex);
+        assert!(check);
+        assert!(!yes);
+    }
+
+    #[test]
+    fn agent_update_defaults_are_all_false() {
+        let cli = parse(&["agent", "update"]);
+        let super::Commands::Agent {
+            action:
+                super::AgentAction::Update {
+                    name,
+                    claude,
+                    codex,
+                    check,
+                    yes,
+                },
+        } = cli.command
+        else {
+            panic!("expected Agent::Update variant");
+        };
+        assert!(name.is_none());
+        assert!(!claude && !codex && !check && !yes);
+    }
+
+    #[test]
+    fn agent_update_yes_short_flag_parses() {
+        let cli = parse(&["agent", "update", "-y"]);
+        let super::Commands::Agent {
+            action: super::AgentAction::Update { yes, .. },
+        } = cli.command
+        else {
+            panic!("expected Agent::Update variant");
+        };
+        assert!(yes);
     }
 
     #[test]
