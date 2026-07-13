@@ -4,6 +4,22 @@
 
 ### Fixes
 
+- **Guest-memory floor enforced by construction** (#404) — `coop up --mem 16`,
+  `coop setup --mem 16`, a `config.toml` with `mem_size_mib = 16`, and a
+  cloned repo whose `devcontainer.json` sets `hostRequirements.memory` below
+  the 128 MiB minimum are now all rejected up front, instead of booting an
+  unbootable VM that never comes up on SSH. The floor lives in a new
+  `VmMemory` type whose constructor every entry point routes through (CLI,
+  `config.toml`, `coop resize`, the devcontainer translator), so no lifecycle
+  path can hold a sub-floor value. The stale `Validated` witness — which
+  vouched for a config that lifecycle commands mutated afterward, and which
+  the actual VM boot (`create_and_start`) never even consumed — is removed;
+  the environmental (path-existence) checks it stood in for now run at the
+  backend boot choke point on the freshest filesystem state, so a new
+  lifecycle path cannot skip them. The start-time mount set gains a
+  `ValidatedMounts` constructor that enforces guest-path uniqueness on every
+  path, closing a gap where `coop quickstart` skipped the check.
+
 - **Firecracker CI artifact listing fetched over HTTPS** (#401) — the S3
   `ListObjectsV2` request that discovers kernel/rootfs versions during
   setup used plain HTTP: the bucket name contains dots, which breaks TLS

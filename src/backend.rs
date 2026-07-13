@@ -12,8 +12,8 @@ use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
 use crate::config::{
-    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel, McpServerDef, MiB,
-    NetworkConfig, Validated,
+    ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel, McpServerDef,
+    NetworkConfig, VmMemory,
 };
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
@@ -741,13 +741,27 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 
 // ── Backend trait ──────────────────────────────────────────────
 
+/// Environmental preconditions for booting: the path-existence checks in
+/// [`CoopConfig::validate`], run at the boot choke point on the freshest
+/// filesystem state.
+///
+/// Every backend boot entry (`setup`, `create_and_start`, `start_existing`)
+/// calls this first, so the check is unforgettable — a new lifecycle path
+/// that reaches boot cannot skip it, and it sees the world as it is at boot
+/// time rather than trusting a witness minted earlier. Warnings are dropped
+/// here; they are surfaced once at the handler via
+/// [`CoopConfig::validate_and_warn`].
+pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
+    cfg.validate().map(drop)
+}
+
 /// VM backend for managing guest lifecycle.
 ///
 /// Two impls: `FirecrackerBackend` (Linux) and `LimaBackend` (macOS).
 /// The `PlatformBackend` type alias selects the correct one at compile
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
-    fn setup(&self, cfg: &CoopConfig, validated: &Validated, opts: &SetupOptions) -> Result<()>;
+    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
     fn create_and_start(
         &self,
         cfg: &CoopConfig,
@@ -788,7 +802,7 @@ pub trait VmBackend: std::fmt::Display {
         &self,
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
-        mem: Option<MiB>,
+        mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
     ) -> Result<()>;
@@ -886,7 +900,8 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
-    fn setup(&self, cfg: &CoopConfig, _: &Validated, opts: &SetupOptions) -> Result<()> {
+    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+        boot_preflight(cfg)?;
         crate::setup::run(cfg, opts)
     }
 
@@ -897,6 +912,7 @@ impl VmBackend for FirecrackerBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        boot_preflight(cfg)?;
         // Mounts are handled after boot via rsync (not virtiofs).
         // Validation already happened in Mount::parse().
         let _ = mounts;
@@ -909,6 +925,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        boot_preflight(cfg)?;
         let vm = crate::vm::FirecrackerVm::new(cfg, inst);
         vm.configure()?;
         crate::network::setup_tap(&cfg.network, inst)?;
@@ -992,7 +1009,7 @@ impl VmBackend for FirecrackerBackend {
         &self,
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
-        mem: Option<MiB>,
+        mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
     ) -> Result<()> {
@@ -1001,7 +1018,7 @@ impl VmBackend for FirecrackerBackend {
         // back — otherwise `configure()` would re-read the rejected value on
         // every subsequent `coop start` and the instance would stay wedged.
         let previous = crate::vm::machine_resources(inst)?;
-        crate::vm::set_machine_resources(inst, mem, vcpus)?;
+        crate::vm::set_machine_resources(inst, mem.map(VmMemory::get), vcpus)?;
         if start_after && let Err(e) = self.start_existing(cfg, inst) {
             if let Err(revert) =
                 crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
@@ -1119,7 +1136,8 @@ impl std::fmt::Display for LimaBackend {
 
 #[cfg(target_os = "macos")]
 impl VmBackend for LimaBackend {
-    fn setup(&self, cfg: &CoopConfig, _: &Validated, opts: &SetupOptions) -> Result<()> {
+    fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
+        boot_preflight(cfg)?;
         crate::lima::setup(cfg, opts)
     }
 
@@ -1130,10 +1148,12 @@ impl VmBackend for LimaBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        boot_preflight(cfg)?;
         crate::lima::create_and_start(cfg, inst, disk_gib, mounts)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        boot_preflight(cfg)?;
         crate::lima::start_existing(cfg, inst)
     }
 
@@ -1188,11 +1208,17 @@ impl VmBackend for LimaBackend {
         &self,
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
-        mem: Option<MiB>,
+        mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
     ) -> Result<()> {
-        crate::lima::set_machine_resources(cfg, stopped.instance(), mem, vcpus, start_after)
+        crate::lima::set_machine_resources(
+            cfg,
+            stopped.instance(),
+            mem.map(VmMemory::get),
+            vcpus,
+            start_after,
+        )
     }
 
     fn commit_disk(
@@ -2617,6 +2643,24 @@ Buffers:          128000 kB
 Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
+
+    #[test]
+    fn boot_preflight_fails_on_missing_config_dir() {
+        // The boot choke point must reject a config whose custom
+        // claude.config_dir does not exist, before any VM cost (issue #404).
+        let mut cfg = CoopConfig::default();
+        cfg.claude.config_dir =
+            ConfigDir::Custom(crate::config::ConfigPath::new("/nonexistent/claude-config"));
+        let err = boot_preflight(&cfg).unwrap_err();
+        assert!(err.to_string().contains("claude.config_dir"));
+    }
+
+    #[test]
+    fn boot_preflight_passes_for_default_config() {
+        // Default config has no custom config dirs or marketplace paths, so
+        // the environmental (errors-only) check passes; warnings are dropped.
+        boot_preflight(&CoopConfig::default()).unwrap();
+    }
 
     #[test]
     fn onboarding_marked_complete_detects_true_flag() {

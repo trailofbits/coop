@@ -314,6 +314,53 @@ test_invalid_names() {
     fi
 }
 
+# ── Guest-memory floor (issue #404) ───────────────────────────
+#
+# A below-floor `--mem` must be rejected at the CLI boundary
+# (`VmMemory::parse_cli`), before any VM is created — so these are fast
+# negative checks that never boot. This is the headline #404 regression:
+# `coop up --mem 16` previously created an unbootable VM instead of failing.
+test_mem_floor() {
+    echo ""
+    echo "=== Phase: guest-memory floor rejection ==="
+
+    if coop_fails up --mem 16 --no-agents "$tmpdir"; then
+        pass "up rejects --mem below the 128 MiB floor"
+    else
+        fail "up rejects --mem below the 128 MiB floor" "should have failed fast"
+    fi
+
+    if coop_fails setup --mem 16 --yes; then
+        pass "setup rejects --mem below the 128 MiB floor"
+    else
+        fail "setup rejects --mem below the 128 MiB floor" "should have failed fast"
+    fi
+
+    # config.toml vector: a below-floor mem_size_mib is rejected at load.
+    local bad_cfg="$tmpdir/mem-floor-config.toml"
+    printf '[vm]\nmem_size_mib = 16\n' >"$bad_cfg"
+    if "$BINARY" --config "$bad_cfg" validate 2>"$tmpdir/mem_floor_cfg_stderr"; then
+        fail "config.toml rejects mem_size_mib below the floor" "load should have failed"
+    elif grep -q "is too low" "$tmpdir/mem_floor_cfg_stderr"; then
+        pass "config.toml rejects mem_size_mib below the floor"
+    else
+        fail "config.toml rejects mem_size_mib below the floor" \
+            "failed for the wrong reason: $(cat "$tmpdir/mem_floor_cfg_stderr")"
+    fi
+
+    # The floor is a floor, not a ban: the boundary value is accepted by the
+    # parser (this still fails later for other reasons, so only assert the
+    # error is not the floor message).
+    if coop up --mem 128 --dry-run "$tmpdir" 2>"$tmpdir/mem_floor_stderr"; then
+        pass "up accepts --mem at the 128 MiB boundary (dry-run)"
+    elif ! grep -q "is too low" "$tmpdir/mem_floor_stderr"; then
+        pass "up accepts --mem at the 128 MiB boundary (no floor error)"
+    else
+        fail "up accepts --mem at the 128 MiB boundary" \
+            "128 MiB was rejected as too low"
+    fi
+}
+
 # ── Profiles list/show ────────────────────────────────────────
 
 test_profiles_cli() {
@@ -4830,6 +4877,7 @@ main() {
     # Pre-VM tests
     test_validate
     test_invalid_names
+    test_mem_floor
     test_profiles_cli
     test_completions
     test_devcontainer_translator

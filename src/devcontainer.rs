@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward};
+use crate::config::{self, CoopConfig, GiB, MiB, Mount, PortForward, VmMemory};
 use crate::devcontainer_oci::{FeatureRequest, ResolvedFeature};
 use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
@@ -501,7 +501,7 @@ impl Report {
 #[derive(Debug, Default)]
 pub struct TranslatorInputs {
     pub cli_vcpus: Option<u8>,
-    pub cli_mem_mib: Option<MiB>,
+    pub cli_mem_mib: Option<VmMemory>,
     pub cli_disk_gib: Option<GiB>,
     pub cli_post_start: Option<String>,
     pub cli_guest_env_keys: Vec<EnvVarName>,
@@ -1569,7 +1569,11 @@ pub fn apply_to_config(cfg: &mut CoopConfig, t: &Translation) -> Result<()> {
             std::num::NonZeroU8::new(v).context("translated --vcpus value resolved to zero")?;
     }
     if let Some(m) = t.mem_mib {
-        cfg.vm.mem_size_mib = m;
+        // Enforce the guest-memory floor on the devcontainer vector too: a
+        // cloned repo's `hostRequirements.memory` is external, user-editable
+        // input and must not be able to request an unbootable VM.
+        cfg.vm.mem_size_mib = VmMemory::new(m)
+            .context("devcontainer.json hostRequirements.memory is below the guest-memory floor")?;
     }
     if let Some(p) = &t.post_start {
         cfg.post_start = Some(p.clone());
@@ -2215,7 +2219,7 @@ mod tests {
         apply_to_config(&mut cfg, &t).unwrap();
 
         assert_eq!(cfg.vm.vcpu_count.get(), 6);
-        assert_eq!(cfg.vm.mem_size_mib.as_u32(), 2048);
+        assert_eq!(cfg.vm.mem_size_mib.get().as_u32(), 2048);
         assert_eq!(cfg.post_start.as_deref(), Some("echo go"));
         assert_eq!(
             cfg.guest_env
@@ -2223,6 +2227,26 @@ mod tests {
                 .map(String::as_str),
             Some("bar"),
         );
+    }
+
+    #[test]
+    fn apply_to_config_rejects_below_floor_devcontainer_memory() {
+        // hostRequirements.memory from a cloned repo's devcontainer.json is
+        // external input; a below-floor value must be rejected here rather
+        // than booting an unbootable VM (issue #404).
+        let mut cfg = CoopConfig::default();
+        let before = cfg.vm.mem_size_mib;
+        let t = Translation {
+            mem_mib: MiB::new(16),
+            ..Translation::default()
+        };
+        let err = apply_to_config(&mut cfg, &t).unwrap_err();
+        assert!(
+            err.to_string().contains("hostRequirements.memory")
+                || format!("{err:#}").contains("is too low"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(cfg.vm.mem_size_mib, before, "config must be left unchanged");
     }
 
     #[test]

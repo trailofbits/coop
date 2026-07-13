@@ -97,7 +97,7 @@ fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
         }],
         machine_config: MachineConfig {
             vcpu_count: cfg.vm.vcpu_count.get(),
-            mem_size_mib: cfg.vm.mem_size_mib.as_u32(),
+            mem_size_mib: cfg.vm.mem_size_mib.get().as_u32(),
         },
         network_interfaces: vec![NetworkInterface {
             iface_id: "eth0".to_string(),
@@ -454,7 +454,7 @@ impl<'a> FirecrackerVm<'a, Running> {
         // authoritative per-instance config, not the global default.
         let machine = read_machine_config(&self.inst.vm_config_path()).unwrap_or(MachineConfig {
             vcpu_count: self.cfg.vm.vcpu_count.get(),
-            mem_size_mib: self.cfg.vm.mem_size_mib.as_u32(),
+            mem_size_mib: self.cfg.vm.mem_size_mib.get().as_u32(),
         });
 
         let mut out = format!(

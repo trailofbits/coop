@@ -377,20 +377,67 @@ pub(crate) fn default_workspace_path() -> GuestPath {
     GuestPath::absolute(GUEST_WORKSPACE).expect("GUEST_WORKSPACE constant is absolute")
 }
 
-/// Reject an extra mount that would collide with the `/workspace` path a
-/// `coop up --git-repo` clone occupies.
-pub(crate) fn validate_git_repo_workspace_mounts(mounts: &[Mount]) -> Result<()> {
-    let workspace_path = default_workspace_path().to_string();
-    if mounts
-        .iter()
-        .any(|mount| mount.guest_path.to_string() == workspace_path)
-    {
-        bail!(
-            "`coop up --git-repo` clones into /workspace. \
-             Give --extra-mount an explicit non-/workspace guest path."
-        );
+/// Which project-mount policy applies when assembling a start-time mount
+/// set. Only the workspace-collision message differs between rules; every
+/// rule also enforces guest-path uniqueness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceMountRule {
+    /// `coop up --copy`: the project occupies `/workspace` via copy, so an
+    /// extra mount targeting `/workspace` collides.
+    CopyProject,
+    /// `coop up --git-repo`: the clone occupies `/workspace`.
+    GitRepoClone,
+    /// The project is itself mounted at `/workspace` (`coop up --mount`), or
+    /// there is no project mount (`coop quickstart`). `/workspace` is either
+    /// legitimately in use or absent, so only uniqueness applies (a second
+    /// `/workspace` mount is still caught, as a duplicate guest path).
+    ProjectMountedOrNone,
+}
+
+/// A start-time mount set that has passed collection-level validation: no
+/// two mounts target the same guest path, and — per [`WorkspaceMountRule`]
+/// — no extra mount collides with the project's `/workspace`.
+///
+/// [`Self::assemble`] is the single place these invariants are enforced, so
+/// no lifecycle path (`up --copy`, `up --mount`, `up --git-repo`,
+/// `quickstart`) can build a mount set and forget to check it.
+#[derive(Debug)]
+pub(crate) struct ValidatedMounts(Vec<Mount>);
+
+impl ValidatedMounts {
+    /// Validate an assembled mount set under `rule`. `mounts` is the final
+    /// set (project mount already inserted for `--mount`, extra mounts
+    /// appended), so the checks see exactly what boot will use.
+    pub(crate) fn assemble(rule: WorkspaceMountRule, mounts: Vec<Mount>) -> Result<Self> {
+        let collision_message = match rule {
+            WorkspaceMountRule::CopyProject => Some(
+                "`coop up --copy` already uses /workspace for the project. \
+                 Give --extra-mount an explicit non-/workspace guest path, or use \
+                 `coop up --mount` to mount the project itself.",
+            ),
+            WorkspaceMountRule::GitRepoClone => Some(
+                "`coop up --git-repo` clones into /workspace. \
+                 Give --extra-mount an explicit non-/workspace guest path.",
+            ),
+            WorkspaceMountRule::ProjectMountedOrNone => None,
+        };
+        if let Some(message) = collision_message {
+            let workspace_path = default_workspace_path().to_string();
+            if mounts
+                .iter()
+                .any(|mount| mount.guest_path.to_string() == workspace_path)
+            {
+                bail!("{message}");
+            }
+        }
+        crate::config::validate_unique_guest_paths(&mounts)?;
+        Ok(Self(mounts))
     }
-    Ok(())
+
+    /// The validated mount set, ready to hand to [`crate::commands::StartOpts`].
+    pub(crate) fn into_vec(self) -> Vec<Mount> {
+        self.0
+    }
 }
 
 fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<WorkspaceState> {
@@ -1259,9 +1306,49 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err =
-            validate_git_repo_workspace_mounts(&mounts).expect_err("expected /workspace collision");
+        let err = ValidatedMounts::assemble(WorkspaceMountRule::GitRepoClone, mounts)
+            .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
+    }
+
+    #[test]
+    fn project_mounted_rule_allows_workspace_mount() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("proj");
+        std::fs::create_dir(&data).expect("data");
+        // A project legitimately mounted at /workspace (coop up --mount) is
+        // fine; the ProjectMountedOrNone rule skips the collision check.
+        let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
+        let validated =
+            ValidatedMounts::assemble(WorkspaceMountRule::ProjectMountedOrNone, mounts.clone())
+                .expect("workspace mount allowed under ProjectMountedOrNone");
+        assert_eq!(validated.into_vec().len(), 1);
+    }
+
+    #[test]
+    fn assemble_rejects_duplicate_guest_paths_under_every_rule() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).expect("a");
+        std::fs::create_dir(&b).expect("b");
+        // Two distinct hosts, same guest path — a duplicate the uniqueness
+        // check must catch regardless of the workspace rule (this is the
+        // invariant quickstart previously skipped).
+        let dup = || {
+            vec![
+                Mount::parse(&format!("{}:/data", a.to_str().unwrap())).expect("a"),
+                Mount::parse(&format!("{}:/data", b.to_str().unwrap())).expect("b"),
+            ]
+        };
+        for rule in [
+            WorkspaceMountRule::CopyProject,
+            WorkspaceMountRule::GitRepoClone,
+            WorkspaceMountRule::ProjectMountedOrNone,
+        ] {
+            let err = ValidatedMounts::assemble(rule, dup()).expect_err("duplicate guest path");
+            assert!(format!("{err}").contains("Duplicate mount guest path"));
+        }
     }
 
     /// Run `f` with a thread-local WARN-level subscriber and return its

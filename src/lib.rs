@@ -120,8 +120,8 @@ enum Commands {
         #[arg(long)]
         vcpus: Option<u8>,
         /// Memory in MiB (overrides config when creating a new instance)
-        #[arg(long, value_parser = config::MiB::parse_cli)]
-        mem: Option<config::MiB>,
+        #[arg(long, value_parser = config::VmMemory::parse_cli)]
+        mem: Option<config::VmMemory>,
         /// Instance disk size in GiB (only used when creating a new instance)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
@@ -203,8 +203,8 @@ enum Commands {
         #[arg(long)]
         vcpus: Option<u8>,
         /// Memory in MiB (overrides config)
-        #[arg(long, value_parser = config::MiB::parse_cli)]
-        mem: Option<config::MiB>,
+        #[arg(long, value_parser = config::VmMemory::parse_cli)]
+        mem: Option<config::VmMemory>,
         /// Force rebuild of template rootfs
         #[arg(long)]
         rebuild: bool,
@@ -555,8 +555,8 @@ enum Commands {
         #[arg(long, value_parser = config::DiskSize::parse)]
         size: Option<config::DiskSize>,
         /// New memory in MiB (minimum 128)
-        #[arg(long, value_parser = config::MiB::parse_cli)]
-        mem: Option<config::MiB>,
+        #[arg(long, value_parser = config::VmMemory::parse_cli)]
+        mem: Option<config::VmMemory>,
         /// New vCPU count
         #[arg(long)]
         vcpus: Option<std::num::NonZeroU8>,
@@ -947,7 +947,7 @@ pub fn run() -> Result<()> {
             dry_run,
             json,
         } => {
-            let validated = cfg.validate_and_warn()?;
+            cfg.validate_and_warn()?;
             let transport = match (copy, mount) {
                 (_, true) => ProjectTransport::Mount,
                 (_, false) => ProjectTransport::Copy,
@@ -989,7 +989,7 @@ pub fn run() -> Result<()> {
                     json,
                 },
             };
-            cmd_up(&be, &mut cfg, &validated, &cli.config, &opts)
+            cmd_up(&be, &mut cfg, &cli.config, &opts)
         }
         Commands::Quickstart {
             no_workspace,
@@ -1020,7 +1020,7 @@ pub fn run() -> Result<()> {
             no_devcontainer,
             dry_run,
         } => {
-            let validated = cfg.validate_and_warn()?;
+            cfg.validate_and_warn()?;
             let ws_path = workspace.as_deref().map(Path::new);
             let inputs = devcontainer::TranslatorInputs {
                 cli_vcpus: vcpus,
@@ -1069,7 +1069,6 @@ pub fn run() -> Result<()> {
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
-                &validated,
                 &setup::SetupOptions {
                     skip_confirm: yes,
                     rebuild,
@@ -1100,7 +1099,7 @@ pub fn run() -> Result<()> {
             dry_run,
             json: json_out,
         } => {
-            let validated = cfg.validate_and_warn()?;
+            cfg.validate_and_warn()?;
             if raw_args_use_deprecated_no_claude(&raw_args) {
                 tracing::warn!(
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
@@ -1169,7 +1168,7 @@ pub fn run() -> Result<()> {
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
             apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
-            cmd_start(&be, &mut cfg, &validated, &start_opts).map(|_| ())
+            cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
         Commands::Claude {

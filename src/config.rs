@@ -228,19 +228,58 @@ impl Quantity<MibUnit> {
 }
 
 /// Smallest guest memory that boots reliably. Below this the kernel
-/// fails to come up, so it is rejected both when validating the global
-/// config and when reconfiguring an existing instance via `coop resize`.
+/// fails to come up, so it is the floor enforced by [`VmMemory::new`].
 pub const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
 
-/// Reject a requested memory size below [`MIN_MEM_MIB`].
+/// Guest RAM that is provably bootable: at least [`MIN_MEM_MIB`].
 ///
-/// Shared by `CoopConfig::validate` (global config) and `coop resize`
-/// (`--mem` on an existing instance) so both enforce the same floor.
-pub fn validate_mem_size(mem: MiB) -> Result<()> {
-    if mem < MIN_MEM_MIB {
-        bail!("mem_size_mib={mem} is too low (minimum {MIN_MEM_MIB})");
+/// `MiB` is a generic byte quantity whose only invariant is non-zero;
+/// the 128 MiB floor is domain-specific to *VM memory*, so it lives here
+/// rather than on `MiB`. Every entry point that sets guest memory — the
+/// `--mem` CLI flag, `config.toml`, `coop resize`, and the devcontainer
+/// translator — constructs through [`Self::new`], so no path can hold an
+/// unbootable value. This is parse-don't-validate: the floor is a
+/// property of the type, not a check a caller must remember to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VmMemory(MiB);
+
+impl VmMemory {
+    /// Wrap a `MiB`, rejecting anything below [`MIN_MEM_MIB`].
+    pub fn new(mib: MiB) -> Result<Self> {
+        if mib < MIN_MEM_MIB {
+            bail!("mem_size_mib={mib} is too low (minimum {MIN_MEM_MIB})");
+        }
+        Ok(Self(mib))
     }
-    Ok(())
+
+    /// Clap value parser for `--mem`: a positive integer at or above the floor.
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        Self::new(MiB::parse_cli(s)?)
+    }
+
+    /// The underlying mebibyte quantity.
+    pub fn get(self) -> MiB {
+        self.0
+    }
+}
+
+impl fmt::Display for VmMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Serialize for VmMemory {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for VmMemory {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mib = MiB::deserialize(d)?;
+        Self::new(mib).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Disk size specification: absolute (`150`) or relative (`+20`), in GiB.
@@ -739,9 +778,10 @@ pub struct VmConfig {
     #[serde(default = "default_vcpus")]
     pub vcpu_count: NonZeroU8,
 
-    /// Memory size in MiB
+    /// Memory size in MiB. Typed [`VmMemory`], so the [`MIN_MEM_MIB`]
+    /// floor holds by construction — including on `config.toml` load.
     #[serde(default = "default_mem_mib")]
-    pub mem_size_mib: MiB,
+    pub mem_size_mib: VmMemory,
 
     /// Path to vmlinux kernel image
     #[serde(default = "default_kernel_path")]
@@ -1768,16 +1808,6 @@ fn unique_instance_name(base: &str, instances: &[Instance]) -> Result<InstanceNa
     bail!("Could not find unique instance name for '{base}'")
 }
 
-/// Witness that [`CoopConfig::validate_and_warn`] has been run.
-///
-/// Only obtainable via [`CoopConfig::validate_and_warn`] (the unit field
-/// is private). Functions that depend on the paths probed by
-/// [`CoopConfig::validate`] take `&Validated` so the compiler refuses
-/// calls that skipped validation. Sibling to `RunningInstance` in
-/// `backend.rs`.
-#[must_use]
-pub struct Validated(());
-
 /// Expand a leading `~` in each marketplace entry that is a path.
 ///
 /// Marketplace entries can be a URL, a GitHub repo slug, or a host
@@ -1834,22 +1864,25 @@ impl CoopConfig {
         }
     }
 
-    /// Run `validate` and surface warnings via `tracing::warn`, returning
-    /// a [`Validated`] witness.
+    /// Fail fast on config errors and surface warnings via `tracing::warn`.
     ///
-    /// Commands that consume the paths probed by [`Self::validate`]
-    /// (`setup`, `build`, `start`) take `&Validated` so the compiler
-    /// enforces the precondition. Query commands (`list`/`status`/`logs`)
-    /// skip the call and don't need the witness, so an unrelated config
-    /// error (e.g. a stale `claude.config_dir`) can't block them.
+    /// Lifecycle commands (`up`/`setup`/`start`/`quickstart`) call this at
+    /// the handler boundary so a broken config aborts before any expensive
+    /// work (image build, PAT prompt, VM boot). It is *not* the gate: the
+    /// authoritative environmental check runs at the boot choke point
+    /// ([`crate::backend::boot_preflight`], inside each backend's
+    /// `setup`/`create_and_start`/`start_existing`) on the freshest
+    /// filesystem state, so a new lifecycle path cannot skip it. Query
+    /// commands (`list`/`status`/`logs`) skip this call, so an unrelated
+    /// config error (e.g. a stale `claude.config_dir`) can't block them.
     ///
-    /// `coop validate` keeps using [`Self::validate`] directly because
-    /// it prints warnings to stdout instead of routing them to tracing.
-    pub fn validate_and_warn(&self) -> Result<Validated> {
+    /// `coop validate` uses [`Self::validate`] directly because it prints
+    /// warnings to stdout instead of routing them to tracing.
+    pub fn validate_and_warn(&self) -> Result<()> {
         for w in self.validate()? {
             tracing::warn!("{w}");
         }
-        Ok(Validated(()))
+        Ok(())
     }
 
     /// Validate config values, returning all problems found.
@@ -1861,12 +1894,18 @@ impl CoopConfig {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        // VM config bounds
-        // vcpu_count, mem_size_mib, template_size_gib, and ssh_port are
-        // NonZero types — zero is rejected at deserialization time.
-        if let Err(e) = validate_mem_size(self.vm.mem_size_mib) {
-            errors.push(e.to_string());
-        }
+        // VM config value bounds are enforced by construction, not here:
+        // `vcpu_count`/`template_size_gib`/`ssh_port` are NonZero types
+        // (zero rejected at deserialization) and `mem_size_mib` is
+        // `VmMemory` (the 128 MiB floor holds by construction). `validate`
+        // is therefore environmental-only — every check below probes
+        // filesystem state, which no value invariant can witness.
+        //
+        // Keep it that way: a new *value* bound belongs in the field's
+        // constructor (parse-don't-validate), not in this pass, so it
+        // cannot be bypassed by a lifecycle path that mutates config after
+        // validation. Only *environmental* checks (path existence) belong
+        // here; they are re-run at the boot choke point on fresh state.
 
         // Path checks
         if let Some(parent) = self.data_dir.parent()
@@ -2489,9 +2528,12 @@ fn default_vcpus() -> NonZeroU8 {
     NonZeroU8::new(2).expect("2 is non-zero")
 }
 
-fn default_mem_mib() -> MiB {
-    #[expect(clippy::expect_used, reason = "literal is provably non-zero")]
-    MiB::new(4096).expect("4096 is non-zero")
+fn default_mem_mib() -> VmMemory {
+    #[expect(
+        clippy::expect_used,
+        reason = "literal is provably non-zero and above the 128 MiB floor"
+    )]
+    VmMemory::new(MiB::new(4096).expect("4096 is non-zero")).expect("4096 MiB is above the floor")
 }
 
 fn default_kernel_path() -> ConfigPath {
@@ -3768,7 +3810,7 @@ skip = ["not-a-slug"]
     fn load_missing_file_returns_defaults() {
         let cfg = CoopConfig::load(Path::new("/nonexistent/config.toml")).unwrap();
         assert_eq!(cfg.vm.vcpu_count.get(), 2);
-        assert_eq!(cfg.vm.mem_size_mib, MiB::new(4096).unwrap());
+        assert_eq!(cfg.vm.mem_size_mib.get(), MiB::new(4096).unwrap());
         assert_eq!(cfg.ssh_port.get(), 22);
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
         assert_eq!(cfg.network.subnet_mask, SubnetMask::new(24).unwrap());
@@ -4129,7 +4171,7 @@ skip = ["not-a-slug"]
         assert_eq!(cfg.ssh_port.get(), 2222);
         assert_eq!(cfg.vm.vcpu_count.get(), 4);
         // Unspecified fields get defaults
-        assert_eq!(cfg.vm.mem_size_mib, MiB::new(4096).unwrap());
+        assert_eq!(cfg.vm.mem_size_mib.get(), MiB::new(4096).unwrap());
         assert_eq!(cfg.network.host_ip, Ipv4Addr::new(172, 16, 0, 1));
     }
 
@@ -4170,7 +4212,7 @@ skip = ["not-a-slug"]
         fs::write(&path, "[vm]\nmem_size_mib = 8192\n").unwrap();
 
         let cfg = CoopConfig::load(&path).unwrap();
-        assert_eq!(cfg.vm.mem_size_mib, MiB::new(8192).unwrap());
+        assert_eq!(cfg.vm.mem_size_mib.get(), MiB::new(8192).unwrap());
         assert_eq!(cfg.vm.vcpu_count.get(), 2);
         assert_eq!(cfg.vm.template_size_gib, GiB::new(8).unwrap());
     }
@@ -4300,29 +4342,44 @@ skip = ["not-a-slug"]
         assert!(warnings.len() <= 3, "unexpected warnings: {warnings:?}");
     }
 
-    // Zero-value rejection is now enforced by NonZero types at
-    // deserialization time (tested in the "NonZero type enforcement"
-    // section above). The validate() method only checks semantic
-    // bounds like mem_size_mib >= 128.
+    // Zero-value rejection is enforced by NonZero types at deserialization
+    // time (tested in the "NonZero type enforcement" section above). The
+    // guest-memory floor is enforced by construction via `VmMemory::new`
+    // (tested below), not in `validate()` — so an unbootable value is
+    // unrepresentable rather than caught by a late pass.
 
     #[test]
-    fn validate_rejects_low_memory() {
-        let mut cfg = CoopConfig::default();
-        cfg.vm.mem_size_mib = MiB::new(64).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("mem_size_mib=64 is too low"));
-    }
-
-    #[test]
-    fn validate_mem_size_rejects_below_minimum() {
-        let err = super::validate_mem_size(MiB::new(127).unwrap()).unwrap_err();
+    fn vm_memory_rejects_below_minimum() {
+        let err = VmMemory::new(MiB::new(127).unwrap()).unwrap_err();
         assert!(err.to_string().contains("mem_size_mib=127 is too low"));
     }
 
     #[test]
-    fn validate_mem_size_accepts_minimum_and_above() {
-        super::validate_mem_size(super::MIN_MEM_MIB).unwrap();
-        super::validate_mem_size(MiB::new(4096).unwrap()).unwrap();
+    fn vm_memory_accepts_minimum_and_above() {
+        assert_eq!(VmMemory::new(MIN_MEM_MIB).unwrap().get(), MIN_MEM_MIB);
+        assert_eq!(
+            VmMemory::new(MiB::new(4096).unwrap()).unwrap().get(),
+            MiB::new(4096).unwrap()
+        );
+    }
+
+    #[test]
+    fn vm_memory_parse_cli_enforces_floor() {
+        assert!(VmMemory::parse_cli("16").is_err());
+        assert!(VmMemory::parse_cli("0").is_err());
+        assert_eq!(VmMemory::parse_cli("128").unwrap().get(), MIN_MEM_MIB);
+    }
+
+    #[test]
+    fn vm_memory_deserialize_enforces_floor() {
+        // config.toml with a below-floor mem_size_mib is rejected at load.
+        let err = toml::from_str::<CoopConfig>("[vm]\nmem_size_mib = 16\n").unwrap_err();
+        assert!(
+            err.to_string().contains("is too low"),
+            "expected floor error, got: {err}"
+        );
+        let cfg: CoopConfig = toml::from_str("[vm]\nmem_size_mib = 256\n").unwrap();
+        assert_eq!(cfg.vm.mem_size_mib.get(), MiB::new(256).unwrap());
     }
 
     #[test]
@@ -4402,14 +4459,17 @@ skip = ["not-a-slug"]
     #[test]
     fn validate_collects_multiple_errors() {
         let mut cfg = CoopConfig::default();
-        cfg.vm.mem_size_mib = MiB::new(64).unwrap();
         cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/claude-config"));
+        cfg.codex.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/codex-config"));
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("mem_size_mib"), "missing mem error: {msg}");
         assert!(
             msg.contains("claude.config_dir"),
-            "missing config_dir error: {msg}"
+            "missing claude config_dir error: {msg}"
+        );
+        assert!(
+            msg.contains("codex.config_dir"),
+            "missing codex config_dir error: {msg}"
         );
     }
 
@@ -4433,16 +4493,9 @@ skip = ["not-a-slug"]
         }
     }
 
-    // Pins `mem_size_mib < 128` against `<= 128`: the boundary value
-    // 128 must be accepted.
-    #[test]
-    fn validate_accepts_min_memory_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = validate_fixture(tmp.path());
-        cfg.vm.mem_size_mib = MiB::new(128).unwrap();
-        // 128 is the documented minimum; the boundary value itself must pass.
-        cfg.validate().unwrap();
-    }
+    // The `mem_size_mib < 128` vs `<= 128` boundary is pinned by
+    // `vm_memory_rejects_below_minimum` / `vm_memory_accepts_minimum_and_above`
+    // now that the floor lives in `VmMemory::new`, not `validate()`.
 
     // Pins both `!parent.as_os_str().is_empty()` and `!parent.exists()`:
     // with a non-empty, non-existent parent, the warning must fire.
@@ -5793,7 +5846,10 @@ skip = ["not-a-slug"]
     /// without an `Arbitrary` impl for every leaf type.
     fn arb_config() -> impl Strategy<Value = CoopConfig> {
         (
-            1u32..=u32::MAX,
+            // Guest memory must stay at or above the floor: `VmMemory`
+            // rejects anything below `MIN_MEM_MIB` at deserialize, so a
+            // lower value would fail the serde round-trip this drives.
+            MIN_MEM_MIB.as_u32()..=u32::MAX,
             1u8..=u8::MAX,
             1u32..=u32::MAX,
             arb_subnet_mask(),
@@ -5804,7 +5860,7 @@ skip = ["not-a-slug"]
             .prop_map(
                 |(mem, vcpu, template, subnet_mask, host_iface, forward_ports, post_start)| {
                     let mut cfg = CoopConfig::default();
-                    cfg.vm.mem_size_mib = MiB::new(mem).unwrap();
+                    cfg.vm.mem_size_mib = VmMemory::new(MiB::new(mem).unwrap()).unwrap();
                     cfg.vm.vcpu_count = NonZeroU8::new(vcpu).unwrap();
                     cfg.vm.template_size_gib = GiB::new(template).unwrap();
                     cfg.network.subnet_mask = subnet_mask;

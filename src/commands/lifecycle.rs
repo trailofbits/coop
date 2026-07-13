@@ -23,7 +23,7 @@ pub(crate) struct UpOpts<'a> {
     pub(crate) extra_mount: Vec<config::Mount>,
     pub(crate) git_repo: Option<&'a str>,
     pub(crate) vcpus: Option<u8>,
-    pub(crate) mem: Option<config::MiB>,
+    pub(crate) mem: Option<config::VmMemory>,
     pub(crate) disk: Option<config::GiB>,
     /// Explicit `--image NAME`, or `None` when unset. `None` selects the
     /// profile-derived image when `--profile` is given, else the default.
@@ -102,12 +102,11 @@ fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
 pub(crate) fn cmd_up(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
-    validated: &config::Validated,
     config_path: &Path,
     opts: &UpOpts<'_>,
 ) -> Result<()> {
     if let Some(repo_url) = opts.git_repo {
-        return cmd_up_git_repo(be, cfg, validated, config_path, opts, repo_url);
+        return cmd_up_git_repo(be, cfg, config_path, opts, repo_url);
     }
 
     let transport = opts.transport;
@@ -159,7 +158,7 @@ pub(crate) fn cmd_up(
         return Ok(());
     }
 
-    ensure_profile_image(be, cfg, validated, opts.profile_target.as_ref())?;
+    ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
 
     create_up_instance(
         be,
@@ -175,7 +174,6 @@ pub(crate) fn cmd_up(
 fn cmd_up_git_repo(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
-    validated: &config::Validated,
     config_path: &Path,
     opts: &UpOpts<'_>,
     repo_url: &str,
@@ -211,7 +209,7 @@ fn cmd_up_git_repo(
         return Ok(());
     }
 
-    ensure_profile_image(be, cfg, validated, opts.profile_target.as_ref())?;
+    ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
     create_git_repo_instance(be, cfg, config_path, opts, repo_url)
 }
 
@@ -271,7 +269,7 @@ fn emit_up_dry_run(
         guest_user: &guest_user,
         vm: json::VmOverrides {
             vcpus: opts.vcpus,
-            mem_mib: opts.mem,
+            mem_mib: opts.mem.map(config::VmMemory::get),
             disk_gib: opts.disk,
         },
     };
@@ -335,15 +333,17 @@ fn create_up_instance(
         .unwrap_or_default();
     mounts.extend(opts.extra_mount.clone());
 
-    let workspace_dir = match opts.transport {
-        ProjectTransport::Copy => Some(project_dir_to_str(project_dir)?),
+    let (workspace_dir, rule) = match opts.transport {
+        ProjectTransport::Copy => (
+            Some(project_dir_to_str(project_dir)?),
+            workspace::WorkspaceMountRule::CopyProject,
+        ),
         ProjectTransport::Mount => {
             mounts.insert(0, project_mount.clone());
-            None
+            (None, workspace::WorkspaceMountRule::ProjectMountedOrNone)
         }
     };
-    validate_copy_workspace_mounts(opts.transport, &mounts)?;
-    config::validate_unique_guest_paths(&mounts)?;
+    let mounts = workspace::ValidatedMounts::assemble(rule, mounts)?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -427,8 +427,9 @@ fn create_git_repo_instance(
         .map(|t| t.mounts.clone())
         .unwrap_or_default();
     mounts.extend(opts.extra_mount.clone());
-    workspace::validate_git_repo_workspace_mounts(&mounts)?;
-    config::validate_unique_guest_paths(&mounts)?;
+    let mounts =
+        workspace::ValidatedMounts::assemble(workspace::WorkspaceMountRule::GitRepoClone, mounts)?
+            .into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -465,7 +466,6 @@ fn create_git_repo_instance(
 fn ensure_profile_image(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
-    validated: &config::Validated,
     target: Option<&ProfileImageTarget>,
 ) -> Result<()> {
     let Some(target) = target else {
@@ -475,7 +475,6 @@ fn ensure_profile_image(
     let _guard = signal::install_handlers();
     be.setup(
         cfg,
-        validated,
         &setup::SetupOptions {
             skip_confirm: true,
             rebuild: false,
@@ -727,27 +726,6 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
     Ok(())
 }
 
-fn validate_copy_workspace_mounts(
-    transport: ProjectTransport,
-    mounts: &[config::Mount],
-) -> Result<()> {
-    if transport != ProjectTransport::Copy {
-        return Ok(());
-    }
-    let workspace_path = workspace::default_workspace_path().to_string();
-    if mounts
-        .iter()
-        .any(|mount| mount.guest_path.to_string() == workspace_path)
-    {
-        bail!(
-            "`coop up --copy` already uses /workspace for the project. \
-             Give --extra-mount an explicit non-/workspace guest path, or use \
-             `coop up --mount` to mount the project itself."
-        );
-    }
-    Ok(())
-}
-
 /// Find the (single) instance whose persisted workspace state's `host_path`
 /// matches `workspace` (after canonicalisation). Returns `None` when no
 /// instance has been started for this directory; bails when multiple do
@@ -819,7 +797,7 @@ fn find_git_repo_instance(
 pub(crate) fn apply_vm_overrides(
     cfg: &mut config::CoopConfig,
     vcpus: Option<u8>,
-    mem: Option<config::MiB>,
+    mem: Option<config::VmMemory>,
     template_size: Option<config::GiB>,
 ) -> Result<()> {
     if let Some(v) = vcpus {
@@ -929,7 +907,6 @@ pub(crate) fn preflight_start_target(
 pub(crate) fn cmd_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
-    _: &config::Validated,
     opts: &StartOpts<'_>,
 ) -> Result<config::Instance> {
     let ws_path = opts.workspace_dir.map(Path::new);
@@ -1752,7 +1729,7 @@ pub(crate) fn cmd_status(
 pub(crate) struct ResizeOpts<'a> {
     pub(crate) name: Option<&'a config::InstanceName>,
     pub(crate) disk: Option<config::DiskSize>,
-    pub(crate) mem: Option<config::MiB>,
+    pub(crate) mem: Option<config::VmMemory>,
     pub(crate) vcpus: Option<std::num::NonZeroU8>,
     pub(crate) start: bool,
 }
@@ -1762,13 +1739,10 @@ pub(crate) fn cmd_resize(
     cfg: &config::CoopConfig,
     opts: &ResizeOpts<'_>,
 ) -> Result<()> {
-    // Reject a below-minimum memory before touching any artifact, so a bad
-    // value never leaves a half-applied instance (the CLI ArgGroup already
-    // guarantees at least one of size/mem/vcpus is present).
-    if let Some(mem) = opts.mem {
-        config::validate_mem_size(mem)?;
-    }
-
+    // A below-minimum `--mem` is rejected at the CLI boundary by
+    // `VmMemory::parse_cli`, so `opts.mem` is already provably bootable
+    // here; no half-applied instance can result from a bad value. (The CLI
+    // ArgGroup guarantees at least one of size/mem/vcpus is present.)
     let inst = cfg.resolve_instance(opts.name)?;
     let stopped = be.as_stopped(inst)?;
 
@@ -2247,8 +2221,11 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err = super::validate_copy_workspace_mounts(super::ProjectTransport::Copy, &mounts)
-            .expect_err("expected /workspace collision");
+        let err = crate::workspace::ValidatedMounts::assemble(
+            crate::workspace::WorkspaceMountRule::CopyProject,
+            mounts,
+        )
+        .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
     }
 
@@ -2485,7 +2462,8 @@ mod tests {
 
         let mut opts = up_opts_for_tests(None);
         opts.vcpus = Some(7);
-        opts.mem = super::config::MiB::new(2048);
+        opts.mem =
+            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap());
         opts.disk = super::config::GiB::new(50);
         opts.extra_mount =
             vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
@@ -2503,7 +2481,10 @@ mod tests {
         let inputs = super::up_translator_inputs(&cfg, &opts);
 
         assert_eq!(inputs.cli_vcpus, Some(7));
-        assert_eq!(inputs.cli_mem_mib, super::config::MiB::new(2048));
+        assert_eq!(
+            inputs.cli_mem_mib,
+            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap())
+        );
         assert_eq!(inputs.cli_disk_gib, super::config::GiB::new(50));
         assert_eq!(inputs.cli_post_start.as_deref(), Some("echo hi"));
         assert_eq!(
@@ -2616,7 +2597,8 @@ mod tests {
         };
 
         let mut opts = up_opts_for_tests(project.to_str());
-        opts.mem = super::config::MiB::new(2048);
+        opts.mem =
+            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap());
         reject(&opts).expect_err("--mem must be rejected");
 
         let mut opts = up_opts_for_tests(project.to_str());
@@ -2703,7 +2685,8 @@ mod tests {
         let dc = tmp.path().join("devcontainer.json");
 
         let mut opts = up_opts_for_tests(None);
-        opts.mem = super::config::MiB::new(2048);
+        opts.mem =
+            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap());
         super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
             .expect_err("--mem must be rejected");
 

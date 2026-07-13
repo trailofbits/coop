@@ -33,7 +33,7 @@ pub(crate) fn cmd_quickstart(
     config_path: &Path,
     opts: &QuickstartOpts,
 ) -> Result<()> {
-    let validated = cfg.validate_and_warn()?;
+    cfg.validate_and_warn()?;
     let image = config::default_image_name();
 
     if be.image_is_built(cfg, &image) {
@@ -43,7 +43,6 @@ pub(crate) fn cmd_quickstart(
         let _guard = signal::install_handlers();
         be.setup(
             cfg,
-            &validated,
             &setup::SetupOptions {
                 skip_confirm: true,
                 rebuild: false,
@@ -78,7 +77,6 @@ pub(crate) fn cmd_quickstart(
             cmd_start(
                 be,
                 cfg,
-                &validated,
                 &StartOpts {
                     name: Some(&inst.name),
                     workspace_dir: None,
@@ -101,7 +99,6 @@ pub(crate) fn cmd_quickstart(
             be,
             cfg,
             config_path,
-            &validated,
             &image,
             workspace_dir.as_deref(),
             opts.no_devcontainer,
@@ -127,7 +124,6 @@ fn quickstart_fresh_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     config_path: &Path,
-    validated: &config::Validated,
     image: &config::ImageName,
     workspace_dir: Option<&Path>,
     no_devcontainer: bool,
@@ -170,10 +166,14 @@ fn quickstart_fresh_start(
         devcontainer::effective_disk(None, translation.as_ref().unwrap_or(&default_translation));
     let post_start_override = translation.as_ref().and_then(|t| t.post_start.clone());
 
-    let final_mounts = translation
-        .as_ref()
-        .map(|t| t.mounts.clone())
-        .unwrap_or_default();
+    let final_mounts = crate::workspace::ValidatedMounts::assemble(
+        crate::workspace::WorkspaceMountRule::ProjectMountedOrNone,
+        translation
+            .as_ref()
+            .map(|t| t.mounts.clone())
+            .unwrap_or_default(),
+    )?
+    .into_vec();
 
     let workspace_str = workspace_dir
         .map(|p| {
@@ -199,7 +199,6 @@ fn quickstart_fresh_start(
         applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
     };
 
-    let _ = validated;
     allocate_and_start(be, cfg, None, image, workspace_dir, &start_opts)
 }
 

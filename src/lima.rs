@@ -132,7 +132,7 @@ pub fn create_and_start(
         // size can't be read.
         base_image_size_gib(&base_img).unwrap_or(cfg.vm.template_size_gib)
     });
-    let mem_gib = cfg.vm.mem_size_mib.as_gib_f64();
+    let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
     let mut child = Command::new("limactl")
         .arg("start")
         .arg(&effective_template)
@@ -1286,7 +1286,7 @@ containerd:
         image_path = base_img.display(),
         arch = arch,
         vcpus = cfg.vm.vcpu_count,
-        mem_gib = cfg.vm.mem_size_mib.as_gib_f64(),
+        mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64(),
         disk_gib = cfg.vm.template_size_gib,
     );
 
@@ -1358,7 +1358,7 @@ provision:
 {script}
 "#,
         vcpus = cfg.vm.vcpu_count,
-        mem_gib = cfg.vm.mem_size_mib.as_gib_f64(),
+        mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64(),
         disk_gib = cfg.vm.template_size_gib,
         script = indented,
     )
