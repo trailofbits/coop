@@ -105,7 +105,7 @@ If `config_dir` also provides a `config.toml`, coop preserves its other settings
 
 ### Plugin marketplaces
 
-`marketplaces` and `plugins` declare Codex [plugin marketplaces](https://developers.openai.com/codex/plugins) and the plugins to install from them, mirroring the same fields under `[claude]`:
+`marketplaces` and `plugins` declare Codex [plugin marketplaces](https://learn.chatgpt.com/docs/plugins) and the plugins to install from them, mirroring the same fields under `[claude]`:
 
 ```toml
 [codex]

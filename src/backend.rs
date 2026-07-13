@@ -2189,6 +2189,14 @@ fn copy_codex_config(
 /// Mirrors `merge_managed_claude_settings`'s warn-on-corrupt handling of
 /// `~/.claude/settings.json`. A missing/empty file is the normal first-boot
 /// case and yields `None` quietly.
+///
+/// Note the realistic failure here is a *transient* SSH read of an
+/// otherwise-good file, not the corrupt file the Claude path deliberately
+/// resets. Since plugin install runs only on `BootMode::FirstBoot`, if this
+/// fails on a restart while a rewrite is otherwise triggered, the dropped
+/// `[marketplaces.*]`/`[plugins.*]` are not reinstalled by that stop/start —
+/// recovery requires recreating the instance (a fresh `FirstBoot`). The
+/// warning is that signal.
 fn read_codex_plugin_state(target: &SshTarget) -> Option<toml::Table> {
     match target.capture("cat ~/.codex/config.toml 2>/dev/null || true") {
         Ok(existing) => match extract_codex_plugin_state(&existing) {
@@ -3537,12 +3545,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn extract_codex_plugin_state_round_trips_tables() {
+        // Keys mirror real guest output: marketplaces are keyed by name,
+        // plugins by `plugin@marketplace` (so the key needs quoting).
         let guest = "model = \"gpt-5\"\n\
              \n\
-             [marketplaces.mine]\n\
+             [marketplaces.codex-plugins]\n\
              source = \"trailofbits/codex-plugins\"\n\
              \n\
-             [plugins.my-lsp]\n\
+             [plugins.\"my-lsp@codex-plugins\"]\n\
              enabled = true\n";
         let state = extract_codex_plugin_state(guest).unwrap().unwrap();
         assert!(state.contains_key("marketplaces"));
@@ -3571,8 +3581,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let src = tempfile::TempDir::new().unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
         let preserved = extract_codex_plugin_state(
-            "[marketplaces.mine]\nsource = \"trailofbits/codex-plugins\"\n\
-             \n[plugins.my-lsp]\nenabled = true\n",
+            "[marketplaces.codex-plugins]\nsource = \"trailofbits/codex-plugins\"\n\
+             \n[plugins.\"my-lsp@codex-plugins\"]\nenabled = true\n",
         )
         .unwrap()
         .unwrap();
@@ -3585,8 +3595,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
-        assert!(config.contains("[marketplaces.mine]"), "got: {config}");
-        assert!(config.contains("[plugins.my-lsp]"), "got: {config}");
+        assert!(
+            config.contains("[marketplaces.codex-plugins]"),
+            "got: {config}"
+        );
+        assert!(
+            config.contains("[plugins.\"my-lsp@codex-plugins\"]"),
+            "got: {config}"
+        );
         assert!(config.contains("model = \"gpt-5\""));
     }
 
