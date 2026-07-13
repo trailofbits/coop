@@ -103,15 +103,32 @@ url = "https://mcp.sentry.dev/mcp"
 
 If `config_dir` also provides a `config.toml`, coop preserves its other settings but replaces the `mcp_servers` table with the one derived from `codex.mcp_servers`. When the VM is in [local-model mode](#local-model-support), coop also owns the `model` and `model_provider` keys and a `[model_providers.coop_local]` block; these are written on a switch to local and removed on a switch back to remote, so they are not preserved across a mode change.
 
+### Plugin marketplaces
+
+`marketplaces` and `plugins` declare Codex [plugin marketplaces](https://developers.openai.com/codex/plugins) and the plugins to install from them, mirroring the same fields under `[claude]`:
+
+```toml
+[codex]
+marketplaces = ["trailofbits/codex-plugins"]  # owner/repo, owner/repo@ref, git URL, or local path
+plugins = ["my-lsp@codex-plugins"]             # plugin@marketplace
+```
+
+Each marketplace source is registered with `codex plugin marketplace add` and each plugin installed with `codex plugin add`. A source that is an absolute local directory is copied into the guest first; a `owner/repo`, `owner/repo@ref`, or git URL is passed through unchanged.
+
+These are **baked into the golden image** during `coop setup` (on the Lima/macOS backend) and recorded in the image's template config. On a VM's first boot coop installs only the delta not already baked in; on the Firecracker/Linux backend, where nothing is baked, the full set installs on first boot. Like Claude plugins, they are installed on **first boot only** — they persist on the guest disk across stop/start.
+
+Codex stores marketplace registrations under `[marketplaces.*]` and per-plugin enabled/disabled state under `[plugins.*]` in `~/.codex/config.toml`. Because coop rewrites that file on every boot, it reads the guest's current tables back first and preserves them across the rewrite (dropping any that came from the host's own `config.toml`), so installed plugins — and any manual enable/disable toggles you make with `/plugins` — survive a restart.
+
 ## Bootstrap sequence
 
 When `coop up` creates/restarts a project VM or `coop start` restarts a stopped VM (without `--no-agents`), coop executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
-2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest.
+2. **User content**: Copy the allowlisted Codex entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from `config_dir` to `~/.codex/` in the guest, preserving the guest's installed `[marketplaces.*]`/`[plugins.*]` tables.
 3. **MCP servers**: Merge configured MCP server definitions into `~/.codex/config.toml`.
+4. **Marketplaces & plugins** (first boot only): Install the configured `marketplaces`/`plugins` not already baked into the golden image.
 
-On restart (`coop start` of a stopped instance), the same Codex config files are refreshed so host-side updates are reflected in the guest.
+On restart (`coop start` of a stopped instance), the same Codex config files are refreshed so host-side updates are reflected in the guest; marketplaces and plugins are not reinstalled, but the guest's installed plugin state is preserved (step 2).
 
 ### Skipping bootstrap
 

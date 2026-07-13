@@ -60,6 +60,10 @@ pub struct TemplateConfig {
     #[serde(default)]
     pub plugins: Vec<String>,
     #[serde(default)]
+    pub codex_marketplaces: Vec<String>,
+    #[serde(default)]
+    pub codex_plugins: Vec<String>,
+    #[serde(default)]
     pub guest_user: GuestUser,
     #[serde(default)]
     pub oci_features: Vec<InstalledFeature>,
@@ -424,6 +428,8 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         post_install_hash: recipe.post_install_hash,
         marketplaces: Vec::new(),
         plugins: Vec::new(),
+        codex_marketplaces: Vec::new(),
+        codex_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: installed_features(&opts.oci_features),
     };
@@ -1590,6 +1596,10 @@ mod tests {
         }"#;
         let tc: TemplateConfig = serde_json::from_str(json).unwrap();
         assert_eq!(tc.guest_user, GuestUser::default());
+        // Codex bake lists were added later; legacy JSON omits them and
+        // must default to empty rather than failing to deserialize.
+        assert!(tc.codex_marketplaces.is_empty());
+        assert!(tc.codex_plugins.is_empty());
     }
 
     #[test]

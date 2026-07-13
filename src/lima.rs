@@ -723,7 +723,11 @@ fn needs_rebuild(
     }
 
     let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
-    existing.marketplaces != wanted_m || existing.plugins != wanted_p
+    let (wanted_cm, wanted_cp) = crate::guest::collect_codex_baked_lists(cfg);
+    existing.marketplaces != wanted_m
+        || existing.plugins != wanted_p
+        || existing.codex_marketplaces != wanted_cm
+        || existing.codex_plugins != wanted_cp
 }
 
 fn build_golden_image(
@@ -806,7 +810,7 @@ fn build_golden_image(
         tracing::debug!("Failed to remove builder template (non-fatal): {e}");
     }
 
-    let (marketplaces, plugins) = match result {
+    let baked = match result {
         Ok(lists) => lists,
         Err(e) => {
             // Clean up failed staging image
@@ -840,8 +844,10 @@ fn build_golden_image(
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
-        marketplaces,
-        plugins,
+        marketplaces: baked.marketplaces,
+        plugins: baked.plugins,
+        codex_marketplaces: baked.codex_marketplaces,
+        codex_plugins: baked.codex_plugins,
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
@@ -859,7 +865,7 @@ fn run_builder_vm(
     builder_template: &std::path::Path,
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
     let mut command = Command::new("limactl");
     command.arg("start");
@@ -893,7 +899,7 @@ fn run_builder_vm(
     // Install marketplaces and plugins into the builder VM so they're
     // baked into the golden image. Runs after binary verification
     // (confirms claude CLI is installed) and before cloud-init clean.
-    let (marketplaces, plugins) = install_builder_plugins(cfg, profiles, guest_user)?;
+    let baked = install_builder_plugins(cfg, profiles, guest_user)?;
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
@@ -960,7 +966,7 @@ fn run_builder_vm(
         )
     })?;
 
-    Ok((marketplaces, plugins))
+    Ok(baked)
 }
 
 /// Get an SSH target for the builder VM.
@@ -979,18 +985,43 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
     })
 }
 
-/// Install marketplaces and plugins in the builder VM via SSH.
-/// Returns the lists that were installed (for recording in
+/// Marketplace/plugin lists baked into a golden image, recorded in
+/// `TemplateConfig` for staleness detection and the `FirstBoot` install delta.
+struct BakedLists {
+    marketplaces: Vec<String>,
+    plugins: Vec<String>,
+    codex_marketplaces: Vec<String>,
+    codex_plugins: Vec<String>,
+}
+
+impl BakedLists {
+    fn is_empty(&self) -> bool {
+        self.marketplaces.is_empty()
+            && self.plugins.is_empty()
+            && self.codex_marketplaces.is_empty()
+            && self.codex_plugins.is_empty()
+    }
+}
+
+/// Install Claude and Codex marketplaces and plugins in the builder VM via
+/// SSH. Returns the lists that were installed (for recording in
 /// `TemplateConfig`).
 fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<BakedLists> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
+    let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
+    let baked = BakedLists {
+        marketplaces,
+        plugins,
+        codex_marketplaces,
+        codex_plugins,
+    };
 
-    if marketplaces.is_empty() && plugins.is_empty() {
-        return Ok((marketplaces, plugins));
+    if baked.is_empty() {
+        return Ok(baked);
     }
 
     eprintln!("  Installing marketplaces and plugins...");
@@ -1005,15 +1036,26 @@ fn install_builder_plugins(
     let session = crate::backend::SshSession { target, env };
     let claude_bin = guest_user.claude_bin();
 
-    if !marketplaces.is_empty() {
-        crate::backend::install_marketplaces(&session, &claude_bin, &marketplaces)?;
+    if !baked.marketplaces.is_empty() {
+        crate::backend::install_marketplaces(&session, &claude_bin, &baked.marketplaces)?;
+    }
+    if !baked.plugins.is_empty() {
+        crate::backend::install_plugins(&session, &claude_bin, &baked.plugins)?;
     }
 
-    if !plugins.is_empty() {
-        crate::backend::install_plugins(&session, &claude_bin, &plugins)?;
+    let codex_bin = crate::guest::codex_bin();
+    if !baked.codex_marketplaces.is_empty() {
+        crate::backend::install_codex_marketplaces(
+            &session,
+            &codex_bin,
+            &baked.codex_marketplaces,
+        )?;
+    }
+    if !baked.codex_plugins.is_empty() {
+        crate::backend::install_codex_plugins(&session, &codex_bin, &baked.codex_plugins)?;
     }
 
-    Ok((marketplaces, plugins))
+    Ok(baked)
 }
 
 /// Dump diagnostic logs from the builder VM when `limactl start` fails.

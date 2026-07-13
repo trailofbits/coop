@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, and the `claude.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -247,6 +247,8 @@ Codex configuration injected into the guest VM at start time. Every field is opt
 | `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
 | `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from this directory to `~/.codex/` in the guest on start. Set to `false` to disable. Supports `~` expansion. |
 | `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `marketplaces` | array of strings | `[]` | Codex plugin marketplace sources. Each entry is a `owner/repo`[`@ref`] shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
+| `plugins` | array of strings | `[]` | Codex plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.codex/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
 | `local_model` | table | unset | Host-side model endpoint to route Codex at when the VM is in local mode (`coop model <vm> local`). See [Local-model routing](#local-model-routing). |
 

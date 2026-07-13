@@ -81,6 +81,8 @@
 # [codex]
 # config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml, auth.json from (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
+# marketplaces = ["trailofbits/codex-plugins"]  # owner/repo, git URL, or local path
+# plugins = ["my-lsp@codex-plugins"]  # plugin@marketplace to install
 #
 # Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.
 #   api_key = "cmd:op read op://Private/OpenAI/credential"

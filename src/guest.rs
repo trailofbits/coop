@@ -434,6 +434,22 @@ pub fn collect_baked_lists(
     (marketplaces, plugins)
 }
 
+/// Collect Codex marketplace and plugin lists from global config.
+/// Results are sorted and deduplicated. Unlike [`collect_baked_lists`],
+/// profiles contribute nothing here: profile plugin lists are
+/// Claude-only, so Codex plugins come solely from `[codex]`.
+pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
+    let mut marketplaces = cfg.codex.marketplaces.clone();
+    let mut plugins = cfg.codex.plugins.clone();
+
+    marketplaces.sort_unstable();
+    marketplaces.dedup();
+    plugins.sort_unstable();
+    plugins.dedup();
+
+    (marketplaces, plugins)
+}
+
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for assertion failures")]
 #[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
@@ -446,6 +462,16 @@ mod tests {
             SCRIPT_CODEX.contains("BIN=\"$TMPDIR/${ASSET%.tar.gz}\""),
             "Codex installer should target the extracted binary path directly",
         );
+    }
+
+    #[test]
+    fn collect_codex_baked_lists_sorts_and_dedups() {
+        let mut cfg = CoopConfig::default();
+        cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
+        cfg.codex.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
+        let (marketplaces, plugins) = collect_codex_baked_lists(&cfg);
+        assert_eq!(marketplaces, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(plugins, vec!["p1@a".to_string(), "p2@b".to_string()]);
     }
 
     #[test]

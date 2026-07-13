@@ -1490,6 +1490,14 @@ pub struct CodexConfig {
     #[serde(default)]
     pub env_forward: Vec<EnvVarName>,
 
+    /// Plugin marketplace sources (URL, path, or GitHub repo)
+    #[serde(default)]
+    pub marketplaces: Vec<String>,
+
+    /// Plugins to install from marketplaces
+    #[serde(default)]
+    pub plugins: Vec<String>,
+
     /// MCP servers to register in `~/.codex/config.toml`
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerDef>,
@@ -1822,6 +1830,20 @@ fn expand_marketplaces(entries: &mut [String]) {
     }
 }
 
+/// Push a validation error for each marketplace entry that looks like a
+/// local (absolute) path but does not exist. `field` is the config key
+/// prefix (e.g. `"claude.marketplaces"`) used in the message.
+fn check_local_marketplaces(field: &str, entries: &[String], errors: &mut Vec<String>) {
+    for mp in entries {
+        let path = Path::new(mp);
+        if path.is_absolute() && !path.exists() {
+            errors.push(format!(
+                "{field} entry '{mp}' looks like a local path but does not exist"
+            ));
+        }
+    }
+}
+
 impl CoopConfig {
     /// Default config path: `~/.coop/config.toml`.
     pub fn default_path() -> PathBuf {
@@ -1859,6 +1881,7 @@ impl CoopConfig {
     /// path-shaped ones (a leading `~`) can be expanded.
     fn expand_user_paths(&mut self) {
         expand_marketplaces(&mut self.claude.marketplaces);
+        expand_marketplaces(&mut self.codex.marketplaces);
         for profile in self.profiles.values_mut() {
             expand_marketplaces(&mut profile.marketplaces);
         }
@@ -1955,15 +1978,12 @@ impl CoopConfig {
             ));
         }
 
-        for mp in &self.claude.marketplaces {
-            let path = Path::new(mp);
-            if path.is_absolute() && !path.exists() {
-                errors.push(format!(
-                    "claude.marketplaces entry '{mp}' looks like a local \
-                     path but does not exist"
-                ));
-            }
-        }
+        check_local_marketplaces(
+            "claude.marketplaces",
+            &self.claude.marketplaces,
+            &mut errors,
+        );
+        check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2297,6 +2317,8 @@ impl Default for CodexConfig {
         Self {
             api_key: std::env::var("OPENAI_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
             local_model: None,
@@ -3336,6 +3358,8 @@ mod tests {
         let json = r#"{
             "api_key": "sk-openai-test",
             "env_forward": ["MYORG_KEY"],
+            "marketplaces": ["https://github.com/trailofbits/codex-plugins"],
+            "plugins": ["my-lsp@codex-plugins"],
             "mcp_servers": {
                 "sentry": {
                     "type": "http",
@@ -3349,6 +3373,11 @@ mod tests {
             Some("sk-openai-test")
         );
         assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
+        assert_eq!(
+            cfg.marketplaces,
+            vec!["https://github.com/trailofbits/codex-plugins".to_string()]
+        );
+        assert_eq!(cfg.plugins, vec!["my-lsp@codex-plugins".to_string()]);
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert!(cfg.mcp_servers.contains_key("sentry"));
     }
@@ -3359,6 +3388,8 @@ mod tests {
         let cfg: CodexConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.api_key.is_none());
         assert!(cfg.env_forward.is_empty());
+        assert!(cfg.marketplaces.is_empty());
+        assert!(cfg.plugins.is_empty());
         assert!(cfg.mcp_servers.is_empty());
         assert_eq!(cfg.config_dir, ConfigDir::Default);
         assert!(cfg.local_model.is_none());
@@ -4454,6 +4485,32 @@ skip = ["not-a-slug"]
 
         let cfg = CoopConfig::load(&path).unwrap();
         assert_eq!(cfg.claude.marketplaces[0], url);
+    }
+
+    #[test]
+    fn validate_rejects_missing_local_codex_marketplace() {
+        let mut cfg = CoopConfig::default();
+        cfg.codex.marketplaces = vec!["/nonexistent/codex-plugins".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("codex.marketplaces"),
+            "expected codex marketplace error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_expands_tilde_in_codex_marketplaces() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[codex]\nmarketplaces = [\"~/codex-plugins\"]\n").unwrap();
+
+        let cfg = CoopConfig::load(&path).unwrap();
+        let mp = &cfg.codex.marketplaces[0];
+        assert!(!mp.starts_with('~'), "tilde should be expanded, got: {mp}");
+        assert!(
+            mp.contains("/codex-plugins"),
+            "should preserve path suffix, got: {mp}"
+        );
     }
 
     #[test]

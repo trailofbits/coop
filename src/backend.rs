@@ -1557,8 +1557,10 @@ fn bootstrap_codex(
     // the configured endpoint has since been removed.
     let manages_local =
         model_state.resolved_codex(codex).is_some() || model_state.codex_materialized;
+    let has_plugins = !codex.marketplaces.is_empty() || !codex.plugins.is_empty();
     let needs_codex =
-        codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers) || manages_local;
+        codex_bootstrap_needed(source_dir.as_deref(), &codex.mcp_servers, has_plugins)
+            || manages_local;
 
     if !needs_codex {
         return Ok(());
@@ -1579,6 +1581,24 @@ fn bootstrap_codex(
         local.as_ref(),
         manages_local,
     )?;
+
+    // Marketplaces and plugins are persisted in the guest's config.toml and
+    // plugin cache (and preserved across restarts by `copy_codex_config`), so
+    // install only the delta not already baked into the golden image, and only
+    // on first boot — marketplaces first, since `plugin add` resolves against a
+    // configured marketplace.
+    if let BootMode::FirstBoot = mode {
+        let codex_bin = crate::guest::codex_bin();
+        let (missing_marketplaces, missing_plugins) = compute_codex_plugin_delta(cfg, &inst.image);
+
+        if !missing_marketplaces.is_empty() {
+            install_codex_marketplaces(session, &codex_bin, &missing_marketplaces)?;
+        }
+
+        if !missing_plugins.is_empty() {
+            install_codex_plugins(session, &codex_bin, &missing_plugins)?;
+        }
+    }
 
     match mode {
         BootMode::Restart => tracing::info!("Codex bootstrap refreshed"),
@@ -1608,30 +1628,57 @@ pub fn persisted_guest_user(cfg: &CoopConfig, image: &ImageName) -> crate::guest
         .unwrap_or_default()
 }
 
-/// Compute which marketplaces and plugins are missing from the
+/// Pure core of the `FirstBoot` install delta: the wanted marketplaces and
+/// plugins that are not already baked into the golden image. A missing
+/// baked list (legacy/orphaned image) is passed as an empty slice, so the
+/// whole wanted set is treated as missing.
+fn plugin_delta(
+    wanted_marketplaces: &[String],
+    wanted_plugins: &[String],
+    baked_marketplaces: &[String],
+    baked_plugins: &[String],
+) -> (Vec<String>, Vec<String>) {
+    fn missing(wanted: &[String], baked: &[String]) -> Vec<String> {
+        wanted
+            .iter()
+            .filter(|w| !baked.contains(w))
+            .cloned()
+            .collect()
+    }
+    (
+        missing(wanted_marketplaces, baked_marketplaces),
+        missing(wanted_plugins, baked_plugins),
+    )
+}
+
+/// Compute which Claude marketplaces and plugins are missing from the
 /// golden image and need to be installed at start time.
 fn compute_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
-    let baked = crate::setup::TemplateConfig::load_for(cfg, image).ok();
+    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
+        .ok()
+        .map(|tc| (tc.marketplaces, tc.plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.claude.marketplaces,
+        &cfg.claude.plugins,
+        &baked_m,
+        &baked_p,
+    )
+}
 
-    let wanted_marketplaces = &cfg.claude.marketplaces;
-    let wanted_plugins = &cfg.claude.plugins;
-
-    match baked {
-        Some(tc) => {
-            let missing_m: Vec<String> = wanted_marketplaces
-                .iter()
-                .filter(|m| !tc.marketplaces.contains(m))
-                .cloned()
-                .collect();
-            let missing_p: Vec<String> = wanted_plugins
-                .iter()
-                .filter(|p| !tc.plugins.contains(p))
-                .cloned()
-                .collect();
-            (missing_m, missing_p)
-        }
-        None => (wanted_marketplaces.clone(), wanted_plugins.clone()),
-    }
+/// Compute which Codex marketplaces and plugins are missing from the
+/// golden image and need to be installed at start time.
+fn compute_codex_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
+    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
+        .ok()
+        .map(|tc| (tc.codex_marketplaces, tc.codex_plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.codex.marketplaces,
+        &cfg.codex.plugins,
+        &baked_m,
+        &baked_p,
+    )
 }
 
 /// Resolve a GitHub token for the guest given the configured auth strategy
@@ -2112,9 +2159,80 @@ fn copy_codex_config(
     local: Option<&toml::Table>,
     manages_local: bool,
 ) -> Result<()> {
-    let staged = stage_codex_files(source_dir, &codex.mcp_servers, local, manages_local)
-        .context("Failed to stage Codex config files")?;
+    // The guest's config.toml holds the Codex CLI's installed `[marketplaces.*]`
+    // / `[plugins.*]` tables. We only need to carry them across a *rewrite* of
+    // that file, so read the guest config only when a rewrite will actually
+    // happen — otherwise the file is left untouched and its state survives on
+    // its own (and we skip a needless SSH round-trip).
+    let preserved =
+        if codex_config_needs_rewrite(source_dir, &codex.mcp_servers, local, manages_local) {
+            read_codex_plugin_state(target)
+        } else {
+            None
+        };
+
+    let staged = stage_codex_files(
+        source_dir,
+        &codex.mcp_servers,
+        local,
+        manages_local,
+        preserved.as_ref(),
+    )
+    .context("Failed to stage Codex config files")?;
     copy_staged_to_guest(target, &staged, ".codex", "Codex")
+}
+
+/// Read the guest's installed Codex marketplace/plugin tables for
+/// preservation across a config.toml rewrite. Warns — rather than silently
+/// proceeding — when the file is present but the read or parse fails, since
+/// the impending rewrite would otherwise drop those tables without a trace.
+/// Mirrors `merge_managed_claude_settings`'s warn-on-corrupt handling of
+/// `~/.claude/settings.json`. A missing/empty file is the normal first-boot
+/// case and yields `None` quietly.
+fn read_codex_plugin_state(target: &SshTarget) -> Option<toml::Table> {
+    match target.capture("cat ~/.codex/config.toml 2>/dev/null || true") {
+        Ok(existing) => match extract_codex_plugin_state(&existing) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not parse guest ~/.codex/config.toml to preserve installed \
+                     Codex marketplaces/plugins across the config refresh; they may be \
+                     dropped and need reinstalling: {e:#}"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "Could not read guest ~/.codex/config.toml to preserve installed Codex \
+                 marketplaces/plugins across the config refresh: {e:#}"
+            );
+            None
+        }
+    }
+}
+
+/// Extract the `marketplaces` and `plugins` tables from a guest
+/// `config.toml`. These hold the Codex CLI's installed marketplace
+/// registrations (`[marketplaces.*]`) and per-plugin enabled state
+/// (`[plugins.*]`); coop preserves them verbatim when it rewrites
+/// config.toml so a stop/start does not wipe installed plugins. Returns
+/// `Ok(None)` when the input is empty or carries neither table, and `Err`
+/// when it is present but not valid TOML — so the caller can warn rather than
+/// silently dropping the tables.
+fn extract_codex_plugin_state(config_toml: &str) -> Result<Option<toml::Table>> {
+    let parsed = toml::from_str::<TomlValue>(config_toml)
+        .context("guest ~/.codex/config.toml is not valid TOML")?;
+    let Some(table) = parsed.as_table() else {
+        return Ok(None);
+    };
+    let mut preserved = toml::Table::new();
+    for key in ["marketplaces", "plugins"] {
+        if let Some(value) = table.get(key) {
+            preserved.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok((!preserved.is_empty()).then_some(preserved))
 }
 
 fn resolve_config_source_dir(
@@ -2205,11 +2323,29 @@ const CODEX_ALLOWED_DIRS: &[&str] = &["prompts"];
 /// Codex config file merged with managed MCP servers rather than copied verbatim.
 const CODEX_CONFIG_FILE: &str = "config.toml";
 
+/// Whether coop will rewrite the guest `~/.codex/config.toml` on this boot:
+/// true when the host supplies a `config.toml` base, when managed
+/// `mcp_servers` must be merged, or when a local-model block is being written
+/// or dropped (`manages_local`). When false the guest file is left untouched,
+/// so its installed plugin tables survive without coop round-tripping them.
+fn codex_config_needs_rewrite(
+    source_dir: Option<&Path>,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+    local: Option<&toml::Table>,
+    manages_local: bool,
+) -> bool {
+    source_dir.is_some_and(|path| path.join(CODEX_CONFIG_FILE).is_file())
+        || !mcp_servers.is_empty()
+        || local.is_some()
+        || manages_local
+}
+
 fn stage_codex_files(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
     local: Option<&toml::Table>,
     manages_local: bool,
+    preserved: Option<&toml::Table>,
 ) -> Result<tempfile::TempDir> {
     let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
 
@@ -2265,12 +2401,36 @@ fn stage_codex_files(
         }
     }
 
+    // The Codex CLI records installed marketplaces under `[marketplaces.*]`
+    // and per-plugin enabled state under `[plugins.*]` in config.toml. Since
+    // this rewrite would otherwise clobber them on every stop/start, drop any
+    // `marketplaces`/`plugins` carried in from the *host* base (host-side
+    // Codex state must not leak into the guest) and overlay the guest's own
+    // tables read back in `copy_codex_config`. This mirrors the guest-side
+    // `merge_managed_claude_settings` preservation of `enabledPlugins` /
+    // `extraKnownMarketplaces`.
+    {
+        let TomlValue::Table(root) = &mut config else {
+            bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
+        };
+        root.remove("marketplaces");
+        root.remove("plugins");
+        if let Some(preserved) = preserved {
+            for (key, value) in preserved {
+                root.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     // `manages_local` forces a rewrite even with no other content so that
     // switching back to remote drops a previously-written provider block.
-    let should_write_config = source_dir.is_some_and(|path| path.join(CODEX_CONFIG_FILE).is_file())
-        || !mcp_servers.is_empty()
-        || local.is_some()
-        || manages_local;
+    // `preserved` alone does not force a write: when nothing else triggers a
+    // rewrite the guest's config.toml is left untouched, so its plugin state
+    // survives without coop having to round-trip it. This must stay in sync
+    // with the gate in `copy_codex_config` that decides whether to read the
+    // guest config at all — hence the shared predicate.
+    let should_write_config =
+        codex_config_needs_rewrite(source_dir, mcp_servers, local, manages_local);
 
     if should_write_config {
         std::fs::write(
@@ -2295,8 +2455,9 @@ fn codex_source_has_bootstrap_content(source_dir: Option<&Path>) -> bool {
 fn codex_bootstrap_needed(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+    has_plugins: bool,
 ) -> bool {
-    codex_source_has_bootstrap_content(source_dir) || !mcp_servers.is_empty()
+    codex_source_has_bootstrap_content(source_dir) || !mcp_servers.is_empty() || has_plugins
 }
 
 fn resolve_codex_mcp_servers(
@@ -2337,45 +2498,63 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 const GUEST_MARKETPLACE_DIR: &str = "~/.coop/marketplaces";
 
+/// Resolve a marketplace source for a guest `plugin marketplace add`.
+///
+/// A local absolute directory is copied into the guest's marketplace dir
+/// and its guest-side path is returned; a URL / GitHub slug / `owner/repo`
+/// shorthand is passed through unchanged. `made_dir` tracks whether the
+/// guest marketplace dir has been created yet so it is only `mkdir -p`'d
+/// once per install pass. Shared by the Claude and Codex marketplace
+/// installers; `tool` (`"claude"` / `"codex"`) namespaces the copy dir so two
+/// local marketplaces with the same directory basename — one per agent — do
+/// not overwrite each other in the guest.
+fn stage_marketplace_source(
+    session: &SshSession,
+    tool: &str,
+    source: &str,
+    made_dir: &mut bool,
+) -> Result<String> {
+    let local_path = Path::new(source);
+    if !(local_path.is_absolute() && local_path.is_dir()) {
+        return Ok(source.to_string());
+    }
+
+    let tool_dir = format!("{GUEST_MARKETPLACE_DIR}/{tool}");
+    if !*made_dir {
+        session
+            .target
+            .exec(RemoteCommand::new().literal(format!("mkdir -p {tool_dir}")))?;
+        *made_dir = true;
+    }
+    let dir_name = local_path
+        .file_name()
+        .context("marketplace path has no directory name")?
+        .to_string_lossy();
+    let remote = GuestPath::new(format!("{tool_dir}/{dir_name}"));
+    tracing::info!(
+        "Copying local marketplace to guest: {} -> {remote}",
+        local_path.display()
+    );
+    session
+        .target
+        .scp_to_recursive(&HostPath::from(local_path), &remote)
+        .with_context(|| {
+            format!(
+                "Failed to copy marketplace '{}' to guest",
+                local_path.display()
+            )
+        })?;
+    Ok(remote.to_string())
+}
+
 pub(crate) fn install_marketplaces(
     session: &SshSession,
     claude_bin: &GuestPath,
     marketplaces: &[String],
 ) -> Result<()> {
-    let mut has_local = false;
-
+    let mut made_dir = false;
     for source in marketplaces {
-        let local_path = Path::new(source);
-        let guest_source = if local_path.is_absolute() && local_path.is_dir() {
-            if !has_local {
-                session.target.exec(
-                    RemoteCommand::new().literal(format!("mkdir -p {GUEST_MARKETPLACE_DIR}")),
-                )?;
-                has_local = true;
-            }
-            let dir_name = local_path
-                .file_name()
-                .context("marketplace path has no directory name")?
-                .to_string_lossy();
-            let remote = GuestPath::new(format!("{GUEST_MARKETPLACE_DIR}/{dir_name}"));
-            tracing::info!(
-                "Copying local marketplace to guest: {} -> {remote}",
-                local_path.display()
-            );
-            session
-                .target
-                .scp_to_recursive(&HostPath::from(local_path), &remote)
-                .with_context(|| {
-                    format!(
-                        "Failed to copy marketplace '{}' to guest",
-                        local_path.display()
-                    )
-                })?;
-            remote.to_string()
-        } else {
-            source.clone()
-        };
-
+        let guest_source = stage_marketplace_source(session, "claude", source, &mut made_dir)?;
         tracing::info!("Adding marketplace: {guest_source}");
         let cmd = RemoteCommand::new()
             .arg(claude_bin)
@@ -2404,6 +2583,55 @@ pub(crate) fn install_plugins(
         session
             .exec(cmd)
             .with_context(|| format!("Failed to install plugin '{plugin}'"))?;
+    }
+    Ok(())
+}
+
+/// Register Codex marketplaces via `codex plugin marketplace add`.
+///
+/// Unlike Claude's `claude plugin marketplace add`, the Codex CLI takes
+/// no `--scope` flag; the registration is written to `~/.codex/config.toml`
+/// under `[marketplaces.<name>]`. Local directories are copied into the
+/// guest first, mirroring [`install_marketplaces`].
+pub(crate) fn install_codex_marketplaces(
+    session: &SshSession,
+    codex_bin: &GuestPath,
+    marketplaces: &[String],
+) -> Result<()> {
+    let mut made_dir = false;
+    for source in marketplaces {
+        let guest_source = stage_marketplace_source(session, "codex", source, &mut made_dir)?;
+        tracing::info!("Adding Codex marketplace: {guest_source}");
+        let cmd = RemoteCommand::new()
+            .arg(codex_bin)
+            .literal(" plugin marketplace add ")
+            .arg(&guest_source);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to add Codex marketplace '{source}'"))?;
+    }
+    Ok(())
+}
+
+/// Install Codex plugins via `codex plugin add <plugin[@marketplace]>`.
+///
+/// The subcommand is `add` (not `install`, as for Claude), and there is
+/// no `-s user` scope flag; enabled state is recorded in
+/// `~/.codex/config.toml` under `[plugins.<name>]`.
+pub(crate) fn install_codex_plugins(
+    session: &SshSession,
+    codex_bin: &GuestPath,
+    plugins: &[String],
+) -> Result<()> {
+    for plugin in plugins {
+        tracing::info!("Installing Codex plugin: {plugin}");
+        let cmd = RemoteCommand::new()
+            .arg(codex_bin)
+            .literal(" plugin add ")
+            .arg(plugin);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to install Codex plugin '{plugin}'"))?;
     }
     Ok(())
 }
@@ -3152,7 +3380,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             },
         );
 
-        let staging = stage_codex_files(Some(src.path()), &servers, None, false).unwrap();
+        let staging = stage_codex_files(Some(src.path()), &servers, None, false, None).unwrap();
         assert!(staging.path().join("AGENTS.md").is_file());
 
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -3182,7 +3410,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             },
         );
 
-        let staging = stage_codex_files(Some(src.path()), &servers, None, false).unwrap();
+        let staging = stage_codex_files(Some(src.path()), &servers, None, false, None).unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
 
         assert!(config.contains("model = \"gpt-5\""));
@@ -3203,6 +3431,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             &std::collections::HashMap::new(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3219,8 +3448,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             "http://host.lima.internal:11434/v1/",
             "gpt-oss:120b",
         );
-        let staging =
-            stage_codex_files(None, &std::collections::HashMap::new(), Some(&local), true).unwrap();
+        let staging = stage_codex_files(
+            None,
+            &std::collections::HashMap::new(),
+            Some(&local),
+            true,
+            None,
+        )
+        .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
         assert!(config.contains("model_provider = \"coop_local\""));
         assert!(config.contains("wire_api = \"responses\""));
@@ -3238,6 +3473,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             &std::collections::HashMap::new(),
             Some(&local),
             true,
+            None,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -3253,7 +3489,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Switching back to remote: no local table, but `manages_local`
         // forces a clean rewrite that omits the provider block.
         let staging =
-            stage_codex_files(None, &std::collections::HashMap::new(), None, true).unwrap();
+            stage_codex_files(None, &std::collections::HashMap::new(), None, true, None).unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
         assert!(
             !config.contains("coop_local"),
@@ -3266,11 +3502,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let src = tempfile::TempDir::new().unwrap();
         assert!(!codex_bootstrap_needed(
             Some(src.path()),
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            false
         ));
         assert!(!codex_bootstrap_needed(
             None,
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            false
         ));
     }
 
@@ -3281,8 +3519,167 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
         assert!(codex_bootstrap_needed(
             Some(src.path()),
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            false
         ));
+    }
+
+    #[test]
+    fn codex_bootstrap_needed_is_true_with_plugins() {
+        // No source content and no MCP servers, but configured plugins alone
+        // must still trigger bootstrap so the FirstBoot install runs.
+        assert!(codex_bootstrap_needed(
+            None,
+            &std::collections::HashMap::new(),
+            true
+        ));
+    }
+
+    #[test]
+    fn extract_codex_plugin_state_round_trips_tables() {
+        let guest = "model = \"gpt-5\"\n\
+             \n\
+             [marketplaces.mine]\n\
+             source = \"trailofbits/codex-plugins\"\n\
+             \n\
+             [plugins.my-lsp]\n\
+             enabled = true\n";
+        let state = extract_codex_plugin_state(guest).unwrap().unwrap();
+        assert!(state.contains_key("marketplaces"));
+        assert!(state.contains_key("plugins"));
+        // Only the two plugin tables are preserved, not unrelated keys.
+        assert!(!state.contains_key("model"));
+    }
+
+    #[test]
+    fn extract_codex_plugin_state_none_when_absent_or_empty() {
+        assert!(extract_codex_plugin_state("").unwrap().is_none());
+        assert!(
+            extract_codex_plugin_state("model = \"gpt-5\"\n")
+                .unwrap()
+                .is_none()
+        );
+        // Present-but-invalid TOML is an error (so the caller can warn),
+        // not a silent None that would drop installed plugin state.
+        assert!(extract_codex_plugin_state("not = = valid").is_err());
+    }
+
+    #[test]
+    fn stage_codex_files_preserves_guest_plugin_state() {
+        // A host config.toml triggers a rewrite; the guest's installed
+        // marketplace/plugin tables must survive it.
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let preserved = extract_codex_plugin_state(
+            "[marketplaces.mine]\nsource = \"trailofbits/codex-plugins\"\n\
+             \n[plugins.my-lsp]\nenabled = true\n",
+        )
+        .unwrap()
+        .unwrap();
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            Some(&preserved),
+        )
+        .unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(config.contains("[marketplaces.mine]"), "got: {config}");
+        assert!(config.contains("[plugins.my-lsp]"), "got: {config}");
+        assert!(config.contains("model = \"gpt-5\""));
+    }
+
+    #[test]
+    fn stage_codex_files_drops_host_base_plugin_state() {
+        // Host config.toml carries its own marketplace/plugin tables (the user
+        // runs Codex on the host too); with nothing preserved these must NOT
+        // leak into the guest.
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("config.toml"),
+            "model = \"gpt-5\"\n\
+             \n[marketplaces.host-only]\nsource = \"someone/else\"\n\
+             \n[plugins.host-plugin]\nenabled = true\n",
+        )
+        .unwrap();
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(config.contains("model = \"gpt-5\""));
+        assert!(
+            !config.contains("host-only"),
+            "host marketplace leaked: {config}"
+        );
+        assert!(
+            !config.contains("host-plugin"),
+            "host plugin leaked: {config}"
+        );
+    }
+
+    #[test]
+    fn plugin_delta_returns_wanted_minus_baked() {
+        let wanted_m = vec!["a".to_string(), "b".to_string()];
+        let wanted_p = vec!["p1@a".to_string(), "p2@b".to_string()];
+        let (missing_m, missing_p) = plugin_delta(
+            &wanted_m,
+            &wanted_p,
+            &["a".to_string()],
+            &["p1@a".to_string()],
+        );
+        assert_eq!(missing_m, vec!["b".to_string()]);
+        assert_eq!(missing_p, vec!["p2@b".to_string()]);
+
+        // Empty baked (legacy/orphaned image): everything wanted is missing.
+        let (all_m, all_p) = plugin_delta(&wanted_m, &wanted_p, &[], &[]);
+        assert_eq!(all_m, wanted_m);
+        assert_eq!(all_p, wanted_p);
+    }
+
+    #[test]
+    fn compute_codex_plugin_delta_reads_codex_fields_not_claude() {
+        // Pins the field wiring: the Codex delta must diff cfg.codex.* against
+        // the template's codex_* lists, ignoring the Claude marketplaces/plugins
+        // (backend.rs is mutation-excluded, so a copy-paste slip to a Claude
+        // field would otherwise go uncaught).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(tmp.path()),
+            ..CoopConfig::default()
+        };
+        cfg.codex.marketplaces = vec!["m-baked".into(), "m-new".into()];
+        cfg.codex.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
+        let image = ImageName::new("default").unwrap();
+
+        // Bake one of each Codex entry — plus decoy Claude entries that must be
+        // ignored — into the on-disk template config.
+        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        let json = r#"{
+            "version": 1,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null,
+            "marketplaces": ["m-new"],
+            "plugins": ["p-new@m"],
+            "codex_marketplaces": ["m-baked"],
+            "codex_plugins": ["p-baked@m"]
+        }"#;
+        std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
+
+        let (missing_m, missing_p) = compute_codex_plugin_delta(&cfg, &image);
+        // Only the non-baked Codex entries remain. If the delta read the Claude
+        // `marketplaces`/`plugins` (which bake "m-new"/"p-new@m"), those would
+        // be filtered out and the assertion would fail.
+        assert_eq!(missing_m, vec!["m-new".to_string()]);
+        assert_eq!(missing_p, vec!["p-new@m".to_string()]);
     }
 
     #[test]
