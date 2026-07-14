@@ -3602,9 +3602,12 @@ CFGEOF
 
     GUEST_INSTANCE="$mp_instance"
 
-    # Verify the marketplace directory was copied to the guest.
-    # Use $HOME explicitly — tilde would expand on the test host, not the guest.
-    local mp_base="\$HOME/.coop/marketplaces/$mp_name"
+    # Verify the marketplace directory was copied to the guest. Local
+    # marketplaces are copied into a per-tool subdir (`claude/` here, since this
+    # is a `[claude]` marketplace) so the two agents' same-named marketplaces
+    # cannot collide. Use $HOME explicitly — tilde would expand on the test
+    # host, not the guest.
+    local mp_base="\$HOME/.coop/marketplaces/claude/$mp_name"
 
     local manifest
     manifest=$(guest_exec sh -c "cat $mp_base/.claude-plugin/marketplace.json" \
@@ -3659,7 +3662,7 @@ CFGEOF
             fail "claude plugin marketplace add was invoked" "log: '$claude_log'"
         fi
 
-        if echo "$claude_log" | grep -q "coop/marketplaces/$mp_name"; then
+        if echo "$claude_log" | grep -q "coop/marketplaces/claude/$mp_name"; then
             pass "marketplace add uses guest path (not host path)"
         else
             fail "marketplace add uses guest path (not host path)" "log: '$claude_log'"
