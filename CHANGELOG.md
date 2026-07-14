@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## v0.5.4
+
+### New features
+
+- **`coop agent update` — refresh in-guest Claude Code and Codex** (#403) —
+  Agents are installed "latest at build time" during `coop setup` and are not
+  part of the image-staleness hash, so a plain `coop setup` never refreshes
+  them; they go stale in long-running VMs and in new VMs built from an old
+  image. `coop agent update [NAME] [--claude] [--codex] [--check] [-y]` updates
+  the agent binaries inside a *running* instance without rebuilding the golden
+  image. No agent flag updates both; `--check` reports installed vs. latest and
+  changes nothing. Codex (root-owned `/usr/local/bin/codex`, no background
+  updater) is reinstalled from the current release via coop's own installer
+  over SSH; Claude Code (`~/.local/bin`, already self-updating) runs
+  `claude update` synchronously. Versions are parsed to semver so "update
+  available" is a comparison, not a string diff; an unparseable version
+  degrades to `Unknown` rather than erroring.
+
+- **Codex plugins and marketplaces** (#407) — New `[codex] marketplaces` /
+  `[codex] plugins` config fields (with `~` expansion and local-path
+  validation), mirroring the existing Claude Code mechanism. On Lima the set is
+  baked into the golden image and staleness-checked; on Firecracker it installs
+  on first boot. coop preserves the guest's own `[marketplaces.*]`/`[plugins.*]`
+  tables across the per-boot `~/.codex/config.toml` rewrite — so plugins
+  installed in-guest and manual `/plugins` toggles survive stop/start — while
+  dropping any that came from the host config. Local marketplace directories
+  are copied into a per-tool guest subdir so same-basename marketplaces from
+  the two agents don't collide. Behavior change: marketplaces/plugins set
+  directly in the host `~/.codex/config.toml` (rather than in coop's `[codex]`)
+  are now stripped from the guest; declarative `[codex]` is the source of
+  truth.
 
 ### Fixes
 
