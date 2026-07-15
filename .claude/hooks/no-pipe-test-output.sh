@@ -2,25 +2,31 @@
 set -euo pipefail
 
 INPUT=$(cat)
-COMMAND=$(jq -r '.tool_input.command // .tool_input.cmd // .command // .cmd // empty' <<<"$INPUT")
+COMMAND=$(jq -r '.tool_input.command // .tool_input.cmd // .command // .cmd // empty' <<<"$INPUT" 2>/dev/null || true)
 
 if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Expensive commands in this project: the cargo quality gates, mutation and
-# fuzzing sweeps, and the integration-test scripts. \b handles subcommand
-# suffixes like `cargo test --lib` and `./tests/run-integration.sh --remote`.
-EXPENSIVE='\b(cargo (test|clippy|mutants|build)|cargo \+nightly fuzz|cargo kani|tests/(run-)?integration([a-z-]*)\.sh)\b'
+# Expensive commands: the cargo quality gates, mutation/fuzz/kani sweeps, and
+# the integration-test scripts. Anchored to a command position (start of line
+# or after a `;`/`&`/`|` separator) so a cargo/tests string quoted inside a
+# `grep`/`echo` argument is not mistaken for the command being run. Flexible
+# whitespace and an optional `+toolchain` prefix catch `cargo   test` and
+# `cargo +nightly test`. POSIX classes only (`[[:space:]]`, no `\s`/`\b`) so it
+# behaves the same under GNU and BSD/macOS grep.
+EXPENSIVE='(^|[;&|][[:space:]]*)(cargo[[:space:]]+(\+[^[:space:]]+[[:space:]]+)?(test|clippy|mutants|build|fuzz|kani)|(\./)?tests/(run-)?integration[a-z-]*\.sh)'
 
-# Filters that indicate the command output is being searched rather than
-# inspected as a whole.
-FILTERS='\|\s*(grep|rg|head|tail|awk|sed)\b'
+# A pipe (optionally `|&`) into a tool that inspects part of the output —
+# i.e. the output is being searched, not viewed whole.
+FILTERS='\|&?[[:space:]]*(grep|rg|head|tail|awk|sed)'
 
-if echo "$COMMAND" | grep -qE "$EXPENSIVE" \
-  && echo "$COMMAND" | grep -qE "$FILTERS"; then
-  tmpdir=${TMPDIR:-/tmp}
-  OUTFILE=$(mktemp "${tmpdir%/}/test-output.XXXXXX")
+if printf '%s' "$COMMAND" | grep -qE "$EXPENSIVE" \
+  && printf '%s' "$COMMAND" | grep -qE "$FILTERS"; then
+  # Suggest a path without creating the file: the command is about to be
+  # blocked, so nothing writes here, and a failed `mktemp` under `set -e` would
+  # abort the hook with exit 1 (allow) instead of the intended exit 2 (block).
+  OUTFILE="${TMPDIR:-/tmp}/test-output.$$"
 
   cat >&2 <<EOF
 Do not pipe this output through grep/rg/head/tail/awk/sed — it forces the

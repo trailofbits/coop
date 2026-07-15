@@ -18,12 +18,13 @@ set -euo pipefail
 # git repo is allowed through, so the gate never wedges unrelated work.
 
 INPUT=$(cat)
-COMMAND=$(jq -r '.tool_input.command // .tool_input.cmd // .command // .cmd // empty' <<<"$INPUT")
+COMMAND=$(jq -r '.tool_input.command // .tool_input.cmd // .command // .cmd // empty' <<<"$INPUT" 2>/dev/null || true)
 
 [ -z "$COMMAND" ] && exit 0
 
 # Only gate PR creation. `pr create` is contiguous (subcommand follows `pr`).
-echo "$COMMAND" | grep -qE '\bgh[[:space:]]+pr[[:space:]]+create\b' || exit 0
+# POSIX anchors (no `\b`) so detection behaves the same under GNU and BSD grep.
+printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)' || exit 0
 
 # Locate the directory the command actually runs git/gh in: an explicit
 # `cd <dir> && ...` prefix wins, else the cwd the hook was invoked with.
@@ -32,8 +33,13 @@ if [[ "$COMMAND" =~ ^[[:space:]]*cd[[:space:]]+([^[:space:]\&\;\|]+) ]]; then
   WORKDIR="${BASH_REMATCH[1]}"
   WORKDIR="${WORKDIR%[\"\']}"
   WORKDIR="${WORKDIR#[\"\']}"
+  # A `cd` target we can't resolve — unexpanded `~`/`$VAR`, or a path truncated
+  # at its first space — must NOT suppress the fallbacks below, or the gate
+  # fails open on idiomatic `cd ~/wt && gh pr create`. Drop it and let the
+  # hook-provided cwd / $PWD decide.
+  [ -d "$WORKDIR" ] || WORKDIR=""
 fi
-[ -z "$WORKDIR" ] && WORKDIR=$(jq -r '.cwd // empty' <<<"$INPUT")
+[ -z "$WORKDIR" ] && WORKDIR=$(jq -r '.cwd // empty' <<<"$INPUT" 2>/dev/null || true)
 [ -z "$WORKDIR" ] && WORKDIR="$PWD"
 [ -d "$WORKDIR" ] || exit 0
 
@@ -77,6 +83,10 @@ head_flag_value() {
         ;;
       -H=*)
         printf '%s' "${tok#-H=}"
+        return
+        ;;
+      -H?*)
+        printf '%s' "${tok#-H}"
         return
         ;;
     esac

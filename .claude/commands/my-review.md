@@ -21,14 +21,22 @@ Design goals:
 
 ## 0. Determine the diff
 
-Resolve the base ref from `gh pr view <n> --json baseRefName` and `git fetch
-origin <base>` if its tip isn't local. The diff range is `<base>...HEAD`.
+With a PR (CI, or a branch that has one): resolve the base ref from `gh pr view
+<n> --json baseRefName` and `git fetch origin <base>` if its tip isn't local.
+The diff range is `<base>...HEAD`.
 
 ```bash
 gh pr view <n> --json number,baseRefName,headRefOid,title,url
 git fetch origin <base> --quiet
 git diff --stat <base>...HEAD
 ```
+
+Invoked locally with **no PR** (e.g. from the `closeout-review` skill on
+uncommitted work): there is no PR number to query. Take the base as the current
+branch's PR base if one exists, else `origin/main`, and review the working diff
+— `git diff` (and `git diff --staged`) for uncommitted work, or `<base>...HEAD`
+for a committed branch. Don't post inline comments in this mode; the caller
+resolves findings locally. The rest of this command is unchanged.
 
 If the diff is empty, stop.
 
