@@ -42,6 +42,10 @@ VMs on macOS — to run coding agents such as Claude Code and Codex. **The
 security boundary is the VM.** coop's job is to stand that boundary up and hand
 work to it without weakening it.
 
+This policy is the disclosure process. The engineering-facing trust boundaries,
+taint sources, and invariants that define what "weakening the boundary" means
+live in [`docs/trust-model.md`](docs/trust-model.md).
+
 In scope:
 
 - Flaws in coop that weaken or escape the VM isolation boundary.
@@ -59,7 +63,9 @@ Out of scope:
   the raw iptables table, another host on the guest's network could reach a
   published container port, even one bound to loopback. The guest's only network
   neighbor is its own Firecracker host, and the VM is the isolation boundary, so
-  this crosses no trust boundary. See `CLAUDE.md` for details.
+  this crosses no trust boundary. See
+  [`docs/platform-notes.md`](docs/platform-notes.md) and
+  [`docs/trust-model.md`](docs/trust-model.md) for details.
 - Vulnerabilities in the software coop runs or orchestrates rather than ships —
   the guest agents (Claude Code, Codex), Docker, the guest OS, Firecracker, and
   Lima. Report those to their respective projects.

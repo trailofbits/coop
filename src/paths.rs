@@ -4,7 +4,7 @@
 //! distinguish source from destination by type rather than by argument
 //! order. `GuestPath` additionally carries the SFTP-friendly `./...`
 //! vs. absolute `/...` distinction that prevents the OpenSSH 9+
-//! tilde-expansion gotcha (see CLAUDE.md).
+//! tilde-expansion gotcha (see docs/platform-notes.md).
 
 use std::path::{Path, PathBuf};
 
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn new_accepts_relative_dot_slash() {
         // Permissive constructor: `./...` is intentional (SFTP tilde
-        // expansion gotcha, see CLAUDE.md).
+        // expansion gotcha, see docs/platform-notes.md).
         let p = GuestPath::new("./.claude");
         assert_eq!(p.to_string(), "./.claude");
     }

@@ -48,7 +48,7 @@ DNSEOF
 # Firecracker CI kernel lacks CONFIG_IP_NF_RAW (iptable_raw module). Docker 28+
 # requires the raw table for bridge networking. This env var tells Docker to skip
 # raw table rules. The "insecure" label is irrelevant here — the VM's only
-# network neighbor is the Firecracker host. See CLAUDE.md for full context.
+# network neighbor is the Firecracker host. See docs/platform-notes.md for full context.
 # Lima does NOT need this — its kernel has the raw table module.
 echo '  [guest] Configuring Docker daemon...'
 mkdir -p /etc/docker

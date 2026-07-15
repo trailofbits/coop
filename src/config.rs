@@ -2596,7 +2596,7 @@ fn default_firecracker_bin() -> ConfigPath {
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
 /// `clippy` never compile them. Run manually with `cargo kani`; see the
-/// "Formal verification" section in `CLAUDE.md`.
+/// "Formal verification (kani)" section in `docs/testing.md`.
 ///
 /// Kani is a narrow fit in a string-heavy CLI — the type system carries
 /// most invariants here. These proofs target the only genuine fit:

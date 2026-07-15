@@ -474,7 +474,7 @@ Lower demand; wrap only when reached. Shapes:
 
 ## Testing
 
-Follow `CLAUDE.md`'s testing and mutation-testing rules.
+Follow the testing and mutation-testing rules in [`testing.md`](testing.md).
 
 ### Unit tests — assert the serialized shape
 
@@ -496,8 +496,8 @@ Also test the pure projections you add — e.g. `BackendKind::of`,
 
 ### Mutation testing — keep `.cargo/mutants.toml` in sync **in the same PR**
 
-`CLAUDE.md` is emphatic about this (see the `coop model` #352 regression). When
-you add these functions:
+[`testing.md`](testing.md) is emphatic about this (see the `coop model` #352
+regression). When you add these functions:
 
 - **`render_json`** and any handler branch that writes JSON to stdout are **IO** —
   add an `exclude_re` entry (they only write stdout; a `--lib` test cannot observe
@@ -510,7 +510,7 @@ you add these functions:
   guard them.
 
 Verify with `cargo mutants -f <touched files> -- --lib` (full-file sweep, not
-just `--in-diff`), per `CLAUDE.md`.
+just `--in-diff`), per [`testing.md`](testing.md).
 
 ### Integration test
 

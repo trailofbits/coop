@@ -1593,7 +1593,7 @@ chown "{user}:{user}" /workspace
 
 # No iptables-legacy or NO_IPTABLES_RAW needed — Lima uses a full kernel with
 # nftables and iptable_raw support. These workarounds are Firecracker-only
-# (see scripts/guest/guest-config.sh and CLAUDE.md).
+# (see scripts/guest/guest-config.sh and docs/platform-notes.md).
 
 echo '  [guest] Enabling services...'
 systemctl enable docker ssh

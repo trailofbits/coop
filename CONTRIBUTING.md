@@ -104,7 +104,7 @@ coop also carries mutation tests (`cargo-mutants`), fuzz targets
 (`cargo-fuzz`), and formal proofs (`kani`). These are manual quality checks,
 not required for every change. If you touch a logic-dense module — config
 parsing, the JSONC reader, the arithmetic kernels — see
-[CLAUDE.md](CLAUDE.md) for when and how to run them.
+[docs/testing.md](docs/testing.md) for when and how to run them.
 
 ## Code style
 
@@ -119,8 +119,8 @@ parsing, the JSONC reader, the arithmetic kernels — see
 - Log with `tracing` (`error!`/`warn!`/`info!`/`debug!`), not `println!`.
   Tracing output goes to stderr.
 
-[CLAUDE.md](CLAUDE.md) documents the project's conventions in detail, including
-the Rust patterns reviewers look for.
+[docs/code-style.md](docs/code-style.md) documents the project's conventions in
+detail, including the Rust patterns reviewers look for.
 
 ## Commits
 
