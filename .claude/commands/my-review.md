@@ -119,7 +119,11 @@ one pass:
    consensus.
 4. **Cross-reference prior feedback** — drop findings duplicating resolved
    comments; add unresolved comments agents missed.
-5. For `review-api-usage` claims, confirm the cited doc URL is current.
+5. For `review-api-usage` claims, confirm the cited doc URL is current when web
+   access is available. The `claude-review` CI workflow withholds `WebFetch`/
+   `WebSearch` (they'd be an exfiltration channel for the untrusted diff), so in
+   CI skip this check and phrase the finding as unverified against upstream docs
+   rather than asserting the URL was confirmed.
 
 Separate surviving findings into substantive vs. `category: "Diff noise"`.
 

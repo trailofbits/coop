@@ -1,6 +1,6 @@
 ---
 description: Single-pass PR shepherding — watch CI, fix failures, address review comments, keep the branch up to date with its base.
-allowed-tools: Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh api graphql:*), Bash(gh api repos:*), Bash(gh run list:*), Bash(gh run view:*), Bash(git fetch:*), Bash(git log:*), Bash(git status:*), Bash(git rev-list:*), Bash(git rev-parse:*), Bash(git diff:*), Bash(git add:*), Bash(git commit:*), Bash(git push:*), Bash(git merge:*), Bash(cargo fmt:*), Bash(cargo clippy:*), Bash(cargo test:*), Bash(cargo check:*), Bash(taplo format:*)
+allowed-tools: Read, Edit, Write, Grep, Glob, Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh pr comment:*), Bash(gh api graphql:*), Bash(gh api repos:*), Bash(gh run list:*), Bash(gh run view:*), Bash(git fetch:*), Bash(git log:*), Bash(git status:*), Bash(git rev-list:*), Bash(git rev-parse:*), Bash(git diff:*), Bash(git add:*), Bash(git commit:*), Bash(git push:*), Bash(git merge:*), Bash(cargo fmt:*), Bash(cargo clippy:*), Bash(cargo test:*), Bash(cargo check:*), Bash(taplo format:*)
 ---
 
 ## What this does

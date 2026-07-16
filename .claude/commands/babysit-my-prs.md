@@ -1,6 +1,6 @@
 ---
 description: Continuously babysit my open PRs — 7-min loop, auto-discovers new PRs, dispatches one background worker per PR needing work.
-allowed-tools: Bash(gh auth status:*), Bash(gh api user:*), Bash(gh repo view:*), Bash(gh search prs:*), Bash(gh pr view:*), Bash(gh api graphql:*), Bash(gh api repos:*), Bash(gh run list:*), Bash(git remote:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git worktree:*), Bash(mkdir:*), Bash(ls:*), Bash(stat:*), Bash(date:*), Bash(find:*), Bash(head:*), Bash(echo:*)
+allowed-tools: Agent, CronCreate, CronList, CronDelete, TaskCreate, TaskUpdate, TaskList, Bash(gh auth status:*), Bash(gh api user:*), Bash(gh repo view:*), Bash(gh search prs:*), Bash(gh pr view:*), Bash(gh api graphql:*), Bash(gh api repos:*), Bash(gh run list:*), Bash(git remote:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git worktree:*), Bash(mkdir:*), Bash(ls:*), Bash(stat:*), Bash(date:*), Bash(find:*), Bash(head:*), Bash(echo:*)
 ---
 
 ## What this does
@@ -26,6 +26,8 @@ This wraps `/babysit-pr` (single PR). It NEVER rewrites published history, never
 - gh is authed: !`gh auth status 2>&1 | head -3`
 - in a git repo: !`git rev-parse --show-toplevel 2>/dev/null || echo "MISSING — not a git repo"`
 - origin points to GitHub: !`git remote get-url origin 2>/dev/null || echo "MISSING — no origin remote"`
+
+This command's orchestration depends on the harness providing the `CronCreate`/`CronList`/`CronDelete`, `TaskCreate`/`TaskUpdate`/`TaskList`, and background `Agent` primitives (all listed in `allowed-tools`). If your Claude Code install doesn't expose scheduled crons or background tasks, this command can't run — use `/babysit-pr` per PR instead.
 
 If any fail, stop and tell the user. Derive once and reuse:
 
