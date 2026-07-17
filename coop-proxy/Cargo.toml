@@ -1,0 +1,70 @@
+[package]
+name = "coop-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side credential-injecting reverse proxy for coop"
+
+[[bin]]
+name = "coop-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "macros",
+  "signal",
+  "time",
+] }
+hyper = { version = "1", default-features = false, features = [
+  "http1",
+  "http2",
+  "server",
+  "client",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+  "tokio",
+  "server",
+  "client-legacy",
+  "http1",
+  "http2",
+] }
+http-body-util = { version = "0.1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "tls12",
+] }
+# Crypto provider: aws-lc-rs (rustls's default, FIPS-capable — the design's
+# recommendation, §13). Its `aws-lc-sys` C backend builds with cmake + a
+# native musl compiler; the release workflow builds every target on a
+# matching-arch runner (no cross-compilation), so `musl-gcc` compiles it
+# cleanly for both musl targets.
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "tls12",
+  "aws_lc_rs",
+] }
+# Pinned Mozilla root set compiled into the binary — the two fixed upstreams
+# need no OS trust-store variance, and a pinned root set is smaller surface and
+# deterministic for a security tool.
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "macros",
+  "time",
+  "process",
+] }
+
+[lints]
+workspace = true

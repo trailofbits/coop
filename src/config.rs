@@ -718,6 +718,12 @@ pub struct CoopConfig {
     #[serde(default)]
     pub codex: CodexConfig,
 
+    /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
+    /// upstream is configured, the real credential stays on the host and the
+    /// guest is pointed at a local proxy instead of receiving the key.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
     /// Literal env vars to set in the guest, independent of the host
     /// process environment. Merged with `env_forward` results during
     /// SSH setup; entries here override forwarded values (with a
@@ -1513,6 +1519,56 @@ pub struct CodexConfig {
     pub local_model: Option<LocalModel>,
 }
 
+/// `[proxy]` — host-side credential-injecting proxy (issue #411).
+///
+/// When an upstream is configured, coop runs a `coop-proxy` process on the
+/// host for the lifetime of each remote-mode VM: the guest is pointed at the
+/// proxy (a base-URL override) and holds only a per-instance capability
+/// token, while the real credential stays on the host and is injected onto
+/// outbound requests the guest never sees. Absent config means no proxy —
+/// credentials are forwarded exactly as before.
+///
+/// v1 covers Anthropic (Claude Code); Codex and GitHub are separate slices.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Anthropic (Claude Code) upstream. Its presence enables proxy mode for
+    /// Claude when the VM is in remote model mode.
+    #[serde(default)]
+    pub anthropic: Option<ProxyUpstream>,
+}
+
+impl ProxyConfig {
+    /// Whether any upstream is configured (proxy mode is opt-in).
+    pub fn is_enabled(&self) -> bool {
+        self.anthropic.is_some()
+    }
+}
+
+/// A single proxied upstream: the real credential and how to inject it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyUpstream {
+    /// The real credential (an API key or a Claude `setup-token`), a plain
+    /// value or a `cmd:` indirection resolved via [`resolve_cmd_value`] at
+    /// proxy start — never written to disk, never forwarded into the guest.
+    pub credential: Secret<String>,
+
+    /// How the proxy injects the credential upstream. Defaults to `api_key`
+    /// (`x-api-key`); use `bearer` for a Claude `setup-token`.
+    #[serde(default)]
+    pub auth: ProxyAuthScheme,
+}
+
+/// The header form the proxy injects the real credential as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyAuthScheme {
+    /// `x-api-key: <credential>` — the Anthropic API-key form.
+    #[default]
+    ApiKey,
+    /// `authorization: Bearer <credential>` — a Claude `setup-token`.
+    Bearer,
+}
+
 /// A local (host-side) model endpoint that `coop model <vm> local`
 /// materializes into guest agent config.
 ///
@@ -2267,6 +2323,7 @@ impl Default for CoopConfig {
             setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
             post_start: None,
@@ -3450,6 +3507,51 @@ model = "qwen"
 [codex.local_model]
 host_url = "http://localhost:1234"
 model = ""
+"#;
+        assert!(toml::from_str::<CoopConfig>(toml_str).is_err());
+    }
+
+    #[test]
+    fn proxy_disabled_by_default() {
+        let cfg: CoopConfig = toml::from_str("").unwrap();
+        assert!(!cfg.proxy.is_enabled());
+        assert!(cfg.proxy.anthropic.is_none());
+    }
+
+    #[test]
+    fn proxy_anthropic_parses_and_defaults_to_api_key() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "sk-ant-secret"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.proxy.is_enabled());
+        let up = cfg.proxy.anthropic.unwrap();
+        assert_eq!(up.credential.expose(), "sk-ant-secret");
+        assert_eq!(up.auth, ProxyAuthScheme::ApiKey);
+    }
+
+    #[test]
+    fn proxy_anthropic_parses_bearer_scheme() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "cmd:echo tok"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let up = cfg.proxy.anthropic.unwrap();
+        assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+        // Credential is stored verbatim (the `cmd:` is resolved at proxy
+        // start, not config parse).
+        assert_eq!(up.credential.expose(), "cmd:echo tok");
+    }
+
+    #[test]
+    fn proxy_rejects_unknown_auth_scheme() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "x"
+auth = "basic"
 "#;
         assert!(toml::from_str::<CoopConfig>(toml_str).is_err());
     }

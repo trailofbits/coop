@@ -102,6 +102,22 @@
 # model = "gpt-oss:120b"
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
+# [proxy]                           # Host-side credential-injecting proxy
+#                                   # (issue #411). Opt-in: when set, coop runs
+#                                   # a `coop-proxy` process on the host and the
+#                                   # raw credential never enters the guest —
+#                                   # the guest is pointed at the proxy and gets
+#                                   # only a per-instance capability token, and
+#                                   # ANTHROPIC_API_KEY is no longer forwarded.
+#                                   # Applies only in remote model mode
+#                                   # (`coop model <vm> remote`); local mode
+#                                   # takes precedence. Firecracker-only for now.
+# [proxy.anthropic]
+# credential = "cmd:op read op://Private/Anthropic/credential"  # same "cmd:" support
+# auth = "api_key"                  # api_key → x-api-key (default); bearer →
+#                                   # Authorization: Bearer, for a Claude
+#                                   # `setup-token` (run `claude setup-token`).
+
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]
 # pre_install = "curl -fsSL https://example.com/setup.sh | bash"

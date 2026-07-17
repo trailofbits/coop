@@ -72,6 +72,7 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
+        crate::proxy::stop(inst);
         be.destroy_instance(cfg, inst)?;
         workspace::remove_ssh_config(inst)?;
     }

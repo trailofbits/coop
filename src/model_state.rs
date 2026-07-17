@@ -237,6 +237,25 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
     root
 }
 
+/// The `env` block coop writes into the managed `~/.claude/settings.json`
+/// to point Claude Code at the host-side injecting proxy (issue #411).
+///
+/// Unlike [`claude_env_block`] (local mode), this pins **nothing** about the
+/// model or request shape — proxy mode is transparent, routing real cloud
+/// traffic through the host so the real credential can be injected upstream.
+/// It sets only the base-URL override and the per-instance capability token
+/// (`ANTHROPIC_AUTH_TOKEN`), which Claude Code sends as `Authorization:
+/// Bearer` — the token the proxy verifies before injecting the real key.
+pub fn claude_proxy_env_block(base_url: &str, capability_token: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        capability_token.to_string(),
+    );
+    env
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -459,6 +478,21 @@ mod tests {
         ] {
             assert_eq!(env[tier], "qwen2.5-coder", "tier {tier} not pinned");
         }
+    }
+
+    #[test]
+    fn claude_proxy_env_block_sets_only_base_url_and_token() {
+        // Proxy mode is transparent: it must NOT pin any model tier or touch
+        // cache-buster keys (those are local-mode concerns) — only the base
+        // URL and the capability token.
+        let env = claude_proxy_env_block("http://172.16.0.1:8788", "cap-token");
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "cap-token");
+        assert_eq!(
+            env.len(),
+            2,
+            "proxy env block must set nothing else: {env:?}"
+        );
     }
 
     #[test]

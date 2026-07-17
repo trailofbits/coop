@@ -867,6 +867,12 @@ pub trait VmBackend: std::fmt::Display {
     /// through the TAP gateway (`network.host_ip`); Lima injects
     /// `host.lima.internal`.
     fn guest_host_address(&self, network: &NetworkConfig) -> String;
+    /// The host-side IPv4 address the credential-injecting proxy (issue #411)
+    /// binds — reachable from exactly this backend's guests. `None` when proxy
+    /// mode is not yet supported on the backend. Firecracker binds the bridge
+    /// gateway (`network.host_ip`); Lima has no first-class host-side bind
+    /// address yet (tracked as a spike in the design).
+    fn proxy_bind_ip(&self, network: &NetworkConfig) -> Option<std::net::Ipv4Addr>;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
     fn mounts_are_live(&self) -> bool;
@@ -1106,6 +1112,13 @@ impl VmBackend for FirecrackerBackend {
         network.host_ip.to_string()
     }
 
+    fn proxy_bind_ip(&self, network: &NetworkConfig) -> Option<std::net::Ipv4Addr> {
+        // The guest reaches the host at the bridge gateway IP; the proxy
+        // binds exactly that address (a per-instance port distinguishes
+        // concurrent VMs), reachable from the guests and not the LAN.
+        Some(network.host_ip)
+    }
+
     fn mounts_are_live(&self) -> bool {
         false
     }
@@ -1289,6 +1302,13 @@ impl VmBackend for LimaBackend {
         crate::lima::HOST_GATEWAY.to_string()
     }
 
+    fn proxy_bind_ip(&self, _network: &NetworkConfig) -> Option<std::net::Ipv4Addr> {
+        // No first-class host-side bind address for the Lima guest yet
+        // (issue #411 tracks the spike); proxy mode is Firecracker-only for
+        // now and fails closed with a clear message on Lima.
+        None
+    }
+
     fn mounts_are_live(&self) -> bool {
         true
     }
@@ -1356,13 +1376,19 @@ pub fn detect_instance_repo(
 pub fn prepare_env_forwarding(
     cfg: &CoopConfig,
     repo: Option<&crate::github_repo::RepoSlug>,
+    suppress_anthropic_key: bool,
 ) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let codex = &cfg.codex;
     let mut env = EnvForward::default();
 
-    // ANTHROPIC_API_KEY: prefer config, fall back to process env
-    if let Some(key) = &claude.api_key {
+    // ANTHROPIC_API_KEY: prefer config, fall back to process env.
+    // In proxy mode (issue #411) the raw key must never enter the guest —
+    // the host-side proxy holds it and injects it upstream, so we forward
+    // only the per-instance capability token via settings.json instead.
+    if suppress_anthropic_key {
+        tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
+    } else if let Some(key) = &claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve claude.api_key")?;
         env.set("ANTHROPIC_API_KEY", resolved);
@@ -1435,6 +1461,7 @@ pub fn bootstrap_agents(
     inst: &crate::config::Instance,
     mode: BootMode,
     guest_host: &str,
+    proxy_bind_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1443,7 +1470,7 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
+    bootstrap_claude(session, cfg, inst, mode, guest_host, proxy_bind_ip)?;
     bootstrap_codex(session, cfg, inst, mode, guest_host)?;
 
     Ok(())
@@ -1468,6 +1495,7 @@ fn bootstrap_claude(
     inst: &crate::config::Instance,
     mode: BootMode,
     guest_host: &str,
+    proxy_bind_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
     let claude = &cfg.claude;
     let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
@@ -1500,7 +1528,12 @@ fn bootstrap_claude(
     // in local mode, so the routing is refreshed on every boot and
     // survives stop/start.
     let model_state = ModelState::load_or_default(inst)?;
-    let local_env = claude_local_env(&model_state, cfg, guest_host)?;
+    // Proxy mode (issue #411): in remote mode with `[proxy]` configured,
+    // start the host-side injecting proxy and point the guest at it. The
+    // guest holds only the capability token; the real key stays on the host.
+    // Fails closed — a resolution or spawn failure aborts the boot.
+    let proxy = start_claude_proxy(inst, cfg, &model_state, proxy_bind_ip)?;
+    let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
     write_managed_claude_settings(&session.target, &local_env)?;
 
     // Work around the onboarding wizard ignoring CLAUDE_CODE_OAUTH_TOKEN
@@ -2109,16 +2142,51 @@ fn claude_local_env(
     state: &ModelState,
     cfg: &CoopConfig,
     guest_host: &str,
+    proxy: Option<&crate::proxy::AnthropicProxy>,
 ) -> Result<BTreeMap<String, String>> {
-    let Some(ep) = local_endpoint(state, state.resolved_claude(&cfg.claude)) else {
-        return Ok(BTreeMap::new());
-    };
-    let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
-    Ok(crate::model_state::claude_env_block(
-        base_url.as_str(),
-        ep.model(),
-        &ep.auth_token_or_default(),
-    ))
+    // Local mode takes precedence over proxy mode: both rewrite the base URL,
+    // and a VM switched to local should route at the user's model server.
+    if let Some(ep) = local_endpoint(state, state.resolved_claude(&cfg.claude)) {
+        let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+        return Ok(crate::model_state::claude_env_block(
+            base_url.as_str(),
+            ep.model(),
+            &ep.auth_token_or_default(),
+        ));
+    }
+    // Remote mode + proxy active → point Claude Code at the host-side proxy.
+    if let Some(p) = proxy {
+        return Ok(crate::model_state::claude_proxy_env_block(
+            &p.base_url,
+            &p.capability_token,
+        ));
+    }
+    Ok(BTreeMap::new())
+}
+
+/// Start the Anthropic credential proxy for this VM when proxy mode applies
+/// (remote model mode + `[proxy]` configured), tearing down any stale proxy
+/// otherwise. Fails closed: an unsupported backend or a resolution/spawn
+/// failure aborts the boot rather than falling back to forwarding a raw key.
+fn start_claude_proxy(
+    inst: &crate::config::Instance,
+    cfg: &CoopConfig,
+    model_state: &ModelState,
+    proxy_bind_ip: Option<std::net::Ipv4Addr>,
+) -> Result<Option<crate::proxy::AnthropicProxy>> {
+    let proxy_mode =
+        cfg.proxy.is_enabled() && model_state.mode == crate::model_state::ModelMode::Remote;
+    if !proxy_mode {
+        // Not in proxy mode: ensure no proxy from a previous boot (e.g. before
+        // a switch to local mode) keeps running against this instance.
+        crate::proxy::stop(inst);
+        return Ok(None);
+    }
+    let bind_ip = proxy_bind_ip.context(
+        "proxy mode is configured ([proxy]) but not supported on this backend \
+         (Firecracker only for now) — remove the [proxy] config to boot this VM",
+    )?;
+    Ok(crate::proxy::start(inst, &cfg.proxy, bind_ip)?.and_then(|r| r.anthropic))
 }
 
 /// The Codex `config.toml` local-provider keys, with the endpoint's host
@@ -2896,6 +2964,60 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn claude_local_env_uses_proxy_block_in_remote_mode() {
+        let state = ModelState {
+            mode: crate::model_state::ModelMode::Remote,
+            ..Default::default()
+        };
+        let cfg = CoopConfig::default();
+        let proxy = crate::proxy::AnthropicProxy {
+            base_url: "http://172.16.0.1:8788".to_string(),
+            capability_token: "cap-token".to_string(),
+        };
+        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "cap-token");
+        // Proxy mode is transparent — no model pinning (unlike local mode).
+        assert!(!env.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn claude_local_env_prefers_local_over_proxy() {
+        let ep = crate::config::LocalModel::new(
+            url::Url::parse("http://localhost:11434").unwrap(),
+            "qwen".to_string(),
+            None,
+        )
+        .unwrap();
+        let state = ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            claude_endpoint: Some(ep),
+            ..Default::default()
+        };
+        let cfg = CoopConfig::default();
+        let proxy = crate::proxy::AnthropicProxy {
+            base_url: "http://172.16.0.1:8788".to_string(),
+            capability_token: "cap-token".to_string(),
+        };
+        // Even with a proxy handle present, local mode wins.
+        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        assert_eq!(env["ANTHROPIC_MODEL"], "qwen");
+        assert!(env["ANTHROPIC_BASE_URL"].starts_with("http://172.16.0.1:11434"));
+    }
+
+    #[test]
+    fn claude_local_env_empty_without_proxy_or_local() {
+        let env = claude_local_env(
+            &ModelState::default(),
+            &CoopConfig::default(),
+            "172.16.0.1",
+            None,
+        )
+        .unwrap();
+        assert!(env.is_empty());
     }
 
     #[test]
@@ -3933,6 +4055,28 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(debug.contains("EnvForward"));
     }
 
+    #[test]
+    fn proxy_mode_suppresses_anthropic_key_forwarding() {
+        // The crown-jewel invariant (issue #411): in proxy mode the raw
+        // Anthropic key must never be forwarded into the guest, regardless of
+        // config or the process environment.
+        let mut cfg = CoopConfig::default();
+        cfg.claude.api_key = Some(crate::config::Secret::new("sk-ant-realkey".to_string()));
+        cfg.github = None;
+
+        let suppressed = prepare_env_forwarding(&cfg, None, true).unwrap();
+        assert!(
+            !suppressed.contains("ANTHROPIC_API_KEY"),
+            "raw Anthropic key leaked into guest env in proxy mode"
+        );
+
+        let forwarded = prepare_env_forwarding(&cfg, None, false).unwrap();
+        assert!(
+            forwarded.contains("ANTHROPIC_API_KEY"),
+            "non-proxy mode should still forward the configured key"
+        );
+    }
+
     // ── guest_env merge precedence ──────────────────────────
 
     /// Build a `CoopConfig` whose env-resolving inputs are all empty
@@ -3959,7 +4103,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn guest_env_entries_are_forwarded() {
         let cfg = cfg_with_guest_env(&[("RUST_LOG", "info"), ("MY_FLAG", "1")]);
-        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        let env = prepare_env_forwarding(&cfg, None, false).unwrap();
         assert_eq!(
             env.as_envs().get("RUST_LOG").map(String::as_str),
             Some("info")
@@ -3974,7 +4118,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let mut cfg = cfg_with_guest_env(&[("ANTHROPIC_API_KEY", "guest-env-wins")]);
         cfg.claude.api_key = Some(crate::config::Secret::new("from-claude-config".to_string()));
 
-        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        let env = prepare_env_forwarding(&cfg, None, false).unwrap();
         assert_eq!(
             env.as_envs().get("ANTHROPIC_API_KEY").map(String::as_str),
             Some("guest-env-wins"),
@@ -3986,7 +4130,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Empty string is a legitimate value — distinguish "unset" from
         // "set to empty" so users can intentionally clear inherited vars.
         let cfg = cfg_with_guest_env(&[("EMPTY", "")]);
-        let env = prepare_env_forwarding(&cfg, None).unwrap();
+        let env = prepare_env_forwarding(&cfg, None, false).unwrap();
         assert_eq!(env.as_envs().get("EMPTY").map(String::as_str), Some(""));
     }
 }

@@ -301,6 +301,21 @@ exclude_re = [
   "\\bcapture_version\\b",
   "\\bagent_binary\\b",
 
+  # ---- src/proxy.rs (#411): host-side credential-proxy lifecycle ----
+  # Process spawn/teardown, binary discovery, and PID-file IO — a `--lib` test
+  # cannot observe their effects (coop-proxy's own tests + tests/integration.sh
+  # cover the behavior). The pure helpers anthropic_port and wire_config_json,
+  # and mint_capability_token (whose randomness/length a unit test asserts),
+  # stay IN scope — a survivor on one of those is a real gap. File-anchored so
+  # the generic `start`/`stop` names don't scope out same-named functions
+  # elsewhere.
+  "src/proxy\\.rs:.*\\bstart\\b",
+  "src/proxy\\.rs:.*\\bstop\\b",
+  "src/proxy\\.rs:.*\\bstop_one\\b",
+  "src/proxy\\.rs:.*\\bspawn_proxy\\b",
+  "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
+  "src/proxy\\.rs:.*\\bpid_path\\b",
+
   # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
   # not honour exclude_re for these — the regex never matches their name (not
   # by function, struct path, or even file:line). They are emitted only where

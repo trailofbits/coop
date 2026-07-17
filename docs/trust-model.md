@@ -92,6 +92,14 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **The stored token is indirected, never inlined.** `config.toml` holds a
   `cmd:...` retrieval command (`secret_store.rs:CmdToken`), not the plaintext
   token; coop runs it at VM-start to fetch the value.
+- **Proxy mode keeps the Anthropic key out of the guest entirely** (issue #411,
+  opt-in `[proxy]`). When enabled in remote model mode, `ANTHROPIC_API_KEY` is
+  **not** forwarded (`prepare_env_forwarding`'s `suppress_anthropic_key`); the
+  host-side `coop-proxy` holds the real credential and the guest gets only a
+  per-instance capability token via `settings.json`. The credential is resolved
+  on the host and handed to `coop-proxy` over **stdin**, never argv or disk; a
+  resolution failure fails the boot closed. See
+  [`credential-proxy.md`](credential-proxy.md).
 
 ## SSH boundary
 
@@ -122,6 +130,15 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - `rewrite_host_url` rewrites a loopback local-model endpoint to the
   guest-visible gateway address so the guest can reach a model server running
   on the host; non-loopback URLs pass through unchanged.
+- **The credential proxy (issue #411) is the one deliberate non-loopback
+  bind.** `coop-proxy` must be reachable from the guest, so it binds the
+  backend's guest-only gateway interface (Firecracker: the `br0` bridge IP,
+  `backend.rs:proxy_bind_ip`) — never `0.0.0.0` (it refuses an unspecified
+  address at bind) and never the LAN. It is guarded by a per-instance
+  capability token and forwards only to a fixed upstream (`api.anthropic.com`),
+  never a guest-supplied host. Its own TLS-verifying outbound HTTPS is the
+  intended egress; a change that lets the guest influence the upstream host, or
+  that binds anything wider than the gateway, is a finding.
 
 ## `coop update` trust chain
 
