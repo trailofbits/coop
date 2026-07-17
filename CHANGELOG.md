@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+- **Credential-injecting proxy — keep the Anthropic API key out of the guest**
+  (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
+  reverse proxy (`coop-proxy`, a new binary shipped in the same tarball) for the
+  lifetime of a remote-mode VM: the guest is pointed at it via
+  `ANTHROPIC_BASE_URL` and holds only a per-instance capability token, while the
+  real credential stays on the host and is injected onto requests upstream. The
+  raw `ANTHROPIC_API_KEY` is no longer forwarded into the guest, so a
+  prompt-injected or rogue agent cannot read a usable key. Supports an API key
+  (`x-api-key`) or a Claude `setup-token` (`Authorization: Bearer`). Resolution
+  fails closed — a bad credential aborts the boot rather than booting without
+  injection. `coop model <vm> local` takes precedence and tears the proxy down.
+  Firecracker only for now; Codex, GitHub, and the Firecracker jail are tracked
+  follow-ups. `coop update` keeps `coop` and `coop-proxy` in lockstep.
+
 ## v0.5.4
 
 ### New features

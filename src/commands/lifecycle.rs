@@ -946,6 +946,7 @@ pub(super) fn allocate_and_start(
         if let Ok(target) = be.ssh_target(cfg, &inst) {
             port_forward::teardown_ssh_forwards(&inst, &target);
         }
+        crate::proxy::stop(&inst);
         if let Err(cleanup_err) = be.destroy_instance(cfg, &inst) {
             tracing::debug!("Cleanup failed (non-fatal): {cleanup_err}");
         }
@@ -1507,16 +1508,31 @@ fn bootstrap_and_post_start(
     mode: backend::BootMode,
 ) -> Result<()> {
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
+    if opts.no_agents && cfg.proxy.is_enabled() {
+        // Proxy mode suppresses ANTHROPIC_API_KEY on every session, but the
+        // proxy + guest base-URL override are only set up during agent
+        // bootstrap — which --no-agents skips. Warn so the loud auth failure
+        // isn't a mystery (contradictory config: proxy is about agent creds).
+        tracing::warn!(
+            "proxy mode is configured but --no-agents skips agent bootstrap; \
+             Claude will not be able to authenticate in this VM"
+        );
+    }
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
-    let session = prepare_session_from_target(cfg, None, target.clone(), repo)?;
+    // Pass `Some(inst)` so proxy-mode key suppression (and the guest-env /
+    // Codex-local overlays) apply to the bootstrap session too — otherwise the
+    // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
+    // defeating proxy-mode non-exposure (issue #411).
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+        let proxy_bind_ip = be.proxy_bind_ip(&cfg.network);
+        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host, proxy_bind_ip)?;
     }
     if let Some(cmd) = post_start {
         backend::run_post_start(&session, cmd);
@@ -1530,7 +1546,23 @@ pub(crate) fn prepare_session_from_target(
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
-    let mut env = backend::prepare_env_forwarding(cfg, repo)?;
+    // Load the per-instance model selection once: it decides both the
+    // proxy-mode key suppression and the Codex local-key forwarding below.
+    let model = match inst {
+        Some(inst) => Some(model_state::ModelState::load_or_default(inst)?),
+        None => None,
+    };
+
+    // In proxy mode (issue #411: `[proxy]` configured and the VM in remote
+    // model mode) the raw Anthropic key must never be forwarded into the
+    // guest — the host-side proxy holds it and the guest gets only the
+    // capability token (via settings.json).
+    let proxy_anthropic = cfg.proxy.is_enabled()
+        && model
+            .as_ref()
+            .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
@@ -1540,8 +1572,8 @@ pub(crate) fn prepare_session_from_target(
         // In local-model mode, Codex reads its API key from the env var
         // named by the provider's `env_key`. Claude's token rides in
         // settings.json instead, so it needs no forwarding here.
-        let model = model_state::ModelState::load_or_default(inst)?;
-        if model.mode == model_state::ModelMode::Local
+        if let Some(model) = &model
+            && model.mode == model_state::ModelMode::Local
             && let Some(ep) = model.resolved_codex(&cfg.codex)
         {
             env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
@@ -1572,6 +1604,9 @@ pub(crate) fn cmd_stop(
             port_forward::teardown_ssh_forwards(inst, &target);
         }
     }
+    // Tear down the credential proxy (issue #411) — best-effort, no-op when
+    // proxy mode was never on.
+    crate::proxy::stop(inst);
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
@@ -1595,6 +1630,7 @@ pub(crate) fn cmd_destroy(
         if let Ok(target) = be.ssh_target(cfg, &inst) {
             port_forward::teardown_ssh_forwards(&inst, &target);
         }
+        crate::proxy::stop(&inst);
         be.destroy_instance(cfg, &inst)?;
         workspace::remove_ssh_config(&inst)?;
         tracing::info!("Instance '{}' destroyed", inst.name);

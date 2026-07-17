@@ -25,6 +25,7 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod proxy;
 mod remote_command;
 mod secret_store;
 mod sha256_hash;

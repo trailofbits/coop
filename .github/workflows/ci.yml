@@ -30,14 +30,22 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
+      # `--workspace` clippy/test below build it. Preinstalled on ubuntu-latest,
+      # installed explicitly so the job doesn't depend on the image contents.
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
       - name: Format check
         run: cargo fmt -- --check
 
+      # `--workspace` so coop-proxy is linted/tested too (it is not a default
+      # member, to keep plain `cargo build` and the integration scripts light).
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Unit tests
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Integration test — coop update
         run: ./tests/integration-update.sh
@@ -60,8 +68,11 @@ jobs:
       - name: Install cargo-deny
         run: cargo binstall --no-confirm cargo-deny@0.19.9
 
+      # `--workspace` roots the crate graph at every workspace member. With a
+      # root package present, cargo-deny otherwise checks only `coop`, missing
+      # `coop-proxy`'s async/HTTP/TLS supply chain (issue #411).
       - name: Check advisories, licenses, bans, sources
-        run: cargo deny check
+        run: cargo deny --workspace check
 
   taplo:
     runs-on: ubuntu-latest
