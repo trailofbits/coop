@@ -52,6 +52,7 @@ mod setup;
 mod shell;
 mod ssh;
 mod update;
+pub mod vcs;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
 mod workspace;

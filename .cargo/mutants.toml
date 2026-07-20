@@ -128,6 +128,16 @@ exclude_re = [
   "\\bremove_all_ssh_config\\b",
   "\\bremove_ssh_config\\b",
 
+  # vcs.rs — git/jj shell-outs for host-side working-copy dirty detection.
+  # The pure logic (Vcs::detect, Vcs::is_repo, rsync_vcs_filters,
+  # tar_vcs_excludes, non_empty) stays IN scope and is unit-tested; a survivor
+  # there is a real gap. These three run `git`/`jj` against a real repo, which
+  # a `--lib` test cannot stand in for (mirrors check_local_dirty above, which
+  # now delegates to working_copy_dirty).
+  "\\bworking_copy_dirty\\b",
+  "\\bgit_working_copy_dirty\\b",
+  "\\bjj_working_copy_dirty\\b",
+
   # devcontainer.rs — persistence IO and NotFound guards; tracing-only warn.
   "DevcontainerPreferences::load",
   "ParsedDevcontainer::load",

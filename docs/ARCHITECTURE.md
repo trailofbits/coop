@@ -157,6 +157,35 @@ Config, secrets, and workspace all cross the host→guest boundary here; the
 security-relevant details of each crossing are in
 [`trust-model.md`](trust-model.md).
 
+### VCS-aware sync (`vcs.rs`)
+
+Workspace sync and dirty checks understand both **git** and **Jujutsu**
+(`jj`). `vcs::Vcs::detect` classifies a directory: a `.jj/` present means
+`Jj` (jj drives the git refs, so it wins even in a colocated repo that also
+has `.git/`); a lone `.git/` is `Git`. This matters because a **non-colocated**
+jj repo (`jj git init --no-colocate`) has *no* top-level `.git/` — a
+`.git`-only check would miss it entirely.
+
+- **Transfer protection** (`vcs::rsync_vcs_filters` / `vcs::tar_vcs_excludes`,
+  wired into `workspace::rsync_base_args` and the tar helpers): when history is
+  kept, `.jj/` is force-protected with a `--filter=+ /.jj/***` rule that
+  **precedes** the per-directory `.gitignore` merge, mirroring the `.git/`
+  rule. jj writes `/*` into `.jj/.gitignore`, so without this rsync's
+  first-match-wins merge would honor it and strip the entire jj store, leaving
+  a broken `.jj/` shell. `--exclude-git` drops `.jj/` alongside `.git/`.
+- **Dirty checks** (`vcs::working_copy_dirty`, `workspace::check_guest_dirty`):
+  jj repos are checked with `jj diff --name-only` (jj auto-snapshots the
+  working copy into `@`, which a git detached-HEAD view would misreport). The
+  host check degrades gracefully when `jj` is absent; the guest check uses `jj`
+  only when the guest has both a `.jj/` repo and the `jj` binary.
+
+**Known limitation:** the guest golden image does not yet install `jj`, so an
+agent working in the guest cannot run jj and the guest dirty check falls back
+to git for colocated repos (and skips non-colocated ones). Adding `jj` to the
+guest is a follow-up: it needs a pinned binary download (a new egress host —
+see the trust-model stop-and-confirm list), golden-image verification, and a
+CI version pin, so it is deliberately out of scope for the sync-safety fix.
+
 ### Config model
 
 `config::CoopConfig` is the type-safe core. Loading reads TOML (or JSON by

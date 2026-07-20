@@ -25,8 +25,6 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     ".coop/",
 ];
 
-const GIT_EXCLUDE: &str = ".git/";
-
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -172,8 +170,8 @@ pub fn tar_pipe_transfer_to(
     for exc in DEFAULT_EXCLUDES {
         tar_cmd.arg(format!("--exclude={exc}"));
     }
-    if exclude_git {
-        tar_cmd.arg(format!("--exclude={GIT_EXCLUDE}"));
+    for f in crate::vcs::tar_vcs_excludes(exclude_git) {
+        tar_cmd.arg(f);
     }
     // --exclude-vcs-ignores is GNU tar only (not available on macOS BSD tar)
     if !cfg!(target_os = "macos") {
@@ -734,16 +732,12 @@ fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
 
 fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
     let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()];
-    // `.git/` rule must precede the per-directory `.gitignore` merge: rsync
-    // uses first-match-wins, so without this a repo whose `.gitignore`
-    // happens to list `.git/` would silently strip git state from the
-    // transfer regardless of `--exclude-git`.
-    if exclude_git {
-        args.push(format!("--exclude={GIT_EXCLUDE}"));
-    } else {
-        // `/.git/***` matches the directory itself and everything inside.
-        args.push("--filter=+ /.git/***".to_string());
-    }
+    // The `.git/` / `.jj/` rules must precede the per-directory `.gitignore`
+    // merge: rsync uses first-match-wins, so without these a repo whose
+    // `.gitignore` lists `.git/` — or a jj repo whose `.jj/.gitignore` holds
+    // `/*` — would silently strip VCS state from the transfer regardless of
+    // `--exclude-git`. See [`crate::vcs::rsync_vcs_filters`].
+    args.extend(crate::vcs::rsync_vcs_filters(exclude_git));
     args.push("--filter=:- .gitignore".to_string());
     for exc in DEFAULT_EXCLUDES {
         args.push(format!("--exclude={exc}"));
@@ -831,9 +825,7 @@ fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
         .iter()
         .map(|exc| format!("--exclude={exc}"))
         .collect();
-    if exclude_git {
-        excludes.push(format!("--exclude={GIT_EXCLUDE}"));
-    }
+    excludes.extend(crate::vcs::tar_vcs_excludes(exclude_git));
     let exclude_str = excludes.join(" ");
     RemoteCommand::new()
         .literal("tar cf - -C ")
@@ -968,22 +960,26 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // edits made inside the guest. Modified tracked files and unpushed
     // commits are the real signal that an agent has done work the host
     // doesn't yet know about.
-    let check_cmd = RemoteCommand::new()
-        .literal("if [ -d ")
-        .arg(guest_path)
-        .literal("/.git ]; then cd ")
-        .arg(guest_path)
-        .literal(
-            " && \
-             git status --porcelain --untracked-files=no && \
-             if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
-                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null); \
-                 if [ \"${ahead:-0}\" -gt 0 ]; then \
-                     echo \"AHEAD $ahead\"; \
+    // jj is preferred when the guest has both a `.jj` repo and the `jj`
+    // binary: `jj diff --name-only` reports working-copy changes jj has
+    // snapshotted into `@` (git's detached-HEAD view would miss them). It
+    // also covers non-colocated jj repos, which have no `.git` for the git
+    // branch to find. Falls back to the git check otherwise, so a colocated
+    // repo on a guest without jj behaves exactly as before.
+    let check_cmd = RemoteCommand::new().literal("cd ").arg(guest_path).literal(
+        " 2>/dev/null || exit 0; \
+             if command -v jj >/dev/null 2>&1 && [ -d .jj ]; then \
+                 jj diff --name-only; \
+             elif [ -d .git ]; then \
+                 git status --porcelain --untracked-files=no && \
+                 if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
+                     ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null); \
+                     if [ \"${ahead:-0}\" -gt 0 ]; then \
+                         echo \"AHEAD $ahead\"; \
+                     fi; \
                  fi; \
-             fi; \
-          fi",
-        );
+             fi",
+    );
 
     let mut args = target.ssh_opts();
     args.push(target.addr());
@@ -1006,22 +1002,13 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
 }
 
 fn check_local_dirty(dest: &Path) -> Result<()> {
-    let git_dir = dest.join(".git");
-    if !git_dir.exists() {
-        return Ok(());
-    }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dest)
-        .args(["status", "--porcelain"])
-        .output()
-        .context("Failed to check local git status")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
+    // VCS-aware: git repos via `git status`, jj repos (colocated or not) via
+    // `jj diff`. A non-colocated jj repo has no top-level `.git`, so the old
+    // `.git`-existence gate silently skipped it and let a pull clobber
+    // uncommitted host work. See [`crate::vcs::working_copy_dirty`].
+    if let Some(changes) = crate::vcs::working_copy_dirty(dest)? {
         bail!(
-            "Local directory has uncommitted changes:\n{stdout}\n\
+            "Local directory has uncommitted changes:\n{changes}\n\
              Use --force to overwrite"
         );
     }
@@ -1928,7 +1915,14 @@ Host coop-other\n\
             !DEFAULT_EXCLUDES.iter().any(|e| e.contains(".git")),
             "DEFAULT_EXCLUDES must not contain a .git pattern; got {DEFAULT_EXCLUDES:?}"
         );
-        assert_eq!(GIT_EXCLUDE, ".git/");
+        // Same policy for jj: `.jj/` is protected/dropped by the
+        // `exclude_git` flag, never unconditionally stripped as a default.
+        assert!(
+            !DEFAULT_EXCLUDES.iter().any(|e| e.contains(".jj")),
+            "DEFAULT_EXCLUDES must not contain a .jj pattern; got {DEFAULT_EXCLUDES:?}"
+        );
+        assert_eq!(crate::vcs::GIT_DIR, ".git/");
+        assert_eq!(crate::vcs::JJ_DIR, ".jj/");
     }
 
     #[test]
@@ -1972,19 +1966,34 @@ Host coop-other\n\
             prop_assert_eq!(has_protect, !exclude_git);
             prop_assert_eq!(has_exclude_git, exclude_git);
 
+            // The same policy applies to jj metadata: protect `.jj/` when
+            // keeping history, exclude it otherwise. Without the protect rule
+            // rsync's `.gitignore` merge honors `.jj/.gitignore`'s `/*` and
+            // destroys the jj store.
+            let has_jj_protect = args.iter().any(|a| a == "--filter=+ /.jj/***");
+            let has_exclude_jj = args.iter().any(|a| a == "--exclude=.jj/");
+            prop_assert_eq!(has_jj_protect, !exclude_git);
+            prop_assert_eq!(has_exclude_jj, exclude_git);
+
             let gitignore_idx = args
                 .iter()
                 .position(|a| a == "--filter=:- .gitignore")
                 .expect("expected .gitignore merge filter");
-            let git_rule_idx = args
-                .iter()
-                .position(|a| a == "--filter=+ /.git/***" || a == "--exclude=.git/")
-                .expect("expected a git rule");
-            prop_assert!(
-                git_rule_idx < gitignore_idx,
-                "git rule must precede the .gitignore merge: {:?}",
-                args
-            );
+            // Every VCS rule must precede the `.gitignore` merge.
+            for rule in [
+                "--filter=+ /.git/***",
+                "--exclude=.git/",
+                "--filter=+ /.jj/***",
+                "--exclude=.jj/",
+            ] {
+                if let Some(idx) = args.iter().position(|a| a == rule) {
+                    prop_assert!(
+                        idx < gitignore_idx,
+                        "VCS rule {rule:?} must precede the .gitignore merge: {:?}",
+                        args
+                    );
+                }
+            }
         }
     }
 
