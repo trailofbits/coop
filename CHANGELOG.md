@@ -4,29 +4,47 @@
 
 ### New features
 
-- **Credential-injecting proxy — keep the Anthropic API key out of the guest**
+- **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
-  reverse proxy (`coop-proxy`, a new binary shipped in the same tarball) for the
-  lifetime of a remote-mode VM: the guest is pointed at it via
-  `ANTHROPIC_BASE_URL` and holds only a per-instance capability token, while the
-  real credential stays on the host and is injected onto requests upstream. The
-  raw `ANTHROPIC_API_KEY` is no longer forwarded into the guest, so a
-  prompt-injected or rogue agent cannot read a usable key. Supports an API key
-  (`x-api-key`) or a Claude `setup-token` (`Authorization: Bearer`). Resolution
-  fails closed — a bad credential aborts the boot rather than booting without
-  injection. `coop model <vm> local` takes precedence and tears the proxy down.
-  The proxy binds host loopback and is reverse-tunnelled (`ssh -R`) into the
-  guest, so it works on both backends (Firecracker and Lima). Codex, GitHub,
+  reverse proxy (`coop-proxy`, a new binary shipped in the same tarball) — one
+  process per (VM, provider) — for the lifetime of a remote-mode VM: the guest
+  is pointed at it and holds only a per-instance capability token, while the
+  real credential stays on the host and is injected onto requests upstream.
+  - **Claude Code** (`[proxy.anthropic]`) is pointed at the proxy via
+    `ANTHROPIC_BASE_URL`; supports an API key (`x-api-key`) or a Claude
+    `setup-token` (`Authorization: Bearer`).
+  - **Codex** (`[proxy.openai]`) is pointed at the proxy via a
+    `[model_providers.coop_local]` block (Responses API) with the capability
+    token as the provider bearer; OpenAI API keys inject as
+    `Authorization: Bearer`. In proxy mode Codex's `~/.codex/auth.json` is no
+    longer staged onto the guest disk; Codex subscription is out of scope — use
+    an API key.
+
+  The raw `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is no longer forwarded into the
+  guest, so a prompt-injected or rogue agent cannot read a usable key.
+  Resolution fails closed — a bad credential aborts the boot rather than booting
+  without injection. `coop model <vm> local` takes precedence and tears the
+  proxy down. The proxy binds host loopback and is reverse-tunnelled (`ssh -R`)
+  into the guest, so it works on both backends (Firecracker and Lima). GitHub
   and the Firecracker jail are tracked follow-ups. `coop update` keeps `coop`
   and `coop-proxy` in lockstep.
 
-- **`coop proxy setup` — store the Anthropic credential like a GitHub PAT**
-  (#411) — Mirrors the `coop github` PAT wizard: paste a Claude `setup-token`
-  (or `--api-key`), pick a secret backend (macOS Keychain / Linux
-  secret-service / 1Password / 0600 file), and coop stores it and writes the
-  `cmd:` reference into `[proxy.anthropic]` — the credential is never plaintext
-  in the config. The secret store is now namespaced per service, so proxy
-  secrets live under their own directory rather than among the GitHub PATs.
+- **Per-VM credential overrides + `coop proxy status`** (#411) — A single VM can
+  use a different credential than the `[proxy.<provider>]` default — for
+  per-project billing, scope, or revocation — via `coop proxy setup [--openai]
+  --vm <name>`. The override is stored in that instance's state
+  (`<inst.dir>/proxy.json`), not a growing config table, and its secret is
+  namespaced separately. Resolution is override → default → off. `coop proxy
+  status [--vm <name>]` shows what each VM resolves to, with credentials
+  redacted.
+
+- **`coop proxy setup` — store a provider credential like a GitHub PAT** (#411)
+  — Mirrors the `coop github` PAT wizard: paste a credential, pick a secret
+  backend (macOS Keychain / Linux secret-service / 1Password / 0600 file), and
+  coop stores it and writes the `cmd:` reference into `[proxy.<provider>]` — the
+  credential is never plaintext in the config. Anthropic is the default;
+  `--openai` configures Codex. The secret store is namespaced per service, so
+  proxy secrets live under their own directory rather than among the GitHub PATs.
 
 ## v0.5.4
 
