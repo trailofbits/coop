@@ -13,7 +13,7 @@ use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
     backend, config, devcontainer, github_repo, guest, guest_env_state, model_state, pat_prompt,
-    port_forward, setup, signal, ssh, workspace,
+    port_forward, proxy, proxy_state, setup, signal, ssh, workspace,
 };
 
 pub(crate) struct UpOpts<'a> {
@@ -1508,14 +1508,18 @@ fn bootstrap_and_post_start(
     mode: backend::BootMode,
 ) -> Result<()> {
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
-    if opts.no_agents && cfg.proxy.is_enabled() {
-        // Proxy mode suppresses ANTHROPIC_API_KEY on every session, but the
+    let proxy_configured =
+        proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
+            || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
+                .is_some();
+    if opts.no_agents && proxy_configured {
+        // Proxy mode suppresses the raw API keys on every session, but the
         // proxy + guest base-URL override are only set up during agent
         // bootstrap — which --no-agents skips. Warn so the loud auth failure
         // isn't a mystery (contradictory config: proxy is about agent creds).
         tracing::warn!(
             "proxy mode is configured but --no-agents skips agent bootstrap; \
-             Claude will not be able to authenticate in this VM"
+             agents will not be able to authenticate in this VM"
         );
     }
     if opts.no_agents && post_start.is_none() {
@@ -1552,30 +1556,45 @@ pub(crate) fn prepare_session_from_target(
         None => None,
     };
 
-    // In proxy mode (issue #411: `[proxy]` configured and the VM in remote
-    // model mode) the raw Anthropic key must never be forwarded into the
-    // guest — the host-side proxy holds it and the guest gets only the
-    // capability token (via settings.json).
-    let proxy_anthropic = cfg.proxy.is_enabled()
-        && model
-            .as_ref()
-            .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+    // In proxy mode (issue #411: an effective upstream — `[proxy.<provider>]`
+    // default or a per-VM override — and the VM in remote model mode) the raw
+    // key must never be forwarded into the guest; the host-side proxy holds it
+    // and the guest gets only the capability token. Overrides live in the
+    // instance state, so this is resolved per provider and needs `inst`.
+    let remote = model
+        .as_ref()
+        .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+    let (proxy_anthropic, proxy_openai) = match inst {
+        Some(inst) if remote => (
+            proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
+                .is_some(),
+            proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?.is_some(),
+        ),
+        _ => (false, false),
+    };
 
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
                 env.set(name.as_str(), value.as_str());
             }
         }
-        // In local-model mode, Codex reads its API key from the env var
-        // named by the provider's `env_key`. Claude's token rides in
-        // settings.json instead, so it needs no forwarding here.
-        if let Some(model) = &model
-            && model.mode == model_state::ModelMode::Local
-            && let Some(ep) = model.resolved_codex(&cfg.codex)
-        {
-            env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+        // Codex reads its provider key from the env var named by `env_key`. In
+        // local-model mode that is the local endpoint's token; in remote proxy
+        // mode it is the per-instance capability token (the raw key stays on
+        // the host). Claude's token rides in settings.json instead. The two
+        // modes are mutually exclusive (mode is Local or Remote).
+        if let Some(model) = &model {
+            if model.mode == model_state::ModelMode::Local
+                && let Some(ep) = model.resolved_codex(&cfg.codex)
+            {
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+            } else if proxy_openai
+                && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
+            {
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
+            }
         }
     }
     Ok(backend::SshSession { target, env })

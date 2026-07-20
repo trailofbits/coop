@@ -637,6 +637,12 @@ pub const SERVICE: &str = "coop-github-pat";
 /// backend subdirectory is `anthropic` (see [`secret_subdir`]).
 pub const ANTHROPIC_SERVICE: &str = "coop-anthropic";
 
+/// Service name for the `OpenAI` (Codex) proxy credential (issue #411); its
+/// file backend subdirectory is `openai` (see [`secret_subdir`]). A per-VM
+/// override appends `-<vm>` (e.g. `coop-openai-dev`) so it never collides with
+/// the global default.
+pub const OPENAI_SERVICE: &str = "coop-openai";
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
