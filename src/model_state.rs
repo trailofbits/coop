@@ -248,6 +248,12 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
 /// ([`CODEX_LOCAL_ENV_KEY`]) as `Authorization: Bearer`; coop forwards the
 /// per-instance capability token there, which the proxy verifies before
 /// injecting the real credential upstream.
+///
+/// The `base_url` gets an `/v1` suffix: Codex forms the request URL as
+/// `{base_url}/responses`, and the proxy forwards the path verbatim to
+/// `api.openai.com`, so the guest must produce `/v1/responses` (`OpenAI`'s
+/// Responses endpoint) — mirroring `OpenAI`'s own `https://api.openai.com/v1`
+/// provider base.
 pub fn codex_proxy_config(base_url: &str) -> toml::Table {
     let mut provider = toml::Table::new();
     provider.insert(
@@ -256,7 +262,7 @@ pub fn codex_proxy_config(base_url: &str) -> toml::Table {
     );
     provider.insert(
         "base_url".to_string(),
-        toml::Value::String(base_url.to_string()),
+        toml::Value::String(format!("{}/v1", base_url.trim_end_matches('/'))),
     );
     provider.insert(
         "wire_api".to_string(),
@@ -587,7 +593,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             provider["base_url"].as_str().unwrap(),
-            "http://127.0.0.1:8900"
+            "http://127.0.0.1:8900/v1"
         );
         assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
