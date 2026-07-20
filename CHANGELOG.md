@@ -15,8 +15,10 @@
   (`x-api-key`) or a Claude `setup-token` (`Authorization: Bearer`). Resolution
   fails closed — a bad credential aborts the boot rather than booting without
   injection. `coop model <vm> local` takes precedence and tears the proxy down.
-  Firecracker only for now; Codex, GitHub, and the Firecracker jail are tracked
-  follow-ups. `coop update` keeps `coop` and `coop-proxy` in lockstep.
+  The proxy binds host loopback and is reverse-tunnelled (`ssh -R`) into the
+  guest, so it works on both backends (Firecracker and Lima). Codex, GitHub,
+  and the Firecracker jail are tracked follow-ups. `coop update` keeps `coop`
+  and `coop-proxy` in lockstep.
 
 - **`coop proxy setup` — store the Anthropic credential like a GitHub PAT**
   (#411) — Mirrors the `coop github` PAT wizard: paste a Claude `setup-token`

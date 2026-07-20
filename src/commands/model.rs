@@ -246,14 +246,12 @@ fn apply_to_running(
     let (inst, target) = running.into_parts();
     let session = super::prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
     let guest_host = be.guest_host_address(&cfg.network);
-    let proxy_bind_ip = be.proxy_bind_ip(&cfg.network);
     backend::bootstrap_agents(
         &session,
         cfg,
         &inst,
         backend::BootMode::Restart,
         &guest_host,
-        proxy_bind_ip,
     )?;
     Ok(true)
 }

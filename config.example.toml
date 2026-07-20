@@ -111,7 +111,7 @@
 #                                   # ANTHROPIC_API_KEY is no longer forwarded.
 #                                   # Applies only in remote model mode
 #                                   # (`coop model <vm> remote`); local mode
-#                                   # takes precedence. Firecracker-only for now.
+#                                   # takes precedence. Works on both backends.
 # `coop proxy setup` writes this block for you: it takes a pasted Claude
 # setup-token (or `--api-key`), stores it in Keychain / 1Password / a 0600
 # file, and fills in the `cmd:` reference below.

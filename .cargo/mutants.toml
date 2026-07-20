@@ -319,10 +319,12 @@ exclude_re = [
   # elsewhere.
   "src/proxy\\.rs:.*\\bstart\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
-  "src/proxy\\.rs:.*\\bstop_one\\b",
+  "src/proxy\\.rs:.*\\bkill_pid_file\\b",
   "src/proxy\\.rs:.*\\bspawn_proxy\\b",
+  "src/proxy\\.rs:.*\\bspawn_reverse_forward\\b",
   "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
   "src/proxy\\.rs:.*\\bpid_path\\b",
+  "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
 
   # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
   # not honour exclude_re for these — the regex never matches their name (not

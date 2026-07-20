@@ -867,12 +867,6 @@ pub trait VmBackend: std::fmt::Display {
     /// through the TAP gateway (`network.host_ip`); Lima injects
     /// `host.lima.internal`.
     fn guest_host_address(&self, network: &NetworkConfig) -> String;
-    /// The host-side IPv4 address the credential-injecting proxy (issue #411)
-    /// binds — reachable from exactly this backend's guests. `None` when proxy
-    /// mode is not yet supported on the backend. Firecracker binds the bridge
-    /// gateway (`network.host_ip`); Lima has no first-class host-side bind
-    /// address yet (tracked as a spike in the design).
-    fn proxy_bind_ip(&self, network: &NetworkConfig) -> Option<std::net::Ipv4Addr>;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
     fn mounts_are_live(&self) -> bool;
@@ -1112,13 +1106,6 @@ impl VmBackend for FirecrackerBackend {
         network.host_ip.to_string()
     }
 
-    fn proxy_bind_ip(&self, network: &NetworkConfig) -> Option<std::net::Ipv4Addr> {
-        // The guest reaches the host at the bridge gateway IP; the proxy
-        // binds exactly that address (a per-instance port distinguishes
-        // concurrent VMs), reachable from the guests and not the LAN.
-        Some(network.host_ip)
-    }
-
     fn mounts_are_live(&self) -> bool {
         false
     }
@@ -1302,13 +1289,6 @@ impl VmBackend for LimaBackend {
         crate::lima::HOST_GATEWAY.to_string()
     }
 
-    fn proxy_bind_ip(&self, _network: &NetworkConfig) -> Option<std::net::Ipv4Addr> {
-        // No first-class host-side bind address for the Lima guest yet
-        // (issue #411 tracks the spike); proxy mode is Firecracker-only for
-        // now and fails closed with a clear message on Lima.
-        None
-    }
-
     fn mounts_are_live(&self) -> bool {
         true
     }
@@ -1461,7 +1441,6 @@ pub fn bootstrap_agents(
     inst: &crate::config::Instance,
     mode: BootMode,
     guest_host: &str,
-    proxy_bind_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1470,7 +1449,7 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host, proxy_bind_ip)?;
+    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
     bootstrap_codex(session, cfg, inst, mode, guest_host)?;
 
     Ok(())
@@ -1495,7 +1474,6 @@ fn bootstrap_claude(
     inst: &crate::config::Instance,
     mode: BootMode,
     guest_host: &str,
-    proxy_bind_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<()> {
     let claude = &cfg.claude;
     let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
@@ -1532,7 +1510,7 @@ fn bootstrap_claude(
     // start the host-side injecting proxy and point the guest at it. The
     // guest holds only the capability token; the real key stays on the host.
     // Fails closed — a resolution or spawn failure aborts the boot.
-    let proxy = start_claude_proxy(inst, cfg, &model_state, proxy_bind_ip)?;
+    let proxy = start_claude_proxy(inst, cfg, &model_state, &session.target)?;
     let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
     write_managed_claude_settings(&session.target, &local_env)?;
 
@@ -2166,13 +2144,14 @@ fn claude_local_env(
 
 /// Start the Anthropic credential proxy for this VM when proxy mode applies
 /// (remote model mode + `[proxy]` configured), tearing down any stale proxy
-/// otherwise. Fails closed: an unsupported backend or a resolution/spawn
-/// failure aborts the boot rather than falling back to forwarding a raw key.
+/// otherwise. Fails closed: a resolution/spawn failure aborts the boot rather
+/// than falling back to forwarding a raw key. Works on both backends — the
+/// proxy binds host loopback and is reverse-tunnelled into the guest.
 fn start_claude_proxy(
     inst: &crate::config::Instance,
     cfg: &CoopConfig,
     model_state: &ModelState,
-    proxy_bind_ip: Option<std::net::Ipv4Addr>,
+    target: &SshTarget,
 ) -> Result<Option<crate::proxy::AnthropicProxy>> {
     let proxy_mode =
         cfg.proxy.is_enabled() && model_state.mode == crate::model_state::ModelMode::Remote;
@@ -2182,11 +2161,7 @@ fn start_claude_proxy(
         crate::proxy::stop(inst);
         return Ok(None);
     }
-    let bind_ip = proxy_bind_ip.context(
-        "proxy mode is configured ([proxy]) but not supported on this backend \
-         (Firecracker only for now) — remove the [proxy] config to boot this VM",
-    )?;
-    Ok(crate::proxy::start(inst, &cfg.proxy, bind_ip)?.and_then(|r| r.anthropic))
+    Ok(crate::proxy::start(inst, &cfg.proxy, target)?.and_then(|r| r.anthropic))
 }
 
 /// The Codex `config.toml` local-provider keys, with the endpoint's host
