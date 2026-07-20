@@ -237,6 +237,51 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
     root
 }
 
+/// The `~/.codex/config.toml` keys coop merges to route Codex through the
+/// host-side injecting proxy (issue #411).
+///
+/// Mirrors [`codex_local_config`] but for proxy mode: it points the
+/// `coop_local` provider's `base_url` at the proxy and selects it via
+/// `model_provider`, while pinning **no** `model` — proxy mode is transparent,
+/// so Codex keeps whatever model the user configured (or its default) and only
+/// its egress is redirected. Codex sends the value of `env_key`
+/// ([`CODEX_LOCAL_ENV_KEY`]) as `Authorization: Bearer`; coop forwards the
+/// per-instance capability token there, which the proxy verifies before
+/// injecting the real credential upstream.
+pub fn codex_proxy_config(base_url: &str) -> toml::Table {
+    let mut provider = toml::Table::new();
+    provider.insert(
+        "name".to_string(),
+        toml::Value::String("coop credential proxy".to_string()),
+    );
+    provider.insert(
+        "base_url".to_string(),
+        toml::Value::String(base_url.to_string()),
+    );
+    provider.insert(
+        "wire_api".to_string(),
+        toml::Value::String("responses".to_string()),
+    );
+    provider.insert(
+        "env_key".to_string(),
+        toml::Value::String(CODEX_LOCAL_ENV_KEY.to_string()),
+    );
+
+    let mut providers = toml::Table::new();
+    providers.insert(
+        CODEX_LOCAL_PROVIDER.to_string(),
+        toml::Value::Table(provider),
+    );
+
+    let mut root = toml::Table::new();
+    root.insert(
+        "model_provider".to_string(),
+        toml::Value::String(CODEX_LOCAL_PROVIDER.to_string()),
+    );
+    root.insert("model_providers".to_string(), toml::Value::Table(providers));
+    root
+}
+
 /// The `env` block coop writes into the managed `~/.claude/settings.json`
 /// to point Claude Code at the host-side injecting proxy (issue #411).
 ///
@@ -523,5 +568,29 @@ mod tests {
         );
         assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
+    }
+
+    #[test]
+    fn codex_proxy_config_pins_provider_but_not_model() {
+        let table = codex_proxy_config("http://127.0.0.1:8900");
+        // Proxy mode is transparent: no model pin, so Codex keeps its own.
+        assert!(
+            !table.contains_key("model"),
+            "proxy mode must not pin a model"
+        );
+        assert_eq!(
+            table["model_provider"].as_str().unwrap(),
+            CODEX_LOCAL_PROVIDER
+        );
+        let provider = table["model_providers"][CODEX_LOCAL_PROVIDER]
+            .as_table()
+            .unwrap();
+        assert_eq!(
+            provider["base_url"].as_str().unwrap(),
+            "http://127.0.0.1:8900"
+        );
+        assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
+        assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
+        assert_eq!(provider["name"].as_str().unwrap(), "coop credential proxy");
     }
 }

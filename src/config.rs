@@ -1528,20 +1528,25 @@ pub struct CodexConfig {
 /// outbound requests the guest never sees. Absent config means no proxy —
 /// credentials are forwarded exactly as before.
 ///
-/// v1 covers Anthropic (Claude Code); Codex and GitHub are separate slices.
+/// Covers Anthropic (Claude Code) and `OpenAI` (Codex); GitHub is a separate
+/// slice. Each provider is an optional default; a VM can override its own
+/// credential per provider (see [`crate::proxy_state`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// Anthropic (Claude Code) upstream. Its presence enables proxy mode for
     /// Claude when the VM is in remote model mode.
     #[serde(default)]
     pub anthropic: Option<ProxyUpstream>,
-}
 
-impl ProxyConfig {
-    /// Whether any upstream is configured (proxy mode is opt-in).
-    pub fn is_enabled(&self) -> bool {
-        self.anthropic.is_some()
-    }
+    /// `OpenAI` (Codex) upstream. Its presence enables proxy mode for Codex
+    /// when the VM is in remote model mode. `OpenAI` API keys are injected as
+    /// `Authorization: Bearer`.
+    ///
+    /// Proxy mode is resolved per provider and per VM (a per-VM override can
+    /// enable it even when this default is absent) by
+    /// [`crate::proxy_state::effective_upstream`], not from this struct alone.
+    #[serde(default)]
+    pub openai: Option<ProxyUpstream>,
 }
 
 /// A single proxied upstream: the real credential and how to inject it.
@@ -2457,6 +2462,12 @@ impl Instance {
 
     pub fn model_state_path(&self) -> PathBuf {
         self.dir.join("model.json")
+    }
+
+    /// Per-instance proxy credential overrides (issue #411). A missing file
+    /// means "no override — use the `[proxy.<provider>]` defaults."
+    pub fn proxy_state_path(&self) -> PathBuf {
+        self.dir.join("proxy.json")
     }
 
     #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
@@ -3514,8 +3525,8 @@ model = ""
     #[test]
     fn proxy_disabled_by_default() {
         let cfg: CoopConfig = toml::from_str("").unwrap();
-        assert!(!cfg.proxy.is_enabled());
         assert!(cfg.proxy.anthropic.is_none());
+        assert!(cfg.proxy.openai.is_none());
     }
 
     #[test]
@@ -3525,10 +3536,22 @@ model = ""
 credential = "sk-ant-secret"
 "#;
         let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.proxy.is_enabled());
         let up = cfg.proxy.anthropic.unwrap();
         assert_eq!(up.credential.expose(), "sk-ant-secret");
         assert_eq!(up.auth, ProxyAuthScheme::ApiKey);
+    }
+
+    #[test]
+    fn proxy_openai_parses_with_bearer() {
+        let toml_str = r#"
+[proxy.openai]
+credential = "cmd:op read op://x"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let up = cfg.proxy.openai.unwrap();
+        assert_eq!(up.credential.expose(), "cmd:op read op://x");
+        assert_eq!(up.auth, ProxyAuthScheme::Bearer);
     }
 
     #[test]

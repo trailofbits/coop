@@ -26,6 +26,7 @@ mod pat_prompt;
 mod paths;
 mod port_forward;
 mod proxy;
+mod proxy_state;
 mod remote_command;
 mod secret_store;
 mod sha256_hash;
@@ -772,14 +773,40 @@ enum GithubAction {
 
 #[derive(Subcommand)]
 enum ProxyAction {
-    /// Store an Anthropic credential in a secret backend and wire it into
-    /// `[proxy.anthropic]`. Defaults to a Claude `setup-token` (subscription);
-    /// pass `--api-key` for an Anthropic API key.
+    /// Store a provider credential in a secret backend and wire it into
+    /// `[proxy.<provider>]` (the default) or a per-VM override. Anthropic
+    /// (Claude) is the default provider; pass `--openai` for Codex.
     Setup {
-        /// Store an Anthropic API key (`x-api-key`) instead of a Claude
-        /// `setup-token`.
+        /// Configure the `OpenAI` (Codex) upstream instead of Anthropic. `OpenAI`
+        /// keys are always injected as `Authorization: Bearer`.
+        #[arg(long, conflicts_with = "anthropic")]
+        openai: bool,
+        /// Configure the Anthropic (Claude) upstream (the default provider).
+        #[arg(long)]
+        anthropic: bool,
+        /// Store the credential as a per-VM override for this instance instead
+        /// of the global `[proxy.<provider>]` default.
+        #[arg(
+            long,
+            value_name = "NAME",
+            add = ArgValueCandidates::new(completions::instance_candidates)
+        )]
+        vm: Option<String>,
+        /// Anthropic only: store an API key (`x-api-key`) instead of a Claude
+        /// `setup-token`. Ignored for `--openai` (always Bearer).
         #[arg(long)]
         api_key: bool,
+    },
+    /// Show what each VM's agents resolve to (per-VM override → default → off),
+    /// with credentials redacted.
+    Status {
+        /// Show the effective resolution for a single VM instead of all.
+        #[arg(
+            long,
+            value_name = "NAME",
+            add = ArgValueCandidates::new(completions::instance_candidates)
+        )]
+        vm: Option<String>,
     },
 }
 

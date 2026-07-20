@@ -6,12 +6,18 @@
 //! process (bound on host loopback), and exposes it into the guest with a
 //! per-instance `ssh -R` reverse tunnel — both tracked by PID files.
 //!
+//! One `coop-proxy` process (and one reverse tunnel) runs per (VM, provider):
+//! Anthropic for Claude Code, `OpenAI` for Codex. The binary is
+//! provider-agnostic — it injects one configured header to one fixed upstream
+//! — so a provider is just a different upstream host, port, and auth scheme
+//! resolved on the host. See [`docs/design/issue-411-injecting-proxy.md`].
+//!
 //! Binding host loopback + reverse-tunnelling works identically on both
 //! backends (Firecracker and Lima), keeps the listener off every non-loopback
 //! interface, and gives each guest its own tunnel (no shared-bridge exposure).
 //! The guest is pointed at `http://127.0.0.1:<port>` and holds only the
 //! capability token, which the proxy verifies before injecting the real
-//! credential upstream. See [`docs/design/issue-411-injecting-proxy.md`].
+//! credential upstream.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -25,16 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::backend::SshTarget;
-use crate::config::{Instance, ProxyAuthScheme, ProxyConfig, resolve_cmd_value};
-
-/// The fixed Anthropic upstream. The guest cannot influence this — only the
-/// request path is forwarded (closes SSRF).
-const ANTHROPIC_UPSTREAM_HOST: &str = "api.anthropic.com";
-
-/// Base port for the per-instance Anthropic proxy. The actual port is
-/// `BASE + instance index`, so concurrent VMs never collide on host loopback.
-/// The same number is used on the guest's loopback via the reverse tunnel.
-const ANTHROPIC_BASE_PORT: u16 = 8788;
+use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, resolve_cmd_value};
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
@@ -45,77 +42,168 @@ const PROXY_BIN_NAME: &str = "coop-proxy";
 /// SSH'd in moments earlier), so surviving it means the forward is bound.
 const TUNNEL_READY_GRACE: Duration = Duration::from_secs(2);
 
-/// A running Anthropic proxy and the values the guest config needs.
+/// A proxied upstream. The binary is provider-agnostic; this enum carries the
+/// host-side per-provider constants (upstream host, base port, file/tunnel
+/// name) so one code path serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// Anthropic (Claude Code) → `api.anthropic.com`.
+    Anthropic,
+    /// `OpenAI` (Codex) → `api.openai.com`.
+    Openai,
+}
+
+impl Provider {
+    /// Every provider, for teardown that must reach all of them.
+    pub const ALL: [Provider; 2] = [Provider::Anthropic, Provider::Openai];
+
+    /// Short name used in PID/log/token file names and log lines.
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::Openai => "openai",
+        }
+    }
+
+    /// The fixed upstream host. The guest cannot influence this — only the
+    /// request path is forwarded (closes SSRF).
+    fn upstream_host(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "api.anthropic.com",
+            Provider::Openai => "api.openai.com",
+        }
+    }
+
+    /// Base port for this provider's per-instance proxy. The actual port is
+    /// `base + instance index`, so concurrent VMs never collide on host
+    /// loopback. The instance index spans `0..=252`, so the bases are 1000
+    /// apart to keep the two providers' ranges disjoint (Anthropic
+    /// `8788..=9040`, `OpenAI` `9788..=10040`).
+    fn base_port(self) -> u16 {
+        match self {
+            Provider::Anthropic => 8788,
+            Provider::Openai => 9788,
+        }
+    }
+
+    /// Per-instance listen port: base + index.
+    fn port(self, inst: &Instance) -> u16 {
+        self.base_port().saturating_add(inst.index.as_u16())
+    }
+
+    /// Whether the capability token must be persisted host-side for later
+    /// sessions to read. Codex needs it: the token is sent as the provider's
+    /// bearer `env_key`, forwarded via `SendEnv` on every session (which is
+    /// created before bootstrap mints the token). Claude Code does not — its
+    /// token rides in the guest's `settings.json`, written at bootstrap — so
+    /// its token stays in host memory only (unchanged from slice 1).
+    fn persists_token(self) -> bool {
+        matches!(self, Provider::Openai)
+    }
+}
+
+/// A running proxy and the values the guest config needs.
 #[derive(Debug, Clone)]
-pub struct AnthropicProxy {
+pub struct ProxyHandle {
     /// Base URL the guest is pointed at, e.g. `http://127.0.0.1:8788`.
     pub base_url: String,
-    /// Per-instance capability token the guest presents (as
-    /// `ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`).
+    /// Per-instance capability token the guest presents (as a bearer / API
+    /// key), which the proxy verifies before injecting the real credential.
     pub capability_token: String,
 }
 
-/// The set of proxies started for one instance. v1: Anthropic only.
-#[derive(Debug, Clone, Default)]
-pub struct RunningProxies {
-    pub anthropic: Option<AnthropicProxy>,
-}
-
-/// Start the configured proxies for `inst`: bind the proxy on host loopback
-/// and open a reverse SSH tunnel via `target` so the guest reaches it at
-/// `127.0.0.1:<port>`. Returns `Ok(None)` when proxy mode is not configured.
+/// Start the proxy for one `provider` on `inst`: resolve the credential, bind
+/// the proxy on host loopback, and open a reverse SSH tunnel via `target` so
+/// the guest reaches it at `127.0.0.1:<port>`.
 ///
 /// **Fail closed:** if the credential cannot be resolved (or the tunnel cannot
 /// be established), this returns an error and the VM start is aborted — the
 /// guest never comes up on a path where the agent silently has no or the wrong
 /// credential.
-pub fn start(
+pub fn start_provider(
     inst: &Instance,
-    cfg: &ProxyConfig,
+    provider: Provider,
+    upstream: &ProxyUpstream,
     target: &SshTarget,
-) -> Result<Option<RunningProxies>> {
-    let Some(anthropic_cfg) = &cfg.anthropic else {
-        return Ok(None);
-    };
-
-    let credential = resolve_cmd_value(anthropic_cfg.credential.expose()).context(
-        "Failed to resolve the Anthropic proxy credential — aborting VM start (fail-closed); \
-         the guest must never come up without the injected credential",
-    )?;
+) -> Result<ProxyHandle> {
+    let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
+        format!(
+            "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
+             the guest must never come up without the injected credential",
+            provider.name()
+        )
+    })?;
 
     let token = mint_capability_token()?;
-    let port = anthropic_port(inst);
+    let port = provider.port(inst);
     let listen = SocketAddr::from(([127, 0, 0, 1], port));
     let json = wire_config_json(
         &listen,
         &token,
-        ANTHROPIC_UPSTREAM_HOST,
-        anthropic_cfg.auth,
+        provider.upstream_host(),
+        upstream.auth,
         &credential,
     )?;
 
-    spawn_proxy(inst, "anthropic", &json)?;
-    // Expose the loopback proxy into the guest. If the tunnel fails, tear the
-    // proxy back down so we don't leave it orphaned (fail closed).
-    if let Err(e) = spawn_reverse_forward(inst, "anthropic", target, port) {
-        stop(inst);
+    spawn_proxy(inst, provider.name(), &json)?;
+    // Persist the capability token for providers that forward it via env on
+    // later sessions (Codex); Claude reads its token from the returned handle
+    // (settings.json) and keeps it out of host disk. Written after spawn so a
+    // stale token is never left pointing at a dead proxy.
+    if provider.persists_token()
+        && let Err(e) = write_token_file(inst, provider, &token)
+    {
+        stop_provider(inst, provider);
         return Err(e);
     }
-    tracing::info!("Started Anthropic credential proxy on {listen} (guest → 127.0.0.1:{port})");
+    // Expose the loopback proxy into the guest. If the tunnel fails, tear the
+    // proxy back down so we don't leave it orphaned (fail closed).
+    if let Err(e) = spawn_reverse_forward(inst, provider.name(), target, port) {
+        stop_provider(inst, provider);
+        return Err(e);
+    }
+    tracing::info!(
+        "Started {} credential proxy on {listen} (guest → 127.0.0.1:{port})",
+        provider.name()
+    );
 
-    Ok(Some(RunningProxies {
-        anthropic: Some(AnthropicProxy {
-            base_url: format!("http://127.0.0.1:{port}"),
-            capability_token: token,
-        }),
-    }))
+    Ok(ProxyHandle {
+        base_url: format!("http://127.0.0.1:{port}"),
+        capability_token: token,
+    })
 }
 
-/// Tear down every proxy process and tunnel for `inst`. Best-effort, safe to
-/// call when none were started (mirrors `teardown_ssh_forwards`).
+/// Tear down the proxy process, tunnel, and token file for one `provider`.
+/// Best-effort, safe to call when none were started.
+pub fn stop_provider(inst: &Instance, provider: Provider) {
+    let name = provider.name();
+    kill_pid_file(&pid_path(inst, name), "proxy");
+    kill_pid_file(&fwd_pid_path(inst, name), "proxy tunnel");
+    let token = token_path(inst, name);
+    if token.exists()
+        && let Err(e) = fs::remove_file(&token)
+    {
+        tracing::debug!(
+            "Failed to remove proxy token file {} (non-fatal): {e}",
+            token.display()
+        );
+    }
+}
+
+/// Tear down every provider's proxy for `inst` (stop/destroy). Best-effort.
 pub fn stop(inst: &Instance) {
-    kill_pid_file(&pid_path(inst, "anthropic"), "anthropic proxy");
-    kill_pid_file(&fwd_pid_path(inst, "anthropic"), "anthropic proxy tunnel");
+    for provider in Provider::ALL {
+        stop_provider(inst, provider);
+    }
+}
+
+/// The persisted capability token for a running `provider` proxy, if any.
+/// Used to forward the Codex provider bearer on interactive sessions after
+/// bootstrap has started the proxy.
+pub fn read_capability_token(inst: &Instance, provider: Provider) -> Option<String> {
+    let token = fs::read_to_string(token_path(inst, provider.name())).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 // ── process supervision ──────────────────────────────────────
@@ -153,9 +241,9 @@ fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     let pid = child.id();
     let pid_path = pid_path(inst, name);
     if let Err(e) = fs::write(&pid_path, pid.to_string()) {
-        // Without a pid file `stop_one` can never reap this proxy, and the std
-        // `Child` destructor does not kill it — so a running proxy holding the
-        // real credential would be orphaned. Kill it before failing.
+        // Without a pid file `stop_provider` can never reap this proxy, and the
+        // std `Child` destructor does not kill it — so a running proxy holding
+        // the real credential would be orphaned. Kill it before failing.
         let _ = child.kill();
         let _ = child.wait();
         return Err(e)
@@ -257,12 +345,24 @@ fn kill_pid_file(path: &Path, label: &str) {
     }
 }
 
+/// Persist the capability token owner-only (0600). It is worthless off the
+/// host, but kept owner-only for consistency with other per-instance state.
+fn write_token_file(inst: &Instance, provider: Provider, token: &str) -> Result<()> {
+    let path = token_path(inst, provider.name());
+    crate::fs_util::atomic_write_with_mode(&path, token, 0o600)
+        .with_context(|| format!("Failed to write proxy token file {}", path.display()))
+}
+
 fn pid_path(inst: &Instance, name: &str) -> PathBuf {
     inst.dir.join(format!("proxy-{name}.pid"))
 }
 
 fn fwd_pid_path(inst: &Instance, name: &str) -> PathBuf {
     inst.dir.join(format!("proxy-{name}-fwd.pid"))
+}
+
+fn token_path(inst: &Instance, name: &str) -> PathBuf {
+    inst.dir.join(format!("proxy-{name}.token"))
 }
 
 fn locate_proxy_binary() -> Result<PathBuf> {
@@ -282,11 +382,6 @@ fn locate_proxy_binary() -> Result<PathBuf> {
 }
 
 // ── pure helpers ─────────────────────────────────────────────
-
-/// Per-instance listen port: base + index, so concurrent VMs never collide.
-fn anthropic_port(inst: &Instance) -> u16 {
-    ANTHROPIC_BASE_PORT.saturating_add(inst.index.as_u16())
-}
 
 /// Mint a 256-bit capability token from the OS CSPRNG, hex-encoded. Worthless
 /// off the host, so exfiltration by a compromised guest gains nothing.
@@ -353,9 +448,34 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_port_is_per_instance() {
-        assert_eq!(anthropic_port(&inst_with_index(0)), 8788);
-        assert_eq!(anthropic_port(&inst_with_index(5)), 8793);
+    fn ports_are_per_instance_and_per_provider() {
+        assert_eq!(Provider::Anthropic.port(&inst_with_index(0)), 8788);
+        assert_eq!(Provider::Anthropic.port(&inst_with_index(5)), 8793);
+        assert_eq!(Provider::Openai.port(&inst_with_index(0)), 9788);
+        assert_eq!(Provider::Openai.port(&inst_with_index(5)), 9793);
+    }
+
+    #[test]
+    fn provider_ranges_do_not_overlap() {
+        // 252 is the max instance index (0..=252); the Anthropic range top
+        // must stay strictly below the OpenAI base so no (VM, provider) pair
+        // ever shares a host-loopback port.
+        assert!(Provider::Anthropic.base_port() + 252 < Provider::Openai.base_port());
+    }
+
+    #[test]
+    fn upstream_hosts_are_pinned() {
+        assert_eq!(Provider::Anthropic.upstream_host(), "api.anthropic.com");
+        assert_eq!(Provider::Openai.upstream_host(), "api.openai.com");
+    }
+
+    #[test]
+    fn only_openai_persists_its_token() {
+        // Codex forwards the token via env on later sessions, so it must be
+        // persisted; Claude reads its token from settings.json and keeps it in
+        // host memory only (unchanged from slice 1).
+        assert!(Provider::Openai.persists_token());
+        assert!(!Provider::Anthropic.persists_token());
     }
 
     #[test]
@@ -388,17 +508,36 @@ mod tests {
 
     #[test]
     fn wire_json_bearer_shape() {
-        let listen: SocketAddr = "172.16.0.1:8788".parse().unwrap();
+        let listen: SocketAddr = "172.16.0.1:8900".parse().unwrap();
         let json = wire_config_json(
             &listen,
             "t",
-            "api.anthropic.com",
+            "api.openai.com",
             ProxyAuthScheme::Bearer,
-            "setup-tok",
+            "sk-openai",
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["injection"]["scheme"], "bearer");
-        assert_eq!(v["injection"]["credential"], "setup-tok");
+        assert_eq!(v["injection"]["credential"], "sk-openai");
+    }
+
+    #[test]
+    fn token_file_round_trips_and_clears() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+
+        assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+        write_token_file(&inst, Provider::Openai, "cap-123").unwrap();
+        assert_eq!(
+            read_capability_token(&inst, Provider::Openai),
+            Some("cap-123".to_string())
+        );
+        // Other providers are independent.
+        assert_eq!(read_capability_token(&inst, Provider::Anthropic), None);
+
+        stop_provider(&inst, Provider::Openai);
+        assert_eq!(read_capability_token(&inst, Provider::Openai), None);
     }
 }
