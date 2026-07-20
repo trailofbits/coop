@@ -405,7 +405,9 @@ fn open_browser_best_effort(url: &str) {
     let _ = Command::new(opener).arg(url).spawn();
 }
 
-fn read_token_no_echo() -> Result<String> {
+/// Read a pasted secret from the terminal without echoing it. Shared with
+/// `coop proxy setup` (issue #411).
+pub(crate) fn read_token_no_echo() -> Result<String> {
     eprint!("Paste token: ");
     std::io::stderr().flush().ok();
     let guard = EchoGuard::off();
@@ -901,7 +903,9 @@ fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[
     eprintln!("Generate a fresh token, then paste it below. (Empty input aborts.)");
 }
 
-fn pick_backend() -> Result<crate::secret_store::Backend> {
+/// Prompt the user to choose a secret-storage backend. Shared with
+/// `coop proxy setup` (issue #411).
+pub(crate) fn pick_backend() -> Result<crate::secret_store::Backend> {
     let backends = available_backends();
     eprintln!("\nWhere should I store this token?");
     for (i, b) in backends.iter().enumerate() {

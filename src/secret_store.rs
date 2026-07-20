@@ -48,7 +48,7 @@ pub enum Backend {
     LinuxSecretService,
     /// 1Password CLI (`op`) — used when explicitly chosen by the user.
     OnePassword,
-    /// Plain file under `~/.coop/state/github-pat/<slug>.txt`, mode 0600.
+    /// Plain file under `~/.coop/state/<service>/<name>.txt`, mode 0600.
     File,
 }
 
@@ -61,7 +61,7 @@ impl Backend {
             #[cfg(target_os = "linux")]
             Self::LinuxSecretService => "Linux Secret Service (GNOME Keyring / KWallet)",
             Self::OnePassword => "1Password CLI",
-            Self::File => "Plain file (~/.coop/state/github-pat/<slug>.txt, mode 0600)",
+            Self::File => "Plain file (~/.coop/state/<service>/<name>.txt, mode 0600)",
         }
     }
 
@@ -272,7 +272,8 @@ pub fn delete_secret(
             Ok(())
         }
         Backend::File => {
-            let path = file_backend_path(state_dir, account);
+            let dir = state_dir.join(secret_subdir(service));
+            let path = file_backend_path(&dir, account);
             if path.exists() {
                 fs::remove_file(&path)
                     .with_context(|| format!("Failed to remove {}", path.display()))?;
@@ -304,11 +305,11 @@ pub enum CmdToken {
     SecretService { service: String, account: String },
     /// 1Password item read via `op item get`.
     OnePassword { title: String },
-    /// Plain-file read via `cat`. Modelled by its varying parts — the state
-    /// directory and the [`AccountName`] — rather than a free `PathBuf`, so
-    /// the canonical `<dir>/github-pat/<account>.txt` layout holds by
-    /// construction and every representable value round-trips through
-    /// [`Display`](fmt::Display) / [`parse`](Self::parse).
+    /// Plain-file read via `cat`. `dir` is the per-service secret directory
+    /// (see [`secret_subdir`]) and `account` names the `<account>.txt` file
+    /// inside it, so the `<dir>/<account>.txt` layout holds by construction
+    /// and every value round-trips through [`Display`](fmt::Display) /
+    /// [`parse`](Self::parse).
     File { dir: PathBuf, account: AccountName },
 }
 
@@ -337,7 +338,7 @@ impl CmdToken {
     ///
     /// The match is the exact inverse of [`Display`](fmt::Display): a command
     /// that does not follow the canonical shape coop writes (including a
-    /// `cat` path not laid out as `…/github-pat/<name>.txt`) falls through to
+    /// `cat` path not of the form `…/<name>.txt`) falls through to
     /// `None` rather than being misattributed to a backend.
     pub fn parse(cmd: &str) -> Option<Self> {
         let body = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
@@ -385,7 +386,7 @@ impl CmdToken {
                 title: (*title).to_string(),
             }),
             ["cat", path] => {
-                parse_pat_file(Path::new(path)).map(|(dir, account)| Self::File { dir, account })
+                parse_file(Path::new(path)).map(|(dir, account)| Self::File { dir, account })
             }
             _ => None,
         }
@@ -423,21 +424,17 @@ impl fmt::Display for CmdToken {
 }
 
 /// Decompose a `cat` path into the parts of a [`CmdToken::File`], or `None`
-/// if it does not follow the canonical `<dir>/github-pat/<account>.txt`
-/// layout coop writes for the file backend.
+/// if it does not follow the `<dir>/<account>.txt` layout coop writes for the
+/// file backend.
 ///
-/// This is the exact inverse of joining those parts in
-/// [`file_backend_path`]: the `.txt` suffix and `github-pat` parent are
-/// stripped, and the filename stem must be a well-formed [`AccountName`].
-/// A path that fails any check is reported as `None` rather than being
-/// misattributed to the file backend.
-fn parse_pat_file(path: &Path) -> Option<(PathBuf, AccountName)> {
+/// The exact inverse of [`file_backend_path`]: the `.txt` suffix is stripped
+/// and the filename stem must be a well-formed [`AccountName`]; `dir` is the
+/// file's parent (the per-service secret directory). A path that fails any
+/// check is reported as `None` rather than being misattributed to the file
+/// backend.
+fn parse_file(path: &Path) -> Option<(PathBuf, AccountName)> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".txt")?;
-    let parent = path.parent()?;
-    if parent.file_name()?.to_str()? != PAT_DIR {
-        return None;
-    }
-    let dir = parent.parent()?.to_path_buf();
+    let dir = path.parent()?.to_path_buf();
     let account = AccountName::new(stem).ok()?;
     Some((dir, account))
 }
@@ -570,10 +567,10 @@ fn store_file(
     token: &str,
     state_dir: &Path,
 ) -> Result<CmdToken> {
-    let dir = state_dir.join(PAT_DIR);
+    let dir = state_dir.join(secret_subdir(service));
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     set_dir_mode(&dir, 0o700)?;
-    let path = file_backend_path(state_dir, account);
+    let path = file_backend_path(&dir, account);
     let mut f = OpenOptions::new()
         .create(true)
         .write(true)
@@ -588,16 +585,25 @@ fn store_file(
         f.write_all(b"\n")
             .with_context(|| format!("Failed to write {}", path.display()))?;
     }
-    // Suppress unused-warning for `service` when the file backend ignores it.
-    let _ = service;
     Ok(CmdToken::File {
-        dir: state_dir.to_path_buf(),
+        dir,
         account: account.clone(),
     })
 }
 
-fn file_backend_path(state_dir: &Path, account: &AccountName) -> PathBuf {
-    state_dir.join(PAT_DIR).join(format!("{account}.txt"))
+/// The per-service secret directory under the state dir for the file
+/// backend, derived by stripping coop's `coop-` service prefix — so
+/// `coop-github-pat` → `github-pat` (unchanged) and `coop-anthropic` →
+/// `anthropic`. Each secret kind gets its own namespace, so a proxy secret
+/// never lands among the GitHub PATs.
+fn secret_subdir(service: &str) -> &str {
+    service.strip_prefix("coop-").unwrap_or(service)
+}
+
+/// The file holding the secret: `<dir>/<account>.txt`, where `dir` is the
+/// per-service directory from [`secret_subdir`].
+fn file_backend_path(dir: &Path, account: &AccountName) -> PathBuf {
+    dir.join(format!("{account}.txt"))
 }
 
 fn set_dir_mode(path: &Path, mode: u32) -> Result<()> {
@@ -622,11 +628,14 @@ fn shell_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Conventional service name used across all backends.
+/// Service name for the GitHub PAT secret across all backends. The file
+/// backend derives its subdirectory from this via [`secret_subdir`]
+/// (`github-pat`).
 pub const SERVICE: &str = "coop-github-pat";
 
-/// Directory under `<data>/state/` holding file-backend PAT secrets.
-const PAT_DIR: &str = "github-pat";
+/// Service name for the Anthropic proxy credential (issue #411); its file
+/// backend subdirectory is `anthropic` (see [`secret_subdir`]).
+pub const ANTHROPIC_SERVICE: &str = "coop-anthropic";
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
@@ -658,7 +667,7 @@ mod tests {
 
     #[test]
     fn account_name_new_rejects_empty_and_slashes() {
-        // `new` is the parse-side smart constructor `parse_pat_file` relies
+        // `new` is the parse-side smart constructor `parse_file` relies
         // on: a `/` (single, repeated, or leading) in the filename stem would
         // make the path decomposition ambiguous, so it must be rejected here.
         // This pins what keeps the `File` round-trip unambiguous, independent
@@ -745,7 +754,7 @@ mod tests {
         assert!(cmd.to_string().starts_with("cmd:cat "));
         assert_eq!(cmd.backend(), Backend::File);
         // Verify the file exists with the right contents and mode.
-        let path = file_backend_path(tmp.path(), &acc);
+        let path = file_backend_path(&tmp.path().join(secret_subdir(SERVICE)), &acc);
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.trim(), "github_pat_xyz");
         let meta = std::fs::metadata(&path).unwrap();
@@ -758,7 +767,7 @@ mod tests {
         let acc = account("trailofbits/coop");
         // A token without a trailing newline gets exactly one appended.
         store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
-        let path = file_backend_path(tmp.path(), &acc);
+        let path = file_backend_path(&tmp.path().join(secret_subdir(SERVICE)), &acc);
         assert_eq!(std::fs::read(&path).unwrap(), b"tok\n");
     }
 
@@ -768,7 +777,7 @@ mod tests {
         let acc = account("trailofbits/coop");
         // A token already newline-terminated is stored verbatim, not doubled.
         store_file(SERVICE, &acc, "tok\n", tmp.path()).unwrap();
-        let path = file_backend_path(tmp.path(), &acc);
+        let path = file_backend_path(&tmp.path().join(secret_subdir(SERVICE)), &acc);
         assert_eq!(std::fs::read(&path).unwrap(), b"tok\n");
     }
 
@@ -777,7 +786,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let acc = account("trailofbits/coop");
         store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
-        let dir = tmp.path().join(PAT_DIR);
+        let dir = tmp.path().join(secret_subdir(SERVICE));
         let meta = std::fs::metadata(&dir).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
     }
@@ -788,7 +797,7 @@ mod tests {
         let acc = account("x/y");
         let _ = store_file(SERVICE, &acc, "token", tmp.path()).unwrap();
         delete_secret(Backend::File, SERVICE, &acc, tmp.path()).unwrap();
-        let path = file_backend_path(tmp.path(), &acc);
+        let path = file_backend_path(&tmp.path().join(secret_subdir(SERVICE)), &acc);
         assert!(!path.exists());
     }
 
@@ -846,15 +855,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_cat_without_canonical_layout() {
-        // A `cat` invocation that doesn't follow the `…/github-pat/<x>.txt`
-        // layout should not be reported as the File backend — otherwise
-        // `forget-pat` would happily try to delete a file coop never wrote.
+    fn parse_recognises_any_cat_txt_file() {
+        // The file layout is now per-service (`<dir>/<account>.txt`), so any
+        // `cat <dir>/<name>.txt` with a valid account stem is the File backend
+        // — deletion recomputes the path from the state dir + service, so this
+        // superset never causes coop to delete a file it did not write.
         assert_eq!(
-            backend_of("cmd:cat ~/some/path/secret.txt"),
-            None,
-            "cat invocation without github-pat in the path must not match File"
+            backend_of("cmd:cat ~/.coop/state/github-pat/x.txt"),
+            Some(Backend::File)
         );
+        assert_eq!(
+            backend_of("cmd:cat ~/.coop/state/anthropic/anthropic.txt"),
+            Some(Backend::File)
+        );
+        // A non-`.txt` suffix is still not a form coop writes.
         assert_eq!(
             backend_of("cmd:cat ~/.coop/state/github-pat/x.bin"),
             None,
@@ -913,7 +927,7 @@ mod tests {
     /// collide with the canonical layout (`github-pat`, a `*.txt` stem) —
     /// with free text (spaces, quotes, unicode, the empty path) so the
     /// round-trip is exercised on the inputs most likely to confuse the
-    /// `parse_pat_file` decomposition, not just random bytes. The NUL byte is
+    /// `parse_file` decomposition, not just random bytes. The NUL byte is
     /// excluded; no real filesystem path carries it.
     fn arb_dir() -> impl Strategy<Value = PathBuf> {
         prop_oneof![
