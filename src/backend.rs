@@ -3106,7 +3106,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             .unwrap();
         assert_eq!(
             provider["base_url"].as_str().unwrap(),
-            "http://127.0.0.1:9788"
+            "http://127.0.0.1:9788/v1"
         );
         // Proxy mode is transparent — no model pin (unlike local mode).
         assert!(!table.contains_key("model"));
