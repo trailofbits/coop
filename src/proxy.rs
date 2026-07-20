@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -37,6 +38,12 @@ const ANTHROPIC_BASE_PORT: u16 = 8788;
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
+
+/// How long to watch the reverse-tunnel `ssh` after spawn before treating it
+/// as established. With `ExitOnForwardFailure`, a refused `-R` bind makes `ssh`
+/// exit well within this window (the guest is already reachable — bootstrap
+/// SSH'd in moments earlier), so surviving it means the forward is bound.
+const TUNNEL_READY_GRACE: Duration = Duration::from_secs(2);
 
 /// A running Anthropic proxy and the values the guest config needs.
 #[derive(Debug, Clone)]
@@ -193,6 +200,27 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         .process_group(0)
         .spawn()
         .context("Failed to spawn the reverse SSH tunnel for the credential proxy")?;
+
+    // Confirm the tunnel actually came up before returning Ok — otherwise the
+    // guest boots pointed at a dead endpoint. `ssh` was not given `-f`, so this
+    // child *is* the tunnel; with `ExitOnForwardFailure=yes` it exits promptly
+    // when the guest refuses the `-R` bind. If it survives the grace window the
+    // forward is bound; if it exits first, fail closed with the ssh log.
+    let deadline = Instant::now() + TUNNEL_READY_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                bail!(
+                    "reverse SSH tunnel for the credential proxy exited before it was \
+                     established ({status}) — the guest may forbid TCP forwarding.\n{}",
+                    log.trim()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(e).context("Failed to poll the reverse SSH tunnel process"),
+        }
+    }
 
     let pid = child.id();
     let path = fwd_pid_path(inst, name);
