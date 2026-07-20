@@ -71,8 +71,8 @@ use commands::{
     QuickstartOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
     UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
     cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
-    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore,
-    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
+    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize,
+    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
     codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
     resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
 };
@@ -607,6 +607,11 @@ enum Commands {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Manage the credential-injecting proxy (issue #411)
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
     /// Validate configuration and check prerequisites
     Validate {
         /// Probe live state for each `[github.pat]` entry (talks to api.github.com)
@@ -762,6 +767,19 @@ enum GithubAction {
         /// Repo slug whose entry should be removed
         #[arg(long, required = true, value_parser = github_repo::RepoSlug::parse_cli)]
         repo: github_repo::RepoSlug,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// Store an Anthropic credential in a secret backend and wire it into
+    /// `[proxy.anthropic]`. Defaults to a Claude `setup-token` (subscription);
+    /// pass `--api-key` for an Anthropic API key.
+    Setup {
+        /// Store an Anthropic API key (`x-api-key`) instead of a Claude
+        /// `setup-token`.
+        #[arg(long)]
+        api_key: bool,
     },
 }
 
@@ -1310,6 +1328,7 @@ pub fn run() -> Result<()> {
             &action.unwrap_or(ProfilesAction::List { json: false }),
         ),
         Commands::Github { action } => cmd_github(&cfg, &cli.config, action),
+        Commands::Proxy { action } => cmd_proxy(&cfg, &cli.config, &action),
         Commands::Validate { probe } => cmd_validate(&cfg, &be, probe),
         Commands::Init
         | Commands::Update { .. }

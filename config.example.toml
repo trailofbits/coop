@@ -112,6 +112,9 @@
 #                                   # Applies only in remote model mode
 #                                   # (`coop model <vm> remote`); local mode
 #                                   # takes precedence. Firecracker-only for now.
+# `coop proxy setup` writes this block for you: it takes a pasted Claude
+# setup-token (or `--api-key`), stores it in Keychain / 1Password / a 0600
+# file, and fills in the `cmd:` reference below.
 # [proxy.anthropic]
 # credential = "cmd:op read op://Private/Anthropic/credential"  # same "cmd:" support
 # auth = "api_key"                  # api_key → x-api-key (default); bearer →

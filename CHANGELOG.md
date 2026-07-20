@@ -18,6 +18,14 @@
   Firecracker only for now; Codex, GitHub, and the Firecracker jail are tracked
   follow-ups. `coop update` keeps `coop` and `coop-proxy` in lockstep.
 
+- **`coop proxy setup` — store the Anthropic credential like a GitHub PAT**
+  (#411) — Mirrors the `coop github` PAT wizard: paste a Claude `setup-token`
+  (or `--api-key`), pick a secret backend (macOS Keychain / Linux
+  secret-service / 1Password / 0600 file), and coop stores it and writes the
+  `cmd:` reference into `[proxy.anthropic]` — the credential is never plaintext
+  in the config. The secret store is now namespaced per service, so proxy
+  secrets live under their own directory rather than among the GitHub PATs.
+
 ## v0.5.4
 
 ### New features

@@ -26,6 +26,15 @@ guest nothing.
 
 ## Enabling it
 
+The easiest path is `coop proxy setup`: it takes a pasted Claude `setup-token`
+(or `--api-key`), stores it in a secret backend of your choice (macOS Keychain /
+Linux secret-service / 1Password / a 0600 file), and writes the `[proxy.anthropic]`
+block for you with a `cmd:` reference — so the credential is never plaintext in
+the config. To generate a subscription token first, run `claude setup-token` on
+the host (needs a Claude subscription; the token is inference-scoped, ~1 year).
+
+Or configure it by hand:
+
 ```toml
 [proxy.anthropic]
 credential = "cmd:op read op://Private/Anthropic/credential"  # or a plain key
