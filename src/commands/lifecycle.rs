@@ -1531,8 +1531,7 @@ fn bootstrap_and_post_start(
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
         let guest_host = be.guest_host_address(&cfg.network);
-        let proxy_bind_ip = be.proxy_bind_ip(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host, proxy_bind_ip)?;
+        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     }
     if let Some(cmd) = post_start {
         backend::run_post_start(&session, cmd);

@@ -2,34 +2,37 @@
 //!
 //! `coop-proxy` is a separate binary (its own workspace crate) that runs on
 //! the host for the lifetime of a remote-mode VM. This module resolves the
-//! real credential, mints a per-instance capability token, and spawns/​tears
-//! down the proxy process — the same shape as the `port_forward` SSH
-//! supervision, but for our own binary tracked by a PID file.
+//! real credential, mints a per-instance capability token, spawns the proxy
+//! process (bound on host loopback), and exposes it into the guest with a
+//! per-instance `ssh -R` reverse tunnel — both tracked by PID files.
 //!
-//! The guest never receives the real credential: it is pointed at
-//! `http://<gateway>:<port>` and holds only the capability token, which the
-//! proxy verifies before injecting the real credential upstream. See
-//! [`docs/design/issue-411-injecting-proxy.md`].
+//! Binding host loopback + reverse-tunnelling works identically on both
+//! backends (Firecracker and Lima), keeps the listener off every non-loopback
+//! interface, and gives each guest its own tunnel (no shared-bridge exposure).
+//! The guest is pointed at `http://127.0.0.1:<port>` and holds only the
+//! capability token, which the proxy verifies before injecting the real
+//! credential upstream. See [`docs/design/issue-411-injecting-proxy.md`].
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::backend::SshTarget;
 use crate::config::{Instance, ProxyAuthScheme, ProxyConfig, resolve_cmd_value};
 
 /// The fixed Anthropic upstream. The guest cannot influence this — only the
 /// request path is forwarded (closes SSRF).
 const ANTHROPIC_UPSTREAM_HOST: &str = "api.anthropic.com";
 
-/// Base host port for the per-instance Anthropic proxy. The actual port is
-/// `BASE + instance index`, so concurrent VMs sharing the bridge gateway IP
-/// never collide (mirrors the per-instance `guest_ip` scheme).
+/// Base port for the per-instance Anthropic proxy. The actual port is
+/// `BASE + instance index`, so concurrent VMs never collide on host loopback.
+/// The same number is used on the guest's loopback via the reverse tunnel.
 const ANTHROPIC_BASE_PORT: u16 = 8788;
 
 /// The proxy binary name, expected next to the `coop` binary.
@@ -38,7 +41,7 @@ const PROXY_BIN_NAME: &str = "coop-proxy";
 /// A running Anthropic proxy and the values the guest config needs.
 #[derive(Debug, Clone)]
 pub struct AnthropicProxy {
-    /// Base URL the guest is pointed at, e.g. `http://172.16.0.1:8788`.
+    /// Base URL the guest is pointed at, e.g. `http://127.0.0.1:8788`.
     pub base_url: String,
     /// Per-instance capability token the guest presents (as
     /// `ANTHROPIC_AUTH_TOKEN` → `Authorization: Bearer`).
@@ -51,17 +54,18 @@ pub struct RunningProxies {
     pub anthropic: Option<AnthropicProxy>,
 }
 
-/// Start the configured proxies for `inst`, binding on `bind_ip` (the
-/// backend's guest-visible gateway address). Returns `Ok(None)` when proxy
-/// mode is not configured.
+/// Start the configured proxies for `inst`: bind the proxy on host loopback
+/// and open a reverse SSH tunnel via `target` so the guest reaches it at
+/// `127.0.0.1:<port>`. Returns `Ok(None)` when proxy mode is not configured.
 ///
-/// **Fail closed:** if the credential cannot be resolved, this returns an
-/// error and the VM start is aborted — the guest never comes up on a path
-/// where the agent silently has no or the wrong credential.
+/// **Fail closed:** if the credential cannot be resolved (or the tunnel cannot
+/// be established), this returns an error and the VM start is aborted — the
+/// guest never comes up on a path where the agent silently has no or the wrong
+/// credential.
 pub fn start(
     inst: &Instance,
     cfg: &ProxyConfig,
-    bind_ip: Ipv4Addr,
+    target: &SshTarget,
 ) -> Result<Option<RunningProxies>> {
     let Some(anthropic_cfg) = &cfg.anthropic else {
         return Ok(None);
@@ -73,7 +77,8 @@ pub fn start(
     )?;
 
     let token = mint_capability_token()?;
-    let listen = SocketAddr::from((bind_ip, anthropic_port(inst)));
+    let port = anthropic_port(inst);
+    let listen = SocketAddr::from(([127, 0, 0, 1], port));
     let json = wire_config_json(
         &listen,
         &token,
@@ -83,20 +88,27 @@ pub fn start(
     )?;
 
     spawn_proxy(inst, "anthropic", &json)?;
-    tracing::info!("Started Anthropic credential proxy on {listen}");
+    // Expose the loopback proxy into the guest. If the tunnel fails, tear the
+    // proxy back down so we don't leave it orphaned (fail closed).
+    if let Err(e) = spawn_reverse_forward(inst, "anthropic", target, port) {
+        stop(inst);
+        return Err(e);
+    }
+    tracing::info!("Started Anthropic credential proxy on {listen} (guest → 127.0.0.1:{port})");
 
     Ok(Some(RunningProxies {
         anthropic: Some(AnthropicProxy {
-            base_url: format!("http://{listen}"),
+            base_url: format!("http://127.0.0.1:{port}"),
             capability_token: token,
         }),
     }))
 }
 
-/// Tear down every proxy process for `inst`. Best-effort, safe to call when
-/// none were started (mirrors `teardown_ssh_forwards`).
+/// Tear down every proxy process and tunnel for `inst`. Best-effort, safe to
+/// call when none were started (mirrors `teardown_ssh_forwards`).
 pub fn stop(inst: &Instance) {
-    stop_one(inst, "anthropic");
+    kill_pid_file(&pid_path(inst, "anthropic"), "anthropic proxy");
+    kill_pid_file(&fwd_pid_path(inst, "anthropic"), "anthropic proxy tunnel");
 }
 
 // ── process supervision ──────────────────────────────────────
@@ -104,7 +116,7 @@ pub fn stop(inst: &Instance) {
 fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     // A previous run may have crashed without stop cleanup; kill any leftover
     // before binding so we don't race it for the same port.
-    stop_one(inst, name);
+    kill_pid_file(&pid_path(inst, name), "stale proxy");
 
     let bin = locate_proxy_binary()?;
     let log_path = inst.dir.join(format!("proxy-{name}.log"));
@@ -147,25 +159,71 @@ fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     Ok(())
 }
 
-fn stop_one(inst: &Instance, name: &str) {
-    let path = pid_path(inst, name);
-    let Ok(contents) = fs::read_to_string(&path) else {
+/// Establish a per-instance reverse SSH tunnel so the guest reaches the
+/// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
+/// and tracked by a PID file like the proxy process, so teardown needs no SSH
+/// target. `ExitOnForwardFailure` makes a bind clash on the guest a loud
+/// failure rather than a silently dead tunnel.
+fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: u16) -> Result<()> {
+    kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
+
+    let log_path = inst.dir.join(format!("proxy-{name}-fwd.log"));
+    let log = File::create(&log_path)
+        .with_context(|| format!("Failed to create proxy tunnel log {}", log_path.display()))?;
+
+    let mut args = target.ssh_opts();
+    args.extend([
+        "-N".into(),
+        "-T".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-R".into(),
+        format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+    ]);
+    args.push(target.addr());
+
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        // New process group so the tunnel outlives the foreground command.
+        .process_group(0)
+        .spawn()
+        .context("Failed to spawn the reverse SSH tunnel for the credential proxy")?;
+
+    let pid = child.id();
+    let path = fwd_pid_path(inst, name);
+    if let Err(e) = fs::write(&path, pid.to_string()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e)
+            .with_context(|| format!("Failed to write proxy tunnel pid file {}", path.display()));
+    }
+    Ok(())
+}
+
+/// SIGTERM the process named by a PID file and remove the file. Best-effort;
+/// safe when the file is absent or malformed.
+fn kill_pid_file(path: &Path, label: &str) {
+    let Ok(contents) = fs::read_to_string(path) else {
         return;
     };
     match contents.trim().parse::<i32>() {
         Ok(pid) if pid > 0 => {
-            // SIGTERM → the proxy stops accepting and exits cleanly.
-            // Safety: `kill` with a parsed pid and a constant signal.
+            // Safety: `kill` with a parsed positive pid and a constant signal.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
-            tracing::debug!("Sent SIGTERM to {name} proxy (pid {pid})");
+            tracing::debug!("Sent SIGTERM to {label} (pid {pid})");
         }
-        _ => tracing::debug!("Ignoring malformed proxy pid file {}", path.display()),
+        _ => tracing::debug!("Ignoring malformed pid file {}", path.display()),
     }
-    if let Err(e) = fs::remove_file(&path) {
+    if let Err(e) = fs::remove_file(path) {
         tracing::debug!(
-            "Failed to remove proxy pid file {} (non-fatal): {e}",
+            "Failed to remove pid file {} (non-fatal): {e}",
             path.display()
         );
     }
@@ -173,6 +231,10 @@ fn stop_one(inst: &Instance, name: &str) {
 
 fn pid_path(inst: &Instance, name: &str) -> PathBuf {
     inst.dir.join(format!("proxy-{name}.pid"))
+}
+
+fn fwd_pid_path(inst: &Instance, name: &str) -> PathBuf {
+    inst.dir.join(format!("proxy-{name}-fwd.pid"))
 }
 
 fn locate_proxy_binary() -> Result<PathBuf> {

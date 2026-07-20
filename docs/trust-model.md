@@ -130,15 +130,15 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - `rewrite_host_url` rewrites a loopback local-model endpoint to the
   guest-visible gateway address so the guest can reach a model server running
   on the host; non-loopback URLs pass through unchanged.
-- **The credential proxy (issue #411) is the one deliberate non-loopback
-  bind.** `coop-proxy` must be reachable from the guest, so it binds the
-  backend's guest-only gateway interface (Firecracker: the `br0` bridge IP,
-  `backend.rs:proxy_bind_ip`) — never `0.0.0.0` (it refuses an unspecified
-  address at bind) and never the LAN. It is guarded by a per-instance
-  capability token and forwards only to a fixed upstream (`api.anthropic.com`),
-  never a guest-supplied host. Its own TLS-verifying outbound HTTPS is the
-  intended egress; a change that lets the guest influence the upstream host, or
-  that binds anything wider than the gateway, is a finding.
+- **The credential proxy (issue #411) binds host loopback** (`127.0.0.1`, it
+  refuses an unspecified address at bind) and is exposed into the guest with a
+  per-instance `ssh -R` reverse tunnel (`proxy.rs:spawn_reverse_forward`), so —
+  like the port-forwards above — it never binds a non-loopback interface and is
+  reachable by exactly one guest, identically on both backends. It is guarded
+  by a per-instance capability token and forwards only to a fixed upstream
+  (`api.anthropic.com`), never a guest-supplied host. Its own TLS-verifying
+  outbound HTTPS is the intended egress; a change that lets the guest influence
+  the upstream host, or that binds anything wider than loopback, is a finding.
 
 ## `coop update` trust chain
 

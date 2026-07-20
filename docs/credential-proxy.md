@@ -1,6 +1,6 @@
 # Credential-injecting proxy (`[proxy]`)
 
-Status: **v1 — Anthropic (Claude Code), Firecracker only.** Opt-in; off by
+Status: **v1 — Anthropic (Claude Code); Firecracker and Lima.** Opt-in; off by
 default. Design: [`design/issue-411-injecting-proxy.md`](design/issue-411-injecting-proxy.md).
 
 ## What it does
@@ -12,9 +12,10 @@ its own environment and, with egress open, exfiltrate it.
 With proxy mode, the raw credential **never enters the guest**. coop runs a
 small host-side reverse proxy (`coop-proxy`) for the lifetime of the VM:
 
-- The guest is pointed at `http://<gateway>:<port>` (via `ANTHROPIC_BASE_URL`
-  in the managed `~/.claude/settings.json`) and holds only a **per-instance
-  capability token** (as `ANTHROPIC_AUTH_TOKEN`).
+- The proxy binds host loopback and is exposed into the guest by a per-instance
+  `ssh -R` reverse tunnel; the guest is pointed at `http://127.0.0.1:<port>`
+  (via `ANTHROPIC_BASE_URL` in the managed `~/.claude/settings.json`) and holds
+  only a **per-instance capability token** (as `ANTHROPIC_AUTH_TOKEN`).
 - The proxy verifies that token (constant-time), strips it, injects the real
   credential (`x-api-key`, or `Authorization: Bearer` for a `setup-token`), and
   streams the request to the pinned upstream `api.anthropic.com` over TLS.
@@ -68,14 +69,13 @@ disk. It does **not**:
 The proxy itself is new attack surface, mitigated by a fixed per-route upstream
 (the guest controls only the path, never the host — closing SSRF), TLS
 verification against a pinned root set, a required capability token, and
-resource limits. On Firecracker the listener binds only the bridge gateway,
-reachable from the guests and not the LAN.
+resource limits. The listener binds only host loopback and is reverse-tunnelled
+to exactly one guest — never a non-loopback interface, never the LAN.
 
 ## Platform support
 
-**Firecracker (Linux) only for now.** The proxy binds the bridge gateway IP,
-which every guest reaches as its default gateway. On Lima/macOS there is no
-first-class host-side bind address yet, so proxy mode fails closed with a clear
-message; enabling it there is a tracked follow-up (see the design's
-cross-platform hardening section). Not yet built: Codex (routes to API-key mode
-regardless), GitHub, and the Firecracker uid/netns jail.
+**Firecracker (Linux) and Lima (macOS).** The proxy binds `127.0.0.1` on the
+host and is exposed into the guest with a per-instance `ssh -R` reverse tunnel,
+so it works identically on both backends (each already keeps an SSH channel to
+its guest). Not yet built: Codex (routes to API-key mode regardless), GitHub,
+and the Firecracker uid/netns jail.
