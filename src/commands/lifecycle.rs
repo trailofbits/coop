@@ -1538,6 +1538,18 @@ fn bootstrap_and_post_start(
         backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     }
     if let Some(cmd) = post_start {
+        // Agent bootstrap may have just minted the per-instance capability
+        // token (proxy mode), which is forwarded to sessions via `SendEnv`
+        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
+        // the token existed, so re-prepare it here — otherwise a `post_start`
+        // that runs Codex in proxy mode would lack the token and fail to
+        // authenticate. Under --no-agents no proxy started, so nothing new to
+        // pick up; keep the original session.
+        let session = if opts.no_agents {
+            session
+        } else {
+            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
+        };
         backend::run_post_start(&session, cmd);
     }
     Ok(())
