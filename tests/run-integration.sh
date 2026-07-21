@@ -33,6 +33,14 @@ if [[ -z "$REMOTE_HOST" ]]; then
     echo "Building coop (release)..."
     cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
 
+    # coop-proxy (issue #411) is a separate workspace member — it needs cmake
+    # (aws-lc-rs), so it is intentionally not a default member. Build it
+    # best-effort next to coop so the credential-proxy phase can run; if it
+    # fails (e.g. cmake missing) that phase skips rather than blocking the suite.
+    if ! cargo build --release -p coop-proxy --manifest-path "$PROJECT_DIR/Cargo.toml"; then
+        echo "warning: coop-proxy build failed (cmake missing?) — proxy phase will skip" >&2
+    fi
+
     BINARY="$PROJECT_DIR/target/release/coop"
     exec "$TEST_SCRIPT" --binary "$BINARY" "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
 fi
@@ -54,13 +62,25 @@ echo "Cross-compiling for $TARGET..."
 cargo build --release --target "$TARGET" \
     --manifest-path "$PROJECT_DIR/Cargo.toml"
 
+# Best-effort coop-proxy (issue #411): a separate workspace member needing
+# cmake + a C toolchain for the target. Ship it alongside coop so `coop` can
+# spawn it (it looks next to itself); the proxy phase skips if it isn't present.
+if ! cargo build --release --target "$TARGET" -p coop-proxy \
+    --manifest-path "$PROJECT_DIR/Cargo.toml"; then
+    echo "warning: coop-proxy build failed for $TARGET (cmake/toolchain?) — proxy phase will skip" >&2
+fi
+
 LOCAL_BINARY="$PROJECT_DIR/target/$TARGET/release/coop"
+LOCAL_PROXY="$PROJECT_DIR/target/$TARGET/release/coop-proxy"
 
 REMOTE_DIR=$(ssh "$REMOTE_HOST" mktemp -d)
 trap 'ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
 scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$REMOTE_HOST:$REMOTE_DIR/"
+if [[ -f "$LOCAL_PROXY" ]]; then
+    scp -q "$LOCAL_PROXY" "$REMOTE_HOST:$REMOTE_DIR/"
+fi
 
 # Build the remote command as an array, then printf %q to safely quote for ssh.
 # ssh doesn't forward arbitrary env vars, so pass opt-in flags explicitly.
