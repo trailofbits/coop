@@ -157,7 +157,7 @@ pub(crate) fn render_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
 | `logs` | no | — | A stream; NDJSON adds ~nothing over raw text. |
 | `profiles show`, `github show` | no | — | Single-item detail dumps; wrap only if a consumer appears. |
 | `up`/`start`/`setup`/`quickstart`/`resize`/`commit`/`restore`/`stop`/`destroy`/`push`/`pull` | no | — | Mutations. Output is side effect + tracing (stderr). |
-| `shell`/`claude`/`claude-agents`/`codex`/`exec`/`vscode` | no | — | Interactive / passthrough; stdout is the guest's. |
+| `shell`/`claude`/`claude-agents`/`codex`/`exec`/`editor` | no | — | Interactive / passthrough; stdout is the guest's. |
 | `ssh-config` | no | — | Emits SSH config text, not data. |
 | `model local`/`remote`, `github setup-pat`/`rotate-pat`/`forget-pat`, `devcontainer ignore`/`clear` | no | — | Mutations; several prompt on a TTY. |
 | `init`/`update`/`uninstall`/`completions` | no | — | Installer/meta actions. |

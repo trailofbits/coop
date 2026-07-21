@@ -599,14 +599,23 @@ pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> R
     Ok(())
 }
 
-/// Generate SSH config and launch VS Code Remote SSH.
+/// Editor that can attach to the guest over SSH remote development.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum EditorKind {
+    /// VS Code, via the Remote-SSH extension
+    Code,
+    /// Zed, via `ssh://` remoting
+    Zed,
+}
+
+/// Generate SSH config and launch an editor connected over SSH.
 ///
 /// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — VS Code needs a live SSH target.
-pub fn vscode(
+/// visible in the signature — the editor needs a live SSH target.
+pub fn open_editor(
     running: &RunningInstance,
     project: Option<&str>,
-    editor: Option<&str>,
+    editor: Option<EditorKind>,
 ) -> Result<()> {
     let inst = running.instance();
     let remote_path = match project {
@@ -624,7 +633,7 @@ pub fn vscode(
 ///
 /// Writes the `Host coop-<name>` block to `~/.ssh/config` idempotently,
 /// then prints the block plus `ssh`/`scp`/`rsync` usage hints to stderr.
-/// Shared by `coop vscode` (which also launches an editor) and the
+/// Shared by `coop editor` (which also launches an editor) and the
 /// standalone `coop ssh-config` command.
 ///
 /// Takes a `RunningInstance` so the SSH target is proven live by the
@@ -1159,6 +1168,10 @@ fn remove_named_marker_block(content: &str, host: &str) -> String {
     }
 }
 
+const CODE_INSTALL_HINT: &str =
+    "To install the `code` CLI: open VS Code, Cmd+Shift+P, 'Shell Command: Install'";
+const ZED_INSTALL_HINT: &str = "To install the `zed` CLI: open Zed, Cmd+Shift+P, 'cli: install'";
+
 struct LaunchStrategy {
     name: &'static str,
     cmd: String,
@@ -1189,14 +1202,51 @@ fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStr
     strategies
 }
 
-fn launch_editor(inst: &Instance, remote_path: &GuestPath, editor: Option<&str>) -> Result<()> {
-    let host = ssh_config_host(inst);
-    let remote_arg = format!("ssh-remote+{host}");
+fn zed_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
+    // Zed shells out to the system `ssh`, so the `coop-<name>` alias in
+    // ~/.ssh/config supplies host, port, user, and key.
+    let url = format!("ssh://{host}{remote_path}");
+    let mut strategies = vec![LaunchStrategy {
+        name: "zed CLI",
+        cmd: "zed".into(),
+        args: vec![url],
+    }];
+    if cfg!(target_os = "macos") {
+        strategies.push(LaunchStrategy {
+            name: "macOS open zed:// URL",
+            cmd: "open".into(),
+            args: vec![format!("zed://ssh/{host}{remote_path}")],
+        });
+    }
+    strategies
+}
 
-    let strategies = match editor {
-        None | Some("code") => vscode_strategies(&remote_arg, remote_path),
-        Some(other) => bail!("Unknown editor '{other}'. Supported: code"),
-    };
+/// Launch order for `editor`: an explicit choice pins its strategies;
+/// no choice tries VS Code first, then falls through to Zed.
+fn editor_strategies(
+    editor: Option<EditorKind>,
+    host: &str,
+    remote_path: &GuestPath,
+) -> Vec<LaunchStrategy> {
+    let remote_arg = format!("ssh-remote+{host}");
+    match editor {
+        Some(EditorKind::Code) => vscode_strategies(&remote_arg, remote_path),
+        Some(EditorKind::Zed) => zed_strategies(host, remote_path),
+        None => {
+            let mut strategies = vscode_strategies(&remote_arg, remote_path);
+            strategies.extend(zed_strategies(host, remote_path));
+            strategies
+        }
+    }
+}
+
+fn launch_editor(
+    inst: &Instance,
+    remote_path: &GuestPath,
+    editor: Option<EditorKind>,
+) -> Result<()> {
+    let host = ssh_config_host(inst);
+    let strategies = editor_strategies(editor, &host, remote_path);
 
     let mut tried = Vec::new();
     for strategy in &strategies {
@@ -1222,15 +1272,19 @@ fn launch_editor(inst: &Instance, remote_path: &GuestPath, editor: Option<&str>)
         }
     }
 
+    let hints: &[&str] = match editor {
+        Some(EditorKind::Code) => &[CODE_INSTALL_HINT],
+        Some(EditorKind::Zed) => &[ZED_INSTALL_HINT],
+        None => &[CODE_INSTALL_HINT, ZED_INSTALL_HINT],
+    };
     bail!(
-        "Could not open VS Code. Tried:\n{}\n\n\
-         To install the `code` CLI: open VS Code, \
-         Cmd+Shift+P, 'Shell Command: Install'",
+        "Could not open an editor. Tried:\n{}\n\n{}",
         tried
             .iter()
             .map(|n| format!("  - {n}"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        hints.join("\n")
     );
 }
 
@@ -1261,6 +1315,37 @@ mod tests {
         assert_eq!(code.cmd, "code");
         let args: Vec<&str> = code.args.iter().map(String::as_str).collect();
         assert_eq!(args, ["--remote", "ssh-remote+coop-test", "/workspace"]);
+    }
+
+    #[test]
+    fn zed_strategies_first_is_zed_cli() {
+        let path = GuestPath::new("/workspace");
+        let strategies = zed_strategies("coop-test", &path);
+        // The `zed` CLI strategy is present on every platform (the macOS
+        // `open zed://` fallback is appended after it).
+        let zed = &strategies[0];
+        assert_eq!(zed.name, "zed CLI");
+        assert_eq!(zed.cmd, "zed");
+        let args: Vec<&str> = zed.args.iter().map(String::as_str).collect();
+        assert_eq!(args, ["ssh://coop-test/workspace"]);
+    }
+
+    #[test]
+    fn editor_strategies_explicit_choice_pins_editor() {
+        let path = GuestPath::new("/workspace");
+        let code = editor_strategies(Some(EditorKind::Code), "coop-test", &path);
+        assert!(code.iter().all(|s| s.cmd != "zed"));
+        let zed = editor_strategies(Some(EditorKind::Zed), "coop-test", &path);
+        assert!(zed.iter().all(|s| s.cmd != "code"));
+    }
+
+    #[test]
+    fn editor_strategies_default_tries_code_before_zed() {
+        let path = GuestPath::new("/workspace");
+        let strategies = editor_strategies(None, "coop-test", &path);
+        let code_pos = strategies.iter().position(|s| s.cmd == "code");
+        let zed_pos = strategies.iter().position(|s| s.cmd == "zed");
+        assert!(code_pos.expect("code present") < zed_pos.expect("zed present"));
     }
 
     #[test]

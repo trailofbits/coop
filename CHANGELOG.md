@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### New features
+
+- **`coop editor` — VS Code or Zed** — `coop vscode` is now `coop editor`
+  (the old name remains as an alias). `--editor` takes `code` or `zed`;
+  when omitted, coop tries VS Code first, then Zed. Zed connects with
+  `zed ssh://coop-<name>/<path>`, reusing the same `~/.ssh/config` alias
+  block that VS Code's Remote-SSH uses.
+
 ## v0.5.4
 
 ### New features

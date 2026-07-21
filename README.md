@@ -44,7 +44,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 - **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
 - **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
 - **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
-- **VS Code remote SSH**: `coop vscode` opens VS Code connected to the guest
+- **Editor remote SSH**: `coop editor` opens VS Code or Zed connected to the guest
 - **Multi-instance**: run multiple VMs side by side, each with its own name and disk
 - **Reconfigure in place**: change a stopped instance's disk, memory, or vCPUs with `coop resize` (e.g. `coop resize --size +20 --mem 8192 --vcpus 4`) — no destroy/recreate
 - **Commit and restore**: save a stopped instance's filesystem as a reusable image with `coop commit`, and roll an instance back to it in place with `coop restore` — a `docker container commit`-style checkpoint for risky agent runs
@@ -72,7 +72,7 @@ That gives you a Claude Code or Codex session running inside an isolated VM with
 | `status` | Show instance status and resource usage |
 | `model` | Show or switch a VM's model backend (cloud vs. local) |
 | `logs` | Stream VM serial console output |
-| `vscode` | Open VS Code connected to the guest |
+| `editor` | Open VS Code or Zed connected to the guest |
 | `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
 | `images` | List or delete template images |
 | `profiles` | List or inspect available profiles |
@@ -167,7 +167,7 @@ Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are a
 - [Workspace sync](docs/workspaces.md)
 - [Claude Code integration](docs/claude-integration.md)
 - [Codex integration](docs/codex-integration.md)
-- [VS Code integration](docs/vscode.md)
+- [Editor integration](docs/editor.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)
 - [Shell completion](docs/shell-completion.md)

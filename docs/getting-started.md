@@ -340,7 +340,7 @@ coop images --delete python-dev
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
 | `coop logs` | Stream VM serial console logs (`-f` to follow) |
-| `coop vscode` | Open VS Code connected to the guest via SSH |
+| `coop editor` | Open VS Code or Zed connected to the guest via SSH |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |
@@ -354,6 +354,6 @@ coop images --delete python-dev
 - [Workspace sync](workspaces.md)
 - [Claude Code integration](claude-integration.md)
 - [Codex integration](codex-integration.md)
-- [VS Code and editor integration](vscode.md)
+- [Editor integration](editor.md)
 - [Running multiple instances](multi-instance.md)
 - [Platform backends](backends.md)
