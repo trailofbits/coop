@@ -4107,6 +4107,14 @@ test_proxy() {
         skip "credential-proxy test (curl not available on host)"
         return
     fi
+    # The proxy needs the `coop-proxy` binary next to `coop`. It is not a
+    # default workspace member (it needs cmake for aws-lc-rs), so a plain
+    # `cargo build` / older deploy may not have it; skip rather than fail the
+    # fail-closed `up` when it's absent.
+    if [[ ! -x "$(dirname "$BINARY")/coop-proxy" ]]; then
+        skip "credential-proxy test (coop-proxy not built alongside coop)"
+        return
+    fi
 
     local inst_name="${INSTANCE}-proxy"
     local px_dir
