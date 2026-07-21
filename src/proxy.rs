@@ -42,6 +42,18 @@ const PROXY_BIN_NAME: &str = "coop-proxy";
 /// SSH'd in moments earlier), so surviving it means the forward is bound.
 const TUNNEL_READY_GRACE: Duration = Duration::from_secs(2);
 
+/// How long to wait for the freshly spawned proxy to accept a connection on
+/// its host-loopback listener before treating the launch as failed. This
+/// enforces fail-closed startup: when confinement *fails to establish* the
+/// proxy exits before binding (an unsupported kernel makes Landlock's
+/// `apply` bail on Linux; a missing `sandbox-exec` or a malformed Seatbelt
+/// profile makes the wrapper exit non-zero on macOS), so this probe never
+/// connects and the VM start aborts rather than proceeding with a dead
+/// credential proxy. It confirms the proxy *bound* — the *strength* of the
+/// confinement is asserted separately by `coop-proxy --jail-selftest` in the
+/// integration suite, not by liveness here.
+const PROXY_READY_GRACE: Duration = Duration::from_secs(5);
+
 /// A proxied upstream. The binary is provider-agnostic; this enum carries the
 /// host-side per-provider constants (upstream host, base port, file/tunnel
 /// name) so one code path serves both.
@@ -145,7 +157,7 @@ pub fn start_provider(
         &credential,
     )?;
 
-    spawn_proxy(inst, provider.name(), &json)?;
+    spawn_proxy(inst, provider.name(), listen, &json)?;
     // Persist the capability token for providers that forward it via env on
     // later sessions (Codex); Claude reads its token from the returned handle
     // (settings.json) and keeps it out of host disk. Written after spawn so a
@@ -208,7 +220,7 @@ pub fn read_capability_token(inst: &Instance, provider: Provider) -> Option<Stri
 
 // ── process supervision ──────────────────────────────────────
 
-fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
+fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> Result<()> {
     // A previous run may have crashed without stop cleanup; kill any leftover
     // before binding so we don't race it for the same port.
     kill_pid_file(&pid_path(inst, name), "stale proxy");
@@ -218,7 +230,7 @@ fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     let log = File::create(&log_path)
         .with_context(|| format!("Failed to create proxy log {}", log_path.display()))?;
 
-    let mut child = Command::new(&bin)
+    let mut child = confined_command(&bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
@@ -238,6 +250,17 @@ fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     // Drop closes stdin (EOF) so the proxy finishes reading its config.
     drop(stdin);
 
+    // Fail closed: confirm the proxy bound its listener before recording it.
+    // When confinement (Landlock on Linux, Seatbelt on macOS) cannot be
+    // established the proxy exits before binding, so this probe never connects
+    // and the launch aborts — a credential proxy that could not be jailed never
+    // reaches a serving state. Kill the child on failure so it is not orphaned.
+    if let Err(e) = await_proxy_ready(&mut child, listen, &log_path) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+
     let pid = child.id();
     let pid_path = pid_path(inst, name);
     if let Err(e) = fs::write(&pid_path, pid.to_string()) {
@@ -253,6 +276,76 @@ fn spawn_proxy(inst: &Instance, name: &str, json: &str) -> Result<()> {
     // lifetime, and the std `Child` destructor does not kill it.
     Ok(())
 }
+
+/// Poll until the proxy accepts a connection on its host-loopback listener, or
+/// fail closed. Returns an error (carrying the proxy log) if the proxy exits
+/// early or never begins serving within [`PROXY_READY_GRACE`].
+fn await_proxy_ready(
+    child: &mut std::process::Child,
+    listen: SocketAddr,
+    log_path: &Path,
+) -> Result<()> {
+    let deadline = Instant::now() + PROXY_READY_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let log = fs::read_to_string(log_path).unwrap_or_default();
+                bail!(
+                    "credential proxy exited before it began serving ({status}) — its \
+                     confinement or bind failed; refusing to start the VM (fail-closed).\n{}",
+                    log.trim()
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e).context("Failed to poll the credential proxy process"),
+        }
+        if std::net::TcpStream::connect_timeout(&listen, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let log = fs::read_to_string(log_path).unwrap_or_default();
+            bail!(
+                "credential proxy did not begin serving on {listen} within \
+                 {PROXY_READY_GRACE:?} — refusing to start the VM (fail-closed).\n{}",
+                log.trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Build the `Command` that launches `coop-proxy` under the platform's process
+/// confinement (issue #411, slice 3).
+///
+/// On Linux the proxy self-confines with Landlock unconditionally (it never
+/// receives a `--no-jail` opt-out from `coop`), so the command is the binary
+/// itself. On macOS — which has no first-class in-process sandbox — the
+/// launcher wraps it in `sandbox-exec` with a Seatbelt profile
+/// ([`SEATBELT_PROFILE`]) that denies filesystem writes and program execution
+/// and limits egress to the two upstream ports. `sandbox-exec`
+/// `execve`-replaces itself with the proxy, so the spawned pid is the proxy's
+/// and teardown is unchanged.
+fn confined_command(bin: &Path) -> Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("sandbox-exec");
+        cmd.arg("-p").arg(SEATBELT_PROFILE).arg(bin);
+        cmd
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Command::new(bin)
+    }
+}
+
+/// Seatbelt profile confining `coop-proxy` on macOS. Kept as a checked-in
+/// `.sb` file so it is the single source of truth shared by the launcher
+/// (here) and the integration smoke test (`sandbox-exec -f src/seatbelt-proxy.sb
+/// coop-proxy --jail-selftest`). Denies filesystem writes, program exec, and
+/// all egress except `:443`/`:53`; see the file for the full rationale and the
+/// `sandbox-exec`-deprecation trade-off.
+#[cfg(target_os = "macos")]
+const SEATBELT_PROFILE: &str = include_str!("seatbelt-proxy.sb");
 
 /// Establish a per-instance reverse SSH tunnel so the guest reaches the
 /// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
@@ -520,6 +613,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["injection"]["scheme"], "bearer");
         assert_eq!(v["injection"]["credential"], "sk-openai");
+    }
+
+    #[test]
+    fn await_proxy_ready_fails_closed_when_proxy_exits_early() {
+        // A proxy that exits before binding (e.g. the jail could not be
+        // established) must abort the launch, not proceed. Stand in with a
+        // child that exits immediately; `await_proxy_ready` must return Err.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("proxy.log");
+        std::fs::write(&log, "boom: jail could not be established\n").unwrap();
+        // An address nothing will ever bind, so success can only come from the
+        // (never-happening) listener, not a stray connect.
+        let listen: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let err = await_proxy_ready(&mut child, listen, &log).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exited before it began serving"),
+            "unexpected error: {msg}"
+        );
+        let _ = child.wait();
     }
 
     #[test]

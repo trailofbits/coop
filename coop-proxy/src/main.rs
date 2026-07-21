@@ -8,6 +8,7 @@
 //! outbound requests the guest never sees.
 
 mod config;
+mod jail;
 mod proxy;
 mod tls;
 
@@ -26,7 +27,35 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Diagnostic used by the integration suite to assert the jail actually
+    // restricts on the host (see `jail::selftest`). Handles no config or
+    // credential, so it runs before reading stdin.
+    if args.iter().any(|a| a == "--jail-selftest") {
+        return jail::selftest();
+    }
+
     let cfg = read_config().context("failed to read startup config from stdin")?;
+
+    // Self-confine before building the runtime: Landlock's domain is inherited
+    // by threads created afterwards, and the multi-thread runtime spawns its
+    // workers below — so applying it here covers every worker.
+    //
+    // Fail-closed by default: on Linux the credential proxy always confines
+    // unless the explicit `--no-jail` opt-out is passed. Only the in-repo
+    // `coop-proxy` tests pass it (they run on hosts that may lack Landlock);
+    // `coop` never does, so there is no path where the launcher serves the
+    // credential proxy unconfined. macOS confines externally via `sandbox-exec`
+    // (coop's `proxy.rs`), so this is Linux-only.
+    #[cfg(target_os = "linux")]
+    if !args.iter().any(|a| a == "--no-jail") {
+        jail::apply(cfg.listen.port()).context("failed to establish the Landlock jail")?;
+        tracing::info!(
+            "Landlock jail established: filesystem writes and program exec denied; \
+             TCP egress limited to :443/:53"
+        );
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

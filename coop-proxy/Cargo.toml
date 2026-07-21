@@ -56,6 +56,15 @@ rustls = { version = "0.23", default-features = false, features = [
 # deterministic for a security tool.
 webpki-roots = "1"
 
+# Linux jail (issue #411, slice 3): the proxy self-restricts with Landlock
+# (ABI v4 — TCP bind/connect port rules, kernel ≥6.7; fs/exec rules, kernel
+# ≥5.13) after its libraries are loaded and before it binds, so a proxy exploit
+# cannot write files, exec programs, or reach any host beyond :443/:53. macOS
+# uses Seatbelt via `sandbox-exec`, applied by the launcher (see coop's
+# `proxy.rs`), so no crate is needed there.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.5"
+
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
   "rt-multi-thread",

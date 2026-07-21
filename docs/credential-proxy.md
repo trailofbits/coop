@@ -110,9 +110,22 @@ verification against a pinned root set, a required capability token, and
 resource limits. The listener binds only host loopback and is reverse-tunnelled
 to exactly one guest — never a non-loopback interface, never the LAN.
 
+It is also **jailed** to bound the blast radius of a proxy exploit: `coop-proxy`
+runs confined so it cannot write files, execute programs, or reach any host
+beyond the upstream `:443` and DNS `:53`. On Linux this is Landlock (self-applied
+before serving); on macOS it is a Seatbelt profile applied via `sandbox-exec`.
+The confinement is **fail-closed** — if it cannot be established the VM start
+aborts rather than running the credential-holding proxy unconfined. The jail is
+port-scoped, not host-scoped (the two upstreams' identity is enforced by the
+proxy's TLS verification, not the jail), and does not restrict UDP on Linux; see
+[`trust-model.md`](trust-model.md) for the full threat model and the accepted
+limitations.
+
 ## Platform support
 
 **Firecracker (Linux) and Lima (macOS).** The proxy binds `127.0.0.1` on the
 host and is exposed into the guest with a per-instance `ssh -R` reverse tunnel,
 so it works identically on both backends (each already keeps an SSH channel to
-its guest). Not yet built: GitHub, and the Firecracker uid/netns jail.
+its guest). The host-side proxy process is jailed on both — Landlock on Linux
+(host kernel ≥6.7), Seatbelt via `sandbox-exec` on macOS. Not yet built:
+GitHub.

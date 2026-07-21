@@ -4264,6 +4264,42 @@ CFGEOF
         fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"
     fi
 
+    # ── The jail confines the host-side proxy (issue #411, slice 3) ──
+    # Prove the confinement coop applies to `coop-proxy` actually restricts on
+    # this host: a filesystem write, a program exec, and egress to a
+    # non-upstream port are all blocked, while the upstream port (:443) stays
+    # reachable. `coop-proxy --jail-selftest` runs the identical probe under
+    # whichever mechanism confined it — Linux self-applies Landlock; macOS
+    # applies the same Seatbelt profile coop uses, via `sandbox-exec` — and
+    # exits 0 with "=> PASS" only if all four hold. This is the host-side
+    # analog of the guest-side non-exposure checks above.
+    local proxy_bin selftest_out selftest_rc=0
+    proxy_bin="$(dirname "$BINARY")/coop-proxy"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local sb_profile
+        sb_profile="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/seatbelt-proxy.sb"
+        if [[ -f "$sb_profile" ]]; then
+            # Pass the profile inline with -p (as coop's launcher does), not -f,
+            # so the smoke test exercises the same code path production uses.
+            selftest_out=$(sandbox-exec -p "$(cat "$sb_profile")" "$proxy_bin" --jail-selftest 2>&1) \
+                || selftest_rc=$?
+            if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
+                pass "proxy jail confines coop-proxy (Seatbelt: no fs-write/exec/off-list egress)"
+            else
+                fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
+            fi
+        else
+            skip "proxy jail self-test (Seatbelt profile not found at $sb_profile)"
+        fi
+    else
+        selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
+        if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
+            pass "proxy jail confines coop-proxy (Landlock: no fs-write/exec/off-list egress)"
+        else
+            fail "proxy jail confines coop-proxy (Landlock)" "rc=$selftest_rc out: $selftest_out"
+        fi
+    fi
+
     # ── Teardown tears the proxy down ──
     px stop "$inst_name" >/dev/null 2>&1 || true
     if [[ -n "$oai_port" ]]; then

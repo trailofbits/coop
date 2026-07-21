@@ -47,7 +47,12 @@ async fn free_loopback_addr() -> SocketAddr {
 /// Spawn the proxy binary, feed it `listen` config on stdin, and wait until it
 /// accepts connections on `addr`.
 async fn spawn_serving(addr: SocketAddr) -> Child {
+    // `--no-jail`: this test drives the gate logic, not the jail, and runs on
+    // CI hosts that may lack Landlock (where the fail-closed jail would abort
+    // startup). coop never passes this flag; the jail is asserted separately by
+    // `--jail-selftest` in the VM integration suite.
     let mut child = Command::new(BIN)
+        .arg("--no-jail")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -113,7 +118,10 @@ async fn valid_token_passes_gate_and_fails_closed_at_upstream() {
 
 #[tokio::test]
 async fn refuses_to_bind_unspecified_address() {
+    // `--no-jail` so the bind guard is asserted regardless of host Landlock
+    // support (see spawn_serving).
     let mut child = Command::new(BIN)
+        .arg("--no-jail")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

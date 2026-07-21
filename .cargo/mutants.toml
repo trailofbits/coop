@@ -332,6 +332,17 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bkill_pid_file\\b",
   "src/proxy\\.rs:.*\\bspawn_proxy\\b",
   "src/proxy\\.rs:.*\\bspawn_reverse_forward\\b",
+  # slice-3 jail: liveness poll of a spawned process + TCP probe (fail-closed)
+  # and the platform spawn-command builder (macOS `sandbox-exec` wrap / Linux
+  # bare binary) — IO/spawn wrappers, not `--lib`-observable. `await_proxy_ready`
+  # has a unit test for its fail-closed early-exit branch; the poll/timeout loop
+  # itself stays excluded (IO-bound, slow timeout path). `wire_config_json`
+  # stays IN scope, pinned by the wire_json_* shape tests. coop-proxy's own
+  # `jail.rs` (the Landlock ruleset) is not in this sweep — coop-proxy is a
+  # separate, non-default workspace member — so it is asserted by
+  # `coop-proxy --jail-selftest` in tests/integration.sh instead.
+  "src/proxy\\.rs:.*\\bawait_proxy_ready\\b",
+  "src/proxy\\.rs:.*\\bconfined_command\\b",
   "src/proxy\\.rs:.*\\bwrite_token_file\\b",
   "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
   "src/proxy\\.rs:.*\\bpid_path\\b",
