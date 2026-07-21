@@ -4085,6 +4085,192 @@ CFGEOF
     rm -r "$lm_dir"
 }
 
+# ── Credential-injecting proxy test (issue #411, --full only) ─────────
+#
+# Brings a VM up in proxy mode (remote model mode + `[proxy.*]` configured) and
+# asserts the non-exposure property end-to-end on both backends. There is no
+# mock upstream: the proxy pins TLS to the real hosts (a security property), so
+# a local mock cannot present a trusted cert. Instead the checks are hermetic
+# and need no upstream — the injection-into-the-header logic is covered by the
+# `coop-proxy` unit tests + `gate.rs`. Here we assert what only a live VM can:
+#   - the guest is wired at the proxy (Codex `config.toml`, Claude
+#     `settings.json`) and holds only the capability token;
+#   - the raw keys are suppressed even when set on the host (crown jewel), and
+#     Codex's `auth.json` is not staged;
+#   - the proxy is reachable on host loopback and enforces the capability gate;
+#   - `stop` tears the proxy down (the host port stops answering).
+test_proxy() {
+    echo ""
+    echo "=== Phase: credential-injecting proxy (--full) ==="
+
+    if ! command -v curl >/dev/null 2>&1; then
+        skip "credential-proxy test (curl not available on host)"
+        return
+    fi
+
+    local inst_name="${INSTANCE}-proxy"
+    local px_dir
+    px_dir=$(mktemp -d)
+    local cfg_file="$px_dir/config.toml"
+    # Literal fake credentials: `resolve_cmd_value` returns a non-`cmd:` value
+    # verbatim, so the proxy injects these. The test asserts they never reach
+    # the guest — bootstrap never runs the agents, so a fake key is harmless.
+    local openai_secret="sk-coop-it-openai-FAKE-do-not-use"
+    local anthropic_secret="sk-ant-coop-it-FAKE-do-not-use"
+
+    cat >"$cfg_file" <<CFGEOF
+[claude]
+github = "off"
+
+[proxy.anthropic]
+credential = "$anthropic_secret"
+auth = "bearer"
+
+[proxy.openai]
+credential = "$openai_secret"
+auth = "bearer"
+CFGEOF
+
+    # Unlike the model-test helpers, DO set host OPENAI_API_KEY/ANTHROPIC_API_KEY
+    # (sentinels) so the test proves proxy mode SUPPRESSES them rather than
+    # merely that they were absent.
+    local host_openai="sk-host-openai-sentinel-LEAK"
+    local host_anthropic="sk-ant-host-sentinel-LEAK"
+    px() {
+        local rc=0
+        HARNESS_OUT=$(env -u GITHUB_TOKEN \
+            OPENAI_API_KEY="$host_openai" ANTHROPIC_API_KEY="$host_anthropic" \
+            "$BINARY" --config "$cfg_file" "$@" 2>"$tmpdir/stderr") || rc=$?
+        HARNESS_ERR=$(cat "$tmpdir/stderr")
+        return $rc
+    }
+    px_exec() {
+        RUST_LOG=off env -u GITHUB_TOKEN \
+            OPENAI_API_KEY="$host_openai" ANTHROPIC_API_KEY="$host_anthropic" \
+            "$BINARY" --config "$cfg_file" exec "$inst_name" -- "$@" \
+            2>"$tmpdir/guest_stderr"
+    }
+
+    local px_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$px_ws"
+    # Proxy mode is wired during AGENT bootstrap, so this must NOT be --no-agents.
+    if px up "$px_ws" --name "$inst_name" --no-devcontainer; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up in proxy mode exits 0"
+    else
+        fail "up in proxy mode exits 0" "exit: $? stderr: $HARNESS_ERR"
+        rm -r "$px_dir"
+        return
+    fi
+
+    # ── Codex (OpenAI) guest wiring ──
+    local codex_cfg
+    if codex_cfg=$(px_exec cat ./.codex/config.toml); then
+        if echo "$codex_cfg" | grep -q "coop_local" \
+            && echo "$codex_cfg" | grep -q "responses" \
+            && echo "$codex_cfg" | grep -Eq "127\.0\.0\.1:[0-9]+/v1" \
+            && echo "$codex_cfg" | grep -q "COOP_LOCAL_API_KEY"; then
+            pass "codex config.toml points at the proxy (coop_local, responses, /v1)"
+        else
+            fail "codex config.toml points at the proxy" "got: $codex_cfg"
+        fi
+        if echo "$codex_cfg" | grep -q "$openai_secret"; then
+            fail "openai credential absent from codex config" "leaked into config.toml"
+        else
+            pass "openai credential absent from codex config"
+        fi
+    else
+        fail "codex config.toml readable" "cat failed; stderr: $(guest_stderr)"
+    fi
+
+    # auth.json must not be staged in proxy mode (issue #411 §7).
+    if px_exec test -f ./.codex/auth.json; then
+        fail "codex auth.json not staged in proxy mode" "auth.json present in guest"
+    else
+        pass "codex auth.json not staged in proxy mode"
+    fi
+
+    # ── Crown jewel: raw keys never enter the guest env ──
+    local guest_env
+    guest_env=$(px_exec env || true)
+    if echo "$guest_env" | grep -q "^COOP_LOCAL_API_KEY="; then
+        pass "guest holds the capability token (COOP_LOCAL_API_KEY)"
+    else
+        fail "guest holds the capability token" "COOP_LOCAL_API_KEY not in guest env"
+    fi
+    if echo "$guest_env" | grep -q "^OPENAI_API_KEY="; then
+        fail "OPENAI_API_KEY suppressed in guest (proxy mode)" "it was forwarded"
+    elif echo "$guest_env" | grep -qF "$openai_secret" \
+        || echo "$guest_env" | grep -qF "$host_openai"; then
+        fail "raw OpenAI key absent from guest env" "a raw key value leaked"
+    else
+        pass "raw OpenAI key suppressed and absent from guest env"
+    fi
+    if echo "$guest_env" | grep -q "^ANTHROPIC_API_KEY="; then
+        fail "ANTHROPIC_API_KEY suppressed in guest (proxy mode)" "it was forwarded"
+    else
+        pass "ANTHROPIC_API_KEY suppressed in guest"
+    fi
+
+    # ── Claude (Anthropic) guest wiring ──
+    local settings
+    if settings=$(px_exec cat ./.claude/settings.json); then
+        if echo "$settings" | grep -q "ANTHROPIC_BASE_URL" \
+            && echo "$settings" | grep -q "ANTHROPIC_AUTH_TOKEN" \
+            && ! echo "$settings" | grep -q "$anthropic_secret"; then
+            pass "claude settings.json points at the proxy with the capability token"
+        else
+            fail "claude settings.json points at the proxy" "got: $settings"
+        fi
+    else
+        fail "claude settings.json readable" "cat failed; stderr: $(guest_stderr)"
+    fi
+
+    # ── The proxy is reachable on host loopback and enforces the gate ──
+    # The proxy binds 127.0.0.1:<port> on the host and is reverse-tunnelled into
+    # the guest, so the host exercises the same listener. A request without the
+    # token is refused locally ("capability token"); with the token it passes
+    # the gate and is forwarded upstream (which fails closed at the real host —
+    # 502 with no egress, or an upstream auth error — but never the local
+    # refusal), so the presence/absence of the "capability" refusal distinguishes
+    # the two without needing a working upstream.
+    local oai_port cap_token
+    oai_port=$(echo "$codex_cfg" | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
+    cap_token=$(echo "$guest_env" | grep '^COOP_LOCAL_API_KEY=' | cut -d= -f2- || true)
+    if [[ -n "$oai_port" ]]; then
+        local no_tok tok
+        no_tok=$(curl -s --max-time 10 "http://127.0.0.1:$oai_port/v1/models" || true)
+        tok=$(curl -s --max-time 15 "http://127.0.0.1:$oai_port/v1/models" \
+            -H "Authorization: Bearer $cap_token" || true)
+        if echo "$no_tok" | grep -qi "capability"; then
+            pass "openai proxy refuses a request missing the capability token"
+        else
+            fail "openai proxy refuses a request missing the capability token" "body: $no_tok"
+        fi
+        if echo "$tok" | grep -qi "capability"; then
+            fail "valid capability token passes the gate" "still refused: $tok"
+        else
+            pass "valid capability token passes the gate (forwarded upstream)"
+        fi
+    else
+        fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"
+    fi
+
+    # ── Teardown tears the proxy down ──
+    px stop "$inst_name" >/dev/null 2>&1 || true
+    if [[ -n "$oai_port" ]]; then
+        if curl -s --max-time 3 -o /dev/null "http://127.0.0.1:$oai_port/v1/models"; then
+            fail "stop tears the proxy down" "proxy still answering on 127.0.0.1:$oai_port"
+        else
+            pass "stop tears the proxy down (host port no longer answers)"
+        fi
+    fi
+
+    px destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    rm -r "$px_dir"
+}
+
 # ── Interrupted setup test (--full only) ──────────────────────
 
 test_interrupted_setup() {
@@ -4966,6 +5152,10 @@ main() {
 
         # coop model local/remote: local-model wiring lands and reverts
         test_local_model
+
+        # credential-injecting proxy (#411): guest wiring, key suppression,
+        # capability gate, teardown — Anthropic + OpenAI/Codex
+        test_proxy
 
         # Interrupted setup: SIGKILL mid-build, verify clean recovery
         test_interrupted_setup
