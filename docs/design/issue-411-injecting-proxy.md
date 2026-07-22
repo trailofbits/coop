@@ -180,19 +180,22 @@ generates.
 | | Claude Code | Codex |
 |---|---|---|
 | Point at proxy | `ANTHROPIC_BASE_URL` in managed `settings.json` (`claude_env_block`) | `[model_providers.coop].base_url` in `~/.codex/config.toml` (`codex_local_config`) |
-| Guest-held credential | dummy `ANTHROPIC_AUTH_TOKEN` (`coop-local` convention) | **none** — omit `env_key` and `requires_openai_auth` (Codex's documented "no auth" disposition for a custom provider) |
+| Guest-held credential | per-instance capability token in `ANTHROPIC_AUTH_TOKEN` | per-instance capability token via `env_key = "COOP_LOCAL_API_KEY"`, sent as `Authorization: Bearer` |
 | Wire protocol | Messages API + SSE + tool-use round-trips | Responses API (`wire_api = "responses"`) + SSE |
 | Proxy injects upstream | real key → `Authorization`/`x-api-key` → `api.anthropic.com` | real key → `Authorization: Bearer` → `api.openai.com` |
 
 Two facts from the Codex docs make this work and are worth pinning:
 
-- **A custom `[model_providers.*]` provider can send no credential at all.** Codex
+- **A custom `[model_providers.*]` provider chooses what credential to send.** Codex
   supports three dispositions: `requires_openai_auth = true` (use the ChatGPT/API
   OpenAI token, `env_key` ignored), `env_key = "VAR"` (send that var as Bearer),
-  or **neither → no auth sent**. The third is what proxy mode uses: the guest
-  holds nothing, the proxy injects. (Codex also supports `http_headers` /
-  `env_http_headers` and a command-backed `[model_providers.<id>.auth]` refresh
-  hook — not needed for v1 but relevant to §7.)
+  or **neither → no auth sent**. Proxy mode as shipped uses the `env_key`
+  disposition: `env_key = "COOP_LOCAL_API_KEY"` carries the per-instance
+  capability token as `Authorization: Bearer`, which the proxy verifies and
+  strips before injecting the real upstream credential. (Codex also supports
+  `http_headers` / `env_http_headers` and a command-backed
+  `[model_providers.<id>.auth]` refresh hook — not needed for v1 but relevant
+  to §7.)
 - **The proxy stays protocol-agnostic.** It is a streaming reverse proxy that
   injects an auth header per route and passes bytes through; it never parses
   Messages-API vs Responses-API bodies. `wire_api` and endpoint paths are the
@@ -393,8 +396,9 @@ Ordered, independently shippable:
    subscription token are static bearers the proxy injects (§7) — no extra slice.
    Smallest end-to-end slice because the base-URL seam already exists.
 2. **Codex (API key).** Add the injection route for `api.openai.com`. Guest config:
-   `codex_local_config`-style block with `base_url` = proxy and *no* `env_key` /
-   `requires_openai_auth`. Stop staging `auth.json` when proxy mode is on (§7).
+   `codex_proxy_config` block with `base_url` = proxy and `env_key =
+   "COOP_LOCAL_API_KEY"` carrying the capability token. Stop staging `auth.json`
+   when proxy mode is on (§7).
    Delivers Claude↔Codex parity at the API-key tier. Codex subscription is out of
    scope by vendor design (§7).
 3. **Jailing (shipped).** Bound a proxy-exploit blast radius by confining
@@ -543,7 +547,7 @@ keeps the dependency surfaces separate at near-zero packaging cost.
 
 ---
 
-## 13. Dependency and feature hygiene (enforced, not advised)
+## 13. Dependency and feature hygiene
 
 Adding an async/HTTP/TLS stack to a tool that currently depends only on `url` is
 the largest new supply-chain surface in this design. The rule is **every new dep
@@ -573,7 +577,7 @@ allow = ["http1", "http2", "server", "client"]
 [[bans.features]]
 crate = "hyper-util"
 exact = true
-allow = ["tokio", "server", "client-legacy", "http1", "http2"]
+allow = ["tokio", "server", "http1", "http2"]
 ```
 
 with the matching `coop-proxy/Cargo.toml`:
@@ -581,16 +585,23 @@ with the matching `coop-proxy/Cargo.toml`:
 ```toml
 tokio            = { version = "1",  default-features = false, features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 hyper            = { version = "1",  default-features = false, features = ["http1", "http2", "server", "client"] }
-hyper-util       = { version = "0.1", default-features = false, features = ["tokio", "server", "client-legacy", "http1", "http2"] }
+hyper-util       = { version = "0.1", default-features = false, features = ["tokio", "server", "http1", "http2"] }
 http-body-util   = { version = "0.1", default-features = false }
 tokio-rustls     = { version = "0.26", default-features = false, features = ["tls12"] }
 rustls           = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
-webpki-roots     = "1"   # pinned Mozilla roots (MPL-2.0, already allowed) — no OS trust-store dependency
+webpki-roots     = "1"   # pinned Mozilla roots (CDLA-Permissive-2.0, scoped exception) — no OS trust-store dependency
 ```
 
 `webpki-roots` (a compiled-in, pinned CA set) is chosen over `rustls-native-certs`
 deliberately: two fixed upstreams need no OS trust-store variance, and a pinned
 root set is both smaller surface and more deterministic for a security tool.
+
+> **As shipped (v1).** Feature minimality is carried by each crate's
+> `default-features = false` + explicit feature list in `coop-proxy/Cargo.toml`;
+> the license exceptions and the `openssl`/`native-tls` bans below are enforced
+> by the `cargo deny check` already in CI. The `[[bans.features]] exact = true`
+> pins in this section were **not** shipped in `deny.toml` — they remain a
+> recommended follow-up, not an active gate.
 
 **Ban the escape hatches outright.** Keep the OpenSSL/system-TLS path out of the
 graph so nothing silently pulls it in:
@@ -601,16 +612,24 @@ deny = [{ crate = "openssl" }, { crate = "openssl-sys" }, { crate = "native-tls"
 ```
 
 **The TLS crypto-provider license, scoped — not globally widened.** rustls itself
-is `Apache-2.0`/`MIT`/`ISC`; its crypto backend is the snag. Both `aws-lc-rs`
-(rustls default) and `ring` carry an **OpenSSL-family license** through their
-C/`-sys` layer, and neither `OpenSSL` nor `ISC` is in coop's `[licenses] allow`
-today. Handle this with a **crate-scoped exception**, so the global allowlist stays
-tight:
+is `Apache-2.0`/`MIT`/`ISC`; its crypto backend is the snag. The pinned
+`aws-lc-rs` (rustls default) stack carries `BSD-3-Clause` through its `aws-lc-sys`
+C/`-sys` layer and through `subtle`, plus `ISC` recurring across the stack —
+none of which was in coop's `[licenses] allow` at design time. Handle the
+crate-specific terms with **crate-scoped exceptions** and add the recurring `ISC`
+globally, so the allowlist stays tight:
 
 ```toml
+[licenses]
+allow = ["MIT", "Apache-2.0", "MPL-2.0", "Unicode-3.0", "ISC"]
+
 [[licenses.exceptions]]
-crate = "aws-lc-sys"          # scope OpenSSL/ISC to the crypto crate only
-allow = ["OpenSSL", "ISC"]    # exact SPDX set verified against the pinned version
+crate = "aws-lc-sys"          # crypto backend's C layer
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+crate = "subtle"              # constant-time primitives in the crypto stack
+allow = ["BSD-3-Clause"]
 ```
 
 **Provider choice — a real tradeoff, flagged not hidden.** `aws-lc-rs` is the
@@ -649,7 +668,7 @@ a throwaway hyper proxy in front of the *real* APIs and confirm:
   placeholder: the proxy strips the guest header and injects the real credential as
   `x-api-key` (API key) **or** `Authorization: Bearer` (`setup-token`), plus
   `anthropic-version`. Confirm the API accepts it and Claude streams correctly.
-- Codex with a custom provider `base_url` = proxy and no `env_key`: the proxy
+- Codex with a custom provider `base_url` = proxy and `env_key` carrying the capability token: the proxy
   injects `Authorization: Bearer` to the Responses endpoint; streaming + tool use
   work.
 - Neither agent pins certs, requires the token client-side for a feature, or sends

@@ -286,6 +286,46 @@ sections of [docs/claude-integration.md](claude-integration.md) and
 [docs/codex-integration.md](codex-integration.md) for how each endpoint is
 materialized into guest config.
 
+## `proxy` section
+
+`[proxy.anthropic]` and `[proxy.openai]` declare host-side
+credential-injecting upstreams for Claude Code and Codex. When an upstream is
+configured, coop runs a `coop-proxy` process on the host for the lifetime of
+each remote-mode VM: the guest is pointed at the proxy (a base-URL override) and
+holds only a per-instance capability token, while the real credential stays on
+the host and is injected onto outbound requests the guest never sees. Absent
+config means no proxy — credentials are forwarded into the guest exactly as
+before.
+
+Proxy mode applies only in remote model mode
+([`coop model <vm> remote`](commands.md#model)); local mode takes precedence.
+Each provider is an optional default, and a VM can override its own credential
+per provider with [`coop proxy setup --vm <name>`](commands.md#proxy) (stored in
+the instance's `proxy.json`, not in the config file).
+
+Both blocks take the same fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `credential` | string | required | The real credential — an API key or a Claude `setup-token`. A plain value or a `cmd:` invocation resolved at proxy start. Never written to disk and never forwarded into the guest. |
+| `auth` | `api_key` \| `bearer` | `api_key` | How the proxy injects the credential upstream. `api_key` sends `x-api-key: <credential>` (the Anthropic API-key form); `bearer` sends `Authorization: Bearer <credential>`, used for a Claude `setup-token`. OpenAI keys are always Bearer. |
+
+```toml
+[proxy.anthropic]
+credential = "cmd:op read op://Private/Anthropic/credential"
+auth = "api_key"
+
+[proxy.openai]
+credential = "cmd:op read op://Private/OpenAI/credential"
+auth = "bearer"
+```
+
+`coop proxy setup` writes these entries for you: it takes a pasted credential,
+stores it in a secret manager (Keychain / Secret Service / 1Password / a `0600`
+file) and fills in the `cmd:` reference. See the
+[credential proxy guide](credential-proxy.md) and
+[`coop proxy`](commands.md#proxy) for the workflow.
+
 ## `profiles` section
 
 Custom installation profiles for `coop setup --profile <name>`. Each profile declares packages and scripts that run during rootfs template creation.

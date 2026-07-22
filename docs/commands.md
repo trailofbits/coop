@@ -922,6 +922,32 @@ coop github forget-pat --repo trailofbits/coop
 `file`, or `null` when unparseable) and `probe` (`ok`/`unexpected_format`/
 `resolve_failed`, or `null` unless `--probe`). The token value is never emitted.
 
+### `proxy`
+
+Manage the host-side credential-injecting proxy. When a `[proxy.<provider>]`
+upstream is configured, coop runs a `coop-proxy` process on the host for the
+lifetime of each remote-mode VM: the guest is pointed at the proxy and holds
+only a per-instance capability token, while the real API key stays on the host
+and is injected onto outbound requests the guest never sees. Applies only in
+remote model mode (`coop model <vm> remote`); local mode takes precedence. See
+the [credential proxy guide](credential-proxy.md) and the
+[`proxy` configuration reference](configuration.md#proxy-section) for the data
+model.
+
+| Subcommand | Effect |
+|------------|--------|
+| `setup [--anthropic] [--openai] [--vm <name>] [--api-key]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic (Claude) is the default provider; pass `--openai` for Codex. `--vm <name>` stores the credential as a per-VM override in that instance's state instead of the global default. Anthropic only: `--api-key` stores an API key (`x-api-key`) instead of a Claude `setup-token`; ignored for `--openai`, whose keys are always injected as `Authorization: Bearer`. |
+| `status [--vm <name>]` | Show what each VM's agents resolve to (per-VM override → default → off), with credentials redacted. Pass `--vm <name>` for the effective resolution of a single VM instead of all. |
+
+```
+coop proxy setup
+coop proxy setup --openai
+coop proxy setup --vm my-project
+coop proxy setup --api-key
+coop proxy status
+coop proxy status --vm my-project
+```
+
 ### `validate`
 
 Check the configuration file and prerequisites. Prints warnings and confirms the config loads correctly. With `--probe`, also exercises each `[github.pat]` entry against `api.github.com` to confirm the token is still live.
