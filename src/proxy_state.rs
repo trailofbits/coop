@@ -58,9 +58,11 @@ impl ProxyState {
         &'a self,
         provider: Provider,
         cfg: &'a ProxyConfig,
-        default_for: fn(&ProxyConfig) -> Option<&ProxyUpstream>,
     ) -> Option<&'a ProxyUpstream> {
-        self.override_for(provider).or_else(|| default_for(cfg))
+        self.override_for(provider).or(match provider {
+            Provider::Anthropic => cfg.anthropic.as_ref(),
+            Provider::Openai => cfg.openai.as_ref(),
+        })
     }
 
     /// `true` when nothing needs persisting — equivalent to "no `proxy.json`
@@ -114,15 +116,6 @@ impl ProxyState {
     }
 }
 
-/// The config default accessor for a provider — pairs with
-/// [`ProxyState::effective`] so callers name the provider once.
-pub fn config_default(provider: Provider) -> fn(&ProxyConfig) -> Option<&ProxyUpstream> {
-    match provider {
-        Provider::Anthropic => |cfg| cfg.anthropic.as_ref(),
-        Provider::Openai => |cfg| cfg.openai.as_ref(),
-    }
-}
-
 /// The effective upstream for `provider` on `inst`: per-VM override → config
 /// default → `None`. A convenience over [`ProxyState::effective`] that loads
 /// the persisted state.
@@ -132,9 +125,7 @@ pub fn effective_upstream(
     cfg: &ProxyConfig,
 ) -> Result<Option<ProxyUpstream>> {
     let state = ProxyState::load_or_default(inst)?;
-    Ok(state
-        .effective(provider, cfg, config_default(provider))
-        .cloned())
+    Ok(state.effective(provider, cfg).cloned())
 }
 
 #[cfg(test)]
@@ -171,13 +162,7 @@ mod tests {
             ..Default::default()
         };
 
-        let eff = state
-            .effective(
-                Provider::Anthropic,
-                &cfg,
-                config_default(Provider::Anthropic),
-            )
-            .unwrap();
+        let eff = state.effective(Provider::Anthropic, &cfg).unwrap();
         assert_eq!(eff.credential.expose(), "cmd:override");
         assert_eq!(eff.auth, ProxyAuthScheme::ApiKey);
     }
@@ -190,20 +175,10 @@ mod tests {
         };
         let state = ProxyState::default();
 
-        let openai = state
-            .effective(Provider::Openai, &cfg, config_default(Provider::Openai))
-            .unwrap();
+        let openai = state.effective(Provider::Openai, &cfg).unwrap();
         assert_eq!(openai.credential.expose(), "cmd:default-oai");
         // No default and no override → off.
-        assert!(
-            state
-                .effective(
-                    Provider::Anthropic,
-                    &cfg,
-                    config_default(Provider::Anthropic)
-                )
-                .is_none()
-        );
+        assert!(state.effective(Provider::Anthropic, &cfg).is_none());
     }
 
     #[test]
