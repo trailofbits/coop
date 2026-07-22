@@ -4406,4 +4406,53 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             Some("sk-openai-realkey")
         );
     }
+
+    #[test]
+    fn proxy_mode_suppresses_anthropic_key_from_env_forward() {
+        // The third raw-key entry path: an explicit env_forward entry resolved
+        // from the host process env. Serialize the env mutation and restore the
+        // prior value so parallel tests are unaffected.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior = std::env::var("ANTHROPIC_API_KEY").ok();
+        // SAFETY: this is the only test that mutates ANTHROPIC_API_KEY, it holds
+        // ENV_LOCK while doing so, and it restores the prior value before
+        // returning. No coop test asserts on a process-inherited
+        // ANTHROPIC_API_KEY, so a transient read by another thread is benign.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-from-host-env") };
+
+        let mut cfg = CoopConfig::default();
+        cfg.claude.api_key = None;
+        cfg.codex.api_key = None;
+        cfg.github = None;
+        cfg.claude.env_forward =
+            vec![crate::guest_env_state::EnvVarName::new("ANTHROPIC_API_KEY").unwrap()];
+
+        let suppressed = prepare_env_forwarding(&cfg, None, true, false).unwrap();
+        let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+
+        // SAFETY: same lock still held; restore the environment to its prior state.
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+                None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            }
+        }
+
+        assert!(
+            !suppressed.contains("ANTHROPIC_API_KEY"),
+            "env_forward re-injected the raw Anthropic key in proxy mode"
+        );
+        assert_eq!(
+            forwarded
+                .as_envs()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("sk-ant-from-host-env"),
+            "non-proxy mode should still forward an env_forward entry"
+        );
+    }
 }

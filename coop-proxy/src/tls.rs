@@ -41,11 +41,11 @@ mod tests {
 
     #[test]
     fn client_config_builds_with_pinned_roots() {
-        let cfg = client_config().unwrap();
-        // Sanity: the shared config resolves and carries the ALPN/versions
-        // defaults. The presence of a non-empty root store is asserted at
-        // build time (bail above); this proves construction succeeds.
-        assert!(Arc::strong_count(&cfg) >= 1);
+        // Construction succeeds (the unwrap): the non-empty root store is
+        // enforced by the bail in `client_config`. That the resulting verifier
+        // actually rejects an untrusted cert is covered by
+        // `rejects_untrusted_upstream_cert` below.
+        client_config().unwrap();
     }
 
     // A self-signed `CN=localhost` cert + its PKCS#8 key, minted once with

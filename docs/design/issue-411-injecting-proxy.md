@@ -614,10 +614,11 @@ deny = [{ crate = "openssl" }, { crate = "openssl-sys" }, { crate = "native-tls"
 **The TLS crypto-provider license, scoped — not globally widened.** rustls itself
 is `Apache-2.0`/`MIT`/`ISC`; its crypto backend is the snag. The pinned
 `aws-lc-rs` (rustls default) stack carries `BSD-3-Clause` through its `aws-lc-sys`
-C/`-sys` layer and through `subtle`, plus `ISC` recurring across the stack —
-none of which was in coop's `[licenses] allow` at design time. Handle the
-crate-specific terms with **crate-scoped exceptions** and add the recurring `ISC`
-globally, so the allowlist stays tight:
+C/`-sys` layer and through `subtle`, the pinned `webpki-roots` set is
+`CDLA-Permissive-2.0`, plus `ISC` recurs across the stack — none of which was in
+coop's `[licenses] allow` at design time. Handle the crate-specific terms with
+**crate-scoped exceptions** and add the recurring `ISC` globally, so the
+allowlist stays tight:
 
 ```toml
 [licenses]
@@ -626,6 +627,10 @@ allow = ["MIT", "Apache-2.0", "MPL-2.0", "Unicode-3.0", "ISC"]
 [[licenses.exceptions]]
 crate = "aws-lc-sys"          # crypto backend's C layer
 allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+crate = "webpki-roots"        # pinned Mozilla root set (a data license)
+allow = ["CDLA-Permissive-2.0"]
 
 [[licenses.exceptions]]
 crate = "subtle"              # constant-time primitives in the crypto stack
