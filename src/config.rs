@@ -2952,10 +2952,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn spawn_firecracker_like() -> std::process::Child {
-        std::process::Command::new("bash")
-            .args(["-c", "exec -a firecracker-test sleep 30"])
+        use std::os::unix::process::CommandExt;
+        // Set argv[0] to a firecracker-like name in a single execve (no shell
+        // `exec -a` indirection). A shell wrapper would exec twice, and reading
+        // /proc/<pid>/cmdline during the second transition races an empty
+        // cmdline. `wait_for_firecracker_cmdline` then waits out the one
+        // remaining fork→execve gap before the process is inspected.
+        std::process::Command::new("sleep")
+            .arg0("firecracker-test")
+            .arg("30")
             .spawn()
             .unwrap()
+    }
+
+    /// Wait until a spawned child's `/proc/<pid>/cmdline` reflects its
+    /// post-`execve` argv. Between `spawn` and `execve` the cmdline is empty, so
+    /// process-detection assertions must not run until it settles.
+    #[cfg(target_os = "linux")]
+    fn wait_for_firecracker_cmdline(pid: u32) {
+        let path = format!("/proc/{pid}/cmdline");
+        for _ in 0..500 {
+            if fs::read_to_string(&path).is_ok_and(|c| c.contains("firecracker")) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("firecracker-like process {pid} never exposed its cmdline");
     }
 
     #[cfg(target_os = "linux")]
@@ -3013,6 +3035,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
         let running = inst.is_running();
@@ -3053,6 +3076,7 @@ mod tests {
     fn is_firecracker_process_true_for_firecracker_named_pid() {
         let mut child = spawn_firecracker_like();
         let pid = child.id();
+        wait_for_firecracker_cmdline(pid);
         let result = is_firecracker_process(pid);
         let _ = child.kill();
         let _ = child.wait();
