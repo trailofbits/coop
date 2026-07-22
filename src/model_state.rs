@@ -599,4 +599,19 @@ mod tests {
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
         assert_eq!(provider["name"].as_str().unwrap(), "coop credential proxy");
     }
+
+    #[test]
+    fn codex_proxy_config_collapses_trailing_slash_before_v1() {
+        // A slash-terminated base must not yield `//v1`; kills the
+        // `trim_end_matches('/')` deletion mutant that the no-slash case
+        // leaves alive.
+        let table = codex_proxy_config("http://127.0.0.1:8900/");
+        let provider = table["model_providers"][CODEX_LOCAL_PROVIDER]
+            .as_table()
+            .unwrap();
+        assert_eq!(
+            provider["base_url"].as_str().unwrap(),
+            "http://127.0.0.1:8900/v1"
+        );
+    }
 }

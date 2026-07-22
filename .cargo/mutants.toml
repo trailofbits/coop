@@ -323,7 +323,8 @@ exclude_re = [
   # (`port`/`base_port`/`upstream_host`/`name`, pinned by the port/range/host
   # tests), `wire_config_json`, `mint_capability_token` (whose randomness/length
   # a unit test asserts), and `read_capability_token` (trim/empty logic covered
-  # by the token-file round-trip test) stay IN scope — a survivor on one of
+  # by `read_capability_token_ignores_empty_and_whitespace_files`) stay IN scope
+  # — a survivor on one of
   # those is a real gap. File-anchored so the generic `start`/`stop` names don't
   # scope out same-named functions elsewhere.
   "src/proxy\\.rs:.*\\bstart_provider\\b",

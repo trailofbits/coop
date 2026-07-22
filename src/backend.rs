@@ -1397,8 +1397,26 @@ pub fn prepare_env_forwarding(
         tracing::debug!("no GITHUB_TOKEN forwarded to guest");
     }
 
+    // In proxy mode the raw provider key must never reach the guest by ANY
+    // path — not just the config/process-env fallback above, but also an
+    // explicit `env_forward` or `guest_env` entry. Collect the suppressed
+    // names so the loops below skip and loudly warn on such an entry.
+    let mut suppressed: Vec<&str> = Vec::new();
+    if suppress_anthropic_key {
+        suppressed.push("ANTHROPIC_API_KEY");
+    }
+    if suppress_openai_key {
+        suppressed.push("OPENAI_API_KEY");
+    }
+
     // User-specified env_forward vars from process environment
     for name in claude.env_forward.iter().chain(codex.env_forward.iter()) {
+        if suppressed.contains(&name.as_str()) {
+            tracing::warn!(
+                "proxy mode: ignoring env_forward entry '{name}' — the raw key stays on the host"
+            );
+            continue;
+        }
         if !env.contains(name.as_str())
             && let Ok(val) = std::env::var(name.as_str())
         {
@@ -1411,6 +1429,12 @@ pub fn prepare_env_forwarding(
     // an inherited one. Warn on collision so the override is visible —
     // values are not logged (they may be secrets).
     for (name, value) in &cfg.guest_env {
+        if suppressed.contains(&name.as_str()) {
+            tracing::warn!(
+                "proxy mode: ignoring guest_env entry '{name}' — the raw key stays on the host"
+            );
+            continue;
+        }
         if env.contains(name.as_str()) {
             tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
         }
@@ -1516,37 +1540,47 @@ fn bootstrap_claude(
     // guest holds only the capability token; the real key stays on the host.
     // Fails closed — a resolution or spawn failure aborts the boot.
     let proxy = start_claude_proxy(inst, cfg, &model_state, &session.target)?;
-    let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
-    write_managed_claude_settings(&session.target, &local_env)?;
+    // Run the rest under a guard: if any step fails after the proxy is live,
+    // tear it (and its reverse tunnel) down rather than orphaning a
+    // credential-holding process after a failed boot. A clean bootstrap leaves
+    // it running for the VM's lifetime. Mirrors `bootstrap_codex`.
+    let result = (|| -> Result<()> {
+        let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
+        write_managed_claude_settings(&session.target, &local_env)?;
 
-    // Work around the onboarding wizard ignoring CLAUDE_CODE_OAUTH_TOKEN
-    // (anthropics/claude-code#8938). Runs on every boot so a token added
-    // before a restart still takes effect; a no-op once the flag is present
-    // or when no OAuth token is forwarded.
-    seed_claude_onboarding(session, &claude_bin)?;
+        // Work around the onboarding wizard ignoring CLAUDE_CODE_OAUTH_TOKEN
+        // (anthropics/claude-code#8938). Runs on every boot so a token added
+        // before a restart still takes effect; a no-op once the flag is present
+        // or when no OAuth token is forwarded.
+        seed_claude_onboarding(session, &claude_bin)?;
 
-    // Marketplaces, plugins, MCP servers — persisted on guest disk,
-    // only install on first boot
-    if let BootMode::FirstBoot = mode {
-        // Compute delta: only install marketplaces/plugins not already
-        // baked into the golden image
-        let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
+        // Marketplaces, plugins, MCP servers — persisted on guest disk,
+        // only install on first boot
+        if let BootMode::FirstBoot = mode {
+            // Compute delta: only install marketplaces/plugins not already
+            // baked into the golden image
+            let (missing_marketplaces, missing_plugins) = compute_plugin_delta(cfg, &inst.image);
 
-        if !missing_marketplaces.is_empty() {
-            install_marketplaces(session, &claude_bin, &missing_marketplaces)?;
+            if !missing_marketplaces.is_empty() {
+                install_marketplaces(session, &claude_bin, &missing_marketplaces)?;
+            }
+
+            if !missing_plugins.is_empty() {
+                install_plugins(session, &claude_bin, &missing_plugins)?;
+            }
+
+            if !claude.mcp_servers.is_empty() {
+                register_mcp_servers(session, &claude_bin, &claude.mcp_servers)?;
+            }
         }
 
-        if !missing_plugins.is_empty() {
-            install_plugins(session, &claude_bin, &missing_plugins)?;
-        }
-
-        if !claude.mcp_servers.is_empty() {
-            register_mcp_servers(session, &claude_bin, &claude.mcp_servers)?;
-        }
+        tracing::info!("Claude Code bootstrap complete");
+        Ok(())
+    })();
+    if result.is_err() && proxy.is_some() {
+        crate::proxy::stop_provider(inst, crate::proxy::Provider::Anthropic);
     }
-
-    tracing::info!("Claude Code bootstrap complete");
-    Ok(())
+    result
 }
 
 /// Bootstrap Codex in the guest declaratively.
@@ -2163,7 +2197,7 @@ fn claude_local_env(
     if let Some(p) = proxy {
         return Ok(crate::model_state::claude_proxy_env_block(
             &p.base_url,
-            &p.capability_token,
+            p.capability_token.expose(),
         ));
     }
     Ok(BTreeMap::new())
@@ -3038,7 +3072,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let cfg = CoopConfig::default();
         let proxy = crate::proxy::ProxyHandle {
             base_url: "http://172.16.0.1:8788".to_string(),
-            capability_token: "cap-token".to_string(),
+            capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
@@ -3063,7 +3097,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let cfg = CoopConfig::default();
         let proxy = crate::proxy::ProxyHandle {
             base_url: "http://172.16.0.1:8788".to_string(),
-            capability_token: "cap-token".to_string(),
+            capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins.
         let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
@@ -3092,7 +3126,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let cfg = CoopConfig::default();
         let proxy = crate::proxy::ProxyHandle {
             base_url: "http://127.0.0.1:9788".to_string(),
-            capability_token: "cap-token".to_string(),
+            capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
             .unwrap()
@@ -3128,7 +3162,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let cfg = CoopConfig::default();
         let proxy = crate::proxy::ProxyHandle {
             base_url: "http://127.0.0.1:9788".to_string(),
-            capability_token: "cap-token".to_string(),
+            capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins (mirrors Claude).
         let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
@@ -4330,5 +4364,46 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let cfg = cfg_with_guest_env(&[("EMPTY", "")]);
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(env.as_envs().get("EMPTY").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn proxy_mode_suppresses_anthropic_key_from_guest_env() {
+        // The crown-jewel invariant must hold even when the raw key is listed
+        // explicitly in `guest_env` — the suppression left the name absent, so
+        // the collision warning never fires and it would otherwise forward
+        // silently.
+        let cfg = cfg_with_guest_env(&[("ANTHROPIC_API_KEY", "sk-ant-realkey")]);
+        let suppressed = prepare_env_forwarding(&cfg, None, true, false).unwrap();
+        assert!(
+            !suppressed.contains("ANTHROPIC_API_KEY"),
+            "guest_env re-injected the raw Anthropic key in proxy mode"
+        );
+        // Non-proxy mode still forwards the explicit guest_env value.
+        let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+        assert_eq!(
+            forwarded
+                .as_envs()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("sk-ant-realkey")
+        );
+    }
+
+    #[test]
+    fn proxy_mode_suppresses_openai_key_from_guest_env() {
+        let cfg = cfg_with_guest_env(&[("OPENAI_API_KEY", "sk-openai-realkey")]);
+        let suppressed = prepare_env_forwarding(&cfg, None, false, true).unwrap();
+        assert!(
+            !suppressed.contains("OPENAI_API_KEY"),
+            "guest_env re-injected the raw OpenAI key in proxy mode"
+        );
+        let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+        assert_eq!(
+            forwarded
+                .as_envs()
+                .get("OPENAI_API_KEY")
+                .map(String::as_str),
+            Some("sk-openai-realkey")
+        );
     }
 }

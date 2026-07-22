@@ -1589,6 +1589,18 @@ pub(crate) fn prepare_session_from_target(
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
+                // In proxy mode a raw provider key snapshotted via `coop start
+                // --env` must not re-enter the guest — the host-side proxy
+                // holds it. Skip and warn, matching `prepare_env_forwarding`.
+                if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
+                    || (proxy_openai && name.as_str() == "OPENAI_API_KEY")
+                {
+                    tracing::warn!(
+                        "proxy mode: ignoring runtime --env entry '{}' — the raw key stays on the host",
+                        name.as_str()
+                    );
+                    continue;
+                }
                 env.set(name.as_str(), value.as_str());
             }
         }
@@ -2125,6 +2137,61 @@ mod tests {
             envs.get("FROM_CFG").map(String::as_str),
             Some("cfg-value"),
             "config.toml [guest_env] entries must still flow through",
+        );
+    }
+
+    /// In proxy mode a raw `ANTHROPIC_API_KEY` persisted via `coop start
+    /// --env` must be dropped from the overlay, not re-injected into the guest
+    /// (issue #411). The VM defaults to remote model mode, so a configured
+    /// `[proxy.anthropic]` upstream makes proxy mode active.
+    #[test]
+    fn prepare_session_suppresses_persisted_proxy_key() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("ANTHROPIC_API_KEY").expect("valid env var"),
+            "sk-ant-realkey".to_string(),
+        );
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
+            "saved-value".to_string(),
+        );
+        state.save(&inst).expect("save snapshot");
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.proxy.anthropic = Some(super::config::ProxyUpstream {
+            credential: super::config::Secret::new("cmd:true".to_string()),
+            auth: super::config::ProxyAuthScheme::ApiKey,
+        });
+
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+
+        let envs = session.env.as_envs();
+        assert!(
+            !envs.contains_key("ANTHROPIC_API_KEY"),
+            "proxy mode re-injected the raw key from the persisted --env overlay",
+        );
+        assert_eq!(
+            envs.get("FROM_CLI").map(String::as_str),
+            Some("saved-value"),
+            "non-suppressed --env entries must still flow through",
         );
     }
 

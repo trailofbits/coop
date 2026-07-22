@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::backend::SshTarget;
-use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, resolve_cmd_value};
+use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value};
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
@@ -121,7 +121,9 @@ pub struct ProxyHandle {
     pub base_url: String,
     /// Per-instance capability token the guest presents (as a bearer / API
     /// key), which the proxy verifies before injecting the real credential.
-    pub capability_token: String,
+    /// Wrapped so a stray `Debug` of the handle never leaks it, matching the
+    /// hygiene of the credential-adjacent path.
+    pub capability_token: Secret<String>,
 }
 
 /// Start the proxy for one `provider` on `inst`: resolve the credential, bind
@@ -181,7 +183,7 @@ pub fn start_provider(
 
     Ok(ProxyHandle {
         base_url: format!("http://127.0.0.1:{port}"),
-        capability_token: token,
+        capability_token: Secret::new(token),
     })
 }
 
@@ -653,5 +655,29 @@ mod tests {
 
         stop_provider(&inst, Provider::Openai);
         assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+    }
+
+    #[test]
+    fn read_capability_token_ignores_empty_and_whitespace_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+
+        // Empty file → no token (kills a `!token.is_empty()` → `true` mutant,
+        // which would otherwise return `Some("")`).
+        write_token_file(&inst, Provider::Openai, "").unwrap();
+        assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+
+        // Whitespace-only file trims to empty and is likewise ignored.
+        write_token_file(&inst, Provider::Openai, "  \n\t ").unwrap();
+        assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+
+        // Surrounding whitespace is stripped from a real token (kills a
+        // `.trim()`-deletion mutant, invisible to the round-trip test).
+        write_token_file(&inst, Provider::Openai, "  cap-123\n").unwrap();
+        assert_eq!(
+            read_capability_token(&inst, Provider::Openai),
+            Some("cap-123".to_string())
+        );
     }
 }

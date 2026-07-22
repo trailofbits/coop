@@ -47,4 +47,50 @@ mod tests {
         // build time (bail above); this proves construction succeeds.
         assert!(Arc::strong_count(&cfg) >= 1);
     }
+
+    // A self-signed `CN=localhost` cert + its PKCS#8 key, minted once with
+    // openssl (valid to 2126) so the test needs no cert-generation crate. It
+    // chains to no pinned root, so a correct verifier must reject it.
+    const UNTRUSTED_CERT_DER: &[u8] = include_bytes!("testdata/untrusted_upstream_cert.der");
+    const UNTRUSTED_KEY_DER: &[u8] = include_bytes!("testdata/untrusted_upstream_key.pkcs8.der");
+
+    // The Tier-1 property: the proxy→upstream hop must reject a certificate
+    // that does not chain to the pinned roots. Stand up a TLS server with the
+    // untrusted self-signed cert and assert the config built by
+    // `client_config()` refuses the handshake. A regression that disabled
+    // verification (e.g. a `dangerous()` verifier) would let the bad cert
+    // through and fail this test.
+    #[tokio::test]
+    async fn rejects_untrusted_upstream_cert() {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(UNTRUSTED_CERT_DER)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(UNTRUSTED_KEY_DER)),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await;
+            }
+        });
+
+        let connector = TlsConnector::from(client_config().unwrap());
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        assert!(
+            connector.connect(name, tcp).await.is_err(),
+            "self-signed upstream cert must be rejected by the pinned-root verifier"
+        );
+    }
 }

@@ -202,8 +202,7 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
     let permit = ctx
         .permits
         .clone()
-        .acquire_owned()
-        .await
+        .try_acquire_owned()
         .map_err(|_| Refusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             msg: "proxy at capacity",

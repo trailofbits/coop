@@ -71,7 +71,16 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     /// Parse the startup blob from a JSON string.
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
-        serde_json::from_str(s).map_err(|e| anyhow::anyhow!("Failed to parse proxy config: {e}"))
+        let cfg: Self = serde_json::from_str(s)
+            .map_err(|e| anyhow::anyhow!("Failed to parse proxy config: {e}"))?;
+        // Defense in depth: an empty token would fail open, since
+        // `constant_time_eq(b"", b"")` is true and a bare `Authorization:
+        // Bearer ` presents an empty token. coop always mints a 64-hex token,
+        // so this is unreachable in production, but reject it at parse anyway.
+        if cfg.capability_token.expose().is_empty() {
+            anyhow::bail!("capability_token must not be empty");
+        }
+        Ok(cfg)
     }
 }
 
@@ -124,6 +133,17 @@ mod tests {
             "capability_token": "t",
             "upstream_host": "h",
             "injection": { "scheme": "basic", "credential": "x" }
+        }"#;
+        assert!(ProxyConfig::from_json(json).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_capability_token() {
+        let json = r#"{
+            "listen": "127.0.0.1:1",
+            "capability_token": "",
+            "upstream_host": "api.anthropic.com",
+            "injection": { "scheme": "bearer", "credential": "x" }
         }"#;
         assert!(ProxyConfig::from_json(json).is_err());
     }
