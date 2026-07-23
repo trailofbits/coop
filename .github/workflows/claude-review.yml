@@ -73,7 +73,7 @@ jobs:
           gh pr comment "$PR" --repo "$REPO" --body '⚠️ **@claude is about to review a PR from an outside contributor.**
           The diff, commit messages, and comments here are **untrusted input** and may contain prompt-injection attempting to make the review agent read or leak CI secrets. The agent is instructed to treat all of it as data, never as instructions — but that is a mitigation, not a guarantee. **Review the diff yourself for injection before relying on the agent'\''s output, and do not merge on the agent'\''s say-so alone.**'
 
-      - uses: anthropics/claude-code-action@e58dfa55559035499a4982426bb73605e8b5ad8e # v1.0.105
+      - uses: anthropics/claude-code-action@1298632ce7736903d02a1435002705aa2a594a6c # v1.0.175
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true
