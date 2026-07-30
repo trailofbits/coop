@@ -98,12 +98,17 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    - the notes match the `## vX.Y.Z` CHANGELOG section.
 
    Then smoke-test the install path with credentials stripped, so the offline
-   bundle verification is exercised as an external user sees it:
+   bundle verification is exercised as an external user sees it. Pin `VERSION`
+   to the tag you just pushed rather than relying on "latest":
 
    ```bash
    env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$(mktemp -d)" \
-     INSTALL_DIR="$(mktemp -d)" bash install.sh
+     VERSION=vX.Y.Z INSTALL_DIR="$(mktemp -d)" bash install.sh
    ```
+
+   The run must print `Verifying attestation...` without a "No
+   `attestations.jsonl` published" line — that line means the asset is missing
+   and verification silently fell back to the credential-requiring API path.
 
 ## If the tag run fails
 

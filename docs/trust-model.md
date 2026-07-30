@@ -133,11 +133,16 @@ Self-update (`update.rs`) must preserve, in order:
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
-4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop`
-   (Sigstore provenance). Skipped with a logged note if `gh` is absent, and
-   skipped entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode).
-   So provenance is *not* guaranteed on hosts without `gh` — checksum is the
-   floor.
+4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
+   --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
+   downloaded from the same release. `--bundle` makes verification offline: no
+   attestations-API call, so no GitHub credential — but it does *not* weaken the
+   check, because the bundle is signed and `--repo` still pins the signer
+   identity, so a substituted or tampered bundle fails. Releases publishing no
+   bundle asset fall back to the API path (credential required). Skipped with a
+   logged note if `gh` is absent, and skipped entirely when
+   `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So provenance is *not*
+   guaranteed on hosts without `gh` — checksum is the floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 

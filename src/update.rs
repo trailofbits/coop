@@ -8,6 +8,7 @@
 //! to nudge users when a newer release is available.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -25,6 +26,8 @@ use crate::sha256_hash::Sha256Hash;
 
 const REPO: &str = "trailofbits/coop";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
+/// Release asset holding the Sigstore provenance bundle, published since #421.
+const BUNDLE_ASSET: &str = "attestations.jsonl";
 const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -383,7 +386,52 @@ fn verify_sha256(file: &Path, expected: &Sha256Hash) -> Result<()> {
 
 // ── Attestation verification (best-effort) ───────────────────────────────────
 
-fn verify_attestation(tarball: &Path) -> Result<()> {
+/// Build the `gh attestation verify` argument list.
+///
+/// With `bundle`, `gh` reads the Sigstore bundle from disk and makes no API
+/// call, so verification needs no GitHub credential. Without it, `gh` fetches
+/// the bundle from the attestations API and always attaches its stored token —
+/// which 403s on public data when that token carries no SSO session for the
+/// org. `--repo` pins the signer identity in both cases.
+fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "attestation".into(),
+        "verify".into(),
+        tarball.as_os_str().to_owned(),
+        "--repo".into(),
+        REPO.into(),
+    ];
+    if let Some(bundle) = bundle {
+        args.push("--bundle".into());
+        args.push(bundle.as_os_str().to_owned());
+    }
+    args
+}
+
+/// Download the release's provenance bundle, if it published one.
+///
+/// `Ok(None)` means verification must fall back to the attestations API, or is
+/// skipped outright. Skipping the download when `verify_attestation` would not
+/// use it matters: the download is fallible, so fetching a bundle nothing reads
+/// would turn a transient network blip into a failed update.
+fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Result<Option<PathBuf>> {
+    if api_base_overridden() || !command_exists("gh") {
+        return Ok(None);
+    }
+    let Some(asset) = release.find_asset(BUNDLE_ASSET) else {
+        tracing::info!(
+            "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
+             GitHub API, which requires a credential authorized for {REPO}.",
+            release.tag
+        );
+        return Ok(None);
+    };
+    let dest = dir.join(BUNDLE_ASSET);
+    download_asset(&release.tag, BUNDLE_ASSET, &asset.url, &dest)?;
+    Ok(Some(dest))
+}
+
+fn verify_attestation(tarball: &Path, bundle: Option<&Path>) -> Result<()> {
     // Skip when the API base is overridden — the local test fixture serves
     // synthetic artifacts that have no provenance in GitHub's attestation
     // API. `warn_if_api_base_overridden` has already surfaced this to the
@@ -397,21 +445,26 @@ fn verify_attestation(tarball: &Path) -> Result<()> {
              The download was verified against the published `SHA256SUMS` checksum, which \
              is the same assurance level as most `curl | bash` installers. For end-to-end \
              Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
-             verify manually: `gh attestation verify <tarball> --repo {}`.",
-            REPO
+             verify manually: `gh attestation verify <tarball> --repo {REPO} --bundle \
+             {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
         );
         return Ok(());
     }
     Cmd::new("gh")
-        .arg("attestation")
-        .arg("verify")
-        .arg(tarball)
-        .arg("--repo")
-        .arg(REPO)
+        .args(attestation_verify_args(tarball, bundle))
         .run()
         .with_context(|| {
+            let hint = if bundle.is_some() {
+                String::new()
+            } else {
+                format!(
+                    " (verified through the GitHub API because the release publishes no \
+                     {BUNDLE_ASSET}; an HTTP 403 here means your GitHub credential has no \
+                     SSO session for the org)"
+                )
+            };
             format!(
-                "Attestation verification failed for {} — refusing to install",
+                "Attestation verification failed for {} — refusing to install{hint}",
                 tarball.display()
             )
         })
@@ -547,7 +600,8 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
         .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
     verify_sha256(&tarball_path, &expected)?;
 
-    verify_attestation(&tarball_path)?;
+    let bundle_path = fetch_attestation_bundle(release, tmp.path())?;
+    verify_attestation(&tarball_path, bundle_path.as_deref())?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
     // `-C <tempdir>` plus modern tar's default refusal of `..`-segmented and absolute
@@ -891,6 +945,76 @@ mod tests {
         verify_sha256(&path, &correct).unwrap();
         let wrong: Sha256Hash = "0".repeat(64).parse().unwrap();
         verify_sha256(&path, &wrong).unwrap_err();
+    }
+
+    #[test]
+    fn attestation_verify_args_pin_repo_and_omit_bundle_when_absent() {
+        let args = attestation_verify_args(Path::new("/tmp/coop.tar.gz"), None);
+        assert_eq!(
+            args,
+            ["attestation", "verify", "/tmp/coop.tar.gz", "--repo", REPO]
+        );
+    }
+
+    #[test]
+    fn attestation_verify_args_append_bundle_when_present() {
+        let args = attestation_verify_args(
+            Path::new("/tmp/coop.tar.gz"),
+            Some(Path::new("/tmp/attestations.jsonl")),
+        );
+        assert_eq!(
+            args,
+            [
+                "attestation",
+                "verify",
+                "/tmp/coop.tar.gz",
+                "--repo",
+                REPO,
+                "--bundle",
+                "/tmp/attestations.jsonl",
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_asset_is_found_on_a_release_that_publishes_it() {
+        let release: Release = serde_json::from_str(&format!(
+            r#"{{"tag_name":"v9.9.9","assets":[
+                 {{"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}},
+                 {{"name":"{BUNDLE_ASSET}","browser_download_url":"https://example.com/B"}}
+               ]}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            release.find_asset(BUNDLE_ASSET).map(|a| a.url.as_str()),
+            Some("https://example.com/B")
+        );
+
+        // A release predating the asset must fall back, not match something else.
+        let old: Release = serde_json::from_str(
+            r#"{"tag_name":"v0.5.4","assets":[
+                 {"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}
+               ]}"#,
+        )
+        .unwrap();
+        assert!(old.find_asset(BUNDLE_ASSET).is_none());
+    }
+
+    /// The asset name is agreed across three files with no compiler link
+    /// between them. A rename in one silently degrades `coop update` and
+    /// `install.sh` back to the credential-requiring API path.
+    #[test]
+    fn bundle_asset_name_matches_release_workflow_and_installer() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        let installer = include_str!("../install.sh");
+        assert!(
+            workflow.contains(BUNDLE_ASSET),
+            "release.yml no longer publishes {BUNDLE_ASSET}"
+        );
+        assert!(
+            installer.contains(BUNDLE_ASSET),
+            "install.sh no longer downloads {BUNDLE_ASSET}"
+        );
     }
 
     #[test]

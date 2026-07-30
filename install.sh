@@ -113,22 +113,38 @@ verify_checksum() {
 
 verify_attestation() {
     local file="$1"
-    if has gh; then
-        info "Verifying attestation..."
-        # Verify offline against the bundle published with the release. `gh
-        # attestation verify` without --bundle queries the GitHub API, and gh
-        # always attaches its token, so a token lacking an SSO session for the
-        # org 403s on public data. The --repo identity check is still enforced.
-        download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" \
-            || die "Could not download ${BUNDLE} for ${VERSION} — releases before the bundle was published cannot be verified offline; install a newer version"
-        gh attestation verify "$file" --repo "$REPO" --bundle "${TMPDIR}/${BUNDLE}" \
-            || die "Attestation verification failed for $(basename "$file") — refusing to install"
-    else
+    if ! has gh; then
         info "Note: \`gh\` not installed — skipped cryptographic attestation verification."
         info "The download was verified against the published \`SHA256SUMS\` checksum, which"
         info "is the same assurance level as most \`curl | bash\` installers. For end-to-end"
         info "Sigstore verification, install \`gh\` (https://cli.github.com) and re-run, or"
-        info "verify manually: \`gh attestation verify <tarball> --repo ${REPO}\`."
+        info "verify manually: \`gh attestation verify <tarball> --repo ${REPO} \\"
+        info "  --bundle ${BUNDLE}\` against the ${BUNDLE} asset from the same release."
+        return 0
+    fi
+
+    info "Verifying attestation..."
+    # Prefer the bundle published with the release: `gh attestation verify`
+    # without --bundle queries the GitHub attestations API, and gh always
+    # attaches its stored token, so a token lacking an SSO session for the org
+    # 403s on public data. The --repo identity check is enforced either way.
+    # The probe is silenced: a missing bundle is expected on older releases, so
+    # curl's bare "404" would read as a hard error.
+    if download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1; then
+        gh attestation verify "$file" --repo "$REPO" --bundle "${TMPDIR}/${BUNDLE}" \
+            || die "Attestation verification failed for $(basename "$file") — refusing to install"
+        return 0
+    fi
+
+    # Releases published before the bundle asset existed verify through the
+    # API, exactly as every release did before. That needs a credential
+    # authorized for the org, so it is the fallback and not the default.
+    info "No ${BUNDLE} published for ${VERSION} — verifying through the GitHub API instead."
+    if ! gh attestation verify "$file" --repo "$REPO"; then
+        info "${VERSION} predates the ${BUNDLE} asset, so verification used the GitHub API."
+        info "An HTTP 403 above means your GitHub credential carries no SSO session for the"
+        info "org; installing a release that publishes ${BUNDLE} avoids the API entirely."
+        die "Attestation verification failed for $(basename "$file") — refusing to install"
     fi
 }
 
