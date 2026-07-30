@@ -30,14 +30,17 @@
   lockstep.
 
 - **The credential proxy is jailed** (#411) — the host-side `coop-proxy`
-  process runs confined so a proxy exploit cannot write files, execute
-  programs, or reach any host beyond the upstream `:443` and DNS `:53`. On
-  Linux it self-applies Landlock (ABI v4; host kernel ≥6.7) before serving; on
-  macOS the launcher wraps it in `sandbox-exec` with a Seatbelt profile. The
-  confinement is fail-closed — if it cannot be established the VM start aborts
-  rather than running the credential-holding proxy unconfined. The jail is
-  port-scoped, not host-scoped (upstream identity is enforced by the proxy's
-  TLS verification), and does not restrict UDP on Linux; see
+  process runs confined so a proxy exploit cannot write files or execute
+  programs, and — on a new enough kernel — cannot reach any host beyond the
+  upstream `:443` and DNS `:53`. On Linux it self-applies Landlock before
+  serving, tiered by kernel capability: filesystem-write and program-exec are
+  always denied (kernel ≥5.13) and fail-closed — the VM start aborts rather
+  than running the proxy without that floor; TCP egress is port-scoped only on
+  kernel ≥6.7, and on kernels 5.13–6.6 (which have no Landlock network rules)
+  that scoping is dropped and egress is left open. On macOS the launcher wraps
+  it in `sandbox-exec` with a Seatbelt profile. The jail is port-scoped, not
+  host-scoped (upstream identity is enforced by the proxy's TLS verification),
+  and does not restrict UDP on Linux; see
   [`docs/trust-model.md`](docs/trust-model.md).
 
 - **Per-VM credential overrides + `coop proxy status`** (#411) — A single VM can

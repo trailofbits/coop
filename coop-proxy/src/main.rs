@@ -50,11 +50,21 @@ fn main() -> Result<()> {
     // (coop's `proxy.rs`), so this is Linux-only.
     #[cfg(target_os = "linux")]
     if !args.iter().any(|a| a == "--no-jail") {
-        jail::apply(cfg.listen.port()).context("failed to establish the Landlock jail")?;
-        tracing::info!(
-            "Landlock jail established: filesystem writes and program exec denied; \
-             TCP egress limited to :443/:53"
-        );
+        let net_scoped =
+            jail::apply(cfg.listen.port()).context("failed to establish the Landlock jail")?;
+        if net_scoped {
+            tracing::info!(
+                "Landlock jail established: filesystem writes and program exec denied; \
+                 TCP egress limited to :443/:53"
+            );
+        } else {
+            tracing::warn!(
+                "Landlock jail established with reduced scope: filesystem writes and program \
+                 exec denied, but this kernel (<6.7) has no Landlock network rules, so TCP \
+                 egress is not port-scoped (open egress). Upstream identity is still enforced \
+                 at the TLS layer."
+            );
+        }
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
