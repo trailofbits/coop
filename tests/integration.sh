@@ -4280,8 +4280,13 @@ CFGEOF
         sb_profile="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/seatbelt-proxy.sb"
         if [[ -f "$sb_profile" ]]; then
             # Pass the profile inline with -p (as coop's launcher does), not -f,
-            # so the smoke test exercises the same code path production uses.
-            selftest_out=$(sandbox-exec -p "$(cat "$sb_profile")" "$proxy_bin" --jail-selftest 2>&1) \
+            # and bind PROXY_BIN to the proxy's absolute path (as the launcher
+            # does), so the smoke test exercises the same code path production
+            # uses. `pwd -P` resolves the dir the way the kernel does at exec.
+            local proxy_bin_abs
+            proxy_bin_abs="$(cd "$(dirname "$proxy_bin")" && pwd -P)/$(basename "$proxy_bin")"
+            selftest_out=$(sandbox-exec -D "PROXY_BIN=$proxy_bin_abs" \
+                -p "$(cat "$sb_profile")" "$proxy_bin_abs" --jail-selftest 2>&1) \
                 || selftest_rc=$?
             if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
                 pass "proxy jail confines coop-proxy (Seatbelt: no fs-write/exec/off-list egress)"

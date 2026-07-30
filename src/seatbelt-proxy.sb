@@ -7,14 +7,25 @@
 ;; needs: read files (the dynamic linker, resolver config), resolve names,
 ;; bind its loopback listener, accept the reverse-tunnel connection, and
 ;; connect out only to :443 (upstream HTTPS) and :53 (DNS). No filesystem
-;; writes, no exec, no other egress. The sandbox is inherited by children and
-;; cannot be relaxed from inside.
+;; writes; the only exec permitted is sandbox-exec's initial replace-exec of
+;; the proxy binary itself (see PROXY_BIN below) — a compromised proxy still
+;; cannot exec any other program. No other egress. The sandbox is inherited by
+;; children and cannot be relaxed from inside.
 ;;
 ;; `sandbox-exec`/SBPL is officially deprecated but still functional and widely
 ;; relied on; Apple has shipped no CLI successor. This is the pragmatic macOS
 ;; analog of the Linux Landlock jail. See docs/trust-model.md.
 (version 1)
 (deny default)
+
+;; sandbox-exec applies this profile to itself and then execve-replaces itself
+;; with the proxy binary. That initial exec is governed by this profile, so it
+;; must be permitted or the proxy can never start. Scope it to this exact
+;; binary — its absolute path is passed as the PROXY_BIN parameter via
+;; `sandbox-exec -D` — so a compromised proxy still cannot exec a shell or any
+;; other program (every other path stays denied by `(deny default)`), and the
+;; proxy never execs again after this.
+(allow process-exec* (literal (param "PROXY_BIN")))
 
 ;; Reads stay open (dyld, dylib cache, /etc/resolv.conf, /etc/hosts). Writes
 ;; are denied by the default deny; the proxy only writes to its inherited

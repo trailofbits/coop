@@ -330,8 +330,19 @@ fn await_proxy_ready(
 fn confined_command(bin: &Path) -> Command {
     #[cfg(target_os = "macos")]
     {
+        // sandbox-exec applies the profile to itself, then execve-replaces
+        // itself with the proxy — an exec the profile must permit. The profile
+        // scopes that allowance to this exact binary via the PROXY_BIN
+        // parameter, so nothing else can be exec'd. Canonicalize so the path
+        // matches what the kernel resolves at exec time (e.g. /var →
+        // /private/var); fall back to the given path if canonicalization fails.
+        let resolved = fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
         let mut cmd = Command::new("sandbox-exec");
-        cmd.arg("-p").arg(SEATBELT_PROFILE).arg(bin);
+        cmd.arg("-D")
+            .arg(format!("PROXY_BIN={}", resolved.display()))
+            .arg("-p")
+            .arg(SEATBELT_PROFILE)
+            .arg(&resolved);
         cmd
     }
     #[cfg(not(target_os = "macos"))]
