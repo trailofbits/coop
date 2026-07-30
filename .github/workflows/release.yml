@@ -107,7 +107,7 @@ jobs:
 
       # Normalize to one bundle per line so the published asset has a stable
       # shape regardless of whether the action emits a single bundle or several.
-      - name: Publish attestation bundle
+      - name: Normalize attestation bundle
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: jq -c . "$BUNDLE_PATH" > attestations.jsonl

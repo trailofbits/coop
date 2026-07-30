@@ -131,8 +131,14 @@ verify_attestation() {
     # The probe is silenced: a missing bundle is expected on older releases, so
     # curl's bare "404" would read as a hard error.
     if download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1; then
+        # A failure here is not retried through the API. That is no stricter on
+        # integrity — a substituted bundle fails here and would then verify
+        # correctly against the genuine attestation — but a bundle that
+        # downloaded and will not verify means a broken download or a `gh` that
+        # cannot read it, and switching transports would hide both.
         gh attestation verify "$file" --repo "$REPO" --bundle "${TMPDIR}/${BUNDLE}" \
             || die "Attestation verification failed for $(basename "$file") — refusing to install"
+        info "Attestation verified offline against ${BUNDLE} — no GitHub credential used."
         return 0
     fi
 
@@ -140,12 +146,23 @@ verify_attestation() {
     # API, exactly as every release did before. That needs a credential
     # authorized for the org, so it is the fallback and not the default.
     info "No ${BUNDLE} published for ${VERSION} — verifying through the GitHub API instead."
-    if ! gh attestation verify "$file" --repo "$REPO"; then
-        info "${VERSION} predates the ${BUNDLE} asset, so verification used the GitHub API."
-        info "An HTTP 403 above means your GitHub credential carries no SSO session for the"
-        info "org; installing a release that publishes ${BUNDLE} avoids the API entirely."
-        die "Attestation verification failed for $(basename "$file") — refusing to install"
+    local out
+    if out="$(gh attestation verify "$file" --repo "$REPO" 2>&1)"; then
+        info "Attestation verified through the GitHub API."
+        return 0
     fi
+    printf '%s\n' "$out" >&2
+    # This path also fails on a network error, a gh too old for the command, or
+    # a genuine provenance mismatch, so only explain the credential requirement
+    # when gh actually reported one of its symptoms.
+    case "$out" in
+        *403* | *SAML* | *"gh auth login"*)
+            info "${VERSION} predates the ${BUNDLE} asset, so verification used the GitHub API,"
+            info "which needs a credential authorized for the org. Installing a release that"
+            info "publishes ${BUNDLE} avoids the API entirely."
+            ;;
+    esac
+    die "Attestation verification failed for $(basename "$file") — refusing to install"
 }
 
 # --- main -------------------------------------------------------------------

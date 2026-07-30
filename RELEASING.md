@@ -106,9 +106,9 @@ CI can't run the full VM integration suite or the extra-toolchain checks
      VERSION=vX.Y.Z INSTALL_DIR="$(mktemp -d)" bash install.sh
    ```
 
-   The run must print `Verifying attestation...` without a "No
-   `attestations.jsonl` published" line — that line means the asset is missing
-   and verification silently fell back to the credential-requiring API path.
+   The run must print `Attestation verified offline against attestations.jsonl`.
+   A "No `attestations.jsonl` published" line instead means the asset is missing
+   and verification fell back to the credential-requiring API path.
 
 ## If the tag run fails
 

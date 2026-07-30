@@ -138,11 +138,14 @@ Self-update (`update.rs`) must preserve, in order:
    downloaded from the same release. `--bundle` makes verification offline: no
    attestations-API call, so no GitHub credential — but it does *not* weaken the
    check, because the bundle is signed and `--repo` still pins the signer
-   identity, so a substituted or tampered bundle fails. Releases publishing no
-   bundle asset fall back to the API path (credential required). Skipped with a
-   logged note if `gh` is absent, and skipped entirely when
-   `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So provenance is *not*
-   guaranteed on hosts without `gh` — checksum is the floor.
+   identity, so a substituted or tampered bundle fails. A release that publishes
+   no bundle asset — or a bundle whose download fails — falls back to the API
+   path (credential required); `update.rs` and `install.sh` treat those two
+   cases identically. A bundle that downloads but fails to verify is refused
+   outright, not retried through the API. Skipped with a logged note if `gh` is
+   absent, and skipped entirely when `COOP_UPDATE_API_BASE_URL` is overridden
+   (test mode). So provenance is *not* guaranteed on hosts without `gh` —
+   checksum is the floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 

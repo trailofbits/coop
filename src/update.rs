@@ -410,13 +410,15 @@ fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsStrin
 
 /// Download the release's provenance bundle, if it published one.
 ///
-/// `Ok(None)` means verification must fall back to the attestations API, or is
-/// skipped outright. Skipping the download when `verify_attestation` would not
-/// use it matters: the download is fallible, so fetching a bundle nothing reads
-/// would turn a transient network blip into a failed update.
-fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Result<Option<PathBuf>> {
+/// `None` means verification falls back to the attestations API, or is skipped
+/// outright — never that the update fails. A download that blips is the same
+/// situation as a release that never published the asset, and `install.sh`
+/// resolves it the same way. The download is also skipped when
+/// `verify_attestation` would not read the result, so an update whose
+/// attestation step is a no-op does no pointless work.
+fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Option<PathBuf> {
     if api_base_overridden() || !command_exists("gh") {
-        return Ok(None);
+        return None;
     }
     let Some(asset) = release.find_asset(BUNDLE_ASSET) else {
         tracing::info!(
@@ -424,11 +426,19 @@ fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Result<Option<Path
              GitHub API, which requires a credential authorized for {REPO}.",
             release.tag
         );
-        return Ok(None);
+        return None;
     };
     let dest = dir.join(BUNDLE_ASSET);
-    download_asset(&release.tag, BUNDLE_ASSET, &asset.url, &dest)?;
-    Ok(Some(dest))
+    if let Err(err) = download_asset(&release.tag, BUNDLE_ASSET, &asset.url, &dest) {
+        tracing::warn!(
+            "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — verifying the \
+             attestation through the GitHub API, which requires a credential authorized for \
+             {REPO}.",
+            release.tag
+        );
+        return None;
+    }
+    Some(dest)
 }
 
 fn verify_attestation(tarball: &Path, bundle: Option<&Path>) -> Result<()> {
@@ -600,7 +610,7 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
         .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
     verify_sha256(&tarball_path, &expected)?;
 
-    let bundle_path = fetch_attestation_bundle(release, tmp.path())?;
+    let bundle_path = fetch_attestation_bundle(release, tmp.path());
     verify_attestation(&tarball_path, bundle_path.as_deref())?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
@@ -1003,13 +1013,21 @@ mod tests {
     /// The asset name is agreed across three files with no compiler link
     /// between them. A rename in one silently degrades `coop update` and
     /// `install.sh` back to the credential-requiring API path.
+    ///
+    /// `include_str!` is the tripwire, so moving either file breaks this test
+    /// as a compile error rather than a named assertion failure.
     #[test]
     fn bundle_asset_name_matches_release_workflow_and_installer() {
         let workflow = include_str!("../.github/workflows/release.yml");
         let installer = include_str!("../install.sh");
+        // The workflow names the asset twice: the `jq` output redirect that
+        // creates it, and the `gh release create` that publishes it. Only the
+        // latter makes it reachable by a client, so assert on that line.
         assert!(
-            workflow.contains(BUNDLE_ASSET),
-            "release.yml no longer publishes {BUNDLE_ASSET}"
+            workflow
+                .lines()
+                .any(|l| l.contains("gh release create") && l.contains(BUNDLE_ASSET)),
+            "release.yml no longer publishes {BUNDLE_ASSET} as a release asset"
         );
         assert!(
             installer.contains(BUNDLE_ASSET),
