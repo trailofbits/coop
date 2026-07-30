@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO="trailofbits/coop"
 BINARY="coop"
+BUNDLE="attestations.jsonl"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 # --- helpers ----------------------------------------------------------------
@@ -114,7 +115,13 @@ verify_attestation() {
     local file="$1"
     if has gh; then
         info "Verifying attestation..."
-        gh attestation verify "$file" --repo "$REPO" \
+        # Verify offline against the bundle published with the release. `gh
+        # attestation verify` without --bundle queries the GitHub API, and gh
+        # always attaches its token, so a token lacking an SSO session for the
+        # org 403s on public data. The --repo identity check is still enforced.
+        download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" \
+            || die "Could not download ${BUNDLE} for ${VERSION} — releases before the bundle was published cannot be verified offline; install a newer version"
+        gh attestation verify "$file" --repo "$REPO" --bundle "${TMPDIR}/${BUNDLE}" \
             || die "Attestation verification failed for $(basename "$file") — refusing to install"
     else
         info "Note: \`gh\` not installed — skipped cryptographic attestation verification."

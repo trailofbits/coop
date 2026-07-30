@@ -131,14 +131,27 @@ The attestation proves the artifact was built from this repository by the
 tagged release workflow.
 
 Both `install.sh` and `coop update` run this verification automatically
-when the [GitHub CLI](https://cli.github.com/) is installed. Without `gh`,
-they fall back to checksum verification against the release's `SHA256SUMS`
-and print a note explaining what was and wasn't verified.
+when the [GitHub CLI](https://cli.github.com/) is installed. `install.sh`
+verifies offline against the `attestations.jsonl` bundle published with the
+release, so that verification step makes no GitHub API call and needs no
+authentication, whereas `coop update` verifies through the GitHub attestations
+API. Without `gh`, both fall back to checksum verification against the
+release's `SHA256SUMS` and print a note explaining what was and wasn't verified.
 
 To verify a downloaded tarball manually:
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop
+```
+
+The API call above requires a GitHub credential. To verify offline against the
+published bundle instead — the workaround if your token has no SSO session for
+the `trailofbits` org — download `attestations.jsonl` from the release and pass
+`--bundle`:
+
+```sh
+gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --bundle attestations.jsonl
 ```
 
 ## Requirements

@@ -100,9 +100,17 @@ jobs:
         run: sha256sum coop-*.tar.gz > SHA256SUMS
 
       - name: Attest build provenance
+        id: attest
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: "coop-*.tar.gz"
+
+      # Normalize to one bundle per line so the published asset has a stable
+      # shape regardless of whether the action emits a single bundle or several.
+      - name: Publish attestation bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: jq -c . "$BUNDLE_PATH" > attestations.jsonl
 
       - name: Extract release notes from CHANGELOG
         env:
@@ -122,4 +130,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS
+        run: gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS attestations.jsonl
