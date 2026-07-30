@@ -28,8 +28,10 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          # Native ARM64 Linux runner — no cross-compilation, so coop-proxy's
+          # aws-lc-sys builds with the native musl toolchain (issue #411).
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
 
@@ -38,28 +40,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+      # Each target builds on a matching-arch runner (no cross-compilation).
+      # The Linux musl legs need musl-gcc + cmake to build coop-proxy's
+      # aws-lc-sys crypto backend natively; macOS ships cmake preinstalled.
+      - name: Install musl tools and cmake (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
-      - name: Install musl tools (Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools cmake
 
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        # `--workspace` builds both `coop` and `coop-proxy` from one source
+        # tree, so they ship in lockstep (issue #411). Native builds: musl-gcc
+        # is the C compiler (for aws-lc-sys) and the linker on each Linux
+        # runner. The macOS leg ignores these vars.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -68,6 +71,9 @@ jobs:
           name="${BINARY}-${tag}-${{ matrix.target }}"
           mkdir -p "staging/${name}"
           cp "target/${{ matrix.target }}/release/${BINARY}" "staging/${name}/"
+          # coop-proxy rides in the same tarball, inheriting the identical
+          # SLSA build-provenance attestation with no new machinery.
+          cp "target/${{ matrix.target }}/release/${BINARY}-proxy" "staging/${name}/"
           cp LICENSE* staging/${name}/ 2>/dev/null || true
           tar -czf "${name}.tar.gz" -C staging "${name}"
           echo "TARBALL=${name}.tar.gz" >> "$GITHUB_ENV"

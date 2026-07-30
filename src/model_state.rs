@@ -237,6 +237,76 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
     root
 }
 
+/// The `~/.codex/config.toml` keys coop merges to route Codex through the
+/// host-side injecting proxy (issue #411).
+///
+/// Mirrors [`codex_local_config`] but for proxy mode: it points the
+/// `coop_local` provider's `base_url` at the proxy and selects it via
+/// `model_provider`, while pinning **no** `model` — proxy mode is transparent,
+/// so Codex keeps whatever model the user configured (or its default) and only
+/// its egress is redirected. Codex sends the value of `env_key`
+/// ([`CODEX_LOCAL_ENV_KEY`]) as `Authorization: Bearer`; coop forwards the
+/// per-instance capability token there, which the proxy verifies before
+/// injecting the real credential upstream.
+///
+/// The `base_url` gets an `/v1` suffix: Codex forms the request URL as
+/// `{base_url}/responses`, and the proxy forwards the path verbatim to
+/// `api.openai.com`, so the guest must produce `/v1/responses` (`OpenAI`'s
+/// Responses endpoint) — mirroring `OpenAI`'s own `https://api.openai.com/v1`
+/// provider base.
+pub fn codex_proxy_config(base_url: &str) -> toml::Table {
+    let mut provider = toml::Table::new();
+    provider.insert(
+        "name".to_string(),
+        toml::Value::String("coop credential proxy".to_string()),
+    );
+    provider.insert(
+        "base_url".to_string(),
+        toml::Value::String(format!("{}/v1", base_url.trim_end_matches('/'))),
+    );
+    provider.insert(
+        "wire_api".to_string(),
+        toml::Value::String("responses".to_string()),
+    );
+    provider.insert(
+        "env_key".to_string(),
+        toml::Value::String(CODEX_LOCAL_ENV_KEY.to_string()),
+    );
+
+    let mut providers = toml::Table::new();
+    providers.insert(
+        CODEX_LOCAL_PROVIDER.to_string(),
+        toml::Value::Table(provider),
+    );
+
+    let mut root = toml::Table::new();
+    root.insert(
+        "model_provider".to_string(),
+        toml::Value::String(CODEX_LOCAL_PROVIDER.to_string()),
+    );
+    root.insert("model_providers".to_string(), toml::Value::Table(providers));
+    root
+}
+
+/// The `env` block coop writes into the managed `~/.claude/settings.json`
+/// to point Claude Code at the host-side injecting proxy (issue #411).
+///
+/// Unlike [`claude_env_block`] (local mode), this pins **nothing** about the
+/// model or request shape — proxy mode is transparent, routing real cloud
+/// traffic through the host so the real credential can be injected upstream.
+/// It sets only the base-URL override and the per-instance capability token
+/// (`ANTHROPIC_AUTH_TOKEN`), which Claude Code sends as `Authorization:
+/// Bearer` — the token the proxy verifies before injecting the real key.
+pub fn claude_proxy_env_block(base_url: &str, capability_token: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("ANTHROPIC_BASE_URL".to_string(), base_url.to_string());
+    env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        capability_token.to_string(),
+    );
+    env
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -462,6 +532,21 @@ mod tests {
     }
 
     #[test]
+    fn claude_proxy_env_block_sets_only_base_url_and_token() {
+        // Proxy mode is transparent: it must NOT pin any model tier or touch
+        // cache-buster keys (those are local-mode concerns) — only the base
+        // URL and the capability token.
+        let env = claude_proxy_env_block("http://172.16.0.1:8788", "cap-token");
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "cap-token");
+        assert_eq!(
+            env.len(),
+            2,
+            "proxy env block must set nothing else: {env:?}"
+        );
+    }
+
+    #[test]
     fn claude_env_block_disables_prefix_cache_busters() {
         // Both keys keep a local KV cache warm by stopping Claude Code
         // from mutating the system prompt per request (see the doc on
@@ -489,5 +574,44 @@ mod tests {
         );
         assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
+    }
+
+    #[test]
+    fn codex_proxy_config_pins_provider_but_not_model() {
+        let table = codex_proxy_config("http://127.0.0.1:8900");
+        // Proxy mode is transparent: no model pin, so Codex keeps its own.
+        assert!(
+            !table.contains_key("model"),
+            "proxy mode must not pin a model"
+        );
+        assert_eq!(
+            table["model_provider"].as_str().unwrap(),
+            CODEX_LOCAL_PROVIDER
+        );
+        let provider = table["model_providers"][CODEX_LOCAL_PROVIDER]
+            .as_table()
+            .unwrap();
+        assert_eq!(
+            provider["base_url"].as_str().unwrap(),
+            "http://127.0.0.1:8900/v1"
+        );
+        assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
+        assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
+        assert_eq!(provider["name"].as_str().unwrap(), "coop credential proxy");
+    }
+
+    #[test]
+    fn codex_proxy_config_collapses_trailing_slash_before_v1() {
+        // A slash-terminated base must not yield `//v1`; kills the
+        // `trim_end_matches('/')` deletion mutant that the no-slash case
+        // leaves alive.
+        let table = codex_proxy_config("http://127.0.0.1:8900/");
+        let provider = table["model_providers"][CODEX_LOCAL_PROVIDER]
+            .as_table()
+            .unwrap();
+        assert_eq!(
+            provider["base_url"].as_str().unwrap(),
+            "http://127.0.0.1:8900/v1"
+        );
     }
 }

@@ -196,10 +196,20 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 info "Installing to ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
-EXTRACTED="${TMPDIR}/${BINARY}-${VERSION}-${TRIPLE}/${BINARY}"
+EXTRACTED_DIR="${TMPDIR}/${BINARY}-${VERSION}-${TRIPLE}"
+EXTRACTED="${EXTRACTED_DIR}/${BINARY}"
 [ -f "$EXTRACTED" ] || die "Binary not found in tarball"
 mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
 chmod +x "${INSTALL_DIR}/${BINARY}"
+
+# coop-proxy (issue #411) ships in the same tarball and must land next to
+# coop — the CLI locates it via its own directory. Present from the version
+# that introduced it; tolerate its absence when installing older releases.
+PROXY_EXTRACTED="${EXTRACTED_DIR}/${BINARY}-proxy"
+if [ -f "$PROXY_EXTRACTED" ]; then
+    mv "$PROXY_EXTRACTED" "${INSTALL_DIR}/${BINARY}-proxy"
+    chmod +x "${INSTALL_DIR}/${BINARY}-proxy"
+fi
 
 printf '\n  %s %s installed to %s/%s\n' "$BINARY" "$VERSION" "$INSTALL_DIR" "$BINARY"
 

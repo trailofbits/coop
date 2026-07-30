@@ -203,6 +203,21 @@ exclude_re = [
   # commands/mod.rs — purges every instance + image (backend destroy calls).
   "\\bpurge_all_data\\b",
 
+  # commands/proxy.rs (#411) — `coop proxy setup` / `status`. run_setup reads a
+  # pasted token, prompts for a backend, and writes to the real secret store;
+  # store_vm_override resolves an instance and writes its proxy.json; run_status
+  # lists instances and writes stdout; the guidance/report printers only write
+  # stderr — none `--lib`-observable. The config writer `upsert_proxy_entry`,
+  # its `read_or_init_doc` helper, and the pure `auth_str` / `auth_for` /
+  # `service_for` / `redact_credential` / `resolve` / `describe` /
+  # `write_vm_status` (buffer-tested) stay IN scope — a survivor there is a real
+  # gap.
+  "src/commands/proxy\\.rs:.*\\brun_setup\\b",
+  "src/commands/proxy\\.rs:.*\\brun_status\\b",
+  "\\bstore_vm_override\\b",
+  "\\bprint_setup_guidance\\b",
+  "\\breport_setup\\b",
+
   # admin.rs — uninstall/init IO: terminal summary, recursive data-dir wipe,
   # self-binary removal. The decide_remove_data / config_path_is_under_data_dir
   # / is_dev_target_path predicates are pure and stay in scope (unit-tested).
@@ -300,6 +315,40 @@ exclude_re = [
   "\\bcodex_latest\\b",
   "\\bcapture_version\\b",
   "\\bagent_binary\\b",
+
+  # ---- src/proxy.rs (#411): host-side credential-proxy lifecycle ----
+  # Process spawn/teardown, binary discovery, PID-file IO, and the token-file
+  # writer — a `--lib` test cannot observe their effects (coop-proxy's own tests
+  # + tests/integration.sh cover the behavior). The pure `Provider` helpers
+  # (`port`/`base_port`/`upstream_host`/`name`, pinned by the port/range/host
+  # tests), `wire_config_json`, `mint_capability_token` (whose randomness/length
+  # a unit test asserts), and `read_capability_token` (trim/empty logic covered
+  # by `read_capability_token_ignores_empty_and_whitespace_files`) stay IN scope
+  # — a survivor on one of
+  # those is a real gap. File-anchored so the generic `start`/`stop` names don't
+  # scope out same-named functions elsewhere.
+  "src/proxy\\.rs:.*\\bstart_provider\\b",
+  "src/proxy\\.rs:.*\\bstop\\b",
+  "src/proxy\\.rs:.*\\bstop_provider\\b",
+  "src/proxy\\.rs:.*\\bkill_pid_file\\b",
+  "src/proxy\\.rs:.*\\bspawn_proxy\\b",
+  "src/proxy\\.rs:.*\\bspawn_reverse_forward\\b",
+  # slice-3 jail: liveness poll of a spawned process + TCP probe (fail-closed)
+  # and the platform spawn-command builder (macOS `sandbox-exec` wrap / Linux
+  # bare binary) — IO/spawn wrappers, not `--lib`-observable. `await_proxy_ready`
+  # has a unit test for its fail-closed early-exit branch; the poll/timeout loop
+  # itself stays excluded (IO-bound, slow timeout path). `wire_config_json`
+  # stays IN scope, pinned by the wire_json_* shape tests. coop-proxy's own
+  # `jail.rs` (the Landlock ruleset) is not in this sweep — coop-proxy is a
+  # separate, non-default workspace member — so it is asserted by
+  # `coop-proxy --jail-selftest` in tests/integration.sh instead.
+  "src/proxy\\.rs:.*\\bawait_proxy_ready\\b",
+  "src/proxy\\.rs:.*\\bconfined_command\\b",
+  "src/proxy\\.rs:.*\\bwrite_token_file\\b",
+  "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
+  "src/proxy\\.rs:.*\\bpid_path\\b",
+  "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
+  "src/proxy\\.rs:.*\\btoken_path\\b",
 
   # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
   # not honour exclude_re for these — the regex never matches their name (not

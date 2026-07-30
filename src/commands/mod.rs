@@ -12,6 +12,7 @@ pub(crate) mod json;
 mod lifecycle;
 mod model;
 mod profiles;
+mod proxy;
 mod quickstart;
 
 pub(crate) use admin::{UninstallOpts, cmd_init, cmd_uninstall, cmd_validate};
@@ -30,6 +31,7 @@ pub(crate) use lifecycle::{
 };
 pub(crate) use model::cmd_model;
 pub(crate) use profiles::{cmd_images, cmd_profiles};
+pub(crate) use proxy::cmd_proxy;
 pub(crate) use quickstart::{QuickstartOpts, cmd_quickstart};
 
 use anyhow::Result;
@@ -72,6 +74,7 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
+        crate::proxy::stop(inst);
         be.destroy_instance(cfg, inst)?;
         workspace::remove_ssh_config(inst)?;
     }

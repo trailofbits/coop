@@ -25,6 +25,8 @@ mod naming;
 mod pat_prompt;
 mod paths;
 mod port_forward;
+mod proxy;
+mod proxy_state;
 mod remote_command;
 mod secret_store;
 mod sha256_hash;
@@ -70,8 +72,8 @@ use commands::{
     QuickstartOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
     UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
     cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
-    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_quickstart, cmd_resize, cmd_restore,
-    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
+    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize,
+    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
     codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
     resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
 };
@@ -606,6 +608,11 @@ enum Commands {
         #[command(subcommand)]
         action: GithubAction,
     },
+    /// Manage the credential-injecting proxy (issue #411)
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
     /// Validate configuration and check prerequisites
     Validate {
         /// Probe live state for each `[github.pat]` entry (talks to api.github.com)
@@ -761,6 +768,45 @@ enum GithubAction {
         /// Repo slug whose entry should be removed
         #[arg(long, required = true, value_parser = github_repo::RepoSlug::parse_cli)]
         repo: github_repo::RepoSlug,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// Store a provider credential in a secret backend and wire it into
+    /// `[proxy.<provider>]` (the default) or a per-VM override. Anthropic
+    /// (Claude) is the default provider; pass `--openai` for Codex.
+    Setup {
+        /// Configure the `OpenAI` (Codex) upstream instead of Anthropic. `OpenAI`
+        /// keys are always injected as `Authorization: Bearer`.
+        #[arg(long, conflicts_with = "anthropic")]
+        openai: bool,
+        /// Configure the Anthropic (Claude) upstream (the default provider).
+        #[arg(long)]
+        anthropic: bool,
+        /// Store the credential as a per-VM override for this instance instead
+        /// of the global `[proxy.<provider>]` default.
+        #[arg(
+            long,
+            value_name = "NAME",
+            add = ArgValueCandidates::new(completions::instance_candidates)
+        )]
+        vm: Option<String>,
+        /// Anthropic only: store an API key (`x-api-key`) instead of a Claude
+        /// `setup-token`. Ignored for `--openai` (always Bearer).
+        #[arg(long)]
+        api_key: bool,
+    },
+    /// Show what each VM's agents resolve to (per-VM override → default → off),
+    /// with credentials redacted.
+    Status {
+        /// Show the effective resolution for a single VM instead of all.
+        #[arg(
+            long,
+            value_name = "NAME",
+            add = ArgValueCandidates::new(completions::instance_candidates)
+        )]
+        vm: Option<String>,
     },
 }
 
@@ -1309,6 +1355,7 @@ pub fn run() -> Result<()> {
             &action.unwrap_or(ProfilesAction::List { json: false }),
         ),
         Commands::Github { action } => cmd_github(&cfg, &cli.config, action),
+        Commands::Proxy { action } => cmd_proxy(&cfg, &cli.config, &action),
         Commands::Validate { probe } => cmd_validate(&cfg, &be, probe),
         Commands::Init
         | Commands::Update { .. }

@@ -92,6 +92,21 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **The stored token is indirected, never inlined.** `config.toml` holds a
   `cmd:...` retrieval command (`secret_store.rs:CmdToken`), not the plaintext
   token; coop runs it at VM-start to fetch the value.
+- **Proxy mode keeps the model API keys out of the guest entirely** (issue #411,
+  opt-in `[proxy]`). When enabled in remote model mode, `ANTHROPIC_API_KEY`
+  (Claude) and/or `OPENAI_API_KEY` (Codex) are **not** forwarded
+  (`prepare_env_forwarding`'s `suppress_anthropic_key`/`suppress_openai_key`, one
+  per provider); the host-side `coop-proxy` holds the real credential and the
+  guest gets only a per-instance capability token (Claude via `settings.json`,
+  Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
+  `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
+  refreshable subscription token). Each credential is resolved on the host and
+  handed to `coop-proxy` over **stdin**, never argv or disk; a resolution failure
+  fails the boot closed. A per-VM override
+  (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
+  credential for one VM — resolution is override → default → off — without
+  changing the proxy binary or the capability token. See
+  [`credential-proxy.md`](credential-proxy.md).
 
 ## SSH boundary
 
@@ -122,6 +137,70 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - `rewrite_host_url` rewrites a loopback local-model endpoint to the
   guest-visible gateway address so the guest can reach a model server running
   on the host; non-loopback URLs pass through unchanged.
+- **The credential proxy (issue #411) binds host loopback** (`127.0.0.1`, it
+  refuses an unspecified address at bind) and is exposed into the guest with a
+  per-instance `ssh -R` reverse tunnel (`proxy.rs:spawn_reverse_forward`), so —
+  like the port-forwards above — it never binds a non-loopback interface and is
+  reachable by exactly one guest, identically on both backends. It is guarded
+  by a per-instance capability token and forwards only to a fixed per-provider
+  upstream (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host
+  — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
+  outbound HTTPS is the intended egress; a change that lets the guest influence
+  the upstream host, or that binds anything wider than loopback, is a finding.
+
+- **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
+  the real credential and terminates connections the untrusted guest
+  originates, so it is the feature's new attack surface; the jail bounds the
+  blast radius of a proxy exploit. On **Linux** the proxy self-confines with
+  **Landlock**, applied in `coop-proxy`'s `main` after its libraries load and
+  before it binds, so every tokio worker inherits the domain. The confinement
+  is tiered by kernel capability: all filesystem writes and all program `exec`
+  are denied as a hard floor (kernel ≥5.13); on kernels ≥6.7 TCP `connect` is
+  additionally limited to `:443` (upstream) and `:53` (DNS), `bind` to the
+  listener port (see the host-kernel floor below).
+  On **macOS** the launcher wraps the spawn in `sandbox-exec` with the Seatbelt
+  profile in [`src/seatbelt-proxy.sb`](../src/seatbelt-proxy.sb) (deny by
+  default; allow file reads, name resolution, the loopback listener, and egress
+  only to `:443`/`:53`). Either way the launch is **fail-closed** on the
+  high-value denials: if the filesystem-write/program-`exec` floor cannot be
+  established — Linux kernel <5.13, or the macOS Seatbelt profile fails to
+  apply — the proxy exits before serving, `proxy.rs`'s post-spawn readiness
+  probe never connects, and the VM start aborts, so the credential-holding
+  proxy never runs without that floor. Reads stay open (the resolver
+  config, the dynamic linker) and writes to the already-open stderr log fd are
+  unaffected, because both jails gate path opens / new connections, not
+  existing descriptors.
+
+  **Accepted limitations, by construction** (do not file these as findings; do
+  flag a change that *widens* them):
+  - **Port-scoped, not host-scoped.** Both Landlock and Seatbelt filter by
+    port, not hostname/IP. A *fully compromised* proxy could still open a TCP
+    connection to some other host on `:443`; the two upstreams' identity is
+    enforced one layer up, at the proxy's TLS verification + pinned `Host`, and
+    the guest still cannot retarget them. Host-scoped egress would need IP
+    pinning (fragile against CDN rotation) or an L7 egress proxy — out of scope
+    and consistent with the DNS/CDN caveat #2 already accepts.
+  - **UDP egress is not restricted on Linux.** Landlock's network rules are
+    TCP-only, and DNS needs UDP `:53`, so arbitrary UDP egress remains possible
+    for a compromised proxy. Closing it would need `nftables` owner-matching
+    (a dedicated uid + `sudo` + per-instance teardown) — deliberately deferred.
+  - **Host-kernel floor / deprecated primitive.** The Linux jail degrades by
+    kernel version rather than all-or-nothing:
+    - **kernel ≥6.7** — full jail: filesystem-write + program-`exec` denied and
+      TCP egress port-scoped to `:443`/`:53`;
+    - **kernel 5.13–6.6** — filesystem-write + program-`exec` denied, but
+      Landlock has no network rules, so TCP egress is **not** scoped (open
+      egress). Acceptable because the network tier is already the weak,
+      port-scoped layer and upstream identity is TLS-pinned in the proxy;
+    - **kernel <5.13** — the floor cannot be established, so the proxy **fails
+      closed** and refuses to start.
+
+    `sandbox-exec` is officially deprecated but still functional and has no CLI
+    successor — a pragmatic, aging primitive.
+
+  These match the design's "Cross-platform hardening" note: the Firecracker
+  (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
+  with Seatbelt, with the stated caveats.
 
 ## `coop update` trust chain
 
