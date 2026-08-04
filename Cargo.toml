@@ -24,6 +24,10 @@ thiserror = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 mutants = "0.0.4"
+# Already in the tree via `url`; taken as a direct dependency so the Zed URL
+# builder can escape guest paths against an explicit set rather than hand-roll
+# percent-encoding.
+percent-encoding = "2"
 url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]

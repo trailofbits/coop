@@ -11,7 +11,7 @@ coop editor my-instance
 This command:
 
 1. Writes an SSH config block for the instance into `~/.ssh/config`.
-2. Launches VS Code with `code --remote ssh-remote+coop-{name} /workspace`, falling back to Zed with `zed ssh://coop-{name}/workspace` when `code` is not installed.
+2. Launches VS Code with `code --remote ssh-remote+coop-{name} /workspace`. When that misses, coop tries the VS Code app (`open -a 'Visual Studio Code'`, macOS only), then Zed with `zed ssh://coop-{name}/workspace`.
 3. Prints the SSH config entry to stderr for manual use with other editors.
 
 ## The `coop editor` command
@@ -24,7 +24,7 @@ coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
 
 **--project** sets the remote directory the editor opens. Defaults to `/workspace`.
 
-**--editor** pins the editor (`code` or `zed`). When omitted, coop tries VS Code first, then Zed.
+**--editor** pins the editor (`code` or `zed`). When omitted, coop tries VS Code first, then Zed. A strategy that cannot be launched at all — binary missing, or present but not executable — counts as a miss, so the chain continues to the next editor.
 
 **--clean** removes the SSH config entry for the specified instance and exits. Useful for manual cleanup without destroying the instance.
 

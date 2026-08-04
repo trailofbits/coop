@@ -185,6 +185,7 @@ dependencies = [
  "indexmap",
  "libc",
  "mutants",
+ "percent-encoding",
  "proptest",
  "semver",
  "serde",

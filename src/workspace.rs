@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{RunningInstance, SshTarget};
@@ -1178,12 +1179,30 @@ struct LaunchStrategy {
     args: Vec<String>,
 }
 
-fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
+/// Bytes escaped before a guest path is interpolated into an editor URL.
+/// `--project` is only checked for a leading `/` ([`GuestPath::absolute`]), so
+/// the path can carry URL-significant bytes: unescaped, `#` reads as a fragment
+/// and silently truncates the target. `%` is escaped too, so a path that merely
+/// looks pre-encoded is not decoded a second time.
+const URL_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
+fn vscode_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
+    let remote_arg = format!("ssh-remote+{host}");
     let path_arg = remote_path.to_string();
     let mut strategies = vec![LaunchStrategy {
         name: "code CLI",
         cmd: "code".into(),
-        args: vec!["--remote".into(), remote_arg.into(), path_arg.clone()],
+        args: vec!["--remote".into(), remote_arg.clone(), path_arg.clone()],
     }];
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
@@ -1194,7 +1213,7 @@ fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStr
                 "Visual Studio Code".into(),
                 "--args".into(),
                 "--remote".into(),
-                remote_arg.into(),
+                remote_arg,
                 path_arg,
             ],
         });
@@ -1204,18 +1223,19 @@ fn vscode_strategies(remote_arg: &str, remote_path: &GuestPath) -> Vec<LaunchStr
 
 fn zed_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
     // Zed shells out to the system `ssh`, so the `coop-<name>` alias in
-    // ~/.ssh/config supplies host, port, user, and key.
-    let url = format!("ssh://{host}{remote_path}");
+    // ~/.ssh/config supplies host, port, user, and key. Unlike the VS Code
+    // strategies (argv), the path lands in a URL, so it needs escaping.
+    let path = utf8_percent_encode(remote_path.as_ref(), URL_PATH).to_string();
     let mut strategies = vec![LaunchStrategy {
         name: "zed CLI",
         cmd: "zed".into(),
-        args: vec![url],
+        args: vec![format!("ssh://{host}{path}")],
     }];
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
             name: "macOS open zed:// URL",
             cmd: "open".into(),
-            args: vec![format!("zed://ssh/{host}{remote_path}")],
+            args: vec![format!("zed://ssh/{host}{path}")],
         });
     }
     strategies
@@ -1228,15 +1248,23 @@ fn editor_strategies(
     host: &str,
     remote_path: &GuestPath,
 ) -> Vec<LaunchStrategy> {
-    let remote_arg = format!("ssh-remote+{host}");
     match editor {
-        Some(EditorKind::Code) => vscode_strategies(&remote_arg, remote_path),
+        Some(EditorKind::Code) => vscode_strategies(host, remote_path),
         Some(EditorKind::Zed) => zed_strategies(host, remote_path),
         None => {
-            let mut strategies = vscode_strategies(&remote_arg, remote_path);
+            let mut strategies = vscode_strategies(host, remote_path);
             strategies.extend(zed_strategies(host, remote_path));
             strategies
         }
+    }
+}
+
+/// CLI-install hints to print when every strategy for `editor` missed.
+fn install_hints(editor: Option<EditorKind>) -> &'static [&'static str] {
+    match editor {
+        Some(EditorKind::Code) => &[CODE_INSTALL_HINT],
+        Some(EditorKind::Zed) => &[ZED_INSTALL_HINT],
+        None => &[CODE_INSTALL_HINT, ZED_INSTALL_HINT],
     }
 }
 
@@ -1262,21 +1290,17 @@ fn launch_editor(
                 tracing::debug!("{} exited with {status}", strategy.name);
                 tried.push(strategy.name);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!("{}: command not found", strategy.name);
-                tried.push(strategy.name);
-            }
+            // Every spawn failure counts as a miss, not a hard stop: in the
+            // auto-detect chain an unusable earlier binary (missing, or present
+            // but not executable) must not shadow a working later editor.
             Err(e) => {
-                return Err(anyhow::anyhow!("{} failed: {e}", strategy.name));
+                tracing::debug!("{}: {e}", strategy.name);
+                tried.push(strategy.name);
             }
         }
     }
 
-    let hints: &[&str] = match editor {
-        Some(EditorKind::Code) => &[CODE_INSTALL_HINT],
-        Some(EditorKind::Zed) => &[ZED_INSTALL_HINT],
-        None => &[CODE_INSTALL_HINT, ZED_INSTALL_HINT],
-    };
+    let hints = install_hints(editor);
     bail!(
         "Could not open an editor. Tried:\n{}\n\n{}",
         tried
@@ -1307,7 +1331,7 @@ mod tests {
     #[test]
     fn vscode_strategies_first_is_code_cli() {
         let path = GuestPath::new("/workspace");
-        let strategies = vscode_strategies("ssh-remote+coop-test", &path);
+        let strategies = vscode_strategies("coop-test", &path);
         // The `code` CLI strategy is present on every platform (the macOS
         // `open -a` fallback is appended after it).
         let code = &strategies[0];
@@ -1331,12 +1355,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn zed_strategies_macos_fallback_is_open_zed_url() {
+        let path = GuestPath::new("/workspace");
+        let strategies = zed_strategies("coop-test", &path);
+        // Different scheme *and* shape from the CLI arm (`zed://ssh/<host><path>`
+        // vs `ssh://<host><path>`), so it needs its own assertion.
+        let open = &strategies[1];
+        assert_eq!(open.cmd, "open");
+        let args: Vec<&str> = open.args.iter().map(String::as_str).collect();
+        assert_eq!(args, ["zed://ssh/coop-test/workspace"]);
+    }
+
+    #[test]
+    fn zed_strategies_escape_url_significant_path_bytes() {
+        // `#` would otherwise read as a fragment and open `/a` instead.
+        let strategies = zed_strategies("coop-test", &GuestPath::new("/a#b c%d"));
+        assert_eq!(strategies[0].args, ["ssh://coop-test/a%23b%20c%25d"]);
+    }
+
+    #[test]
     fn editor_strategies_explicit_choice_pins_editor() {
         let path = GuestPath::new("/workspace");
         let code = editor_strategies(Some(EditorKind::Code), "coop-test", &path);
+        assert_eq!(code[0].cmd, "code");
         assert!(code.iter().all(|s| s.cmd != "zed"));
         let zed = editor_strategies(Some(EditorKind::Zed), "coop-test", &path);
+        assert_eq!(zed[0].cmd, "zed");
         assert!(zed.iter().all(|s| s.cmd != "code"));
+    }
+
+    #[test]
+    fn install_hints_match_the_pinned_editor() {
+        assert_eq!(install_hints(Some(EditorKind::Code)), [CODE_INSTALL_HINT]);
+        assert_eq!(install_hints(Some(EditorKind::Zed)), [ZED_INSTALL_HINT]);
+        assert_eq!(install_hints(None), [CODE_INSTALL_HINT, ZED_INSTALL_HINT]);
     }
 
     #[test]

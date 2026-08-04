@@ -16,7 +16,9 @@
 # (remove_marker_blocks / remove_named_marker_block / remove_*_ssh_config_at,
 # split from remove_all_ssh_config / remove_ssh_config), CmdToken::from_words's
 # Linux/op arms, atomic_write_with_mode, and the editor strategy helpers
-# (vscode_strategies / zed_strategies / editor_strategies). The thin
+# (vscode_strategies / zed_strategies / editor_strategies / install_hints —
+# the last split out of launch_editor so the per-editor hint choice is in
+# scope, since launch_editor itself is excluded below). The thin
 # external-process / IO wrappers those helpers were carved out of ARE excluded
 # below — a `--lib` unit test cannot reach a wrapper without a real $HOME or
 # network, so its surviving body-replacement mutant is noise, not a gap.
