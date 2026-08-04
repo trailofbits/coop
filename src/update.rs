@@ -388,11 +388,10 @@ fn verify_sha256(file: &Path, expected: &Sha256Hash) -> Result<()> {
 
 /// Build the `gh attestation verify` argument list.
 ///
-/// With `bundle`, `gh` reads the Sigstore bundle from disk and makes no API
-/// call, so verification needs no GitHub credential. Without it, `gh` fetches
-/// the bundle from the attestations API and always attaches its stored token —
-/// which 403s on public data when that token carries no SSO session for the
-/// org. `--repo` pins the signer identity in both cases.
+/// With `bundle`, `gh` reads the Sigstore bundle from disk rather than the
+/// attestations API, so no GitHub credential is involved. What each transport
+/// does and does not pin is recorded in the `coop update` trust chain in
+/// `docs/trust-model.md`.
 fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "attestation".into(),
@@ -408,26 +407,127 @@ fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsStrin
     args
 }
 
-/// Download the release's provenance bundle, if it published one.
+/// Whether the release's provenance bundle can be used.
 ///
-/// `None` means verification falls back to the attestations API, or is skipped
-/// outright — never that the update fails. A download that blips is the same
-/// situation as a release that never published the asset, and `install.sh`
-/// resolves it the same way. The download is also skipped when
-/// `verify_attestation` would not read the result, so an update whose
-/// attestation step is a no-op does no pointless work.
-fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Option<PathBuf> {
-    if api_base_overridden() || !command_exists("gh") {
-        return None;
+/// Decided before any IO so every outcome is unit-testable; `resolve_provenance`
+/// performs the download this describes.
+#[derive(Debug)]
+enum BundleDecision<'a> {
+    /// `COOP_UPDATE_API_BASE_URL` is set. The local fixture serves synthetic
+    /// artifacts that have no provenance in GitHub's attestation API, so
+    /// verification is skipped; `warn_if_api_base_overridden` has already
+    /// surfaced the override on stderr.
+    TestMode,
+    /// `gh` is absent, so nothing can verify an attestation.
+    NoGh,
+    /// The release publishes no bundle asset.
+    NoAsset,
+    /// The release publishes one; download it from this asset.
+    Fetch(&'a Asset),
+}
+
+fn bundle_decision(
+    release: &Release,
+    api_overridden: bool,
+    gh_present: bool,
+) -> BundleDecision<'_> {
+    if api_overridden {
+        return BundleDecision::TestMode;
     }
-    let Some(asset) = release.find_asset(BUNDLE_ASSET) else {
-        tracing::info!(
-            "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
-             GitHub API, which requires a credential authorized for {REPO}.",
-            release.tag
-        );
-        return None;
+    if !gh_present {
+        return BundleDecision::NoGh;
+    }
+    match release.find_asset(BUNDLE_ASSET) {
+        Some(asset) => BundleDecision::Fetch(asset),
+        None => BundleDecision::NoAsset,
+    }
+}
+
+/// Why verification fell back to the attestations API.
+///
+/// All three mean the same thing to the client — no bundle to read — but they
+/// are kept apart so the failure message can name the one that happened.
+#[derive(Debug)]
+enum ApiReason {
+    /// The release publishes no bundle asset.
+    NoAsset,
+    /// The bundle asset exists but could not be downloaded.
+    DownloadFailed,
+    /// The bundle downloaded but is empty. `gh` before 2.56.0 (cli/cli#9541)
+    /// reports success on an empty bundle, having verified nothing, so an
+    /// empty file must never reach `--bundle`.
+    EmptyBundle,
+}
+
+/// What `verify_attestation` verifies against.
+///
+/// The reason a bundle is absent is carried here rather than re-derived from
+/// its absence, so a failure message cannot claim the wrong one.
+#[derive(Debug)]
+enum Provenance {
+    /// Verification is skipped; see [`BundleDecision::TestMode`].
+    TestMode,
+    /// Verification is skipped; see [`BundleDecision::NoGh`].
+    NoGh,
+    /// Verify through the attestations API, which requires a credential.
+    Api(ApiReason),
+    /// Verify against this downloaded bundle, with no credential.
+    Bundle(PathBuf),
+}
+
+impl Provenance {
+    /// The path for `gh --bundle`, or `None` to use the attestations API.
+    fn bundle(&self) -> Option<&Path> {
+        match self {
+            Provenance::Bundle(path) => Some(path),
+            Provenance::TestMode | Provenance::NoGh | Provenance::Api(_) => None,
+        }
+    }
+
+    /// Explains the API fallback in a verification failure message. Empty
+    /// unless verification actually went through the API.
+    fn api_fallback_hint(&self) -> String {
+        let cause = match self {
+            Provenance::Api(ApiReason::NoAsset) => {
+                format!("the release publishes no {BUNDLE_ASSET}")
+            }
+            Provenance::Api(ApiReason::DownloadFailed) => {
+                format!("{BUNDLE_ASSET} could not be downloaded")
+            }
+            Provenance::Api(ApiReason::EmptyBundle) => {
+                format!("the published {BUNDLE_ASSET} is empty")
+            }
+            Provenance::TestMode | Provenance::NoGh | Provenance::Bundle(_) => {
+                return String::new();
+            }
+        };
+        format!(
+            " (verified through the GitHub API because {cause}; an HTTP 403 here means your \
+             GitHub credential has no SSO session for {REPO})"
+        )
+    }
+}
+
+/// Resolve how the attestation will be verified, downloading the release's
+/// provenance bundle when it publishes a usable one.
+///
+/// Never fails the update: every problem with the bundle falls back to the
+/// attestations API or skips verification outright.
+fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
+    let asset = match bundle_decision(release, api_base_overridden(), command_exists("gh")) {
+        BundleDecision::TestMode => return Provenance::TestMode,
+        BundleDecision::NoGh => return Provenance::NoGh,
+        BundleDecision::NoAsset => {
+            tracing::info!(
+                "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
+                 GitHub API, which requires a credential authorized for {REPO}.",
+                release.tag
+            );
+            return Provenance::Api(ApiReason::NoAsset);
+        }
+        BundleDecision::Fetch(asset) => asset,
     };
+
     let dest = dir.join(BUNDLE_ASSET);
     if let Err(err) = download_asset(&release.tag, BUNDLE_ASSET, &asset.url, &dest) {
         tracing::warn!(
@@ -436,46 +536,43 @@ fn fetch_attestation_bundle(release: &Release, dir: &Path) -> Option<PathBuf> {
              {REPO}.",
             release.tag
         );
-        return None;
+        return Provenance::Api(ApiReason::DownloadFailed);
     }
-    Some(dest)
+    if !fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0) {
+        tracing::warn!(
+            "{BUNDLE_ASSET} for release {} is empty — verifying the attestation through the \
+             GitHub API, which requires a credential authorized for {REPO}.",
+            release.tag
+        );
+        return Provenance::Api(ApiReason::EmptyBundle);
+    }
+    Provenance::Bundle(dest)
 }
 
-fn verify_attestation(tarball: &Path, bundle: Option<&Path>) -> Result<()> {
-    // Skip when the API base is overridden — the local test fixture serves
-    // synthetic artifacts that have no provenance in GitHub's attestation
-    // API. `warn_if_api_base_overridden` has already surfaced this to the
-    // user as a visible stderr warning.
-    if api_base_overridden() {
-        return Ok(());
-    }
-    if !command_exists("gh") {
-        tracing::info!(
-            "Note: `gh` not installed — skipped cryptographic attestation verification. \
-             The download was verified against the published `SHA256SUMS` checksum, which \
-             is the same assurance level as most `curl | bash` installers. For end-to-end \
-             Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
-             verify manually: `gh attestation verify <tarball> --repo {REPO} --bundle \
-             {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
-        );
-        return Ok(());
+fn verify_attestation(tarball: &Path, provenance: &Provenance) -> Result<()> {
+    match provenance {
+        Provenance::TestMode => return Ok(()),
+        Provenance::NoGh => {
+            tracing::info!(
+                "Note: `gh` not installed — skipped cryptographic attestation verification. \
+                 The download was verified against the published `SHA256SUMS` checksum, which \
+                 is the same assurance level as most `curl | bash` installers. For end-to-end \
+                 Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
+                 verify manually: `gh attestation verify <tarball> --repo {REPO} --bundle \
+                 {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
+            );
+            return Ok(());
+        }
+        Provenance::Api(_) | Provenance::Bundle(_) => {}
     }
     Cmd::new("gh")
-        .args(attestation_verify_args(tarball, bundle))
+        .args(attestation_verify_args(tarball, provenance.bundle()))
         .run()
         .with_context(|| {
-            let hint = if bundle.is_some() {
-                String::new()
-            } else {
-                format!(
-                    " (verified through the GitHub API because the release publishes no \
-                     {BUNDLE_ASSET}; an HTTP 403 here means your GitHub credential has no \
-                     SSO session for the org)"
-                )
-            };
             format!(
-                "Attestation verification failed for {} — refusing to install{hint}",
-                tarball.display()
+                "Attestation verification failed for {} — refusing to install{}",
+                tarball.display(),
+                provenance.api_fallback_hint()
             )
         })
 }
@@ -639,8 +736,8 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
         .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
     verify_sha256(&tarball_path, &expected)?;
 
-    let bundle_path = fetch_attestation_bundle(release, tmp.path());
-    verify_attestation(&tarball_path, bundle_path.as_deref())?;
+    let provenance = resolve_provenance(release, tmp.path());
+    verify_attestation(&tarball_path, &provenance)?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
     // `-C <tempdir>` plus modern tar's default refusal of `..`-segmented and absolute
@@ -824,6 +921,7 @@ fn interval_elapsed(now: u64, last_checked_at: u64, interval_hours: u64) -> bool
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
+#[expect(clippy::panic, reason = "tests use panic! for unreachable arms")]
 mod tests {
     use super::*;
 
@@ -1017,33 +1115,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bundle_asset_is_found_on_a_release_that_publishes_it() {
-        let release: Release = serde_json::from_str(&format!(
+    fn release_with_bundle() -> Release {
+        serde_json::from_str(&format!(
             r#"{{"tag_name":"v9.9.9","assets":[
                  {{"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}},
                  {{"name":"{BUNDLE_ASSET}","browser_download_url":"https://example.com/B"}}
                ]}}"#
         ))
-        .unwrap();
-        assert_eq!(
-            release.find_asset(BUNDLE_ASSET).map(|a| a.url.as_str()),
-            Some("https://example.com/B")
-        );
+        .unwrap()
+    }
 
-        // A release predating the asset must fall back, not match something else.
-        let old: Release = serde_json::from_str(
+    /// A release predating the bundle asset.
+    fn release_without_bundle() -> Release {
+        serde_json::from_str(
             r#"{"tag_name":"v0.5.4","assets":[
                  {"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}
                ]}"#,
         )
-        .unwrap();
-        assert!(old.find_asset(BUNDLE_ASSET).is_none());
+        .unwrap()
     }
 
     /// The asset name is agreed across three files with no compiler link
     /// between them. A rename in one silently degrades `coop update` and
     /// `install.sh` back to the credential-requiring API path.
+    ///
+    /// Each assertion keys on a line that carries the *behavior*, not on the
+    /// name alone: `install.sh` mentions `attestations.jsonl` literally only in
+    /// its `BUNDLE=` declaration, so a `contains` over the whole file survives
+    /// deletion of the download and the `--bundle` verify.
     ///
     /// `include_str!` is the tripwire, so moving either file breaks this test
     /// as a compile error rather than a named assertion failure.
@@ -1061,9 +1160,97 @@ mod tests {
             "release.yml no longer publishes {BUNDLE_ASSET} as a release asset"
         );
         assert!(
-            installer.contains(BUNDLE_ASSET),
-            "install.sh no longer downloads {BUNDLE_ASSET}"
+            installer
+                .lines()
+                .any(|l| l.contains(&format!("BUNDLE=\"{BUNDLE_ASSET}\""))),
+            "install.sh no longer names {BUNDLE_ASSET} as the bundle asset"
         );
+        assert!(
+            installer
+                .lines()
+                .any(|l| l.contains("download_asset") && l.contains("$BUNDLE")),
+            "install.sh no longer downloads the bundle asset"
+        );
+        assert!(
+            installer
+                .lines()
+                .any(|l| l.contains("gh attestation verify") && l.contains("--bundle")),
+            "install.sh no longer verifies against the downloaded bundle"
+        );
+    }
+
+    #[test]
+    fn bundle_decision_skips_when_verification_would_not_run() {
+        let release = release_with_bundle();
+        match bundle_decision(&release, true, true) {
+            BundleDecision::TestMode => {}
+            other => panic!("expected TestMode, got {other:?}"),
+        }
+        match bundle_decision(&release, false, false) {
+            BundleDecision::NoGh => {}
+            other => panic!("expected NoGh, got {other:?}"),
+        }
+        // The API-base override is checked first, so it reports TestMode
+        // rather than NoGh when `gh` is also absent.
+        match bundle_decision(&release, true, false) {
+            BundleDecision::TestMode => {}
+            other => panic!("expected TestMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bundle_decision_fetches_only_when_the_release_publishes_the_asset() {
+        match bundle_decision(&release_with_bundle(), false, true) {
+            BundleDecision::Fetch(asset) => assert_eq!(asset.url, "https://example.com/B"),
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+        match bundle_decision(&release_without_bundle(), false, true) {
+            BundleDecision::NoAsset => {}
+            other => panic!("expected NoAsset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_the_bundle_variant_yields_a_bundle_path() {
+        assert_eq!(
+            Provenance::Bundle(PathBuf::from("/tmp/b.jsonl")).bundle(),
+            Some(Path::new("/tmp/b.jsonl"))
+        );
+        assert_eq!(Provenance::TestMode.bundle(), None);
+        assert_eq!(Provenance::NoGh.bundle(), None);
+        assert_eq!(Provenance::Api(ApiReason::NoAsset).bundle(), None);
+    }
+
+    /// The failure message must name the reason that actually happened: a
+    /// failed download previously reported "the release publishes no
+    /// attestations.jsonl" on a release that publishes it.
+    #[test]
+    fn api_fallback_hint_names_the_reason_that_happened() {
+        assert!(
+            Provenance::Api(ApiReason::NoAsset)
+                .api_fallback_hint()
+                .contains("the release publishes no attestations.jsonl")
+        );
+        assert!(
+            Provenance::Api(ApiReason::DownloadFailed)
+                .api_fallback_hint()
+                .contains("attestations.jsonl could not be downloaded")
+        );
+        assert!(
+            Provenance::Api(ApiReason::EmptyBundle)
+                .api_fallback_hint()
+                .contains("the published attestations.jsonl is empty")
+        );
+    }
+
+    #[test]
+    fn api_fallback_hint_is_empty_when_the_api_was_not_used() {
+        assert_eq!(
+            Provenance::Bundle(PathBuf::from("/tmp/b.jsonl")).api_fallback_hint(),
+            ""
+        );
+        assert_eq!(Provenance::TestMode.api_fallback_hint(), "");
+        assert_eq!(Provenance::NoGh.api_fallback_hint(), "");
     }
 
     #[test]

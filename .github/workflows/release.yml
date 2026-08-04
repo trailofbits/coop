@@ -111,12 +111,24 @@ jobs:
         with:
           subject-path: "coop-*.tar.gz"
 
-      # Normalize to one bundle per line so the published asset has a stable
-      # shape regardless of whether the action emits a single bundle or several.
+      # The asset name is load-bearing: `gh attestation verify --bundle`
+      # dispatches on the file extension and rejects anything that is not
+      # `.json`/`.jsonl`, so renaming this output breaks verification for every
+      # client. `bundle-path` is a single JSON line covering all three tarball
+      # subjects, so `jq -c` reshapes nothing — it is here to reject a malformed
+      # bundle, and the `-s` test to reject an empty one, which `jq` itself
+      # exits 0 on. An empty asset is worse than none: clients would download it
+      # and then fail verification with no API fallback, and the tag cannot be
+      # re-cut.
       - name: Normalize attestation bundle
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
-        run: jq -c . "$BUNDLE_PATH" > attestations.jsonl
+        run: |
+          jq -c . "$BUNDLE_PATH" > attestations.jsonl
+          if [ ! -s attestations.jsonl ]; then
+            echo "Attestation bundle at $BUNDLE_PATH produced no output" >&2
+            exit 1
+          fi
 
       - name: Extract release notes from CHANGELOG
         env:

@@ -214,17 +214,40 @@ Self-update (`update.rs`) must preserve, in order:
    (`verify_sha256`, constant-size `Sha256Hash` compare).
 4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
    --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
-   downloaded from the same release. `--bundle` makes verification offline: no
-   attestations-API call, so no GitHub credential — but it does *not* weaken the
-   check, because the bundle is signed and `--repo` still pins the signer
-   identity, so a substituted or tampered bundle fails. A release that publishes
-   no bundle asset — or a bundle whose download fails — falls back to the API
-   path (credential required); `update.rs` and `install.sh` treat those two
-   cases identically. A bundle that downloads but fails to verify is refused
-   outright, not retried through the API. Skipped with a logged note if `gh` is
-   absent, and skipped entirely when `COOP_UPDATE_API_BASE_URL` is overridden
-   (test mode). So provenance is *not* guaranteed on hosts without `gh` —
-   checksum is the floor.
+   downloaded from the same release.
+
+   `--bundle` means **no attestations-API call and no credential** — `gh` marks
+   the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
+   It is *not* offline: without `--custom-trusted-root`, `gh` still reaches
+   `tuf-repo.github.com` and the Sigstore public-good CDN for the trust root
+   (one-day cache) and fails if neither is reachable. Fetching the bundle
+   itself also still goes through `download_asset`, which uses `gh` or a
+   `GITHUB_TOKEN` when one exists. Only the verify step is credential-free.
+
+   It does *not* weaken the check. The bundle is signed, and what defeats a
+   substituted bundle is the **subject-digest binding** — `gh` digests the
+   artifact and requires a matching subject. `--repo` pins the certificate's
+   *source repository*, not the signer: any workflow on any ref in
+   `trailofbits/coop` holding `id-token: write` + `attestations: write` mints a
+   bundle that satisfies it. `--signer-workflow` / `--cert-identity` are the
+   actual pin and neither client passes one — but the API path is keyed by
+   digest against the same repo-scoped store and is equally unpinned, so the
+   transport change costs nothing here.
+
+   A release that publishes no bundle asset — or one whose download fails, or
+   whose bundle is empty — falls back to the API path (credential required);
+   `update.rs` and `install.sh` treat all three identically, because for a
+   client they are one situation: no bundle to read. An empty bundle is
+   rejected rather than passed through because `gh` before 2.56.0
+   (cli/cli#9541) reports success on one, having verified nothing;
+   `release.yml` also fails the release rather than publish one. A bundle that
+   downloads and fails to *verify* is refused outright, not retried through the
+   API — that is no stricter on integrity, but a digest mismatch, a corrupt
+   download and an unusable `gh` all surface here, and switching transports
+   would mask them. Skipped with a logged note if `gh` is absent, and skipped
+   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   provenance is *not* guaranteed on hosts without `gh` — checksum is the
+   floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 

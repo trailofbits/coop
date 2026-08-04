@@ -19,6 +19,11 @@ die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
 
 info() { printf '  %s\n' "$1"; }
 
+# Failure commentary belongs on the same stream as the `gh` output it explains
+# and the `die` that follows it, so a redirected `curl … | bash` keeps the whole
+# report together and in order.
+warn() { printf '  %s\n' "$1" >&2; }
+
 need() {
     command -v "$1" > /dev/null 2>&1 || die "'$1' is required but not found"
 }
@@ -124,28 +129,35 @@ verify_attestation() {
     fi
 
     info "Verifying attestation..."
-    # Prefer the bundle published with the release: `gh attestation verify`
-    # without --bundle queries the GitHub attestations API, and gh always
-    # attaches its stored token, so a token lacking an SSO session for the org
-    # 403s on public data. The --repo identity check is enforced either way.
-    # The probe is silenced: a missing bundle is expected on older releases, so
-    # curl's bare "404" would read as a hard error.
-    if download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1; then
-        # A failure here is not retried through the API. That is no stricter on
-        # integrity — a substituted bundle fails here and would then verify
-        # correctly against the genuine attestation — but a bundle that
-        # downloaded and will not verify means a broken download or a `gh` that
-        # cannot read it, and switching transports would hide both.
+    # Prefer the bundle published with the release: without --bundle, `gh`
+    # queries the attestations API and always attaches its stored token, so a
+    # token with no SSO session for the org 403s on public data. See the
+    # `coop update` trust chain in docs/trust-model.md for what each transport
+    # does and does not pin.
+    #
+    # The probe is silenced because a missing bundle is expected on older
+    # releases, so curl's bare "404" would read as a hard error — which means
+    # it cannot tell "not published" from a failed download. The message below
+    # says so rather than picking one. An empty file is rejected here too: `gh`
+    # before 2.56.0 reports success on an empty bundle, having verified nothing.
+    if download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1 \
+        && [ -s "${TMPDIR}/${BUNDLE}" ]; then
+        # Not retried through the API. A digest mismatch — a tampered tarball
+        # published with a matching SHA256SUMS — is caught here and nowhere
+        # else in this script, and a bundle that downloaded but will not verify
+        # is equally a broken download or a `gh` that cannot read it. Switching
+        # transports would mask all three.
         gh attestation verify "$file" --repo "$REPO" --bundle "${TMPDIR}/${BUNDLE}" \
             || die "Attestation verification failed for $(basename "$file") — refusing to install"
-        info "Attestation verified offline against ${BUNDLE} — no GitHub credential used."
+        info "Attestation verified against ${BUNDLE} — no attestations-API call, no credential."
         return 0
     fi
 
-    # Releases published before the bundle asset existed verify through the
-    # API, exactly as every release did before. That needs a credential
-    # authorized for the org, so it is the fallback and not the default.
-    info "No ${BUNDLE} published for ${VERSION} — verifying through the GitHub API instead."
+    # Verifying through the API is exactly what every release did before the
+    # bundle asset existed. It needs a credential authorized for the org, so it
+    # is the fallback and not the default.
+    info "Could not use ${BUNDLE} for ${VERSION} (not published, download failed, or empty) —"
+    info "verifying through the GitHub API instead."
     local out
     if out="$(gh attestation verify "$file" --repo "$REPO" 2>&1)"; then
         info "Attestation verified through the GitHub API."
@@ -157,9 +169,10 @@ verify_attestation() {
     # when gh actually reported one of its symptoms.
     case "$out" in
         *403* | *SAML* | *"gh auth login"*)
-            info "${VERSION} predates the ${BUNDLE} asset, so verification used the GitHub API,"
-            info "which needs a credential authorized for the org. Installing a release that"
-            info "publishes ${BUNDLE} avoids the API entirely."
+            warn "Verification used the GitHub API because ${BUNDLE} was unavailable for"
+            warn "${VERSION}, and the API needs a credential authorized for the org. Confirm"
+            warn "${BUNDLE} is on the release page; a release that publishes it needs no"
+            warn "credential to verify."
             ;;
     esac
     die "Attestation verification failed for $(basename "$file") — refusing to install"

@@ -131,14 +131,13 @@ The attestation proves the artifact was built from this repository by the
 tagged release workflow.
 
 Both `install.sh` and `coop update` run this verification automatically when
-the [GitHub CLI](https://cli.github.com/) is installed. Both verify offline
-against the `attestations.jsonl` bundle published with the release, so
-verification makes no GitHub API call and needs no authentication. Releases
-published before that asset existed are verified through the GitHub
-attestations API instead, which does require a credential authorized for the
-`trailofbits` org. Without `gh`, both fall back to checksum verification
-against the release's `SHA256SUMS` and print a note explaining what was and
-wasn't verified.
+the [GitHub CLI](https://cli.github.com/) is installed. Both verify against the
+`attestations.jsonl` bundle published with the release, so the verification step
+makes no attestations-API call and needs no credential. Releases published
+before that asset existed are verified through the GitHub attestations API
+instead, which does require a credential authorized for the `trailofbits` org.
+Without `gh`, both fall back to checksum verification against the release's
+`SHA256SUMS` and print a note explaining what was and wasn't verified.
 
 To verify a downloaded tarball manually, download `attestations.jsonl` from the
 same release and pass `--bundle`:
@@ -149,9 +148,7 @@ gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
 ```
 
 That needs no GitHub credential. Dropping `--bundle` makes `gh` fetch the
-attestation from the API instead, which requires one — and fails with
-`HTTP 403: Resource protected by organization SAML enforcement` if your token
-carries no SSO session for the org:
+attestation from the API instead, which requires one:
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop
