@@ -102,6 +102,32 @@
 # model = "gpt-oss:120b"
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
+# [proxy]                           # Host-side credential-injecting proxy
+#                                   # (issue #411). Opt-in: when set, coop runs
+#                                   # a `coop-proxy` process on the host and the
+#                                   # raw credential never enters the guest —
+#                                   # the guest is pointed at the proxy and gets
+#                                   # only a per-instance capability token, and
+#                                   # the raw API key is no longer forwarded.
+#                                   # Applies only in remote model mode
+#                                   # (`coop model <vm> remote`); local mode
+#                                   # takes precedence. Works on both backends.
+# `coop proxy setup [--openai] [--vm <name>]` writes this for you: it takes a
+# pasted credential, stores it in Keychain / 1Password / a 0600 file, and fills
+# in the `cmd:` reference. Anthropic covers Claude Code; openai covers Codex.
+# A `--vm <name>` override is stored in that VM's instance state (not here);
+# `coop proxy status` shows what each VM resolves to (override → default → off).
+# [proxy.anthropic]
+# credential = "cmd:op read op://Private/Anthropic/credential"  # same "cmd:" support
+# auth = "api_key"                  # api_key → x-api-key (default); bearer →
+#                                   # Authorization: Bearer, for a Claude
+#                                   # `setup-token` (run `claude setup-token`).
+# [proxy.openai]                    # Codex. OpenAI keys are always Bearer.
+# credential = "cmd:op read op://Private/OpenAI/credential"
+# auth = "bearer"                   # OpenAI keys inject as Authorization: Bearer.
+#                                   # Codex subscription (auth.json) is not
+#                                   # supported in proxy mode — use an API key.
+
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]
 # pre_install = "curl -fsSL https://example.com/setup.sh | bash"

@@ -718,6 +718,12 @@ pub struct CoopConfig {
     #[serde(default)]
     pub codex: CodexConfig,
 
+    /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
+    /// upstream is configured, the real credential stays on the host and the
+    /// guest is pointed at a local proxy instead of receiving the key.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
     /// Literal env vars to set in the guest, independent of the host
     /// process environment. Merged with `env_forward` results during
     /// SSH setup; entries here override forwarded values (with a
@@ -1513,6 +1519,61 @@ pub struct CodexConfig {
     pub local_model: Option<LocalModel>,
 }
 
+/// `[proxy]` — host-side credential-injecting proxy (issue #411).
+///
+/// When an upstream is configured, coop runs a `coop-proxy` process on the
+/// host for the lifetime of each remote-mode VM: the guest is pointed at the
+/// proxy (a base-URL override) and holds only a per-instance capability
+/// token, while the real credential stays on the host and is injected onto
+/// outbound requests the guest never sees. Absent config means no proxy —
+/// credentials are forwarded exactly as before.
+///
+/// Covers Anthropic (Claude Code) and `OpenAI` (Codex); GitHub is a separate
+/// slice. Each provider is an optional default; a VM can override its own
+/// credential per provider (see [`crate::proxy_state`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Anthropic (Claude Code) upstream. Its presence enables proxy mode for
+    /// Claude when the VM is in remote model mode.
+    #[serde(default)]
+    pub anthropic: Option<ProxyUpstream>,
+
+    /// `OpenAI` (Codex) upstream. Its presence enables proxy mode for Codex
+    /// when the VM is in remote model mode. `OpenAI` API keys are injected as
+    /// `Authorization: Bearer`.
+    ///
+    /// Proxy mode is resolved per provider and per VM (a per-VM override can
+    /// enable it even when this default is absent) by
+    /// [`crate::proxy_state::effective_upstream`], not from this struct alone.
+    #[serde(default)]
+    pub openai: Option<ProxyUpstream>,
+}
+
+/// A single proxied upstream: the real credential and how to inject it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyUpstream {
+    /// The real credential (an API key or a Claude `setup-token`), a plain
+    /// value or a `cmd:` indirection resolved via [`resolve_cmd_value`] at
+    /// proxy start — never written to disk, never forwarded into the guest.
+    pub credential: Secret<String>,
+
+    /// How the proxy injects the credential upstream. Defaults to `api_key`
+    /// (`x-api-key`); use `bearer` for a Claude `setup-token`.
+    #[serde(default)]
+    pub auth: ProxyAuthScheme,
+}
+
+/// The header form the proxy injects the real credential as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyAuthScheme {
+    /// `x-api-key: <credential>` — the Anthropic API-key form.
+    #[default]
+    ApiKey,
+    /// `authorization: Bearer <credential>` — a Claude `setup-token`.
+    Bearer,
+}
+
 /// A local (host-side) model endpoint that `coop model <vm> local`
 /// materializes into guest agent config.
 ///
@@ -2267,6 +2328,7 @@ impl Default for CoopConfig {
             setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
             post_start: None,
@@ -2400,6 +2462,12 @@ impl Instance {
 
     pub fn model_state_path(&self) -> PathBuf {
         self.dir.join("model.json")
+    }
+
+    /// Per-instance proxy credential overrides (issue #411). A missing file
+    /// means "no override — use the `[proxy.<provider>]` defaults."
+    pub fn proxy_state_path(&self) -> PathBuf {
+        self.dir.join("proxy.json")
     }
 
     #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
@@ -2884,10 +2952,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn spawn_firecracker_like() -> std::process::Child {
-        std::process::Command::new("bash")
-            .args(["-c", "exec -a firecracker-test sleep 30"])
+        use std::os::unix::process::CommandExt;
+        // Set argv[0] to a firecracker-like name in a single execve (no shell
+        // `exec -a` indirection). A shell wrapper would exec twice, and reading
+        // /proc/<pid>/cmdline during the second transition races an empty
+        // cmdline. `wait_for_firecracker_cmdline` then waits out the one
+        // remaining fork→execve gap before the process is inspected.
+        std::process::Command::new("sleep")
+            .arg0("firecracker-test")
+            .arg("30")
             .spawn()
             .unwrap()
+    }
+
+    /// Wait until a spawned child's `/proc/<pid>/cmdline` reflects its
+    /// post-`execve` argv. Between `spawn` and `execve` the cmdline is empty, so
+    /// process-detection assertions must not run until it settles.
+    #[cfg(target_os = "linux")]
+    fn wait_for_firecracker_cmdline(pid: u32) {
+        let path = format!("/proc/{pid}/cmdline");
+        for _ in 0..500 {
+            if fs::read_to_string(&path).is_ok_and(|c| c.contains("firecracker")) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("firecracker-like process {pid} never exposed its cmdline");
     }
 
     #[cfg(target_os = "linux")]
@@ -2945,6 +3035,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
         let running = inst.is_running();
@@ -2985,6 +3076,7 @@ mod tests {
     fn is_firecracker_process_true_for_firecracker_named_pid() {
         let mut child = spawn_firecracker_like();
         let pid = child.id();
+        wait_for_firecracker_cmdline(pid);
         let result = is_firecracker_process(pid);
         let _ = child.kill();
         let _ = child.wait();
@@ -3450,6 +3542,63 @@ model = "qwen"
 [codex.local_model]
 host_url = "http://localhost:1234"
 model = ""
+"#;
+        assert!(toml::from_str::<CoopConfig>(toml_str).is_err());
+    }
+
+    #[test]
+    fn proxy_disabled_by_default() {
+        let cfg: CoopConfig = toml::from_str("").unwrap();
+        assert!(cfg.proxy.anthropic.is_none());
+        assert!(cfg.proxy.openai.is_none());
+    }
+
+    #[test]
+    fn proxy_anthropic_parses_and_defaults_to_api_key() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "sk-ant-secret"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let up = cfg.proxy.anthropic.unwrap();
+        assert_eq!(up.credential.expose(), "sk-ant-secret");
+        assert_eq!(up.auth, ProxyAuthScheme::ApiKey);
+    }
+
+    #[test]
+    fn proxy_openai_parses_with_bearer() {
+        let toml_str = r#"
+[proxy.openai]
+credential = "cmd:op read op://x"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let up = cfg.proxy.openai.unwrap();
+        assert_eq!(up.credential.expose(), "cmd:op read op://x");
+        assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+    }
+
+    #[test]
+    fn proxy_anthropic_parses_bearer_scheme() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "cmd:echo tok"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let up = cfg.proxy.anthropic.unwrap();
+        assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+        // Credential is stored verbatim (the `cmd:` is resolved at proxy
+        // start, not config parse).
+        assert_eq!(up.credential.expose(), "cmd:echo tok");
+    }
+
+    #[test]
+    fn proxy_rejects_unknown_auth_scheme() {
+        let toml_str = r#"
+[proxy.anthropic]
+credential = "x"
+auth = "basic"
 "#;
         assert!(toml::from_str::<CoopConfig>(toml_str).is_err());
     }

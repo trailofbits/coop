@@ -1,10 +1,26 @@
-[package]
-name = "coop"
+[workspace]
+members = ["coop-proxy"]
+# No `default-members`: with a root package present, plain `cargo build` /
+# `cargo test` build only `coop`, so the integration scripts and everyday dev
+# builds don't pull in coop-proxy's aws-lc-sys (and its cmake requirement).
+# coop-proxy is reached explicitly via `--workspace` — CI clippy/test, the
+# release build, and `cargo deny --workspace` all pass it.
+# `fuzz/` is its own detached workspace (cargo-fuzz), kept out of this one.
+exclude = ["fuzz"]
+
+[workspace.package]
 version = "0.5.4"
 edition = "2024"
-description = "Isolated VM environment for running Claude Code"
 license = "Apache-2.0"
 repository = "https://github.com/trailofbits/coop"
+
+[package]
+name = "coop"
+version.workspace = true
+edition.workspace = true
+description = "Isolated VM environment for running Claude Code"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = "1"
@@ -33,7 +49,12 @@ url = { version = "2", features = ["serde"] }
 [dev-dependencies]
 proptest = "1.11.0"
 
-[lints.clippy]
+[lints]
+workspace = true
+
+# Shared across every workspace member (coop + coop-proxy) so the strict
+# clippy/rustc policy is declared once.
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "warn"
@@ -59,7 +80,7 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
-[lints.rust]
+[workspace.lints.rust]
 # `cfg(kani)` is set by `cargo kani` (the bounded-proof toolchain), never by a
 # normal build. Register it so the `proofs` module doesn't trip unexpected-cfgs.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

@@ -29,6 +29,9 @@ short navigational entrypoint; durable detail lives here.
   [`shell-completion.md`](shell-completion.md).
 - [`claude-integration.md`](claude-integration.md),
   [`codex-integration.md`](codex-integration.md) — agent integration.
+- [`credential-proxy.md`](credential-proxy.md) — the opt-in `[proxy]`
+  credential-injecting proxy (issue #411): keeps the raw API key out of the
+  guest.
 - [`json-output-design.md`](json-output-design.md) — the `--json` design
   (a good precedent for design-doc style).
 

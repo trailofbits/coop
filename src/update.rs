@@ -436,14 +436,20 @@ fn check_parent_writable(dir: &Path) -> Result<()> {
     }
 }
 
-fn atomic_replace_self(new_binary: &Path) -> Result<()> {
-    let current = env::current_exe().context("Failed to resolve current executable path")?;
-    let dir = current
+/// Atomically swap `new_binary` over `target`: stage a copy in the target's
+/// directory, chmod + fsync it, then `rename` it into place (atomic on the
+/// same filesystem, safe over a running binary on Unix).
+fn atomic_replace(new_binary: &Path, target: &Path) -> Result<()> {
+    let dir = target
         .parent()
-        .context("Current executable has no parent directory")?;
+        .context("Target executable has no parent directory")?;
     check_parent_writable(dir)?;
 
-    let tmp = dir.join(format!(".coop-update-{}", std::process::id()));
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Target executable has no file name")?;
+    let tmp = dir.join(format!(".{file_name}-update-{}", std::process::id()));
     fs::copy(new_binary, &tmp)
         .with_context(|| format!("Failed to stage update at {}", tmp.display()))?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
@@ -454,14 +460,37 @@ fn atomic_replace_self(new_binary: &Path) -> Result<()> {
         .sync_all()
         .with_context(|| format!("Failed to fsync staged binary {}", tmp.display()))?;
 
-    fs::rename(&tmp, &current).with_context(|| {
-        format!(
-            "Failed to swap {} over {}",
-            tmp.display(),
-            current.display()
-        )
-    })?;
+    fs::rename(&tmp, target)
+        .with_context(|| format!("Failed to swap {} over {}", tmp.display(), target.display()))?;
     Ok(())
+}
+
+fn atomic_replace_self(new_binary: &Path) -> Result<()> {
+    let current = env::current_exe().context("Failed to resolve current executable path")?;
+    atomic_replace(new_binary, &current)
+}
+
+/// Replace the sibling `coop-proxy` (issue #411) from the same verified
+/// tarball so it never drifts from `coop`. Fails closed: if the tarball
+/// carries a proxy but the sibling cannot be written, the update aborts
+/// before `coop` itself is swapped. A no-op for older releases that predate
+/// the bundled proxy.
+fn replace_sibling_proxy(extract_dir: &Path) -> Result<()> {
+    let current = env::current_exe().context("Failed to resolve current executable path")?;
+    replace_sibling_proxy_at(extract_dir, &current)
+}
+
+/// Core of [`replace_sibling_proxy`] with the running-binary path injected so
+/// the swap destination is testable without touching the real `coop` binary.
+fn replace_sibling_proxy_at(extract_dir: &Path, current_exe: &Path) -> Result<()> {
+    let new_proxy = extract_dir.join("coop-proxy");
+    if !new_proxy.exists() {
+        return Ok(());
+    }
+    let dir = current_exe
+        .parent()
+        .context("Current executable has no parent directory")?;
+    atomic_replace(&new_proxy, &dir.join("coop-proxy"))
 }
 
 // ── Main update flow ─────────────────────────────────────────────────────────
@@ -562,16 +591,18 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
         .run()
         .context("Failed to extract release tarball")?;
 
-    let extracted = tmp
-        .path()
-        .join(format!("coop-{}-{triple}", release.tag))
-        .join("coop");
+    let extract_dir = tmp.path().join(format!("coop-{}-{triple}", release.tag));
+    let extracted = extract_dir.join("coop");
     ensure!(
         extracted.exists(),
         "Extracted binary not found at {}",
         extracted.display()
     );
 
+    // Swap the sibling proxy first (from the same verified tarball) so a
+    // proxy-write failure aborts before coop itself is replaced, keeping the
+    // two in lockstep.
+    replace_sibling_proxy(&extract_dir)?;
     atomic_replace_self(&extracted)
 }
 
@@ -1011,5 +1042,45 @@ mod tests {
         assert_eq!(release.assets.len(), 1);
         assert_eq!(release.assets[0].name, "x.tar.gz");
         assert_eq!(release.assets[0].url, "https://example.com/x.tar.gz");
+    }
+
+    #[test]
+    fn replace_sibling_proxy_is_noop_for_release_without_proxy() {
+        // Old release: the tarball carries no coop-proxy, so the swap returns
+        // before ever resolving the running binary.
+        let extract = tempfile::tempdir().unwrap();
+        replace_sibling_proxy(extract.path()).unwrap();
+    }
+
+    #[test]
+    fn replace_sibling_proxy_swaps_sibling_next_to_coop() {
+        let extract = tempfile::tempdir().unwrap();
+        fs::write(extract.path().join("coop-proxy"), b"new-proxy").unwrap();
+
+        let install = tempfile::tempdir().unwrap();
+        let coop = install.path().join("coop");
+        fs::write(&coop, b"coop-binary").unwrap();
+
+        replace_sibling_proxy_at(extract.path(), &coop).unwrap();
+
+        let sibling = install.path().join("coop-proxy");
+        assert_eq!(fs::read(&sibling).unwrap(), b"new-proxy");
+        assert_eq!(
+            fs::metadata(&sibling).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn replace_sibling_proxy_fails_closed_when_sibling_unwritable() {
+        // The tarball carries a proxy but the sibling cannot be written: the
+        // swap must return Err so perform_update never reaches
+        // atomic_replace_self and coop is left untouched.
+        let extract = tempfile::tempdir().unwrap();
+        fs::write(extract.path().join("coop-proxy"), b"new-proxy").unwrap();
+
+        // A running-binary path whose parent directory does not exist.
+        let missing = extract.path().join("no-such-dir").join("coop");
+        replace_sibling_proxy_at(extract.path(), &missing).unwrap_err();
     }
 }

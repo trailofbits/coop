@@ -13,7 +13,7 @@ use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
     backend, config, devcontainer, github_repo, guest, guest_env_state, model_state, pat_prompt,
-    port_forward, setup, signal, ssh, workspace,
+    port_forward, proxy, proxy_state, setup, signal, ssh, workspace,
 };
 
 pub(crate) struct UpOpts<'a> {
@@ -946,6 +946,7 @@ pub(super) fn allocate_and_start(
         if let Ok(target) = be.ssh_target(cfg, &inst) {
             port_forward::teardown_ssh_forwards(&inst, &target);
         }
+        crate::proxy::stop(&inst);
         if let Err(cleanup_err) = be.destroy_instance(cfg, &inst) {
             tracing::debug!("Cleanup failed (non-fatal): {cleanup_err}");
         }
@@ -1507,11 +1508,29 @@ fn bootstrap_and_post_start(
     mode: backend::BootMode,
 ) -> Result<()> {
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
+    let proxy_configured =
+        proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
+            || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
+                .is_some();
+    if opts.no_agents && proxy_configured {
+        // Proxy mode suppresses the raw API keys on every session, but the
+        // proxy + guest base-URL override are only set up during agent
+        // bootstrap — which --no-agents skips. Warn so the loud auth failure
+        // isn't a mystery (contradictory config: proxy is about agent creds).
+        tracing::warn!(
+            "proxy mode is configured but --no-agents skips agent bootstrap; \
+             agents will not be able to authenticate in this VM"
+        );
+    }
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
-    let session = prepare_session_from_target(cfg, None, target.clone(), repo)?;
+    // Pass `Some(inst)` so proxy-mode key suppression (and the guest-env /
+    // Codex-local overlays) apply to the bootstrap session too — otherwise the
+    // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
+    // defeating proxy-mode non-exposure (issue #411).
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
@@ -1519,6 +1538,18 @@ fn bootstrap_and_post_start(
         backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     }
     if let Some(cmd) = post_start {
+        // Agent bootstrap may have just minted the per-instance capability
+        // token (proxy mode), which is forwarded to sessions via `SendEnv`
+        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
+        // the token existed, so re-prepare it here — otherwise a `post_start`
+        // that runs Codex in proxy mode would lack the token and fail to
+        // authenticate. Under --no-agents no proxy started, so nothing new to
+        // pick up; keep the original session.
+        let session = if opts.no_agents {
+            session
+        } else {
+            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
+        };
         backend::run_post_start(&session, cmd);
     }
     Ok(())
@@ -1530,21 +1561,64 @@ pub(crate) fn prepare_session_from_target(
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
-    let mut env = backend::prepare_env_forwarding(cfg, repo)?;
+    // Load the per-instance model selection once: it decides both the
+    // proxy-mode key suppression and the Codex local-key forwarding below.
+    let model = match inst {
+        Some(inst) => Some(model_state::ModelState::load_or_default(inst)?),
+        None => None,
+    };
+
+    // In proxy mode (issue #411: an effective upstream — `[proxy.<provider>]`
+    // default or a per-VM override — and the VM in remote model mode) the raw
+    // key must never be forwarded into the guest; the host-side proxy holds it
+    // and the guest gets only the capability token. Overrides live in the
+    // instance state, so this is resolved per provider and needs `inst`.
+    let remote = model
+        .as_ref()
+        .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+    let (proxy_anthropic, proxy_openai) = match inst {
+        Some(inst) if remote => (
+            proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
+                .is_some(),
+            proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?.is_some(),
+        ),
+        _ => (false, false),
+    };
+
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
+                // In proxy mode a raw provider key snapshotted via `coop start
+                // --env` must not re-enter the guest — the host-side proxy
+                // holds it. Skip and warn, matching `prepare_env_forwarding`.
+                if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
+                    || (proxy_openai && name.as_str() == "OPENAI_API_KEY")
+                {
+                    tracing::warn!(
+                        "proxy mode: ignoring runtime --env entry '{}' — the raw key stays on the host",
+                        name.as_str()
+                    );
+                    continue;
+                }
                 env.set(name.as_str(), value.as_str());
             }
         }
-        // In local-model mode, Codex reads its API key from the env var
-        // named by the provider's `env_key`. Claude's token rides in
-        // settings.json instead, so it needs no forwarding here.
-        let model = model_state::ModelState::load_or_default(inst)?;
-        if model.mode == model_state::ModelMode::Local
-            && let Some(ep) = model.resolved_codex(&cfg.codex)
-        {
-            env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+        // Codex reads its provider key from the env var named by `env_key`. In
+        // local-model mode that is the local endpoint's token; in remote proxy
+        // mode it is the per-instance capability token (the raw key stays on
+        // the host). Claude's token rides in settings.json instead. The two
+        // modes are mutually exclusive (mode is Local or Remote).
+        if let Some(model) = &model {
+            if model.mode == model_state::ModelMode::Local
+                && let Some(ep) = model.resolved_codex(&cfg.codex)
+            {
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+            } else if proxy_openai
+                && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
+            {
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
+            }
         }
     }
     Ok(backend::SshSession { target, env })
@@ -1572,6 +1646,9 @@ pub(crate) fn cmd_stop(
             port_forward::teardown_ssh_forwards(inst, &target);
         }
     }
+    // Tear down the credential proxy (issue #411) — best-effort, no-op when
+    // proxy mode was never on.
+    crate::proxy::stop(inst);
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
@@ -1595,6 +1672,7 @@ pub(crate) fn cmd_destroy(
         if let Ok(target) = be.ssh_target(cfg, &inst) {
             port_forward::teardown_ssh_forwards(&inst, &target);
         }
+        crate::proxy::stop(&inst);
         be.destroy_instance(cfg, &inst)?;
         workspace::remove_ssh_config(&inst)?;
         tracing::info!("Instance '{}' destroyed", inst.name);
@@ -2059,6 +2137,61 @@ mod tests {
             envs.get("FROM_CFG").map(String::as_str),
             Some("cfg-value"),
             "config.toml [guest_env] entries must still flow through",
+        );
+    }
+
+    /// In proxy mode a raw `ANTHROPIC_API_KEY` persisted via `coop start
+    /// --env` must be dropped from the overlay, not re-injected into the guest
+    /// (issue #411). The VM defaults to remote model mode, so a configured
+    /// `[proxy.anthropic]` upstream makes proxy mode active.
+    #[test]
+    fn prepare_session_suppresses_persisted_proxy_key() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("ANTHROPIC_API_KEY").expect("valid env var"),
+            "sk-ant-realkey".to_string(),
+        );
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
+            "saved-value".to_string(),
+        );
+        state.save(&inst).expect("save snapshot");
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.proxy.anthropic = Some(super::config::ProxyUpstream {
+            credential: super::config::Secret::new("cmd:true".to_string()),
+            auth: super::config::ProxyAuthScheme::ApiKey,
+        });
+
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+
+        let envs = session.env.as_envs();
+        assert!(
+            !envs.contains_key("ANTHROPIC_API_KEY"),
+            "proxy mode re-injected the raw key from the persisted --env overlay",
+        );
+        assert_eq!(
+            envs.get("FROM_CLI").map(String::as_str),
+            Some("saved-value"),
+            "non-suppressed --env entries must still flow through",
         );
     }
 

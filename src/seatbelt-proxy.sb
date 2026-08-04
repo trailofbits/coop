@@ -1,0 +1,61 @@
+;; Seatbelt (SBPL) profile confining the host-side coop-proxy on macOS
+;; (issue #411, slice 3). Applied by the launcher via `sandbox-exec -p`
+;; (see src/proxy.rs) and asserted by the integration suite via
+;; `sandbox-exec -f src/seatbelt-proxy.sb coop-proxy --jail-selftest`.
+;;
+;; Deny everything by default, then allow only what the proxy legitimately
+;; needs: read files (the dynamic linker, resolver config), resolve names,
+;; bind its loopback listener, accept the reverse-tunnel connection, and
+;; connect out only to :443 (upstream HTTPS) and :53 (DNS). No filesystem
+;; writes; the only exec permitted is sandbox-exec's initial replace-exec of
+;; the proxy binary itself (see PROXY_BIN below) — a compromised proxy still
+;; cannot exec any other program. No other egress. The sandbox is inherited by
+;; children and cannot be relaxed from inside.
+;;
+;; `sandbox-exec`/SBPL is officially deprecated but still functional and widely
+;; relied on; Apple has shipped no CLI successor. This is the pragmatic macOS
+;; analog of the Linux Landlock jail. See docs/trust-model.md.
+(version 1)
+(deny default)
+
+;; sandbox-exec applies this profile to itself and then execve-replaces itself
+;; with the proxy binary. That initial exec is governed by this profile, so it
+;; must be permitted or the proxy can never start. Scope it to this exact
+;; binary — its absolute path is passed as the PROXY_BIN parameter via
+;; `sandbox-exec -D` — so a compromised proxy still cannot exec a shell or any
+;; other program (every other path stays denied by `(deny default)`), and the
+;; proxy never execs again after this.
+(allow process-exec* (literal (param "PROXY_BIN")))
+
+;; Reads stay open (dyld, dylib cache, /etc/resolv.conf, /etc/hosts). Writes
+;; are denied by the default deny; the proxy only writes to its inherited
+;; stderr log, which is an already-open descriptor and is unaffected.
+(allow file-read*)
+
+;; Baseline a networked binary needs to start under (deny default).
+(allow sysctl-read)
+(allow system-socket)
+(allow process-info* (target self))
+(allow mach-lookup
+  (global-name "com.apple.mDNSResponder")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.logger"))
+
+;; Bind only the loopback listener and accept the host's reverse-tunnel
+;; connection to it.
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+
+;; Egress allowlist: connect out only to the upstream HTTPS port and DNS.
+;; This is port-scoped, not host-scoped — the two upstreams' identity is
+;; enforced at the TLS layer in the proxy, and the guest cannot retarget them.
+(allow network-outbound (remote tcp "*:443"))
+(allow network-outbound (remote tcp "*:53"))
+(allow network-outbound (remote udp "*:53"))
+;; Local UNIX sockets used during name resolution. This is the broadest allow
+;; in the profile (any local UNIX socket, not a specific path). macOS resolves
+;; names via mach (allowed above), so this may be unnecessary or scopeable to a
+;; specific path (e.g. path-literal "/var/run/mDNSResponder") — a candidate to
+;; tighten once validated on a Mac. Kept for now so name resolution cannot
+;; break; no weaker than Linux, where Landlock does not gate UNIX sockets.
+(allow network-outbound (remote unix-socket))

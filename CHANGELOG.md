@@ -4,6 +4,62 @@
 
 ### New features
 
+- **Credential-injecting proxy — keep the model API keys out of the guest**
+  (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
+  reverse proxy (`coop-proxy`, a new binary shipped in the same tarball) — one
+  process per (VM, provider) — for the lifetime of a remote-mode VM: the guest
+  is pointed at it and holds only a per-instance capability token, while the
+  real credential stays on the host and is injected onto requests upstream.
+  - **Claude Code** (`[proxy.anthropic]`) is pointed at the proxy via
+    `ANTHROPIC_BASE_URL`; supports an API key (`x-api-key`) or a Claude
+    `setup-token` (`Authorization: Bearer`).
+  - **Codex** (`[proxy.openai]`) is pointed at the proxy via a
+    `[model_providers.coop_local]` block (Responses API) with the capability
+    token as the provider bearer; OpenAI API keys inject as
+    `Authorization: Bearer`. In proxy mode Codex's `~/.codex/auth.json` is no
+    longer staged onto the guest disk; Codex subscription is out of scope — use
+    an API key.
+
+  The raw `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is no longer forwarded into the
+  guest, so a prompt-injected or rogue agent cannot read a usable key.
+  Resolution fails closed — a bad credential aborts the boot rather than booting
+  without injection. `coop model <vm> local` takes precedence and tears the
+  proxy down. The proxy binds host loopback and is reverse-tunnelled (`ssh -R`)
+  into the guest, so it works on both backends (Firecracker and Lima). GitHub
+  is a tracked follow-up. `coop update` keeps `coop` and `coop-proxy` in
+  lockstep.
+
+- **The credential proxy is jailed** (#411) — the host-side `coop-proxy`
+  process runs confined so a proxy exploit cannot write files or execute
+  programs, and — on a new enough kernel — cannot reach any host beyond the
+  upstream `:443` and DNS `:53`. On Linux it self-applies Landlock before
+  serving, tiered by kernel capability: filesystem-write and program-exec are
+  always denied (kernel ≥5.13) and fail-closed — the VM start aborts rather
+  than running the proxy without that floor; TCP egress is port-scoped only on
+  kernel ≥6.7, and on kernels 5.13–6.6 (which have no Landlock network rules)
+  that scoping is dropped and egress is left open. On macOS the launcher wraps
+  it in `sandbox-exec` with a Seatbelt profile. The jail is port-scoped, not
+  host-scoped (upstream identity is enforced by the proxy's TLS verification),
+  and does not restrict UDP on Linux; see
+  [`docs/trust-model.md`](docs/trust-model.md).
+
+- **Per-VM credential overrides + `coop proxy status`** (#411) — A single VM can
+  use a different credential than the `[proxy.<provider>]` default — for
+  per-project billing, scope, or revocation — via `coop proxy setup [--openai]
+  --vm <name>`. The override is stored in that instance's state
+  (`<inst.dir>/proxy.json`), not a growing config table, and its secret is
+  namespaced separately. Resolution is override → default → off. `coop proxy
+  status [--vm <name>]` shows what each VM resolves to, with credentials
+  redacted.
+
+- **`coop proxy setup` — store a provider credential like a GitHub PAT** (#411)
+  — Mirrors the `coop github` PAT wizard: paste a credential, pick a secret
+  backend (macOS Keychain / Linux secret-service / 1Password / 0600 file), and
+  coop stores it and writes the `cmd:` reference into `[proxy.<provider>]` — the
+  credential is never plaintext in the config. Anthropic is the default;
+  `--openai` configures Codex. The secret store is namespaced per service, so
+  proxy secrets live under their own directory rather than among the GitHub PATs.
+
 - **`coop editor` — VS Code or Zed** — `coop vscode` is now `coop editor`
   (the old name remains as an alias). `--editor` takes `code` or `zed`;
   when omitted, coop tries VS Code first, then Zed. Zed connects with
