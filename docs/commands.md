@@ -33,7 +33,11 @@ the project identity for instance naming, devcontainer discovery, GitHub PAT
 lookup, and future `coop up DIR` affinity. If a matching instance is already
 running, `up` reports success without creating another VM. If a matching
 instance is stopped, `up` restarts it. If no matching instance exists, `up`
-creates one.
+creates one. Pass `--new-instance` with `--name` to skip the lookup and create
+a second, separately named instance for the same directory or `--git-repo`
+URL. That leaves the project with two matching instances, so later `coop up`
+runs report the ambiguity instead of choosing one — address the instances by
+name (`coop start <name>`, `coop shell <name>`) from then on.
 
 By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
@@ -46,6 +50,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 |------|-------------|
 | `DIR` | Project directory (default: current directory) |
 | `--name <name>` | Instance name to use when creating the project environment |
+| `--new-instance` | Create a separate instance even when the project already has one (requires `--name`) |
 | `--copy` | Copy/sync `DIR` into `/workspace` (default) |
 | `--mount` | Mount `DIR` at `/workspace` instead of using `--copy` |
 | `--extra-mount <spec>` | Additional host directory to mount into the guest (`HOST_PATH[:GUEST_PATH]`, repeatable; specify a guest path other than `/workspace` when using `--copy`) |

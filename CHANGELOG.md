@@ -81,6 +81,14 @@
   `zed ssh://coop-<name>/<path>`, reusing the same `~/.ssh/config` alias
   block that VS Code's Remote-SSH uses.
 
+- **`coop up --new-instance` — a second instance for the same project** — `up`
+  normally reuses the instance recorded for a project directory or `--git-repo`
+  URL. `--new-instance` skips that lookup and creates a sibling instance
+  instead, so two agents can work from one source tree. It requires `--name`,
+  since the project-derived name is already taken. Once a project has siblings,
+  `coop up` reports the ambiguity rather than picking one, so address them by
+  name (`coop start <name>`, `coop shell <name>`).
+
 ### Fixes
 
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases

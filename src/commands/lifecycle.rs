@@ -19,6 +19,7 @@ use crate::{
 pub(crate) struct UpOpts<'a> {
     pub(crate) dir: Option<&'a str>,
     pub(crate) name: Option<&'a config::InstanceName>,
+    pub(crate) new_instance: bool,
     pub(crate) transport: ProjectTransport,
     pub(crate) extra_mount: Vec<config::Mount>,
     pub(crate) git_repo: Option<&'a str>,
@@ -93,12 +94,13 @@ fn canonical_profile_list(profiles: &[String]) -> Vec<String> {
     names
 }
 
-/// Project-oriented start: ensure DIR has a single matching environment.
+/// Project-oriented start: ensure DIR has a matching environment.
 ///
 /// Unlike `start`, `up` treats the project directory as identity and keeps
 /// transport explicit. Existing instances are found by their recorded
-/// `workspace.json` host path; creation-only inputs are only applied when no
-/// matching instance exists.
+/// `workspace.json` host path unless `--new-instance` requests a separate,
+/// explicitly named environment for the same source tree; creation-only
+/// inputs are only applied when no matching instance exists.
 pub(crate) fn cmd_up(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -138,7 +140,9 @@ pub(crate) fn cmd_up(
         );
     }
 
-    if let Some(inst) = find_workspace_instance(cfg, &project_dir)? {
+    if !opts.new_instance
+        && let Some(inst) = find_workspace_instance(cfg, &project_dir)?
+    {
         ensure_up_project_name_matches(&inst, &project_dir, opts)?;
         ensure_up_existing_inputs_are_compatible(&inst, transport, opts)?;
         if be.is_running(&inst) {
@@ -194,7 +198,9 @@ fn cmd_up_git_repo(
         );
     }
 
-    if let Some(inst) = find_git_repo_instance(cfg, repo_url)? {
+    if !opts.new_instance
+        && let Some(inst) = find_git_repo_instance(cfg, repo_url)?
+    {
         ensure_up_git_repo_name_matches(&inst, repo_url, opts)?;
         ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, opts)?;
         if be.is_running(&inst) {
@@ -2071,6 +2077,7 @@ mod tests {
         super::UpOpts {
             dir,
             name: None,
+            new_instance: false,
             transport: super::ProjectTransport::Copy,
             extra_mount: Vec::new(),
             git_repo: None,
