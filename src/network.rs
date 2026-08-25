@@ -70,6 +70,16 @@ pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
         .sudo()
         .run()
         .context("Failed to add TAP to bridge")?;
+    // The Linux bridge forwards guest-to-guest frames at L2. Those frames do
+    // not reliably traverse the host's iptables FORWARD chain, so firewall
+    // rules alone cannot establish VM isolation. Mark every TAP as an
+    // isolated bridge port: isolated ports may talk to the non-isolated host
+    // bridge port, but never to one another.
+    Cmd::new("bridge")
+        .args(["link", "set", "dev", &tap, "isolated", "on"])
+        .sudo()
+        .run()
+        .context("Failed to isolate TAP from peer guest ports")?;
     Cmd::new("ip")
         .args(["link", "set", &tap, "up"])
         .sudo()
