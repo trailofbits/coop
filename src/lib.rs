@@ -69,12 +69,12 @@ use backend::VmBackend as _;
 use commands::json;
 use commands::{
     AgentUpdateOpts, DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport,
-    QuickstartOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
+    QuickstartOpts, RecreateOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
     UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
     cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
-    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize,
-    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
-    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
+    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_recreate,
+    cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up,
+    cmd_validate, codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
     resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
 };
 
@@ -581,6 +581,41 @@ enum Commands {
         /// Overwrite an existing image with the same name
         #[arg(long)]
         force: bool,
+    },
+    /// Wipe an instance's filesystem and bring it back with the same settings
+    ///
+    /// Replaces the guest disk with a fresh copy of the instance's image, then
+    /// provisions it as a first boot: the recorded workspace is re-synced or
+    /// re-cloned, agents are re-bootstrapped, and plugins and MCP servers are
+    /// reinstalled. Name, IP, image, disk size, port forwards and guest env
+    /// (including a devcontainer's containerEnv and forwardPorts) are kept, so
+    /// those flags do not have to be repeated.
+    ///
+    /// Not replayed: extra --extra-mount directories, --exclude-git, and a
+    /// devcontainer's postCreateCommand — none of which coop persists.
+    Recreate {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Rebuild from this image instead of the one the instance records
+        #[arg(
+            long,
+            value_parser = config::ImageName::new,
+            add = ArgValueCandidates::new(completions::image_candidates),
+        )]
+        image: Option<config::ImageName>,
+        /// Skip the confirmation prompt (required when stdin is not a TTY)
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        #[arg(long, alias = "no-claude")]
+        no_agents: bool,
+        /// Suppress the interactive prompt to set up a scoped GitHub PAT
+        #[arg(long)]
+        no_prompt: bool,
     },
     /// Roll a stopped instance back to an image's filesystem in place
     Restore {
@@ -1363,6 +1398,24 @@ pub fn run() -> Result<()> {
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }
+        Commands::Recreate {
+            name,
+            image,
+            yes,
+            no_agents,
+            no_prompt,
+        } => cmd_recreate(
+            &be,
+            &mut cfg,
+            &RecreateOpts {
+                name: name.as_ref(),
+                image: image.as_ref(),
+                yes,
+                no_agents,
+                no_prompt,
+                config_path: &cli.config,
+            },
+        ),
         Commands::Restore { name, image } => cmd_restore(&be, &cfg, name.as_ref(), &image),
         Commands::Profiles { action } => cmd_profiles(
             &cfg,
@@ -1632,6 +1685,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recreate_parses_name_and_defaults_image_to_none() {
+        let cli = parse(&["recreate", "myvm"]);
+        let super::Commands::Recreate {
+            name,
+            image,
+            yes,
+            no_agents,
+            no_prompt,
+        } = cli.command
+        else {
+            panic!("expected Recreate variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        // Unlike `restore`, `--image` is optional: omitting it reuses the
+        // image the instance already records.
+        assert!(image.is_none());
+        assert!(!yes);
+        assert!(!no_agents);
+        assert!(!no_prompt);
+    }
+
+    #[test]
+    fn recreate_parses_all_flags() {
+        let cli = parse(&[
+            "recreate",
+            "myvm",
+            "--image",
+            "rust",
+            "-y",
+            "--no-agents",
+            "--no-prompt",
+        ]);
+        let super::Commands::Recreate {
+            name,
+            image,
+            yes,
+            no_agents,
+            no_prompt,
+        } = cli.command
+        else {
+            panic!("expected Recreate variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(
+            image.as_ref().map(super::config::ImageName::as_str),
+            Some("rust")
+        );
+        assert!(yes);
+        assert!(no_agents);
+        assert!(no_prompt);
+    }
+
+    #[test]
+    fn recreate_accepts_no_claude_alias_and_bare_invocation() {
+        // `--no-claude` is the legacy spelling `up`/`start` still accept.
+        let cli = parse(&["recreate", "--no-claude"]);
+        let super::Commands::Recreate {
+            name, no_agents, ..
+        } = cli.command
+        else {
+            panic!("expected Recreate variant");
+        };
+        // NAME is optional — resolved to the single instance at run time.
+        assert!(name.is_none());
+        assert!(no_agents);
+    }
     #[test]
     fn restore_parses_name_and_image() {
         let cli = parse(&["restore", "myvm", "--image", "safe-point"]);

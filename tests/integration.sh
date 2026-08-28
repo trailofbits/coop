@@ -2492,6 +2492,167 @@ test_restart_rejects_ignored_flags() {
     rm -rf "$mount_dir"
 }
 
+test_recreate() {
+    echo ""
+    echo "=== Phase: recreate ==="
+
+    # The instance is running from the previous phase. `recreate` accepts a
+    # running instance (it stops it itself), so no state prep is needed.
+    #
+    # This phase asserts the distinction between `recreate` and
+    # `restore` + `start`: both replace the disk, but only `recreate` re-runs
+    # the first-boot provisioning, so only `recreate` puts /workspace back.
+    # Three discriminators are seeded first:
+    #   * a guest-home sentinel, which must be GONE (the disk really was wiped)
+    #   * a host-side workspace marker, which must be PRESENT in /workspace
+    #     (the workspace was re-synced, not merely left blank)
+    #   * COOP_TEST_GUEST_ENV, set at `up` time, which must survive (the
+    #     persisted guest_env.json was replayed, not lost with the disk)
+    local ip_before=""
+    if guest_exec sh -c 'echo pre-recreate > ~/sentinel'; then
+        pass "seed guest sentinel before recreate"
+    else
+        fail "seed guest sentinel before recreate" "stderr: $(guest_stderr)"
+    fi
+
+    # Written on the host, so only a real workspace re-sync can put it in the
+    # guest — it has never been inside the VM.
+    echo "recreated" > "$tmpdir/primary-ws/recreate-marker"
+
+    if coop status "$INSTANCE" 2>/dev/null; then
+        ip_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+    fi
+
+    # An unknown image is rejected before anything is destroyed.
+    if coop_fails recreate "$INSTANCE" -y --image "no-such-image-$$"; then
+        pass "recreate rejects unknown image"
+    else
+        fail "recreate rejects unknown image" "should have failed"
+    fi
+
+    # The instance must be untouched by that rejection — still running.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "rejected recreate leaves the instance running"
+    else
+        fail "rejected recreate leaves the instance running" "status: $HARNESS_OUT"
+    fi
+
+    # Without -y and without a TTY, `prompt::confirm` short-circuits to false,
+    # so a scripted recreate must refuse rather than silently wipe the guest.
+    if coop_fails recreate "$INSTANCE"; then
+        pass "recreate without -y refuses off a TTY"
+        if echo "$HARNESS_ERR" | grep -q -- "-y"; then
+            pass "non-interactive refusal names -y"
+        else
+            fail "non-interactive refusal names -y" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "recreate without -y refuses off a TTY" "should have failed"
+    fi
+
+    # The refusal must be inert: the guest sentinel is still there.
+    if [[ "$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null')" == "pre-recreate" ]]; then
+        pass "refused recreate leaves the guest untouched"
+    else
+        fail "refused recreate leaves the guest untouched" "sentinel changed"
+    fi
+
+    # Grow the disk first, so the recreate has a non-template size to carry
+    # across the swap. `restore_disk` copies the template, which is smaller,
+    # so a recreate that skipped the re-grow would shrink the instance back.
+    # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
+    # absent value degrades to a skip rather than a spurious failure.
+    local disk_before=""
+    coop stop "$INSTANCE" >/dev/null 2>&1 || true
+    if coop resize "$INSTANCE" --size +1G; then
+        pass "grow disk before recreate exits 0"
+        if coop status "$INSTANCE" 2>/dev/null; then
+            disk_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+        fi
+    else
+        fail "grow disk before recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+    coop start "$INSTANCE" --no-agents >/dev/null 2>&1 || true
+
+    if coop recreate "$INSTANCE" -y --no-agents; then
+        pass "recreate exits 0"
+    else
+        fail "recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # Unlike `restore` (which leaves the instance stopped), `recreate` brings
+    # it back up as part of the same command.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "recreate leaves the instance running"
+    else
+        fail "recreate leaves the instance running" "status: $HARNESS_OUT"
+        return
+    fi
+
+    local sentinel_after ws_marker env_after
+    sentinel_after=$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null') || sentinel_after=""
+    ws_marker=$(coop_exec sh -c 'cat /workspace/recreate-marker 2>/dev/null') || ws_marker=""
+    env_after=$(guest_exec printenv COOP_TEST_GUEST_ENV) || env_after=""
+
+    # The disk was really replaced: guest-home state written before the
+    # recreate is gone.
+    if [[ -z "$sentinel_after" ]]; then
+        pass "recreate wipes guest filesystem state"
+    else
+        fail "recreate wipes guest filesystem state" \
+            "sentinel='$sentinel_after' (expected it to be gone)"
+    fi
+
+    # …and the workspace came back. This is the assertion `restore` + `start`
+    # cannot satisfy: BootMode::Restart skips the workspace sync.
+    if [[ "$ws_marker" == "recreated" ]]; then
+        pass "recreate re-syncs the workspace from the host"
+    else
+        fail "recreate re-syncs the workspace from the host" \
+            "marker='$ws_marker' (expected 'recreated')"
+    fi
+
+    # Persisted guest-env survived the wipe and was replayed into the new boot.
+    if [[ "$env_after" == "hello-from-cli" ]]; then
+        pass "recreate preserves persisted guest env"
+    else
+        fail "recreate preserves persisted guest env" \
+            "COOP_TEST_GUEST_ENV='$env_after' (expected 'hello-from-cli')"
+    fi
+
+    # Identity: the guest IP is derived from the instance index, so an
+    # unchanged IP proves recreate swapped only the disk rather than
+    # reallocating the instance. Lima's status does not surface the IP, so
+    # the compare degrades to a skip there rather than a spurious failure.
+    local ip_after=""
+    if coop status "$INSTANCE" 2>/dev/null; then
+        ip_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+    fi
+    if [[ -z "$ip_before" || -z "$ip_after" ]]; then
+        skip "guest IP preserved across recreate" "status does not surface Guest IP"
+    elif [[ "$ip_before" == "$ip_after" ]]; then
+        pass "guest IP preserved across recreate ($ip_after)"
+    else
+        fail "guest IP preserved across recreate" "before=$ip_before after=$ip_after"
+    fi
+
+    # A `coop resize --size` must survive the wipe: the image the disk is
+    # restored from is template-sized, so recreate has to re-grow it.
+    local disk_after=""
+    if coop status "$INSTANCE" 2>/dev/null; then
+        disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+    fi
+    if [[ -z "$disk_before" || -z "$disk_after" ]]; then
+        skip "disk size preserved across recreate" "status does not report disk GiB"
+    elif [[ "$disk_after" -ge "$disk_before" ]]; then
+        pass "disk size preserved across recreate (${disk_after} GiB)"
+    else
+        fail "disk size preserved across recreate" \
+            "before=${disk_before} GiB after=${disk_after} GiB (recreate shrank the disk)"
+    fi
+}
+
 test_destroy() {
     echo ""
     echo "=== Phase: destroy ==="
@@ -5446,6 +5607,7 @@ main() {
     test_commit_restore
     test_restart_stopped
     test_restart_rejects_ignored_flags
+    test_recreate
     test_destroy
     test_auto_resolve_no_instances
     test_list_empty
