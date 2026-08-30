@@ -14,8 +14,10 @@
 #![expect(clippy::expect_used, reason = "tests")]
 #![expect(clippy::panic, reason = "tests")]
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,8 +32,21 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often to probe while waiting for that first answer.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Read budget for one readiness probe. Well under [`READY_TIMEOUT`] so that a
+/// peer which accepts but never replies costs one poll, not the whole budget —
+/// the loop keeps checking whether the child died.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Read budget for a test's own request, which waits on the real upstream path.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How many ports to try before giving up (see [`spawn_serving`]).
 const PORT_ATTEMPTS: usize = 10;
+
+/// Ports already handed out in this process. `bind(0)` can return a port a
+/// sibling test just released, and these tests run concurrently in one binary,
+/// so without this two of them would race to give the same port to two proxies.
+static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
 /// A config whose upstream can never resolve, so any request that passes the
 /// gate fails closed rather than reaching a real service.
@@ -46,60 +61,63 @@ fn config_json(listen: &str) -> String {
     )
 }
 
-/// How a spawned proxy left the readiness wait.
+/// How a spawned proxy left the readiness wait: it answered, it exited first,
+/// or it outlived [`READY_TIMEOUT`] without answering.
 enum Startup {
-    /// It answered a request on its address.
     Serving,
-    /// It exited before answering.
     Exited,
-    /// It never answered within [`READY_TIMEOUT`].
     Unresponsive,
 }
 
-/// A loopback port that is free *right now*.
-///
-/// Nothing holds it: binding and dropping only samples the kernel's free list,
-/// so the port can be taken again before the caller uses it. [`spawn_serving`]
-/// handles losing that race.
+/// A loopback port that is free *right now* and not yet used by this process.
+/// Nothing holds it, so it can still be taken before the child binds — see
+/// [`spawn_serving`].
 async fn free_loopback_addr() -> SocketAddr {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
+    loop {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let fresh = HANDED_OUT.lock().unwrap().insert(addr.port());
+        if fresh {
+            return addr;
+        }
+    }
 }
 
 /// Spawn the proxy binary on a free loopback port and wait until it answers
 /// requests, returning the address it is serving on.
 ///
-/// The port cannot be reserved for the child. `free_loopback_addr` yields a
-/// port from the ephemeral range, and until the child binds it the kernel may
-/// hand that same port to any other socket — including this process's own
-/// outgoing probe connections, which do not set `SO_REUSEADDR` and so block the
-/// child's listening bind. The child then exits with `EADDRINUSE`; retrying on
-/// a fresh port is what makes this deterministic. A child that fails for any
-/// other reason fails the test immediately, with its stderr.
+/// The port cannot be reserved for the child: between `free_loopback_addr`
+/// sampling it and the child binding it, the kernel can hand the same port to
+/// another socket — including this process's own outgoing probe connections —
+/// and the child then exits with `EADDRINUSE`. Retrying on a fresh port is what
+/// keeps that from flaking.
 async fn spawn_serving() -> (SocketAddr, Child) {
+    let mut last_stderr = String::new();
     for _ in 0..PORT_ATTEMPTS {
         let addr = free_loopback_addr().await;
         let mut child = spawn_proxy(addr).await;
         match wait_until_serving(&mut child, addr).await {
             Startup::Serving => return (addr, child),
             Startup::Unresponsive => {
-                panic!("proxy did not answer on {addr} within {READY_TIMEOUT:?}")
+                // Kill first: `drain_stderr` reads to EOF, which only arrives
+                // once the child closes the pipe.
+                let _ = child.kill().await;
+                let stderr = drain_stderr(&mut child).await;
+                panic!("proxy did not answer on {addr} within {READY_TIMEOUT:?}: {stderr}");
             }
             Startup::Exited => {
-                let stderr = drain_stderr(&mut child).await;
+                last_stderr = drain_stderr(&mut child).await;
                 assert!(
-                    stderr.contains("Address already in use"),
-                    "proxy exited instead of serving on {addr}: {stderr}"
+                    last_stderr.contains("Address already in use"),
+                    "proxy exited instead of serving on {addr}: {last_stderr}"
                 );
             }
         }
     }
-    panic!("proxy lost the race for a free loopback port {PORT_ATTEMPTS} times");
+    panic!("proxy lost the race for a free loopback port {PORT_ATTEMPTS} times: {last_stderr}");
 }
 
-/// Spawn the proxy binary and feed it the config for `addr` on stdin.
 async fn spawn_proxy(addr: SocketAddr) -> Child {
     // `--no-jail`: this test drives the gate logic, not the jail, and runs on
     // CI hosts that may lack Landlock (where the fail-closed jail would abort
@@ -107,6 +125,12 @@ async fn spawn_proxy(addr: SocketAddr) -> Child {
     // `--jail-selftest` in the VM integration suite.
     let mut child = Command::new(BIN)
         .arg("--no-jail")
+        // Pin both so the child's stderr is what the harness expects whatever
+        // the developer's environment: `LC_ALL` keeps the `EADDRINUSE` text
+        // untranslated for the retry check below, and `RUST_LOG` keeps the
+        // volume to the couple of lines that fit the undrained pipe buffer.
+        .env("LC_ALL", "C")
+        .env("RUST_LOG", "info")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -130,6 +154,12 @@ async fn wait_until_serving(child: &mut Child, addr: SocketAddr) -> Startup {
                 return Startup::Exited;
             }
             if is_serving(addr).await {
+                // A probe only proves *something* answers on `addr`. If our
+                // child lost the port it is already gone, and the answer came
+                // from whoever won it.
+                if child.try_wait().unwrap().is_some() {
+                    return Startup::Exited;
+                }
                 return Startup::Serving;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -140,53 +170,102 @@ async fn wait_until_serving(child: &mut Child, addr: SocketAddr) -> Startup {
         .unwrap_or(Startup::Unresponsive)
 }
 
-/// Read the exited child's stderr to EOF.
+/// Call only once the child has exited or been killed — this reads to EOF, and
+/// a live child holds the pipe open.
 async fn drain_stderr(child: &mut Child) -> String {
     let mut buf = Vec::new();
     if let Some(mut stderr) = child.stderr.take() {
-        stderr.read_to_end(&mut buf).await.unwrap();
+        let _ = stderr.read_to_end(&mut buf).await;
     }
     String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Whether a proxy is answering requests on `addr`.
 ///
-/// A bare `connect()` is not a readiness signal. `addr` is an ephemeral-range
-/// port, so before the child binds the kernel can hand that same port to this
-/// probe's own outgoing socket; `127.0.0.1:X → 127.0.0.1:X` is a TCP
-/// simultaneous open that connects with nothing listening, and echoes back
-/// whatever the probe writes. Rejecting a peer that is our own local address,
-/// and requiring an HTTP status line in reply, separates a serving proxy from
-/// that self-connect.
+/// A bare `connect()` is not a readiness signal: the kernel can give this
+/// probe's own outgoing socket the very port it is probing, and
+/// `127.0.0.1:X → 127.0.0.1:X` is a TCP simultaneous open that succeeds with
+/// nothing listening, then echoes back whatever the probe writes. Such a socket
+/// has `peer_addr() == local_addr()`; requiring a reply that *starts with*
+/// `HTTP/` rejects it a second time, since the echo of the request line merely
+/// contains that text.
+///
+/// Every failure is a `false`, never a panic — this runs during the startup
+/// window, where a peer may reset the connection at any point, and the retry
+/// loop is what should absorb that.
 async fn is_serving(addr: SocketAddr) -> bool {
     let Ok(stream) = TcpStream::connect(addr).await else {
         return false;
     };
-    if stream.local_addr().unwrap() == stream.peer_addr().unwrap() {
+    let (Ok(local), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) else {
+        return false;
+    };
+    if local == peer {
         return false;
     }
-    status_line(stream, None).await.starts_with("HTTP/")
+    status_line(stream, None, PROBE_TIMEOUT)
+        .await
+        .is_some_and(|status| status.starts_with("HTTP/"))
 }
 
-/// Send a minimal HTTP/1.1 request and return the status line.
 async fn request_status(addr: SocketAddr, auth_header: Option<&str>) -> String {
-    status_line(TcpStream::connect(addr).await.unwrap(), auth_header).await
+    let stream = TcpStream::connect(addr).await.unwrap();
+    status_line(stream, auth_header, RESPONSE_TIMEOUT)
+        .await
+        .unwrap_or_default()
 }
 
-/// Send a minimal HTTP/1.1 request over `stream` and return the status line.
-async fn status_line(mut stream: TcpStream, auth_header: Option<&str>) -> String {
+/// Send a minimal HTTP/1.1 request over `stream` and return the status line, or
+/// `None` if the exchange failed at the socket level.
+async fn status_line(
+    mut stream: TcpStream,
+    auth_header: Option<&str>,
+    read_budget: Duration,
+) -> Option<String> {
     let mut req = String::from("GET /v1/messages HTTP/1.1\r\nHost: proxy\r\n");
     if let Some(h) = auth_header {
         req.push_str(h);
         req.push_str("\r\n");
     }
     req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(req.as_bytes()).await.ok()?;
 
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(read_budget, stream.read_to_end(&mut buf)).await;
     let text = String::from_utf8_lossy(&buf);
-    text.lines().next().unwrap_or_default().to_string()
+    Some(text.lines().next().unwrap_or_default().to_string())
+}
+
+/// Accept once on a fresh loopback port, reply with `reply`, and close.
+async fn serve_one(reply: &'static [u8]) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(reply).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn readiness_probe_rejects_a_dead_port() {
+    let addr = free_loopback_addr().await;
+    assert!(!is_serving(addr).await);
+}
+
+#[tokio::test]
+async fn readiness_probe_rejects_an_echoed_request_line() {
+    // What a self-connected socket returns. It contains "HTTP/" but does not
+    // start with it, which is why `is_serving` matches on the prefix.
+    let addr = serve_one(b"GET /v1/messages HTTP/1.1\r\n\r\n").await;
+    assert!(!is_serving(addr).await);
+}
+
+#[tokio::test]
+async fn readiness_probe_accepts_an_http_status_line() {
+    let addr = serve_one(b"HTTP/1.1 401 Unauthorized\r\n\r\n").await;
+    assert!(is_serving(addr).await);
 }
 
 #[tokio::test]
@@ -213,7 +292,7 @@ async fn valid_token_passes_gate_and_fails_closed_at_upstream() {
 #[tokio::test]
 async fn refuses_to_bind_unspecified_address() {
     // `--no-jail` so the bind guard is asserted regardless of host Landlock
-    // support (see spawn_serving).
+    // support (see spawn_proxy).
     let mut child = Command::new(BIN)
         .arg("--no-jail")
         .stdin(Stdio::piped())
@@ -229,7 +308,7 @@ async fn refuses_to_bind_unspecified_address() {
         .unwrap();
     drop(stdin);
 
-    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+    let output = tokio::time::timeout(RESPONSE_TIMEOUT, child.wait_with_output())
         .await
         .expect("proxy should exit promptly on a bad bind address")
         .unwrap();

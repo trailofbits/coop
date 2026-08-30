@@ -114,8 +114,8 @@ impl Ctx {
 /// must be reachable only over the private host-guest link, never every host
 /// interface.
 ///
-/// The `Ctx` is built before the bind, so a bound listener means the proxy can
-/// serve: nothing fallible remains between the bind and `accept_loop`.
+/// `Ctx::new` runs before the bind so that a bound listener means the proxy can
+/// serve — nothing fallible may sit between the bind and `accept_loop`.
 pub async fn serve(
     cfg: ProxyConfig,
     shutdown: impl std::future::Future<Output = ()>,
