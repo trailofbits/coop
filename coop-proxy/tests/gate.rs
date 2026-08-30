@@ -10,9 +10,10 @@
 //! logic is covered by the unit tests in `src/proxy.rs`, and end-to-end against
 //! a mock upstream by coop's VM integration suite.
 //!
-//! The `readiness_probe_*` tests are the exception: they drive no binary and no
-//! gate, but pin the harness's own readiness probe, whose failure modes are
-//! what made this file flaky (issue 435).
+//! The `readiness_probe_*` and `spawned_proxy_*` tests are the exception: they
+//! assert nothing about the gate, but pin the harness that reaches it — the
+//! readiness probe and its `EADDRINUSE` retry — whose failure modes are what
+//! made this file flaky (issue 435).
 
 #![expect(clippy::unwrap_used, reason = "tests")]
 #![expect(clippy::expect_used, reason = "tests")]
@@ -44,13 +45,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Read budget for a test's own request, which waits on the real upstream path.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long a proxy that refuses its config gets to exit. It never binds, so
+/// this bounds a process exit rather than any socket read.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How many ports to try before giving up (see [`spawn_serving`], [`bind_fresh`]).
 const PORT_ATTEMPTS: usize = 10;
 
 /// Every loopback port this process has taken, so no two tests in this binary
 /// are handed the same one — `bind(0)` will otherwise return a port a sibling
-/// just released, and these tests run concurrently. Only [`bind_fresh`] adds to
-/// it, so every port in the binary comes from there.
+/// just released, and these tests run concurrently. A port is claimed here only
+/// once its socket already holds it, never before.
 static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
 /// A config whose upstream can never resolve, so any request that passes the
@@ -259,8 +264,9 @@ async fn serve_one(reply: &'static [u8]) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
-            // Read the request first: closing with data still queued makes the
+            // Drain the request first: closing with data still queued makes the
             // kernel send RST, which on BSD-derived stacks discards the reply.
+            // One read suffices — the probe's request is one small write.
             let mut discard = [0u8; 1024];
             let _ = sock.read(&mut discard).await;
             let _ = sock.write_all(reply).await;
@@ -275,17 +281,24 @@ async fn readiness_probe_rejects_unbound_port() {
     assert!(!is_serving(addr).await);
 }
 
+// Linux only, in both directions: macOS and the BSDs reject a connect to the
+// socket's own bound address with `EINVAL` inside `tcp_connect`, so neither the
+// accidental collision behind issue 435 nor this deliberate reconstruction of
+// it can happen there. The guard under test is likewise a Linux-only concern.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn readiness_probe_rejects_self_connect() {
     // Force the simultaneous open that issue 435 hit by accident: a socket
     // connecting to its own bound address completes with nothing listening.
     // Binding `:0` and reading the port back keeps the socket in possession of
     // it throughout — sampling a free port first would reintroduce the very
-    // steal this file exists to eliminate.
+    // steal this file exists to eliminate. No `SO_REUSEADDR`: the construction
+    // does not need it, and without it the kernel will not hand this port to a
+    // sibling's listener.
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.set_reuseaddr(true).unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = socket.local_addr().unwrap();
+    HANDED_OUT.lock().unwrap().insert(addr.port());
     let stream = socket.connect(addr).await.unwrap();
     assert_eq!(
         stream.local_addr().unwrap(),
@@ -374,7 +387,7 @@ async fn refuses_to_bind_unspecified_address() {
         .unwrap();
     drop(stdin);
 
-    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+    let output = tokio::time::timeout(EXIT_TIMEOUT, child.wait_with_output())
         .await
         .expect("proxy should exit promptly on a bad bind address")
         .unwrap();
