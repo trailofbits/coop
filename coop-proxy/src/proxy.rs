@@ -25,7 +25,7 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use rustls::pki_types::ServerName;
@@ -199,6 +199,13 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
         });
     }
 
+    if !operation_allowed(req.method(), req.uri(), &ctx.cfg.upstream_host) {
+        return Err(Refusal {
+            status: StatusCode::FORBIDDEN,
+            msg: "operation is not allowed by coop-proxy",
+        });
+    }
+
     // Held until the response body finishes streaming (see `GuardedBody`), so
     // the concurrency cap bounds a request for its whole lifetime.
     let permit = ctx
@@ -224,6 +231,29 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
     let upstream_req = Request::from_parts(parts, body);
 
     forward(upstream_req, ctx, permit).await
+}
+
+/// Whether the fixed upstream permits this method/path pair.
+///
+/// Provider operations are deliberately default-deny: the coding agents only
+/// need response/message creation and input-token counting, so administrative
+/// APIs and stored-resource reads must never inherit the host credential's
+/// broader authority.
+fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
+    if method != Method::POST {
+        return false;
+    }
+
+    matches!(
+        (upstream_host, uri.path()),
+        (
+            "api.openai.com",
+            "/v1/responses" | "/v1/responses/input_tokens"
+        ) | (
+            "api.anthropic.com",
+            "/v1/messages" | "/v1/messages/count_tokens"
+        )
+    )
 }
 
 async fn forward(
@@ -473,6 +503,89 @@ mod tests {
         assert!(authorized(&h, "right"));
         assert!(!authorized(&h, "wrong"));
         assert!(!authorized(&HeaderMap::new(), "right"));
+    }
+
+    // ── OpenAI operation policy ────────────────────────────────
+
+    #[test]
+    fn openai_allows_response_creation_and_token_counting() {
+        let create: Uri = "/v1/responses".parse().unwrap();
+        let count_tokens: Uri = "/v1/responses/input_tokens".parse().unwrap();
+        let create_with_query: Uri = "/v1/responses?foo=bar".parse().unwrap();
+
+        assert!(operation_allowed(&Method::POST, &create, "api.openai.com"));
+        assert!(operation_allowed(
+            &Method::POST,
+            &count_tokens,
+            "api.openai.com"
+        ));
+        assert!(operation_allowed(
+            &Method::POST,
+            &create_with_query,
+            "api.openai.com"
+        ));
+    }
+
+    #[test]
+    fn openai_denies_admin_key_creation() {
+        let uri: Uri = "/v1/organization/admin_api_keys".parse().unwrap();
+        assert!(!operation_allowed(&Method::POST, &uri, "api.openai.com"));
+    }
+
+    #[test]
+    fn openai_denies_stored_response_reads() {
+        let uri: Uri = "/v1/responses/resp_123".parse().unwrap();
+        assert!(!operation_allowed(&Method::GET, &uri, "api.openai.com"));
+    }
+
+    #[test]
+    fn openai_policy_is_default_deny() {
+        for (method, path) in [
+            (Method::GET, "/v1/responses"),
+            (Method::DELETE, "/v1/responses/resp_123"),
+            (Method::POST, "/v1/files"),
+            (Method::TRACE, "/v1/responses"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(
+                !operation_allowed(&method, &uri, "api.openai.com"),
+                "unexpectedly allowed {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_allows_message_creation_and_token_counting() {
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(operation_allowed(&Method::POST, &uri, "api.anthropic.com"));
+        }
+    }
+
+    #[test]
+    fn anthropic_policy_is_default_deny() {
+        for (method, path) in [
+            (Method::GET, "/v1/messages"),
+            (Method::POST, "/v1/messages/batches"),
+            (Method::GET, "/v1/messages/batches/msgbatch_123/results"),
+            (Method::POST, "/v1/organizations/invites"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(
+                !operation_allowed(&method, &uri, "api.anthropic.com"),
+                "unexpectedly allowed {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_upstream_has_no_allowed_operations() {
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        assert!(!operation_allowed(
+            &Method::POST,
+            &uri,
+            "proxy-test.invalid"
+        ));
     }
 
     // ── header rewrite ───────────────────────────────────────

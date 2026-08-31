@@ -4,11 +4,12 @@
 //!
 //! These assert the security-critical refusal path without a live upstream: a
 //! request that fails the capability check is rejected with 401 and the
-//! upstream is never contacted; a request that passes fails closed at the
-//! (unresolvable) upstream with 502, proving the gate opened without any real
-//! credential reaching a real service. The authorized header-rewrite/injection
-//! logic is covered by the unit tests in `src/proxy.rs`, and end-to-end against
-//! a mock upstream by coop's VM integration suite.
+//! upstream is never contacted; a request with a valid token reaches the
+//! operation policy and is denied with 403 for the test-only unknown upstream,
+//! proving the authentication gate opened without any credential reaching a
+//! real service. The authorized header-rewrite/injection logic is covered by
+//! the unit tests in `src/proxy.rs`, and end-to-end against a mock upstream by
+//! coop's VM integration suite.
 //!
 //! The `readiness_probe_*` and `spawned_proxy_*` tests are the exception: they
 //! assert nothing about the gate, but pin the harness that reaches it — the
@@ -362,10 +363,10 @@ async fn rejects_wrong_token_with_401() {
 }
 
 #[tokio::test]
-async fn valid_token_passes_gate_and_fails_closed_at_upstream() {
+async fn valid_token_passes_auth_gate_and_reaches_operation_policy() {
     let (addr, _child) = spawn_serving().await;
     let status = request_status(addr, Some("Authorization: Bearer the-right-token")).await;
-    assert!(status.contains("502"), "expected 502, got: {status:?}");
+    assert!(status.contains("403"), "expected 403, got: {status:?}");
 }
 
 #[tokio::test]
