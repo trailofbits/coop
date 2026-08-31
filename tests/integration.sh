@@ -2501,18 +2501,32 @@ test_recreate() {
     #
     # This phase asserts the distinction between `recreate` and
     # `restore` + `start`: both replace the disk, but only `recreate` re-runs
-    # the first-boot provisioning, so only `recreate` puts /workspace back.
-    # Three discriminators are seeded first:
+    # the first-boot provisioning, so only `recreate` puts /workspace back and
+    # re-runs the agent bootstrap. Four discriminators are seeded first:
     #   * a guest-home sentinel, which must be GONE (the disk really was wiped)
     #   * a host-side workspace marker, which must be PRESENT in /workspace
     #     (the workspace was re-synced, not merely left blank)
     #   * COOP_TEST_GUEST_ENV, set at `up` time, which must survive (the
     #     persisted guest_env.json was replayed, not lost with the disk)
+    #   * a sentinel key in ~/.claude/settings.json, which must be GONE while
+    #     the managed permissions block is back — the agent-bootstrap half of
+    #     provision_first_boot ran against a blank disk. The settings-merge
+    #     phase pins the opposite direction (a restart preserves the key), so
+    #     the pair distinguishes FirstBoot from Restart.
     local ip_before=""
     if guest_exec sh -c 'echo pre-recreate > ~/sentinel'; then
         pass "seed guest sentinel before recreate"
     else
         fail "seed guest sentinel before recreate" "stderr: $(guest_stderr)"
+    fi
+
+    local claude_seed='mkdir -p ~/.claude && printf "%s" '
+    claude_seed+='"{\"enabledPlugins\":{\"recreate-sentinel@m\":true}}" '
+    claude_seed+='> ~/.claude/settings.json'
+    if coop_exec sh -c "$claude_seed"; then
+        pass "seed claude settings sentinel before recreate"
+    else
+        fail "seed claude settings sentinel before recreate" "stderr: $(guest_stderr)"
     fi
 
     # Written on the host, so only a real workspace re-sync can put it in the
@@ -2563,7 +2577,12 @@ test_recreate() {
     # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
     # absent value degrades to a skip rather than a spurious failure.
     local disk_before=""
-    coop stop "$INSTANCE" >/dev/null 2>&1 || true
+    if coop stop "$INSTANCE"; then
+        pass "stop before disk grow exits 0"
+    else
+        fail "stop before disk grow exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
     if coop resize "$INSTANCE" --size +1G; then
         pass "grow disk before recreate exits 0"
         if coop status "$INSTANCE" 2>/dev/null; then
@@ -2572,9 +2591,27 @@ test_recreate() {
     else
         fail "grow disk before recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
     fi
-    coop start "$INSTANCE" --no-agents >/dev/null 2>&1 || true
+    # Not `|| true`: a failed restart silently sends the recreate down the
+    # already-stopped branch instead of the running one, and the phase would
+    # still report green while testing the wrong path.
+    if coop start "$INSTANCE" --no-agents; then
+        pass "restart before recreate exits 0"
+    else
+        fail "restart before recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
 
-    if coop recreate "$INSTANCE" -y --no-agents; then
+    # The guest root filesystem size *after* the grow, so the comparison below
+    # isolates what recreate did to it rather than folding in the resize.
+    # 1K blocks; empty when df is unavailable.
+    local guest_fs_before=""
+    guest_fs_before=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_before=""
+
+    # No `--no-agents`: it skips `bootstrap_agents` entirely, which is half of
+    # what distinguishes `recreate` from `restore` + `start` (BootMode::Restart
+    # re-merges settings but does not reinstall plugins or MCP servers). The
+    # claude settings assertions below depend on it having run.
+    if coop recreate "$INSTANCE" -y; then
         pass "recreate exits 0"
     else
         fail "recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
@@ -2591,17 +2628,24 @@ test_recreate() {
     fi
 
     local sentinel_after ws_marker env_after
-    sentinel_after=$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null') || sentinel_after=""
+    # A positive discriminator, not `cat ... 2>/dev/null`: the guest has to
+    # answer "absent" for this to pass, so an unreachable guest or a changed
+    # home directory reads as a failure rather than as a successful wipe.
+    if ! sentinel_after=$(coop_exec sh -c 'test -e ~/sentinel && echo present || echo absent'); then
+        fail "recreate wipes guest filesystem state" \
+            "guest unreachable after recreate; stderr: $(guest_stderr)"
+        return
+    fi
     ws_marker=$(coop_exec sh -c 'cat /workspace/recreate-marker 2>/dev/null') || ws_marker=""
     env_after=$(guest_exec printenv COOP_TEST_GUEST_ENV) || env_after=""
 
     # The disk was really replaced: guest-home state written before the
     # recreate is gone.
-    if [[ -z "$sentinel_after" ]]; then
+    if [[ "$sentinel_after" == "absent" ]]; then
         pass "recreate wipes guest filesystem state"
     else
         fail "recreate wipes guest filesystem state" \
-            "sentinel='$sentinel_after' (expected it to be gone)"
+            "~/sentinel is '$sentinel_after' (expected 'absent')"
     fi
 
     # …and the workspace came back. This is the assertion `restore` + `start`
@@ -2619,6 +2663,40 @@ test_recreate() {
     else
         fail "recreate preserves persisted guest env" \
             "COOP_TEST_GUEST_ENV='$env_after' (expected 'hello-from-cli')"
+    fi
+
+    # The agent-bootstrap half of provision_first_boot ran against the blank
+    # disk: the managed settings are back, and the sentinel key seeded before
+    # the wipe is not (the settings-merge phase pins that a *restart* keeps
+    # it, so this is the FirstBoot-vs-Restart discriminator).
+    local claude_settings
+    if claude_settings=$(coop_exec sh -c 'cat ~/.claude/settings.json'); then
+        if echo "$claude_settings" | grep -q 'bypassPermissions'; then
+            pass "recreate re-runs the agent bootstrap"
+        else
+            fail "recreate re-runs the agent bootstrap" \
+                "managed permissions missing from settings.json: $claude_settings"
+        fi
+        if echo "$claude_settings" | grep -q 'recreate-sentinel@m'; then
+            fail "recreate wipes agent state from the old disk" \
+                "sentinel plugin survived the wipe: $claude_settings"
+        else
+            pass "recreate wipes agent state from the old disk"
+        fi
+    else
+        fail "recreate re-runs the agent bootstrap" \
+            "~/.claude/settings.json missing after recreate; stderr: $(guest_stderr)"
+    fi
+
+    # `--env CLAUDE_CODE_OAUTH_TOKEN` persisted by the onboarding phase must
+    # reach the bootstrap on the fresh disk too — the seed is gated on that
+    # variable reaching the guest env, so the file's presence proves both the
+    # replay and that bootstrap_agents ran in FirstBoot mode.
+    if coop_exec sh -c 'test -e ~/.claude.json'; then
+        pass "recreate replays the persisted token into the agent bootstrap"
+    else
+        fail "recreate replays the persisted token into the agent bootstrap" \
+            "~/.claude.json not seeded after recreate; stderr: $(guest_stderr)"
     fi
 
     # Identity: the guest IP is derived from the instance index, so an
@@ -2650,6 +2728,22 @@ test_recreate() {
     else
         fail "disk size preserved across recreate" \
             "before=${disk_before} GiB after=${disk_after} GiB (recreate shrank the disk)"
+    fi
+
+    # `coop status` reports the host image file's size, which `resize_disk`
+    # changes with a bare `truncate` on Lima — the guest filesystem only grows
+    # when the guest expands the partition on boot. So the host-side check
+    # above cannot tell a real re-grow from a shrunken guest. Compare what the
+    # guest itself sees, in 1K blocks.
+    local guest_fs_after=""
+    guest_fs_after=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_after=""
+    if [[ -z "$guest_fs_before" || -z "$guest_fs_after" ]]; then
+        skip "guest filesystem not shrunk by recreate" "df unavailable in the guest"
+    elif [[ "$guest_fs_after" -ge "$guest_fs_before" ]]; then
+        pass "guest filesystem not shrunk by recreate (${guest_fs_after} 1K-blocks)"
+    else
+        fail "guest filesystem not shrunk by recreate" \
+            "before=${guest_fs_before} after=${guest_fs_after} 1K-blocks (the re-grow did not reach the guest)"
     fi
 }
 

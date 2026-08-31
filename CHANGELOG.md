@@ -20,21 +20,22 @@
   the new guest packages.
 - **`coop recreate` — start over without re-typing anything** (#432) — Replaces
   a clobbered or bloated guest filesystem with a fresh copy of the instance's
-  image, then provisions it as a first boot: `/workspace` is re-synced or
-  re-cloned from the source the instance recorded, agents are re-bootstrapped,
-  and plugins, marketplaces and MCP servers are reinstalled. The instance keeps
-  its name, index, IP, image, disk size, port forwards and guest env —
-  including a devcontainer's `containerEnv` and `forwardPorts` — so those flags
-  do not have to be remembered. GitHub PATs and provider credentials live in the
-  host-side secret store and are untouched. Extra `--extra-mount` directories,
-  `--exclude-git` and a devcontainer's `postCreateCommand` are not replayed,
-  because coop does not persist them. `--image` rebuilds from a different image;
-  `-y` skips the confirmation and is required off a TTY.
+  image, then provisions it as a first boot: `/workspace` is restored from the
+  source the instance recorded — re-synced, re-cloned or re-mounted — agents are
+  re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled.
+  The instance keeps its name, index, IP, image, disk size, port forwards and
+  guest env — including a devcontainer's `containerEnv` and `forwardPorts` — so
+  those flags do not have to be remembered. GitHub PATs and provider credentials
+  live in the host-side secret store and are untouched. Extra `--extra-mount`
+  directories, `--exclude-git` and a devcontainer's `postCreateCommand` are not
+  replayed, because coop does not persist them. `--image` rebuilds from a
+  different image; `-y` skips the confirmation and is required off a TTY.
 
-  This is what `coop restore` + `coop start` could not do: `start` takes the
-  `BootMode::Restart` path, which skips the workspace sync and the plugin
-  install on the assumption that both survived on the guest disk — after a disk
-  swap neither did.
+  This is what `coop restore` + `coop start` could not do: a restart skips the
+  workspace sync and the plugin install on the assumption that both survived on
+  the guest disk — which holds for a `coop commit` checkpoint, but not after the
+  disk is replaced with a base image. Use `restore` + `start` to roll back to a
+  checkpoint, and `recreate` to start over from an image.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

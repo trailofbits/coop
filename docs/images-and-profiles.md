@@ -192,6 +192,8 @@ coop start my-project
 
 Restore keeps the instance's name, index, IP, and workspace association — only the disk is replaced and the instance's recorded image is updated. That makes it the ergonomic choice over `destroy` + `up --image` for the destructive-undo loop, which would allocate a different instance.
 
+The `coop start` in that recipe does not re-sync `/workspace` or reinstall plugins, which is correct for a checkpoint — the restored disk already carries both. Restoring a **base** image is different: nothing on that disk to preserve, so `start` would leave an empty `/workspace` and no plugins. Use `coop recreate` to reset an instance onto a base image; see [commands.md](commands.md#recreate).
+
 ## Template versioning and staleness
 
 coop records what went into each template in a `template-config.json` file alongside the image. This config contains:

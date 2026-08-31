@@ -799,6 +799,60 @@ coop restore [NAME] --image <name>
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
 
+The `start` in that recipe deliberately does *not* re-sync `/workspace` or reinstall plugins — a checkpoint image already carries both, and overwriting them would defeat the rollback. Restoring a **base** image is the other case: nothing on that disk to preserve, so `coop start` would leave an empty `/workspace` and no plugins. Use [`recreate`](#recreate) for that.
+
+### `recreate`
+
+Wipe an instance's guest filesystem and bring it back with the same settings it already had — the inverse of "destroy it and remember every flag I passed". The disk is replaced with a fresh copy of the instance's image and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced or re-cloned, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled.
+
+```
+coop recreate [NAME] [FLAGS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--image <name>` | Rebuild from this image instead of the one the instance records |
+| `-y`, `--yes` | Skip the confirmation prompt (required when stdin is not a TTY) |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT |
+
+Kept across the wipe, because coop persists them host-side:
+
+| Setting | Where it lives |
+|---------|----------------|
+| Name, index, guest IP | `instance.json` |
+| Image | `instance.json` (updated when `--image` is given) |
+| Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
+| vCPUs and memory | backend VM config, which the swap does not touch |
+| Workspace association (copy, git clone, or mount) | `workspace.json` |
+| Port forwards, including a devcontainer's `forwardPorts` | `forwards.json` |
+| Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
+| Model mode and proxy settings | `model.json` / `proxy.json` |
+| GitHub PATs and provider credentials | host secret store (never on the guest disk) |
+
+**Not replayed**, because coop does not persist them:
+
+- Extra `--extra-mount` directories. Only the *primary* workspace source is recorded, so an instance created with `--extra-mount /host/data:/data` comes back without `/data`. There is no way to re-add one to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering it means `coop destroy` and a fresh `coop up`.
+- `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
+- A devcontainer's `postCreateCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive.
+
+Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running `coop recreate` finishes the job.
+
+```
+coop recreate my-project          # confirm, then reset to the recorded image
+coop recreate my-project -y       # no prompt (required in scripts)
+coop recreate my-project --image rust-24  # reset onto a different image
+```
+
+Compared with the neighbouring commands:
+
+| Command | Disk | Instance identity | Workspace / plugins |
+|---------|------|-------------------|---------------------|
+| `destroy` + `up` | fresh | **new** name, index, IP | re-synced; every flag re-typed |
+| `restore` + `start` | replaced | kept | left as the image had them |
+| `recreate` | replaced | kept | re-synced, plugins reinstalled |
+
 ### `profiles`
 
 List or inspect available profiles. With no subcommand, lists every profile (builtin and custom).

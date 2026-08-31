@@ -183,8 +183,9 @@ exclude_re = [
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop recreate` can reuse it. Waits on SSH, spawns forwards,
   # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.
-  # The pure helpers `coop recreate` adds — recreate_workspace_inputs and
-  # recreate_confirmation — stay IN scope and are unit-tested.
+  # The pure helpers `coop recreate` adds — check_recreate_workspace_source,
+  # recreate_workspace_inputs, recreate_confirmation and
+  # recreate_partial_message — stay IN scope and are unit-tested.
   "\\bprovision_first_boot\\b",
   "\\bwarn_on_live_git_mounts\\b",
   "\\bresolve_running\\b",

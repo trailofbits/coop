@@ -585,14 +585,12 @@ enum Commands {
     /// Wipe an instance's filesystem and bring it back with the same settings
     ///
     /// Replaces the guest disk with a fresh copy of the instance's image, then
-    /// provisions it as a first boot: the recorded workspace is re-synced or
-    /// re-cloned, agents are re-bootstrapped, and plugins and MCP servers are
-    /// reinstalled. Name, IP, image, disk size, port forwards and guest env
-    /// (including a devcontainer's containerEnv and forwardPorts) are kept, so
-    /// those flags do not have to be repeated.
+    /// provisions it as a first boot.
     ///
-    /// Not replayed: extra --extra-mount directories, --exclude-git, and a
-    /// devcontainer's postCreateCommand — none of which coop persists.
+    /// Kept: name, IP, image, disk size, port forwards, guest env.
+    ///
+    /// Not replayed: --extra-mount, --exclude-git, a devcontainer's
+    /// postCreateCommand.
     Recreate {
         /// Instance name (required if multiple instances exist)
         #[arg(
