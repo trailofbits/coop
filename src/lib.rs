@@ -1543,6 +1543,21 @@ mod tests {
     }
 
     #[test]
+    fn vscode_alias_parses_as_editor() {
+        let cli = parse(&["vscode"]);
+        assert!(matches!(cli.command, super::Commands::Editor { .. }));
+    }
+
+    #[test]
+    fn editor_kind_values_parse() {
+        let cli = parse(&["editor", "--editor", "zed"]);
+        let super::Commands::Editor { editor, .. } = cli.command else {
+            panic!("expected Editor variant");
+        };
+        assert_eq!(editor, Some(super::workspace::EditorKind::Zed));
+    }
+
+    #[test]
     fn ssh_config_subcommand_parses() {
         let cli = parse(&["ssh-config", "myvm"]);
         let super::Commands::SshConfig { name, clean } = cli.command else {

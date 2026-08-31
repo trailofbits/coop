@@ -633,7 +633,7 @@ coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--project <path>` | Remote path to open in the editor (default: `/workspace`) |
-| `--editor <name>` | Editor to launch (`code` or `zed`). Omitted: try VS Code first, then Zed. |
+| `--editor <code\|zed>` | Editor to launch. Omitted: try VS Code first, then Zed. |
 | `--clean` | Remove the SSH config entry for this instance and exit |
 
 ```

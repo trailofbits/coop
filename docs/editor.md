@@ -11,7 +11,7 @@ coop editor my-instance
 This command:
 
 1. Writes an SSH config block for the instance into `~/.ssh/config`.
-2. Launches VS Code with `code --remote ssh-remote+coop-{name} /workspace`. When that misses, coop tries the VS Code app (`open -a 'Visual Studio Code'`, macOS only), then Zed with `zed ssh://coop-{name}/workspace`.
+2. Launches VS Code with `code --remote ssh-remote+coop-{name} /workspace`. When it cannot spawn a VS Code strategy, coop tries the VS Code app (`open -a 'Visual Studio Code'`, macOS only), then Zed with `zed ssh://coop-{name}/workspace`.
 3. Prints the SSH config entry to stderr for manual use with other editors.
 
 ## The `coop editor` command
@@ -24,7 +24,7 @@ coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
 
 **--project** sets the remote directory the editor opens. Defaults to `/workspace`.
 
-**--editor** pins the editor (`code` or `zed`). When omitted, coop tries VS Code first, then Zed. A strategy that cannot be launched at all — binary missing, or present but not executable — counts as a miss, so the chain continues to the next editor.
+**--editor** pins the editor (`code` or `zed`). When omitted, coop tries VS Code first, then Zed. A strategy that cannot be launched at all — binary missing, or present but not executable — counts as a miss, so the chain continues to the next editor. If an editor starts but exits unsuccessfully, coop tries only that editor's remaining strategies and reports the failure instead of opening a different editor.
 
 **--clean** removes the SSH config entry for the specified instance and exits. Useful for manual cleanup without destroying the instance.
 
@@ -39,7 +39,7 @@ The `code` command must be on your PATH. If it is not installed, open VS Code an
 
 > Cmd+Shift+P, then "Shell Command: Install 'code' command in PATH"
 
-coop prints an error with this instruction when `code` is not found.
+coop includes this instruction when `--editor code` cannot launch VS Code, or when no editor can be launched in auto-detect mode.
 
 ### Zed
 
@@ -49,7 +49,15 @@ Zed connects with `zed ssh://coop-{name}/workspace` (macOS fallback: an `open ze
 
 Two Zed-specific caveats:
 
-- On first connect, Zed downloads a `zed-remote-server` binary inside the guest from zed.dev. If your guest has restricted egress, set `"upload_binary_over_ssh": true` in Zed's settings so the binary is uploaded over SSH instead.
+- On first connect, Zed downloads a `zed-remote-server` binary inside the guest from zed.dev. If your guest has restricted egress, enable `upload_binary_over_ssh` on the `coop-{name}` entry in Zed's `ssh_connections` setting so the binary is uploaded over SSH instead:
+
+  ```json
+  {
+    "ssh_connections": [
+      { "host": "coop-my-instance", "upload_binary_over_ssh": true }
+    ]
+  }
+  ```
 - Zed's protocol runs over the SSH channel, so anything the guest shell prints on non-interactive startup corrupts the handshake (Zed hangs at "Starting proxy…"). Keep guest rc files quiet for non-interactive shells.
 
 ## SSH config management

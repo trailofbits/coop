@@ -1174,6 +1174,7 @@ const CODE_INSTALL_HINT: &str =
 const ZED_INSTALL_HINT: &str = "To install the `zed` CLI: open Zed, Cmd+Shift+P, 'cli: install'";
 
 struct LaunchStrategy {
+    editor: EditorKind,
     name: &'static str,
     cmd: String,
     args: Vec<String>,
@@ -1200,12 +1201,14 @@ fn vscode_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy>
     let remote_arg = format!("ssh-remote+{host}");
     let path_arg = remote_path.to_string();
     let mut strategies = vec![LaunchStrategy {
+        editor: EditorKind::Code,
         name: "code CLI",
         cmd: "code".into(),
         args: vec!["--remote".into(), remote_arg.clone(), path_arg.clone()],
     }];
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
+            editor: EditorKind::Code,
             name: "macOS open -a 'Visual Studio Code'",
             cmd: "open".into(),
             args: vec![
@@ -1227,12 +1230,14 @@ fn zed_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
     // strategies (argv), the path lands in a URL, so it needs escaping.
     let path = utf8_percent_encode(remote_path.as_ref(), URL_PATH).to_string();
     let mut strategies = vec![LaunchStrategy {
+        editor: EditorKind::Zed,
         name: "zed CLI",
         cmd: "zed".into(),
         args: vec![format!("ssh://{host}{path}")],
     }];
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
+            editor: EditorKind::Zed,
             name: "macOS open zed:// URL",
             cmd: "open".into(),
             args: vec![format!("zed://ssh/{host}{path}")],
@@ -1268,6 +1273,14 @@ fn install_hints(editor: Option<EditorKind>) -> &'static [&'static str] {
     }
 }
 
+/// A non-zero exit means an editor was found and declined the request. Its
+/// remaining launch strategies may still recover, but a different editor must
+/// not open unexpectedly. Spawn failures do not set `failed_editor`, so auto
+/// detection can continue across editors when a binary is merely unavailable.
+fn may_try_after_nonzero_exit(failed_editor: Option<EditorKind>, candidate: EditorKind) -> bool {
+    failed_editor.is_none_or(|editor| editor == candidate)
+}
+
 fn launch_editor(
     inst: &Instance,
     remote_path: &GuestPath,
@@ -1277,7 +1290,11 @@ fn launch_editor(
     let strategies = editor_strategies(editor, &host, remote_path);
 
     let mut tried = Vec::new();
+    let mut failed_editor = None;
     for strategy in &strategies {
+        if !may_try_after_nonzero_exit(failed_editor, strategy.editor) {
+            break;
+        }
         tracing::info!(
             "Trying {}: {} {}",
             strategy.name,
@@ -1288,14 +1305,15 @@ fn launch_editor(
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
                 tracing::debug!("{} exited with {status}", strategy.name);
-                tried.push(strategy.name);
+                tried.push(format!("{} exited with {status}", strategy.name));
+                failed_editor = Some(strategy.editor);
             }
             // Every spawn failure counts as a miss, not a hard stop: in the
             // auto-detect chain an unusable earlier binary (missing, or present
             // but not executable) must not shadow a working later editor.
             Err(e) => {
                 tracing::debug!("{}: {e}", strategy.name);
-                tried.push(strategy.name);
+                tried.push(format!("{} ({e})", strategy.name));
             }
         }
     }
@@ -1383,6 +1401,19 @@ mod tests {
         let zed = editor_strategies(Some(EditorKind::Zed), "coop-test", &path);
         assert_eq!(zed[0].cmd, "zed");
         assert!(zed.iter().all(|s| s.cmd != "code"));
+    }
+
+    #[test]
+    fn nonzero_exit_only_allows_same_editor_fallbacks() {
+        assert!(may_try_after_nonzero_exit(None, EditorKind::Zed));
+        assert!(may_try_after_nonzero_exit(
+            Some(EditorKind::Code),
+            EditorKind::Code
+        ));
+        assert!(!may_try_after_nonzero_exit(
+            Some(EditorKind::Code),
+            EditorKind::Zed
+        ));
     }
 
     #[test]
