@@ -218,26 +218,47 @@ Self-update (`update.rs`) must preserve, in order:
 
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
-   It is *not* offline: without `--custom-trusted-root`, `gh` still reaches
-   `tuf-repo.github.com` and the Sigstore public-good CDN for the trust root
-   (one-day cache) and fails if neither is reachable. Fetching the bundle
-   itself also still goes through `download_asset`, which uses `gh` or a
-   `GITHUB_TOKEN` when one exists. Only the verify step is credential-free.
+   The bundle asset is fetched with a deliberately unauthenticated request
+   (`curl_download(url, dest, None)` in `update.rs`, `download_bundle` in
+   `install.sh`) rather than through `download_asset` / `gh release download`,
+   which would re-attach the very credential this transport exists to avoid — a
+   SAML-restricted token would then 403 on the fetch and drop the chain back to
+   the API path. Keep both fetches credential-free. It is *not* offline:
+   without `--custom-trusted-root`, `gh` still reaches `tuf-repo.github.com`
+   and the Sigstore public-good CDN for the trust root (one-day cache) and
+   fails if neither is reachable.
 
-   It does *not* weaken the check. The bundle is signed, and what defeats a
-   substituted bundle is the **subject-digest binding** — `gh` digests the
-   artifact and requires a matching subject. `--repo` pins the certificate's
-   *source repository*, not the signer: any workflow on any ref in
-   `trailofbits/coop` holding `id-token: write` + `attestations: write` mints a
-   bundle that satisfies it. `--signer-workflow` / `--cert-identity` are the
-   actual pin and neither client passes one — but the API path is keyed by
-   digest against the same repo-scoped store and is equally unpinned, so the
-   transport change costs nothing here.
+   It does *not* weaken the check materially, but the two transports are not
+   interchangeable, and the differences are worth stating rather than arguing
+   away:
+
+   - **The bundle path accepts a superset.** The API path only returns
+     attestations registered in the repo's attestation store, so minting one
+     requires `attestations: write`. The `--bundle` path accepts any
+     correctly-signed bundle sitting in a release, which requires only
+     `contents: write`.
+   - **The bundle path is unrevocable.** `DELETE
+     /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
+     carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
+     revocation source — so a bundle already saved by a client keeps verifying
+     indefinitely after the attestation is deleted.
+
+   What still defeats a substituted bundle is the **subject-digest binding** —
+   `gh` digests the artifact and requires a matching subject. `--repo
+   trailofbits/coop` pins the source repository and constrains the signer SAN
+   to that repo, but not to a specific workflow file or ref: any workflow on
+   any ref in `trailofbits/coop` holding `id-token: write` +
+   `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
+   / `--cert-identity` are the tighter pin and neither client passes one — the
+   API path is keyed by digest against the same repo-scoped store and is
+   equally unpinned there.
 
    A release that publishes no bundle asset — or one whose download fails, or
-   whose bundle is empty — falls back to the API path (credential required);
-   `update.rs` and `install.sh` treat all three identically, because for a
-   client they are one situation: no bundle to read. An empty bundle is
+   whose bundle is empty — falls back to the API path, where `gh` requires a
+   credential authorized for the org even though the store itself is
+   anonymously readable. `update.rs` and `install.sh` treat all three
+   identically, because for a client they are one situation: no bundle to read.
+   An empty bundle is
    rejected rather than passed through because `gh` before 2.56.0
    (cli/cli#9541) reports success on one, having verified nothing;
    `release.yml` also fails the release rather than publish one. A bundle that

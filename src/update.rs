@@ -469,7 +469,10 @@ enum Provenance {
     TestMode,
     /// Verification is skipped; see [`BundleDecision::NoGh`].
     NoGh,
-    /// Verify through the attestations API, which requires a credential.
+    /// Verify through the attestations API. The store itself is anonymously
+    /// readable for a public repo, but `gh` refuses to run the command without
+    /// `--bundle` unless it is logged in, so this path needs a credential
+    /// authorized for the org.
     Api(ApiReason),
     /// Verify against this downloaded bundle, with no credential.
     Bundle(PathBuf),
@@ -520,7 +523,7 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
         BundleDecision::NoAsset => {
             tracing::info!(
                 "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
-                 GitHub API, which requires a credential authorized for {REPO}.",
+                 GitHub API, for which `gh` needs a credential authorized for {REPO}.",
                 release.tag
             );
             return Provenance::Api(ApiReason::NoAsset);
@@ -529,11 +532,18 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
     };
 
     let dest = dir.join(BUNDLE_ASSET);
-    if let Err(err) = download_asset(&release.tag, BUNDLE_ASSET, &asset.url, &dest) {
+    // Deliberately not `download_asset`: it routes through
+    // `select_auth_strategy_from_env`, which prefers `gh` and then a
+    // `GITHUB_TOKEN` bearer, re-attaching the credential `--bundle` exists to
+    // avoid. A token with no SSO session for the org would 403 on this one step
+    // and drop the chain back to the API path, failing with the original error.
+    // The bundle is a public release asset, so a bare curl reaches it and keeps
+    // the path credential-free end to end.
+    if let Err(err) = curl_download(&asset.url, &dest, None) {
         tracing::warn!(
             "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — verifying the \
-             attestation through the GitHub API, which requires a credential authorized for \
-             {REPO}.",
+             attestation through the GitHub API, for which `gh` needs a credential authorized \
+             for {REPO}.",
             release.tag
         );
         return Provenance::Api(ApiReason::DownloadFailed);
@@ -541,7 +551,7 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
     if !fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0) {
         tracing::warn!(
             "{BUNDLE_ASSET} for release {} is empty — verifying the attestation through the \
-             GitHub API, which requires a credential authorized for {REPO}.",
+             GitHub API, for which `gh` needs a credential authorized for {REPO}.",
             release.tag
         );
         return Provenance::Api(ApiReason::EmptyBundle);
@@ -1165,11 +1175,27 @@ mod tests {
                 .any(|l| l.contains(&format!("BUNDLE=\"{BUNDLE_ASSET}\""))),
             "install.sh no longer names {BUNDLE_ASSET} as the bundle asset"
         );
+        // `download_bundle`, not `download_asset`: the latter prefers `gh` and
+        // then a `GITHUB_TOKEN` bearer, which would re-attach the credential
+        // this transport exists to avoid.
         assert!(
             installer
                 .lines()
-                .any(|l| l.contains("download_asset") && l.contains("$BUNDLE")),
-            "install.sh no longer downloads the bundle asset"
+                .any(|l| l.contains("download_bundle \"${TMPDIR}/${BUNDLE}\"")),
+            "install.sh no longer fetches the bundle asset with download_bundle"
+        );
+        let Some((bundle_fetch, _)) = installer
+            .split_once("download_bundle() {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+        else {
+            panic!("install.sh no longer defines download_bundle");
+        };
+        assert!(
+            bundle_fetch.contains("curl -fsSL")
+                && !bundle_fetch.contains("GITHUB_TOKEN")
+                && !bundle_fetch.contains("gh release"),
+            "the {BUNDLE_ASSET} fetch is no longer credential-free — it must be a bare curl, \
+             or a SAML-restricted token can 403 on the one step --bundle exists to avoid"
         );
         assert!(
             installer

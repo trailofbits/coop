@@ -99,6 +99,20 @@ download_asset() {
     fi
 }
 
+# Fetch the release's provenance bundle with no credential attached.
+#
+# Deliberately not `download_asset`: that prefers `gh` and then falls back to
+# curl carrying $GITHUB_TOKEN, which would re-attach the credential `--bundle`
+# exists to avoid. A token with no SSO session for the org would 403 on this one
+# step and drop the whole chain back to the API path, failing with the original
+# error. The bundle is a public release file, so a bare curl reaches it and
+# keeps the path credential-free end to end.
+download_bundle() {
+    local dest="$1"
+    curl -fsSL -o "$dest" \
+        "https://github.com/${REPO}/releases/download/${VERSION}/${BUNDLE}"
+}
+
 verify_checksum() {
     local file="$1" expected="$2"
     local actual
@@ -130,17 +144,17 @@ verify_attestation() {
 
     info "Verifying attestation..."
     # Prefer the bundle published with the release: without --bundle, `gh`
-    # queries the attestations API and always attaches its stored token, so a
-    # token with no SSO session for the org 403s on public data. See the
-    # `coop update` trust chain in docs/trust-model.md for what each transport
-    # does and does not pin.
+    # refuses to run unauthenticated and then attaches its stored token to the
+    # attestations API call, so a token with no SSO session for the org 403s on
+    # data that is anonymously readable. See the `coop update` trust chain in
+    # docs/trust-model.md for what each transport does and does not pin.
     #
     # The probe is silenced because a missing bundle is expected on older
     # releases, so curl's bare "404" would read as a hard error — which means
     # it cannot tell "not published" from a failed download. The message below
     # says so rather than picking one. An empty file is rejected here too: `gh`
     # before 2.56.0 reports success on an empty bundle, having verified nothing.
-    if download_asset "$BUNDLE" "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1 \
+    if download_bundle "${TMPDIR}/${BUNDLE}" > /dev/null 2>&1 \
         && [ -s "${TMPDIR}/${BUNDLE}" ]; then
         # Not retried through the API. A digest mismatch — a tampered tarball
         # published with a matching SHA256SUMS — is caught here and nowhere
@@ -154,8 +168,9 @@ verify_attestation() {
     fi
 
     # Verifying through the API is exactly what every release did before the
-    # bundle asset existed. It needs a credential authorized for the org, so it
-    # is the fallback and not the default.
+    # bundle asset existed. Without `--bundle`, `gh` gates the command on being
+    # logged in and attaches its token, so this path needs a credential
+    # authorized for the org — which is why it is the fallback, not the default.
     info "Could not use ${BUNDLE} for ${VERSION} (not published, download failed, or empty) —"
     info "verifying through the GitHub API instead."
     local out
@@ -170,9 +185,9 @@ verify_attestation() {
     case "$out" in
         *403* | *SAML* | *"gh auth login"*)
             warn "Verification used the GitHub API because ${BUNDLE} was unavailable for"
-            warn "${VERSION}, and the API needs a credential authorized for the org. Confirm"
-            warn "${BUNDLE} is on the release page; a release that publishes it needs no"
-            warn "credential to verify."
+            warn "${VERSION}, and without \`--bundle\` \`gh\` requires a credential authorized"
+            warn "for the org. Confirm ${BUNDLE} is on the release page; a release that"
+            warn "publishes it needs no credential to verify."
             ;;
     esac
     die "Attestation verification failed for $(basename "$file") — refusing to install"
