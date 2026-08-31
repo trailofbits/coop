@@ -122,6 +122,11 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
+/// Wrapper that runs Codex with a guest Linux Secret Service session.
+pub fn codex_account_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex-account")
+}
+
 impl Default for GuestUser {
     fn default() -> Self {
         // Safe: DEFAULT_GUEST_USER ("ubuntu") satisfies the validator.
@@ -165,12 +170,13 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 4] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 5] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         codex_bin(),
+        codex_account_bin(),
     ]
 }
 
@@ -216,9 +222,11 @@ pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh")
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
+pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 
 pub const BASE_PACKAGES: &[&str] = &[
     "openssh-server",
+    "dbus-user-session",
     "curl",
     "wget",
     "git",
@@ -236,7 +244,9 @@ pub const BASE_PACKAGES: &[&str] = &[
     "unzip",
     "zip",
     "file",
+    "gnome-keyring",
     "less",
+    "libsecret-tools",
 ];
 
 pub const GH_PACKAGES: &[&str] = &["gh"];
@@ -465,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_account_script_uses_secret_service() {
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("/usr/local/bin/codex-account"),
+            "Codex account wrapper should be installed in the guest image",
+        );
+        for expected in [
+            "dbus-run-session",
+            "gnome-keyring-daemon --unlock",
+            "secret-tool store",
+        ] {
+            assert!(
+                SCRIPT_CODEX_ACCOUNT.contains(expected),
+                "Codex account wrapper is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
     fn collect_codex_baked_lists_sorts_and_dedups() {
         let mut cfg = CoopConfig::default();
         cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
@@ -621,6 +649,21 @@ mod tests {
             bins.iter().any(|b| b.to_string() == "/usr/local/bin/codex"),
             "guest image should include codex in the default PATH",
         );
+        assert!(
+            bins.iter()
+                .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
+            "guest image should include the Codex account-auth wrapper",
+        );
+    }
+
+    #[test]
+    fn base_packages_include_secret_service_support() {
+        for expected in ["dbus-user-session", "gnome-keyring", "libsecret-tools"] {
+            assert!(
+                BASE_PACKAGES.contains(&expected),
+                "base packages should include {expected}",
+            );
+        }
     }
 
     #[test]
@@ -672,7 +715,12 @@ mod tests {
         let user = GuestUser::default();
         let result = verify_required_binaries(&user, "install script", |_path| false, String::new);
         let err = result.unwrap_err().to_string();
-        for expected in ["/usr/bin/docker", "/usr/bin/gh", "/usr/local/bin/codex"] {
+        for expected in [
+            "/usr/bin/docker",
+            "/usr/bin/gh",
+            "/usr/local/bin/codex",
+            "/usr/local/bin/codex-account",
+        ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");
         }
     }

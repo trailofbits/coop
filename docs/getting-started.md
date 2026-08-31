@@ -92,6 +92,7 @@ mem_size_mib = 8192
 config_dir = "~/.claude"
 
 [codex]
+auth = "api_key"
 config_dir = "~/.codex"
 ```
 
@@ -104,7 +105,14 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 
 GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
 
-coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
+coop picks up `ANTHROPIC_API_KEY` and, in the default Codex API-key mode,
+`OPENAI_API_KEY` from your environment automatically. Setting them explicitly
+under `claude.api_key` or `codex.api_key` also works, but environment variables
+are preferred.
+
+For Codex account or workspace access without OpenAI API billing, set
+`[codex] auth = "chatgpt"`, rebuild any old image with `coop setup --rebuild`,
+then run `coop codex --ask -- login --device-auth` once.
 
 ## First run
 
@@ -259,6 +267,12 @@ coop claude -- --model opus
 
 ```
 coop codex
+```
+
+With `[codex] auth = "chatgpt"`, first sign in from the guest:
+
+```
+coop codex --ask -- login --device-auth
 ```
 
 Pass extra arguments through to `codex`:

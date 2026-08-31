@@ -107,6 +107,15 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex ChatGPT account auth is persistent guest state.** With
+  `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
+  process env, `env_forward`, and persisted `--env` overlays, writes
+  `cli_auth_credentials_store = "keyring"` to guest `~/.codex/config.toml`, and
+  excludes host `auth.json` from the guest copy. Codex stores its cached account
+  credentials in the guest Linux Secret Service instead. This avoids API-key
+  billing and host `auth.json` copying, but it does **not** keep the ChatGPT
+  refresh token out of the guest. A compromised guest can use or extract any
+  credential its keyring session can unlock.
 
 ## SSH boundary
 

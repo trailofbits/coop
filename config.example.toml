@@ -79,12 +79,16 @@
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
 # [codex]
+# auth = "api_key"  # "api_key" (default) or "chatgpt" for ChatGPT account/workspace auth
 # config_dir = "~/.codex"  # path to copy AGENTS.md, prompts/, config.toml, auth.json from (false to disable)
+# auth = "chatgpt" stores Codex credentials in the guest Linux keyring and
+# does not copy auth.json or forward OPENAI_API_KEY.
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["trailofbits/codex-plugins"]  # owner/repo, git URL, or local path
 # plugins = ["my-lsp@codex-plugins"]  # plugin@marketplace to install
 #
-# Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.
+# Secrets: with auth = "api_key", `api_key` accepts the same "cmd:" prefix as
+# `claude.api_key`.
 #   api_key = "cmd:op read op://Private/OpenAI/credential"
 #   api_key = "sk-proj-..."
 
@@ -125,8 +129,9 @@
 # [proxy.openai]                    # Codex. OpenAI keys are always Bearer.
 # credential = "cmd:op read op://Private/OpenAI/credential"
 # auth = "bearer"                   # OpenAI keys inject as Authorization: Bearer.
-#                                   # Codex subscription (auth.json) is not
-#                                   # supported in proxy mode — use an API key.
+#                                   # Cannot be combined with
+#                                   # [codex] auth = "chatgpt"; proxy mode uses
+#                                   # an API key.
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]

@@ -32,6 +32,11 @@ for the lifetime of the VM:
   closes). Codex subscription is therefore out of scope in proxy mode; use an
   OpenAI API key.
 
+For Codex account or workspace access without API billing, use
+`[codex] auth = "chatgpt"` instead of `[proxy.openai]`. That mode stores Codex
+credentials in the guest Linux keyring and is rejected when an OpenAI proxy is
+also active.
+
 The capability token is worthless off the host — it only authorizes the local
 proxy, which holds the real key itself — so exfiltrating it gains a compromised
 guest nothing.

@@ -1241,7 +1241,13 @@ pub fn run() -> Result<()> {
         Commands::Codex { name, ask, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             let args = codex_launch_args(ask, args);
-            ssh::run_interactive(&sess, &prepend_binary(guest::codex_bin().as_ref(), args))
+            let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
+                backend::ensure_codex_account_guest_support(&sess.target)?;
+                guest::codex_account_bin()
+            } else {
+                guest::codex_bin()
+            };
+            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
