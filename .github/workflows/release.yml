@@ -117,9 +117,16 @@ jobs:
       # client. `bundle-path` is a single JSON line covering all three tarball
       # subjects, so `jq -c` reshapes nothing — it is here to reject a malformed
       # bundle, and the `-s` test to reject an empty one, which `jq` itself
-      # exits 0 on. An empty asset is worse than none: clients would download it
-      # and then fail verification with no API fallback, and the tag cannot be
-      # re-cut.
+      # exits 0 on.
+      #
+      # An empty asset is caught client-side too (`install.sh` gates on `[ -s ]`
+      # and `resolve_provenance` returns `ApiReason::EmptyBundle`, both falling
+      # back to the API). What no client catches is a *non-empty* degenerate
+      # bundle: a whitespace-only file passes `[ -s ]` and `len() > 0` alike,
+      # and `gh`'s JSON-Lines loader then yields zero attestations — which `gh`
+      # before 2.56.0 (cli/cli#9541) reports as success, having verified
+      # nothing. `jq -c .` is what makes that unreachable, so it has to stay
+      # upstream of publication; the tag is immutable once cut.
       - name: Normalize attestation bundle
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
