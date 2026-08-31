@@ -29,7 +29,12 @@ Every template installs these packages regardless of profile selection.
 **Codex CLI:** installed as a standalone binary during the template build.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
-Secret Service storage.
+Secret Service storage. The wrapper and its three supporting packages
+(`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) are installed in every
+image, not gated on the `auth` setting: an image is built once and reused across
+configs, so gating them would let a later `auth = "chatgpt"` edit meet an image
+that cannot serve it. When that mode is not configured the wrapper simply execs
+Codex, so it costs nothing at run time.
 
 Both agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 

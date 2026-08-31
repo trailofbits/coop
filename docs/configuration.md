@@ -298,6 +298,12 @@ the host and is injected onto outbound requests the guest never sees. Absent
 config means no proxy — credentials are forwarded into the guest exactly as
 before.
 
+Every golden image installs the Secret Service packages this mode needs
+(`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) regardless of the
+`auth` setting, because the image is built once and reused across configs —
+gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
+serve it.
+
 `[proxy.openai]` is API-key based and cannot be combined with
 `[codex] auth = "chatgpt"`. Use one Codex remote auth path per VM: the proxy
 for an OpenAI API key, or ChatGPT auth for account/workspace access.

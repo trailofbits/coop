@@ -11,9 +11,17 @@ coop codex [instance-name] [-- extra-args...]
 This SSHes into the guest and runs the `codex` CLI. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with how `coop claude` runs unrestricted. The VM is the isolation boundary, so Codex's own sandbox is redundant; it also does not work in the guest, which lacks a functioning bubblewrap, so leaving it enabled makes every shell command Codex runs fail.
 
 When `[codex] auth = "chatgpt"` is enabled, `coop codex` launches a small
-guest wrapper that starts a D-Bus session, unlocks GNOME Keyring when needed,
-and then runs the real Codex binary. The wrapper may prompt for the guest
-keyring password before Codex starts.
+guest wrapper (`/usr/local/bin/codex-account`) that starts a D-Bus session,
+unlocks GNOME Keyring when needed, and then runs the real Codex binary. The
+wrapper may prompt for the guest keyring password before Codex starts.
+
+The in-guest `codex-yolo` shortcut routes through the same wrapper, so it works
+in either auth mode. Running the bare `codex` binary from `coop shell` does
+not: it has no D-Bus session, and `keyring` credential storage has no
+`auth.json` fallback, so Codex will not find its credentials. Inside the guest,
+run `codex-account` (or `codex-yolo`) instead of `codex`. The wrapper is a
+transparent passthrough when `auth = "chatgpt"` is not configured, so it is
+always safe to use.
 
 To keep Codex's sandbox and approval prompts for a single session, pass `--ask`. coop then launches `codex` with no bypass flag, so Codex applies its normal defaults:
 
@@ -85,12 +93,27 @@ for the Codex credential-store setting and device-code login flow.
 The first login should use device-code auth from inside the guest:
 
 ```bash
-coop codex --ask -- login --device-auth
+coop codex -- login --device-auth
 ```
 
 Then open the shown URL in your browser, sign in to the intended ChatGPT
 workspace, and enter the one-time code. Later `coop codex` launches reuse the
-cached account credentials from the guest keyring.
+cached account credentials from the guest keyring. (`coop codex` launches
+`login` and `logout` without the sandbox-bypass flag, which Codex rejects on
+those subcommands, so no `--ask` is needed.)
+
+#### The guest keyring password
+
+A fresh VM has no keyring, so the first prompt is *choosing* a password, not
+entering one. The wrapper says so and asks for confirmation. That password
+encrypts the Codex account credentials at rest inside the guest and is
+requested again on later launches; it is unrelated to your ChatGPT or host
+credentials. Because it is per-guest, `coop destroy` discards it along with the
+cached login.
+
+The prompt needs a terminal. `coop codex` provides one; a non-interactive
+`coop exec` does not, and the wrapper fails with a clear message rather than
+hanging.
 
 Security and billing guardrails in this mode:
 

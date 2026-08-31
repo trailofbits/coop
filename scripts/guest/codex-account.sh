@@ -7,12 +7,30 @@ cat >/usr/local/bin/codex-account <<'CODEXACCOUNTEOF'
 set -euo pipefail
 
 CODEX_BIN="/usr/local/bin/codex"
+CODEX_CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+KEYRING_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/keyrings"
 PROBE_SERVICE="coop-codex"
 PROBE_ACCOUNT="keyring-probe"
 
 die() {
     echo "codex-account: $*" >&2
     exit 1
+}
+
+# coop writes `cli_auth_credentials_store = "keyring"` into the guest Codex
+# config only under `[codex] auth = "chatgpt"`. Every other mode reads
+# credentials from auth.json, where the D-Bus/keyring session is pure overhead
+# (and its password prompt is an outright regression). Gating on the config the
+# guest actually has lets every Codex entry point route through this wrapper.
+keyring_mode() {
+    [ -r "$CODEX_CONFIG" ] \
+        && grep -Eq \
+            '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*"keyring"' \
+            "$CODEX_CONFIG"
+}
+
+keyring_exists() {
+    compgen -G "$KEYRING_DIR/*.keyring" >/dev/null 2>&1
 }
 
 eval_env_output() {
@@ -27,35 +45,66 @@ start_keyring() {
     eval_env_output gnome-keyring-daemon --start --components=secrets || true
 }
 
+# Writing proves the collection is both reachable and unlocked; a lookup can
+# succeed against a locked collection. The probe item is cleared again so
+# repeated launches do not accumulate junk in the user's keyring.
 probe_keyring() {
     printf 'ok' \
         | timeout 5 secret-tool store \
             --label="coop Codex keyring probe" \
             service "$PROBE_SERVICE" \
             account "$PROBE_ACCOUNT" \
-            >/dev/null 2>&1
+            >/dev/null 2>&1 || return 1
+    timeout 5 secret-tool clear \
+        service "$PROBE_SERVICE" \
+        account "$PROBE_ACCOUNT" \
+        >/dev/null 2>&1 || true
 }
 
 unlock_keyring() {
+    local creating=0 password confirm output
+    keyring_exists || creating=1
+
     if [ ! -t 0 ]; then
         die "Codex ChatGPT auth needs an interactive TTY to unlock the guest keyring"
     fi
 
-    local password output
-    password=""
+    # On a fresh guest there is no keyring yet, so this prompt is choosing a
+    # password rather than entering one. Say so, and confirm it — an
+    # unnoticed typo would otherwise lock the credentials behind a password
+    # the user cannot reproduce on the next launch.
+    if [ "$creating" = 1 ]; then
+        printf '%s\n' \
+            'codex-account: this VM has no guest keyring yet.' \
+            'Choose a password to create one. It encrypts the Codex account' \
+            'credentials stored inside the guest, and later `coop codex` runs' \
+            'ask for it again. It is not your ChatGPT or host password.' >&2
+    fi
+
     if ! IFS= read -rsp "Codex keyring password: " password; then
         echo >&2
         die "failed to read keyring password"
     fi
     echo >&2
 
+    if [ -z "$password" ]; then
+        die "keyring password must not be empty"
+    fi
+
+    if [ "$creating" = 1 ]; then
+        if ! IFS= read -rsp "Confirm keyring password: " confirm; then
+            echo >&2
+            die "failed to read keyring password"
+        fi
+        echo >&2
+        if [ "$password" != "$confirm" ]; then
+            die "passwords did not match; no keyring was created"
+        fi
+    fi
+
     output="$(printf '%s' "$password" \
         | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null)" \
-        || {
-            unset password
-            die "failed to unlock the guest keyring"
-        }
-    unset password
+        || die "failed to unlock the guest keyring"
 
     if [ -n "$output" ]; then
         eval "$output"
@@ -66,6 +115,12 @@ if [ ! -x "$CODEX_BIN" ]; then
     die "$CODEX_BIN is missing; rebuild the coop image"
 fi
 
+if ! keyring_mode; then
+    exec "$CODEX_BIN" "$@"
+fi
+
+# The keyring speaks D-Bus, and a headless SSH session has no session bus.
+# Re-exec under one, using the env guard to avoid recursing forever.
 if [ "${COOP_CODEX_ACCOUNT_DBUS:-0}" != "1" ]; then
     command -v dbus-run-session >/dev/null 2>&1 \
         || die "dbus-run-session is missing; install dbus-user-session or rebuild the coop image"

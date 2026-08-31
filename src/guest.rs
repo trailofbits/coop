@@ -170,13 +170,19 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 5] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         codex_bin(),
         codex_account_bin(),
+        // The Secret Service stack `codex-account` drives. Checking the
+        // wrapper alone proves nothing — the provision script always writes
+        // it — so verify the three tools its BASE_PACKAGES entries install.
+        GuestPath::new("/usr/bin/dbus-run-session"),
+        GuestPath::new("/usr/bin/gnome-keyring-daemon"),
+        GuestPath::new("/usr/bin/secret-tool"),
     ]
 }
 
@@ -224,6 +230,17 @@ pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 
+/// Packages installed into every golden image.
+///
+/// `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` back the
+/// Secret Service that `codex-account` needs under `[codex] auth =
+/// "chatgpt"`. They are unconditional rather than gated on that config field
+/// on purpose: the golden image is built once by `coop setup` and reused
+/// across configs, so gating them would let a later `auth = "chatgpt"` edit
+/// meet an image that cannot serve it — a silent skew that surfaces only at
+/// `coop codex` time. The cost is the same for everyone (see
+/// `docs/images-and-profiles.md`); the wrapper stays a no-op passthrough
+/// unless the guest Codex config actually asks for the keyring.
 pub const BASE_PACKAGES: &[&str] = &[
     "openssh-server",
     "dbus-user-session",
@@ -484,12 +501,44 @@ mod tests {
             "dbus-run-session",
             "gnome-keyring-daemon --unlock",
             "secret-tool store",
+            // The probe item must be removed again, not left in the keyring.
+            "secret-tool clear",
         ] {
             assert!(
                 SCRIPT_CODEX_ACCOUNT.contains(expected),
                 "Codex account wrapper is missing {expected:?}",
             );
         }
+    }
+
+    #[test]
+    fn codex_account_script_passes_through_without_keyring_mode() {
+        // Every Codex entry point routes through the wrapper, so it must be a
+        // transparent exec unless the guest config asks for keyring storage.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("cli_auth_credentials_store"),
+            "wrapper should gate on the guest Codex credential-store setting",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT
+                .contains("if ! keyring_mode; then\n    exec \"$CODEX_BIN\" \"$@\""),
+            "wrapper should exec Codex directly when keyring mode is off",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_confirms_a_newly_created_keyring_password() {
+        // A fresh guest has no keyring, so the prompt creates one; an
+        // unconfirmed typo would lock credentials behind an unreproducible
+        // password.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("Confirm keyring password: "),
+            "wrapper should confirm the password when creating a keyring",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("this VM has no guest keyring yet"),
+            "wrapper should explain that the first prompt chooses a password",
+        );
     }
 
     #[test]
@@ -654,6 +703,18 @@ mod tests {
                 .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
             "guest image should include the Codex account-auth wrapper",
         );
+        // The wrapper is written unconditionally by the provision script, so
+        // verifying it alone cannot catch the packages failing to install.
+        for tool in [
+            "/usr/bin/dbus-run-session",
+            "/usr/bin/gnome-keyring-daemon",
+            "/usr/bin/secret-tool",
+        ] {
+            assert!(
+                bins.iter().any(|b| b.to_string() == tool),
+                "guest image should verify {tool} for Codex account auth",
+            );
+        }
     }
 
     #[test]

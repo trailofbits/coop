@@ -1489,7 +1489,7 @@ fn default_prompt_for_pat() -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CodexConfig {
-    /// How Codex should authenticate to OpenAI in remote cloud mode.
+    /// How Codex should authenticate to `OpenAI` in remote cloud mode.
     #[serde(default)]
     pub auth: CodexAuthMode,
 

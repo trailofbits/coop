@@ -1061,8 +1061,48 @@ test_codex_bin_path() {
             fail "codex-yolo includes dangerous full-access flag" \
                 "content: $yolo_content"
         fi
+        if echo "$yolo_content" | grep -q "codex-account"; then
+            pass "codex-yolo routes through the account wrapper"
+        else
+            fail "codex-yolo routes through the account wrapper" \
+                "content: $yolo_content"
+        fi
     else
         fail "codex-yolo includes dangerous full-access flag" "cat failed"
+    fi
+}
+
+test_codex_account_auth_support() {
+    echo ""
+    echo "=== Phase: codex account-auth (Secret Service) support ==="
+
+    if guest_exec test -x /usr/local/bin/codex-account; then
+        pass "codex-account wrapper exists"
+    else
+        fail "codex-account wrapper exists" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    # The wrapper is written unconditionally by the provision script, so the
+    # packages behind it are what actually need asserting.
+    local tool
+    for tool in dbus-run-session gnome-keyring-daemon secret-tool; do
+        if guest_exec command -v "$tool"; then
+            pass "guest Secret Service tool present: $tool"
+        else
+            fail "guest Secret Service tool present: $tool" "stderr: $(guest_stderr)"
+        fi
+    done
+
+    # Default config is auth = "api_key", so the wrapper must be a transparent
+    # passthrough: no D-Bus session, no keyring, no password prompt. A hang
+    # here would mean it tried to unlock a keyring it should have skipped.
+    local version
+    if version=$(coop_exec /usr/local/bin/codex-account --version); then
+        pass "codex-account passes through to codex without keyring mode ($version)"
+    else
+        fail "codex-account passes through to codex without keyring mode" \
+            "stderr: $(guest_stderr)"
     fi
 }
 
@@ -5155,6 +5195,7 @@ main() {
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path
+    test_codex_account_auth_support
     test_codex_sandbox_bypass
     test_agent_update
     test_github_token_forwarding

@@ -1585,7 +1585,7 @@ chmod 755 /usr/local/bin/claude-yolo
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
 #!/bin/bash
-exec codex --dangerously-bypass-approvals-and-sandbox "$@"
+exec codex-account --dangerously-bypass-approvals-and-sandbox "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/codex-yolo
 
@@ -2072,6 +2072,11 @@ mod tests {
         assert!(
             script.contains("Installing codex-account shortcut"),
             "Lima provision script should install Codex account-auth wrapper",
+        );
+        assert!(
+            script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
+            "codex-yolo should route through the account wrapper so keyring \
+             mode works from an in-guest shell",
         );
     }
 

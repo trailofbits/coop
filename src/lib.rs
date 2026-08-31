@@ -1242,6 +1242,9 @@ pub fn run() -> Result<()> {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
+                let inst = cfg.resolve_instance(name.as_ref())?;
+                let model_state = model_state::ModelState::load_or_default(&inst)?;
+                backend::ensure_codex_remote_auth_consistent(&cfg, &inst, &model_state)?;
                 backend::ensure_codex_account_guest_support(&sess.target)?;
                 guest::codex_account_bin()
             } else {

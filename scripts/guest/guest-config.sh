@@ -128,7 +128,7 @@ chmod 755 /usr/local/bin/claude-yolo
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
 #!/bin/bash
-exec codex --dangerously-bypass-approvals-and-sandbox "$@"
+exec codex-account --dangerously-bypass-approvals-and-sandbox "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/codex-yolo
 

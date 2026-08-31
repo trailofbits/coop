@@ -1616,13 +1616,7 @@ fn bootstrap_codex(
     guest_host: &str,
 ) -> Result<()> {
     let mut model_state = ModelState::load_or_default(inst)?;
-    if cfg.codex.auth.uses_chatgpt_account()
-        && model_state.mode == crate::model_state::ModelMode::Remote
-        && crate::proxy_state::effective_upstream(inst, crate::proxy::Provider::Openai, &cfg.proxy)?
-            .is_some()
-    {
-        bail!("{}", codex_chatgpt_proxy_conflict_message());
-    }
+    ensure_codex_remote_auth_consistent(cfg, inst, &model_state)?;
     // Proxy mode (issue #411): in remote mode with `[proxy.openai]` (or a
     // per-VM override) configured, start the host-side injecting proxy and
     // point Codex at it. The guest holds only the capability token; the real
@@ -1727,6 +1721,25 @@ pub fn codex_chatgpt_proxy_conflict_message() -> &'static str {
     "codex.auth = \"chatgpt\" conflicts with the effective OpenAI proxy for \
      this VM; Codex account auth uses ChatGPT workspace credentials, while \
      the OpenAI proxy uses an API key"
+}
+
+/// Reject the one Codex remote-auth combination `CoopConfig::validate` cannot
+/// see: a per-VM `coop proxy` override that pairs an `OpenAI` upstream with
+/// `codex.auth = "chatgpt"`. Every Codex entry point calls this so the failure
+/// lands on Codex rather than on the whole session.
+pub fn ensure_codex_remote_auth_consistent(
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    model_state: &ModelState,
+) -> Result<()> {
+    if cfg.codex.auth.uses_chatgpt_account()
+        && model_state.mode == crate::model_state::ModelMode::Remote
+        && crate::proxy_state::effective_upstream(inst, crate::proxy::Provider::Openai, &cfg.proxy)?
+            .is_some()
+    {
+        bail!("{}", codex_chatgpt_proxy_conflict_message());
+    }
+    Ok(())
 }
 
 pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
@@ -2543,14 +2556,14 @@ fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
 }
 
 /// Allowlisted files copied verbatim from the host Codex config dir. In proxy
-/// mode or ChatGPT account-auth mode `auth.json` is dropped (see
+/// mode or `ChatGPT` account-auth mode `auth.json` is dropped (see
 /// [`codex_allowed_files`]) so refreshable account tokens do not land on the
 /// guest disk through a host-file copy.
 const CODEX_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json"];
 
 /// The Codex allowlist for this boot. In proxy mode `~/.codex/auth.json` is
 /// dropped because Codex authenticates to the proxy with a capability token.
-/// In ChatGPT account-auth mode it is dropped because Codex must use the guest
+/// In `ChatGPT` account-auth mode it is dropped because Codex must use the guest
 /// keyring instead of a host-copied file.
 fn codex_allowed_files(proxy_active: bool, auth: CodexAuthMode) -> Vec<&'static str> {
     if proxy_active || auth.uses_chatgpt_account() {

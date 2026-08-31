@@ -1441,14 +1441,25 @@ pub(crate) fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
 /// Codex's flag for running fully unrestricted (no sandbox, no approvals).
 const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
+/// Codex subcommands that manage credentials rather than start an agent
+/// session. They reject the sandbox-bypass flag, so it must not be prepended.
+const CODEX_AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
+
 /// Prepend Codex's sandbox-bypass flag unless the user opted into approvals.
 ///
 /// The VM is the isolation boundary, so Codex's own sandbox is redundant — and
 /// broken in the guest, which lacks a working bubblewrap. Bypassing by default
 /// gives `coop codex` parity with `coop claude`'s `bypassPermissions`. `ask`
 /// (from `--ask`) keeps Codex's sandbox and approval prompts.
+///
+/// `codex login` / `codex logout` never start a session, and Codex rejects the
+/// bypass flag on them, so they are launched bare regardless of `ask` — this is
+/// what makes `coop codex -- login --device-auth` work without `--ask`.
 pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
-    if !ask {
+    let is_auth_subcommand = args
+        .first()
+        .is_some_and(|arg| CODEX_AUTH_SUBCOMMANDS.contains(&arg.as_str()));
+    if !ask && !is_auth_subcommand {
         args.insert(0, CODEX_BYPASS_FLAG.to_string());
     }
     args
@@ -1586,8 +1597,13 @@ pub(crate) fn prepare_session_from_target(
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
     let suppress_openai_key = proxy_openai || codex_account_auth;
+    // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
+    // auth even though `CoopConfig::validate` rejects that combination in the
+    // config file. Only Codex is unusable then, so warn here and let the
+    // Codex entry points (`coop codex`, agent bootstrap) fail hard — a shell,
+    // exec, or `coop claude` session on the same VM is unaffected.
     if codex_account_auth && proxy_openai {
-        bail!("{}", backend::codex_chatgpt_proxy_conflict_message());
+        tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
     }
 
     let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, suppress_openai_key)?;
@@ -2068,6 +2084,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_launch_args_leaves_auth_subcommands_bare() {
+        // `coop codex -- login --device-auth` is the ChatGPT account sign-in
+        // path; Codex rejects the bypass flag on it, so `--ask` must not be
+        // required to get a working invocation.
+        for subcommand in ["login", "logout"] {
+            let args =
+                super::codex_launch_args(false, vec![subcommand.into(), "--device-auth".into()]);
+            assert_eq!(args, vec![subcommand, "--device-auth"]);
+        }
+    }
+
+    #[test]
+    fn codex_launch_args_still_bypasses_when_login_is_not_first() {
+        // Only the leading token selects a subcommand — a `login` appearing
+        // as a value must not disarm the bypass flag.
+        let args = super::codex_launch_args(false, vec!["--model".into(), "login".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "login"
+            ]
+        );
+    }
+
+    #[test]
     fn codex_launch_args_with_ask_keeps_sandbox() {
         let args = super::codex_launch_args(true, vec!["--model".into(), "gpt-5".into()]);
         assert_eq!(args, vec!["--model", "gpt-5"]);
@@ -2251,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_rejects_chatgpt_auth_with_openai_proxy() {
+    fn prepare_session_survives_chatgpt_auth_with_openai_proxy() {
         use std::num::NonZeroU16;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2277,11 +2320,16 @@ mod tests {
             key_path: tmp.path().join("id_test"),
         };
 
-        let err = super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap_err();
+        // The conflict makes Codex unusable, not the VM: a shell/exec/claude
+        // session on the same instance must still come up. `coop codex` and
+        // the agent bootstrap are what fail hard, via
+        // `backend::ensure_codex_remote_auth_consistent`.
+        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+            .expect("session must still be usable for non-Codex commands");
 
         assert!(
-            err.to_string().contains("effective OpenAI proxy"),
-            "expected ChatGPT/proxy conflict, got: {err}",
+            !session.env.as_envs().contains_key("OPENAI_API_KEY"),
+            "the raw key must stay on the host in both suppression modes",
         );
     }
 

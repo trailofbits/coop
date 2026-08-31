@@ -7,10 +7,14 @@
 - **Codex ChatGPT account auth** — New `[codex] auth = "chatgpt"` mode for
   account/workspace access without OpenAI API billing. coop installs Linux
   Secret Service support in the guest image, writes Codex's
-  `cli_auth_credentials_store = "keyring"` setting, launches `coop codex`
-  through a D-Bus/GNOME Keyring wrapper, suppresses every `OPENAI_API_KEY`
-  forwarding path, and stops copying host `auth.json` into the guest. Existing
-  images must be rebuilt with `coop setup --rebuild` before using this mode.
+  `cli_auth_credentials_store = "keyring"` setting, launches Codex through a
+  D-Bus/GNOME Keyring wrapper (`/usr/local/bin/codex-account`, which the
+  in-guest `codex-yolo` shortcut also uses and which execs Codex unchanged when
+  the mode is off), suppresses every `OPENAI_API_KEY` forwarding path, and stops
+  copying host `auth.json` into the guest. Sign in with `coop codex -- login
+  --device-auth`; `login` and `logout` now run without the sandbox-bypass flag
+  that Codex rejects on them. Existing images must be rebuilt with `coop setup
+  --rebuild` before using this mode.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

@@ -332,7 +332,7 @@ coop ca my-project -- --cwd /workspace
 
 ### `codex`
 
-Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper; use `--ask` when running login subcommands.
+Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag, which Codex rejects on them.
 
 ```
 coop codex [NAME] [FLAGS] [ARGS...]
@@ -348,7 +348,7 @@ coop codex [NAME] [FLAGS] [ARGS...]
 coop codex
 coop codex my-project --ask
 coop codex my-project -- --model gpt-5
-coop codex my-project --ask -- login --device-auth
+coop codex my-project -- login --device-auth
 ```
 
 ### `exec`
