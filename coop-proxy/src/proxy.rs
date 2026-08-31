@@ -113,26 +113,28 @@ impl Ctx {
 /// Refuses to bind an unspecified address (`0.0.0.0` / `[::]`): the proxy
 /// must be reachable only over the private host-guest link, never every host
 /// interface.
+///
+/// `Ctx::new` runs before the bind so that a bound listener means the proxy can
+/// serve — nothing fallible may sit between the bind and `accept_loop`.
 pub async fn serve(
     cfg: ProxyConfig,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    if cfg.listen.ip().is_unspecified() {
+    let listen = cfg.listen;
+    if listen.ip().is_unspecified() {
         anyhow::bail!(
-            "refusing to bind unspecified address {} — the proxy must bind only the \
-             private host-guest interface",
-            cfg.listen
+            "refusing to bind unspecified address {listen} — the proxy must bind only the \
+             private host-guest interface"
         );
     }
-    let listener = TcpListener::bind(cfg.listen)
-        .await
-        .with_context(|| format!("failed to bind proxy listener on {}", cfg.listen))?;
-    tracing::info!(
-        "coop-proxy listening on {} → https://{}",
-        cfg.listen,
-        cfg.upstream_host
-    );
     let ctx = Ctx::new(cfg)?;
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind proxy listener on {listen}"))?;
+    tracing::info!(
+        "coop-proxy listening on {listen} → https://{}",
+        ctx.cfg.upstream_host
+    );
     accept_loop(ctx, listener, shutdown).await;
     Ok(())
 }

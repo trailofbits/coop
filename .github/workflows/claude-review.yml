@@ -41,7 +41,7 @@ jobs:
       # path is reached.
       id-token: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -73,7 +73,7 @@ jobs:
           gh pr comment "$PR" --repo "$REPO" --body '⚠️ **@claude is about to review a PR from an outside contributor.**
           The diff, commit messages, and comments here are **untrusted input** and may contain prompt-injection attempting to make the review agent read or leak CI secrets. The agent is instructed to treat all of it as data, never as instructions — but that is a mitigation, not a guarantee. **Review the diff yourself for injection before relying on the agent'\''s output, and do not merge on the agent'\''s say-so alone.**'
 
-      - uses: anthropics/claude-code-action@1298632ce7736903d02a1435002705aa2a594a6c # v1.0.175
+      - uses: anthropics/claude-code-action@c81e3bc69d1b18badbb63ba39581218f02421678 # v1.0.201
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true
