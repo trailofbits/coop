@@ -2492,17 +2492,17 @@ test_restart_rejects_ignored_flags() {
     rm -rf "$mount_dir"
 }
 
-test_recreate() {
+test_restore_reprovision() {
     echo ""
-    echo "=== Phase: recreate ==="
+    echo "=== Phase: restore --reprovision ==="
 
-    # The instance is running from the previous phase. `recreate` accepts a
+    # The instance is running from the previous phase. `restore --reprovision` accepts a
     # running instance (it stops it itself), so no state prep is needed.
     #
-    # This phase asserts the distinction between `recreate` and
-    # `restore` + `start`: both replace the disk, but only `recreate` re-runs
-    # the first-boot provisioning, so only `recreate` puts /workspace back and
-    # re-runs the agent bootstrap. Four discriminators are seeded first:
+    # This phase asserts the distinction between `restore --reprovision`
+    # and a plain `restore` + `start`: both replace the disk, but only
+    # --reprovision re-runs the first-boot provisioning, so only it puts
+    # /workspace back and re-runs the agent bootstrap. Four discriminators are seeded first:
     #   * a guest-home sentinel, which must be GONE (the disk really was wiped)
     #   * a host-side workspace marker, which must be PRESENT in /workspace
     #     (the workspace was re-synced, not merely left blank)
@@ -2514,66 +2514,66 @@ test_recreate() {
     #     phase pins the opposite direction (a restart preserves the key), so
     #     the pair distinguishes FirstBoot from Restart.
     local ip_before=""
-    if guest_exec sh -c 'echo pre-recreate > ~/sentinel'; then
-        pass "seed guest sentinel before recreate"
+    if guest_exec sh -c 'echo pre-reprovision > ~/sentinel'; then
+        pass "seed guest sentinel before reprovision"
     else
-        fail "seed guest sentinel before recreate" "stderr: $(guest_stderr)"
+        fail "seed guest sentinel before reprovision" "stderr: $(guest_stderr)"
     fi
 
     local claude_seed='mkdir -p ~/.claude && printf "%s" '
-    claude_seed+='"{\"enabledPlugins\":{\"recreate-sentinel@m\":true}}" '
+    claude_seed+='"{\"enabledPlugins\":{\"reprovision-sentinel@m\":true}}" '
     claude_seed+='> ~/.claude/settings.json'
     if coop_exec sh -c "$claude_seed"; then
-        pass "seed claude settings sentinel before recreate"
+        pass "seed claude settings sentinel before reprovision"
     else
-        fail "seed claude settings sentinel before recreate" "stderr: $(guest_stderr)"
+        fail "seed claude settings sentinel before reprovision" "stderr: $(guest_stderr)"
     fi
 
     # Written on the host, so only a real workspace re-sync can put it in the
     # guest — it has never been inside the VM.
-    echo "recreated" > "$tmpdir/primary-ws/recreate-marker"
+    echo "reprovisioned" > "$tmpdir/primary-ws/reprovision-marker"
 
     if coop status "$INSTANCE" 2>/dev/null; then
         ip_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
     fi
 
     # An unknown image is rejected before anything is destroyed.
-    if coop_fails recreate "$INSTANCE" -y --image "no-such-image-$$"; then
-        pass "recreate rejects unknown image"
+    if coop_fails restore "$INSTANCE" --reprovision -y --image "no-such-image-$$"; then
+        pass "restore --reprovision rejects unknown image"
     else
-        fail "recreate rejects unknown image" "should have failed"
+        fail "restore --reprovision rejects unknown image" "should have failed"
     fi
 
     # The instance must be untouched by that rejection — still running.
     if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
-        pass "rejected recreate leaves the instance running"
+        pass "rejected reprovision leaves the instance running"
     else
-        fail "rejected recreate leaves the instance running" "status: $HARNESS_OUT"
+        fail "rejected reprovision leaves the instance running" "status: $HARNESS_OUT"
     fi
 
     # Without -y and without a TTY, `prompt::confirm` short-circuits to false,
-    # so a scripted recreate must refuse rather than silently wipe the guest.
-    if coop_fails recreate "$INSTANCE"; then
-        pass "recreate without -y refuses off a TTY"
+    # so a scripted reprovision must refuse rather than silently wipe the guest.
+    if coop_fails restore "$INSTANCE" --reprovision; then
+        pass "reprovision without -y refuses off a TTY"
         if echo "$HARNESS_ERR" | grep -q -- "-y"; then
             pass "non-interactive refusal names -y"
         else
             fail "non-interactive refusal names -y" "stderr: $HARNESS_ERR"
         fi
     else
-        fail "recreate without -y refuses off a TTY" "should have failed"
+        fail "reprovision without -y refuses off a TTY" "should have failed"
     fi
 
     # The refusal must be inert: the guest sentinel is still there.
-    if [[ "$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null')" == "pre-recreate" ]]; then
-        pass "refused recreate leaves the guest untouched"
+    if [[ "$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null')" == "pre-reprovision" ]]; then
+        pass "refused reprovision leaves the guest untouched"
     else
-        fail "refused recreate leaves the guest untouched" "sentinel changed"
+        fail "refused reprovision leaves the guest untouched" "sentinel changed"
     fi
 
-    # Grow the disk first, so the recreate has a non-template size to carry
+    # Grow the disk first, so the reprovision has a non-template size to carry
     # across the swap. `restore_disk` copies the template, which is smaller,
-    # so a recreate that skipped the re-grow would shrink the instance back.
+    # so a reprovision that skipped the re-grow would shrink the instance back.
     # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
     # absent value degrades to a skip rather than a spurious failure.
     local disk_before=""
@@ -2584,46 +2584,46 @@ test_recreate() {
         return
     fi
     if coop resize "$INSTANCE" --size +1G; then
-        pass "grow disk before recreate exits 0"
+        pass "grow disk before reprovision exits 0"
         if coop status "$INSTANCE" 2>/dev/null; then
             disk_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
         fi
     else
-        fail "grow disk before recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        fail "grow disk before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
     fi
-    # Not `|| true`: a failed restart silently sends the recreate down the
+    # Not `|| true`: a failed restart silently sends the reprovision down the
     # already-stopped branch instead of the running one, and the phase would
     # still report green while testing the wrong path.
     if coop start "$INSTANCE" --no-agents; then
-        pass "restart before recreate exits 0"
+        pass "restart before reprovision exits 0"
     else
-        fail "restart before recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        fail "restart before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
 
     # The guest root filesystem size *after* the grow, so the comparison below
-    # isolates what recreate did to it rather than folding in the resize.
+    # isolates what the reprovision did to it rather than folding in the resize.
     # 1K blocks; empty when df is unavailable.
     local guest_fs_before=""
     guest_fs_before=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_before=""
 
     # No `--no-agents`: it skips `bootstrap_agents` entirely, which is half of
-    # what distinguishes `recreate` from `restore` + `start` (BootMode::Restart
+    # what distinguishes --reprovision from a plain restore + start (BootMode::Restart
     # re-merges settings but does not reinstall plugins or MCP servers). The
     # claude settings assertions below depend on it having run.
-    if coop recreate "$INSTANCE" -y; then
-        pass "recreate exits 0"
+    if coop restore "$INSTANCE" --reprovision -y; then
+        pass "restore --reprovision exits 0"
     else
-        fail "recreate exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        fail "restore --reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
 
-    # Unlike `restore` (which leaves the instance stopped), `recreate` brings
+    # Unlike a plain `restore` (which leaves the instance stopped), --reprovision brings
     # it back up as part of the same command.
     if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
-        pass "recreate leaves the instance running"
+        pass "reprovision leaves the instance running"
     else
-        fail "recreate leaves the instance running" "status: $HARNESS_OUT"
+        fail "reprovision leaves the instance running" "status: $HARNESS_OUT"
         return
     fi
 
@@ -2632,36 +2632,36 @@ test_recreate() {
     # answer "absent" for this to pass, so an unreachable guest or a changed
     # home directory reads as a failure rather than as a successful wipe.
     if ! sentinel_after=$(coop_exec sh -c 'test -e ~/sentinel && echo present || echo absent'); then
-        fail "recreate wipes guest filesystem state" \
-            "guest unreachable after recreate; stderr: $(guest_stderr)"
+        fail "reprovision wipes guest filesystem state" \
+            "guest unreachable after reprovision; stderr: $(guest_stderr)"
         return
     fi
-    ws_marker=$(coop_exec sh -c 'cat /workspace/recreate-marker 2>/dev/null') || ws_marker=""
+    ws_marker=$(coop_exec sh -c 'cat /workspace/reprovision-marker 2>/dev/null') || ws_marker=""
     env_after=$(guest_exec printenv COOP_TEST_GUEST_ENV) || env_after=""
 
     # The disk was really replaced: guest-home state written before the
-    # recreate is gone.
+    # reprovision is gone.
     if [[ "$sentinel_after" == "absent" ]]; then
-        pass "recreate wipes guest filesystem state"
+        pass "reprovision wipes guest filesystem state"
     else
-        fail "recreate wipes guest filesystem state" \
+        fail "reprovision wipes guest filesystem state" \
             "~/sentinel is '$sentinel_after' (expected 'absent')"
     fi
 
     # …and the workspace came back. This is the assertion `restore` + `start`
     # cannot satisfy: BootMode::Restart skips the workspace sync.
-    if [[ "$ws_marker" == "recreated" ]]; then
-        pass "recreate re-syncs the workspace from the host"
+    if [[ "$ws_marker" == "reprovisioned" ]]; then
+        pass "reprovision re-syncs the workspace from the host"
     else
-        fail "recreate re-syncs the workspace from the host" \
-            "marker='$ws_marker' (expected 'recreated')"
+        fail "reprovision re-syncs the workspace from the host" \
+            "marker='$ws_marker' (expected 'reprovisioned')"
     fi
 
     # Persisted guest-env survived the wipe and was replayed into the new boot.
     if [[ "$env_after" == "hello-from-cli" ]]; then
-        pass "recreate preserves persisted guest env"
+        pass "reprovision preserves persisted guest env"
     else
-        fail "recreate preserves persisted guest env" \
+        fail "reprovision preserves persisted guest env" \
             "COOP_TEST_GUEST_ENV='$env_after' (expected 'hello-from-cli')"
     fi
 
@@ -2672,20 +2672,20 @@ test_recreate() {
     local claude_settings
     if claude_settings=$(coop_exec sh -c 'cat ~/.claude/settings.json'); then
         if echo "$claude_settings" | grep -q 'bypassPermissions'; then
-            pass "recreate re-runs the agent bootstrap"
+            pass "reprovision re-runs the agent bootstrap"
         else
-            fail "recreate re-runs the agent bootstrap" \
+            fail "reprovision re-runs the agent bootstrap" \
                 "managed permissions missing from settings.json: $claude_settings"
         fi
-        if echo "$claude_settings" | grep -q 'recreate-sentinel@m'; then
-            fail "recreate wipes agent state from the old disk" \
+        if echo "$claude_settings" | grep -q 'reprovision-sentinel@m'; then
+            fail "reprovision wipes agent state from the old disk" \
                 "sentinel plugin survived the wipe: $claude_settings"
         else
-            pass "recreate wipes agent state from the old disk"
+            pass "reprovision wipes agent state from the old disk"
         fi
     else
-        fail "recreate re-runs the agent bootstrap" \
-            "~/.claude/settings.json missing after recreate; stderr: $(guest_stderr)"
+        fail "reprovision re-runs the agent bootstrap" \
+            "~/.claude/settings.json missing after reprovision; stderr: $(guest_stderr)"
     fi
 
     # `--env CLAUDE_CODE_OAUTH_TOKEN` persisted by the onboarding phase must
@@ -2693,14 +2693,14 @@ test_recreate() {
     # variable reaching the guest env, so the file's presence proves both the
     # replay and that bootstrap_agents ran in FirstBoot mode.
     if coop_exec sh -c 'test -e ~/.claude.json'; then
-        pass "recreate replays the persisted token into the agent bootstrap"
+        pass "reprovision replays the persisted token into the agent bootstrap"
     else
-        fail "recreate replays the persisted token into the agent bootstrap" \
-            "~/.claude.json not seeded after recreate; stderr: $(guest_stderr)"
+        fail "reprovision replays the persisted token into the agent bootstrap" \
+            "~/.claude.json not seeded after reprovision; stderr: $(guest_stderr)"
     fi
 
     # Identity: the guest IP is derived from the instance index, so an
-    # unchanged IP proves recreate swapped only the disk rather than
+    # unchanged IP proves the reprovision swapped only the disk rather than
     # reallocating the instance. Lima's status does not surface the IP, so
     # the compare degrades to a skip there rather than a spurious failure.
     local ip_after=""
@@ -2708,26 +2708,26 @@ test_recreate() {
         ip_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
     fi
     if [[ -z "$ip_before" || -z "$ip_after" ]]; then
-        skip "guest IP preserved across recreate" "status does not surface Guest IP"
+        skip "guest IP preserved across reprovision" "status does not surface Guest IP"
     elif [[ "$ip_before" == "$ip_after" ]]; then
-        pass "guest IP preserved across recreate ($ip_after)"
+        pass "guest IP preserved across reprovision ($ip_after)"
     else
-        fail "guest IP preserved across recreate" "before=$ip_before after=$ip_after"
+        fail "guest IP preserved across reprovision" "before=$ip_before after=$ip_after"
     fi
 
     # A `coop resize --size` must survive the wipe: the image the disk is
-    # restored from is template-sized, so recreate has to re-grow it.
+    # restored from is template-sized, so the reprovision has to re-grow it.
     local disk_after=""
     if coop status "$INSTANCE" 2>/dev/null; then
         disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
     fi
     if [[ -z "$disk_before" || -z "$disk_after" ]]; then
-        skip "disk size preserved across recreate" "status does not report disk GiB"
+        skip "disk size preserved across reprovision" "status does not report disk GiB"
     elif [[ "$disk_after" -ge "$disk_before" ]]; then
-        pass "disk size preserved across recreate (${disk_after} GiB)"
+        pass "disk size preserved across reprovision (${disk_after} GiB)"
     else
-        fail "disk size preserved across recreate" \
-            "before=${disk_before} GiB after=${disk_after} GiB (recreate shrank the disk)"
+        fail "disk size preserved across reprovision" \
+            "before=${disk_before} GiB after=${disk_after} GiB (the reprovision shrank the disk)"
     fi
 
     # `coop status` reports the host image file's size, which `resize_disk`
@@ -2738,11 +2738,11 @@ test_recreate() {
     local guest_fs_after=""
     guest_fs_after=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_after=""
     if [[ -z "$guest_fs_before" || -z "$guest_fs_after" ]]; then
-        skip "guest filesystem not shrunk by recreate" "df unavailable in the guest"
+        skip "guest filesystem not shrunk by reprovision" "df unavailable in the guest"
     elif [[ "$guest_fs_after" -ge "$guest_fs_before" ]]; then
-        pass "guest filesystem not shrunk by recreate (${guest_fs_after} 1K-blocks)"
+        pass "guest filesystem not shrunk by reprovision (${guest_fs_after} 1K-blocks)"
     else
-        fail "guest filesystem not shrunk by recreate" \
+        fail "guest filesystem not shrunk by reprovision" \
             "before=${guest_fs_before} after=${guest_fs_after} 1K-blocks (the re-grow did not reach the guest)"
     fi
 }
@@ -5701,7 +5701,7 @@ main() {
     test_commit_restore
     test_restart_stopped
     test_restart_rejects_ignored_flags
-    test_recreate
+    test_restore_reprovision
     test_destroy
     test_auto_resolve_no_instances
     test_list_empty

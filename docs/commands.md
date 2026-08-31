@@ -789,33 +789,33 @@ coop start my-project
 ```
 
 ```
-coop restore [NAME] --image <name>
+coop restore [NAME] [--image <name>] [--reprovision] [-y] [--no-agents] [--no-prompt]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--image <name>` | Name of the image to restore from (required) |
+| `--image <name>` | Image to restore from. Required on its own; with `--reprovision` it defaults to the image the instance already records |
+| `--reprovision` | Provision the new disk as a first boot and leave the instance running (see below) |
+| `-y`, `--yes` | Skip the `--reprovision` confirmation prompt (required when stdin is not a TTY). Requires `--reprovision` |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM. Requires `--reprovision` |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT. Requires `--reprovision` |
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
 
-The `start` in that recipe deliberately does *not* re-sync `/workspace` or reinstall plugins — a checkpoint image already carries both, and overwriting them would defeat the rollback. Restoring a **base** image is the other case: nothing on that disk to preserve, so `coop start` would leave an empty `/workspace` and no plugins. Use [`recreate`](#recreate) for that.
+#### `--reprovision`
 
-### `recreate`
+The `coop start` in the checkpoint recipe above deliberately does *not* re-sync `/workspace` or reinstall plugins: a checkpoint image already carries both, and overwriting them would defeat the rollback. Restoring a **base** image is the other case — nothing on that disk to preserve — so a plain `coop start` there leaves an empty `/workspace` and no plugins.
 
-Wipe an instance's guest filesystem and bring it back with the same settings it already had — the inverse of "destroy it and remember every flag I passed". The disk is replaced with a fresh copy of the instance's image and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced or re-cloned, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled.
+`--reprovision` is that case. The disk is replaced as usual, and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced, re-cloned or re-mounted, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled. The instance is left **running** rather than stopped, so no follow-up `coop start` is needed.
+
+It is also the way to start an instance over without re-typing every flag it was created with — the inverse of "destroy it and remember what I passed":
 
 ```
-coop recreate [NAME] [FLAGS]
+coop restore my-project --reprovision                  # confirm, then reset to the recorded image
+coop restore my-project --reprovision -y               # no prompt (required in scripts)
+coop restore my-project --reprovision --image rust-24  # reset onto a different image
 ```
-
-| Flag | Description |
-|------|-------------|
-| `NAME` | Instance name (required if multiple instances exist) |
-| `--image <name>` | Rebuild from this image instead of the one the instance records |
-| `-y`, `--yes` | Skip the confirmation prompt (required when stdin is not a TTY) |
-| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
-| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT |
 
 Kept across the wipe, because coop persists them host-side:
 
@@ -837,21 +837,15 @@ Kept across the wipe, because coop persists them host-side:
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
 - A devcontainer's `postCreateCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive.
 
-Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running `coop recreate` finishes the job.
-
-```
-coop recreate my-project          # confirm, then reset to the recorded image
-coop recreate my-project -y       # no prompt (required in scripts)
-coop recreate my-project --image rust-24  # reset onto a different image
-```
+Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running the same command finishes the job.
 
 Compared with the neighbouring commands:
 
-| Command | Disk | Instance identity | Workspace / plugins |
-|---------|------|-------------------|---------------------|
-| `destroy` + `up` | fresh | **new** name, index, IP | re-synced; every flag re-typed |
-| `restore` + `start` | replaced | kept | left as the image had them |
-| `recreate` | replaced | kept | re-synced, plugins reinstalled |
+| Command | Disk | Instance identity | Workspace / plugins | Left |
+|---------|------|-------------------|---------------------|------|
+| `destroy` + `up` | fresh | **new** name, index, IP | re-synced; every flag re-typed | running |
+| `restore` + `start` | replaced | kept | left as the image had them | running |
+| `restore --reprovision` | replaced | kept | re-synced, plugins reinstalled | running |
 
 ### `profiles`
 

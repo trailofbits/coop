@@ -123,7 +123,7 @@ flags — this is a load-bearing design choice (see
    (`list`/`status`/`logs`) skip it.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
-exec/stop/destroy/status/list/resize/commit/restore/recreate), `quickstart.rs`,
+exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
 `devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `github.rs`, `admin.rs` (init/validate/uninstall),
 and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`

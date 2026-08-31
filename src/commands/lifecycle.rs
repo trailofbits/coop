@@ -1211,8 +1211,8 @@ fn start_instance(
 /// the workspace/mount sync that populates the guest filesystem.
 ///
 /// Shared by [`start_instance`] (a freshly allocated instance) and
-/// [`cmd_recreate`] (an existing instance whose disk was just reset to its
-/// image). Both arrive with a guest carrying only the golden image, so both
+/// [`reprovision_instance`] (an existing instance whose disk was just reset to
+/// its image). Both arrive with a guest carrying only the golden image, so both
 /// need the full first-boot treatment rather than the cheaper
 /// [`backend::BootMode::Restart`] path, which assumes plugins, MCP servers
 /// and `/workspace` survived on the guest disk.
@@ -1223,7 +1223,7 @@ fn start_instance(
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
 /// resolved forward set arrives as `forwards`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
-/// behavior for `cmd_recreate` only, which passes placeholders for them.
+/// behavior for `reprovision_instance` only, which passes placeholders for them.
 fn provision_first_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1242,8 +1242,8 @@ fn provision_first_boot(
     signal::check_shutdown()?;
 
     // Keep an already-installed `coop-<name>` alias current. A brand-new
-    // instance cannot have one (this is a no-op there), but `coop recreate`
-    // restarts an existing instance, and on Lima the forwarded port changes
+    // instance cannot have one (this is a no-op there), but `coop restore
+    // --reprovision` restarts an existing instance, and on Lima the forwarded port changes
     // across stop/start. Never installs a block the user didn't ask for.
     if let Err(e) = workspace::refresh_ssh_config_if_present(&target, inst) {
         tracing::warn!("Failed to refresh SSH config for '{}': {e}", inst.name);
@@ -1995,56 +1995,33 @@ pub(crate) fn cmd_commit(
     Ok(())
 }
 
-/// Roll a stopped instance back to image `image`'s filesystem in place.
-///
-/// The instance keeps its name, index, IP, and workspace association —
-/// only the disk is replaced. Its recorded origin image is updated so the
-/// guest-user lookup and status lineage track the restored image. Run
-/// `coop start` afterwards to bring the instance back up.
-pub(crate) fn cmd_restore(
-    be: &backend::PlatformBackend,
-    cfg: &config::CoopConfig,
-    name: Option<&config::InstanceName>,
-    image: &config::ImageName,
-) -> Result<()> {
-    let inst = cfg.resolve_instance(name)?;
-
-    if !be.image_is_built(cfg, image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
-
-    let stopped = be.as_stopped(inst)?;
-    be.restore_disk(cfg, &stopped, image)?;
-
-    // Persist the new lineage after the disk swap: if `restore_disk` fails,
-    // the recorded image still matches the (untouched) disk. The only
-    // residual window is a failed `instance.json` write after a successful
-    // swap, which re-running `restore` corrects.
-    let mut restored = stopped.instance().clone();
-    restored.set_image(image.clone())?;
-
-    // `coop start` is the right follow-up for the `commit`/`restore`
-    // checkpoint loop: the restored disk already carries `/workspace` and the
-    // installed plugins, and `BootMode::Restart` deliberately leaves them
-    // alone. Restoring a *base* image is the other case — nothing on that disk
-    // to preserve — so name `coop recreate` for it rather than leaving the
-    // empty-`/workspace` outcome to be discovered.
-    tracing::info!(
-        "Restored instance '{name}' from image '{image}'. \
-         Run `coop start {name}` to bring it back up — or \
-         `coop recreate {name} --image {image}` if '{image}' is a base image \
-         rather than a checkpoint, to re-sync /workspace and reinstall plugins.",
-        name = restored.name,
-    );
-    Ok(())
+/// Inputs to `coop restore`.
+pub(crate) struct RestoreOpts<'a> {
+    pub(crate) name: Option<&'a config::InstanceName>,
+    /// Image to restore from. Required by the CLI without `--reprovision`;
+    /// with it, `None` keeps the image the instance already records.
+    pub(crate) image: Option<&'a config::ImageName>,
+    pub(crate) mode: RestoreMode<'a>,
 }
 
-/// Inputs to `coop recreate`.
-pub(crate) struct RecreateOpts<'a> {
-    pub(crate) name: Option<&'a config::InstanceName>,
-    /// Rebuild from a different image than the one the instance was created
-    /// from. `None` keeps the recorded image.
-    pub(crate) image: Option<&'a config::ImageName>,
+/// What `coop restore` does with the disk once it has been replaced.
+///
+/// An enum rather than a `reprovision: bool` beside the three flags that only
+/// mean anything when it is set: this makes the illegal combination
+/// unrepresentable here, mirroring the `requires = "reprovision"` the CLI
+/// enforces at the boundary.
+pub(crate) enum RestoreMode<'a> {
+    /// Replace the disk and stop there — the `coop commit` checkpoint loop.
+    /// The restored disk already carries `/workspace` and the installed
+    /// plugins, so the follow-up `coop start` must leave them alone.
+    DiskOnly,
+    /// Provision the replaced disk as a first boot and leave the instance
+    /// running — a base image, with nothing on the new disk to preserve.
+    Reprovision(ReprovisionOpts<'a>),
+}
+
+/// The `--reprovision`-only inputs to `coop restore`.
+pub(crate) struct ReprovisionOpts<'a> {
     /// Skip the destructive-action confirmation.
     pub(crate) yes: bool,
     pub(crate) no_agents: bool,
@@ -2053,8 +2030,63 @@ pub(crate) struct RecreateOpts<'a> {
     pub(crate) config_path: &'a Path,
 }
 
+/// Replace a stopped instance's filesystem with image `image`'s, in place.
+///
+/// The instance keeps its name, index, IP, and workspace association — only
+/// the disk is replaced. Its recorded origin image is updated so the
+/// guest-user lookup and status lineage track the restored image. Run
+/// `coop start` afterwards to bring the instance back up.
+///
+/// That default is the `coop commit` checkpoint loop, where the restored disk
+/// already carries `/workspace` and the installed plugins and a restart must
+/// leave them alone. [`RestoreOpts::reprovision`] is the other case — a base
+/// image, with nothing on the new disk to preserve — and routes to
+/// [`reprovision_instance`] instead.
+pub(crate) fn cmd_restore(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    opts: &RestoreOpts<'_>,
+) -> Result<()> {
+    let reprovision = match &opts.mode {
+        RestoreMode::DiskOnly => None,
+        RestoreMode::Reprovision(reprovision) => Some(reprovision),
+    };
+    if let Some(reprovision) = reprovision {
+        return reprovision_instance(be, cfg, opts.name, opts.image, reprovision);
+    }
+
+    let inst = cfg.resolve_instance(opts.name)?;
+    // Required by the CLI without `--reprovision`, so this cannot be `None`
+    // here; the fallback keeps the invariant local rather than trusting it.
+    let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
+
+    if !be.image_is_built(cfg, &image) {
+        bail!("No image '{image}' found. Run `coop images` to list available images.");
+    }
+
+    let stopped = be.as_stopped(inst)?;
+    be.restore_disk(cfg, &stopped, &image)?;
+
+    // Persist the new lineage after the disk swap: if `restore_disk` fails,
+    // the recorded image still matches the (untouched) disk. The only
+    // residual window is a failed `instance.json` write after a successful
+    // swap, which re-running `restore` corrects.
+    let mut restored = stopped.instance().clone();
+    restored.set_image(image.clone())?;
+
+    tracing::info!(
+        "Restored instance '{name}' from image '{image}'. \
+         Run `coop start {name}` to bring it back up — or, if '{image}' is a \
+         base image rather than a checkpoint, \
+         `coop restore {name} --image {image} --reprovision` to re-sync \
+         /workspace and reinstall plugins.",
+        name = restored.name,
+    );
+    Ok(())
+}
+
 /// Wipe an instance's guest filesystem and bring it back with the same
-/// settings it already had.
+/// settings it already had — `coop restore --reprovision`.
 ///
 /// The inverse of "destroy it and remember every flag I passed": the
 /// instance keeps its name, index, IP, image, disk size, workspace
@@ -2070,16 +2102,18 @@ pub(crate) struct RecreateOpts<'a> {
 /// `post_start_override` during `coop up` and is **not** re-run here.
 /// Likewise extra `--extra-mount` directories and `--exclude-git`.
 ///
-/// `coop restore` replaces the disk but leaves the follow-up `coop start`
-/// on the [`backend::BootMode::Restart`] path, which skips exactly the work
-/// a blank disk needs. `recreate` runs the first-boot path instead.
-pub(crate) fn cmd_recreate(
+/// The plain [`cmd_restore`] path replaces the disk but leaves the follow-up
+/// `coop start` on the [`backend::BootMode::Restart`] path, which skips
+/// exactly the work a blank disk needs. This runs the first-boot path instead.
+fn reprovision_instance(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
-    opts: &RecreateOpts<'_>,
+    name: Option<&config::InstanceName>,
+    image: Option<&config::ImageName>,
+    opts: &ReprovisionOpts<'_>,
 ) -> Result<()> {
-    let inst = cfg.resolve_instance(opts.name)?;
-    let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
+    let inst = cfg.resolve_instance(name)?;
+    let image = image.cloned().unwrap_or_else(|| inst.image.clone());
 
     if !be.image_is_built(cfg, &image) {
         bail!("No image '{image}' found. Run `coop images` to list available images.");
@@ -2089,7 +2123,7 @@ pub(crate) fn cmd_recreate(
     // cheaply runs before `restore_disk`, because a stopped instance can be
     // started again and a wiped one cannot be un-wiped. Start with the
     // host-side settings that have to survive the swap, so a malformed state
-    // file aborts with the guest still intact rather than half-recreated.
+    // file aborts with the guest still intact rather than half-reprovisioned.
     let workspace_state = workspace::WorkspaceState::try_load(&inst)?;
     let saved_forwards = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
@@ -2099,7 +2133,7 @@ pub(crate) fn cmd_recreate(
         .unwrap_or_default();
     let applied_devcontainer = devcontainer::DevcontainerState::try_load(&inst)?.map(|s| s.applied);
 
-    check_recreate_workspace_source(&inst.name, workspace_state.as_ref())?;
+    check_reprovision_workspace_source(&inst.name, workspace_state.as_ref())?;
 
     // Same warning a restart prints: the recorded `devcontainer.json` may have
     // changed since creation. It matters more here — the state file is
@@ -2109,20 +2143,20 @@ pub(crate) fn cmd_recreate(
 
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
-    let ws_inputs = recreate_workspace_inputs(workspace_state.as_ref())?;
+    let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
 
     if !opts.yes
-        && !prompt::confirm(&recreate_confirmation(
+        && !prompt::confirm(&reprovision_confirmation(
             &inst.name,
             &image,
             workspace_state.as_ref(),
         ))?
     {
         // `prompt::confirm` is also false off a TTY, so name the flag that
-        // makes a non-interactive recreate possible.
+        // makes a non-interactive reprovision possible.
         bail!(
             "Aborted — instance '{}' left untouched.\n\
-             Pass -y to recreate without the prompt (required when stdin is \
+             Pass -y to reprovision without the prompt (required when stdin is \
              not a TTY).",
             inst.name,
         );
@@ -2158,7 +2192,7 @@ pub(crate) fn cmd_recreate(
     // the instance is still running its *own* forwarder holds them and every
     // forward would look taken.
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
-    // The bail names `--forward-port`, which `recreate` does not expose, and
+    // The bail names `--forward-port`, which `restore` does not expose, and
     // the instance is stopped by now — so say both. Reachable without the
     // user having asked about ports at all: a `forward_ports` entry added to
     // `config.toml` since creation whose host port is busy, or two entries
@@ -2166,9 +2200,10 @@ pub(crate) fn cmd_recreate(
     // dedupes on the guest port only).
     port_forward::check_host_port_collisions(&forwards).with_context(|| {
         format!(
-            "Instance '{}' is stopped and was not recreated. Free the host port \
+            "Instance '{}' is stopped and was not reprovisioned. Free the host port \
              or drop the conflicting `forward_ports` entry from config.toml, then \
-             re-run `coop recreate {}` — or `coop start {}` to bring it back as it was.",
+             re-run `coop restore {} --reprovision` — or `coop start {}` to bring \
+             it back as it was.",
             inst.name, inst.name, inst.name,
         )
     })?;
@@ -2176,7 +2211,7 @@ pub(crate) fn cmd_recreate(
     // Prove the instance is stopped before reading or replacing its disk.
     // The name is copied out first: `as_stopped` consumes `inst`, and the
     // post-swap error context below needs it.
-    let recreated_name = inst.name.clone();
+    let reprovisioned_name = inst.name.clone();
     let stopped = be.as_stopped(inst)?;
 
     // An image's disk is template-sized, so a `coop resize --disk` is lost in
@@ -2195,7 +2230,7 @@ pub(crate) fn cmd_recreate(
     // to, so every remaining step carries the same recovery advice: the
     // instance survives, its guest is only partly provisioned, and re-running
     // finishes the job.
-    let partial = || recreate_partial_message(&recreated_name);
+    let partial = || reprovision_partial_message(&reprovisioned_name);
 
     // Persist the new lineage after the swap: if `restore_disk` failed the
     // recorded image still matches the untouched disk.
@@ -2240,16 +2275,16 @@ pub(crate) fn cmd_recreate(
     provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &forwards)
         .with_context(partial)?;
 
-    tracing::info!("Instance '{}' recreated", inst.name);
+    tracing::info!("Instance '{}' reprovisioned", inst.name);
     Ok(())
 }
 
-/// Reject a recorded workspace association that `recreate` could not act on,
-/// while the guest is still intact.
+/// Reject a recorded workspace association that a reprovision could not act
+/// on, while the guest is still intact.
 ///
 /// Both failures would otherwise surface inside `provision_first_boot`, after
 /// `restore_disk` has already destroyed the disk.
-fn check_recreate_workspace_source(
+fn check_reprovision_workspace_source(
     name: &config::InstanceName,
     state: Option<&workspace::WorkspaceState>,
 ) -> Result<()> {
@@ -2271,12 +2306,13 @@ fn check_recreate_workspace_source(
     // `StartOpts::workspace_dir` is `Option<&str>`, so a non-UTF-8 path
     // reaches `provision_first_boot` only as `display()`'s lossy rendering,
     // which names a different (missing) directory. Left to that check it
-    // would bail after the swap, on every re-run — a recreate that can never
-    // finish.
+    // would bail after the swap, on every re-run — a reprovision that can
+    // never finish.
     if host_path.to_str().is_none() {
         bail!(
             "Instance '{name}' records workspace {}, whose path is not valid UTF-8.\n\
-             `coop recreate` cannot re-sync it. Move the directory to a UTF-8 path \
+             `coop restore --reprovision` cannot re-sync it. Move the directory to \
+             a UTF-8 path \
              and re-associate it with `coop up`.",
             host_path.display(),
         );
@@ -2292,7 +2328,7 @@ fn check_recreate_workspace_source(
 /// `Option<String>`, so positional slots would let a swap turn a re-sync into
 /// a clone attempt with no compile error.
 #[derive(Debug, Default)]
-struct RecreateWorkspaceInputs {
+struct ReprovisionWorkspaceInputs {
     /// Host directory to re-sync into the guest.
     workspace_dir: Option<String>,
     /// Clone URL to re-clone into the guest.
@@ -2312,19 +2348,19 @@ struct RecreateWorkspaceInputs {
 /// is creation-only (`coop up` against an existing instance rejects it), and
 /// `coop push` writes to the recorded `guest_path`, not to an arbitrary mount
 /// point.
-fn recreate_workspace_inputs(
+fn reprovision_workspace_inputs(
     state: Option<&workspace::WorkspaceState>,
-) -> Result<RecreateWorkspaceInputs> {
+) -> Result<ReprovisionWorkspaceInputs> {
     let Some(state) = state else {
-        return Ok(RecreateWorkspaceInputs::default());
+        return Ok(ReprovisionWorkspaceInputs::default());
     };
     Ok(match &state.source {
-        workspace::WorkspaceSource::Workspace { host_path } => RecreateWorkspaceInputs {
+        workspace::WorkspaceSource::Workspace { host_path } => ReprovisionWorkspaceInputs {
             workspace_dir: Some(host_path.display().to_string()),
             git_repo: None,
             mounts: Vec::new(),
         },
-        workspace::WorkspaceSource::GitRepo { url } => RecreateWorkspaceInputs {
+        workspace::WorkspaceSource::GitRepo { url } => ReprovisionWorkspaceInputs {
             workspace_dir: None,
             git_repo: Some(url.as_str().to_string()),
             mounts: Vec::new(),
@@ -2335,7 +2371,7 @@ fn recreate_workspace_inputs(
         // argument. On Firecracker the mount is re-synced with `rsync`, which
         // parses its own source argument, so an unvalidated path here would
         // reach a host-side command.
-        workspace::WorkspaceSource::Mount { host_path } => RecreateWorkspaceInputs {
+        workspace::WorkspaceSource::Mount { host_path } => ReprovisionWorkspaceInputs {
             workspace_dir: None,
             git_repo: None,
             mounts: vec![config::Mount::from_parts(
@@ -2349,16 +2385,16 @@ fn recreate_workspace_inputs(
 /// Advice attached to every failure after the disk has been replaced. The old
 /// filesystem is gone by then, so the useful thing to say is what survived and
 /// that re-running completes the job.
-fn recreate_partial_message(name: &config::InstanceName) -> String {
+fn reprovision_partial_message(name: &config::InstanceName) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
-         Re-run `coop recreate {name}` to finish."
+         Re-run `coop restore {name} --reprovision` to finish."
     )
 }
 
 /// The destructive-action prompt, naming what is about to be lost and what
 /// carries over, so the answer is an informed one.
-fn recreate_confirmation(
+fn reprovision_confirmation(
     name: &config::InstanceName,
     image: &config::ImageName,
     state: Option<&workspace::WorkspaceState>,
@@ -2382,7 +2418,7 @@ fn recreate_confirmation(
         None => "\nThis instance has no recorded workspace to restore.".to_string(),
     };
     format!(
-        "Recreate instance '{name}' from image '{image}'?\n\
+        "Reprovision instance '{name}' from image '{image}'?\n\
          Everything written inside the guest is destroyed.{restored}\n\
          Name, IP, disk size, port forwards and guest env are kept."
     )
@@ -2905,25 +2941,25 @@ mod tests {
     }
 
     #[test]
-    fn recreate_workspace_inputs_maps_workspace_source_to_a_sync_dir() {
+    fn reprovision_workspace_inputs_maps_workspace_source_to_a_sync_dir() {
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: std::path::PathBuf::from("/home/dev/proj"),
         });
-        let got = super::recreate_workspace_inputs(Some(&state)).expect("no mount to validate");
+        let got = super::reprovision_workspace_inputs(Some(&state)).expect("no mount to validate");
         assert_eq!(got.workspace_dir.as_deref(), Some("/home/dev/proj"));
         assert!(got.git_repo.is_none());
         // Extra `--extra-mount` data dirs are not recorded in
-        // WorkspaceState, so recreate cannot replay them; see the doc
+        // WorkspaceState, so a reprovision cannot replay them; see the doc
         // comment on the function.
         assert!(got.mounts.is_empty());
     }
 
     #[test]
-    fn recreate_workspace_inputs_maps_git_repo_source_to_a_clone_url() {
+    fn reprovision_workspace_inputs_maps_git_repo_source_to_a_clone_url() {
         let state = ws_state(super::workspace::WorkspaceSource::GitRepo {
             url: super::github_repo::GitRepoUrl::new("https://github.com/trailofbits/coop.git"),
         });
-        let got = super::recreate_workspace_inputs(Some(&state)).expect("no mount to validate");
+        let got = super::reprovision_workspace_inputs(Some(&state)).expect("no mount to validate");
         assert!(got.workspace_dir.is_none());
         assert_eq!(
             got.git_repo.as_deref(),
@@ -2933,11 +2969,11 @@ mod tests {
     }
 
     #[test]
-    fn recreate_workspace_inputs_maps_mount_source_to_a_mount_at_its_guest_path() {
+    fn reprovision_workspace_inputs_maps_mount_source_to_a_mount_at_its_guest_path() {
         // A non-default guest path, so the assertion below distinguishes a
         // real passthrough from a hardcoded `/workspace`. `coop up
         // --extra-mount /host/data:/data` is a supported shape, and remounting it
-        // at `/workspace` on recreate would be a silent relocation.
+        // at `/workspace` on a reprovision would be a silent relocation.
         // A real directory: `Mount::from_parts` canonicalizes and rejects a
         // host path that is not one.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2948,7 +2984,7 @@ mod tests {
             },
             "/data",
         );
-        let got = super::recreate_workspace_inputs(Some(&state)).expect("mount host dir exists");
+        let got = super::reprovision_workspace_inputs(Some(&state)).expect("mount host dir exists");
         // A mount must not be re-synced as a workspace: on Lima the host
         // directory is already served live, and on Firecracker the mount
         // sync path is the one that records mount state.
@@ -2960,8 +2996,8 @@ mod tests {
     }
 
     #[test]
-    fn recreate_workspace_inputs_rejects_a_mount_host_path_that_is_not_a_directory() {
-        // `recreate_workspace_inputs` returns `Result` precisely to carry this
+    fn reprovision_workspace_inputs_rejects_a_mount_host_path_that_is_not_a_directory() {
+        // `reprovision_workspace_inputs` returns `Result` precisely to carry this
         // error: the path comes from `workspace.json`, and on Firecracker it
         // reaches `rsync`, which parses its own source argument. Routing it
         // through `Mount::from_parts` is what rejects it, and doing so before
@@ -2973,47 +3009,47 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::Mount {
             host_path: not_a_dir,
         });
-        assert!(super::recreate_workspace_inputs(Some(&state)).is_err());
+        assert!(super::reprovision_workspace_inputs(Some(&state)).is_err());
     }
 
     #[test]
-    fn recreate_workspace_inputs_rejects_a_mount_host_path_that_does_not_exist() {
+    fn reprovision_workspace_inputs_rejects_a_mount_host_path_that_does_not_exist() {
         let state = ws_state(super::workspace::WorkspaceSource::Mount {
-            host_path: std::path::PathBuf::from("/nonexistent/coop/recreate/mount"),
+            host_path: std::path::PathBuf::from("/nonexistent/coop/reprovision/mount"),
         });
-        assert!(super::recreate_workspace_inputs(Some(&state)).is_err());
+        assert!(super::reprovision_workspace_inputs(Some(&state)).is_err());
     }
 
     #[test]
-    fn check_recreate_workspace_source_accepts_a_live_host_directory() {
+    fn check_reprovision_workspace_source_accepts_a_live_host_directory() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: tmp.path().to_path_buf(),
         });
-        assert!(super::check_recreate_workspace_source(&name, Some(&state)).is_ok());
+        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
     }
 
     #[test]
-    fn check_recreate_workspace_source_accepts_sources_without_a_host_path() {
+    fn check_reprovision_workspace_source_accepts_sources_without_a_host_path() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         // A git-repo instance is re-cloned rather than re-synced, so there is
         // no host directory to require.
         let state = ws_state(super::workspace::WorkspaceSource::GitRepo {
             url: super::github_repo::GitRepoUrl::new("https://github.com/trailofbits/coop.git"),
         });
-        assert!(super::check_recreate_workspace_source(&name, Some(&state)).is_ok());
+        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
         // Nor does an instance with no recorded association at all.
-        assert!(super::check_recreate_workspace_source(&name, None).is_ok());
+        assert!(super::check_reprovision_workspace_source(&name, None).is_ok());
     }
 
     #[test]
-    fn check_recreate_workspace_source_rejects_a_workspace_dir_that_moved() {
+    fn check_reprovision_workspace_source_rejects_a_workspace_dir_that_moved() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
-            host_path: std::path::PathBuf::from("/nonexistent/coop/recreate/workspace"),
+            host_path: std::path::PathBuf::from("/nonexistent/coop/reprovision/workspace"),
         });
-        let err = super::check_recreate_workspace_source(&name, Some(&state))
+        let err = super::check_reprovision_workspace_source(&name, Some(&state))
             .expect_err("a missing host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not a directory"), "{err}");
     }
@@ -3025,7 +3061,7 @@ mod tests {
     /// every re-run, so the "re-run to finish" advice would never finish.
     #[cfg(unix)]
     #[test]
-    fn check_recreate_workspace_source_rejects_a_non_utf8_workspace_dir() {
+    fn check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir() {
         use std::os::unix::ffi::OsStrExt as _;
 
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
@@ -3040,38 +3076,38 @@ mod tests {
         assert!(host_path.to_str().is_none(), "path must not be valid UTF-8");
 
         let state = ws_state(super::workspace::WorkspaceSource::Workspace { host_path });
-        let err = super::check_recreate_workspace_source(&name, Some(&state))
+        let err = super::check_reprovision_workspace_source(&name, Some(&state))
             .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
     }
 
     #[test]
-    fn recreate_partial_message_names_the_instance_and_the_recovery_command() {
+    fn reprovision_partial_message_names_the_instance_and_the_recovery_command() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let msg = super::recreate_partial_message(&name);
+        let msg = super::reprovision_partial_message(&name);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
-        assert!(msg.contains("coop recreate myvm"), "{msg}");
+        assert!(msg.contains("coop restore myvm --reprovision"), "{msg}");
     }
 
     #[test]
-    fn recreate_workspace_inputs_yields_nothing_without_recorded_state() {
-        let got = super::recreate_workspace_inputs(None).expect("no state to validate");
+    fn reprovision_workspace_inputs_yields_nothing_without_recorded_state() {
+        let got = super::reprovision_workspace_inputs(None).expect("no state to validate");
         assert!(got.workspace_dir.is_none());
         assert!(got.git_repo.is_none());
         assert!(got.mounts.is_empty());
     }
 
     #[test]
-    fn recreate_confirmation_names_the_instance_image_and_workspace_source() {
+    fn reprovision_confirmation_names_the_instance_image_and_workspace_source() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("rust").expect("valid image name");
 
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: std::path::PathBuf::from("/home/dev/proj"),
         });
-        let msg = super::recreate_confirmation(&name, &image, Some(&state));
+        let msg = super::reprovision_confirmation(&name, &image, Some(&state));
         assert!(msg.contains("myvm"), "{msg}");
         assert!(msg.contains("rust"), "{msg}");
         assert!(msg.contains("re-synced from /home/dev/proj"), "{msg}");
@@ -3085,13 +3121,13 @@ mod tests {
     }
 
     #[test]
-    fn recreate_confirmation_describes_a_git_repo_workspace_as_a_re_clone() {
+    fn reprovision_confirmation_describes_a_git_repo_workspace_as_a_re_clone() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("default").expect("valid image name");
         let state = ws_state(super::workspace::WorkspaceSource::GitRepo {
             url: super::github_repo::GitRepoUrl::new("https://github.com/trailofbits/coop.git"),
         });
-        let msg = super::recreate_confirmation(&name, &image, Some(&state));
+        let msg = super::reprovision_confirmation(&name, &image, Some(&state));
         assert!(
             msg.contains("re-cloned from https://github.com/trailofbits/coop.git"),
             "{msg}"
@@ -3102,13 +3138,13 @@ mod tests {
     }
 
     #[test]
-    fn recreate_confirmation_says_a_mounted_host_dir_is_not_destroyed() {
+    fn reprovision_confirmation_says_a_mounted_host_dir_is_not_destroyed() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("default").expect("valid image name");
         let state = ws_state(super::workspace::WorkspaceSource::Mount {
             host_path: std::path::PathBuf::from("/home/dev/proj"),
         });
-        let msg = super::recreate_confirmation(&name, &image, Some(&state));
+        let msg = super::reprovision_confirmation(&name, &image, Some(&state));
         // A mount comes back from the host rather than being restored from
         // the wiped disk, so the prompt must name it as a mount and must not
         // describe it as a workspace sync or a clone.
@@ -3118,10 +3154,10 @@ mod tests {
     }
 
     #[test]
-    fn recreate_confirmation_warns_when_no_workspace_is_recorded() {
+    fn reprovision_confirmation_warns_when_no_workspace_is_recorded() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("default").expect("valid image name");
-        let msg = super::recreate_confirmation(&name, &image, None);
+        let msg = super::reprovision_confirmation(&name, &image, None);
         // Nothing will repopulate the guest, so say so rather than implying
         // the workspace comes back.
         assert!(msg.contains("no recorded workspace"), "{msg}");
