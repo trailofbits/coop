@@ -807,7 +807,7 @@ Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (nam
 
 The `coop start` in the checkpoint recipe above deliberately does *not* re-sync `/workspace` or reinstall plugins: a checkpoint image already carries both, and overwriting them would defeat the rollback. Restoring a **base** image is the other case — nothing on that disk to preserve — so a plain `coop start` there leaves an empty `/workspace` and no plugins.
 
-`--reprovision` is that case. The disk is replaced as usual, and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced, re-cloned or re-mounted, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled. The instance is left **running** rather than stopped, so no follow-up `coop start` is needed.
+`--reprovision` is that case. Unlike a plain `restore`, which requires a stopped instance, it also accepts a running one and stops it itself. The disk is replaced as usual, and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced, re-cloned or re-mounted, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled. The instance is left **running** rather than stopped, so no follow-up `coop start` is needed.
 
 It is also the way to start an instance over without re-typing every flag it was created with — the inverse of "destroy it and remember what I passed":
 

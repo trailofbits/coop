@@ -1998,23 +1998,29 @@ pub(crate) fn cmd_commit(
 /// Inputs to `coop restore`.
 pub(crate) struct RestoreOpts<'a> {
     pub(crate) name: Option<&'a config::InstanceName>,
-    /// Image to restore from. Required by the CLI without `--reprovision`;
-    /// with it, `None` keeps the image the instance already records.
-    pub(crate) image: Option<&'a config::ImageName>,
     pub(crate) mode: RestoreMode<'a>,
 }
 
 /// What `coop restore` does with the disk once it has been replaced.
 ///
-/// An enum rather than a `reprovision: bool` beside the three flags that only
-/// mean anything when it is set: this makes the illegal combination
+/// An enum rather than a `reprovision: bool` beside the flags that only mean
+/// anything when it is set: this makes the illegal combinations
 /// unrepresentable here, mirroring the `requires = "reprovision"` the CLI
-/// enforces at the boundary.
+/// enforces at the boundary. The image lives in the variants for the same
+/// reason — it is optional only under `--reprovision`, so a single
+/// `Option<&ImageName>` on `RestoreOpts` would let a caller ask for a
+/// checkpoint rollback with no image to roll back to, and leave the handler
+/// to guess.
 pub(crate) enum RestoreMode<'a> {
     /// Replace the disk and stop there — the `coop commit` checkpoint loop.
     /// The restored disk already carries `/workspace` and the installed
     /// plugins, so the follow-up `coop start` must leave them alone.
-    DiskOnly,
+    DiskOnly {
+        /// Image to roll back to. Not optional: `--image` is required without
+        /// `--reprovision`, and a rollback onto the image the instance already
+        /// records would be a destructive no-op rather than a useful default.
+        image: &'a config::ImageName,
+    },
     /// Provision the replaced disk as a first boot and leave the instance
     /// running — a base image, with nothing on the new disk to preserve.
     Reprovision(ReprovisionOpts<'a>),
@@ -2022,6 +2028,10 @@ pub(crate) enum RestoreMode<'a> {
 
 /// The `--reprovision`-only inputs to `coop restore`.
 pub(crate) struct ReprovisionOpts<'a> {
+    /// Image to reset onto. `None` keeps the image the instance already
+    /// records — meaningful only here, which is why it is not on
+    /// [`RestoreOpts`].
+    pub(crate) image: Option<&'a config::ImageName>,
     /// Skip the destructive-action confirmation.
     pub(crate) yes: bool,
     pub(crate) no_agents: bool,
@@ -2039,7 +2049,7 @@ pub(crate) struct ReprovisionOpts<'a> {
 ///
 /// That default is the `coop commit` checkpoint loop, where the restored disk
 /// already carries `/workspace` and the installed plugins and a restart must
-/// leave them alone. [`RestoreOpts::reprovision`] is the other case — a base
+/// leave them alone. [`RestoreMode::Reprovision`] is the other case — a base
 /// image, with nothing on the new disk to preserve — and routes to
 /// [`reprovision_instance`] instead.
 pub(crate) fn cmd_restore(
@@ -2047,25 +2057,21 @@ pub(crate) fn cmd_restore(
     cfg: &mut config::CoopConfig,
     opts: &RestoreOpts<'_>,
 ) -> Result<()> {
-    let reprovision = match &opts.mode {
-        RestoreMode::DiskOnly => None,
-        RestoreMode::Reprovision(reprovision) => Some(reprovision),
+    let image = match &opts.mode {
+        RestoreMode::Reprovision(reprovision) => {
+            return reprovision_instance(be, cfg, opts.name, reprovision);
+        }
+        RestoreMode::DiskOnly { image } => *image,
     };
-    if let Some(reprovision) = reprovision {
-        return reprovision_instance(be, cfg, opts.name, opts.image, reprovision);
-    }
 
     let inst = cfg.resolve_instance(opts.name)?;
-    // Required by the CLI without `--reprovision`, so this cannot be `None`
-    // here; the fallback keeps the invariant local rather than trusting it.
-    let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
-    if !be.image_is_built(cfg, &image) {
+    if !be.image_is_built(cfg, image) {
         bail!("No image '{image}' found. Run `coop images` to list available images.");
     }
 
     let stopped = be.as_stopped(inst)?;
-    be.restore_disk(cfg, &stopped, &image)?;
+    be.restore_disk(cfg, &stopped, image)?;
 
     // Persist the new lineage after the disk swap: if `restore_disk` fails,
     // the recorded image still matches the (untouched) disk. The only
@@ -2113,11 +2119,10 @@ fn reprovision_instance(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     name: Option<&config::InstanceName>,
-    image: Option<&config::ImageName>,
     opts: &ReprovisionOpts<'_>,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
-    let image = image.cloned().unwrap_or_else(|| inst.image.clone());
+    let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
     if !be.image_is_built(cfg, &image) {
         bail!("No image '{image}' found. Run `coop images` to list available images.");
@@ -2313,11 +2318,13 @@ fn check_reprovision_workspace_source(
         );
     }
 
-    // `StartOpts::workspace_dir` is `Option<&str>`, so a non-UTF-8 path
-    // reaches `provision_first_boot` only as `display()`'s lossy rendering,
-    // which names a different (missing) directory. Left to that check it
-    // would bail after the swap, on every re-run — a reprovision that can
-    // never finish.
+    // Neither arm can carry a non-UTF-8 path back to the guest: the
+    // `Workspace` arm goes through `StartOpts::workspace_dir`
+    // (`Option<&str>`), and the `Mount` arm through `Mount::from_parts`,
+    // which also takes `&str`. Both would see only a lossy rendering naming a
+    // different (missing) directory, so both would bail *after* the swap — and
+    // identically on every re-run, making the "re-run to finish" advice
+    // unreachable. Rejecting here is what keeps that promise true.
     if host_path.to_str().is_none() {
         bail!(
             "Instance '{name}' records workspace {}, whose path is not valid UTF-8.\n\

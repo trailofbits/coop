@@ -583,14 +583,16 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Replace a stopped instance's filesystem with an image's, in place
+    /// Replace an instance's filesystem with an image's, in place
     ///
     /// Keeps the name, index, IP and workspace association; only the disk
     /// changes.
     ///
-    /// Left stopped, for the `coop commit` checkpoint loop.
+    /// Needs a stopped instance, and leaves it stopped: the `coop commit` loop.
     ///
     /// --reprovision instead runs the first-boot path and leaves it running.
+    ///
+    /// It also accepts a running instance, stopping it itself.
     ///
     /// Use it for a base image, where `coop start` leaves /workspace empty.
     ///
@@ -613,8 +615,7 @@ enum Commands {
         /// Provision the new disk as a first boot and leave the instance running
         #[arg(long)]
         reprovision: bool,
-        /// Skip the --reprovision confirmation prompt (required when stdin is
-        /// not a TTY)
+        /// Skip the --reprovision confirmation prompt (required off a TTY)
         #[arg(short = 'y', long, requires = "reprovision")]
         yes: bool,
         /// Skip injecting Claude Code and Codex credentials/config into the VM
@@ -1395,24 +1396,34 @@ pub fn run() -> Result<()> {
             yes,
             no_agents,
             no_prompt,
-        } => cmd_restore(
-            &be,
-            &mut cfg,
-            &RestoreOpts {
-                name: name.as_ref(),
-                image: image.as_ref(),
-                mode: if reprovision {
-                    RestoreMode::Reprovision(ReprovisionOpts {
-                        yes,
-                        no_agents,
-                        no_prompt,
-                        config_path: &cli.config,
-                    })
-                } else {
-                    RestoreMode::DiskOnly
+        } => {
+            // Collapse clap's `Option<ImageName>` into the shape each mode
+            // actually needs, once, here at the boundary: `--image` is
+            // `required_unless_present = "reprovision"`, so a `DiskOnly`
+            // restore always has one and the handler never has to guess.
+            let mode = if reprovision {
+                RestoreMode::Reprovision(ReprovisionOpts {
+                    image: image.as_ref(),
+                    yes,
+                    no_agents,
+                    no_prompt,
+                    config_path: &cli.config,
+                })
+            } else {
+                let Some(image) = image.as_ref() else {
+                    bail!("`--image` is required without `--reprovision`");
+                };
+                RestoreMode::DiskOnly { image }
+            };
+            cmd_restore(
+                &be,
+                &mut cfg,
+                &RestoreOpts {
+                    name: name.as_ref(),
+                    mode,
                 },
-            },
-        ),
+            )
+        }
         Commands::Profiles { action } => cmd_profiles(
             &cfg,
             &action.unwrap_or(ProfilesAction::List { json: false }),
