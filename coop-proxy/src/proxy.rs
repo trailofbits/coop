@@ -14,6 +14,9 @@
 //! - The guest's own `authorization` / `x-api-key` (the capability token) is
 //!   stripped and replaced with the real credential — it never reaches the
 //!   upstream, and the real credential never reaches the guest.
+//! - Only the provider-specific method/path operations required by the coding
+//!   agents are forwarded; all other authenticated requests are refused
+//!   locally before any upstream connection is made.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -233,7 +236,7 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
     forward(upstream_req, ctx, permit).await
 }
 
-/// Whether the fixed upstream permits this method/path pair.
+/// Whether coop-proxy allows this method/path pair for the fixed upstream.
 ///
 /// Provider operations are deliberately default-deny: the coding agents only
 /// need response/message creation and Anthropic token counting, so
