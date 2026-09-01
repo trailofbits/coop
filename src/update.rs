@@ -1190,17 +1190,28 @@ mod tests {
         else {
             panic!("install.sh no longer defines download_bundle");
         };
+        // Keyed on the shape of the request, not on a list of credential
+        // spellings: banning only `GITHUB_TOKEN` and `gh release` failed open
+        // on `-H "Authorization: token $(gh auth token)"` and on `${GH_TOKEN}`,
+        // either of which re-attaches the credential. A bare curl carries no
+        // header and shells out to nothing.
         assert!(
             bundle_fetch.contains("curl -fsSL")
+                && !bundle_fetch.contains("-H")
+                && !bundle_fetch.contains("--header")
+                && !bundle_fetch.contains("$(")
                 && !bundle_fetch.contains("GITHUB_TOKEN")
                 && !bundle_fetch.contains("gh release"),
             "the {BUNDLE_ASSET} fetch is no longer credential-free — it must be a bare curl, \
              or a SAML-restricted token can 403 on the one step --bundle exists to avoid"
         );
+        // Keyed on the downloaded path, not the bare `--bundle` flag: the
+        // `verify manually:` help text in the no-`gh` branch also names
+        // `--bundle ${BUNDLE}`, so rewrapping those two `info` lines into one
+        // would satisfy a bare-flag check on its own and let the real verify
+        // lose `--bundle` unnoticed. Only the call site names the temp path.
         assert!(
-            installer
-                .lines()
-                .any(|l| l.contains("gh attestation verify") && l.contains("--bundle")),
+            installer.contains(r#"--bundle "${TMPDIR}/${BUNDLE}""#),
             "install.sh no longer verifies against the downloaded bundle"
         );
     }
