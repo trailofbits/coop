@@ -9,7 +9,9 @@
 //! proving the authentication gate opened without any credential reaching a
 //! real service. The authorized header-rewrite/injection logic is covered by
 //! the unit tests in `src/proxy.rs`, and end-to-end against a mock upstream by
-//! coop's VM integration suite.
+//! coop's VM integration suite. Because the unknown-upstream policy denies
+//! before forwarding, this harness does not exercise `forward`, `bad_gateway`,
+//! or the `GuardedBody` permit wiring.
 //!
 //! The `readiness_probe_*` and `spawned_proxy_*` tests are the exception: they
 //! assert nothing about the gate, but pin the harness that reaches it — the
@@ -43,7 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// the loop keeps checking whether the child died.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Read budget for a test's own request, which waits on the real upstream path.
+/// Read budget for a test's own HTTP request to the proxy.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long a proxy that refuses its config gets to exit. It never binds, so
@@ -59,8 +61,8 @@ const PORT_ATTEMPTS: usize = 10;
 /// once its socket already holds it, never before.
 static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
-/// A config whose upstream can never resolve, so any request that passes the
-/// gate fails closed rather than reaching a real service.
+/// A config with an unknown upstream profile, so valid requests reach the
+/// operation policy but never reach a real service.
 fn config_json(listen: &str) -> String {
     format!(
         r#"{{
