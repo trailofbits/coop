@@ -236,9 +236,9 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
 /// Whether the fixed upstream permits this method/path pair.
 ///
 /// Provider operations are deliberately default-deny: the coding agents only
-/// need response/message creation and input-token counting, so administrative
-/// APIs and stored-resource reads must never inherit the host credential's
-/// broader authority.
+/// need response/message creation and Anthropic token counting, so
+/// administrative APIs and stored-resource reads must never inherit the host
+/// credential's broader authority.
 fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
     if method != Method::POST {
         return false;
@@ -246,13 +246,11 @@ fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
 
     matches!(
         (upstream_host, uri.path()),
-        (
-            "api.openai.com",
-            "/v1/responses" | "/v1/responses/input_tokens"
-        ) | (
-            "api.anthropic.com",
-            "/v1/messages" | "/v1/messages/count_tokens"
-        )
+        ("api.openai.com", "/v1/responses")
+            | (
+                "api.anthropic.com",
+                "/v1/messages" | "/v1/messages/count_tokens"
+            )
     )
 }
 
@@ -508,17 +506,11 @@ mod tests {
     // ── OpenAI operation policy ────────────────────────────────
 
     #[test]
-    fn openai_allows_response_creation_and_token_counting() {
+    fn openai_allows_only_response_creation() {
         let create: Uri = "/v1/responses".parse().unwrap();
-        let count_tokens: Uri = "/v1/responses/input_tokens".parse().unwrap();
         let create_with_query: Uri = "/v1/responses?foo=bar".parse().unwrap();
 
         assert!(operation_allowed(&Method::POST, &create, "api.openai.com"));
-        assert!(operation_allowed(
-            &Method::POST,
-            &count_tokens,
-            "api.openai.com"
-        ));
         assert!(operation_allowed(
             &Method::POST,
             &create_with_query,
