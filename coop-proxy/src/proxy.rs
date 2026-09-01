@@ -506,7 +506,7 @@ mod tests {
         assert!(!authorized(&HeaderMap::new(), "right"));
     }
 
-    // ── OpenAI operation policy ────────────────────────────────
+    // ── Provider operation policy ──────────────────────────────
 
     #[test]
     fn openai_allows_only_response_creation() {
@@ -539,6 +539,7 @@ mod tests {
             (Method::GET, "/v1/responses"),
             (Method::DELETE, "/v1/responses/resp_123"),
             (Method::POST, "/v1/files"),
+            (Method::POST, "/v1/responses/"),
             (Method::TRACE, "/v1/responses"),
         ] {
             let uri: Uri = path.parse().unwrap();
@@ -564,6 +565,7 @@ mod tests {
             (Method::POST, "/v1/messages/batches"),
             (Method::GET, "/v1/messages/batches/msgbatch_123/results"),
             (Method::POST, "/v1/organizations/invites"),
+            (Method::POST, "/v1/messages/"),
         ] {
             let uri: Uri = path.parse().unwrap();
             assert!(
@@ -571,6 +573,23 @@ mod tests {
                 "unexpectedly allowed {method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn provider_operations_cannot_cross_provider_boundaries() {
+        let openai_path: Uri = "/v1/responses".parse().unwrap();
+        let anthropic_path: Uri = "/v1/messages".parse().unwrap();
+
+        assert!(!operation_allowed(
+            &Method::POST,
+            &anthropic_path,
+            "api.openai.com"
+        ));
+        assert!(!operation_allowed(
+            &Method::POST,
+            &openai_path,
+            "api.anthropic.com"
+        ));
     }
 
     #[test]
