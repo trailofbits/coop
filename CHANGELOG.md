@@ -60,6 +60,21 @@
   `--openai` configures Codex. The secret store is namespaced per service, so
   proxy secrets live under their own directory rather than among the GitHub PATs.
 
+### Fixes
+
+- **`install.sh` and `coop update` verify provenance without a GitHub
+  credential** (#421) — Verification ran `gh attestation verify --repo
+  trailofbits/coop`, which reads the Sigstore bundle from the attestations
+  API. `gh` refuses to run that command unless it is logged in, and then
+  attaches its stored token, so a token with no SSO session for the
+  `trailofbits` org got `HTTP 403` and the install was refused; the same path
+  failed outright for anyone with `gh` installed but not authenticated.
+  Releases now publish the provenance bundle as an `attestations.jsonl` asset,
+  and both clients fetch it with an unauthenticated request and verify against
+  it with `--bundle`, which makes no attestations-API call and needs no
+  credential. Releases published before the asset existed are still verified
+  through the API path, unchanged.
+
 ## v0.5.4
 
 ### New features
