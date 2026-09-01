@@ -835,7 +835,7 @@ Kept across the wipe, because coop persists them host-side:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded, so an instance created with `--extra-mount /host/data:/data` comes back without `/data`. There is no way to re-add one to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering it means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
-- A devcontainer's `postCreateCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive.
+- A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
 
 Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running the same command finishes the job.
 

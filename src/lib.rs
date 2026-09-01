@@ -585,22 +585,16 @@ enum Commands {
     },
     /// Replace a stopped instance's filesystem with an image's, in place
     ///
-    /// The instance keeps its name, index, IP and workspace association —
-    /// only the disk is replaced.
+    /// Keeps the name, index, IP and workspace association; only the disk
+    /// changes.
     ///
-    /// Left stopped; `coop start` brings it back up. That is the `coop commit`
-    /// checkpoint loop.
+    /// Left stopped, for the `coop commit` checkpoint loop.
     ///
-    /// --reprovision instead provisions the new disk as a first boot and
-    /// leaves the instance running.
+    /// --reprovision instead runs the first-boot path and leaves it running.
     ///
-    /// Use it for a base image, where a plain `coop start` would leave an
-    /// empty /workspace.
+    /// Use it for a base image, where `coop start` leaves /workspace empty.
     ///
-    /// It keeps disk size, port forwards and guest env.
-    ///
-    /// Not replayed: --extra-mount, --exclude-git, a devcontainer's
-    /// postCreateCommand.
+    /// See docs/commands.md for what --reprovision does not replay.
     Restore {
         /// Instance name (required if multiple instances exist)
         #[arg(

@@ -189,7 +189,7 @@ exclude_re = [
   # reprovision_instance itself is NOT matched by the `\bcmd_[a-z_]+\b`
   # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
   # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
-  "\breprovision_instance\b",
+  "\\breprovision_instance\\b",
   "\\bprovision_first_boot\\b",
   "\\bwarn_on_live_git_mounts\\b",
   "\\bresolve_running\\b",

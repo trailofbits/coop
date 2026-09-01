@@ -29,7 +29,7 @@
   `forwardPorts` — so those flags do not have to be remembered. GitHub PATs and
   provider credentials live in the host-side secret store and are untouched.
   Extra `--extra-mount` directories, `--exclude-git` and a devcontainer's
-  `postCreateCommand` are not replayed, because coop does not persist them.
+  `postStartCommand` are not replayed, because coop does not persist them.
 
   This is what `coop restore` + `coop start` could not do: a restart skips the
   workspace sync and the plugin install on the assumption that both survived on

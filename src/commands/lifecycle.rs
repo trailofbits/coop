@@ -2098,8 +2098,12 @@ pub(crate) fn cmd_restore(
 /// Only what coop persists can be replayed. A devcontainer's `containerEnv`
 /// and `forwardPorts` survive (they live in `guest_env.json` /
 /// `forwards.json`) and its features are baked into the image, but its
-/// `postCreateCommand` reaches the guest only as an in-memory
+/// `postStartCommand` reaches the guest only as an in-memory
 /// `post_start_override` during `coop up` and is **not** re-run here.
+/// (`postCreateCommand` is not the affected key: coop parses
+/// `postStartCommand` and reports `postCreateCommand` as an unrecognised
+/// `devcontainer.json` key, so it never reaches the guest on `coop up`
+/// either.)
 /// Likewise extra `--extra-mount` directories and `--exclude-git`.
 ///
 /// The plain [`cmd_restore`] path replaces the disk but leaves the follow-up
@@ -2229,8 +2233,10 @@ fn reprovision_instance(
     // Past this point the old disk is gone and there is nothing to roll back
     // to, so every remaining step carries the same recovery advice: the
     // instance survives, its guest is only partly provisioned, and re-running
-    // finishes the job.
-    let partial = || reprovision_partial_message(&reprovisioned_name);
+    // finishes the job. It also carries `previous_disk`, which only this
+    // process knows: nothing persists an instance's disk size, so a re-run
+    // measures the replaced template-sized file and skips the re-grow.
+    let partial = || reprovision_partial_message(&reprovisioned_name, previous_disk);
 
     // Persist the new lineage after the swap: if `restore_disk` failed the
     // recorded image still matches the untouched disk.
@@ -2297,8 +2303,12 @@ fn check_reprovision_workspace_source(
     if !host_path.is_dir() {
         bail!(
             "Instance '{name}' records workspace {}, which is not a directory.\n\
-             Restore it, or use `coop up` to associate a new one — recreating \
-             now would leave the guest with no workspace to sync back.",
+             Put it back at that path, or `coop destroy {name}` and `coop up` \
+             from the new location — reprovisioning now would leave the guest \
+             with no workspace to sync back.\n\
+             Nothing re-points an existing instance's recorded workspace: \
+             `coop up` matches on the canonical path and would create a second \
+             instance, and `coop push --dir` does not persist the new source.",
             host_path.display(),
         );
     }
@@ -2311,9 +2321,11 @@ fn check_reprovision_workspace_source(
     if host_path.to_str().is_none() {
         bail!(
             "Instance '{name}' records workspace {}, whose path is not valid UTF-8.\n\
-             `coop restore --reprovision` cannot re-sync it. Move the directory to \
-             a UTF-8 path \
-             and re-associate it with `coop up`.",
+             `coop restore --reprovision` cannot re-sync it, and moving the \
+             directory would not help: nothing re-points an existing instance's \
+             recorded workspace, so this would fail again on every run.\n\
+             Recover with `coop destroy {name}` and a fresh `coop up` from a \
+             UTF-8 path.",
             host_path.display(),
         );
     }
@@ -2385,10 +2397,14 @@ fn reprovision_workspace_inputs(
 /// Advice attached to every failure after the disk has been replaced. The old
 /// filesystem is gone by then, so the useful thing to say is what survived and
 /// that re-running completes the job.
-fn reprovision_partial_message(name: &config::InstanceName) -> String {
+fn reprovision_partial_message(name: &config::InstanceName, previous_disk: config::GiB) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
-         Re-run `coop restore {name} --reprovision` to finish."
+         Re-run `coop restore {name} --reprovision` to finish.\n\
+         Its disk was {previous_disk} GiB before the reset. Nothing persists \
+         that, and a re-run measures the replaced (template-sized) disk, so \
+         check `coop status {name}` and run `coop resize {name} --size \
+         {previous_disk}` if the re-grow did not complete."
     )
 }
 
@@ -3052,6 +3068,12 @@ mod tests {
         let err = super::check_reprovision_workspace_source(&name, Some(&state))
             .expect_err("a missing host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not a directory"), "{err}");
+        // Both recoveries must be ones that actually work: put the directory
+        // back at the recorded path, or destroy and re-create. Re-associating
+        // a moved directory with a bare `coop up` does not — it matches on the
+        // canonical path and would create a second instance.
+        assert!(err.to_string().contains("Put it back"), "{err}");
+        assert!(err.to_string().contains("coop destroy myvm"), "{err}");
     }
 
     /// A non-UTF-8 workspace path must be rejected *before* `restore_disk`.
@@ -3079,16 +3101,31 @@ mod tests {
         let err = super::check_reprovision_workspace_source(&name, Some(&state))
             .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        // The only recovery that works. Moving the directory does not: nothing
+        // re-points an existing instance's `workspace.json`, so the advice has
+        // to name destroy + a fresh `up` rather than a relocation.
+        assert!(
+            err.to_string().contains("coop destroy myvm"),
+            "the message must offer a recovery that works: {err}"
+        );
     }
 
     #[test]
     fn reprovision_partial_message_names_the_instance_and_the_recovery_command() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let msg = super::reprovision_partial_message(&name);
+        let disk = super::config::GiB::new(20).expect("20 is non-zero");
+        let msg = super::reprovision_partial_message(&name, disk);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
         assert!(msg.contains("coop restore myvm --reprovision"), "{msg}");
+        // Nothing persists an instance's disk size, so a re-run measures the
+        // replaced template-sized file and skips the re-grow. The size this
+        // process read before the swap is the only record of it, so the
+        // message has to carry both the number and the command that reapplies
+        // it — otherwise a prior `coop resize` is silently dropped.
+        assert!(msg.contains("20 GiB"), "{msg}");
+        assert!(msg.contains("coop resize myvm --size 20"), "{msg}");
     }
 
     #[test]

@@ -2496,23 +2496,43 @@ test_restore_reprovision() {
     echo ""
     echo "=== Phase: restore --reprovision ==="
 
-    # The instance is running from the previous phase. `restore --reprovision` accepts a
-    # running instance (it stops it itself), so no state prep is needed.
-    #
-    # This phase asserts the distinction between `restore --reprovision`
-    # and a plain `restore` + `start`: both replace the disk, but only
-    # --reprovision re-runs the first-boot provisioning, so only it puts
-    # /workspace back and re-runs the agent bootstrap. Four discriminators are seeded first:
+    # This phase asserts the distinction between `restore --reprovision` and a
+    # plain `restore` + `start`: both replace the disk, but only --reprovision
+    # re-runs the first-boot provisioning, so only it puts /workspace back and
+    # re-runs the agent bootstrap. Four discriminators are seeded first:
     #   * a guest-home sentinel, which must be GONE (the disk really was wiped)
     #   * a host-side workspace marker, which must be PRESENT in /workspace
-    #     (the workspace was re-synced, not merely left blank)
+    #     (the workspace was re-synced, not merely left blank). This is the
+    #     FirstBoot-vs-Restart discriminator: BootMode::Restart skips the sync.
     #   * COOP_TEST_GUEST_ENV, set at `up` time, which must survive (the
     #     persisted guest_env.json was replayed, not lost with the disk)
     #   * a sentinel key in ~/.claude/settings.json, which must be GONE while
-    #     the managed permissions block is back — the agent-bootstrap half of
-    #     provision_first_boot ran against a blank disk. The settings-merge
-    #     phase pins the opposite direction (a restart preserves the key), so
-    #     the pair distinguishes FirstBoot from Restart.
+    #     the managed permissions block is back. Note what this does and does
+    #     not prove: write_managed_claude_settings and seed_claude_onboarding
+    #     run on EVERY boot (src/backend.rs, outside the BootMode::FirstBoot
+    #     gate), so their output does not distinguish FirstBoot from Restart —
+    #     it only proves bootstrap_agents ran at all against the blank disk,
+    #     which a wiped ~/.claude would otherwise not show. The FirstBoot-only
+    #     work is the marketplace/plugin/MCP install, and this phase cannot
+    #     assert it: the main flow reads the developer's own
+    #     ~/.coop/config.toml, which carries no marketplaces, plugins or MCP
+    #     servers, so compute_plugin_delta has nothing to install. The
+    #     --full-only test_local_marketplace phase covers that path with its
+    #     own instance and stub-claude image.
+    #
+    # The previous phase ends with `coop stop "$INSTANCE"` ("Stop again for the
+    # destroy phase", from before this phase was inserted between them), so the
+    # instance is STOPPED here. Neither `coop shell` nor `coop exec` auto-starts
+    # — both go through resolve_running, which bails "is not running" — so
+    # every guest-side seed and assertion below needs it up first.
+    if coop start "$INSTANCE" --no-agents; then
+        pass "start instance before reprovision seeding"
+    else
+        fail "start instance before reprovision seeding" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
     local ip_before=""
     if guest_exec sh -c 'echo pre-reprovision > ~/sentinel'; then
         pass "seed guest sentinel before reprovision"
@@ -2607,6 +2627,21 @@ test_restore_reprovision() {
     local guest_fs_before=""
     guest_fs_before=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_before=""
 
+    # Install the `coop-<name>` SSH alias so the reprovision has one to
+    # refresh. `provision_first_boot` calls `refresh_ssh_config_if_present`,
+    # which is gated on the marker block existing (workspace.rs), and
+    # test_ssh_config ran `--clean` long before this phase — so without this
+    # the call is a no-op and nothing covers it. On Lima the forwarded port
+    # changes across the reprovision's stop/start, so a stale block leaves the
+    # alias pointing at a dead port.
+    local ssh_alias_seeded=""
+    if coop ssh-config "$INSTANCE"; then
+        ssh_alias_seeded=1
+        pass "install coop-$INSTANCE alias before reprovision"
+    else
+        fail "install coop-$INSTANCE alias before reprovision" "stderr: $HARNESS_ERR"
+    fi
+
     # No `--no-agents`: it skips `bootstrap_agents` entirely, which is half of
     # what distinguishes --reprovision from a plain restore + start (BootMode::Restart
     # re-merges settings but does not reinstall plugins or MCP servers). The
@@ -2667,8 +2702,12 @@ test_restore_reprovision() {
 
     # The agent-bootstrap half of provision_first_boot ran against the blank
     # disk: the managed settings are back, and the sentinel key seeded before
-    # the wipe is not (the settings-merge phase pins that a *restart* keeps
-    # it, so this is the FirstBoot-vs-Restart discriminator).
+    # the wipe is not. This proves bootstrap_agents ran at all — on a wiped
+    # disk ~/.claude/settings.json would otherwise be absent — but NOT that it
+    # ran in FirstBoot mode: write_managed_claude_settings runs on every boot,
+    # and test_claude_settings_merge asserts the same bypassPermissions grep
+    # after a plain restart. The workspace re-sync above is the mode
+    # discriminator.
     local claude_settings
     if claude_settings=$(coop_exec sh -c 'cat ~/.claude/settings.json'); then
         if echo "$claude_settings" | grep -q 'bypassPermissions'; then
@@ -2690,8 +2729,9 @@ test_restore_reprovision() {
 
     # `--env CLAUDE_CODE_OAUTH_TOKEN` persisted by the onboarding phase must
     # reach the bootstrap on the fresh disk too — the seed is gated on that
-    # variable reaching the guest env, so the file's presence proves both the
-    # replay and that bootstrap_agents ran in FirstBoot mode.
+    # variable reaching the guest env, so the file's presence proves the replay
+    # reached bootstrap_agents. seed_claude_onboarding also runs on every boot,
+    # so like the settings check above this is not a FirstBoot discriminator.
     if coop_exec sh -c 'test -e ~/.claude.json'; then
         pass "reprovision replays the persisted token into the agent bootstrap"
     else
@@ -2744,6 +2784,25 @@ test_restore_reprovision() {
     else
         fail "guest filesystem not shrunk by reprovision" \
             "before=${guest_fs_before} after=${guest_fs_after} 1K-blocks (the re-grow did not reach the guest)"
+    fi
+
+    # The `coop-<name>` alias installed before the reprovision must still
+    # connect: `provision_first_boot` calls `refresh_ssh_config_if_present`,
+    # and on Lima the forwarded port changed across the stop/start, so an
+    # unrefreshed block points at a dead port. Cleaned up afterwards to leave
+    # ~/.ssh/config as this phase found it.
+    if [[ -n "$ssh_alias_seeded" ]]; then
+        if _timeout 30 ssh "coop-$INSTANCE" echo "reprovision-alias-ok" 2>/dev/null \
+            | grep -q "reprovision-alias-ok"; then
+            pass "reprovision refreshes the coop-$INSTANCE ssh alias"
+        else
+            fail "reprovision refreshes the coop-$INSTANCE ssh alias" \
+                "alias did not connect after the reprovision"
+        fi
+        coop ssh-config "$INSTANCE" --clean || true
+    else
+        skip "reprovision refreshes the coop-$INSTANCE ssh alias" \
+            "alias was not installed"
     fi
 }
 
