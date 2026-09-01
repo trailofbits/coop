@@ -1536,11 +1536,15 @@ fn bootstrap_and_post_start(
              agents will not be able to authenticate in this VM"
         );
     }
-    if no_agents_skips_codex_keyring(
-        opts.no_agents,
-        cfg.codex.auth,
-        model_state::ModelState::load_or_default(inst)?.codex_keyring_materialized,
-    ) {
+    // A failed read degrades to "not materialized", which at worst warns when
+    // it need not. Aborting `--no-agents` — a path that otherwise never opens
+    // this file — over an unreadable model.json would be the worse trade.
+    if no_agents_skips_codex_keyring(opts.no_agents, cfg.codex.auth, || {
+        model_state::ModelState::try_load(inst)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.codex_keyring_materialized)
+    }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
     if opts.no_agents && post_start.is_none() {
@@ -1592,12 +1596,15 @@ pub(crate) const NO_AGENTS_CHATGPT_WARNING: &str = "codex.auth = \"chatgpt\" is 
 /// `keyring_materialized` is what keeps this from crying wolf on a restart: the
 /// guest config lives on the guest disk and survives stop/start, so once an
 /// earlier boot has written the key, skipping bootstrap changes nothing.
+///
+/// `keyring_materialized` is lazy: reading it costs an instance-state file
+/// read, and the cheap terms decide the answer for every VM not in this mode.
 pub(crate) fn no_agents_skips_codex_keyring(
     no_agents: bool,
     auth: config::CodexAuthMode,
-    keyring_materialized: bool,
+    keyring_materialized: impl FnOnce() -> bool,
 ) -> bool {
-    no_agents && auth.uses_chatgpt_account() && !keyring_materialized
+    no_agents && auth.uses_chatgpt_account() && !keyring_materialized()
 }
 
 pub(crate) fn prepare_session_from_target(
@@ -2126,21 +2133,38 @@ mod tests {
         use super::no_agents_skips_codex_keyring as warns;
 
         assert!(
-            warns(true, CodexAuthMode::ChatGpt, false),
+            warns(true, CodexAuthMode::ChatGpt, || false),
             "--no-agents on a guest that never got the keyring store must warn",
         );
         assert!(
-            !warns(false, CodexAuthMode::ChatGpt, false),
+            !warns(false, CodexAuthMode::ChatGpt, || false),
             "a normal start bootstraps the keyring store, so there is nothing to warn about",
         );
         assert!(
-            !warns(true, CodexAuthMode::ApiKey, false),
+            !warns(true, CodexAuthMode::ApiKey, || false),
             "api_key auth does not use the guest keyring at all",
         );
         assert!(
-            !warns(true, CodexAuthMode::ChatGpt, true),
+            !warns(true, CodexAuthMode::ChatGpt, || true),
             "an earlier boot already wrote the key; it survives on the guest disk",
         );
+
+        // The instance-state read is the expensive term, so it must not happen
+        // for the VMs that are not in this mode at all.
+        for (no_agents, auth) in [
+            (false, CodexAuthMode::ChatGpt),
+            (true, CodexAuthMode::ApiKey),
+        ] {
+            let read = std::cell::Cell::new(false);
+            assert!(!warns(no_agents, auth, || {
+                read.set(true);
+                false
+            }));
+            assert!(
+                !read.get(),
+                "the cheap terms must short-circuit before the state read",
+            );
+        }
     }
 
     #[test]

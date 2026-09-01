@@ -3642,6 +3642,40 @@ auth = "bearer"
     }
 
     #[test]
+    fn validate_accepts_codex_chatgpt_without_a_proxy() {
+        // Pins the `proxy.openai.is_some()` half of the conflict check. With
+        // `&&` flipped to `||`, plain `auth = "chatgpt"` — the headline
+        // configuration for this mode — becomes a hard config error.
+        let toml_str = r#"
+[codex]
+auth = "chatgpt"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "chatgpt auth alone must be a valid config: {:?}",
+            cfg.validate().err(),
+        );
+    }
+
+    #[test]
+    fn validate_accepts_openai_proxy_with_default_api_key_auth() {
+        // Pins the `uses_chatgpt_account()` half. With `&&` flipped to `||`,
+        // an ordinary `[proxy.openai]` setup becomes a hard config error.
+        let toml_str = r#"
+[proxy.openai]
+credential = "cmd:op read op://x"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "an OpenAI proxy with default api_key auth must be valid: {:?}",
+            cfg.validate().err(),
+        );
+    }
+
+    #[test]
     fn proxy_anthropic_parses_bearer_scheme() {
         let toml_str = r#"
 [proxy.anthropic]

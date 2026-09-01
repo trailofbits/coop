@@ -101,9 +101,15 @@ unlock_keyring() {
         | gnome-keyring-daemon --unlock --components=secrets)" \
         || die "failed to unlock the guest keyring"
 
-    if [ -n "$output" ]; then
-        eval "$output"
-    fi
+    # The daemon prints its session env as `NAME=value` lines. Take only
+    # those, and export them: an unfiltered `eval` would execute any GLib
+    # diagnostic the daemon puts on stdout as a command, and a bare
+    # assignment would not reach Codex anyway.
+    while IFS= read -r line; do
+        case "$line" in
+            [A-Za-z_]*=*) export "${line%%=*}=${line#*=}" ;;
+        esac
+    done <<<"$output"
 }
 
 if [ ! -x "$CODEX_BIN" ]; then
@@ -128,17 +134,26 @@ for tool in gnome-keyring-daemon secret-tool timeout; do
         || die "$tool is missing; rebuild the coop image with Codex account-auth support"
 done
 
-# Unlock before anything else touches the bus. `gnome-keyring-daemon --unlock`
-# only creates and unlocks the login collection when it is the process that
-# starts the daemon; once any daemon owns `org.freedesktop.secrets` it hands
-# the unlock to the graphical gcr-prompter, which cannot render on a headless
-# guest and exits immediately. That includes a daemon the probe itself would
-# D-Bus-activate, so there is no cheap "is it already unlocked?" check to make
-# first — `dbus-run-session` above mints a fresh private bus every time, so
-# there is never a pre-unlocked daemon to find anyway.
-unlock_keyring
-probe_keyring \
-    || die "guest Secret Service is unavailable${PROBE_ERROR:+: $PROBE_ERROR}; check the keyring password"
+# A nested codex-account — an in-guest agent shelling out to `codex-account` or
+# `codex-yolo` — inherits this bus and its already-unlocked keyring. Unlocking
+# again there would fail, for the same reason the ordering below matters, so
+# reuse the session instead of prompting a second time.
+if [ "${COOP_CODEX_ACCOUNT_UNLOCKED:-0}" = "1" ]; then
+    probe_keyring \
+        || die "inherited guest Secret Service session is unusable${PROBE_ERROR:+: $PROBE_ERROR}"
+else
+    # Unlock before anything else touches the bus. `gnome-keyring-daemon
+    # --unlock` only creates and unlocks the login collection when it is the
+    # process that starts the daemon; once any daemon owns
+    # `org.freedesktop.secrets` it hands the unlock to the graphical
+    # gcr-prompter, which cannot render on a headless guest and exits
+    # immediately. That includes a daemon the probe itself would D-Bus-activate,
+    # so there is no cheap "is it already unlocked?" check to make first.
+    unlock_keyring
+    probe_keyring \
+        || die "guest Secret Service is unavailable${PROBE_ERROR:+: $PROBE_ERROR}; check the keyring password"
+    export COOP_CODEX_ACCOUNT_UNLOCKED=1
+fi
 
 exec "$CODEX_BIN" "$@"
 CODEXACCOUNTEOF

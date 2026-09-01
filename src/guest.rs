@@ -523,19 +523,71 @@ mod tests {
         // graphical gcr-prompter, which cannot run on a headless guest, and
         // ChatGPT auth fails on every invocation. So the unlock must be the
         // first thing the main flow does.
-        let unlock = SCRIPT_CODEX_ACCOUNT.find("\nunlock_keyring\n");
-        let probe = SCRIPT_CODEX_ACCOUNT.find("\nprobe_keyring \\");
         assert!(
-            unlock.is_some() && probe.is_some(),
-            "the main flow must call both unlock_keyring and probe_keyring",
-        );
-        assert!(
-            unlock < probe,
-            "the main flow must unlock before probing, or the unlock is a no-op",
+            SCRIPT_CODEX_ACCOUNT.contains("    unlock_keyring\n    probe_keyring \\"),
+            "on a bus this wrapper created, the unlock must precede the probe",
         );
         assert!(
             !SCRIPT_CODEX_ACCOUNT.contains("gnome-keyring-daemon --start"),
             "starting the daemon before the unlock is what breaks the unlock",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_reuses_an_inherited_unlocked_session() {
+        // A nested codex-account (an in-guest agent shelling out to
+        // `codex-account` / `codex-yolo`) inherits the bus and its unlocked
+        // keyring. Unlocking again there hits the very gcr-prompter trap the
+        // ordering above exists to avoid, so the nested call must probe and
+        // reuse rather than re-unlock — and the outer call must publish the
+        // marker that says so.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_UNLOCKED=1"),
+            "the unlocking call must mark the session as reusable",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_UNLOCKED:-0}\" = \"1\""),
+            "a nested call must branch on the inherited-session marker",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_guards_against_dbus_reexec_recursion() {
+        // `exec dbus-run-session -- "$0"` re-runs this same script. Without the
+        // env guard around it that is an unbounded fork loop inside the guest,
+        // and no other test would notice.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_DBUS:-0}\" != \"1\""),
+            "the re-exec must be guarded, or it recurses forever",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_DBUS=1"),
+            "the guard must be set before the re-exec, or it never takes effect",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_bounds_its_secret_service_calls() {
+        // A wedged Secret Service must fail the launch, not hang it. The
+        // tool-presence loop checks for `timeout`; these pin that it is
+        // actually used on both probe calls.
+        assert_eq!(
+            SCRIPT_CODEX_ACCOUNT
+                .matches("timeout 5 secret-tool")
+                .count(),
+            2,
+            "both probe secret-tool calls must be time-bounded",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_requires_a_tty_before_prompting() {
+        // Without this guard `read -rsp` blocks forever on a non-interactive
+        // session (agent bootstrap, `coop exec`), turning a clear failure into
+        // a hang.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("[ ! -t 0 ]"),
+            "the wrapper must refuse to prompt without a TTY",
         );
     }
 
