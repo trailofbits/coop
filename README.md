@@ -21,13 +21,13 @@ cargo build --release
 cp target/release/coop /usr/local/bin/
 ```
 
-Then build the VM template image, which installs the backend runtime and fetches a kernel on first run:
+Then build the VM template image:
 
 ```
 coop setup
 ```
 
-coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
+On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
 
 `coop update` replaces the running binary with the latest GitHub release, verifying its checksum and build-provenance attestation first. coop also checks for new releases in the background at most once a day; turn that off with `updates.mode = "off"` in `~/.coop/config.toml` or `COOP_NO_UPDATE_CHECK=1`. See [`coop update`](docs/commands.md#update) and the [`updates` config section](docs/configuration.md#updates-section).
 
