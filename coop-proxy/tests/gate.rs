@@ -232,10 +232,23 @@ async fn probe_reply(stream: TcpStream) -> bool {
 }
 
 async fn request_status(addr: SocketAddr, auth_header: Option<&str>) -> String {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    status_line(stream, auth_header, RESPONSE_TIMEOUT)
-        .await
-        .expect("request to the proxy failed at the socket level")
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut req =
+        String::from("POST /v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: 0\r\n");
+    if let Some(h) = auth_header {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(RESPONSE_TIMEOUT, stream.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Send a minimal HTTP/1.1 request over `stream` and return the status line, or
