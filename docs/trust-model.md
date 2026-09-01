@@ -212,10 +212,62 @@ Self-update (`update.rs`) must preserve, in order:
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
-4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop`
-   (Sigstore provenance). Skipped with a logged note if `gh` is absent, and
-   skipped entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode).
-   So provenance is *not* guaranteed on hosts without `gh` — checksum is the
+4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
+   --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
+   downloaded from the same release.
+
+   `--bundle` means **no attestations-API call and no credential** — `gh` marks
+   the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
+   The bundle asset is fetched with a deliberately unauthenticated request
+   (`curl_download(url, dest, None)` in `update.rs`, `download_bundle` in
+   `install.sh`) rather than through `download_asset` / `gh release download`,
+   which would re-attach the very credential this transport exists to avoid — a
+   SAML-restricted token would then 403 on the fetch and drop the chain back to
+   the API path. Keep both fetches credential-free. It is *not* offline:
+   without `--custom-trusted-root`, `gh` still reaches `tuf-repo.github.com`
+   and the Sigstore public-good CDN for the trust root (one-day cache) and
+   fails if neither is reachable.
+
+   It does *not* weaken the check materially, but the two transports are not
+   interchangeable, and the differences are worth stating rather than arguing
+   away:
+
+   - **The bundle path accepts a superset.** The API path only returns
+     attestations registered in the repo's attestation store, so minting one
+     requires `attestations: write`. The `--bundle` path accepts any
+     correctly-signed bundle sitting in a release, which requires only
+     `contents: write`.
+   - **The bundle path is unrevocable.** `DELETE
+     /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
+     carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
+     revocation source — so a bundle already saved by a client keeps verifying
+     indefinitely after the attestation is deleted.
+
+   What still defeats a substituted bundle is the **subject-digest binding** —
+   `gh` digests the artifact and requires a matching subject. `--repo
+   trailofbits/coop` pins the source repository and constrains the signer SAN
+   to that repo, but not to a specific workflow file or ref: any workflow on
+   any ref in `trailofbits/coop` holding `id-token: write` +
+   `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
+   / `--cert-identity` are the tighter pin and neither client passes one — the
+   API path is keyed by digest against the same repo-scoped store and is
+   equally unpinned there.
+
+   A release that publishes no bundle asset — or one whose download fails, or
+   whose bundle is empty — falls back to the API path, where `gh` requires a
+   credential authorized for the org even though the store itself is
+   anonymously readable. `update.rs` and `install.sh` treat all three
+   identically, because for a client they are one situation: no bundle to read.
+   An empty bundle is
+   rejected rather than passed through because `gh` before 2.56.0
+   (cli/cli#9541) reports success on one, having verified nothing;
+   `release.yml` also fails the release rather than publish one. A bundle that
+   downloads and fails to *verify* is refused outright, not retried through the
+   API — that is no stricter on integrity, but a digest mismatch, a corrupt
+   download and an unusable `gh` all surface here, and switching transports
+   would mask them. Skipped with a logged note if `gh` is absent, and skipped
+   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.

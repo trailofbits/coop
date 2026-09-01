@@ -552,6 +552,24 @@ test_status_running() {
         fail "status shows valid disk" "used=$disk_used total=$disk_total from: $HARNESS_OUT"
     fi
 
+    # The PID must be the VMM, not the `sudo` wrapper: a wrapper PID makes
+    # stop()'s SIGKILL fallback orphan the VM. Firecracker only.
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        local fc_pid comm=""
+        fc_pid=$(echo "$HARNESS_OUT" | sed -n 's/.*PID: \([0-9][0-9]*\).*/\1/p' | head -1)
+        if [[ -n "$fc_pid" ]]; then
+            comm=$(cat "/proc/$fc_pid/comm" 2>/dev/null || true)
+        fi
+        if [[ "$comm" == *firecracker* ]]; then
+            pass "status PID is the firecracker process (pid $fc_pid)"
+        else
+            fail "status PID is the firecracker process" \
+                "pid=${fc_pid:-<none>} comm=${comm:-<unreadable>} from: $HARNESS_OUT"
+        fi
+    else
+        skip "status PID is the firecracker process" "Firecracker-only"
+    fi
+
     # JSON output: HARNESS_OUT captures stdout only (tracing stays on stderr),
     # so `coop status --json` must be clean, parseable JSON. This exercises the
     # real stdout/stderr split on both backends.

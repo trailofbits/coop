@@ -4,29 +4,44 @@ Isolated VM environments for running Claude Code and Codex.
 
 > **Pronunciation:** "coop" (/kuːp/) — one syllable, rhymes with "loop", like the thing you keep chickens in. Not "co-op".
 
-coop is a Rust CLI that manages disposable virtual machines where Claude Code and Codex have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy. On Linux, coop runs Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. The backend is selected automatically based on platform.
+coop is a Rust CLI that manages disposable virtual machines where Claude Code and Codex have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
 
-## Quick start
+## Setup
 
-Install:
+Install the latest release:
 
-```
+```shell
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
 Or build from source (requires [Rust](https://rustup.rs/)):
 
-```
+```shell
 cargo build --release
 cp target/release/coop /usr/local/bin/
 ```
 
-Set up the VM template, start an instance, and launch an agent CLI:
+Then build the VM template image:
+
+```shell
+coop setup
+```
+
+On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
+
+Keep coop updated:
+
+```shell
+coop update
+```
+
+See [`coop update`](docs/commands.md#update) and the [`updates` config section](docs/configuration.md#updates-section).
+
+## Usage
+
+Start an instance for the current project and launch an agent CLI:
 
 ```
-export ANTHROPIC_API_KEY=sk-ant-...
-export OPENAI_API_KEY=sk-proj-...
-coop setup
 cd ~/code/my-project
 coop up
 coop claude
@@ -34,132 +49,9 @@ coop claude
 coop codex
 ```
 
-That gives you a Claude Code or Codex session running inside an isolated VM with your project synced in. `coop up` is re-runnable: it creates an environment for the current project the first time, reuses it if it is already running, and restarts it after `coop stop`. During startup, coop writes `~/.claude/settings.json` in the guest with `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Pass `--ask` to `coop claude` to restore prompts for that session (`--permission-mode default`).
-
-## Features
-
-- **Two backends**: Firecracker microVMs (Linux/KVM) and Lima VMs (macOS/Virtualization.framework), auto-detected by platform
-- **Workspace sync**: copy or mount a local project directory into the VM with `coop up`
-- **Profiles**: customizable guest environments with apt packages and install scripts; built-in profiles for Python, Node, C, Rust, Go, and fuzzing; `coop up --profile python,node` builds the matching image on demand
-- **Named images**: build multiple template images with different profiles (`coop setup --image ml-dev --profile python`)
-- **Claude Code integration**: API key forwarding, CLAUDE.md injection, plugin/marketplace support, MCP server configuration
-- **Codex integration**: API key forwarding, `~/.codex` config sync, MCP server configuration, dedicated `coop codex` launcher
-- **Editor remote SSH**: `coop editor` opens VS Code or Zed connected to the guest
-- **Multi-instance**: run multiple VMs side by side, each with its own name and disk
-- **Reconfigure in place**: change a stopped instance's disk, memory, or vCPUs with `coop resize` (e.g. `coop resize --size +20 --mem 8192 --vcpus 4`) — no destroy/recreate
-- **Commit and restore**: save a stopped instance's filesystem as a reusable image with `coop commit`, and roll an instance back to it in place with `coop restore` — a `docker container commit`-style checkpoint for risky agent runs
-- **Config optional**: works with sensible defaults; customize via `~/.coop/config.toml` when needed
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `up` | Ensure a project environment exists and is running |
-| `quickstart` | One-shot: ensure default image, start an instance for cwd, launch Claude |
-| `setup` | Install backend runtime, fetch kernel, build template rootfs |
-| `devcontainer` | Inspect devcontainer.json support without starting setup or a VM |
-| `start` | Restart a stopped VM |
-| `stop` | Stop a running VM (preserves disk) |
-| `destroy` | Stop and remove a VM instance |
-| `shell` | Interactive shell session in a running VM |
-| `claude` | Launch Claude Code inside the VM |
-| `claude-agents` (`ca`) | Open the Claude Code agent view inside the VM |
-| `codex` | Launch Codex inside the VM |
-| `exec` | Run a command in the VM non-interactively |
-| `push` | Sync local directory into the VM |
-| `pull` | Sync VM workspace back to the host |
-| `list` (`ls`) | List instances by name and state |
-| `status` | Show instance status and resource usage |
-| `model` | Show or switch a VM's model backend (cloud vs. local) |
-| `logs` | Stream VM serial console output |
-| `editor` | Open VS Code or Zed connected to the guest |
-| `ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync |
-| `images` | List or delete template images |
-| `profiles` | List or inspect available profiles |
-| `resize` | Change a stopped instance's disk, memory, or vCPUs |
-| `commit` | Save a stopped instance's filesystem as a reusable image |
-| `restore` | Roll a stopped instance back to an image's filesystem in place |
-| `init` | Generate a starter config file at ~/.coop/config.toml |
-| `validate` | Check config and prerequisites |
-| `update` | Self-update coop to the latest GitHub release |
-| `uninstall` | Remove the coop binary and (optionally) its data directories |
-| `completions` | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
-| `github` | Manage GitHub fine-grained PATs (`setup-pat`, `status`, `rotate-pat`, `forget-pat`) |
-
-## Shell completion
-
-`coop completions <bash|zsh|fish|powershell|elvish>` prints a static completion script. Adding `source <(COMPLETE=<shell> coop)` to your rc additionally completes instance, image, and profile names live. Full setup recipes are in [docs/shell-completion.md](docs/shell-completion.md).
-
-## Updating
-
-`coop update` replaces the running binary with the latest release from
-`github.com/trailofbits/coop`. It downloads the tarball matching the current
-host triple, verifies the SHA-256 against the release's `SHA256SUMS`, and
-(when `gh` is installed) verifies the GitHub build-provenance attestation
-before swapping the binary atomically.
-
-No authentication is required. When [`gh`](https://cli.github.com/) is
-authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update`
-uses it, which helps avoid GitHub API rate limits.
-
-```sh
-coop update --check             # report whether a newer release exists
-coop update                     # prompt, then install the latest release
-coop update --yes               # skip confirmation
-coop update --version v0.3.2    # pin to a specific release
-coop update --force             # reinstall the current version
-```
-
-If coop is installed in a protected directory (e.g. `/usr/local/bin`), run
-with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to
-self-update; use `install.sh` to replace them.
-
-By default, coop checks for a newer release in the background at most once
-per day and prints a one-line notice on stderr when an update is available.
-Opt out with either:
-
-- `updates.mode = "off"` in `~/.coop/config.toml`, or
-- `COOP_NO_UPDATE_CHECK=1` in the environment.
-
-The check is also silent when `CI=true` or when stdin is not a TTY.
-
-## Verifying a release
-
-Every release tarball is published with a Sigstore build-provenance
-attestation via [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance).
-The attestation proves the artifact was built from this repository by the
-tagged release workflow.
-
-Both `install.sh` and `coop update` run this verification automatically
-when the [GitHub CLI](https://cli.github.com/) is installed. Without `gh`,
-they fall back to checksum verification against the release's `SHA256SUMS`
-and print a note explaining what was and wasn't verified.
-
-To verify a downloaded tarball manually:
-
-```sh
-gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop
-```
-
-## Requirements
-
-Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are available but untested.
-
-**macOS (Lima backend)**
-
-- macOS with Apple Silicon
-- [Lima](https://github.com/lima-vm/lima) with `limactl` on your PATH (installed automatically by `coop setup`)
-- Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
-
-**Linux (Firecracker backend)**
-
-- x86_64 or arm64 architecture
-- KVM access (`/dev/kvm` must exist and be writable by your user)
-- `sudo` privileges (Firecracker uses jailer and TAP networking)
-- `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
-
 ## Documentation
 
+- [Documentation index](docs/index.md)
 - [Getting started](docs/getting-started.md)
 - [Command reference](docs/commands.md)
 - [Configuration reference](docs/configuration.md)
@@ -171,3 +63,5 @@ Tested on macOS arm64 (Apple Silicon) and Linux x86_64. Linux arm64 builds are a
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)
 - [Shell completion](docs/shell-completion.md)
+- [Architecture](docs/ARCHITECTURE.md) and [trust model](docs/trust-model.md)
+- [Contributing](CONTRIBUTING.md) and [security policy](SECURITY.md)

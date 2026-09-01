@@ -175,8 +175,10 @@ dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
 ## `coop update`
 
 `update.rs` self-updates the binary: fetch release metadata from the pinned
-`trailofbits/coop` repo, download the platform tarball + `SHA256SUMS`, verify
-the checksum (mandatory), verify Sigstore attestation via `gh` (best-effort),
+`trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
+`attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
+attestation via `gh` against that bundle, falling back to the attestations API
+when the release publishes no usable one (best-effort),
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
 binary over the running one. A background notifier checks for new versions on a
 24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and

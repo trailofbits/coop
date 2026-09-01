@@ -228,8 +228,10 @@ impl<'a> FirecrackerVm<'a, Configured> {
         let log_path = self.inst.log_path();
         let socket_path = self.inst.api_socket_path();
 
-        // Kill orphaned Firecracker process if socket exists but no
-        // PID file (crash between spawn and PID write).
+        // Kill an orphaned Firecracker if the socket is present without a
+        // PID file: stop() removes the PID file unconditionally, and
+        // is_running() drops it whenever its liveness probe fails, so the
+        // file can go missing while the process still holds the socket.
         let pid_path = self.inst.pid_file_path();
         if socket_path.exists() && !pid_path.exists() {
             tracing::warn!(
@@ -251,7 +253,13 @@ impl<'a> FirecrackerVm<'a, Configured> {
             }
         }
 
-        let fc_cmd = Cmd::new(&self.cfg.firecracker_bin)
+        // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
+        // rather than sudo's wrapper. Paths ride as positional argv ($1,
+        // $@), so nothing is interpolated into the shell string.
+        let fc_cmd = Cmd::new("sh")
+            .args(["-c", PID_TRAMPOLINE, "sh"])
+            .arg(&pid_path)
+            .arg(&self.cfg.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
             .arg("--config-file")
@@ -260,7 +268,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
             .arg(&log_path)
             .args(["--level", "Info"])
             .sudo();
-        let child = fc_cmd
+        let _child = fc_cmd
             .build()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -271,10 +279,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
                  is it installed and in PATH?",
             )?;
 
-        let pid = child.id();
-        fs::write(self.inst.pid_file_path(), pid.to_string())
-            .context("Failed to write PID file")?;
-
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(5))?;
         tracing::info!(
             "Firecracker started with PID {pid} \
              (instance '{}')",
@@ -287,8 +292,9 @@ impl<'a> FirecrackerVm<'a, Configured> {
             _state: PhantomData,
         };
 
-        // Give Firecracker a moment to start, then check it
-        // didn't crash
+        // The PID file only proves the trampoline reached its exec, so
+        // give Firecracker a beat to die before probing — otherwise
+        // check_alive() races an immediate crash.
         std::thread::sleep(Duration::from_secs(1));
         running.check_alive().context(
             "Firecracker exited immediately — \
@@ -539,8 +545,8 @@ impl<'a> FirecrackerVm<'a, Running> {
 /// Find and kill any process holding the given Unix socket.
 ///
 /// Uses `lsof` to find the PID, then sends SIGKILL. This handles
-/// orphaned Firecracker processes left behind when the PID file
-/// was never written (crash between spawn and PID write).
+/// orphaned Firecracker processes whose PID file was removed while
+/// the process still held the socket.
 fn kill_process_on_socket(socket_path: &std::path::Path) {
     let Ok(stdout) = Cmd::new("lsof").arg("-t").arg(socket_path).sudo().capture() else {
         return;
@@ -554,6 +560,49 @@ fn kill_process_on_socket(socket_path: &std::path::Path) {
             tracing::debug!("Failed to kill PID {pid_str} (non-fatal): {e}");
         }
     }
+}
+
+/// Shell wrapper that makes the recorded PID Firecracker's own.
+///
+/// `sudo` forks rather than execs when `use_pty` is on (its default since
+/// 1.9.14), so the spawned child is the wrapper and `Child::id()` names it
+/// instead of the VMM — `stop()`'s SIGKILL would then hit sudo and leave
+/// the VM running. This shell records its own PID and execs in place, so
+/// the PID file names the process SIGKILL must reach.
+///
+/// The mode is pinned because root's umask here comes from the host's
+/// PAM/`login.defs`, not ours: under a hardened `UMASK` (027 in the CIS
+/// baseline) the file would land unreadable to every unprivileged reader
+/// of it — `stop`, `status`, `check_alive` and `Instance::is_running`.
+const PID_TRAMPOLINE: &str = concat!(
+    r#"rm -f "$1" || exit 1; "#,
+    r#"echo $$ > "$1" || exit 1; "#,
+    r#"chmod 644 "$1" || exit 1; "#,
+    r#"shift; exec "$@""#,
+);
+
+/// Poll for the PID file until its contents parse as a PID.
+///
+/// Returns an error on timeout, or on the first read error that is
+/// not `NotFound`.
+fn wait_for_pid_file(pid_path: &Path, timeout: Duration) -> Result<u32> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        match fs::read_to_string(pid_path) {
+            Ok(pid_str) => {
+                if let Ok(pid) = pid_str.trim().parse() {
+                    return Ok(pid);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("Failed to read PID file"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    bail!(
+        "Timed out waiting for valid PID file at {}",
+        pid_path.display()
+    );
 }
 
 /// Poll `kill -0` until the process exits or the timeout elapses.
@@ -573,7 +622,10 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
-    use super::{MachineConfig, MiB, NonZeroU8, apply_machine_resources, read_machine_config};
+    use super::{
+        Duration, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
+        read_machine_config, wait_for_pid_file,
+    };
 
     const SAMPLE_CONFIG_JSON: &str = r#"{
         "boot-source": {"kernel_image_path": "/k", "boot_args": "console=ttyS0"},
@@ -643,5 +695,72 @@ mod tests {
         let back: MachineConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vcpu_count, 4);
         assert_eq!(back.mem_size_mib, 3072);
+    }
+
+    #[test]
+    fn wait_for_pid_file_returns_immediately_when_already_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        std::fs::write(&path, "4242\n").unwrap();
+
+        let start = Instant::now();
+        let pid = wait_for_pid_file(&path, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(pid, 4242);
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "a ready PID file must not cost a poll interval"
+        );
+    }
+
+    #[test]
+    fn wait_for_pid_file_retries_past_the_empty_write_window() {
+        // The trampoline's `echo $$ > "$1"` truncates before it writes, so a
+        // reader can legitimately observe a zero-byte file. That must retry,
+        // not fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        std::fs::write(&path, "").unwrap();
+
+        let writer = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::write(&writer, "777\n").unwrap();
+        });
+
+        assert_eq!(
+            wait_for_pid_file(&path, Duration::from_secs(5)).unwrap(),
+            777
+        );
+    }
+
+    #[test]
+    fn wait_for_pid_file_times_out_when_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.pid");
+
+        let err = wait_for_pid_file(&path, Duration::from_millis(300)).unwrap_err();
+
+        assert!(err.to_string().contains("Timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_for_pid_file_propagates_errors_other_than_not_found() {
+        // A directory reads as EISDIR, not NotFound: abort rather than spin
+        // until the timeout. This is the arm an unreadable root-owned PID
+        // file also takes.
+        let dir = tempfile::tempdir().unwrap();
+
+        let start = Instant::now();
+        let err = wait_for_pid_file(dir.path(), Duration::from_secs(30)).unwrap_err();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a non-NotFound error must return at once, not poll to timeout"
+        );
+        assert!(
+            err.to_string().contains("Failed to read PID file"),
+            "got: {err}"
+        );
     }
 }
