@@ -17,6 +17,28 @@ coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it s
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
 
+## Install
+
+Install the latest release:
+
+```
+curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
+```
+
+`install.sh` verifies the downloaded tarball's SHA-256 against the release's
+`SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
+also verifies its Sigstore build-provenance attestation. `coop update` runs the
+same checks. To verify a tarball by hand, download `attestations.jsonl` from the
+same release and pass `--bundle` (this needs no GitHub credential):
+
+```sh
+gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --bundle attestations.jsonl
+```
+
+Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
+instead, which it will only do when `gh` is logged in.
+
 ## Build from source
 
 coop is a Rust project. Install [Rust](https://rustup.rs/), then:

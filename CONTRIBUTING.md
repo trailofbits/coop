@@ -30,7 +30,8 @@ backend. The sections below note where that applies.
   - **Linux**: x86_64 or arm64 with KVM access (`/dev/kvm`), `sudo`, and
     `curl`, `tar`, `e2fsprogs`.
 
-  See the [README](README.md#requirements) for the full backend requirements.
+  See [docs/getting-started.md](docs/getting-started.md#prerequisites) for the
+  full backend requirements.
 
 ## Building
 
