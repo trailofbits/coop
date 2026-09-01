@@ -32,7 +32,8 @@ also verifies its Sigstore build-provenance attestation. `coop update` runs the
 same verification, except that it treats the checksum as mandatory and refuses
 to install without it. To verify a tarball by hand, download
 `attestations.jsonl` from the same release and pass `--bundle` (this needs no
-GitHub credential):
+GitHub credential — releases up to v0.5.4 predate the bundle asset and do
+not publish it):
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
