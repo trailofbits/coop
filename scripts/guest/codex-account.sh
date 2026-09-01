@@ -33,28 +33,20 @@ keyring_exists() {
     compgen -G "$KEYRING_DIR/*.keyring" >/dev/null 2>&1
 }
 
-eval_env_output() {
-    local output
-    output="$("$@" 2>/dev/null)" || return 1
-    if [ -n "$output" ]; then
-        eval "$output"
-    fi
-}
-
-start_keyring() {
-    eval_env_output gnome-keyring-daemon --start --components=secrets || true
-}
+# secret-tool's stderr from the last probe, so the failure path can report the
+# real cause instead of only guessing at the password.
+PROBE_ERROR=""
 
 # Writing proves the collection is both reachable and unlocked; a lookup can
 # succeed against a locked collection. The probe item is cleared again so
 # repeated launches do not accumulate junk in the user's keyring.
 probe_keyring() {
-    printf 'ok' \
+    PROBE_ERROR="$(printf 'ok' \
         | timeout 5 secret-tool store \
             --label="coop Codex keyring probe" \
             service "$PROBE_SERVICE" \
             account "$PROBE_ACCOUNT" \
-            >/dev/null 2>&1 || return 1
+            2>&1 >/dev/null)" || return 1
     timeout 5 secret-tool clear \
         service "$PROBE_SERVICE" \
         account "$PROBE_ACCOUNT" \
@@ -102,8 +94,11 @@ unlock_keyring() {
         fi
     fi
 
+    # Let the daemon's stderr reach the terminal. Once it forks it redirects
+    # its own fd 2, so this surfaces only its startup diagnostics — the probe
+    # below is what reports a wrong password.
     output="$(printf '%s' "$password" \
-        | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null)" \
+        | gnome-keyring-daemon --unlock --components=secrets)" \
         || die "failed to unlock the guest keyring"
 
     if [ -n "$output" ]; then
@@ -133,13 +128,17 @@ for tool in gnome-keyring-daemon secret-tool timeout; do
         || die "$tool is missing; rebuild the coop image with Codex account-auth support"
 done
 
-start_keyring
-if ! probe_keyring; then
-    unlock_keyring
-    start_keyring
-    probe_keyring \
-        || die "guest Secret Service is still unavailable; check the keyring password"
-fi
+# Unlock before anything else touches the bus. `gnome-keyring-daemon --unlock`
+# only creates and unlocks the login collection when it is the process that
+# starts the daemon; once any daemon owns `org.freedesktop.secrets` it hands
+# the unlock to the graphical gcr-prompter, which cannot render on a headless
+# guest and exits immediately. That includes a daemon the probe itself would
+# D-Bus-activate, so there is no cheap "is it already unlocked?" check to make
+# first — `dbus-run-session` above mints a fresh private bus every time, so
+# there is never a pre-unlocked daemon to find anyway.
+unlock_keyring
+probe_keyring \
+    || die "guest Secret Service is unavailable${PROBE_ERROR:+: $PROBE_ERROR}; check the keyring password"
 
 exec "$CODEX_BIN" "$@"
 CODEXACCOUNTEOF

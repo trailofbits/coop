@@ -1363,14 +1363,12 @@ pub fn prepare_env_forwarding(
     let codex = &cfg.codex;
     let codex_account_auth = codex.auth.uses_chatgpt_account();
     let suppress_openai_key = suppress_openai_key || codex_account_auth;
-    let openai_suppression_reason = if suppress_openai_key {
-        if codex_account_auth {
-            "codex.auth = \"chatgpt\""
-        } else {
-            "proxy mode"
-        }
+    // Only ever read under `suppress_openai_key`, so there is no "not
+    // suppressed" case to name.
+    let openai_suppression_reason = if codex_account_auth {
+        "codex.auth = \"chatgpt\""
     } else {
-        ""
+        "proxy mode"
     };
     let mut env = EnvForward::default();
 
@@ -1648,7 +1646,8 @@ fn bootstrap_codex(
             &codex.mcp_servers,
             has_plugins,
             codex.auth,
-        ) || manages_local;
+        ) || manages_local
+            || model_state.codex_keyring_materialized;
 
         if !needs_codex {
             return Ok(());
@@ -1674,7 +1673,26 @@ fn bootstrap_codex(
             local.as_ref(),
             manages_local,
             proxy.is_some(),
+            model_state.codex_keyring_materialized,
         )?;
+
+        // Same reasoning as `codex_materialized` above, for the keyring
+        // credential-store key: remember that coop has written it so a later
+        // switch back to `api_key` still rewrites a clean file that drops it,
+        // even when nothing else would trigger a rewrite.
+        //
+        // Recorded only after `copy_codex_config` succeeded, unlike
+        // `codex_materialized` — that flag records a fact already settled on
+        // the host, this one a claim about the guest. Setting it earlier would
+        // survive a failed bootstrap (a guest without Secret Service support,
+        // a dropped scp) and then force a full config rewrite on every later
+        // boot of a VM the guest key never reached — including the
+        // `read_codex_plugin_state` round-trip, whose warn-and-continue on a
+        // failed read drops the guest's own plugin tables.
+        if codex.auth.uses_chatgpt_account() && !model_state.codex_keyring_materialized {
+            model_state.codex_keyring_materialized = true;
+            model_state.save(inst)?;
+        }
 
         // Marketplaces and plugins are persisted in the guest's config.toml and
         // plugin cache (and preserved across restarts by `copy_codex_config`), so
@@ -1759,9 +1777,13 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
         "Codex ChatGPT account auth requires guest Secret Service support, \
          but this VM image does not have it.\n\
          Rebuild the image with `coop setup --rebuild` (or \
-         `coop setup --image <name> --rebuild` for a named image), then \
-         recreate or restart the VM. For an existing guest disk, install \
-         `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` manually."
+         `coop setup --image <name> --rebuild` for a named image).\n\
+         A rebuild does not touch this VM's existing guest disk, and a \
+         restart reuses it. To pick up the rebuilt image, either \
+         `coop stop` then `coop restore <vm> --image <image>` (in place, \
+         keeping the instance), or destroy and recreate the VM. \
+         Alternatively, install `dbus-user-session`, `gnome-keyring`, and \
+         `libsecret-tools` in the running guest by hand."
     );
 }
 
@@ -2384,6 +2406,7 @@ fn copy_codex_config(
     local: Option<&toml::Table>,
     manages_local: bool,
     proxy_active: bool,
+    keyring_materialized: bool,
 ) -> Result<()> {
     // The guest's config.toml holds the Codex CLI's installed `[marketplaces.*]`
     // / `[plugins.*]` tables. We only need to carry them across a *rewrite* of
@@ -2396,6 +2419,7 @@ fn copy_codex_config(
         local,
         manages_local,
         codex.auth,
+        keyring_materialized,
     ) {
         read_codex_plugin_state(target)
     } else {
@@ -2410,6 +2434,7 @@ fn copy_codex_config(
         preserved.as_ref(),
         proxy_active,
         codex.auth,
+        keyring_materialized,
     )
     .context("Failed to stage Codex config files")?;
     copy_staged_to_guest(target, &staged, ".codex", "Codex")
@@ -2585,23 +2610,32 @@ const CODEX_CONFIG_FILE: &str = "config.toml";
 
 /// Whether coop will rewrite the guest `~/.codex/config.toml` on this boot:
 /// true when the host supplies a `config.toml` base, when managed
-/// `mcp_servers` must be merged, or when a local-model block is being written
-/// or dropped (`manages_local`). When false the guest file is left untouched,
-/// so its installed plugin tables survive without coop round-tripping them.
+/// `mcp_servers` must be merged, when a local-model block is being written or
+/// dropped (`manages_local`), when `auth = "chatgpt"` needs the keyring
+/// credential store written, or when a previous boot wrote that key and this
+/// one must drop it again (`keyring_materialized`). When false the guest file
+/// is left untouched, so its installed plugin tables survive without coop
+/// round-tripping them.
 fn codex_config_needs_rewrite(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
     local: Option<&toml::Table>,
     manages_local: bool,
     auth: CodexAuthMode,
+    keyring_materialized: bool,
 ) -> bool {
     source_dir.is_some_and(|path| path.join(CODEX_CONFIG_FILE).is_file())
         || !mcp_servers.is_empty()
         || local.is_some()
         || manages_local
         || auth.uses_chatgpt_account()
+        || keyring_materialized
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent, caller-resolved fact about this boot"
+)]
 fn stage_codex_files(
     source_dir: Option<&Path>,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
@@ -2610,6 +2644,7 @@ fn stage_codex_files(
     preserved: Option<&toml::Table>,
     proxy_active: bool,
     auth: CodexAuthMode,
+    keyring_materialized: bool,
 ) -> Result<tempfile::TempDir> {
     let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
     let allowed_files = codex_allowed_files(proxy_active, auth);
@@ -2699,8 +2734,14 @@ fn stage_codex_files(
     // survives without coop having to round-trip it. This must stay in sync
     // with the gate in `copy_codex_config` that decides whether to read the
     // guest config at all — hence the shared predicate.
-    let should_write_config =
-        codex_config_needs_rewrite(source_dir, mcp_servers, local, manages_local, auth);
+    let should_write_config = codex_config_needs_rewrite(
+        source_dir,
+        mcp_servers,
+        local,
+        manages_local,
+        auth,
+        keyring_materialized,
+    );
 
     if should_write_config {
         std::fs::write(
@@ -3791,6 +3832,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         assert!(staging.path().join("AGENTS.md").is_file());
@@ -3830,6 +3872,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -3855,6 +3898,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3879,6 +3923,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             true,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         assert!(
@@ -3902,6 +3947,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ChatGpt,
+            false,
         )
         .unwrap();
 
@@ -3923,11 +3969,66 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ChatGpt,
+            false,
         )
         .unwrap();
 
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
         assert_eq!(config.trim(), "cli_auth_credentials_store = \"keyring\"");
+    }
+
+    #[test]
+    fn stage_codex_files_drops_keyring_store_when_switching_back_to_api_key() {
+        // Switching a VM from `chatgpt` to `api_key` with nothing else
+        // configured used to leave `cli_auth_credentials_store = "keyring"`
+        // behind in the guest, so the wrapper kept asking for a keyring
+        // password that was no longer needed. `keyring_materialized` (from
+        // `ModelState`) forces the rewrite that drops it.
+        let staging = stage_codex_files(
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            None,
+            false,
+            CodexAuthMode::ApiKey,
+            true,
+        )
+        .unwrap();
+
+        let path = staging.path().join("config.toml");
+        assert!(
+            path.is_file(),
+            "a previously materialized keyring store must force a rewrite",
+        );
+        let config = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !config.contains("cli_auth_credentials_store"),
+            "api_key mode must clear the keyring store, got: {config:?}",
+        );
+    }
+
+    #[test]
+    fn codex_config_needs_rewrite_on_switch_away_from_chatgpt() {
+        // The gate that lets the rewrite above happen at all: with no source,
+        // no MCP servers, no local model and `api_key` auth, only the
+        // materialized flag can force it.
+        assert!(!codex_config_needs_rewrite(
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            CodexAuthMode::ApiKey,
+            false,
+        ));
+        assert!(codex_config_needs_rewrite(
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            CodexAuthMode::ApiKey,
+            true,
+        ));
     }
 
     #[test]
@@ -3946,6 +4047,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -3968,6 +4070,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -3990,6 +4093,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -4102,6 +4206,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             Some(&preserved),
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -4137,6 +4242,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             None,
             false,
             CodexAuthMode::ApiKey,
+            false,
         )
         .unwrap();
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
@@ -4499,6 +4605,125 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(
             !env.contains("OPENAI_API_KEY"),
             "ChatGPT account auth must not forward an OpenAI API key"
+        );
+    }
+
+    // ── ensure_codex_remote_auth_consistent ─────────────────
+
+    fn auth_check_cfg(auth: CodexAuthMode, openai: bool, anthropic: bool) -> CoopConfig {
+        let upstream = || crate::config::ProxyUpstream {
+            credential: crate::config::Secret::new("sk-upstream".to_string()),
+            auth: crate::config::ProxyAuthScheme::Bearer,
+        };
+        let mut cfg = CoopConfig::default();
+        cfg.codex.auth = auth;
+        cfg.proxy.openai = openai.then(upstream);
+        cfg.proxy.anthropic = anthropic.then(upstream);
+        cfg
+    }
+
+    #[test]
+    fn codex_remote_auth_rejects_chatgpt_with_openai_upstream() {
+        // The tempdir holds no `proxy.json`, so `effective_upstream` resolves
+        // purely from the `[proxy]` config these fixtures build — the same
+        // holds for the three tests below.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = temp_instance(tmp.path());
+        let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
+        let state = crate::model_state::ModelState::default();
+        assert_eq!(state.mode, crate::model_state::ModelMode::Remote);
+
+        let err = ensure_codex_remote_auth_consistent(&cfg, &inst, &state).unwrap_err();
+        assert_eq!(err.to_string(), codex_chatgpt_proxy_conflict_message());
+    }
+
+    #[test]
+    fn codex_remote_auth_rejects_chatgpt_with_per_vm_openai_override() {
+        // The case this guard exists for, and the only one that reaches it in
+        // production: `CoopConfig::validate` already rejects a config-level
+        // `[proxy.openai]` alongside `auth = "chatgpt"`, so the pairing can
+        // only survive a validated parse when it comes from a per-VM `coop
+        // proxy --vm` override in `<inst.dir>/proxy.json`. Config `[proxy]` is
+        // empty here, so only the on-disk override can trip the bail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = temp_instance(tmp.path());
+        crate::proxy_state::ProxyState {
+            openai: Some(crate::config::ProxyUpstream {
+                credential: crate::config::Secret::new("sk-per-vm".to_string()),
+                auth: crate::config::ProxyAuthScheme::Bearer,
+            }),
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+
+        let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, false, false);
+        assert!(
+            cfg.proxy.openai.is_none(),
+            "the override must be the source"
+        );
+
+        let err = ensure_codex_remote_auth_consistent(
+            &cfg,
+            &inst,
+            &crate::model_state::ModelState::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), codex_chatgpt_proxy_conflict_message());
+    }
+
+    #[test]
+    fn codex_remote_auth_allows_chatgpt_with_openai_upstream_in_local_mode() {
+        // Local mode never starts the OpenAI proxy, so the pair is not a
+        // conflict — this is the `model_state` term of the guard.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = temp_instance(tmp.path());
+        let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
+        let state = crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        };
+
+        assert!(
+            ensure_codex_remote_auth_consistent(&cfg, &inst, &state).is_ok(),
+            "local mode must not trip the proxy conflict",
+        );
+    }
+
+    #[test]
+    fn codex_remote_auth_allows_api_key_with_openai_upstream() {
+        // The `uses_chatgpt_account` term: API-key auth is exactly what the
+        // OpenAI proxy is for.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = temp_instance(tmp.path());
+        let cfg = auth_check_cfg(CodexAuthMode::ApiKey, true, false);
+
+        assert!(
+            ensure_codex_remote_auth_consistent(
+                &cfg,
+                &inst,
+                &crate::model_state::ModelState::default(),
+            )
+            .is_ok(),
+            "api_key auth with an OpenAI upstream is the supported pairing",
+        );
+    }
+
+    #[test]
+    fn codex_remote_auth_allows_chatgpt_with_anthropic_only_upstream() {
+        // The provider argument: a Claude-only proxy says nothing about Codex.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = temp_instance(tmp.path());
+        let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, false, true);
+
+        assert!(
+            ensure_codex_remote_auth_consistent(
+                &cfg,
+                &inst,
+                &crate::model_state::ModelState::default(),
+            )
+            .is_ok(),
+            "an Anthropic-only proxy must not trip the Codex guard",
         );
     }
 

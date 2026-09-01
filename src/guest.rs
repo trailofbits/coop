@@ -494,11 +494,14 @@ mod tests {
     #[test]
     fn codex_account_script_uses_secret_service() {
         assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("/usr/local/bin/codex-account"),
+            SCRIPT_CODEX_ACCOUNT.contains("cat >/usr/local/bin/codex-account"),
             "Codex account wrapper should be installed in the guest image",
         );
         for expected in [
-            "dbus-run-session",
+            // Anchored on the re-exec itself: a bare "dbus-run-session" also
+            // matches the `command -v` guard and its die message, so it would
+            // pass even with the re-exec deleted.
+            "exec dbus-run-session -- ",
             "gnome-keyring-daemon --unlock",
             "secret-tool store",
             // The probe item must be removed again, not left in the keyring.
@@ -509,6 +512,48 @@ mod tests {
                 "Codex account wrapper is missing {expected:?}",
             );
         }
+    }
+
+    #[test]
+    fn codex_account_script_unlocks_before_touching_the_bus() {
+        // `gnome-keyring-daemon --unlock` only creates and unlocks the login
+        // collection when it is the process that starts the daemon. Once any
+        // daemon owns `org.freedesktop.secrets` — including one the probe's
+        // `secret-tool` would D-Bus-activate — the unlock is handed to the
+        // graphical gcr-prompter, which cannot run on a headless guest, and
+        // ChatGPT auth fails on every invocation. So the unlock must be the
+        // first thing the main flow does.
+        let unlock = SCRIPT_CODEX_ACCOUNT.find("\nunlock_keyring\n");
+        let probe = SCRIPT_CODEX_ACCOUNT.find("\nprobe_keyring \\");
+        assert!(
+            unlock.is_some() && probe.is_some(),
+            "the main flow must call both unlock_keyring and probe_keyring",
+        );
+        assert!(
+            unlock < probe,
+            "the main flow must unlock before probing, or the unlock is a no-op",
+        );
+        assert!(
+            !SCRIPT_CODEX_ACCOUNT.contains("gnome-keyring-daemon --start"),
+            "starting the daemon before the unlock is what breaks the unlock",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_captures_probe_stderr() {
+        // The redirect order is load-bearing and easy to "correct" wrongly:
+        // `2>&1 >/dev/null` captures stderr because `2>&1` binds while stdout
+        // is still the substitution pipe. The tidier-looking `>/dev/null 2>&1`
+        // sends both to /dev/null, leaving PROBE_ERROR always empty and the
+        // die message back to guessing at the password.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("2>&1 >/dev/null"),
+            "the probe must capture secret-tool's stderr, not discard it",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("${PROBE_ERROR:+"),
+            "the die message must report the captured cause when there is one",
+        );
     }
 
     #[test]

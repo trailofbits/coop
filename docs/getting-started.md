@@ -111,8 +111,11 @@ under `claude.api_key` or `codex.api_key` also works, but environment variables
 are preferred.
 
 For Codex account or workspace access without OpenAI API billing, set
-`[codex] auth = "chatgpt"`, rebuild any old image with `coop setup --rebuild`,
-then run `coop codex --ask -- login --device-auth` once.
+`[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
+--rebuild`. An existing VM keeps its own guest disk across a restart, so also
+run `coop restore <vm> --image <image>` (see
+[Codex integration](codex-integration.md)) to pick up the rebuilt image. Then
+run `coop codex -- login --device-auth` once.
 
 ## First run
 
@@ -272,7 +275,7 @@ coop codex
 With `[codex] auth = "chatgpt"`, first sign in from the guest:
 
 ```
-coop codex --ask -- login --device-auth
+coop codex -- login --device-auth
 ```
 
 Pass extra arguments through to `codex`:

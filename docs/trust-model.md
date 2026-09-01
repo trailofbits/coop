@@ -115,7 +115,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   credentials in the guest Linux Secret Service instead. This avoids API-key
   billing and host `auth.json` copying, but it does **not** keep the ChatGPT
   refresh token out of the guest. A compromised guest can use or extract any
-  credential its keyring session can unlock.
+  credential its keyring session can unlock. The keyring setting is written
+  during agent bootstrap, so `--no-agents` skips it. On a guest where no
+  earlier boot wrote it, the wrapper then falls through to plain Codex and
+  `codex login` writes a plaintext `~/.codex/auth.json` instead. coop warns in
+  exactly that case; the setting lives on the guest disk, so once written it
+  survives a later `--no-agents` start.
 
 ## SSH boundary
 

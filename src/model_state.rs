@@ -82,6 +82,16 @@ pub struct ModelState {
     /// if the configured endpoint has since been removed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub codex_materialized: bool,
+
+    /// Set once coop has written `cli_auth_credentials_store = "keyring"`
+    /// into the guest Codex config for `[codex] auth = "chatgpt"`. Switching
+    /// back to `api_key` otherwise leaves that key behind — with no host
+    /// `config.toml`, MCP servers, plugins, or local model there is nothing
+    /// else to rewrite for, so the guest keeps asking for a keyring password
+    /// it no longer needs. This flag keeps the file in coop's hands across
+    /// that transition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_keyring_materialized: bool,
 }
 
 impl ModelState {
@@ -93,6 +103,7 @@ impl ModelState {
             && self.claude_endpoint.is_none()
             && self.codex_endpoint.is_none()
             && !self.codex_materialized
+            && !self.codex_keyring_materialized
     }
 
     pub fn save(&self, inst: &Instance) -> Result<()> {
@@ -346,6 +357,7 @@ mod tests {
             claude_endpoint: Some(endpoint("http://localhost:11434", "qwen", None)),
             codex_endpoint: None,
             codex_materialized: false,
+            codex_keyring_materialized: false,
         };
         state.save(&inst).unwrap();
 
@@ -431,6 +443,7 @@ mod tests {
             claude_endpoint: Some(endpoint("http://localhost:1234", "m", None)),
             codex_endpoint: None,
             codex_materialized: false,
+            codex_keyring_materialized: false,
         }
         .save(&inst)
         .unwrap();
@@ -451,6 +464,7 @@ mod tests {
             claude_endpoint: None,
             codex_endpoint: None,
             codex_materialized: true,
+            codex_keyring_materialized: false,
         }
         .save(&inst)
         .unwrap();
@@ -460,6 +474,33 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .codex_materialized
+        );
+    }
+
+    #[test]
+    fn remote_with_codex_keyring_materialized_is_persisted() {
+        // Otherwise this state looks like the default and `save` deletes the
+        // file — losing the fact that the guest still carries
+        // `cli_auth_credentials_store = "keyring"` from a previous
+        // `auth = "chatgpt"` boot, so a switch back to `api_key` would never
+        // rewrite the guest config to drop it.
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = fake_instance(tmp.path().to_path_buf());
+        ModelState {
+            mode: ModelMode::Remote,
+            claude_endpoint: None,
+            codex_endpoint: None,
+            codex_materialized: false,
+            codex_keyring_materialized: true,
+        }
+        .save(&inst)
+        .unwrap();
+        assert!(inst.model_state_path().exists());
+        assert!(
+            ModelState::try_load(&inst)
+                .unwrap()
+                .unwrap()
+                .codex_keyring_materialized
         );
     }
 
@@ -484,6 +525,7 @@ mod tests {
             claude_endpoint: Some(endpoint("http://localhost:2/", "from-saved", None)),
             codex_endpoint: None,
             codex_materialized: false,
+            codex_keyring_materialized: false,
         };
         assert_eq!(
             state.resolved_claude(&claude).unwrap().model(),
@@ -499,6 +541,7 @@ mod tests {
             claude_endpoint: Some(endpoint("http://localhost:2/", "from-saved", None)),
             codex_endpoint: None,
             codex_materialized: false,
+            codex_keyring_materialized: false,
         };
         assert_eq!(
             state.resolved_claude(&claude).unwrap().model(),

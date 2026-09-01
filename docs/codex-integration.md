@@ -12,16 +12,20 @@ This SSHes into the guest and runs the `codex` CLI. By default coop passes `--da
 
 When `[codex] auth = "chatgpt"` is enabled, `coop codex` launches a small
 guest wrapper (`/usr/local/bin/codex-account`) that starts a D-Bus session,
-unlocks GNOME Keyring when needed, and then runs the real Codex binary. The
-wrapper may prompt for the guest keyring password before Codex starts.
+unlocks GNOME Keyring, and then runs the real Codex binary. In keyring mode
+each launch gets a fresh private D-Bus session, so the wrapper asks for the
+guest keyring password every time before Codex starts.
 
 The in-guest `codex-yolo` shortcut routes through the same wrapper, so it works
 in either auth mode. Running the bare `codex` binary from `coop shell` does
 not: it has no D-Bus session, and `keyring` credential storage has no
 `auth.json` fallback, so Codex will not find its credentials. Inside the guest,
 run `codex-account` (or `codex-yolo`) instead of `codex`. The wrapper is a
-transparent passthrough when `auth = "chatgpt"` is not configured, so it is
-always safe to use.
+transparent passthrough unless the guest `~/.codex/config.toml` asks for
+keyring storage, so it is safe to use in either mode. It gates on the guest
+file rather than on coop's `auth` setting, which is what keeps `codex-yolo`
+working from inside the guest; coop keeps that file in step when you switch
+modes, rewriting it on the next `coop start` to drop the keyring setting.
 
 To keep Codex's sandbox and approval prompts for a single session, pass `--ask`. coop then launches `codex` with no bypass flag, so Codex applies its normal defaults:
 
@@ -99,8 +103,8 @@ coop codex -- login --device-auth
 Then open the shown URL in your browser, sign in to the intended ChatGPT
 workspace, and enter the one-time code. Later `coop codex` launches reuse the
 cached account credentials from the guest keyring. (`coop codex` launches
-`login` and `logout` without the sandbox-bypass flag, which Codex rejects on
-those subcommands, so no `--ask` is needed.)
+`login` and `logout` without the sandbox-bypass flag — they never start an
+agent session, so there is nothing to sandbox — and no `--ask` is needed.)
 
 #### The guest keyring password
 
@@ -130,6 +134,20 @@ Images built before this support existed need a rebuild:
 ```bash
 coop setup --rebuild
 ```
+
+A rebuild only changes the golden image. An existing VM keeps its own guest
+disk across `coop stop` / `coop start`, so it will not pick up the new guest
+packages. Swap the rebuilt image in without losing the instance:
+
+```bash
+coop stop my-project
+coop restore my-project --image default
+coop start my-project
+```
+
+[`restore`](commands.md#restore) keeps the instance's name, index, IP, and
+workspace association. Destroying and recreating the VM also works, but
+discards its guest disk.
 
 ### GitHub auth
 

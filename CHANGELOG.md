@@ -12,9 +12,12 @@
   in-guest `codex-yolo` shortcut also uses and which execs Codex unchanged when
   the mode is off), suppresses every `OPENAI_API_KEY` forwarding path, and stops
   copying host `auth.json` into the guest. Sign in with `coop codex -- login
-  --device-auth`; `login` and `logout` now run without the sandbox-bypass flag
-  that Codex rejects on them. Existing images must be rebuilt with `coop setup
-  --rebuild` before using this mode.
+  --device-auth`; `login` and `logout` now run without the sandbox-bypass flag,
+  which is meaningless on subcommands that never start an agent session.
+  Existing images must be rebuilt with `coop setup --rebuild` before using this
+  mode. A restart reuses the old guest disk, so an existing VM also needs
+  `coop restore <vm> --image <image>` (or a destroy and recreate) to pick up
+  the new guest packages.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
