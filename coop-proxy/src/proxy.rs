@@ -241,7 +241,11 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
 /// Provider operations are deliberately default-deny: the coding agents only
 /// need response/message creation and Anthropic token counting, so
 /// administrative APIs and stored-resource reads must never inherit the host
-/// credential's broader authority.
+/// credential's broader authority. Agent upgrades that require another route
+/// must fail with 403 until this policy, its tests, and the documentation are
+/// deliberately updated. Codex currently identifies this custom provider as
+/// `coop credential proxy`, not `OpenAI`, so its OpenAI-specific
+/// `POST /v1/responses/compact` behavior does not apply.
 fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
     if method != Method::POST {
         return false;

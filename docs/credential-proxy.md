@@ -59,6 +59,16 @@ existing conversations, responses, prompts, or files) when the injected key is
 authorized for them. The allowlist is defense in depth against broad API use,
 not object-level tenant isolation.
 
+The policy is intentionally closed: if a future agent version needs another
+endpoint, it fails locally with `403` until coop adds and reviews that route.
+Claude Code may issue `HEAD /api/hello` and `GET /v1/models?limit=1000` for
+warmup or discovery; proxy mode intentionally refuses both because its normal
+message and token-count operations do not require gateway discovery. Codex's
+proxy provider is named `coop credential proxy`, not `OpenAI`, so Codex does
+not currently enable its OpenAI-specific `POST /v1/responses/compact` behavior.
+If either client changes this behavior, add the route only with an explicit
+policy, test, and documentation update.
+
 ## Enabling it
 
 The easiest path is `coop proxy setup`: it takes a pasted credential, stores it
