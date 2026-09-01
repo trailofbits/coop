@@ -833,7 +833,7 @@ Kept across the wipe, because coop persists them host-side:
 
 **Not replayed**, because coop does not persist them:
 
-- Extra `--extra-mount` directories. Only the *primary* workspace source is recorded, so an instance created with `--extra-mount /host/data:/data` comes back without `/data`. There is no way to re-add one to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering it means `coop destroy` and a fresh `coop up`.
+- Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
 - A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
 

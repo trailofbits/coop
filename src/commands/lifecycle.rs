@@ -2361,8 +2361,11 @@ struct ReprovisionWorkspaceInputs {
 /// blank disk from the same source it was originally filled from.
 ///
 /// `WorkspaceState` records only the *primary* source, so extra
-/// `--extra-mount` data directories are not replayed — an instance created
-/// with `--extra-mount /host/data:/data` comes back without `/data`. There is
+/// `--extra-mount` data directories are not replayed. What that costs is
+/// backend-dependent: on Firecracker a mount is a one-time sync into the
+/// rootfs, so `/data` comes back empty; on Lima it is declared in `lima.yaml`,
+/// which `restore_disk` does not touch and `start_existing` re-reads, so it
+/// may be served again. Either way coop does not re-establish it, and there is
 /// no recovery short of `coop destroy` and a fresh `coop up`: `--extra-mount`
 /// is creation-only (`coop up` against an existing instance rejects it), and
 /// `coop push` writes to the recorded `guest_path`, not to an arbitrary mount

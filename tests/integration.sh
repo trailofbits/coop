@@ -3984,7 +3984,7 @@ test_host_mount() {
 
     # Host-side, after boot. On Firecracker only a re-sync can carry it into
     # the guest; on Lima the live mount serves it either way.
-    echo "remounted" > "$mount_dir/reprovision-marker.txt"
+    echo "remounted" > "$mount_dir/mount-remount-marker.txt"
 
     # The instance is running; --reprovision stops it itself.
     if coop restore "$mount_instance" --reprovision -y --no-agents; then
@@ -4012,7 +4012,7 @@ test_host_mount() {
                 "got '$mnt_original' (expected 'mount-test-content')"
         fi
 
-        mnt_marker=$(guest_exec cat /workspace/reprovision-marker.txt) || mnt_marker=""
+        mnt_marker=$(guest_exec cat /workspace/mount-remount-marker.txt) || mnt_marker=""
         if [[ "$mnt_marker" == "remounted" ]]; then
             pass "mount reprovision picks up host writes made before it"
         else
