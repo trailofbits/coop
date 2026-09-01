@@ -2525,7 +2525,14 @@ test_restore_reprovision() {
     # instance is STOPPED here. Neither `coop shell` nor `coop exec` auto-starts
     # — both go through resolve_running, which bails "is not running" — so
     # every guest-side seed and assertion below needs it up first.
-    if coop start "$INSTANCE" --no-agents; then
+    #
+    # Probe before starting rather than starting unconditionally: `coop start`
+    # is not idempotent (find_stopped_instance bails "already running"), and the
+    # previous phase's trailing stop is `|| true`. A transient stop failure
+    # there would otherwise make this guard fail and skip the whole phase.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "instance is up before reprovision seeding"
+    elif coop start "$INSTANCE" --no-agents; then
         pass "start instance before reprovision seeding"
     else
         fail "start instance before reprovision seeding" \
@@ -2631,13 +2638,49 @@ test_restore_reprovision() {
     # refresh. `provision_first_boot` calls `refresh_ssh_config_if_present`,
     # which is gated on the marker block existing (workspace.rs), and
     # test_ssh_config ran `--clean` long before this phase — so without this
-    # the call is a no-op and nothing covers it. On Lima the forwarded port
-    # changes across the reprovision's stop/start, so a stale block leaves the
-    # alias pointing at a dead port.
+    # the call is a no-op and nothing covers it.
+    #
+    # Then deliberately break the block's Port. Relying on the port changing
+    # by itself only works on Lima (Firecracker's guest IP and port 22 are
+    # stable across stop/start), so on Firecracker an unrefreshed block would
+    # still connect and the assertion would pass without exercising anything.
+    # Pointing it at port 1 makes the post-reprovision connection succeed only
+    # if the refresh actually rewrote the block, on both backends.
     local ssh_alias_seeded=""
     if coop ssh-config "$INSTANCE"; then
         ssh_alias_seeded=1
         pass "install coop-$INSTANCE alias before reprovision"
+        # Exits non-zero unless it actually rewrote a Port line inside this
+        # instance's block, so a marker-format change cannot leave the
+        # assertion below silently vacuous.
+        if python3 - "$HOME/.ssh/config" "coop-$INSTANCE" <<'PYEOF'
+import re, sys
+path, host = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    lines = f.readlines()
+out, inside, staled = [], False, 0
+for line in lines:
+    if line.strip() == f"# coop START {host}":
+        inside = True
+    elif line.strip() == "# coop END":
+        inside = False
+    elif inside:
+        line, n = re.subn(r"^(\s*)Port\s+\d+\s*$", r"\1Port 1", line.rstrip("\n"))
+        line += "\n"
+        staled += n
+    out.append(line)
+if staled != 1:
+    sys.exit(f"expected exactly one Port line in the {host} block, rewrote {staled}")
+with open(path, "w") as f:
+    f.writelines(out)
+PYEOF
+        then
+            pass "staled the coop-$INSTANCE alias port before reprovision"
+        else
+            fail "staled the coop-$INSTANCE alias port before reprovision" \
+                "could not rewrite the Port line; the assertion below would be vacuous"
+            ssh_alias_seeded=""
+        fi
     else
         fail "install coop-$INSTANCE alias before reprovision" "stderr: $HARNESS_ERR"
     fi
@@ -2786,11 +2829,11 @@ test_restore_reprovision() {
             "before=${guest_fs_before} after=${guest_fs_after} 1K-blocks (the re-grow did not reach the guest)"
     fi
 
-    # The `coop-<name>` alias installed before the reprovision must still
-    # connect: `provision_first_boot` calls `refresh_ssh_config_if_present`,
-    # and on Lima the forwarded port changed across the stop/start, so an
-    # unrefreshed block points at a dead port. Cleaned up afterwards to leave
-    # ~/.ssh/config as this phase found it.
+    # The `coop-<name>` alias must connect again. Its Port was set to 1 above,
+    # so this succeeds only if `refresh_ssh_config_if_present` rewrote the
+    # block during `provision_first_boot` — the one assertion covering that
+    # call, and it now discriminates on Firecracker as well as Lima. Cleaned up
+    # afterwards to leave ~/.ssh/config as this phase found it.
     if [[ -n "$ssh_alias_seeded" ]]; then
         if _timeout 30 ssh "coop-$INSTANCE" echo "reprovision-alias-ok" 2>/dev/null \
             | grep -q "reprovision-alias-ok"; then
@@ -3261,6 +3304,60 @@ test_git_repo() {
         fail "up --git-repo reuses the running instance" \
             "list changed: $(diff <(echo "$pre_list") <(echo "$post_list"))"
     fi
+
+    # `restore --reprovision` against a GIT-REPO-source instance, so the
+    # GitRepo arm of `reprovision_workspace_inputs` has end-to-end coverage
+    # too — the main reprovision phase only exercises the copy transport. The
+    # instance is running here, and --reprovision stops it itself.
+    # `--no-agents` for the same reason as the mount phase: the subject here is
+    # the re-clone, not the bootstrap.
+    GUEST_INSTANCE="$gr_instance"
+
+    if guest_exec sh -c 'echo pre-reprovision > ~/gr-sentinel'; then
+        pass "seed guest sentinel before git-repo reprovision"
+    else
+        fail "seed guest sentinel before git-repo reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    if coop restore "$gr_instance" --reprovision -y --no-agents; then
+        pass "restore --reprovision exits 0 for a git-repo instance"
+
+        local gr_sentinel gr_head_after
+        if ! gr_sentinel=$(guest_exec sh -c 'test -e ~/gr-sentinel && echo present || echo absent'); then
+            fail "git-repo reprovision wipes guest filesystem state" \
+                "guest unreachable after reprovision; stderr: $(guest_stderr)"
+        elif [[ "$gr_sentinel" == "absent" ]]; then
+            pass "git-repo reprovision wipes guest filesystem state"
+        else
+            fail "git-repo reprovision wipes guest filesystem state" \
+                "~/gr-sentinel is '$gr_sentinel' (expected 'absent')"
+        fi
+
+        # The clone was re-run from the URL in workspace.json: /workspace was
+        # wiped with the disk, so a valid HEAD can only come from a re-clone.
+        if gr_head_after=$(guest_exec git -C /workspace rev-parse HEAD); then
+            if [[ -n "$gr_head_after" ]]; then
+                pass "git-repo reprovision re-clones the repository"
+            else
+                fail "git-repo reprovision re-clones the repository" \
+                    "empty rev-parse output"
+            fi
+        else
+            fail "git-repo reprovision re-clones the repository" \
+                "git rev-parse failed: $(guest_stderr)"
+        fi
+
+        # Deliberately no assertion on /data. `--extra-mount` is not replayed
+        # by coop, but whether the mount point itself survives is backend
+        # dependent (Firecracker syncs once at create; Lima's own mount
+        # declaration may re-establish it on a fresh boot), and asserting
+        # either way would be wrong on one of them.
+    else
+        fail "restore --reprovision exits 0 for a git-repo instance" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+
+    unset GUEST_INSTANCE
 
     coop destroy "$gr_instance" 2>/dev/null || true
     untrack_instance "$gr_instance"
@@ -3864,6 +3961,67 @@ test_host_mount() {
     else
         skip "bidirectional mount" "Firecracker uses one-time rsync sync"
         skip "live mount sync" "Firecracker uses one-time rsync sync"
+    fi
+
+    # `restore --reprovision` against a MOUNT-source instance. The main
+    # reprovision phase only covers WorkspaceSource::Workspace (the copy
+    # transport), so without this the Mount arm of
+    # `reprovision_workspace_inputs` is only unit-tested as a pure function.
+    # It is the arm with a real backend divergence: `create_and_start` receives
+    # the mount set and `start_existing` does not, so a reprovisioned mount
+    # instance depends on the backend's own mount declaration surviving and
+    # being re-established against a wiped disk.
+    #
+    # `--no-agents` on purpose here, unlike the main reprovision phase: this
+    # phase is about the workspace source, and that phase already covers the
+    # agent-bootstrap half. Skipping it also keeps an unrelated bootstrap
+    # failure from being reported as a mount regression.
+    if guest_exec sh -c 'echo pre-reprovision > ~/mnt-sentinel'; then
+        pass "seed guest sentinel before mount reprovision"
+    else
+        fail "seed guest sentinel before mount reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    # Host-side, after boot. On Firecracker only a re-sync can carry it into
+    # the guest; on Lima the live mount serves it either way.
+    echo "remounted" > "$mount_dir/reprovision-marker.txt"
+
+    # The instance is running; --reprovision stops it itself.
+    if coop restore "$mount_instance" --reprovision -y --no-agents; then
+        pass "restore --reprovision exits 0 for a mount-source instance"
+
+        local mnt_sentinel mnt_marker mnt_original
+        if ! mnt_sentinel=$(guest_exec sh -c 'test -e ~/mnt-sentinel && echo present || echo absent'); then
+            fail "mount reprovision wipes guest filesystem state" \
+                "guest unreachable after reprovision; stderr: $(guest_stderr)"
+        elif [[ "$mnt_sentinel" == "absent" ]]; then
+            pass "mount reprovision wipes guest filesystem state"
+        else
+            fail "mount reprovision wipes guest filesystem state" \
+                "~/mnt-sentinel is '$mnt_sentinel' (expected 'absent')"
+        fi
+
+        # The load-bearing one: /workspace still serves the host directory
+        # after the disk was replaced. `sentinel.txt` has been there since
+        # creation, so this fails if the mount was not re-established.
+        mnt_original=$(guest_exec cat /workspace/sentinel.txt) || mnt_original=""
+        if [[ "$mnt_original" == "mount-test-content" ]]; then
+            pass "mount reprovision re-establishes /workspace from the host"
+        else
+            fail "mount reprovision re-establishes /workspace from the host" \
+                "got '$mnt_original' (expected 'mount-test-content')"
+        fi
+
+        mnt_marker=$(guest_exec cat /workspace/reprovision-marker.txt) || mnt_marker=""
+        if [[ "$mnt_marker" == "remounted" ]]; then
+            pass "mount reprovision picks up host writes made before it"
+        else
+            fail "mount reprovision picks up host writes made before it" \
+                "got '$mnt_marker' (expected 'remounted')"
+        fi
+    else
+        fail "restore --reprovision exits 0 for a mount-source instance" \
+            "exit code: $?; stderr: $HARNESS_ERR"
     fi
 
     unset GUEST_INSTANCE

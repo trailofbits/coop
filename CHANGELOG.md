@@ -41,7 +41,9 @@
   instance already records; it stays required otherwise. `-y` skips the
   confirmation and is required off a TTY. `-y`, `--no-agents` and `--no-prompt`
   are rejected without `--reprovision`, since none of them mean anything to a
-  plain disk swap. `coop restore` without `--reprovision` is unchanged.
+  plain disk swap. Unlike a plain `restore`, which requires a stopped instance,
+  `--reprovision` also accepts a running one and stops it itself. `coop restore`
+  without `--reprovision` is unchanged.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
