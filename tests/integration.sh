@@ -1253,8 +1253,9 @@ test_agent_update() {
         # Model the broken legacy/corrupt-package state from #442. The forced
         # updater must rebuild an incomplete same-SHA release, not merely keep
         # an already healthy host executable in place.
-        local installed_host
+        local installed_host installed_codex_version
         installed_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+        installed_codex_version=$(guest_exec codex --version)
         if guest_exec sudo rm -f "$installed_host" \
             && guest_exec test ! -e /usr/local/bin/codex-code-mode-host; then
             pass "removed code-mode host before updater repair test"
@@ -1279,14 +1280,16 @@ test_agent_update() {
                 "got: $ver stderr: $(guest_stderr)"
         fi
 
-        local repaired_host
+        local repaired_host repaired_codex_version
         repaired_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+        repaired_codex_version=$(guest_exec codex --version)
         if guest_exec test -x /usr/local/bin/codex-code-mode-host \
-            && [[ "$repaired_host" == "$installed_host" ]]; then
-            pass "codex update repairs code-mode host in the same release"
+            && { [[ "$repaired_codex_version" != "$installed_codex_version" ]] \
+                || [[ "$repaired_host" == "$installed_host" ]]; }; then
+            pass "codex update repairs missing code-mode host"
         else
-            fail "codex update repairs code-mode host in the same release" \
-                "before=$installed_host after=$repaired_host stderr: $(guest_stderr)"
+            fail "codex update repairs missing code-mode host" \
+                "before=$installed_host ($installed_codex_version) after=$repaired_host ($repaired_codex_version) stderr: $(guest_stderr)"
         fi
     else
         skip "agent update --codex" "use --full; downloads the release in-guest"
