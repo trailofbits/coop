@@ -70,6 +70,53 @@ codex_reconcile_public_entrypoints() {
     done
 }
 
+codex_current_release_sha() {
+    local current_target current_sha
+
+    current_target=$(readlink -f "$CODEX_INSTALL_ROOT/current" 2>/dev/null) || return 1
+    [ "$(dirname "$current_target")" = "$CODEX_RELEASES_DIR" ] || return 1
+    current_sha=$(basename "$current_target")
+    [[ "$current_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$current_sha"
+}
+
+codex_release_has_live_executable() {
+    local release_dir="$1"
+    local proc_exe executable
+
+    # Processes can disappear, or become unreadable, between glob expansion
+    # and readlink. Those ordinary /proc races must not abort an update under
+    # `set -e`.
+    for proc_exe in /proc/[0-9]*/exe; do
+        [ -L "$proc_exe" ] || continue
+        executable=$(readlink "$proc_exe" 2>/dev/null) || continue
+        case "$executable" in
+            "$release_dir"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+codex_gc_releases() {
+    local current_sha="$1"
+    local previous_sha="$2"
+    local release_dir release_sha
+
+    for release_dir in "$CODEX_RELEASES_DIR"/*; do
+        # Never follow or remove a symlink. Release directories created by
+        # this installer have strict lowercase SHA-256 names.
+        [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || continue
+        release_sha=$(basename "$release_dir")
+        [[ "$release_sha" =~ ^[0-9a-f]{64}$ ]] || continue
+        [ "$release_sha" = "$current_sha" ] && continue
+        [ -n "$previous_sha" ] && [ "$release_sha" = "$previous_sha" ] && continue
+        if codex_release_has_live_executable "$release_dir"; then
+            continue
+        fi
+        rm -rf -- "$release_dir"
+    done
+}
+
 # COOP_FORCE_INSTALL bypasses the installed-package guard so `coop agent
 # update --codex` always checks upstream. Normal setup skips only a complete,
 # root-owned package; two manually copied binaries are not enough.
@@ -80,6 +127,13 @@ if [ -z "${COOP_FORCE_INSTALL:-}" ] \
     echo '  [guest] Codex CLI package already installed, skipping.'
 else
     echo '  [guest] Installing Codex CLI package...'
+
+    # Serialize the complete update, including resolving the moving `latest`
+    # release. Otherwise a slower updater can download an older release, wait
+    # for a newer updater to activate, and then roll `current` backward.
+    install -d -m 755 "$CODEX_RELEASES_DIR"
+    exec 9>"$CODEX_INSTALL_ROOT/install.lock"
+    flock 9
 
     CODEX_TMP_DIR=$(mktemp -d)
     CODEX_STAGING_DIR=""
@@ -151,11 +205,13 @@ else
         exit 1
     fi
 
-    install -d -m 755 "$CODEX_RELEASES_DIR"
-    exec 9>"$CODEX_INSTALL_ROOT/install.lock"
-    flock 9
     find "$CODEX_RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
         -name '.staging-*' -exec rm -rf -- {} +
+
+    CODEX_PREVIOUS_RELEASE_SHA=""
+    if previous_release_sha=$(codex_current_release_sha); then
+        CODEX_PREVIOUS_RELEASE_SHA="$previous_release_sha"
+    fi
 
     CODEX_RELEASE_DIR="$CODEX_RELEASES_DIR/$CODEX_PACKAGE_SHA"
     if ! codex_installed_package_is_safe "$CODEX_RELEASE_DIR"; then
@@ -184,7 +240,9 @@ else
     CODEX_NEXT_LINK=""
 
     codex_reconcile_public_entrypoints
+    codex_installed_package_is_safe "$CODEX_INSTALL_ROOT/current"
     /usr/local/bin/codex --version >/dev/null
+    codex_gc_releases "$CODEX_PACKAGE_SHA" "$CODEX_PREVIOUS_RELEASE_SHA"
     flock -u 9
     exec 9>&-
 fi

@@ -520,6 +520,57 @@ mod tests {
     }
 
     #[test]
+    fn codex_script_locks_before_resolving_latest_release() {
+        let lock = SCRIPT_CODEX.find("flock 9").unwrap();
+        let first_fetch = SCRIPT_CODEX.find("releases/latest/download").unwrap();
+        let final_validation = SCRIPT_CODEX
+            .rfind("codex_installed_package_is_safe \"$CODEX_INSTALL_ROOT/current\"")
+            .unwrap();
+        let unlock = SCRIPT_CODEX.find("flock -u 9").unwrap();
+
+        assert!(
+            lock < first_fetch,
+            "update lock must precede the first fetch"
+        );
+        assert!(
+            final_validation < unlock,
+            "activation must be validated before releasing the update lock",
+        );
+    }
+
+    #[test]
+    fn codex_script_garbage_collects_only_safe_inactive_releases() {
+        let final_validation = SCRIPT_CODEX
+            .rfind("codex_installed_package_is_safe \"$CODEX_INSTALL_ROOT/current\"")
+            .unwrap();
+        let garbage_collection = SCRIPT_CODEX
+            .find("codex_gc_releases \"$CODEX_PACKAGE_SHA\" \"$CODEX_PREVIOUS_RELEASE_SHA\"")
+            .unwrap();
+        let unlock = SCRIPT_CODEX.find("flock -u 9").unwrap();
+
+        assert!(
+            final_validation < garbage_collection && garbage_collection < unlock,
+            "release collection should run after validation and while holding the update lock",
+        );
+
+        for expected in [
+            "codex_gc_releases \"$CODEX_PACKAGE_SHA\" \"$CODEX_PREVIOUS_RELEASE_SHA\"",
+            "[[ \"$release_sha\" =~ ^[0-9a-f]{64}$ ]] || continue",
+            "[ ! -L \"$release_dir\" ]",
+            "[ \"$release_sha\" = \"$current_sha\" ] && continue",
+            "[ \"$release_sha\" = \"$previous_sha\" ] && continue",
+            "for proc_exe in /proc/[0-9]*/exe",
+            "executable=$(readlink \"$proc_exe\" 2>/dev/null) || continue",
+            "codex_release_has_live_executable \"$release_dir\"",
+        ] {
+            assert!(
+                SCRIPT_CODEX.contains(expected),
+                "Codex release retention is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
     fn codex_account_script_uses_secret_service() {
         assert!(
             SCRIPT_CODEX_ACCOUNT.contains("cat >/usr/local/bin/codex-account"),

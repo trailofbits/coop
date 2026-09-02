@@ -1063,27 +1063,40 @@ test_claude_onboarding_seed() {
     fi
 }
 
-test_codex_bin_path() {
-    echo ""
-    echo "=== Phase: codex binary path ==="
+validate_codex_package() {
+    local context="$1"
 
     if guest_exec test -x /usr/local/bin/codex; then
-        pass "codex binary exists at /usr/local/bin/codex"
+        pass "codex binary exists at /usr/local/bin/codex ($context)"
     else
-        fail "codex binary exists at /usr/local/bin/codex" "stderr: $(guest_stderr)"
+        fail "codex binary exists at /usr/local/bin/codex ($context)" \
+            "stderr: $(guest_stderr)"
         return
     fi
 
     if coop_exec /usr/local/bin/codex --version >/dev/null; then
-        pass "codex binary invocable via full path"
+        pass "codex binary invocable via full path ($context)"
     else
-        fail "codex binary invocable via full path" "stderr: $(guest_stderr)"
+        fail "codex binary invocable via full path ($context)" \
+            "stderr: $(guest_stderr)"
     fi
 
     if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
-        pass "codex code-mode host exists and is executable"
+        pass "codex code-mode host exists and is executable ($context)"
     else
-        fail "codex code-mode host exists and is executable" \
+        fail "codex code-mode host exists and is executable ($context)" \
+            "stderr: $(guest_stderr)"
+        return
+    fi
+
+    # `--help` exits before the host initializes its transport. Stdio with EOF
+    # exercises the real entrypoint without starting a persistent service; the
+    # timeout makes a regression fail instead of hanging the integration run.
+    if coop_exec sh -c \
+        'timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio </dev/null >/dev/null'; then
+        pass "codex code-mode host accepts stdio transport ($context)"
+    else
+        fail "codex code-mode host accepts stdio transport ($context)" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -1093,9 +1106,9 @@ test_codex_bin_path() {
     if [[ "$codex_path" =~ ^(/usr/local/lib/codex/releases/[0-9a-f]{64})/bin/codex$ ]] \
         && [[ "$code_mode_path" == "${BASH_REMATCH[1]}/bin/codex-code-mode-host" ]]; then
         codex_release="${BASH_REMATCH[1]}"
-        pass "codex and code-mode host come from the same package"
+        pass "codex and code-mode host come from the same package ($context)"
     else
-        fail "codex and code-mode host come from the same package" \
+        fail "codex and code-mode host come from the same package ($context)" \
             "codex=$codex_path host=$code_mode_path"
         return
     fi
@@ -1104,19 +1117,26 @@ test_codex_bin_path() {
         -a -x "$codex_release/codex-resources/bwrap" \
         -a -x "$codex_release/codex-resources/zsh/bin/zsh" \
         -a -f "$codex_release/codex-package.json"; then
-        pass "codex package runtime resources are installed"
+        pass "codex package runtime resources are installed ($context)"
     else
-        fail "codex package runtime resources are installed" \
+        fail "codex package runtime resources are installed ($context)" \
             "release=$codex_release stderr: $(guest_stderr)"
     fi
 
     if guest_exec test ! -w "$codex_release/bin/codex" \
         -a ! -w "$codex_release/bin/codex-code-mode-host"; then
-        pass "codex package executables are not guest-writable"
+        pass "codex package executables are not guest-writable ($context)"
     else
-        fail "codex package executables are not guest-writable" \
+        fail "codex package executables are not guest-writable ($context)" \
             "release=$codex_release stderr: $(guest_stderr)"
     fi
+}
+
+test_codex_bin_path() {
+    echo ""
+    echo "=== Phase: codex binary path ==="
+
+    validate_codex_package "after provisioning"
 
     if guest_exec test -x /usr/local/bin/codex-yolo; then
         pass "codex-yolo shortcut exists"
@@ -1254,6 +1274,53 @@ test_agent_update() {
         # updater must rebuild an incomplete same-SHA release, not merely keep
         # an already healthy host executable in place.
         local installed_host installed_codex_version
+        local inactive_sha active_sha inactive_release active_release active_pid active_exe
+        inactive_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        active_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        inactive_release="/usr/local/lib/codex/releases/$inactive_sha"
+        active_release="/usr/local/lib/codex/releases/$active_sha"
+        active_pid=""
+
+        # Seed one collectable release and one whose executable is live. The
+        # updater should bound disk growth without breaking an in-flight Codex
+        # session that still needs files from its package directory.
+        # shellcheck disable=SC2016 # Variables expand in the guest's sh, not here.
+        if guest_exec sudo sh -c '
+            set -eu
+            inactive_release=$1
+            active_release=$2
+            install -d -m 755 "$inactive_release" "$active_release/bin"
+            cp /bin/sleep "$active_release/bin/hold"
+            chmod 755 "$active_release/bin/hold"
+            nohup "$active_release/bin/hold" 300 </dev/null >/dev/null 2>&1 &
+            active_pid=$!
+            echo "$active_pid" >/tmp/coop-codex-active-release.pid
+            attempt=0
+            while [ "$attempt" -lt 50 ]; do
+                executable=$(readlink -f "/proc/$active_pid/exe" 2>/dev/null || true)
+                [ "$executable" = "$active_release/bin/hold" ] && exit 0
+                attempt=$((attempt + 1))
+                sleep 0.1
+            done
+            exit 1
+        ' sh "$inactive_release" "$active_release"; then
+            active_pid=$(guest_exec cat /tmp/coop-codex-active-release.pid) \
+                || active_pid=""
+            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
+                || active_exe=""
+            if [[ "$active_exe" == "$active_release/bin/hold" ]]; then
+                pass "seeded inactive and live Codex releases for garbage collection"
+            else
+                fail "seeded inactive and live Codex releases for garbage collection" \
+                    "pid=${active_pid:-unknown} exe=${active_exe:-unknown} stderr: $(guest_stderr)"
+            fi
+        else
+            active_pid=$(guest_exec cat /tmp/coop-codex-active-release.pid) \
+                || active_pid=""
+            fail "seeded inactive and live Codex releases for garbage collection" \
+                "stderr: $(guest_stderr)"
+        fi
+
         installed_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
         installed_codex_version=$(guest_exec codex --version)
         if guest_exec sudo rm -f "$installed_host" \
@@ -1291,6 +1358,38 @@ test_agent_update() {
             fail "codex update repairs missing code-mode host" \
                 "before=$installed_host ($installed_codex_version) after=$repaired_host ($repaired_codex_version) stderr: $(guest_stderr)"
         fi
+
+        validate_codex_package "after updater repair"
+
+        if guest_exec test ! -e "$inactive_release"; then
+            pass "codex update prunes an inactive release"
+        else
+            fail "codex update prunes an inactive release" \
+                "release still exists: $inactive_release"
+        fi
+        active_exe=""
+        if [[ -n "$active_pid" ]]; then
+            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
+                || active_exe=""
+        fi
+        if [[ "$active_exe" == "$active_release/bin/hold" ]] \
+            && guest_exec test -d "$active_release" \
+            && guest_exec sudo kill -0 "$active_pid"; then
+            pass "codex update preserves a release with a live executable"
+        else
+            fail "codex update preserves a release with a live executable" \
+                "release=$active_release pid=${active_pid:-unknown} exe=${active_exe:-unknown} stderr: $(guest_stderr)"
+        fi
+
+        if [[ -n "$active_pid" ]]; then
+            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
+                || active_exe=""
+            if [[ "$active_exe" == "$active_release/bin/hold" ]]; then
+                guest_exec sudo kill "$active_pid" 2>/dev/null || true
+            fi
+        fi
+        guest_exec sudo rm -rf -- "$active_release" "$inactive_release" \
+            /tmp/coop-codex-active-release.pid || true
     else
         skip "agent update --codex" "use --full; downloads the release in-guest"
     fi
