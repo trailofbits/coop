@@ -9,10 +9,10 @@
 //! The two agents differ in how they update, and the difference is encoded in
 //! [`UpdateStrategy`] so no caller can run the wrong one:
 //!
-//! - **Codex** lives at root-owned `/usr/local/bin/codex` and has no
-//!   background updater. coop re-runs its own installer ([`guest::SCRIPT_CODEX`])
-//!   as root with `COOP_FORCE_INSTALL=1` to overwrite the binary with the
-//!   current release.
+//! - **Codex** is a root-owned package exposed through `/usr/local/bin` and has
+//!   no background updater. coop re-runs its own installer
+//!   ([`guest::SCRIPT_CODEX`]) as root with `COOP_FORCE_INSTALL=1` to install
+//!   the current release and atomically switch its entrypoints.
 //! - **Claude Code** lives in the guest user's `~/.local/bin` and already
 //!   auto-updates in the background. `coop agent update --claude` just runs
 //!   `claude update` synchronously as the guest user — a convenience, not a

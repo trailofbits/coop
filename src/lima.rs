@@ -1490,7 +1490,7 @@ fn compose_provision_script(
     s.push_str(SCRIPT_CLAUDE_CODE);
     s.push('\n');
 
-    // Codex CLI (standalone binary under /usr/local/bin)
+    // Codex CLI package (stable entrypoints under /usr/local/bin)
     s.push_str(SCRIPT_CODEX);
     s.push('\n');
     s.push_str(SCRIPT_CODEX_ACCOUNT);

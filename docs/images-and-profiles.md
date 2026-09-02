@@ -26,7 +26,9 @@ Every template installs these packages regardless of profile selection.
 
 **Claude Code CLI:** installed via the native installer during the template build.
 
-**Codex CLI:** installed as a standalone binary during the template build.
+**Codex CLI:** installed as a complete package during the template build. The
+package contains the CLI, its code-mode host, and bundled runtime resources;
+stable entrypoints under `/usr/local/bin` switch together on update.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages

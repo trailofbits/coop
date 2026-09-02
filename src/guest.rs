@@ -122,6 +122,11 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
+/// Companion process used by Codex for Code Mode execution.
+pub fn codex_code_mode_host_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex-code-mode-host")
+}
+
 /// Wrapper that runs Codex with a guest Linux Secret Service session.
 pub fn codex_account_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex-account")
@@ -170,12 +175,13 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         codex_bin(),
+        codex_code_mode_host_bin(),
         codex_account_bin(),
         // The Secret Service stack `codex-account` drives. Checking the
         // wrapper alone proves nothing — the provision script always writes
@@ -484,11 +490,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_script_installs_extracted_binary_not_archive() {
+    fn codex_script_installs_complete_package_atomically() {
         assert!(
-            SCRIPT_CODEX.contains("BIN=\"$TMPDIR/${ASSET%.tar.gz}\""),
-            "Codex installer should target the extracted binary path directly",
+            SCRIPT_CODEX.contains("codex-package-$CODEX_TARGET.tar.gz"),
+            "Codex installer should download the complete upstream package",
         );
+        for expected in [
+            "bin/codex-code-mode-host",
+            "codex-package.json",
+            "codex-resources",
+            "codex-path",
+            "mv -Tf \"$CODEX_NEXT_LINK\" \"$CODEX_INSTALL_ROOT/current\"",
+        ] {
+            assert!(
+                SCRIPT_CODEX.contains(expected),
+                "Codex package installer is missing {expected:?}",
+            );
+        }
     }
 
     #[test]
@@ -802,6 +820,11 @@ mod tests {
         );
         assert!(
             bins.iter()
+                .any(|b| b.to_string() == "/usr/local/bin/codex-code-mode-host"),
+            "guest image should include Codex's code-mode host",
+        );
+        assert!(
+            bins.iter()
                 .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
             "guest image should include the Codex account-auth wrapper",
         );
@@ -882,6 +905,7 @@ mod tests {
             "/usr/bin/docker",
             "/usr/bin/gh",
             "/usr/local/bin/codex",
+            "/usr/local/bin/codex-code-mode-host",
             "/usr/local/bin/codex-account",
         ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");

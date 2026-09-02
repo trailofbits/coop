@@ -730,7 +730,7 @@ fn compose_recipe(
     }
     // Direct binary download (runs as root in chroot, installs for guest user).
     s.push_str(SCRIPT_CLAUDE_CODE);
-    // Codex installs as a standalone binary under /usr/local/bin.
+    // Codex installs as a package with stable entrypoints under /usr/local/bin.
     s.push_str(SCRIPT_CODEX);
     s.push_str(SCRIPT_CODEX_ACCOUNT);
 

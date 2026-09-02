@@ -1075,6 +1075,24 @@ test_codex_bin_path() {
         fail "codex binary invocable via full path" "stderr: $(guest_stderr)"
     fi
 
+    if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
+        pass "codex code-mode host exists and is executable"
+    else
+        fail "codex code-mode host exists and is executable" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    local codex_release code_mode_release
+    codex_release=$(guest_exec readlink -f /usr/local/bin/codex | sed 's|/bin/codex$||')
+    code_mode_release=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host \
+        | sed 's|/bin/codex-code-mode-host$||')
+    if [[ -n "$codex_release" && "$codex_release" == "$code_mode_release" ]]; then
+        pass "codex and code-mode host come from the same package"
+    else
+        fail "codex and code-mode host come from the same package" \
+            "codex=$codex_release host=$code_mode_release"
+    fi
+
     if guest_exec test -x /usr/local/bin/codex-yolo; then
         pass "codex-yolo shortcut exists"
     else
@@ -1221,6 +1239,13 @@ test_agent_update() {
         else
             fail "codex is executable and versioned after update" \
                 "got: $ver stderr: $(guest_stderr)"
+        fi
+
+        if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
+            pass "codex update preserves executable code-mode host"
+        else
+            fail "codex update preserves executable code-mode host" \
+                "stderr: $(guest_stderr)"
         fi
     else
         skip "agent update --codex" "use --full; downloads the release in-guest"
