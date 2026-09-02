@@ -1173,8 +1173,15 @@ const CODE_INSTALL_HINT: &str =
     "To install the `code` CLI: open VS Code, Cmd+Shift+P, 'Shell Command: Install'";
 const ZED_INSTALL_HINT: &str = "To install the `zed` CLI: open Zed, Cmd+Shift+P, 'cli: install'";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonzeroExit {
+    EditorFailure,
+    LauncherMiss,
+}
+
 struct LaunchStrategy {
     editor: EditorKind,
+    nonzero_exit: NonzeroExit,
     name: &'static str,
     cmd: String,
     args: Vec<String>,
@@ -1202,6 +1209,7 @@ fn vscode_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy>
     let path_arg = remote_path.to_string();
     let mut strategies = vec![LaunchStrategy {
         editor: EditorKind::Code,
+        nonzero_exit: NonzeroExit::EditorFailure,
         name: "code CLI",
         cmd: "code".into(),
         args: vec!["--remote".into(), remote_arg.clone(), path_arg.clone()],
@@ -1209,6 +1217,7 @@ fn vscode_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy>
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
             editor: EditorKind::Code,
+            nonzero_exit: NonzeroExit::LauncherMiss,
             name: "macOS open -a 'Visual Studio Code'",
             cmd: "open".into(),
             args: vec![
@@ -1231,6 +1240,7 @@ fn zed_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
     let path = utf8_percent_encode(remote_path.as_ref(), URL_PATH).to_string();
     let mut strategies = vec![LaunchStrategy {
         editor: EditorKind::Zed,
+        nonzero_exit: NonzeroExit::EditorFailure,
         name: "zed CLI",
         cmd: "zed".into(),
         args: vec![format!("ssh://{host}{path}")],
@@ -1238,6 +1248,7 @@ fn zed_strategies(host: &str, remote_path: &GuestPath) -> Vec<LaunchStrategy> {
     if cfg!(target_os = "macos") {
         strategies.push(LaunchStrategy {
             editor: EditorKind::Zed,
+            nonzero_exit: NonzeroExit::LauncherMiss,
             name: "macOS open zed:// URL",
             cmd: "open".into(),
             args: vec![format!("zed://ssh/{host}{path}")],
@@ -1273,10 +1284,10 @@ fn install_hints(editor: Option<EditorKind>) -> &'static [&'static str] {
     }
 }
 
-/// A non-zero exit means an editor was found and declined the request. Its
-/// remaining launch strategies may still recover, but a different editor must
-/// not open unexpectedly. Spawn failures do not set `failed_editor`, so auto
-/// detection can continue across editors when a binary is merely unavailable.
+/// A non-zero editor exit means it declined the request. Its remaining launch
+/// strategies may still recover, but a different editor must not open
+/// unexpectedly. Spawn failures and launcher misses do not set `failed_editor`,
+/// so auto detection can continue when an editor is merely unavailable.
 fn may_try_after_nonzero_exit(failed_editor: Option<EditorKind>, candidate: EditorKind) -> bool {
     failed_editor.is_none_or(|editor| editor == candidate)
 }
@@ -1306,7 +1317,9 @@ fn launch_editor(
             Ok(status) => {
                 tracing::debug!("{} exited with {status}", strategy.name);
                 tried.push(format!("{} exited with {status}", strategy.name));
-                failed_editor = Some(strategy.editor);
+                if strategy.nonzero_exit == NonzeroExit::EditorFailure {
+                    failed_editor = Some(strategy.editor);
+                }
             }
             // Every spawn failure counts as a miss, not a hard stop: in the
             // auto-detect chain an unusable earlier binary (missing, or present
@@ -1355,8 +1368,16 @@ mod tests {
         let code = &strategies[0];
         assert_eq!(code.name, "code CLI");
         assert_eq!(code.cmd, "code");
+        assert_eq!(code.nonzero_exit, NonzeroExit::EditorFailure);
         let args: Vec<&str> = code.args.iter().map(String::as_str).collect();
         assert_eq!(args, ["--remote", "ssh-remote+coop-test", "/workspace"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn vscode_strategies_macos_launcher_nonzero_is_a_miss() {
+        let strategies = vscode_strategies("coop-test", &GuestPath::new("/workspace"));
+        assert_eq!(strategies[1].nonzero_exit, NonzeroExit::LauncherMiss);
     }
 
     #[test]
@@ -1368,6 +1389,7 @@ mod tests {
         let zed = &strategies[0];
         assert_eq!(zed.name, "zed CLI");
         assert_eq!(zed.cmd, "zed");
+        assert_eq!(zed.nonzero_exit, NonzeroExit::EditorFailure);
         let args: Vec<&str> = zed.args.iter().map(String::as_str).collect();
         assert_eq!(args, ["ssh://coop-test/workspace"]);
     }
@@ -1381,6 +1403,7 @@ mod tests {
         // vs `ssh://<host><path>`), so it needs its own assertion.
         let open = &strategies[1];
         assert_eq!(open.cmd, "open");
+        assert_eq!(open.nonzero_exit, NonzeroExit::LauncherMiss);
         let args: Vec<&str> = open.args.iter().map(String::as_str).collect();
         assert_eq!(args, ["zed://ssh/coop-test/workspace"]);
     }
@@ -1388,8 +1411,8 @@ mod tests {
     #[test]
     fn zed_strategies_escape_url_significant_path_bytes() {
         // `#` would otherwise read as a fragment and open `/a` instead.
-        let strategies = zed_strategies("coop-test", &GuestPath::new("/a#b c%d"));
-        assert_eq!(strategies[0].args, ["ssh://coop-test/a%23b%20c%25d"]);
+        let strategies = zed_strategies("coop-test", &GuestPath::new("/a#b c%d?e"));
+        assert_eq!(strategies[0].args, ["ssh://coop-test/a%23b%20c%25d%3Fe"]);
     }
 
     #[test]
@@ -1397,10 +1420,10 @@ mod tests {
         let path = GuestPath::new("/workspace");
         let code = editor_strategies(Some(EditorKind::Code), "coop-test", &path);
         assert_eq!(code[0].cmd, "code");
-        assert!(code.iter().all(|s| s.cmd != "zed"));
+        assert!(code.iter().all(|s| s.editor == EditorKind::Code));
         let zed = editor_strategies(Some(EditorKind::Zed), "coop-test", &path);
         assert_eq!(zed[0].cmd, "zed");
-        assert!(zed.iter().all(|s| s.cmd != "code"));
+        assert!(zed.iter().all(|s| s.editor == EditorKind::Zed));
     }
 
     #[test]
