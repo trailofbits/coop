@@ -28,7 +28,7 @@ Every template installs these packages regardless of profile selection.
 
 **Codex CLI:** installed as a complete package during the template build. The
 package contains the CLI, its code-mode host, and bundled runtime resources;
-stable entrypoints under `/usr/local/bin` switch together on update.
+stable entrypoints under `/usr/local/bin` share one current-package link.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages

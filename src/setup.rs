@@ -1313,17 +1313,21 @@ fn install_guest_packages(
 
 /// Verify critical binaries exist in the chroot after provisioning.
 ///
-/// Uses `symlink_metadata` (lstat) instead of `exists` (stat) because
-/// the Claude binary is a symlink with an absolute target
-/// (`/home/<user>/.local/share/claude/versions/X.Y.Z`). When checked
-/// from outside the chroot, `exists()` follows the symlink to the
-/// host filesystem where the target doesn't exist. A symlink being
-/// present is sufficient — it will resolve correctly inside the guest.
+/// Runs `test -x` inside the chroot so absolute symlink targets resolve against
+/// the guest root. Checking from the host with either `exists` or `lstat` would
+/// respectively reject valid absolute guest symlinks or accept dangling ones.
 fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()> {
     crate::guest::verify_required_binaries(
         guest_user,
         "install script",
-        |path| std::fs::symlink_metadata(format!("{mount_str}{path}")).is_ok(),
+        |path| {
+            let path = path.to_string();
+            Cmd::new("chroot")
+                .args([mount_str, "/usr/bin/test", "-x", path.as_str()])
+                .sudo()
+                .run()
+                .is_ok()
+        },
         String::new,
     )
 }

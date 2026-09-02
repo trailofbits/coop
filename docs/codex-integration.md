@@ -262,7 +262,7 @@ coop agent update --codex          # update Codex to the latest release
 coop agent update --check          # report installed vs. latest, change nothing
 ```
 
-This re-runs coop's own Codex installer inside the guest as root and atomically switches the CLI and code-mode host to the same current package. To refresh the golden image so new VMs ship the latest Codex, rebuild it with `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
+This re-runs coop's own Codex installer inside the guest as root, verifies the published package checksums, and switches the CLI and code-mode host through the same current-package link. To refresh the golden image so new VMs ship the latest Codex, rebuild it with `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
 
 ## Local model support
 

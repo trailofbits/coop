@@ -459,6 +459,11 @@ test_setup() {
     echo "=== Phase: setup ==="
 
     local args=(setup -y)
+    # The full suite exercises `agent update --codex`; force the initial image
+    # build so that test cannot silently reuse a pre-fix local template.
+    if [[ "$FULL" == "1" ]]; then
+        args+=(--rebuild)
+    fi
     if [[ -n "$PROFILES" ]]; then
         args+=(--profile "$PROFILES")
     fi
@@ -1082,15 +1087,35 @@ test_codex_bin_path() {
             "stderr: $(guest_stderr)"
     fi
 
-    local codex_release code_mode_release
-    codex_release=$(guest_exec readlink -f /usr/local/bin/codex | sed 's|/bin/codex$||')
-    code_mode_release=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host \
-        | sed 's|/bin/codex-code-mode-host$||')
-    if [[ -n "$codex_release" && "$codex_release" == "$code_mode_release" ]]; then
+    local codex_path code_mode_path codex_release
+    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
+    code_mode_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+    if [[ "$codex_path" =~ ^(/usr/local/lib/codex/releases/[0-9a-f]{64})/bin/codex$ ]] \
+        && [[ "$code_mode_path" == "${BASH_REMATCH[1]}/bin/codex-code-mode-host" ]]; then
+        codex_release="${BASH_REMATCH[1]}"
         pass "codex and code-mode host come from the same package"
     else
         fail "codex and code-mode host come from the same package" \
-            "codex=$codex_release host=$code_mode_release"
+            "codex=$codex_path host=$code_mode_path"
+        return
+    fi
+
+    if guest_exec test -x "$codex_release/codex-path/rg" \
+        -a -x "$codex_release/codex-resources/bwrap" \
+        -a -x "$codex_release/codex-resources/zsh/bin/zsh" \
+        -a -f "$codex_release/codex-package.json"; then
+        pass "codex package runtime resources are installed"
+    else
+        fail "codex package runtime resources are installed" \
+            "release=$codex_release stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec test ! -w "$codex_release/bin/codex" \
+        -a ! -w "$codex_release/bin/codex-code-mode-host"; then
+        pass "codex package executables are not guest-writable"
+    else
+        fail "codex package executables are not guest-writable" \
+            "release=$codex_release stderr: $(guest_stderr)"
     fi
 
     if guest_exec test -x /usr/local/bin/codex-yolo; then
@@ -1225,6 +1250,19 @@ test_agent_update() {
     fi
 
     if [[ "$FULL" == "1" ]]; then
+        # Model the broken legacy/corrupt-package state from #442. The forced
+        # updater must rebuild an incomplete same-SHA release, not merely keep
+        # an already healthy host executable in place.
+        local installed_host
+        installed_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+        if guest_exec sudo rm -f "$installed_host" \
+            && guest_exec test ! -e /usr/local/bin/codex-code-mode-host; then
+            pass "removed code-mode host before updater repair test"
+        else
+            fail "removed code-mode host before updater repair test" \
+                "host=$installed_host stderr: $(guest_stderr)"
+        fi
+
         if coop agent update "$INSTANCE" --codex -y; then
             pass "agent update --codex exits 0"
         else
@@ -1242,9 +1280,9 @@ test_agent_update() {
         fi
 
         if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
-            pass "codex update preserves executable code-mode host"
+            pass "codex update repairs missing code-mode host"
         else
-            fail "codex update preserves executable code-mode host" \
+            fail "codex update repairs missing code-mode host" \
                 "stderr: $(guest_stderr)"
         fi
     else

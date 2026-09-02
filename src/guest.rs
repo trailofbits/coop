@@ -262,6 +262,7 @@ pub const BASE_PACKAGES: &[&str] = &[
     "iptables",
     "kmod",
     "procps",
+    "util-linux",
     "jq",
     "rsync",
     "unzip",
@@ -500,6 +501,13 @@ mod tests {
             "codex-package.json",
             "codex-resources",
             "codex-path",
+            "codex-package_SHA256SUMS",
+            "sha256sum -c -",
+            "tar --no-same-owner --no-same-permissions",
+            "flock 9",
+            "chown -R root:root",
+            "for executable in codex-code-mode-host codex",
+            "codex_reconcile_public_entrypoints",
             "mv -Tf \"$CODEX_NEXT_LINK\" \"$CODEX_INSTALL_ROOT/current\"",
         ] {
             assert!(
@@ -844,7 +852,12 @@ mod tests {
 
     #[test]
     fn base_packages_include_secret_service_support() {
-        for expected in ["dbus-user-session", "gnome-keyring", "libsecret-tools"] {
+        for expected in [
+            "dbus-user-session",
+            "gnome-keyring",
+            "libsecret-tools",
+            "util-linux",
+        ] {
             assert!(
                 BASE_PACKAGES.contains(&expected),
                 "base packages should include {expected}",

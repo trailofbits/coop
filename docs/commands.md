@@ -483,7 +483,8 @@ With no agent flag, both agents are updated; passing both `--claude` and
 
 Codex has no background updater, so `coop agent update --codex` re-runs coop's
 own installer inside the guest as root. It installs the complete upstream
-package and atomically switches the CLI and code-mode host to the same release.
+package, verifies its published checksums, and switches the CLI and code-mode
+host through the same current-release link.
 Claude Code already auto-updates in the background;
 `coop agent update --claude` runs `claude update` now, synchronously — a
 convenience rather than a fix.
