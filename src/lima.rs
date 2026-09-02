@@ -12,7 +12,7 @@ use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -1493,6 +1493,8 @@ fn compose_provision_script(
     // Codex CLI (standalone binary under /usr/local/bin)
     s.push_str(SCRIPT_CODEX);
     s.push('\n');
+    s.push_str(SCRIPT_CODEX_ACCOUNT);
+    s.push('\n');
 
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
@@ -1583,7 +1585,7 @@ chmod 755 /usr/local/bin/claude-yolo
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
 #!/bin/bash
-exec codex --dangerously-bypass-approvals-and-sandbox "$@"
+exec codex-account --dangerously-bypass-approvals-and-sandbox "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/codex-yolo
 
@@ -2066,6 +2068,15 @@ mod tests {
         assert!(
             script.contains("Installing Codex CLI"),
             "Lima provision script should install Codex CLI",
+        );
+        assert!(
+            script.contains("Installing codex-account shortcut"),
+            "Lima provision script should install Codex account-auth wrapper",
+        );
+        assert!(
+            script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
+            "codex-yolo should route through the account wrapper so keyring \
+             mode works from an in-guest shell",
         );
     }
 

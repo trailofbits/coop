@@ -13,7 +13,7 @@ use crate::config::{CoopConfig, ImageName, Instance};
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -24,7 +24,7 @@ const GH_RELEASES: &str = "https://github.com/firecracker-microvm/firecracker/re
 
 /// Monotonic version bumped when the base install script changes
 /// in a way that requires rebuilding templates.
-pub const TEMPLATE_VERSION: u32 = 1;
+pub const TEMPLATE_VERSION: u32 = 2;
 
 // ── Public types ──────────────────────────────────────────────
 
@@ -732,6 +732,7 @@ fn compose_recipe(
     s.push_str(SCRIPT_CLAUDE_CODE);
     // Codex installs as a standalone binary under /usr/local/bin.
     s.push_str(SCRIPT_CODEX);
+    s.push_str(SCRIPT_CODEX_ACCOUNT);
 
     s
 }
@@ -1567,6 +1568,15 @@ mod tests {
         assert!(
             script.contains("Installing Codex CLI"),
             "base recipe should install Codex CLI",
+        );
+        assert!(
+            script.contains("Installing codex-account shortcut"),
+            "base recipe should install Codex account-auth wrapper",
+        );
+        assert!(
+            script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
+            "codex-yolo should route through the account wrapper so keyring \
+             mode works from an in-guest shell",
         );
         no_consecutive_concat(&script);
     }

@@ -238,6 +238,34 @@ test_validate() {
     else
         fail "validate reports OK" "got: $HARNESS_OUT"
     fi
+
+    # `[codex] auth = "chatgpt"` uses ChatGPT workspace credentials while the
+    # OpenAI proxy injects an API key, so the pair is rejected at parse time.
+    local conflict_dir conflict_cfg
+    conflict_dir=$(mktemp -d)
+    conflict_cfg="$conflict_dir/config.toml"
+    cat >"$conflict_cfg" <<'CONFLICTEOF'
+[codex]
+auth = "chatgpt"
+
+[proxy.openai]
+credential = "cmd:echo sk-test"
+auth = "bearer"
+CONFLICTEOF
+
+    if coop_fails --config "$conflict_cfg" validate; then
+        if grep -q "conflicts with \[proxy.openai\]" <<<"$HARNESS_ERR$HARNESS_OUT"; then
+            pass "validate rejects codex.auth=chatgpt with [proxy.openai]"
+        else
+            fail "validate rejects codex.auth=chatgpt with [proxy.openai]" \
+                "wrong error: $HARNESS_ERR$HARNESS_OUT"
+        fi
+    else
+        fail "validate rejects codex.auth=chatgpt with [proxy.openai]" \
+            "validate unexpectedly succeeded"
+    fi
+
+    rm -rf "$conflict_dir"
 }
 
 test_completions() {
@@ -1061,9 +1089,76 @@ test_codex_bin_path() {
             fail "codex-yolo includes dangerous full-access flag" \
                 "content: $yolo_content"
         fi
+        if echo "$yolo_content" | grep -q "codex-account"; then
+            pass "codex-yolo routes through the account wrapper"
+        else
+            fail "codex-yolo routes through the account wrapper" \
+                "content: $yolo_content"
+        fi
     else
         fail "codex-yolo includes dangerous full-access flag" "cat failed"
     fi
+}
+
+test_codex_account_auth_support() {
+    echo ""
+    echo "=== Phase: codex account-auth (Secret Service) support ==="
+
+    if guest_exec test -x /usr/local/bin/codex-account; then
+        pass "codex-account wrapper exists"
+    else
+        fail "codex-account wrapper exists" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    # The wrapper is written unconditionally by the provision script, so the
+    # packages behind it are what actually need asserting.
+    local tool
+    for tool in dbus-run-session gnome-keyring-daemon secret-tool; do
+        if guest_exec command -v "$tool"; then
+            pass "guest Secret Service tool present: $tool"
+        else
+            fail "guest Secret Service tool present: $tool" "stderr: $(guest_stderr)"
+        fi
+    done
+
+    # Default config is auth = "api_key", so the wrapper must be a transparent
+    # passthrough: no D-Bus session, no keyring, no password prompt. A hang
+    # here would mean it tried to unlock a keyring it should have skipped.
+    local version
+    if version=$(coop_exec /usr/local/bin/codex-account --version); then
+        pass "codex-account passes through to codex without keyring mode ($version)"
+    else
+        fail "codex-account passes through to codex without keyring mode" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    # Drive the keyring branch without reconfiguring the VM: the wrapper reads
+    # $CODEX_HOME, so a scratch config selects keyring mode for one call. This
+    # is the only place the `cli_auth_credentials_store` grep, the D-Bus
+    # re-exec, the tool guards and the TTY guard actually execute — the
+    # assertions above all run on the passthrough branch.
+    #
+    # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
+    # a password prompt. A hang here is the failure this asserts against.
+    guest_exec sh -c 'mkdir -p /tmp/coop-keyring-probe \
+        && printf "cli_auth_credentials_store = \"keyring\"\n" \
+            > /tmp/coop-keyring-probe/config.toml'
+
+    # </dev/null so the TTY guard is deterministic: run interactively, stdin
+    # could otherwise be a terminal and the wrapper would prompt and block.
+    if coop_exec env CODEX_HOME=/tmp/coop-keyring-probe \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "codex-account enters keyring mode from the guest config" \
+            "expected a non-TTY refusal, but the wrapper passed through to codex"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "codex-account enters keyring mode and refuses a non-TTY session"
+    else
+        fail "codex-account enters keyring mode and refuses a non-TTY session" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    guest_exec rm -rf /tmp/coop-keyring-probe
 }
 
 test_codex_sandbox_bypass() {
@@ -5155,6 +5250,7 @@ main() {
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path
+    test_codex_account_auth_support
     test_codex_sandbox_bypass
     test_agent_update
     test_github_token_forwarding

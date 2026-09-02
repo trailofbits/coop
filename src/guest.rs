@@ -122,6 +122,11 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
+/// Wrapper that runs Codex with a guest Linux Secret Service session.
+pub fn codex_account_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex-account")
+}
+
 impl Default for GuestUser {
     fn default() -> Self {
         // Safe: DEFAULT_GUEST_USER ("ubuntu") satisfies the validator.
@@ -165,12 +170,19 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 4] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         codex_bin(),
+        codex_account_bin(),
+        // The Secret Service stack `codex-account` drives. Checking the
+        // wrapper alone proves nothing — the provision script always writes
+        // it — so verify the three tools its BASE_PACKAGES entries install.
+        GuestPath::new("/usr/bin/dbus-run-session"),
+        GuestPath::new("/usr/bin/gnome-keyring-daemon"),
+        GuestPath::new("/usr/bin/secret-tool"),
     ]
 }
 
@@ -216,9 +228,22 @@ pub const SCRIPT_GH_REPO: &str = include_str!("../scripts/guest/gh-cli-repo.sh")
 pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.sh");
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
+pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 
+/// Packages installed into every golden image.
+///
+/// `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` back the
+/// Secret Service that `codex-account` needs under `[codex] auth =
+/// "chatgpt"`. They are unconditional rather than gated on that config field
+/// on purpose: the golden image is built once by `coop setup` and reused
+/// across configs, so gating them would let a later `auth = "chatgpt"` edit
+/// meet an image that cannot serve it — a silent skew that surfaces only at
+/// `coop codex` time. The cost is the same for everyone (see
+/// `docs/images-and-profiles.md`); the wrapper stays a no-op passthrough
+/// unless the guest Codex config actually asks for the keyring.
 pub const BASE_PACKAGES: &[&str] = &[
     "openssh-server",
+    "dbus-user-session",
     "curl",
     "wget",
     "git",
@@ -236,7 +261,9 @@ pub const BASE_PACKAGES: &[&str] = &[
     "unzip",
     "zip",
     "file",
+    "gnome-keyring",
     "less",
+    "libsecret-tools",
 ];
 
 pub const GH_PACKAGES: &[&str] = &["gh"];
@@ -465,6 +492,158 @@ mod tests {
     }
 
     #[test]
+    fn codex_account_script_uses_secret_service() {
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("cat >/usr/local/bin/codex-account"),
+            "Codex account wrapper should be installed in the guest image",
+        );
+        for expected in [
+            // Anchored on the re-exec itself: a bare "dbus-run-session" also
+            // matches the `command -v` guard and its die message, so it would
+            // pass even with the re-exec deleted.
+            "exec dbus-run-session -- ",
+            "gnome-keyring-daemon --unlock",
+            "secret-tool store",
+            // The probe item must be removed again, not left in the keyring.
+            "secret-tool clear",
+        ] {
+            assert!(
+                SCRIPT_CODEX_ACCOUNT.contains(expected),
+                "Codex account wrapper is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_account_script_unlocks_before_touching_the_bus() {
+        // `gnome-keyring-daemon --unlock` only creates and unlocks the login
+        // collection when it is the process that starts the daemon. Once any
+        // daemon owns `org.freedesktop.secrets` — including one the probe's
+        // `secret-tool` would D-Bus-activate — the unlock is handed to the
+        // graphical gcr-prompter, which cannot run on a headless guest, and
+        // ChatGPT auth fails on every invocation. So the unlock must be the
+        // first thing the main flow does.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("    unlock_keyring\n    probe_keyring \\"),
+            "on a bus this wrapper created, the unlock must precede the probe",
+        );
+        assert!(
+            !SCRIPT_CODEX_ACCOUNT.contains("gnome-keyring-daemon --start"),
+            "starting the daemon before the unlock is what breaks the unlock",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_reuses_an_inherited_unlocked_session() {
+        // A nested codex-account (an in-guest agent shelling out to
+        // `codex-account` / `codex-yolo`) inherits the bus and its unlocked
+        // keyring. Unlocking again there hits the very gcr-prompter trap the
+        // ordering above exists to avoid, so the nested call must probe and
+        // reuse rather than re-unlock — and the outer call must publish the
+        // marker that says so.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_UNLOCKED=1"),
+            "the unlocking call must mark the session as reusable",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_UNLOCKED:-0}\" = \"1\""),
+            "a nested call must branch on the inherited-session marker",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_guards_against_dbus_reexec_recursion() {
+        // `exec dbus-run-session -- "$0"` re-runs this same script. Without the
+        // env guard around it that is an unbounded fork loop inside the guest,
+        // and no other test would notice.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_DBUS:-0}\" != \"1\""),
+            "the re-exec must be guarded, or it recurses forever",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_DBUS=1"),
+            "the guard must be set before the re-exec, or it never takes effect",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_bounds_its_secret_service_calls() {
+        // A wedged Secret Service must fail the launch, not hang it. The
+        // tool-presence loop checks for `timeout`; these pin that it is
+        // actually used on both probe calls.
+        assert_eq!(
+            SCRIPT_CODEX_ACCOUNT
+                .matches("timeout 5 secret-tool")
+                .count(),
+            2,
+            "both probe secret-tool calls must be time-bounded",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("timeout 30 gnome-keyring-daemon --unlock"),
+            "the unlock must be time-bounded too: it runs inside a command \
+             substitution, which waits for EOF rather than for exit",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_requires_a_tty_before_prompting() {
+        // Without this guard `read -rsp` blocks forever on a non-interactive
+        // session (agent bootstrap, `coop exec`), turning a clear failure into
+        // a hang.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("[ ! -t 0 ]"),
+            "the wrapper must refuse to prompt without a TTY",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_captures_probe_stderr() {
+        // The redirect order is load-bearing and easy to "correct" wrongly:
+        // `2>&1 >/dev/null` captures stderr because `2>&1` binds while stdout
+        // is still the substitution pipe. The tidier-looking `>/dev/null 2>&1`
+        // sends both to /dev/null, leaving PROBE_ERROR always empty and the
+        // die message back to guessing at the password.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("2>&1 >/dev/null"),
+            "the probe must capture secret-tool's stderr, not discard it",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("${PROBE_ERROR:+"),
+            "the die message must report the captured cause when there is one",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_passes_through_without_keyring_mode() {
+        // Every Codex entry point routes through the wrapper, so it must be a
+        // transparent exec unless the guest config asks for keyring storage.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("cli_auth_credentials_store"),
+            "wrapper should gate on the guest Codex credential-store setting",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT
+                .contains("if ! keyring_mode; then\n    exec \"$CODEX_BIN\" \"$@\""),
+            "wrapper should exec Codex directly when keyring mode is off",
+        );
+    }
+
+    #[test]
+    fn codex_account_script_confirms_a_newly_created_keyring_password() {
+        // A fresh guest has no keyring, so the prompt creates one; an
+        // unconfirmed typo would lock credentials behind an unreproducible
+        // password.
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("Confirm keyring password: "),
+            "wrapper should confirm the password when creating a keyring",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("this VM has no guest keyring yet"),
+            "wrapper should explain that the first prompt chooses a password",
+        );
+    }
+
+    #[test]
     fn collect_codex_baked_lists_sorts_and_dedups() {
         let mut cfg = CoopConfig::default();
         cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
@@ -621,6 +800,33 @@ mod tests {
             bins.iter().any(|b| b.to_string() == "/usr/local/bin/codex"),
             "guest image should include codex in the default PATH",
         );
+        assert!(
+            bins.iter()
+                .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
+            "guest image should include the Codex account-auth wrapper",
+        );
+        // The wrapper is written unconditionally by the provision script, so
+        // verifying it alone cannot catch the packages failing to install.
+        for tool in [
+            "/usr/bin/dbus-run-session",
+            "/usr/bin/gnome-keyring-daemon",
+            "/usr/bin/secret-tool",
+        ] {
+            assert!(
+                bins.iter().any(|b| b.to_string() == tool),
+                "guest image should verify {tool} for Codex account auth",
+            );
+        }
+    }
+
+    #[test]
+    fn base_packages_include_secret_service_support() {
+        for expected in ["dbus-user-session", "gnome-keyring", "libsecret-tools"] {
+            assert!(
+                BASE_PACKAGES.contains(&expected),
+                "base packages should include {expected}",
+            );
+        }
     }
 
     #[test]
@@ -672,7 +878,12 @@ mod tests {
         let user = GuestUser::default();
         let result = verify_required_binaries(&user, "install script", |_path| false, String::new);
         let err = result.unwrap_err().to_string();
-        for expected in ["/usr/bin/docker", "/usr/bin/gh", "/usr/local/bin/codex"] {
+        for expected in [
+            "/usr/bin/docker",
+            "/usr/bin/gh",
+            "/usr/local/bin/codex",
+            "/usr/local/bin/codex-account",
+        ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");
         }
     }

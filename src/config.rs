@@ -1489,6 +1489,10 @@ fn default_prompt_for_pat() -> bool {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CodexConfig {
+    /// How Codex should authenticate to `OpenAI` in remote cloud mode.
+    #[serde(default)]
+    pub auth: CodexAuthMode,
+
     /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
     pub api_key: Option<Secret<String>>,
 
@@ -1517,6 +1521,28 @@ pub struct CodexConfig {
     /// prompted interactively and saved in instance state.
     #[serde(default)]
     pub local_model: Option<LocalModel>,
+}
+
+/// Codex cloud authentication mode.
+///
+/// `ApiKey` preserves the historical behavior: coop forwards
+/// `OPENAI_API_KEY` when configured or present in the host environment.
+/// `ChatGpt` is account-level auth: coop suppresses API-key forwarding,
+/// writes Codex's credential store setting to `keyring`, and launches Codex
+/// through the guest Secret Service wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CodexAuthMode {
+    #[serde(rename = "api_key")]
+    #[default]
+    ApiKey,
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
+}
+
+impl CodexAuthMode {
+    pub fn uses_chatgpt_account(self) -> bool {
+        matches!(self, Self::ChatGpt)
+    }
 }
 
 /// `[proxy]` — host-side credential-injecting proxy (issue #411).
@@ -2039,6 +2065,15 @@ impl CoopConfig {
             ));
         }
 
+        if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
+            errors.push(
+                "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
+                 Codex account auth uses ChatGPT workspace credentials, while \
+                 the OpenAI proxy uses an API key"
+                    .to_string(),
+            );
+        }
+
         check_local_marketplaces(
             "claude.marketplaces",
             &self.claude.marketplaces,
@@ -2377,6 +2412,7 @@ impl Default for ClaudeConfig {
 impl Default for CodexConfig {
     fn default() -> Self {
         Self {
+            auth: CodexAuthMode::ApiKey,
             api_key: std::env::var("OPENAI_API_KEY").ok().map(Secret::new),
             env_forward: Vec::new(),
             marketplaces: Vec::new(),
@@ -3448,6 +3484,7 @@ mod tests {
     #[test]
     fn codex_config_all_fields() {
         let json = r#"{
+            "auth": "chatgpt",
             "api_key": "sk-openai-test",
             "env_forward": ["MYORG_KEY"],
             "marketplaces": ["https://github.com/trailofbits/codex-plugins"],
@@ -3464,6 +3501,7 @@ mod tests {
             cfg.api_key.as_ref().map(|s| s.expose().as_str()),
             Some("sk-openai-test")
         );
+        assert_eq!(cfg.auth, CodexAuthMode::ChatGpt);
         assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
         assert_eq!(
             cfg.marketplaces,
@@ -3478,6 +3516,7 @@ mod tests {
     fn codex_config_all_defaults() {
         let json = "{}";
         let cfg: CodexConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.auth, CodexAuthMode::ApiKey);
         assert!(cfg.api_key.is_none());
         assert!(cfg.env_forward.is_empty());
         assert!(cfg.marketplaces.is_empty());
@@ -3485,6 +3524,12 @@ mod tests {
         assert!(cfg.mcp_servers.is_empty());
         assert_eq!(cfg.config_dir, ConfigDir::Default);
         assert!(cfg.local_model.is_none());
+    }
+
+    #[test]
+    fn codex_config_rejects_unknown_auth_mode() {
+        let json = r#"{"auth": "subscription"}"#;
+        assert!(serde_json::from_str::<CodexConfig>(json).is_err());
     }
 
     // ── LocalModel ───────────────────────────────────────────
@@ -3576,6 +3621,58 @@ auth = "bearer"
         let up = cfg.proxy.openai.unwrap();
         assert_eq!(up.credential.expose(), "cmd:op read op://x");
         assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+    }
+
+    #[test]
+    fn validate_rejects_codex_chatgpt_with_openai_proxy() {
+        let toml_str = r#"
+[codex]
+auth = "chatgpt"
+
+[proxy.openai]
+credential = "cmd:op read op://x"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts with [proxy.openai]"),
+            "expected proxy conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_codex_chatgpt_without_a_proxy() {
+        // Pins the `proxy.openai.is_some()` half of the conflict check. With
+        // `&&` flipped to `||`, plain `auth = "chatgpt"` — the headline
+        // configuration for this mode — becomes a hard config error.
+        let toml_str = r#"
+[codex]
+auth = "chatgpt"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "chatgpt auth alone must be a valid config: {:?}",
+            cfg.validate().err(),
+        );
+    }
+
+    #[test]
+    fn validate_accepts_openai_proxy_with_default_api_key_auth() {
+        // Pins the `uses_chatgpt_account()` half. With `&&` flipped to `||`,
+        // an ordinary `[proxy.openai]` setup becomes a hard config error.
+        let toml_str = r#"
+[proxy.openai]
+credential = "cmd:op read op://x"
+auth = "bearer"
+"#;
+        let cfg: CoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "an OpenAI proxy with default api_key auth must be valid: {:?}",
+            cfg.validate().err(),
+        );
     }
 
     #[test]

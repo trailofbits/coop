@@ -1242,7 +1242,20 @@ pub fn run() -> Result<()> {
         Commands::Codex { name, ask, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             let args = codex_launch_args(ask, args);
-            ssh::run_interactive(&sess, &prepend_binary(guest::codex_bin().as_ref(), args))
+            let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
+                let inst = cfg.resolve_instance(name.as_ref())?;
+                let model_state = model_state::ModelState::load_or_default(&inst)?;
+                backend::ensure_codex_remote_auth_consistent(&cfg, &inst, &model_state)?;
+                backend::ensure_codex_account_guest_support(&sess.target)?;
+                // The wrapper gates on the guest's own config, so a guest that
+                // never got the keyring setting would silently pass through and
+                // write a plaintext token. Fail closed instead.
+                backend::ensure_codex_keyring_configured(&sess.target)?;
+                guest::codex_account_bin()
+            } else {
+                guest::codex_bin()
+            };
+            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;

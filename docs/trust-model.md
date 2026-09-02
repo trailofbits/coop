@@ -107,6 +107,26 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex ChatGPT account auth is persistent guest state.** With
+  `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
+  process env, `env_forward`, and persisted `--env` overlays, writes
+  `cli_auth_credentials_store = "keyring"` to guest `~/.codex/config.toml`, and
+  excludes host `auth.json` from the guest copy. Codex stores its cached account
+  credentials in the guest Linux Secret Service instead. This avoids API-key
+  billing and host `auth.json` copying, but it does **not** keep the ChatGPT
+  refresh token out of the guest. A compromised guest can use or extract any
+  credential its keyring session can unlock. The keyring setting is written
+  during agent bootstrap, so `--no-agents` skips it. On a guest where no
+  earlier boot wrote it, the wrapper then falls through to plain Codex and
+  `codex login` writes a plaintext `~/.codex/auth.json` instead. coop warns in
+  exactly that case; the setting lives on the guest disk, so once written it
+  survives a later `--no-agents` start. Two guardrails close the gaps that
+  leaves: each bootstrap in this mode deletes any guest `~/.codex/auth.json`
+  left by an earlier `api_key` boot or `--no-agents` login (dropping the file
+  from the staged set only stops coop *copying* one, it removes nothing), and
+  `coop codex` refuses to launch when the guest config does not actually
+  select the keyring store — otherwise the wrapper would pass through to plain
+  Codex and write the token in the clear.
 
 ## SSH boundary
 
