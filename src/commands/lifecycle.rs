@@ -1640,9 +1640,12 @@ pub(crate) fn prepare_session_from_target(
     let suppress_openai_key = proxy_openai || codex_account_auth;
     // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
     // auth even though `CoopConfig::validate` rejects that combination in the
-    // config file. Only Codex is unusable then, so warn here and let the
-    // Codex entry points (`coop codex`, agent bootstrap) fail hard — a shell,
-    // exec, or `coop claude` session on the same VM is unaffected.
+    // config file. Warn here so the reason is visible on every session, and
+    // let the Codex entry points fail hard via
+    // `ensure_codex_remote_auth_consistent`. Note that agent bootstrap is one
+    // of those entry points, so `coop start` on such a VM aborts too — only
+    // `--no-agents` brings it up, and then shell/exec/`coop claude` work
+    // normally while Codex does not.
     if codex_account_auth && proxy_openai {
         tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
     }

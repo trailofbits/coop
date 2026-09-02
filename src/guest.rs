@@ -578,6 +578,11 @@ mod tests {
             2,
             "both probe secret-tool calls must be time-bounded",
         );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains("timeout 30 gnome-keyring-daemon --unlock"),
+            "the unlock must be time-bounded too: it runs inside a command \
+             substitution, which waits for EOF rather than for exit",
+        );
     }
 
     #[test]

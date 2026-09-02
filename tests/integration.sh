@@ -238,6 +238,34 @@ test_validate() {
     else
         fail "validate reports OK" "got: $HARNESS_OUT"
     fi
+
+    # `[codex] auth = "chatgpt"` uses ChatGPT workspace credentials while the
+    # OpenAI proxy injects an API key, so the pair is rejected at parse time.
+    local conflict_dir conflict_cfg
+    conflict_dir=$(mktemp -d)
+    conflict_cfg="$conflict_dir/config.toml"
+    cat >"$conflict_cfg" <<'CONFLICTEOF'
+[codex]
+auth = "chatgpt"
+
+[proxy.openai]
+credential = "cmd:echo sk-test"
+auth = "bearer"
+CONFLICTEOF
+
+    if coop_fails --config "$conflict_cfg" validate; then
+        if grep -q "conflicts with \[proxy.openai\]" <<<"$HARNESS_ERR$HARNESS_OUT"; then
+            pass "validate rejects codex.auth=chatgpt with [proxy.openai]"
+        else
+            fail "validate rejects codex.auth=chatgpt with [proxy.openai]" \
+                "wrong error: $HARNESS_ERR$HARNESS_OUT"
+        fi
+    else
+        fail "validate rejects codex.auth=chatgpt with [proxy.openai]" \
+            "validate unexpectedly succeeded"
+    fi
+
+    rm -rf "$conflict_dir"
 }
 
 test_completions() {
@@ -1104,6 +1132,33 @@ test_codex_account_auth_support() {
         fail "codex-account passes through to codex without keyring mode" \
             "stderr: $(guest_stderr)"
     fi
+
+    # Drive the keyring branch without reconfiguring the VM: the wrapper reads
+    # $CODEX_HOME, so a scratch config selects keyring mode for one call. This
+    # is the only place the `cli_auth_credentials_store` grep, the D-Bus
+    # re-exec, the tool guards and the TTY guard actually execute — the
+    # assertions above all run on the passthrough branch.
+    #
+    # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
+    # a password prompt. A hang here is the failure this asserts against.
+    guest_exec sh -c 'mkdir -p /tmp/coop-keyring-probe \
+        && printf "cli_auth_credentials_store = \"keyring\"\n" \
+            > /tmp/coop-keyring-probe/config.toml'
+
+    # </dev/null so the TTY guard is deterministic: run interactively, stdin
+    # could otherwise be a terminal and the wrapper would prompt and block.
+    if coop_exec env CODEX_HOME=/tmp/coop-keyring-probe \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "codex-account enters keyring mode from the guest config" \
+            "expected a non-TTY refusal, but the wrapper passed through to codex"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "codex-account enters keyring mode and refuses a non-TTY session"
+    else
+        fail "codex-account enters keyring mode and refuses a non-TTY session" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    guest_exec rm -rf /tmp/coop-keyring-probe
 }
 
 test_codex_sandbox_bypass() {

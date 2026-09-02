@@ -1573,6 +1573,11 @@ mod tests {
             script.contains("Installing codex-account shortcut"),
             "base recipe should install Codex account-auth wrapper",
         );
+        assert!(
+            script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
+            "codex-yolo should route through the account wrapper so keyring \
+             mode works from an in-guest shell",
+        );
         no_consecutive_concat(&script);
     }
 

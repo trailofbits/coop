@@ -98,7 +98,7 @@ unlock_keyring() {
     # its own fd 2, so this surfaces only its startup diagnostics — the probe
     # below is what reports a wrong password.
     output="$(printf '%s' "$password" \
-        | gnome-keyring-daemon --unlock --components=secrets)" \
+        | timeout 30 gnome-keyring-daemon --unlock --components=secrets)" \
         || die "failed to unlock the guest keyring"
 
     # The daemon prints its session env as `NAME=value` lines. Take only

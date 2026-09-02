@@ -120,7 +120,13 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   earlier boot wrote it, the wrapper then falls through to plain Codex and
   `codex login` writes a plaintext `~/.codex/auth.json` instead. coop warns in
   exactly that case; the setting lives on the guest disk, so once written it
-  survives a later `--no-agents` start.
+  survives a later `--no-agents` start. Two guardrails close the gaps that
+  leaves: each bootstrap in this mode deletes any guest `~/.codex/auth.json`
+  left by an earlier `api_key` boot or `--no-agents` login (dropping the file
+  from the staged set only stops coop *copying* one, it removes nothing), and
+  `coop codex` refuses to launch when the guest config does not actually
+  select the keyring store — otherwise the wrapper would pass through to plain
+  Codex and write the token in the clear.
 
 ## SSH boundary
 

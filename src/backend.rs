@@ -1689,9 +1689,18 @@ fn bootstrap_codex(
         // boot of a VM the guest key never reached — including the
         // `read_codex_plugin_state` round-trip, whose warn-and-continue on a
         // failed read drops the guest's own plugin tables.
-        if codex.auth.uses_chatgpt_account() && !model_state.codex_keyring_materialized {
-            model_state.codex_keyring_materialized = true;
+        // Cleared as well as set, so it mirrors the guest rather than
+        // latching: once the `api_key` rewrite above has actually dropped the
+        // key, a stale `true` would force the very every-boot rewrite (and
+        // `read_codex_plugin_state` round-trip) this comment warns about.
+        let wants_keyring = codex.auth.uses_chatgpt_account();
+        if wants_keyring != model_state.codex_keyring_materialized {
+            model_state.codex_keyring_materialized = wants_keyring;
             model_state.save(inst)?;
+        }
+
+        if wants_keyring {
+            remove_guest_codex_auth_json(&session.target);
         }
 
         // Marketplaces and plugins are persisted in the guest's config.toml and
@@ -1758,6 +1767,56 @@ pub fn ensure_codex_remote_auth_consistent(
         bail!("{}", codex_chatgpt_proxy_conflict_message());
     }
     Ok(())
+}
+
+/// Delete a guest `~/.codex/auth.json` left behind by an earlier `api_key`
+/// boot (or by a `codex login` run under `--no-agents`).
+///
+/// Dropping `auth.json` from the staged file set only stops coop *copying* a
+/// new one — `copy_staged_to_guest` is additive and deletes nothing — so a VM
+/// switched from `api_key` to `chatgpt` would keep a plaintext refresh token
+/// on its guest disk, which is precisely what this mode exists to avoid.
+///
+/// Best-effort: the credential store is already the keyring by this point, so
+/// a failure here leaves a stale file rather than breaking the boot. It is
+/// loud about it, because the file is a credential.
+fn remove_guest_codex_auth_json(target: &SshTarget) {
+    if let Err(e) = target.exec(RemoteCommand::new().literal("rm -f ~/.codex/auth.json")) {
+        tracing::warn!(
+            "Could not remove a possible stale plaintext ~/.codex/auth.json from the \
+             guest; Codex account auth stores credentials in the guest keyring, so any \
+             such file is unused but still readable: {e:#}"
+        );
+    }
+}
+
+pub fn codex_keyring_not_configured_message() -> &'static str {
+    "Codex ChatGPT account auth is configured, but this VM's guest \
+     ~/.codex/config.toml does not select the keyring credential store.\n\
+     coop writes that setting during agent bootstrap, so a VM started before \
+     `auth = \"chatgpt\"` was set (or started with `--no-agents`) has not got \
+     it yet, and Codex would write its account credentials to a plaintext \
+     ~/.codex/auth.json in the guest instead.\n\
+     Run `coop start` (without `--no-agents`) to bootstrap it."
+}
+
+/// Fail closed when the guest is not actually in keyring mode.
+///
+/// The guest wrapper gates on the guest's own `~/.codex/config.toml` — which
+/// is what lets in-guest `codex-yolo` work — so if that file lacks the
+/// setting the wrapper silently execs plain Codex and `codex login` writes a
+/// plaintext token. `ensure_codex_account_guest_support` only proves the
+/// *packages* are installed, and agent bootstrap only runs on start/up, so
+/// enabling the mode against a running VM reaches exactly this gap.
+pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
+    let configured = target.exec_ok(RemoteCommand::new().literal(
+        "grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*\"keyring\"' \
+         ~/.codex/config.toml",
+    ));
+    if configured {
+        return Ok(());
+    }
+    bail!("{}", codex_keyring_not_configured_message());
 }
 
 pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
@@ -2478,14 +2537,26 @@ fn read_codex_plugin_state(target: &SshTarget) -> Option<toml::Table> {
     }
 }
 
-/// Extract the `marketplaces` and `plugins` tables from a guest
-/// `config.toml`. These hold the Codex CLI's installed marketplace
-/// registrations (`[marketplaces.*]`) and per-plugin enabled state
-/// (`[plugins.*]`); coop preserves them verbatim when it rewrites
-/// config.toml so a stop/start does not wipe installed plugins. Returns
-/// `Ok(None)` when the input is empty or carries neither table, and `Err`
-/// when it is present but not valid TOML — so the caller can warn rather than
-/// silently dropping the tables.
+/// Guest-owned tables in `~/.codex/config.toml` that coop carries across its
+/// own rewrite of that file.
+///
+/// `marketplaces`/`plugins` are the Codex CLI's installed marketplace
+/// registrations and per-plugin enabled state. `projects` holds its
+/// per-directory `trust_level` records — without it a user re-approves
+/// workspace trust after every `coop stop`/`coop start`, which
+/// `auth = "chatgpt"` would otherwise make the norm by forcing a rewrite on
+/// every boot.
+///
+/// Deliberately *not* here: `model` / `model_provider`. Local-model routing
+/// and proxy mode overwrite those on purpose, so preserving the guest's copy
+/// would fight `coop model`.
+const CODEX_PRESERVED_GUEST_TABLES: &[&str] = &["marketplaces", "plugins", "projects"];
+
+/// Extract the guest-owned tables listed in [`CODEX_PRESERVED_GUEST_TABLES`]
+/// from a guest `config.toml`, so coop can write them back verbatim when it
+/// rewrites the file. Returns `Ok(None)` when the input is empty or carries
+/// none of them, and `Err` when it is present but not valid TOML — so the
+/// caller can warn rather than silently dropping the tables.
 fn extract_codex_plugin_state(config_toml: &str) -> Result<Option<toml::Table>> {
     let parsed = toml::from_str::<TomlValue>(config_toml)
         .context("guest ~/.codex/config.toml is not valid TOML")?;
@@ -2493,9 +2564,9 @@ fn extract_codex_plugin_state(config_toml: &str) -> Result<Option<toml::Table>> 
         return Ok(None);
     };
     let mut preserved = toml::Table::new();
-    for key in ["marketplaces", "plugins"] {
-        if let Some(value) = table.get(key) {
-            preserved.insert(key.to_string(), value.clone());
+    for key in CODEX_PRESERVED_GUEST_TABLES {
+        if let Some(value) = table.get(*key) {
+            preserved.insert((*key).to_string(), value.clone());
         }
     }
     Ok((!preserved.is_empty()).then_some(preserved))
@@ -2696,14 +2767,22 @@ fn stage_codex_files(
         }
     }
 
-    if auth.uses_chatgpt_account() {
+    {
         let TomlValue::Table(root) = &mut config else {
             bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
         };
-        root.insert(
-            "cli_auth_credentials_store".to_string(),
-            TomlValue::String("keyring".to_string()),
-        );
+        if auth.uses_chatgpt_account() {
+            root.insert(
+                "cli_auth_credentials_store".to_string(),
+                TomlValue::String("keyring".to_string()),
+            );
+        } else {
+            // Explicit, not incidental: the host's own config.toml may set
+            // this (the user may use keyring storage on the host too), and
+            // copying it into an `api_key` guest would make the wrapper
+            // demand a keyring password that mode does not need.
+            root.remove("cli_auth_credentials_store");
+        }
     }
 
     // The Codex CLI records installed marketplaces under `[marketplaces.*]`
@@ -2718,8 +2797,9 @@ fn stage_codex_files(
         let TomlValue::Table(root) = &mut config else {
             bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
         };
-        root.remove("marketplaces");
-        root.remove("plugins");
+        for key in CODEX_PRESERVED_GUEST_TABLES {
+            root.remove(*key);
+        }
         if let Some(preserved) = preserved {
             for (key, value) in preserved {
                 root.insert(key.clone(), value.clone());
@@ -4009,6 +4089,107 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn stage_codex_files_drops_a_host_supplied_keyring_store_in_api_key_mode() {
+        // A user may use keyring storage on their *host* Codex too. Copying
+        // that key into an `api_key` guest would make the wrapper demand a
+        // keyring password the mode does not need, so the api_key path must
+        // remove it rather than merely not add it.
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("config.toml"),
+            "cli_auth_credentials_store = \"keyring\"\nmodel = \"gpt-5\"\n",
+        )
+        .unwrap();
+
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            None,
+            false,
+            CodexAuthMode::ApiKey,
+            false,
+        )
+        .unwrap();
+
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(
+            !config.contains("cli_auth_credentials_store"),
+            "api_key mode must drop a host-supplied keyring store, got: {config:?}",
+        );
+        assert!(
+            config.contains("gpt-5"),
+            "the rest of the host config must survive, got: {config:?}",
+        );
+    }
+
+    #[test]
+    fn extract_codex_plugin_state_preserves_project_trust_records() {
+        // Codex writes `[projects."<dir>"] trust_level` when the user approves
+        // a workspace. ChatGPT mode rewrites config.toml on every boot, so
+        // without this the user re-approves trust after every restart.
+        let guest = r#"
+model = "gpt-5"
+
+[projects."/workspace"]
+trust_level = "trusted"
+
+[marketplaces.acme]
+url = "https://example.com/m"
+"#;
+        let preserved = extract_codex_plugin_state(guest).unwrap().unwrap();
+        assert!(
+            preserved.contains_key("projects"),
+            "project trust records must survive coop's rewrite: {preserved:?}",
+        );
+        assert!(preserved.contains_key("marketplaces"));
+        assert!(
+            !preserved.contains_key("model"),
+            "model is coop-managed (local/proxy routing overwrite it) and must not be preserved",
+        );
+    }
+
+    #[test]
+    fn stage_codex_files_drops_host_projects_but_keeps_guest_ones() {
+        // Host-side Codex state must not leak into the guest, but the guest's
+        // own trust records must come back — the same rule the marketplaces
+        // and plugins tables already follow.
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("config.toml"),
+            "[projects.\"/host/secret\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+        let mut preserved = toml::Table::new();
+        let guest_projects =
+            toml::from_str::<toml::Table>("[\"/workspace\"]\ntrust_level = \"trusted\"\n").unwrap();
+        preserved.insert("projects".to_string(), toml::Value::Table(guest_projects));
+
+        let staging = stage_codex_files(
+            Some(src.path()),
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            Some(&preserved),
+            false,
+            CodexAuthMode::ApiKey,
+            false,
+        )
+        .unwrap();
+
+        let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
+        assert!(
+            config.contains("/workspace"),
+            "the guest's own trust records must be written back: {config:?}",
+        );
+        assert!(
+            !config.contains("/host/secret"),
+            "host-side Codex project state must not reach the guest: {config:?}",
+        );
+    }
+
+    #[test]
     fn codex_config_needs_rewrite_on_switch_away_from_chatgpt() {
         // The gate that lets the rewrite above happen at all: with no source,
         // no MCP servers, no local model and `api_key` auth, only the
@@ -4322,6 +4503,21 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(msg.contains("--no-agents"));
         assert!(msg.contains("--no-claude"));
         assert!(msg.contains("coop setup --rebuild"));
+    }
+
+    #[test]
+    fn codex_keyring_not_configured_message_names_the_recovery() {
+        // This fires when the guest never got the keyring setting, so the
+        // message has to name the step that writes it — otherwise the user is
+        // told only that something is wrong.
+        let msg = codex_keyring_not_configured_message();
+        assert!(msg.contains("cli_auth_credentials_store") || msg.contains("keyring"));
+        assert!(msg.contains("coop start"));
+        assert!(msg.contains("--no-agents"));
+        assert!(
+            msg.contains("auth.json"),
+            "the consequence — a plaintext token — is the reason to act",
+        );
     }
 
     #[test]

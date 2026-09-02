@@ -115,8 +115,9 @@ requested again on later launches; it is unrelated to your ChatGPT or host
 credentials. Because it is per-guest, `coop destroy` discards it along with the
 cached login.
 
-The prompt needs a terminal. `coop codex` provides one; a non-interactive
-`coop exec` does not, and the wrapper fails with a clear message rather than
+The prompt needs a terminal. `coop codex` provides one. Anything that runs
+the wrapper without one — invoking `codex-account` yourself through
+`coop exec`, or a `post_start` script — fails with a clear message rather than
 hanging.
 
 Security and billing guardrails in this mode:
@@ -128,6 +129,12 @@ Security and billing guardrails in this mode:
   guest. Account tokens are stored in the guest OS credential store instead.
 - `[proxy.openai]` is rejected with `auth = "chatgpt"`, because the proxy path
   uses an OpenAI API key and would switch Codex back to API billing.
+
+Because coop must keep `cli_auth_credentials_store` in the guest
+`~/.codex/config.toml`, this mode rewrites that file on every start. Codex's
+own state in it — installed marketplaces and plugins, and the
+`[projects.*]` workspace-trust records — is read back and preserved across the
+rewrite, so you are not re-approving workspace trust after each restart.
 
 Images built before this support existed need a rebuild:
 
