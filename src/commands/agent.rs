@@ -73,8 +73,8 @@ impl Agent {
 
 /// How an agent's binary is refreshed in the guest.
 enum UpdateStrategy {
-    /// Re-run coop's own installer as root, forcing overwrite of the
-    /// root-owned binary. Carries the embedded installer script.
+    /// Re-run coop's installer as root and activate its package. Carries the
+    /// embedded installer script.
     ReinstallAsRoot { script: &'static str },
     /// Invoke the agent's own updater as the guest user (no sudo).
     SelfUpdate,

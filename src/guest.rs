@@ -196,8 +196,8 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
 /// uniform error if any are missing.
 ///
 /// `probe` answers "does this binary exist in the image?" — its mechanism
-/// differs per backend (a chroot `symlink_metadata` for Firecracker, a
-/// `test -x` over `limactl shell` for Lima). `source_label` names what
+/// differs per backend (`test -x` inside the chroot for Firecracker, or over
+/// `limactl shell` for Lima). `source_label` names what
 /// produced the image ("install script" vs "provision script"), and
 /// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
 /// evaluated lazily only when something is missing.
@@ -505,6 +505,8 @@ mod tests {
             "sha256sum -c -",
             "tar --no-same-owner --no-same-permissions",
             "flock 9",
+            "flock -u 9",
+            "exec 9>&-",
             "chown -R root:root",
             "for executable in codex-code-mode-host codex",
             "codex_reconcile_public_entrypoints",

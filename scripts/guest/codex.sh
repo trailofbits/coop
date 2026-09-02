@@ -185,4 +185,6 @@ else
 
     codex_reconcile_public_entrypoints
     /usr/local/bin/codex --version >/dev/null
+    flock -u 9
+    exec 9>&-
 fi

@@ -1279,11 +1279,14 @@ test_agent_update() {
                 "got: $ver stderr: $(guest_stderr)"
         fi
 
-        if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
-            pass "codex update repairs missing code-mode host"
+        local repaired_host
+        repaired_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+        if guest_exec test -x /usr/local/bin/codex-code-mode-host \
+            && [[ "$repaired_host" == "$installed_host" ]]; then
+            pass "codex update repairs code-mode host in the same release"
         else
-            fail "codex update repairs missing code-mode host" \
-                "stderr: $(guest_stderr)"
+            fail "codex update repairs code-mode host in the same release" \
+                "before=$installed_host after=$repaired_host stderr: $(guest_stderr)"
         fi
     else
         skip "agent update --codex" "use --full; downloads the release in-guest"
