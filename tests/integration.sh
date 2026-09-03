@@ -1280,11 +1280,22 @@ test_codex_account_auth_support() {
         fi
     done
 
-    # Default config is auth = "api_key", so the wrapper must be a transparent
-    # passthrough: no D-Bus session, no keyring, no password prompt. A hang
-    # here would mean it tried to unlock a keyring it should have skipped.
+    # The primary guest config may inherit the host's Codex credential-store
+    # setting. Use an explicit empty config so this assertion isolates the
+    # wrapper's non-keyring branch from the machine running the suite.
+    local account_probe_dir="/tmp/coop-codex-account-probe"
+    if ! guest_exec sh -c 'mkdir -p "$1" && : > "$1/config.toml"' \
+        sh "$account_probe_dir"; then
+        fail "prepare codex-account probe config" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    # Without keyring mode the wrapper must be a transparent passthrough: no
+    # D-Bus session, keyring, or password prompt. A hang here would mean it
+    # tried to unlock a keyring it should have skipped.
     local version
-    if version=$(coop_exec /usr/local/bin/codex-account --version); then
+    if version=$(coop_exec env CODEX_HOME="$account_probe_dir" \
+        /usr/local/bin/codex-account --version); then
         pass "codex-account passes through to codex without keyring mode ($version)"
     else
         fail "codex-account passes through to codex without keyring mode" \
@@ -1299,13 +1310,12 @@ test_codex_account_auth_support() {
     #
     # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
     # a password prompt. A hang here is the failure this asserts against.
-    guest_exec sh -c 'mkdir -p /tmp/coop-keyring-probe \
-        && printf "cli_auth_credentials_store = \"keyring\"\n" \
-            > /tmp/coop-keyring-probe/config.toml'
+    guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
+        > "$1/config.toml"' sh "$account_probe_dir"
 
     # </dev/null so the TTY guard is deterministic: run interactively, stdin
     # could otherwise be a terminal and the wrapper would prompt and block.
-    if coop_exec env CODEX_HOME=/tmp/coop-keyring-probe \
+    if coop_exec env CODEX_HOME="$account_probe_dir" \
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
@@ -1316,7 +1326,7 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    guest_exec rm -rf /tmp/coop-keyring-probe
+    guest_exec rm -rf "$account_probe_dir"
 }
 
 # The wrapper/package checks above use a scratch CODEX_HOME, but they do not
