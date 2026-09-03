@@ -2241,12 +2241,12 @@ fn reprovision_instance(
     // finishes the job. It also carries `previous_disk`, which only this
     // process knows: nothing persists an instance's disk size, so a re-run
     // measures the replaced template-sized file and skips the re-grow.
-    let partial = || reprovision_partial_message(&reprovisioned_name, previous_disk);
+    let partial = || reprovision_partial_message(&reprovisioned_name, &image, previous_disk);
 
     // Persist the new lineage after the swap: if `restore_disk` failed the
     // recorded image still matches the untouched disk.
     let mut inst = stopped.instance().clone();
-    inst.set_image(image).with_context(partial)?;
+    inst.set_image(image.clone()).with_context(partial)?;
 
     if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
         let stopped = be.as_stopped(inst.clone()).with_context(partial)?;
@@ -2407,10 +2407,20 @@ fn reprovision_workspace_inputs(
 /// Advice attached to every failure after the disk has been replaced. The old
 /// filesystem is gone by then, so the useful thing to say is what survived and
 /// that re-running completes the job.
-fn reprovision_partial_message(name: &config::InstanceName, previous_disk: config::GiB) -> String {
+///
+/// The recovery command names `--image` rather than leaning on the
+/// `--reprovision` default, because `set_image` is one of the steps that can
+/// fail here. If it does, `instance.json` still records the *previous* image,
+/// and a defaulted re-run would wipe the disk back to that one instead of
+/// finishing the reprovision that was asked for.
+fn reprovision_partial_message(
+    name: &config::InstanceName,
+    image: &config::ImageName,
+    previous_disk: config::GiB,
+) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
-         Re-run `coop restore {name} --reprovision` to finish.\n\
+         Re-run `coop restore {name} --image {image} --reprovision` to finish.\n\
          Its disk was {previous_disk} GiB before the reset. Nothing persists \
          that, and a re-run measures the replaced (template-sized) disk, so \
          check `coop status {name}` and run `coop resize {name} --size \
@@ -3123,12 +3133,20 @@ mod tests {
     #[test]
     fn reprovision_partial_message_names_the_instance_and_the_recovery_command() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
+        let image = super::config::ImageName::new("rust").expect("valid image name");
         let disk = super::config::GiB::new(20).expect("20 is non-zero");
-        let msg = super::reprovision_partial_message(&name, disk);
+        let msg = super::reprovision_partial_message(&name, &image, disk);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
-        assert!(msg.contains("coop restore myvm --reprovision"), "{msg}");
+        // The image has to be named explicitly: `set_image` is one of the
+        // steps that can fail after the swap, and it is what records the new
+        // image. A re-run that defaulted to `instance.json` would then target
+        // the previous image and wipe the disk to the wrong template.
+        assert!(
+            msg.contains("coop restore myvm --image rust --reprovision"),
+            "{msg}"
+        );
         // Nothing persists an instance's disk size, so a re-run measures the
         // replaced template-sized file and skips the re-grow. The size this
         // process read before the swap is the only record of it, so the
