@@ -244,15 +244,16 @@ Codex configuration injected into the guest VM at start time. Every field is opt
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
-| `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from this directory to `~/.codex/` in the guest on start. Set to `false` to disable. Supports `~` expansion. |
+| `auth` | string | `"api_key"` | Codex auth mode: `"api_key"` forwards an OpenAI API key; `"chatgpt"` uses ChatGPT account or workspace login through the guest Linux keyring. |
+| `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Used only with `auth = "api_key"`. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
+| `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from this directory to `~/.codex/` in the guest on start. `auth.json` is omitted when `auth = "chatgpt"` or `[proxy.openai]` is active. Set to `false` to disable. Supports `~` expansion. |
 | `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
 | `marketplaces` | array of strings | `[]` | Codex plugin marketplace sources. Each entry is a `owner/repo`[`@ref`] shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
 | `plugins` | array of strings | `[]` | Codex plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.codex/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
 | `local_model` | table | unset | Host-side model endpoint to route Codex at when the VM is in local mode (`coop model <vm> local`). See [Local-model routing](#local-model-routing). |
 
-coop preserves any other settings already present in the staged `config.toml`, but the `mcp_servers` table is owned by coop when `codex.mcp_servers` is configured.
+coop preserves any other settings already present in the staged `config.toml`, but the `mcp_servers` table is owned by coop when `codex.mcp_servers` is configured. With `auth = "chatgpt"`, coop also writes `cli_auth_credentials_store = "keyring"` so Codex caches account credentials in the guest OS credential store instead of `auth.json`.
 
 ## Local-model routing
 
@@ -296,6 +297,16 @@ holds only a per-instance capability token, while the real credential stays on
 the host and is injected onto outbound requests the guest never sees. Absent
 config means no proxy — credentials are forwarded into the guest exactly as
 before.
+
+Every golden image installs the Secret Service packages this mode needs
+(`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) regardless of the
+`auth` setting, because the image is built once and reused across configs —
+gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
+serve it.
+
+`[proxy.openai]` is API-key based and cannot be combined with
+`[codex] auth = "chatgpt"`. Use one Codex remote auth path per VM: the proxy
+for an OpenAI API key, or ChatGPT auth for account/workspace access.
 
 Proxy mode applies only in remote model mode
 ([`coop model <vm> remote`](commands.md#model)); local mode takes precedence.
@@ -446,6 +457,7 @@ args = ["--verbose"]
 env = { API_KEY = "MY_API_KEY" }
 
 [codex]
+auth = "api_key"
 config_dir = "~/.codex"
 env_forward = ["CUSTOM_TOKEN"]
 

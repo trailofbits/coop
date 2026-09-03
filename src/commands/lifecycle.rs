@@ -1441,14 +1441,28 @@ pub(crate) fn prepend_binary(binary: &str, args: Vec<String>) -> Vec<String> {
 /// Codex's flag for running fully unrestricted (no sandbox, no approvals).
 const CODEX_BYPASS_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
 
+/// Codex subcommands that manage credentials rather than start an agent
+/// session, so the sandbox-bypass flag is meaningless on them.
+const CODEX_AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
+
 /// Prepend Codex's sandbox-bypass flag unless the user opted into approvals.
 ///
 /// The VM is the isolation boundary, so Codex's own sandbox is redundant — and
 /// broken in the guest, which lacks a working bubblewrap. Bypassing by default
 /// gives `coop codex` parity with `coop claude`'s `bypassPermissions`. `ask`
 /// (from `--ask`) keeps Codex's sandbox and approval prompts.
+///
+/// `codex login` / `codex logout` never start a session, so there is nothing
+/// to sandbox and the flag is dropped regardless of `ask`. Codex does accept it
+/// in the position this builds (root-level, before the subcommand); leaving it
+/// off keeps the argv for the `ChatGPT` sign-in path free of a flag that says
+/// nothing about it. Either way `coop codex -- login --device-auth` works
+/// without `--ask`.
 pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
-    if !ask {
+    let is_auth_subcommand = args
+        .first()
+        .is_some_and(|arg| CODEX_AUTH_SUBCOMMANDS.contains(&arg.as_str()));
+    if !ask && !is_auth_subcommand {
         args.insert(0, CODEX_BYPASS_FLAG.to_string());
     }
     args
@@ -1522,6 +1536,17 @@ fn bootstrap_and_post_start(
              agents will not be able to authenticate in this VM"
         );
     }
+    // A failed read degrades to "not materialized", which at worst warns when
+    // it need not. Aborting `--no-agents` — a path that otherwise never opens
+    // this file — over an unreadable model.json would be the worse trade.
+    if no_agents_skips_codex_keyring(opts.no_agents, cfg.codex.auth, || {
+        model_state::ModelState::try_load(inst)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.codex_keyring_materialized)
+    }) {
+        tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
+    }
     if opts.no_agents && post_start.is_none() {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
@@ -1555,6 +1580,33 @@ fn bootstrap_and_post_start(
     Ok(())
 }
 
+/// Warning for `--no-agents` on a VM that wants Codex `ChatGPT` account auth.
+pub(crate) const NO_AGENTS_CHATGPT_WARNING: &str = "codex.auth = \"chatgpt\" is configured but --no-agents skips agent bootstrap; \
+     the guest keyring credential store will not be set up, so `coop codex -- login` \
+     would store credentials in a plaintext ~/.codex/auth.json in the guest";
+
+/// Whether `--no-agents` leaves this VM's Codex writing plaintext credentials.
+///
+/// `cli_auth_credentials_store = "keyring"` is written during agent bootstrap,
+/// which `--no-agents` skips; without it the guest wrapper takes its
+/// passthrough branch and `codex login` writes `~/.codex/auth.json` in the
+/// clear instead of using the guest Secret Service — the one thing this mode
+/// exists to avoid.
+///
+/// `keyring_materialized` is what keeps this from crying wolf on a restart: the
+/// guest config lives on the guest disk and survives stop/start, so once an
+/// earlier boot has written the key, skipping bootstrap changes nothing.
+///
+/// `keyring_materialized` is lazy: reading it costs an instance-state file
+/// read, and the cheap terms decide the answer for every VM not in this mode.
+pub(crate) fn no_agents_skips_codex_keyring(
+    no_agents: bool,
+    auth: config::CodexAuthMode,
+    keyring_materialized: impl FnOnce() -> bool,
+) -> bool {
+    no_agents && auth.uses_chatgpt_account() && !keyring_materialized()
+}
+
 pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: Option<&config::Instance>,
@@ -1584,21 +1636,39 @@ pub(crate) fn prepare_session_from_target(
         ),
         _ => (false, false),
     };
+    let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
+    let suppress_openai_key = proxy_openai || codex_account_auth;
+    // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
+    // auth even though `CoopConfig::validate` rejects that combination in the
+    // config file. Warn here so the reason is visible on every session, and
+    // let the Codex entry points fail hard via
+    // `ensure_codex_remote_auth_consistent`. Note that agent bootstrap is one
+    // of those entry points, so `coop start` on such a VM aborts too — only
+    // `--no-agents` brings it up, and then shell/exec/`coop claude` work
+    // normally while Codex does not.
+    if codex_account_auth && proxy_openai {
+        tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
+    }
 
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, suppress_openai_key)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
-                // In proxy mode a raw provider key snapshotted via `coop start
-                // --env` must not re-enter the guest — the host-side proxy
-                // holds it. Skip and warn, matching `prepare_env_forwarding`.
+                // A raw provider key snapshotted via `coop start --env` must
+                // not re-enter the guest under either suppression mode: in
+                // proxy mode the host-side proxy holds it, and under
+                // `codex.auth = "chatgpt"` forwarding it would let Codex
+                // silently fall back to API billing. Skip and warn, matching
+                // `prepare_env_forwarding`.
                 if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
-                    || (proxy_openai && name.as_str() == "OPENAI_API_KEY")
+                    || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
                 {
-                    tracing::warn!(
-                        "proxy mode: ignoring runtime --env entry '{}' — the raw key stays on the host",
-                        name.as_str()
-                    );
+                    let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
+                        "codex.auth = \"chatgpt\""
+                    } else {
+                        "proxy mode"
+                    };
+                    tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
                     continue;
                 }
                 env.set(name.as_str(), value.as_str());
@@ -2061,6 +2131,73 @@ mod tests {
     }
 
     #[test]
+    fn no_agents_warns_only_when_the_guest_keyring_was_never_set_up() {
+        use super::config::CodexAuthMode;
+        use super::no_agents_skips_codex_keyring as warns;
+
+        assert!(
+            warns(true, CodexAuthMode::ChatGpt, || false),
+            "--no-agents on a guest that never got the keyring store must warn",
+        );
+        assert!(
+            !warns(false, CodexAuthMode::ChatGpt, || false),
+            "a normal start bootstraps the keyring store, so there is nothing to warn about",
+        );
+        assert!(
+            !warns(true, CodexAuthMode::ApiKey, || false),
+            "api_key auth does not use the guest keyring at all",
+        );
+        assert!(
+            !warns(true, CodexAuthMode::ChatGpt, || true),
+            "an earlier boot already wrote the key; it survives on the guest disk",
+        );
+
+        // The instance-state read is the expensive term, so it must not happen
+        // for the VMs that are not in this mode at all.
+        for (no_agents, auth) in [
+            (false, CodexAuthMode::ChatGpt),
+            (true, CodexAuthMode::ApiKey),
+        ] {
+            let read = std::cell::Cell::new(false);
+            assert!(!warns(no_agents, auth, || {
+                read.set(true);
+                false
+            }));
+            assert!(
+                !read.get(),
+                "the cheap terms must short-circuit before the state read",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_launch_args_leaves_auth_subcommands_bare() {
+        // `coop codex -- login --device-auth` is the ChatGPT account sign-in
+        // path. Nothing is sandboxed there, so the bypass flag is dropped and
+        // `--ask` is not required to get a working invocation.
+        for subcommand in ["login", "logout"] {
+            let args =
+                super::codex_launch_args(false, vec![subcommand.into(), "--device-auth".into()]);
+            assert_eq!(args, vec![subcommand, "--device-auth"]);
+        }
+    }
+
+    #[test]
+    fn codex_launch_args_still_bypasses_when_login_is_not_first() {
+        // Only the leading token selects a subcommand — a `login` appearing
+        // as a value must not disarm the bypass flag.
+        let args = super::codex_launch_args(false, vec!["--model".into(), "login".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "login"
+            ]
+        );
+    }
+
+    #[test]
     fn codex_launch_args_with_ask_keeps_sandbox() {
         let args = super::codex_launch_args(true, vec!["--model".into(), "gpt-5".into()]);
         assert_eq!(args, vec!["--model", "gpt-5"]);
@@ -2192,6 +2329,145 @@ mod tests {
             envs.get("FROM_CLI").map(String::as_str),
             Some("saved-value"),
             "non-suppressed --env entries must still flow through",
+        );
+    }
+
+    #[test]
+    fn prepare_session_suppresses_persisted_openai_key_for_chatgpt_auth() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("OPENAI_API_KEY").expect("valid env var"),
+            "sk-openai-realkey".to_string(),
+        );
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
+            "saved-value".to_string(),
+        );
+        state.save(&inst).expect("save snapshot");
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
+
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        let session =
+            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+
+        let envs = session.env.as_envs();
+        assert!(
+            !envs.contains_key("OPENAI_API_KEY"),
+            "ChatGPT account auth re-injected the raw key from the persisted --env overlay",
+        );
+        assert_eq!(
+            envs.get("FROM_CLI").map(String::as_str),
+            Some("saved-value"),
+            "non-suppressed --env entries must still flow through",
+        );
+    }
+
+    #[test]
+    fn prepare_session_survives_chatgpt_auth_with_openai_proxy() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
+        cfg.proxy.openai = Some(super::config::ProxyUpstream {
+            credential: super::config::Secret::new("cmd:true".to_string()),
+            auth: super::config::ProxyAuthScheme::Bearer,
+        });
+
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        // The conflict makes Codex unusable, not the VM: a shell/exec/claude
+        // session on the same instance must still come up. `coop codex` and
+        // the agent bootstrap are what fail hard, via
+        // `backend::ensure_codex_remote_auth_consistent`.
+        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+            .expect("session must still be usable for non-Codex commands");
+
+        assert!(
+            !session.env.as_envs().contains_key("OPENAI_API_KEY"),
+            "proxy mode must keep the raw key on the host",
+        );
+    }
+
+    #[test]
+    fn prepare_session_suppresses_openai_key_for_chatgpt_auth_without_proxy() {
+        use std::num::NonZeroU16;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("valid name"),
+            index: super::config::InstanceIndex::new(0).expect("0 is in range"),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
+                .expect("DEFAULT_IMAGE is valid"),
+        };
+
+        // No `[proxy.openai]`, so ChatGPT account auth is the *only* reason
+        // the key can be absent — unlike
+        // `prepare_session_survives_chatgpt_auth_with_openai_proxy`, where
+        // proxy-mode suppression would satisfy the assertion on its own.
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
+        cfg.codex.api_key = Some(super::config::Secret::new("sk-openai-realkey".to_string()));
+        cfg.github = None;
+        cfg.guest_env.insert(
+            super::guest_env_state::EnvVarName::new("COOP_TEST_PASSTHROUGH").expect("valid name"),
+            "kept".to_string(),
+        );
+        assert!(cfg.proxy.openai.is_none(), "fixture must have no proxy");
+
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            port: NonZeroU16::new(22).expect("non-zero"),
+            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
+            key_path: tmp.path().join("id_test"),
+        };
+
+        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+            .expect("ChatGPT account auth must not break session preparation");
+
+        let envs = session.env.as_envs();
+        assert!(
+            !envs.contains_key("OPENAI_API_KEY"),
+            "ChatGPT account auth must not forward an OpenAI API key",
+        );
+        // Positive control: proves the fixture can produce env at all, so the
+        // assertion above is about suppression and not an inert pipeline.
+        assert_eq!(
+            envs.get("COOP_TEST_PASSTHROUGH").map(String::as_str),
+            Some("kept"),
+            "non-suppressed entries must still flow through",
         );
     }
 

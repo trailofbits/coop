@@ -4,6 +4,21 @@
 
 ### New features
 
+- **Codex ChatGPT account auth** — New `[codex] auth = "chatgpt"` mode for
+  account/workspace access without OpenAI API billing. coop installs Linux
+  Secret Service support in the guest image, writes Codex's
+  `cli_auth_credentials_store = "keyring"` setting, launches Codex through a
+  D-Bus/GNOME Keyring wrapper (`/usr/local/bin/codex-account`, which the
+  in-guest `codex-yolo` shortcut also uses and which execs Codex unchanged when
+  the mode is off), suppresses every `OPENAI_API_KEY` forwarding path, and stops
+  copying host `auth.json` into the guest. Sign in with `coop codex -- login
+  --device-auth`; `login` and `logout` now run without the sandbox-bypass flag,
+  which is meaningless on subcommands that never start an agent session.
+  Existing images must be rebuilt with `coop setup --rebuild` before using this
+  mode. A restart reuses the old guest disk, so an existing VM also needs
+  `coop restore <vm> --image <image>` (or a destroy and recreate) to pick up
+  the new guest packages.
+
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side
   reverse proxy (`coop-proxy`, a new binary shipped in the same tarball) — one
@@ -59,6 +74,28 @@
   credential is never plaintext in the config. Anthropic is the default;
   `--openai` configures Codex. The secret store is namespaced per service, so
   proxy secrets live under their own directory rather than among the GitHub PATs.
+
+### Fixes
+
+- **Install Codex's complete runtime package** (#442) — Recent Codex releases
+  use a companion `codex-code-mode-host` executable, but coop installed only
+  the raw `codex` binary, causing Code Mode to fail closed at startup. Image
+  builds and `coop agent update --codex` now verify and install the upstream
+  package with its host and runtime resources intact, root-owned and behind a
+  shared current-release link.
+
+- **`install.sh` and `coop update` verify provenance without a GitHub
+  credential** (#421) — Verification ran `gh attestation verify --repo
+  trailofbits/coop`, which reads the Sigstore bundle from the attestations
+  API. `gh` refuses to run that command unless it is logged in, and then
+  attaches its stored token, so a token with no SSO session for the
+  `trailofbits` org got `HTTP 403` and the install was refused; the same path
+  failed outright for anyone with `gh` installed but not authenticated.
+  Releases now publish the provenance bundle as an `attestations.jsonl` asset,
+  and both clients fetch it with an unauthenticated request and verify against
+  it with `--bundle`, which makes no attestations-API call and needs no
+  credential. Releases published before the asset existed are still verified
+  through the API path, unchanged.
 
 ## v0.5.4
 

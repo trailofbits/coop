@@ -7,15 +7,43 @@ coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it s
 **macOS (Lima backend)**
 
 - [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
+  (`brew install lima`) — `coop setup` fails without it
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
 
 **Linux (Firecracker backend)**
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
-- x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but less exercised)
+- x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
+
+## Install
+
+Install the latest release:
+
+```
+curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
+```
+
+`install.sh` verifies the downloaded tarball's SHA-256 against the release's
+`SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
+also verifies its Sigstore build-provenance attestation. `coop update` runs the
+same verification, except that it treats the checksum as mandatory and refuses
+to install without it. To verify a tarball by hand, download
+`attestations.jsonl` from the same release and pass `--bundle` (this needs no
+GitHub credential — releases up to v0.5.4 predate the bundle asset and do
+not publish it):
+
+```sh
+gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --bundle attestations.jsonl
+```
+
+Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
+instead, which it will only do when `gh` is logged in. `install.sh` and `coop
+update` use that API path themselves for releases published without a usable
+bundle.
 
 ## Build from source
 
@@ -64,6 +92,7 @@ mem_size_mib = 8192
 config_dir = "~/.claude"
 
 [codex]
+auth = "api_key"
 config_dir = "~/.codex"
 ```
 
@@ -76,7 +105,17 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 
 GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
 
-coop picks up `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment automatically. Setting them explicitly under `claude.api_key` or `codex.api_key` also works, but environment variables are preferred.
+coop picks up `ANTHROPIC_API_KEY` and, in the default Codex API-key mode,
+`OPENAI_API_KEY` from your environment automatically. Setting them explicitly
+under `claude.api_key` or `codex.api_key` also works, but environment variables
+are preferred.
+
+For Codex account or workspace access without OpenAI API billing, set
+`[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
+--rebuild`. An existing VM keeps its own guest disk across a restart, so also
+run `coop restore <vm> --image <image>` (see
+[Codex integration](codex-integration.md)) to pick up the rebuilt image. Then
+run `coop codex -- login --device-auth` once.
 
 ## First run
 
@@ -231,6 +270,12 @@ coop claude -- --model opus
 
 ```
 coop codex
+```
+
+With `[codex] auth = "chatgpt"`, first sign in from the guest:
+
+```
+coop codex -- login --device-auth
 ```
 
 Pass extra arguments through to `codex`:
