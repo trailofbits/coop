@@ -53,7 +53,7 @@ coop/
 │   └── commands/           # one module per command domain (see below)
 ├── scripts/guest/          # guest-image provisioning scripts (embedded at build)
 ├── guest/init.sh           # guest first-boot init
-├── tests/                  # integration test scripts (see CLAUDE.md "Testing")
+├── tests/                  # integration test scripts (see AGENTS.md "Before committing")
 ├── fuzz/                   # cargo-fuzz targets (own workspace)
 └── docs/                   # this tree
 ```
@@ -193,7 +193,7 @@ embedded provisioning scripts in `scripts/guest/` (`preamble.sh`,
 from `guest.rs`. Firecracker uses a minimal CI kernel that is missing several
 netfilter modules; the resulting workarounds (iptables-legacy, static
 `resolv.conf`, `DOCKER_INSECURE_NO_IPTABLES_RAW=1`) are applied in
-`guest-config.sh` and explained in [`CLAUDE.md`](../CLAUDE.md) and
+`guest-config.sh` and explained in [`AGENTS.md`](../AGENTS.md) and
 [`trust-model.md`](trust-model.md#documented-accepted-trade-offs).
 
 ## Architectural invariants

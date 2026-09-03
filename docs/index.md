@@ -1,6 +1,6 @@
 # Documentation index
 
-System-of-record map for `coop`. The root [`CLAUDE.md`](../CLAUDE.md) is the
+System-of-record map for `coop`. The root [`AGENTS.md`](../AGENTS.md) is the
 short navigational entrypoint; durable detail lives here.
 
 ## For contributors (engineering)
@@ -35,10 +35,11 @@ short navigational entrypoint; durable detail lives here.
 - [`json-output-design.md`](json-output-design.md) — the `--json` design
   (a good precedent for design-doc style).
 
-## Agent tooling (`.claude/`)
+## Agent tooling
 
-- `agents/review-*.md` — single-lens PR review sub-agents.
-- `commands/` — `my-review`, `babysit-pr`, `babysit-my-prs`, `integration`.
-- `skills/` — `closeout-review` (pre-PR gate), `mutation-check`.
-- `hooks/` + `settings.json` — the closeout gate, `cargo fmt` formatter, the
-  no-pipe-test-output guard, and the read-only Bash allowlist.
+- [`.agents/skills/`](../.agents/skills/) — shared review, closeout, mutation,
+  integration, and PR-shepherding workflows discovered by Codex.
+- [`.github/workflows/codex-review.yml`](../.github/workflows/codex-review.yml)
+  — trusted-user, on-demand `@codex` review in a read-only sandbox.
+- [`.claude/`](../.claude/) — compatibility commands, skill entrypoints, and
+  local hooks/settings.
