@@ -4518,28 +4518,31 @@ CFGEOF
     # ── The proxy is reachable on host loopback and enforces the gate ──
     # The proxy binds 127.0.0.1:<port> on the host and is reverse-tunnelled into
     # the guest, so the host exercises the same listener. A request without the
-    # token is refused locally ("capability token"); with the token it passes
-    # the gate and is forwarded upstream (which fails closed at the real host —
-    # 502 with no egress, or an upstream auth error — but never the local
-    # refusal), so the presence/absence of the "capability" refusal distinguishes
-    # the two without needing a working upstream.
+    # token is refused locally ("capability token"). With the token, an
+    # allowlisted operation is forwarded upstream (which fails closed at the
+    # real host — 502 with no egress, or an upstream auth error — but never the
+    # local refusal), so the presence/absence of the "capability" refusal
+    # distinguishes the two without needing a working upstream.
     local oai_port cap_token
     oai_port=$(echo "$codex_cfg" | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
     cap_token=$(echo "$guest_env" | grep '^COOP_LOCAL_API_KEY=' | cut -d= -f2- || true)
     if [[ -n "$oai_port" ]]; then
-        local no_tok tok
-        no_tok=$(curl -s --max-time 10 "http://127.0.0.1:$oai_port/v1/models" || true)
-        tok=$(curl -s --max-time 15 "http://127.0.0.1:$oai_port/v1/models" \
-            -H "Authorization: Bearer $cap_token" || true)
+        local no_tok tok response_body
+        response_body='{"model":"gpt-4.1","input":"ping"}'
+        no_tok=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
+            -H "Content-Type: application/json" --data "$response_body" || true)
+        tok=$(curl -s --max-time 15 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
+            -H "Authorization: Bearer $cap_token" -H "Content-Type: application/json" \
+            --data "$response_body" || true)
         if echo "$no_tok" | grep -qi "capability"; then
             pass "openai proxy refuses a request missing the capability token"
         else
             fail "openai proxy refuses a request missing the capability token" "body: $no_tok"
         fi
         if echo "$tok" | grep -qi "capability"; then
-            fail "valid capability token passes the gate" "still refused: $tok"
+            fail "valid capability token forwards an allowed operation" "still refused: $tok"
         else
-            pass "valid capability token passes the gate (forwarded upstream)"
+            pass "valid capability token forwards an allowed operation"
         fi
     else
         fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"

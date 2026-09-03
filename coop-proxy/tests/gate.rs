@@ -4,11 +4,14 @@
 //!
 //! These assert the security-critical refusal path without a live upstream: a
 //! request that fails the capability check is rejected with 401 and the
-//! upstream is never contacted; a request that passes fails closed at the
-//! (unresolvable) upstream with 502, proving the gate opened without any real
-//! credential reaching a real service. The authorized header-rewrite/injection
-//! logic is covered by the unit tests in `src/proxy.rs`, and end-to-end against
-//! a mock upstream by coop's VM integration suite.
+//! upstream is never contacted; a request with a valid token reaches the
+//! operation policy and is denied with 403 for the test-only unknown upstream,
+//! proving the authentication gate opened without any credential reaching a
+//! real service. The authorized header-rewrite/injection logic is covered by
+//! the unit tests in `src/proxy.rs`, and end-to-end against a mock upstream by
+//! coop's VM integration suite. Because the unknown-upstream policy denies
+//! before forwarding, this harness does not exercise `forward`, `bad_gateway`,
+//! or the `GuardedBody` permit wiring.
 //!
 //! The `readiness_probe_*` and `spawned_proxy_*` tests are the exception: they
 //! assert nothing about the gate, but pin the harness that reaches it — the
@@ -42,7 +45,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// the loop keeps checking whether the child died.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Read budget for a test's own request, which waits on the real upstream path.
+/// Read budget for a test's own HTTP request to the proxy.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long a proxy that refuses its config gets to exit. It never binds, so
@@ -58,8 +61,8 @@ const PORT_ATTEMPTS: usize = 10;
 /// once its socket already holds it, never before.
 static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
-/// A config whose upstream can never resolve, so any request that passes the
-/// gate fails closed rather than reaching a real service.
+/// A config with an unknown upstream profile, so valid requests reach the
+/// operation policy but never reach a real service.
 fn config_json(listen: &str) -> String {
     format!(
         r#"{{
@@ -231,10 +234,23 @@ async fn probe_reply(stream: TcpStream) -> bool {
 }
 
 async fn request_status(addr: SocketAddr, auth_header: Option<&str>) -> String {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    status_line(stream, auth_header, RESPONSE_TIMEOUT)
-        .await
-        .expect("request to the proxy failed at the socket level")
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut req =
+        String::from("POST /v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: 0\r\n");
+    if let Some(h) = auth_header {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(RESPONSE_TIMEOUT, stream.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Send a minimal HTTP/1.1 request over `stream` and return the status line, or
@@ -362,10 +378,10 @@ async fn rejects_wrong_token_with_401() {
 }
 
 #[tokio::test]
-async fn valid_token_passes_gate_and_fails_closed_at_upstream() {
+async fn valid_token_passes_auth_gate_and_reaches_operation_policy() {
     let (addr, _child) = spawn_serving().await;
     let status = request_status(addr, Some("Authorization: Bearer the-right-token")).await;
-    assert!(status.contains("502"), "expected 502, got: {status:?}");
+    assert!(status.contains("403"), "expected 403, got: {status:?}");
 }
 
 #[tokio::test]

@@ -162,11 +162,15 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   per-instance `ssh -R` reverse tunnel (`proxy.rs:spawn_reverse_forward`), so —
   like the port-forwards above — it never binds a non-loopback interface and is
   reachable by exactly one guest, identically on both backends. It is guarded
-  by a per-instance capability token and forwards only to a fixed per-provider
-  upstream (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host
-  — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
+  by a per-instance capability token and forwards only its documented
+  provider-specific operations to a fixed per-provider upstream
+  (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host — one
+  proxy process and one tunnel per (VM, provider). Its own TLS-verifying
   outbound HTTPS is the intended egress; a change that lets the guest influence
-  the upstream host, or that binds anything wider than loopback, is a finding.
+  the upstream host, widens the operation policy without security review, or
+  binds anything wider than loopback, is a finding. The proxy streams allowed
+  request bodies opaquely, so this does not isolate provider objects referenced
+  by ID within an allowed request.
 
 - **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
   the real credential and terminates connections the untrusted guest
