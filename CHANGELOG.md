@@ -16,8 +16,8 @@
   which is meaningless on subcommands that never start an agent session.
   Existing images must be rebuilt with `coop setup --rebuild` before using this
   mode. A restart reuses the old guest disk, so an existing VM also needs
-  `coop restore <vm> --image <image>` (or a destroy and recreate) to pick up
-  the new guest packages.
+  `coop restore <vm> --image <image> --reprovision` (or a destroy and
+  recreate) to pick up the new guest packages.
 - **`coop restore --reprovision` — start over without re-typing anything**
   (#432) — Replaces a clobbered or bloated guest filesystem with a fresh copy of
   the instance's image, then provisions it as a first boot: `/workspace` is
