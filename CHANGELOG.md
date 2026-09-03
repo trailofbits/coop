@@ -75,6 +75,12 @@
   `--openai` configures Codex. The secret store is namespaced per service, so
   proxy secrets live under their own directory rather than among the GitHub PATs.
 
+- **`coop editor` — VS Code or Zed** — `coop vscode` is now `coop editor`
+  (the old name remains as an alias). `--editor` takes `code` or `zed`;
+  when omitted, coop tries VS Code first, then Zed. Zed connects with
+  `zed ssh://coop-<name>/<path>`, reusing the same `~/.ssh/config` alias
+  block that VS Code's Remote-SSH uses.
+
 ### Fixes
 
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases

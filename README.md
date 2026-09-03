@@ -59,7 +59,7 @@ coop codex
 - [Workspace sync](docs/workspaces.md)
 - [Claude Code integration](docs/claude-integration.md)
 - [Codex integration](docs/codex-integration.md)
-- [VS Code integration](docs/vscode.md)
+- [Editor integration](docs/editor.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)
 - [Shell completion](docs/shell-completion.md)

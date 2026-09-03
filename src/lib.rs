@@ -498,20 +498,21 @@ enum Commands {
         #[arg(required = true, last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Open VS Code connected to the guest VM
-    Vscode {
+    /// Open an editor (VS Code or Zed) connected to the guest VM
+    #[command(alias = "vscode")]
+    Editor {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Remote path to open in VS Code
+        /// Remote path to open in the editor
         #[arg(long, default_value = "/workspace")]
         project: String,
-        /// Editor to use (e.g. "code"). Overrides auto-detection
+        /// Editor to launch. Omitted: try VS Code first, then Zed
         #[arg(long)]
-        editor: Option<String>,
+        editor: Option<workspace::EditorKind>,
         /// Remove the SSH config entry for this instance and exit
         #[arg(long)]
         clean: bool,
@@ -1316,7 +1317,7 @@ pub fn run() -> Result<()> {
             workspace::pull(&running, dir.as_deref(), force, exclude_git)
         }
         Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_ref(), &command),
-        Commands::Vscode {
+        Commands::Editor {
             name,
             project,
             editor,
@@ -1329,7 +1330,7 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
             let running = resolve_running(&be, &cfg, name.as_ref())?;
-            workspace::vscode(&running, Some(&project), editor.as_deref())
+            workspace::open_editor(&running, Some(&project), editor)
         }
         Commands::SshConfig { name, clean } => {
             if clean {
@@ -1552,6 +1553,21 @@ mod tests {
     fn ssh_alias_parses_as_shell() {
         let cli = parse(&["ssh"]);
         assert!(matches!(cli.command, super::Commands::Shell { .. }));
+    }
+
+    #[test]
+    fn vscode_alias_parses_as_editor() {
+        let cli = parse(&["vscode"]);
+        assert!(matches!(cli.command, super::Commands::Editor { .. }));
+    }
+
+    #[test]
+    fn editor_kind_values_parse() {
+        let cli = parse(&["editor", "--editor", "zed"]);
+        let super::Commands::Editor { editor, .. } = cli.command else {
+            panic!("expected Editor variant");
+        };
+        assert_eq!(editor, Some(super::workspace::EditorKind::Zed));
     }
 
     #[test]
