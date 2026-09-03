@@ -96,7 +96,9 @@ apply across all lenses:
   focused mutant. A string occurring in a declaration is not evidence that the
   behavior using it still exists.
 - Exercise all independent boolean terms and enum states. Fixtures must not
-  satisfy the result through a different branch.
+  satisfy the result through a different branch. In layered security tests,
+  prove the request reached the intended policy layer; the same 403 from an
+  earlier auth or method check does not cover a host/path rule.
 - Prefer outcome assertions over executable-bit, non-panic, `Arc` count, or
   exit-zero proxies. Verify the real process, TLS rejection, cleanup, or output.
 - Account for test blind spots: modules excluded from mutation testing,
@@ -129,6 +131,10 @@ apply across all lenses:
 - Keep scope disciplined. Confirmed adjacent issues become explicit follow-ups
   unless the diff created them or the current contract cannot work without the
   fix.
+- Treat a closed operation allowlist as both a security invariant and a
+  compatibility boundary. Test the default-deny case, exact method/path,
+  trailing and encoded variants, cross-provider routes, and unknown profiles;
+  document which auto-updating client operations are intentionally rejected.
 
 ## 5. Validate findings in batches
 
