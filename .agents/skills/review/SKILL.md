@@ -20,9 +20,12 @@ Prefer, in order:
 Fetch only a missing base ref. If the diff is empty, stop. Record the exact base
 and head SHAs so a later force-push cannot silently change the target.
 
-For CI merge-ref checkouts, review the PR parents with
-`git diff HEAD^1...HEAD^2`; do not review the synthetic merge commit as though
-it were authored by the contributor.
+For CI reviews that provide trusted base/head refs in
+`.codex-review-context.json`, use those refs directly. Keep the trusted base
+checked out and inspect contributor files with `git diff` and
+`git show <head-ref>:<path>`; do not materialize or execute the contributor
+tree. For a merge-ref checkout supplied by another trusted harness, review the
+parents and do not attribute the synthetic merge commit to the contributor.
 
 ## 2. Build one evidence packet
 
