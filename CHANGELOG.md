@@ -16,8 +16,34 @@
   which is meaningless on subcommands that never start an agent session.
   Existing images must be rebuilt with `coop setup --rebuild` before using this
   mode. A restart reuses the old guest disk, so an existing VM also needs
-  `coop restore <vm> --image <image>` (or a destroy and recreate) to pick up
-  the new guest packages.
+  `coop restore <vm> --image <image> --reprovision` (or a destroy and
+  recreate) to pick up the new guest packages.
+- **`coop restore --reprovision` — start over without re-typing anything**
+  (#432) — Replaces a clobbered or bloated guest filesystem with a fresh copy of
+  the instance's image, then provisions it as a first boot: `/workspace` is
+  restored from the source the instance recorded — re-synced, re-cloned or
+  re-mounted — agents are re-bootstrapped, and plugins, marketplaces and MCP
+  servers are reinstalled. The instance is left running, so no follow-up
+  `coop start` is needed. It keeps its name, index, IP, image, disk size, port
+  forwards and guest env — including a devcontainer's `containerEnv` and
+  `forwardPorts` — so those flags do not have to be remembered. GitHub PATs and
+  provider credentials live in the host-side secret store and are untouched.
+  Extra `--extra-mount` directories, `--exclude-git` and a devcontainer's
+  `postStartCommand` are not replayed, because coop does not persist them.
+
+  This is what `coop restore` + `coop start` could not do: a restart skips the
+  workspace sync and the plugin install on the assumption that both survived on
+  the guest disk — which holds for a `coop commit` checkpoint, but not after the
+  disk is replaced with a base image. Plain `restore` + `start` remains the
+  checkpoint rollback; `--reprovision` is the base-image case.
+
+  `--image` becomes optional under `--reprovision`, defaulting to the image the
+  instance already records; it stays required otherwise. `-y` skips the
+  confirmation and is required off a TTY. `-y`, `--no-agents` and `--no-prompt`
+  are rejected without `--reprovision`, since none of them mean anything to a
+  plain disk swap. Unlike a plain `restore`, which requires a stopped instance,
+  `--reprovision` also accepts a running one and stops it itself. `coop restore`
+  without `--reprovision` is unchanged.
 
 - **Credential-injecting proxy — keep the model API keys out of the guest**
   (#411) — New opt-in `[proxy]` config. When set, coop runs a small host-side

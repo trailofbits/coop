@@ -2492,6 +2492,363 @@ test_restart_rejects_ignored_flags() {
     rm -rf "$mount_dir"
 }
 
+test_restore_reprovision() {
+    echo ""
+    echo "=== Phase: restore --reprovision ==="
+
+    # This phase asserts the distinction between `restore --reprovision` and a
+    # plain `restore` + `start`: both replace the disk, but only --reprovision
+    # re-runs the first-boot provisioning, so only it puts /workspace back and
+    # re-runs the agent bootstrap. Four discriminators are seeded first:
+    #   * a guest-home sentinel, which must be GONE (the disk really was wiped)
+    #   * a host-side workspace marker, which must be PRESENT in /workspace
+    #     (the workspace was re-synced, not merely left blank). This is the
+    #     FirstBoot-vs-Restart discriminator: BootMode::Restart skips the sync.
+    #   * COOP_TEST_GUEST_ENV, set at `up` time, which must survive (the
+    #     persisted guest_env.json was replayed, not lost with the disk)
+    #   * a sentinel key in ~/.claude/settings.json, which must be GONE while
+    #     the managed permissions block is back. Note what this does and does
+    #     not prove: write_managed_claude_settings and seed_claude_onboarding
+    #     run on EVERY boot (src/backend.rs, outside the BootMode::FirstBoot
+    #     gate), so their output does not distinguish FirstBoot from Restart —
+    #     it only proves bootstrap_agents ran at all against the blank disk,
+    #     which a wiped ~/.claude would otherwise not show. The FirstBoot-only
+    #     work is the marketplace/plugin/MCP install, and this phase cannot
+    #     assert it: the main flow reads the developer's own
+    #     ~/.coop/config.toml, which carries no marketplaces, plugins or MCP
+    #     servers, so compute_plugin_delta has nothing to install. The
+    #     --full-only test_local_marketplace phase covers that path with its
+    #     own instance and stub-claude image.
+    #
+    # The previous phase ends with `coop stop "$INSTANCE"` ("Stop again for the
+    # destroy phase", from before this phase was inserted between them), so the
+    # instance is STOPPED here. Neither `coop shell` nor `coop exec` auto-starts
+    # — both go through resolve_running, which bails "is not running" — so
+    # every guest-side seed and assertion below needs it up first.
+    #
+    # Probe before starting rather than starting unconditionally: `coop start`
+    # is not idempotent (find_stopped_instance bails "already running"), and the
+    # previous phase's trailing stop is `|| true`. A transient stop failure
+    # there would otherwise make this guard fail and skip the whole phase.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "instance is up before reprovision seeding"
+    elif coop start "$INSTANCE" --no-agents; then
+        pass "start instance before reprovision seeding"
+    else
+        fail "start instance before reprovision seeding" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local ip_before=""
+    if guest_exec sh -c 'echo pre-reprovision > ~/sentinel'; then
+        pass "seed guest sentinel before reprovision"
+    else
+        fail "seed guest sentinel before reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    local claude_seed='mkdir -p ~/.claude && printf "%s" '
+    claude_seed+='"{\"enabledPlugins\":{\"reprovision-sentinel@m\":true}}" '
+    claude_seed+='> ~/.claude/settings.json'
+    if coop_exec sh -c "$claude_seed"; then
+        pass "seed claude settings sentinel before reprovision"
+    else
+        fail "seed claude settings sentinel before reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    # Written on the host, so only a real workspace re-sync can put it in the
+    # guest — it has never been inside the VM.
+    echo "reprovisioned" > "$tmpdir/primary-ws/reprovision-marker"
+
+    if coop status "$INSTANCE" 2>/dev/null; then
+        ip_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+    fi
+
+    # An unknown image is rejected before anything is destroyed.
+    if coop_fails restore "$INSTANCE" --reprovision -y --image "no-such-image-$$"; then
+        pass "restore --reprovision rejects unknown image"
+    else
+        fail "restore --reprovision rejects unknown image" "should have failed"
+    fi
+
+    # The instance must be untouched by that rejection — still running.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "rejected reprovision leaves the instance running"
+    else
+        fail "rejected reprovision leaves the instance running" "status: $HARNESS_OUT"
+    fi
+
+    # Without -y and without a TTY, `prompt::confirm` short-circuits to false,
+    # so a scripted reprovision must refuse rather than silently wipe the guest.
+    if coop_fails restore "$INSTANCE" --reprovision; then
+        pass "reprovision without -y refuses off a TTY"
+        if echo "$HARNESS_ERR" | grep -q -- "-y"; then
+            pass "non-interactive refusal names -y"
+        else
+            fail "non-interactive refusal names -y" "stderr: $HARNESS_ERR"
+        fi
+    else
+        fail "reprovision without -y refuses off a TTY" "should have failed"
+    fi
+
+    # The refusal must be inert: the guest sentinel is still there.
+    if [[ "$(coop_exec sh -c 'cat ~/sentinel 2>/dev/null')" == "pre-reprovision" ]]; then
+        pass "refused reprovision leaves the guest untouched"
+    else
+        fail "refused reprovision leaves the guest untouched" "sentinel changed"
+    fi
+
+    # Grow the disk first, so the reprovision has a non-template size to carry
+    # across the swap. `restore_disk` copies the template, which is smaller,
+    # so a reprovision that skipped the re-grow would shrink the instance back.
+    # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
+    # absent value degrades to a skip rather than a spurious failure.
+    local disk_before=""
+    if coop stop "$INSTANCE"; then
+        pass "stop before disk grow exits 0"
+    else
+        fail "stop before disk grow exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+    if coop resize "$INSTANCE" --size +1G; then
+        pass "grow disk before reprovision exits 0"
+        if coop status "$INSTANCE" 2>/dev/null; then
+            disk_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+        fi
+    else
+        fail "grow disk before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+    # Not `|| true`: a failed restart silently sends the reprovision down the
+    # already-stopped branch instead of the running one, and the phase would
+    # still report green while testing the wrong path.
+    if coop start "$INSTANCE" --no-agents; then
+        pass "restart before reprovision exits 0"
+    else
+        fail "restart before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # The guest root filesystem size *after* the grow, so the comparison below
+    # isolates what the reprovision did to it rather than folding in the resize.
+    # 1K blocks; empty when df is unavailable.
+    local guest_fs_before=""
+    guest_fs_before=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_before=""
+
+    # Install the `coop-<name>` SSH alias so the reprovision has one to
+    # refresh. `provision_first_boot` calls `refresh_ssh_config_if_present`,
+    # which is gated on the marker block existing (workspace.rs), and
+    # test_ssh_config ran `--clean` long before this phase — so without this
+    # the call is a no-op and nothing covers it.
+    #
+    # Then deliberately break the block's Port. Relying on the port changing
+    # by itself only works on Lima (Firecracker's guest IP and port 22 are
+    # stable across stop/start), so on Firecracker an unrefreshed block would
+    # still connect and the assertion would pass without exercising anything.
+    # Pointing it at port 1 makes the post-reprovision connection succeed only
+    # if the refresh actually rewrote the block, on both backends.
+    local ssh_alias_seeded=""
+    if coop ssh-config "$INSTANCE"; then
+        ssh_alias_seeded=1
+        pass "install coop-$INSTANCE alias before reprovision"
+        # Exits non-zero unless it actually rewrote a Port line inside this
+        # instance's block, so a marker-format change cannot leave the
+        # assertion below silently vacuous.
+        if python3 - "$HOME/.ssh/config" "coop-$INSTANCE" <<'PYEOF'
+import re, sys
+path, host = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    lines = f.readlines()
+out, inside, staled = [], False, 0
+for line in lines:
+    if line.strip() == f"# coop START {host}":
+        inside = True
+    elif line.strip() == "# coop END":
+        inside = False
+    elif inside:
+        line, n = re.subn(r"^(\s*)Port\s+\d+\s*$", r"\1Port 1", line.rstrip("\n"))
+        line += "\n"
+        staled += n
+    out.append(line)
+if staled != 1:
+    sys.exit(f"expected exactly one Port line in the {host} block, rewrote {staled}")
+with open(path, "w") as f:
+    f.writelines(out)
+PYEOF
+        then
+            pass "staled the coop-$INSTANCE alias port before reprovision"
+        else
+            fail "staled the coop-$INSTANCE alias port before reprovision" \
+                "could not rewrite the Port line; the assertion below would be vacuous"
+            ssh_alias_seeded=""
+        fi
+    else
+        fail "install coop-$INSTANCE alias before reprovision" "stderr: $HARNESS_ERR"
+    fi
+
+    # No `--no-agents`: it skips `bootstrap_agents` entirely, which is half of
+    # what distinguishes --reprovision from a plain restore + start (BootMode::Restart
+    # re-merges settings but does not reinstall plugins or MCP servers). The
+    # claude settings assertions below depend on it having run.
+    if coop restore "$INSTANCE" --reprovision -y; then
+        pass "restore --reprovision exits 0"
+    else
+        fail "restore --reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
+    fi
+
+    # Unlike a plain `restore` (which leaves the instance stopped), --reprovision brings
+    # it back up as part of the same command.
+    if coop status "$INSTANCE" && echo "$HARNESS_OUT" | grep -qi "running"; then
+        pass "reprovision leaves the instance running"
+    else
+        fail "reprovision leaves the instance running" "status: $HARNESS_OUT"
+        return
+    fi
+
+    local sentinel_after ws_marker env_after
+    # A positive discriminator, not `cat ... 2>/dev/null`: the guest has to
+    # answer "absent" for this to pass, so an unreachable guest or a changed
+    # home directory reads as a failure rather than as a successful wipe.
+    if ! sentinel_after=$(coop_exec sh -c 'test -e ~/sentinel && echo present || echo absent'); then
+        fail "reprovision wipes guest filesystem state" \
+            "guest unreachable after reprovision; stderr: $(guest_stderr)"
+        return
+    fi
+    ws_marker=$(coop_exec sh -c 'cat /workspace/reprovision-marker 2>/dev/null') || ws_marker=""
+    env_after=$(guest_exec printenv COOP_TEST_GUEST_ENV) || env_after=""
+
+    # The disk was really replaced: guest-home state written before the
+    # reprovision is gone.
+    if [[ "$sentinel_after" == "absent" ]]; then
+        pass "reprovision wipes guest filesystem state"
+    else
+        fail "reprovision wipes guest filesystem state" \
+            "~/sentinel is '$sentinel_after' (expected 'absent')"
+    fi
+
+    # …and the workspace came back. This is the assertion `restore` + `start`
+    # cannot satisfy: BootMode::Restart skips the workspace sync.
+    if [[ "$ws_marker" == "reprovisioned" ]]; then
+        pass "reprovision re-syncs the workspace from the host"
+    else
+        fail "reprovision re-syncs the workspace from the host" \
+            "marker='$ws_marker' (expected 'reprovisioned')"
+    fi
+
+    # Persisted guest-env survived the wipe and was replayed into the new boot.
+    if [[ "$env_after" == "hello-from-cli" ]]; then
+        pass "reprovision preserves persisted guest env"
+    else
+        fail "reprovision preserves persisted guest env" \
+            "COOP_TEST_GUEST_ENV='$env_after' (expected 'hello-from-cli')"
+    fi
+
+    # The agent-bootstrap half of provision_first_boot ran against the blank
+    # disk: the managed settings are back, and the sentinel key seeded before
+    # the wipe is not. This proves bootstrap_agents ran at all — on a wiped
+    # disk ~/.claude/settings.json would otherwise be absent — but NOT that it
+    # ran in FirstBoot mode: write_managed_claude_settings runs on every boot,
+    # and test_claude_settings_merge asserts the same bypassPermissions grep
+    # after a plain restart. The workspace re-sync above is the mode
+    # discriminator.
+    local claude_settings
+    if claude_settings=$(coop_exec sh -c 'cat ~/.claude/settings.json'); then
+        if echo "$claude_settings" | grep -q 'bypassPermissions'; then
+            pass "reprovision re-runs the agent bootstrap"
+        else
+            fail "reprovision re-runs the agent bootstrap" \
+                "managed permissions missing from settings.json: $claude_settings"
+        fi
+        if echo "$claude_settings" | grep -q 'reprovision-sentinel@m'; then
+            fail "reprovision wipes agent state from the old disk" \
+                "sentinel plugin survived the wipe: $claude_settings"
+        else
+            pass "reprovision wipes agent state from the old disk"
+        fi
+    else
+        fail "reprovision re-runs the agent bootstrap" \
+            "~/.claude/settings.json missing after reprovision; stderr: $(guest_stderr)"
+    fi
+
+    # `--env CLAUDE_CODE_OAUTH_TOKEN` persisted by the onboarding phase must
+    # reach the bootstrap on the fresh disk too — the seed is gated on that
+    # variable reaching the guest env, so the file's presence proves the replay
+    # reached bootstrap_agents. seed_claude_onboarding also runs on every boot,
+    # so like the settings check above this is not a FirstBoot discriminator.
+    if coop_exec sh -c 'test -e ~/.claude.json'; then
+        pass "reprovision replays the persisted token into the agent bootstrap"
+    else
+        fail "reprovision replays the persisted token into the agent bootstrap" \
+            "~/.claude.json not seeded after reprovision; stderr: $(guest_stderr)"
+    fi
+
+    # Identity: the guest IP is derived from the instance index, so an
+    # unchanged IP proves the reprovision swapped only the disk rather than
+    # reallocating the instance. Lima's status does not surface the IP, so
+    # the compare degrades to a skip there rather than a spurious failure.
+    local ip_after=""
+    if coop status "$INSTANCE" 2>/dev/null; then
+        ip_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Guest IP: \([0-9.][0-9.]*\).*/\1/p' | head -1)
+    fi
+    if [[ -z "$ip_before" || -z "$ip_after" ]]; then
+        skip "guest IP preserved across reprovision" "status does not surface Guest IP"
+    elif [[ "$ip_before" == "$ip_after" ]]; then
+        pass "guest IP preserved across reprovision ($ip_after)"
+    else
+        fail "guest IP preserved across reprovision" "before=$ip_before after=$ip_after"
+    fi
+
+    # A `coop resize --size` must survive the wipe: the image the disk is
+    # restored from is template-sized, so the reprovision has to re-grow it.
+    local disk_after=""
+    if coop status "$INSTANCE" 2>/dev/null; then
+        disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+    fi
+    if [[ -z "$disk_before" || -z "$disk_after" ]]; then
+        skip "disk size preserved across reprovision" "status does not report disk GiB"
+    elif [[ "$disk_after" -ge "$disk_before" ]]; then
+        pass "disk size preserved across reprovision (${disk_after} GiB)"
+    else
+        fail "disk size preserved across reprovision" \
+            "before=${disk_before} GiB after=${disk_after} GiB (the reprovision shrank the disk)"
+    fi
+
+    # `coop status` reports the host image file's size, which `resize_disk`
+    # changes with a bare `truncate` on Lima — the guest filesystem only grows
+    # when the guest expands the partition on boot. So the host-side check
+    # above cannot tell a real re-grow from a shrunken guest. Compare what the
+    # guest itself sees, in 1K blocks.
+    local guest_fs_after=""
+    guest_fs_after=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_after=""
+    if [[ -z "$guest_fs_before" || -z "$guest_fs_after" ]]; then
+        skip "guest filesystem not shrunk by reprovision" "df unavailable in the guest"
+    elif [[ "$guest_fs_after" -ge "$guest_fs_before" ]]; then
+        pass "guest filesystem not shrunk by reprovision (${guest_fs_after} 1K-blocks)"
+    else
+        fail "guest filesystem not shrunk by reprovision" \
+            "before=${guest_fs_before} after=${guest_fs_after} 1K-blocks (the re-grow did not reach the guest)"
+    fi
+
+    # The `coop-<name>` alias must connect again. Its Port was set to 1 above,
+    # so this succeeds only if `refresh_ssh_config_if_present` rewrote the
+    # block during `provision_first_boot` — the one assertion covering that
+    # call, and it now discriminates on Firecracker as well as Lima. Cleaned up
+    # afterwards to leave ~/.ssh/config as this phase found it.
+    if [[ -n "$ssh_alias_seeded" ]]; then
+        if _timeout 30 ssh "coop-$INSTANCE" echo "reprovision-alias-ok" 2>/dev/null \
+            | grep -q "reprovision-alias-ok"; then
+            pass "reprovision refreshes the coop-$INSTANCE ssh alias"
+        else
+            fail "reprovision refreshes the coop-$INSTANCE ssh alias" \
+                "alias did not connect after the reprovision"
+        fi
+        coop ssh-config "$INSTANCE" --clean || true
+    else
+        skip "reprovision refreshes the coop-$INSTANCE ssh alias" \
+            "alias was not installed"
+    fi
+}
+
 test_destroy() {
     echo ""
     echo "=== Phase: destroy ==="
@@ -2947,6 +3304,60 @@ test_git_repo() {
         fail "up --git-repo reuses the running instance" \
             "list changed: $(diff <(echo "$pre_list") <(echo "$post_list"))"
     fi
+
+    # `restore --reprovision` against a GIT-REPO-source instance, so the
+    # GitRepo arm of `reprovision_workspace_inputs` has end-to-end coverage
+    # too — the main reprovision phase only exercises the copy transport. The
+    # instance is running here, and --reprovision stops it itself.
+    # `--no-agents` for the same reason as the mount phase: the subject here is
+    # the re-clone, not the bootstrap.
+    GUEST_INSTANCE="$gr_instance"
+
+    if guest_exec sh -c 'echo pre-reprovision > ~/gr-sentinel'; then
+        pass "seed guest sentinel before git-repo reprovision"
+    else
+        fail "seed guest sentinel before git-repo reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    if coop restore "$gr_instance" --reprovision -y --no-agents; then
+        pass "restore --reprovision exits 0 for a git-repo instance"
+
+        local gr_sentinel gr_head_after
+        if ! gr_sentinel=$(guest_exec sh -c 'test -e ~/gr-sentinel && echo present || echo absent'); then
+            fail "git-repo reprovision wipes guest filesystem state" \
+                "guest unreachable after reprovision; stderr: $(guest_stderr)"
+        elif [[ "$gr_sentinel" == "absent" ]]; then
+            pass "git-repo reprovision wipes guest filesystem state"
+        else
+            fail "git-repo reprovision wipes guest filesystem state" \
+                "~/gr-sentinel is '$gr_sentinel' (expected 'absent')"
+        fi
+
+        # The clone was re-run from the URL in workspace.json: /workspace was
+        # wiped with the disk, so a valid HEAD can only come from a re-clone.
+        if gr_head_after=$(guest_exec git -C /workspace rev-parse HEAD); then
+            if [[ -n "$gr_head_after" ]]; then
+                pass "git-repo reprovision re-clones the repository"
+            else
+                fail "git-repo reprovision re-clones the repository" \
+                    "empty rev-parse output"
+            fi
+        else
+            fail "git-repo reprovision re-clones the repository" \
+                "git rev-parse failed: $(guest_stderr)"
+        fi
+
+        # Deliberately no assertion on /data. `--extra-mount` is not replayed
+        # by coop, but whether the mount point itself survives is backend
+        # dependent (Firecracker syncs once at create; Lima's own mount
+        # declaration may re-establish it on a fresh boot), and asserting
+        # either way would be wrong on one of them.
+    else
+        fail "restore --reprovision exits 0 for a git-repo instance" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+
+    unset GUEST_INSTANCE
 
     coop destroy "$gr_instance" 2>/dev/null || true
     untrack_instance "$gr_instance"
@@ -3550,6 +3961,67 @@ test_host_mount() {
     else
         skip "bidirectional mount" "Firecracker uses one-time rsync sync"
         skip "live mount sync" "Firecracker uses one-time rsync sync"
+    fi
+
+    # `restore --reprovision` against a MOUNT-source instance. The main
+    # reprovision phase only covers WorkspaceSource::Workspace (the copy
+    # transport), so without this the Mount arm of
+    # `reprovision_workspace_inputs` is only unit-tested as a pure function.
+    # It is the arm with a real backend divergence: `create_and_start` receives
+    # the mount set and `start_existing` does not, so a reprovisioned mount
+    # instance depends on the backend's own mount declaration surviving and
+    # being re-established against a wiped disk.
+    #
+    # `--no-agents` on purpose here, unlike the main reprovision phase: this
+    # phase is about the workspace source, and that phase already covers the
+    # agent-bootstrap half. Skipping it also keeps an unrelated bootstrap
+    # failure from being reported as a mount regression.
+    if guest_exec sh -c 'echo pre-reprovision > ~/mnt-sentinel'; then
+        pass "seed guest sentinel before mount reprovision"
+    else
+        fail "seed guest sentinel before mount reprovision" "stderr: $(guest_stderr)"
+    fi
+
+    # Host-side, after boot. On Firecracker only a re-sync can carry it into
+    # the guest; on Lima the live mount serves it either way.
+    echo "remounted" > "$mount_dir/mount-remount-marker.txt"
+
+    # The instance is running; --reprovision stops it itself.
+    if coop restore "$mount_instance" --reprovision -y --no-agents; then
+        pass "restore --reprovision exits 0 for a mount-source instance"
+
+        local mnt_sentinel mnt_marker mnt_original
+        if ! mnt_sentinel=$(guest_exec sh -c 'test -e ~/mnt-sentinel && echo present || echo absent'); then
+            fail "mount reprovision wipes guest filesystem state" \
+                "guest unreachable after reprovision; stderr: $(guest_stderr)"
+        elif [[ "$mnt_sentinel" == "absent" ]]; then
+            pass "mount reprovision wipes guest filesystem state"
+        else
+            fail "mount reprovision wipes guest filesystem state" \
+                "~/mnt-sentinel is '$mnt_sentinel' (expected 'absent')"
+        fi
+
+        # The load-bearing one: /workspace still serves the host directory
+        # after the disk was replaced. `sentinel.txt` has been there since
+        # creation, so this fails if the mount was not re-established.
+        mnt_original=$(guest_exec cat /workspace/sentinel.txt) || mnt_original=""
+        if [[ "$mnt_original" == "mount-test-content" ]]; then
+            pass "mount reprovision re-establishes /workspace from the host"
+        else
+            fail "mount reprovision re-establishes /workspace from the host" \
+                "got '$mnt_original' (expected 'mount-test-content')"
+        fi
+
+        mnt_marker=$(guest_exec cat /workspace/mount-remount-marker.txt) || mnt_marker=""
+        if [[ "$mnt_marker" == "remounted" ]]; then
+            pass "mount reprovision picks up host writes made before it"
+        else
+            fail "mount reprovision picks up host writes made before it" \
+                "got '$mnt_marker' (expected 'remounted')"
+        fi
+    else
+        fail "restore --reprovision exits 0 for a mount-source instance" \
+            "exit code: $?; stderr: $HARNESS_ERR"
     fi
 
     unset GUEST_INSTANCE
@@ -5446,6 +5918,7 @@ main() {
     test_commit_restore
     test_restart_stopped
     test_restart_rejects_ignored_flags
+    test_restore_reprovision
     test_destroy
     test_auto_resolve_no_instances
     test_list_empty

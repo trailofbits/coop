@@ -180,6 +180,17 @@ exclude_re = [
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
   "\\bstart_instance\\b",
+  # provision_first_boot (#432): the post-boot half start_instance was split
+  # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
+  # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.
+  # The pure helpers `--reprovision` adds — check_reprovision_workspace_source,
+  # reprovision_workspace_inputs, reprovision_confirmation and
+  # reprovision_partial_message — stay IN scope and are unit-tested.
+  # reprovision_instance itself is NOT matched by the `\bcmd_[a-z_]+\b`
+  # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
+  # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
+  "\\breprovision_instance\\b",
+  "\\bprovision_first_boot\\b",
   "\\bwarn_on_live_git_mounts\\b",
   "\\bresolve_running\\b",
   "\\ballocate_and_start\\b",

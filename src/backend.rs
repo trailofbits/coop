@@ -1839,7 +1839,7 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
          `coop setup --image <name> --rebuild` for a named image).\n\
          A rebuild does not touch this VM's existing guest disk, and a \
          restart reuses it. To pick up the rebuilt image, either \
-         `coop stop` then `coop restore <vm> --image <image>` (in place, \
+         `coop restore <vm> --image <image> --reprovision` (in place, \
          keeping the instance), or destroy and recreate the VM. \
          Alternatively, install `dbus-user-session`, `gnome-keyring`, and \
          `libsecret-tools` in the running guest by hand."
