@@ -122,6 +122,11 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
+/// Companion process used by Codex for Code Mode execution.
+pub fn codex_code_mode_host_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex-code-mode-host")
+}
+
 /// Wrapper that runs Codex with a guest Linux Secret Service session.
 pub fn codex_account_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex-account")
@@ -170,12 +175,13 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         codex_bin(),
+        codex_code_mode_host_bin(),
         codex_account_bin(),
         // The Secret Service stack `codex-account` drives. Checking the
         // wrapper alone proves nothing — the provision script always writes
@@ -190,8 +196,8 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
 /// uniform error if any are missing.
 ///
 /// `probe` answers "does this binary exist in the image?" — its mechanism
-/// differs per backend (a chroot `symlink_metadata` for Firecracker, a
-/// `test -x` over `limactl shell` for Lima). `source_label` names what
+/// differs per backend (`test -x` inside the chroot for Firecracker, or over
+/// `limactl shell` for Lima). `source_label` names what
 /// produced the image ("install script" vs "provision script"), and
 /// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
 /// evaluated lazily only when something is missing.
@@ -256,6 +262,7 @@ pub const BASE_PACKAGES: &[&str] = &[
     "iptables",
     "kmod",
     "procps",
+    "util-linux",
     "jq",
     "rsync",
     "unzip",
@@ -484,11 +491,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_script_installs_extracted_binary_not_archive() {
+    fn codex_script_installs_complete_package_atomically() {
         assert!(
-            SCRIPT_CODEX.contains("BIN=\"$TMPDIR/${ASSET%.tar.gz}\""),
-            "Codex installer should target the extracted binary path directly",
+            SCRIPT_CODEX.contains("codex-package-$CODEX_TARGET.tar.gz"),
+            "Codex installer should download the complete upstream package",
         );
+        for expected in [
+            "bin/codex-code-mode-host",
+            "codex-package.json",
+            "codex-resources",
+            "codex-path",
+            "codex-package_SHA256SUMS",
+            "sha256sum -c -",
+            "tar --no-same-owner --no-same-permissions",
+            "flock 9",
+            "flock -u 9",
+            "exec 9>&-",
+            "chown -R root:root",
+            "for executable in codex-code-mode-host codex",
+            "codex_reconcile_public_entrypoints",
+            "mv -Tf \"$CODEX_NEXT_LINK\" \"$CODEX_INSTALL_ROOT/current\"",
+        ] {
+            assert!(
+                SCRIPT_CODEX.contains(expected),
+                "Codex package installer is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_script_locks_before_resolving_latest_release() {
+        let lock = SCRIPT_CODEX.find("flock 9").unwrap();
+        let first_fetch = SCRIPT_CODEX.find("releases/latest/download").unwrap();
+        let final_validation = SCRIPT_CODEX
+            .rfind("codex_installed_package_is_safe \"$CODEX_INSTALL_ROOT/current\"")
+            .unwrap();
+        let unlock = SCRIPT_CODEX.find("flock -u 9").unwrap();
+
+        assert!(
+            lock < first_fetch,
+            "update lock must precede the first fetch"
+        );
+        assert!(
+            final_validation < unlock,
+            "activation must be validated before releasing the update lock",
+        );
+    }
+
+    #[test]
+    fn codex_script_garbage_collects_only_safe_inactive_releases() {
+        let final_validation = SCRIPT_CODEX
+            .rfind("codex_installed_package_is_safe \"$CODEX_INSTALL_ROOT/current\"")
+            .unwrap();
+        let garbage_collection = SCRIPT_CODEX
+            .find("codex_gc_releases \"$CODEX_PACKAGE_SHA\" \"$CODEX_PREVIOUS_RELEASE_SHA\"")
+            .unwrap();
+        let unlock = SCRIPT_CODEX.find("flock -u 9").unwrap();
+
+        assert!(
+            final_validation < garbage_collection && garbage_collection < unlock,
+            "release collection should run after validation and while holding the update lock",
+        );
+
+        for expected in [
+            "codex_gc_releases \"$CODEX_PACKAGE_SHA\" \"$CODEX_PREVIOUS_RELEASE_SHA\"",
+            "[[ \"$release_sha\" =~ ^[0-9a-f]{64}$ ]] || continue",
+            "[ ! -L \"$release_dir\" ]",
+            "[ \"$release_sha\" = \"$current_sha\" ] && continue",
+            "[ \"$release_sha\" = \"$previous_sha\" ] && continue",
+            "for proc_exe in /proc/[0-9]*/exe",
+            "executable=$(readlink \"$proc_exe\" 2>/dev/null) || continue",
+            "codex_release_has_live_executable \"$release_dir\"",
+        ] {
+            assert!(
+                SCRIPT_CODEX.contains(expected),
+                "Codex release retention is missing {expected:?}",
+            );
+        }
     }
 
     #[test]
@@ -802,6 +881,11 @@ mod tests {
         );
         assert!(
             bins.iter()
+                .any(|b| b.to_string() == "/usr/local/bin/codex-code-mode-host"),
+            "guest image should include Codex's code-mode host",
+        );
+        assert!(
+            bins.iter()
                 .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
             "guest image should include the Codex account-auth wrapper",
         );
@@ -821,7 +905,12 @@ mod tests {
 
     #[test]
     fn base_packages_include_secret_service_support() {
-        for expected in ["dbus-user-session", "gnome-keyring", "libsecret-tools"] {
+        for expected in [
+            "dbus-user-session",
+            "gnome-keyring",
+            "libsecret-tools",
+            "util-linux",
+        ] {
             assert!(
                 BASE_PACKAGES.contains(&expected),
                 "base packages should include {expected}",
@@ -882,6 +971,7 @@ mod tests {
             "/usr/bin/docker",
             "/usr/bin/gh",
             "/usr/local/bin/codex",
+            "/usr/local/bin/codex-code-mode-host",
             "/usr/local/bin/codex-account",
         ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");

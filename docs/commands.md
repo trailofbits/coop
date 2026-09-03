@@ -482,8 +482,10 @@ With no agent flag, both agents are updated; passing both `--claude` and
 `--codex` is the same as passing neither. The VM must be running.
 
 Codex has no background updater, so `coop agent update --codex` re-runs coop's
-own installer inside the guest as root, overwriting `/usr/local/bin/codex` with
-the current release. Claude Code already auto-updates in the background;
+own installer inside the guest as root. It installs the complete upstream
+package, verifies its published checksums, and switches the CLI and code-mode
+host through the same current-release link.
+Claude Code already auto-updates in the background;
 `coop agent update --claude` runs `claude update` now, synchronously — a
 convenience rather than a fix.
 

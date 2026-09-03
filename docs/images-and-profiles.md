@@ -18,7 +18,7 @@ coop stores the result under `~/.coop/images/<name>/`. When creating an instance
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`
+**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
@@ -26,7 +26,9 @@ Every template installs these packages regardless of profile selection.
 
 **Claude Code CLI:** installed via the native installer during the template build.
 
-**Codex CLI:** installed as a standalone binary during the template build.
+**Codex CLI:** installed as a complete package during the template build. The
+package contains the CLI, its code-mode host, and bundled runtime resources;
+stable entrypoints under `/usr/local/bin` share one current-package link.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages

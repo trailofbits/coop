@@ -255,14 +255,14 @@ This skips the guest bootstrap sequence entirely. The VM still includes both CLI
 
 ## Updating Codex
 
-Codex is installed "latest at build time" during `coop setup` and has no background updater, so it stays at that version until the image is rebuilt. Unlike Claude Code, it does not refresh itself. To update Codex in a running VM without rebuilding the image:
+Codex is installed "latest at build time" during `coop setup` and has no background updater, so it stays at that version until the image is rebuilt. Unlike Claude Code, it does not refresh itself. coop installs the complete upstream package, including the `codex-code-mode-host` companion and runtime resources, under `/usr/local/lib/codex`; stable entrypoints live in `/usr/local/bin`. To update Codex in a running VM without rebuilding the image:
 
 ```bash
 coop agent update --codex          # update Codex to the latest release
 coop agent update --check          # report installed vs. latest, change nothing
 ```
 
-This re-runs coop's own Codex installer inside the guest as root, overwriting `/usr/local/bin/codex` with the current release. To refresh the golden image so new VMs ship the latest Codex, rebuild it with `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
+This re-runs coop's own Codex installer inside the guest as root, verifies the published package checksums, and switches the CLI and code-mode host through the same current-package link. To refresh the golden image so new VMs ship the latest Codex, rebuild it with `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
 
 ## Local model support
 

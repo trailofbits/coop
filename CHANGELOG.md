@@ -83,6 +83,13 @@
 
 ### Fixes
 
+- **Install Codex's complete runtime package** (#442) — Recent Codex releases
+  use a companion `codex-code-mode-host` executable, but coop installed only
+  the raw `codex` binary, causing Code Mode to fail closed at startup. Image
+  builds and `coop agent update --codex` now verify and install the upstream
+  package with its host and runtime resources intact, root-owned and behind a
+  shared current-release link.
+
 - **`install.sh` and `coop update` verify provenance without a GitHub
   credential** (#421) — Verification ran `gh attestation verify --repo
   trailofbits/coop`, which reads the Sigstore bundle from the attestations
