@@ -101,9 +101,14 @@ apply across all lenses:
   earlier auth or method check does not cover a host/path rule.
 - Prefer outcome assertions over executable-bit, non-panic, `Arc` count, or
   exit-zero proxies. Verify the real process, TLS rejection, cleanup, or output.
+- Pair negative assertions with a positive witness. Predicates such as
+  `all(...)` are vacuously true for an empty collection, so prove the expected
+  strategy, enum tag, alias, or value is present as well as excluding the wrong
+  one.
 - Account for test blind spots: modules excluded from mutation testing,
   integration suites absent from CI, platform-only branches, and silently
-  skipped assertions.
+  skipped assertions. A platform-gated test is not CI coverage when CI never
+  runs that platform.
 
 ### Verify behavior, do not infer it
 
@@ -114,6 +119,10 @@ apply across all lenses:
 - If later diagnostics need the cause, preserve it structurally (for example an
   enum) instead of collapsing it to `None` and re-deriving a possibly false
   message.
+- Classify the component that produced an exit status before assigning meaning
+  to it. A launcher or wrapper failing to find its target is not equivalent to
+  the target program starting and declining the request; fallback and error
+  reporting often need to distinguish those cases.
 - Correct the rationale even when the code happens to be right. False comments
   and security claims become future implementation guidance.
 
@@ -128,6 +137,11 @@ apply across all lenses:
   exhaustive docs, workflows, installers/updaters, security docs, comments,
   and PR prose. Review fixes can introduce new bugs; re-review the entire branch
   after response commits and rebases.
+- Pin compatibility promises directly: legacy aliases, public enum spellings,
+  fallback order, and strategy metadata need positive tests. For URL-shaped
+  contracts, check both character escaping and segment-level structure such as
+  dot segments; percent-encoding a chosen character set does not by itself
+  prove that the parsed authority and path retain their intended meaning.
 - Keep scope disciplined. Confirmed adjacent issues become explicit follow-ups
   unless the diff created them or the current contract cannot work without the
   fix.

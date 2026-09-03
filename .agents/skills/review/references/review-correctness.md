@@ -19,6 +19,10 @@ Only flag issues **introduced or materially changed by the diff**. The one excep
   - `?` that propagates a low-context error where the boundary should attach `.context(...)`; or the reverse — re-wrapping at every level producing low-signal errors.
   - Silent empty returns where an empty result is indistinguishable from a missing input.
 - **Process / SSH / VM lifecycle:** a spawned `Command`/child whose exit status is never checked; a VM, mount, temp file, or SSH control socket left behind on an error path (cleanup should run on both success and failure); `scp`/`ssh` argument construction that breaks on paths with spaces or the `~`-expansion caveat (see AGENTS.md — guest paths use `./`, not `~/`).
+- **Launcher vs. target failures:** do not assume every non-zero status means the
+  requested program ran and rejected the request. A wrapper such as a desktop
+  application launcher may instead be reporting that its target was absent;
+  preserve that distinction in fallback and diagnostics.
 - **Concurrency / signals:** shared state without synchronization, a signal handler racing teardown, a lock held across a blocking call. Only if the diff touches these.
 - Resource lifecycle: file handles, sockets, child processes, and VM state cleaned up on every path.
 - **Cross-backend correctness:** a change to `backend.rs`-shared code (SSH, workspace sync, config injection) that only holds for one of Firecracker/Lima. Confirm the abstraction still holds for both.

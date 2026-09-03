@@ -22,6 +22,11 @@ Only flag issues **introduced or materially changed by the diff**. Cross-referen
 - **A new guest-visible command, flag, or lifecycle behavior with no integration-test phase.** New `coop` subcommands or guest environment changes are candidates for a new `tests/integration.sh` phase; flag the gap.
 - **Mutation-scope regression.** A new logic function that is neither unit-tested nor added to `.cargo/mutants.toml`'s exclude set — a survivor waiting to happen (AGENTS.md #352/#373).
 - **Test quality:** behavior vs. implementation detail; tautological or unassertive tests ("it didn't panic" without asserting the value); tests that would still pass if the behavior were broken.
+- **Vacuous assertions:** an `all(...)` or absence-only assertion over an empty
+  collection; require a positive witness for the expected strategy, enum tag,
+  alias, or output as well.
+- **Platform mirages:** a `#[cfg]`-gated test for a platform that no CI job runs
+  is useful local coverage but must not be reported as a CI-enforced contract.
 - **Over-mocked tests:** mocking the logic under test rather than only the boundaries AGENTS.md sanctions (network, filesystem, time, external services). A heavily-mocked happy path proves little.
 - If the diff contains tests, review them for correctness.
 
