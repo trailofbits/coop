@@ -274,6 +274,7 @@ step "Unit tests" cargo test
 step "Release target builds" build_release_targets
 step "Supply chain (cargo deny)" run_deny
 step "Workflow audit (zizmor)" run_zizmor
+step "Integration — installer provenance" ./tests/integration-install.sh
 step "Integration — coop update" ./tests/integration-update.sh
 step "Integration — coop uninstall" ./tests/integration-uninstall.sh
 step "Formal verification (kani)" run_kani

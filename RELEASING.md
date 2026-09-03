@@ -5,7 +5,8 @@ How a `coop` release is cut, and what to check before cutting one.
 ## How the automation works
 
 - **`ci.yml`** runs on pushes to `main` and on every PR: `fmt --check`, `clippy -D warnings`,
-  `cargo test`, `integration-update.sh`, `integration-uninstall.sh`,
+  `cargo test`, `integration-install.sh`, `integration-update.sh`,
+  `integration-uninstall.sh`,
   `cargo deny check`, and `zizmor`.
 - **`release.yml`** runs when a `v*` tag is pushed. It **re-runs all of CI as a
   gate**, then cross-compiles the three target binaries
@@ -24,7 +25,7 @@ push succeeds and ships something correct.
 |-------|:---:|:---:|:---:|
 | fmt / clippy / unit tests | ✓ | ✓ | |
 | `cargo deny`, `zizmor` | ✓ | ✓ (if installed) | |
-| `integration-update` / `-uninstall` | ✓ | ✓ | |
+| Host-only integration suites | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
 | Formal verification (`cargo kani`) | | ✓ (if installed) | |
