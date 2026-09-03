@@ -7,10 +7,11 @@
 //! per-instance `ssh -R` reverse tunnel — both tracked by PID files.
 //!
 //! One `coop-proxy` process (and one reverse tunnel) runs per (VM, provider):
-//! Anthropic for Claude Code, `OpenAI` for Codex. The binary is
-//! provider-agnostic — it injects one configured header to one fixed upstream
-//! — so a provider is just a different upstream host, port, and auth scheme
-//! resolved on the host. See [`docs/design/issue-411-injecting-proxy.md`].
+//! Anthropic for Claude Code, `OpenAI` for Codex. The host lifecycle is shared,
+//! but `coop-proxy` applies a provider-specific operation profile as well as a
+//! fixed upstream and authentication scheme. Adding a provider therefore
+//! requires an explicit proxy policy change, not just a host, port, and auth
+//! configuration. See [`docs/design/issue-411-injecting-proxy.md`].
 //!
 //! Binding host loopback + reverse-tunnelling works identically on both
 //! backends (Firecracker and Lima), keeps the listener off every non-loopback
@@ -54,9 +55,9 @@ const TUNNEL_READY_GRACE: Duration = Duration::from_secs(2);
 /// integration suite, not by liveness here.
 const PROXY_READY_GRACE: Duration = Duration::from_secs(5);
 
-/// A proxied upstream. The binary is provider-agnostic; this enum carries the
-/// host-side per-provider constants (upstream host, base port, file/tunnel
-/// name) so one code path serves both.
+/// A proxied upstream. This enum carries the host-side per-provider constants
+/// (upstream host, base port, file/tunnel name); `coop-proxy` separately owns
+/// the per-provider operation policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     /// Anthropic (Claude Code) → `api.anthropic.com`.
