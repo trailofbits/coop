@@ -623,33 +623,34 @@ coop pull
 coop pull my-project --dir ./local-copy --force
 ```
 
-### `vscode`
+### `editor`
 
-Open VS Code connected to the guest VM over SSH remote.
+Open an editor (VS Code or Zed) connected to the guest VM over SSH remote.
+`coop vscode` remains as an alias.
 
 ```
-coop vscode [NAME] [--project PATH] [--editor EDITOR] [--clean]
+coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--project <path>` | Remote path to open in VS Code (default: `/workspace`) |
-| `--editor <name>` | Editor to use (e.g. `code`). Overrides auto-detection. |
+| `--project <path>` | Remote path to open in the editor (default: `/workspace`) |
+| `--editor <code\|zed>` | Editor to launch. Omitted: try VS Code first, then Zed. |
 | `--clean` | Remove the SSH config entry for this instance and exit |
 
 ```
-coop vscode
-coop vscode my-project --project /workspace/subdir
-coop vscode my-project --editor code
-coop vscode my-project --clean
+coop editor
+coop editor my-project --project /workspace/subdir
+coop editor my-project --editor zed
+coop editor my-project --clean
 ```
 
 ### `ssh-config`
 
 Install a `coop-<name>` alias into `~/.ssh/config` so plain `ssh`, `scp`, and
 `rsync` reach the guest without remembering its host, port, user, or key. This
-is the same SSH config block `coop vscode` writes, but without launching an
+is the same SSH config block `coop editor` writes, but without launching an
 editor.
 
 ```
@@ -670,7 +671,7 @@ rsync -az ./dir/ coop-my-project:/workspace/dir/
 coop ssh-config my-project --clean
 ```
 
-The alias is created only when you run `coop ssh-config` (or `coop vscode`).
+The alias is created only when you run `coop ssh-config` (or `coop editor`).
 The lifecycle keeps it tidy: `coop stop` and `coop destroy` remove the block,
 and `coop start` refreshes an already-installed block so it stays valid across
 a restart. On macOS/Lima the forwarded SSH port changes on each start; the

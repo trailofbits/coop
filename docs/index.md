@@ -25,7 +25,7 @@ short navigational entrypoint; durable detail lives here.
 - [`backends.md`](backends.md) — Lima (macOS) and Firecracker (Linux) setup.
 - [`images-and-profiles.md`](images-and-profiles.md),
   [`workspaces.md`](workspaces.md), [`multi-instance.md`](multi-instance.md),
-  [`devcontainer.md`](devcontainer.md), [`vscode.md`](vscode.md),
+  [`devcontainer.md`](devcontainer.md), [`editor.md`](editor.md),
   [`shell-completion.md`](shell-completion.md).
 - [`claude-integration.md`](claude-integration.md),
   [`codex-integration.md`](codex-integration.md) — agent integration.

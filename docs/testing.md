@@ -132,7 +132,9 @@ marker-block helpers (`remove_marker_blocks` / `remove_named_marker_block` /
 `remove_all_ssh_config_at` / `remove_ssh_config_at`), `CmdToken::from_words`'s
 Linux/`op`/`cat` arms (only the macOS keychain arm is scoped, pinned on macOS by
 `parse_recognises_macos_keychain`), `Report::push`, `atomic_write_with_mode`,
-and `vscode_strategies`. The thin wrappers those were split out of
+and the editor strategy helpers (`vscode_strategies` / `zed_strategies` /
+`editor_strategies` / `install_hints` / `may_try_after_nonzero_exit`). The thin
+wrappers those were split out of
 (`probe_user_login`, `run_status`, `remove_*_ssh_config`, `gh_auth_token`) are
 excluded — a `--lib` test can't reach them without a real `$HOME` or network.
 When adding a new shell-out or IO function to one of these modules, add a
