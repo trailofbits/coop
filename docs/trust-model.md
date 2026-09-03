@@ -2,8 +2,8 @@
 
 This is the engineering-facing trust model for `coop` — the authoritative list
 of trust boundaries, taint sources, and the invariants that hold the isolation
-together. The [`review-security`](../.claude/agents/review-security.md) agent
-reads this file, and the root [`CLAUDE.md`](../CLAUDE.md) "Trust model" section
+together. The shared [`review`](../.agents/skills/review/SKILL.md) workflow
+reads this file, and the root [`AGENTS.md`](../AGENTS.md) "Trust model" section
 points here. Apply these checks whenever you build or review a change.
 
 This complements — it does not replace — [`SECURITY.md`](../SECURITY.md), which
@@ -304,7 +304,7 @@ is honored, or that softens any step above.
 
 ## Documented, accepted trade-offs
 
-These are deliberate and documented in [`CLAUDE.md`](../CLAUDE.md) /
+These are deliberate and documented in [`AGENTS.md`](../AGENTS.md) /
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Don't "fix" them without
 understanding the rationale; do flag a change that *widens* them:
 

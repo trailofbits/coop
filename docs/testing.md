@@ -171,7 +171,7 @@ stdout, add its `exclude_re`/`exclude_globs` entry (and extract any pure logic
 into a kept, tested helper) before merging. Verify with `cargo mutants -f
 <touched files> -- --lib` — not just the `--in-diff` sweep, which only mutates
 changed lines and so misses pre-existing same-class survivors in a touched file.
-The [`mutation-check`](../.claude/skills/mutation-check/SKILL.md) skill walks
+The [`mutation-check`](../.agents/skills/mutation-check/SKILL.md) skill walks
 this workflow.
 
 ### Running it

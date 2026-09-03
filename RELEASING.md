@@ -68,7 +68,7 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    ```
 
 6. **Run the deep checks when the diff warrants it** (these are slow and not CI
-   gates — see `CLAUDE.md`):
+   gates — see `AGENTS.md`):
    - `--mutants` when this release changed logic-dense modules (config,
      workspace, devcontainer, parsing, secret routing).
    - `--fuzz` when it changed a parser of user-editable input

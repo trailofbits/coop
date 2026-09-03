@@ -77,7 +77,7 @@ all `Option`.
 
 ### 5. JSON goes to stdout; tracing/human decoration stays on stderr
 
-Per `CLAUDE.md`, tracing already goes to stderr, so `coop … --json | jq` stays
+Per `AGENTS.md`, tracing already goes to stderr, so `coop … --json | jq` stays
 clean. **Two commands (`devcontainer check`, `up/start --dry-run`) currently
 write their report to stderr** via `eprintln!` / `Report::render()`. For those,
 `--json` must move the payload to **stdout** — the flag selects

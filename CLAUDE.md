@@ -1,7 +1,11 @@
-# coop — Claude / Codex / contributor guide
+# coop agent guide
 
-Isolated VM environment for running Claude Code and Codex — Firecracker on
-Linux, Lima on macOS.
+Follow the shared repository instructions in [`AGENTS.md`](AGENTS.md). Agent
+workflows are in [`.agents/skills/`](.agents/skills/); compatibility commands
+under [`.claude/commands/`](.claude/commands/) invoke those workflows.
+
+<!-- The remainder is retained as a standalone fallback for clients that do
+not follow the shared entrypoint link. Keep normative changes in AGENTS.md. -->
 
 ## Agent entrypoint
 
@@ -19,8 +23,7 @@ navigational; durable detail lives in [`docs/`](docs/).
 - [`docs/testing.md`](docs/testing.md) — integration, mutation, fuzzing, kani.
 - [`docs/platform-notes.md`](docs/platform-notes.md) — CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
-- Review tooling: `.claude/agents/review-*.md`, `.claude/commands/`,
-  `.claude/skills/`.
+- Agent workflows: `.agents/skills/`.
 
 ## Architecture (one paragraph)
 
@@ -80,7 +83,7 @@ platforms** — too slow for hooks:
 
 The `/integration` command wraps this; [`docs/testing.md`](docs/testing.md) has
 the full testing reference (including the `.cargo/mutants.toml` mutation scoping
-and the [`mutation-check`](.claude/skills/mutation-check/SKILL.md) skill).
+and the [`mutation-check`](.agents/skills/mutation-check/SKILL.md) skill).
 
 ## Code style
 
@@ -101,7 +104,7 @@ adding a runtime check.
 - Keep cross-file infra in sync in the same PR — a new CLI flag/config field ↔
   `config.example.toml` + `docs/`; tool-version pins ↔ CI; a new shell-out/IO
   function in a scoped module ↔ `.cargo/mutants.toml`.
-- Before opening, run the [`closeout-review`](.claude/skills/closeout-review/SKILL.md)
+- Before opening, run the [`closeout-review`](.agents/skills/closeout-review/SKILL.md)
   skill on the working diff (a `PreToolUse` hook gates `gh pr create` on it).
   Describe what the code does now — plain, factual language; a bug fix is a bug
   fix.

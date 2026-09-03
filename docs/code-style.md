@@ -4,8 +4,8 @@ These notes are coop's project-specific Rust conventions. They complement the
 global Rust guidance (clippy lint policy, `thiserror`/`anyhow`, `tracing`,
 newtypes, enums over bools) rather than restating it. The focus here is on
 **using the type system to eliminate error states** — not on style. The
-[`review-conventions`](../.claude/agents/review-conventions.md) and
-[`review-design`](../.claude/agents/review-design.md) agents enforce these; the
+conventions and design lenses in the shared
+[`review`](../.agents/skills/review/SKILL.md) workflow enforce these; the
 [architecture doc](ARCHITECTURE.md) shows where the patterns already live in the
 codebase.
 
@@ -126,7 +126,7 @@ Before reviewing, sync to latest remote (`git fetch origin`).
    CLI's intentional output. Tracing goes to **stderr**.
 8. **Cross-platform.** Touching backend-shared code? Confirm the abstraction
    still holds for both Firecracker and Lima. Integration tests must run on both
-   platforms (see [`CLAUDE.md`](../CLAUDE.md) "Before committing").
+   platforms (see [`AGENTS.md`](../AGENTS.md) "Before committing").
 
 ## Authoring checklist
 
