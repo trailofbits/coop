@@ -693,16 +693,30 @@ mod tests {
     }
 
     #[test]
-    fn codex_account_script_passes_through_without_keyring_mode() {
+    fn codex_account_script_guards_alternate_home_and_otherwise_passes_through() {
         // Every Codex entry point routes through the wrapper, so it must be a
         // transparent exec unless the guest config asks for keyring storage.
+        // The exception prevents session-level CODEX_HOME from bypassing
+        // coop's managed keyring config and its plaintext-token cleanup path.
         assert!(
             SCRIPT_CODEX_ACCOUNT.contains("cli_auth_credentials_store"),
             "wrapper should gate on the guest Codex credential-store setting",
         );
         assert!(
             SCRIPT_CODEX_ACCOUNT
-                .contains("if ! keyring_mode; then\n    exec \"$CODEX_BIN\" \"$@\""),
+                .contains("[ \"$first_line\" = 'cli_auth_credentials_store = \"keyring\"' ]"),
+            "credential-store detection should require coop's first-line setting",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains(
+                "if [ -n \"${CODEX_HOME:-}\" ] \\\n    && keyring_mode_in \"$HOME/.codex/config.toml\"; then"
+            ),
+            "wrapper should reject an explicit CODEX_HOME when coop's config uses the keyring",
+        );
+        assert!(
+            SCRIPT_CODEX_ACCOUNT.contains(
+                "unset CODEX_HOME for Codex ChatGPT account auth\"\nfi\n\nif ! keyring_mode; then\n    exec \"$CODEX_BIN\" \"$@\""
+            ),
             "wrapper should exec Codex directly when keyring mode is off",
         );
     }

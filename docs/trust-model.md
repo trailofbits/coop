@@ -126,7 +126,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   from the staged set only stops coop *copying* one, it removes nothing), and
   `coop codex` refuses to launch when the guest config does not actually
   select the keyring store — otherwise the wrapper would pass through to plain
-  Codex and write the token in the clear.
+  Codex and write the token in the clear. The wrapper also fails closed when a
+  session-level `CODEX_HOME` is set while coop's managed
+  `~/.codex/config.toml` selects keyring mode; coop does not otherwise stage or
+  maintain an alternate Codex home.
 
 ## SSH boundary
 

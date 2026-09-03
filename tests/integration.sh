@@ -1390,6 +1390,41 @@ CFGEOF
             "config=$codex_cfg stderr: $(guest_stderr)"
     fi
 
+    # coop manages only ~/.codex. A session-level CODEX_HOME must not bypass the
+    # managed setting and let Codex write a plaintext refresh token into the
+    # alternate directory (which could be inside /workspace and copied back to
+    # the host). Give the alternate config the same first-line keyring marker
+    # so its contents cannot bypass the guard.
+    local alternate_codex_home="/tmp/coop-codex-home-bypass-probe"
+    chatgpt_exec sh -c 'mkdir -p "$1" && printf "%s\n" \
+        "cli_auth_credentials_store = \"keyring\"" > "$1/config.toml"' \
+        sh "$alternate_codex_home"
+    if chatgpt_exec env CODEX_HOME="$alternate_codex_home" \
+        /usr/local/bin/codex-account --version; then
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "wrapper honored CODEX_HOME instead of coop's managed config"
+    elif guest_stderr | grep -q "unset CODEX_HOME"; then
+        pass "chatgpt mode rejects an unmanaged CODEX_HOME"
+    else
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+    chatgpt_exec rm -rf "$alternate_codex_home"
+
+    # Positive witness for the supported path: the CODEX_HOME guard must not
+    # reject a normal ChatGPT launch. This non-TTY call should get past that
+    # guard and reach the existing keyring prompt check.
+    if chatgpt_exec env -u CODEX_HOME \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "expected the later non-TTY keyring refusal, but Codex ran"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "chatgpt mode accepts an unset CODEX_HOME"
+    else
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+
     local guest_env
     guest_env=$(chatgpt_exec env || true)
     if echo "$guest_env" | grep -q '^OPENAI_API_KEY=' \

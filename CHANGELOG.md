@@ -83,6 +83,12 @@
 
 ### Fixes
 
+- **Fail closed on an unmanaged `CODEX_HOME` in ChatGPT auth mode** (#441) —
+  The guest wrapper now refuses an explicitly set `CODEX_HOME` when coop's
+  managed `~/.codex/config.toml` selects keyring storage. This prevents `codex
+  login` from silently writing a plaintext refresh token to the alternate
+  directory, including a workspace path that syncs back to the host.
+
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases
   use a companion `codex-code-mode-host` executable, but coop installed only
   the raw `codex` binary, causing Code Mode to fail closed at startup. Image
