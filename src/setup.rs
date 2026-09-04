@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::{Cmd, command_exists};
-use crate::config::{CoopConfig, ImageName, Instance};
+use crate::config::{CoopConfig, ImageName, Instance, InstanceName};
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
@@ -163,7 +163,6 @@ pub fn create_instance(
         }
     }
 
-    // Patch the guest's network config with the correct IP for this instance
     patch_guest_network(inst)?;
 
     Ok(())
@@ -254,8 +253,8 @@ pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageNa
 ///
 /// Mirrors [`create_instance`]'s copy + network-patch, but sources the
 /// rootfs from an arbitrary image rather than the instance's origin
-/// image. The network config is re-patched for this instance's IP,
-/// overwriting whatever address the template baked in at commit time.
+/// image. The network config and guest identity are re-patched for this
+/// instance, overwriting whatever the template baked in at commit time.
 pub fn restore_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
     let template = cfg.template_path_for(image);
     if !template.exists() {
@@ -342,7 +341,11 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
     let mount_dir = inst.dir.join("rootfs-mount");
     let mount_str = mount_dir.display().to_string();
 
-    tracing::info!("Patching guest network: IP={}", inst.guest_ip());
+    let hostname = guest_hostname(&inst.name);
+    tracing::info!(
+        "Patching guest network: IP={}, hostname={hostname}",
+        inst.guest_ip()
+    );
 
     let _guard = MountGuard::simple(&rootfs_str, &mount_str)?;
 
@@ -359,15 +362,14 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         .stdin_write(network_config.as_bytes())
         .context("Failed to write guest network config")?;
 
-    patch_guest_identity(&mount_str, &guest_hostname(inst.name.as_str()))?;
+    patch_guest_identity(&mount_str, &hostname)?;
 
     // _guard dropped here → unmount + rmdir
     Ok(())
 }
 
 /// Debian/Ubuntu convention: the machine's own name lives on a `127.0.1.1`
-/// line, separate from `127.0.0.1 localhost`. That is the line the guest's
-/// resolver hits when looking up its own hostname.
+/// line, separate from `127.0.0.1 localhost`.
 const GUEST_HOSTS_ALIAS_IP: &str = "127.0.1.1";
 
 /// Cap on the guest `/etc/hosts` read. The file is guest-authored — `coop
@@ -376,26 +378,26 @@ const GUEST_HOSTS_ALIAS_IP: &str = "127.0.1.1";
 /// few hundred bytes.
 const MAX_GUEST_HOSTS_BYTES: usize = 64 * 1024;
 
-/// Linux's `HOST_NAME_MAX` is 64 bytes including the terminator, so 63 usable.
+/// One byte under Linux's `HOST_NAME_MAX` of 64, which POSIX counts without
+/// the terminator. A 57-character instance name is already pathological, so
+/// the spare byte is free — and the clamp holds even where the limit is read
+/// as including the terminator.
 const MAX_GUEST_HOSTNAME_LEN: usize = 63;
 
-/// The guest hostname for an instance: `claude-<name>`, clamped to
+/// The guest hostname for an instance: `claude-<name>`, clamped to fit
 /// `HOST_NAME_MAX`.
 ///
-/// Instance names allow 64 characters (`config.rs`'s `MAX_INSTANCE_NAME_LEN`),
-/// so the prefixed form reaches 71 — past the kernel's limit. systemd rejects
-/// an over-long `/etc/hostname` outright instead of truncating it, which would
-/// leave the running hostname different from the `/etc/hosts` alias written
-/// beside it and bring the resolver warning back.
-fn guest_hostname(name: &str) -> String {
-    let full = format!("claude-{name}");
-    // Instance names are validated ASCII, so this is also a char truncation;
-    // the boundary walk keeps a hypothetical non-ASCII name from panicking.
-    let mut end = MAX_GUEST_HOSTNAME_LEN.min(full.len());
-    while !full.is_char_boundary(end) {
-        end -= 1;
-    }
-    full[..end].to_string()
+/// Instance names allow 64 characters, so the prefixed form reaches 71 — past
+/// the kernel's limit. An over-long name cannot reach
+/// the running hostname intact, so `/etc/hostname` and the `/etc/hosts` alias
+/// would then name different things. Deriving both from this one value is what
+/// keeps them equal.
+fn guest_hostname(name: &InstanceName) -> String {
+    // `truncate` is a byte index, and `InstanceName` is validated ASCII, so
+    // every index is a char boundary.
+    let mut hostname = format!("claude-{name}");
+    hostname.truncate(MAX_GUEST_HOSTNAME_LEN);
+    hostname
 }
 
 /// Write `/etc/hostname` and the matching `/etc/hosts` alias inside a mounted
@@ -422,11 +424,10 @@ fn patch_guest_identity(mount_str: &str, hostname: &str) -> Result<()> {
         .stdin_write(hosts.as_bytes())
         .context("Failed to write guest hosts file")?;
 
-    // `tee` keeps an existing file's mode but creates a new one under the root
-    // session's umask, which comes from the host's PAM/`login.defs` rather than
-    // from coop: under the CIS baseline's `UMASK 027` a freshly created
-    // /etc/hosts would land unreadable to the guest's own resolver. Same trap
-    // the PID file hit (`vm.rs`'s `PID_TRAMPOLINE`).
+    // `tee` preserves an existing file's mode but creates a new one under
+    // root's umask, which comes from the host's PAM/`login.defs`, not coop — a
+    // hardened umask hides /etc/hosts from the guest's resolver. Reachable only
+    // if the guest deleted the file before `coop commit`. Cf. `PID_TRAMPOLINE`.
     Cmd::new("chmod")
         .arg("644")
         .arg(&hostsfile)
@@ -435,15 +436,12 @@ fn patch_guest_identity(mount_str: &str, hostname: &str) -> Result<()> {
         .context("Failed to set guest hosts file mode")
 }
 
-/// Read a guest `/etc/hosts` — bounded, and best-effort by design.
+/// Read a guest `/etc/hosts`, bounded one byte past the cap so that an
+/// oversized file is detected rather than written back truncated.
 ///
-/// A committed image can carry a missing, oversized or non-UTF-8 `/etc/hosts`,
-/// because the guest is untrusted and `coop commit` preserves whatever it left
-/// behind. Such a rootfs booted fine before coop patched this file, so a
-/// cosmetic fix must not turn it into a failed `coop up`: an unusable file
-/// degrades to empty, and [`hosts_with_hostname`] synthesizes a default from
-/// there. `head -c` bounds the read one byte past the cap, so an oversized
-/// file is detected rather than silently written back truncated.
+/// The file is guest-authored (see `docs/trust-model.md`), so the read is
+/// best-effort: a cosmetic fix must not fail `coop up` on a rootfs that used
+/// to boot. [`bound_guest_hosts`] holds that decision.
 fn read_guest_hosts(path: &str) -> String {
     let read = Cmd::new("head")
         .arg("-c")
@@ -451,17 +449,22 @@ fn read_guest_hosts(path: &str) -> String {
         .arg(path)
         .sudo()
         .capture();
+    bound_guest_hosts(read)
+}
+
+/// Decide what a bounded read of the guest hosts file yields: the contents, or
+/// empty for "no usable file" — which [`hosts_with_hostname`] turns into a
+/// default.
+fn bound_guest_hosts(read: Result<String>) -> String {
     match read {
         Ok(contents) if contents.len() > MAX_GUEST_HOSTS_BYTES => {
-            tracing::warn!(
-                "Guest {path} is larger than {MAX_GUEST_HOSTS_BYTES} bytes — replacing it"
-            );
+            tracing::warn!("Guest hosts file exceeds {MAX_GUEST_HOSTS_BYTES} bytes — replacing it");
             String::new()
         }
         Ok(contents) => contents,
         Err(e) => {
-            // The error names the command and path, never the file's contents.
-            tracing::warn!("Guest {path} is unreadable ({e}) — writing a fresh one");
+            // `capture`'s error text is the command line, not the file's bytes.
+            tracing::warn!("Guest hosts file is unreadable ({e}) — writing a fresh one");
             String::new()
         }
     }
@@ -469,12 +472,9 @@ fn read_guest_hosts(path: &str) -> String {
 
 /// Return `contents` with the guest's own-hostname entry set to `hostname`.
 ///
-/// The first `127.0.1.1` line is replaced **whole**: any alias on it named the
-/// previous hostname (the template's `claude-vm`), so carrying those forward
-/// would keep a stale name resolvable. Later duplicates are dropped, every
-/// other line — comments, blanks, entries coop did not author — is passed
-/// through verbatim, and the entry is appended when absent. Blank input yields
-/// a minimal default file. Idempotent.
+/// The matched line is replaced whole rather than edited: its aliases name the
+/// previous hostname, and carrying them forward keeps a stale name resolvable.
+/// Blank input yields a minimal default file. Idempotent.
 fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
     let entry = format!("{GUEST_HOSTS_ALIAS_IP} {hostname}\n");
     if contents.trim().is_empty() {
@@ -2107,8 +2107,6 @@ mod tests {
         );
     }
 
-    /// The documented contract: the matched line is replaced whole, so aliases
-    /// naming the *previous* hostname do not survive the rename.
     #[test]
     fn hosts_with_hostname_replaces_the_whole_matched_line() {
         assert_eq!(
@@ -2134,9 +2132,8 @@ mod tests {
         );
     }
 
-    /// The degraded path from [`read_guest_hosts`]: a missing, oversized or
-    /// non-UTF-8 guest file reads as empty, so the helper has to produce a
-    /// usable hosts file rather than one holding only the guest alias.
+    /// Blank input is what [`bound_guest_hosts`] degrades to, so the result has
+    /// to be a usable hosts file — not one holding only the guest alias.
     #[test]
     fn hosts_with_hostname_synthesizes_a_default_from_blank_input() {
         let expected = "127.0.0.1 localhost\n127.0.1.1 claude-a\n";
@@ -2159,18 +2156,57 @@ mod tests {
         assert_eq!(hosts_with_hostname(&once, "claude-a"), once);
     }
 
-    #[test]
-    fn guest_hostname_prefixes_the_instance_name() {
-        assert_eq!(guest_hostname("auditor-1"), "claude-auditor-1");
+    fn instance_name(name: &str) -> InstanceName {
+        InstanceName::new(name).unwrap()
     }
 
-    /// A 64-char instance name would yield 71 bytes, which systemd rejects
-    /// rather than truncates — leaving the running hostname out of sync with
-    /// the `/etc/hosts` entry written next to it.
     #[test]
-    fn guest_hostname_clamps_to_host_name_max() {
-        let hostname = guest_hostname(&"n".repeat(64));
-        assert_eq!(hostname.len(), MAX_GUEST_HOSTNAME_LEN);
-        assert!(hostname.starts_with("claude-n"), "{hostname}");
+    fn guest_hostname_prefixes_the_instance_name() {
+        assert_eq!(
+            guest_hostname(&instance_name("auditor-1")),
+            "claude-auditor-1"
+        );
+    }
+
+    /// Asserted against literals, not `MAX_GUEST_HOSTNAME_LEN` — comparing the
+    /// output length to the constant that produced it passes for any bound.
+    #[test]
+    fn guest_hostname_clamps_the_longest_instance_name() {
+        let longest = instance_name(&"n".repeat(64));
+        assert_eq!(
+            guest_hostname(&longest),
+            format!("claude-{}", "n".repeat(56))
+        );
+    }
+
+    /// The exact-fit boundary: 56 characters is the longest name that survives
+    /// the clamp untouched, so this pins which names the fix still reaches.
+    #[test]
+    fn guest_hostname_leaves_an_exactly_fitting_name_intact() {
+        let name = "n".repeat(56);
+        assert_eq!(
+            guest_hostname(&instance_name(&name)),
+            format!("claude-{name}")
+        );
+        assert_eq!(guest_hostname(&instance_name(&name)).len(), 63);
+    }
+
+    #[test]
+    fn bound_guest_hosts_passes_through_a_file_at_the_cap() {
+        let at_cap = "a".repeat(MAX_GUEST_HOSTS_BYTES);
+        assert_eq!(bound_guest_hosts(Ok(at_cap.clone())), at_cap);
+    }
+
+    /// `head -c` reads one byte past the cap, so an oversized file arrives as
+    /// `MAX + 1` bytes and must be discarded rather than written back truncated.
+    #[test]
+    fn bound_guest_hosts_discards_a_file_over_the_cap() {
+        let over_cap = "a".repeat(MAX_GUEST_HOSTS_BYTES + 1);
+        assert_eq!(bound_guest_hosts(Ok(over_cap)), "");
+    }
+
+    #[test]
+    fn bound_guest_hosts_degrades_on_a_read_error() {
+        assert_eq!(bound_guest_hosts(Err(anyhow::anyhow!("no such file"))), "");
     }
 }

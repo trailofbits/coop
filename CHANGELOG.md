@@ -88,8 +88,8 @@
   the image's `127.0.1.1 claude-vm` entry in `/etc/hosts`, so every `sudo` in
   the guest printed `sudo: unable to resolve host claude-<name>` before running.
   Both files are now written together at create and restore, and the guest
-  hostname is clamped to the kernel's 63-byte limit so long instance names
-  still get a resolvable name. No image rebuild is needed — the patch is
+  hostname is clamped to fit the kernel's 64-byte hostname limit so long
+  instance names still get a resolvable name. No image rebuild is needed — the patch is
   per-instance, and the image's own entry is what gets overwritten — but
   `patch_guest_network` runs only on create and restore, so an existing VM
   keeps the stale entry until `coop restore <vm> --image <image>` or a destroy
