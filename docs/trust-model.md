@@ -49,6 +49,16 @@ user launched it.
   `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
+- **Rootfs files touched while loop-mounted during setup.** `setup.rs`
+  `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
+  commit` turns a guest-mutated rootfs into an image template — so the guest
+  authors both the contents and the directory entry at that path on every later
+  create/restore. Contents are read bounded and best-effort
+  (`bound_guest_hosts` degrades to a default rather than aborting the
+  lifecycle). The paths are **host** paths: `MountGuard::simple` is a loop
+  mount, not a chroot, so the traversal rule below applies to every
+  `{mount}/…` string there — compare `verify_chroot_binaries`, which runs
+  `test -x` *inside* a chroot for that reason. Not currently validated.
 - **Guest command output read by the host.** e.g. `check_guest_dirty` reads
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it

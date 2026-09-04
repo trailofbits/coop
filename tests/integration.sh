@@ -1883,6 +1883,37 @@ test_sudo() {
     else
         fail "sudo can write to /root" "stderr: $(guest_stderr)"
     fi
+
+    # Firecracker only: coop renames the guest there. Lima configures its own
+    # guest hostname, so a Lima guest's self-resolution is Lima's business.
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        local guest_host
+        guest_host=$(guest_exec hostname) || guest_host=""
+        # Assert the answer comes from the hosts entry coop wrote: getent also
+        # consults DNS, which could resolve the bare name without one.
+        if [[ -n "$guest_host" ]] &&
+            guest_exec getent hosts "$guest_host" | grep -q '^127\.0\.1\.1'; then
+            pass "guest hostname resolves via /etc/hosts ($guest_host)"
+        else
+            fail "guest hostname resolves via /etc/hosts" \
+                "hostname='$guest_host'; stderr: $(guest_stderr)"
+        fi
+
+        if guest_exec sudo -n true; then
+            local sudo_err
+            sudo_err=$(guest_stderr)
+            if echo "$sudo_err" | grep -qi "unable to resolve host"; then
+                fail "sudo emits no resolver warning" "stderr: $sudo_err"
+            else
+                pass "sudo emits no resolver warning"
+            fi
+        else
+            fail "sudo emits no resolver warning" "sudo -n failed; stderr: $(guest_stderr)"
+        fi
+    else
+        skip "guest hostname resolves via /etc/hosts" "Lima owns guest hostname config"
+        skip "sudo emits no resolver warning" "Lima owns guest hostname config"
+    fi
 }
 
 test_network() {
