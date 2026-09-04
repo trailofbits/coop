@@ -1280,13 +1280,21 @@ test_codex_account_auth_support() {
         fi
     done
 
-    # The primary guest config may inherit the host's Codex credential-store
-    # setting. Use an explicit empty config so this assertion isolates the
-    # wrapper's non-keyring branch from the machine running the suite.
-    local account_probe_dir="/tmp/coop-codex-account-probe"
-    if ! guest_exec sh -c 'mkdir -p "$1" && : > "$1/config.toml"' \
-        sh "$account_probe_dir"; then
+    # Give the probe an explicit managed config with no credential-store
+    # setting. The wrapper checks $HOME/.codex/config.toml before consulting an
+    # explicit $CODEX_HOME, so both locations must be isolated for this test.
+    local account_probe_root="/tmp/coop-codex-account-probe"
+    local account_probe_home="$account_probe_root/home"
+    local account_probe_codex_home="$account_probe_root/codex-home"
+    if ! guest_exec sh -c '
+        set -eu
+        rm -rf "$1"
+        mkdir -p "$1/home/.codex" "$1/codex-home"
+        : > "$1/home/.codex/config.toml"
+        : > "$1/codex-home/config.toml"
+    ' sh "$account_probe_root"; then
         fail "prepare codex-account probe config" "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
         return
     fi
 
@@ -1294,7 +1302,8 @@ test_codex_account_auth_support() {
     # D-Bus session, keyring, or password prompt. A hang here would mean it
     # tried to unlock a keyring it should have skipped.
     local version
-    if version=$(coop_exec env CODEX_HOME="$account_probe_dir" \
+    if version=$(coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
         /usr/local/bin/codex-account --version); then
         pass "codex-account passes through to codex without keyring mode ($version)"
     else
@@ -1302,20 +1311,26 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    # Drive the keyring branch without reconfiguring the VM: the wrapper reads
-    # $CODEX_HOME, so a scratch config selects keyring mode for one call. This
-    # is the only place the `cli_auth_credentials_store` grep, the D-Bus
-    # re-exec, the tool guards and the TTY guard actually execute — the
-    # assertions above all run on the passthrough branch.
+    # Select keyring mode explicitly in the scratch CODEX_HOME while retaining
+    # the isolated managed config. This is the only place the
+    # `cli_auth_credentials_store` check, the D-Bus re-exec, the tool guards and
+    # the TTY guard actually execute — the assertions above all run on the
+    # passthrough branch.
     #
     # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
     # a password prompt. A hang here is the failure this asserts against.
-    guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
-        > "$1/config.toml"' sh "$account_probe_dir"
+    if ! guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
+        > "$1/config.toml"' sh "$account_probe_codex_home"; then
+        fail "prepare codex-account keyring probe config" \
+            "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
+        return
+    fi
 
     # </dev/null so the TTY guard is deterministic: run interactively, stdin
     # could otherwise be a terminal and the wrapper would prompt and block.
-    if coop_exec env CODEX_HOME="$account_probe_dir" \
+    if coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
@@ -1326,7 +1341,9 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    guest_exec rm -rf "$account_probe_dir"
+    if ! guest_exec rm -rf "$account_probe_root"; then
+        fail "clean up codex-account probe config" "stderr: $(guest_stderr)"
+    fi
 }
 
 # The wrapper/package checks above use a scratch CODEX_HOME, but they do not
@@ -1388,6 +1405,41 @@ CFGEOF
     else
         fail "chatgpt mode selects the guest keyring credential store" \
             "config=$codex_cfg stderr: $(guest_stderr)"
+    fi
+
+    # coop manages only ~/.codex. A session-level CODEX_HOME must not bypass the
+    # managed setting and let Codex write a plaintext refresh token into the
+    # alternate directory (which could be inside /workspace and copied back to
+    # the host). Give the alternate config the same first-line keyring marker
+    # so its contents cannot bypass the guard.
+    local alternate_codex_home="/tmp/coop-codex-home-bypass-probe"
+    chatgpt_exec sh -c 'mkdir -p "$1" && printf "%s\n" \
+        "cli_auth_credentials_store = \"keyring\"" > "$1/config.toml"' \
+        sh "$alternate_codex_home"
+    if chatgpt_exec env CODEX_HOME="$alternate_codex_home" \
+        /usr/local/bin/codex-account --version; then
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "wrapper honored CODEX_HOME instead of coop's managed config"
+    elif guest_stderr | grep -q "unset CODEX_HOME"; then
+        pass "chatgpt mode rejects an unmanaged CODEX_HOME"
+    else
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+    chatgpt_exec rm -rf "$alternate_codex_home"
+
+    # Positive witness for the supported path: the CODEX_HOME guard must not
+    # reject a normal ChatGPT launch. This non-TTY call should get past that
+    # guard and reach the existing keyring prompt check.
+    if chatgpt_exec env -u CODEX_HOME \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "expected the later non-TTY keyring refusal, but Codex ran"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "chatgpt mode accepts an unset CODEX_HOME"
+    else
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "stderr: $(guest_stderr)"
     fi
 
     local guest_env
