@@ -337,9 +337,31 @@ impl SshTarget {
         dir.join(format!("coop-{short:08x}.sock"))
     }
 
-    /// SSH options for commands.
-    pub fn ssh_opts(&self) -> Vec<String> {
+    /// Options every transport shares, up to the port flag.
+    ///
+    /// `ssh`, `scp`, and rsync's `-e` command all take these; only the port
+    /// flag differs (`-p` vs `-P`), so all three derive from here instead of
+    /// hand-copying a list that then drifts.
+    ///
+    /// The bounds, in the order they take effect. `ConnectTimeout` caps the
+    /// TCP connect and banner exchange. `BatchMode` refuses password and
+    /// passphrase prompts, so a key the guest rejects fails instead of
+    /// blocking on stdin where no interactive user exists (`coop up` in CI).
+    /// `ServerAlive*` then covers the established session: a paused VM, a
+    /// wedged sshd, or a lost TAP device otherwise leaves SSH blocked on a
+    /// dead socket with no deadline. It is answered by sshd itself, not by
+    /// the remote command, so a silent hour-long install is never at risk —
+    /// only a guest whose sshd cannot answer for 90s.
+    fn transport_opts(&self) -> Vec<String> {
         vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+            "-o".into(),
+            "ServerAliveInterval=30".into(),
+            "-o".into(),
+            "ServerAliveCountMax=3".into(),
             "-o".into(),
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
@@ -350,9 +372,14 @@ impl SshTarget {
             "LogLevel=ERROR".into(),
             "-i".into(),
             self.key_path.display().to_string(),
-            "-p".into(),
-            self.port.to_string(),
         ]
+    }
+
+    /// SSH options for commands.
+    pub fn ssh_opts(&self) -> Vec<String> {
+        let mut opts = self.transport_opts();
+        opts.extend(["-p".into(), self.port.to_string()]);
+        opts
     }
 
     /// SSH options with connection multiplexing.
@@ -376,21 +403,10 @@ impl SshTarget {
 
     /// SCP options (uses -P for port instead of -p).
     pub fn scp_opts(&self) -> Vec<String> {
-        vec![
-            "-q".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "IdentitiesOnly=yes".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-i".into(),
-            self.key_path.display().to_string(),
-            "-P".into(),
-            self.port.to_string(),
-        ]
+        let mut opts = vec!["-q".to_string()];
+        opts.extend(self.transport_opts());
+        opts.extend(["-P".into(), self.port.to_string()]);
+        opts
     }
 
     /// user@host address string.
@@ -529,13 +545,12 @@ impl SshTarget {
     }
 
     /// SSH command string for rsync's -e flag.
+    ///
+    /// Derived from [`Self::ssh_opts`] so a transfer inherits the same bounds
+    /// as any other guest command. rsync splits this string on whitespace, so
+    /// it stays unquoted — a key path containing spaces has never worked here.
     pub fn rsync_ssh_cmd(&self) -> String {
-        format!(
-            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o IdentitiesOnly=yes -o LogLevel=ERROR -i {} -p {}",
-            self.key_path.display(),
-            self.port,
-        )
+        format!("ssh {}", self.ssh_opts().join(" "))
     }
 
     /// Run a command on the guest via SSH and capture stdout.
@@ -3266,6 +3281,61 @@ Buffers:          128000 kB
 Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
+
+    fn ssh_test_target() -> SshTarget {
+        SshTarget {
+            host: Hostname::new("192.0.2.1").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: PathBuf::from("/tmp/test-key"),
+        }
+    }
+
+    #[test]
+    fn every_transport_is_bounded_against_a_wedged_guest() {
+        let target = ssh_test_target();
+        let ssh = target.ssh_opts();
+        let scp = target.scp_opts();
+        let rsync = target.rsync_ssh_cmd();
+
+        for bound in [
+            "BatchMode=yes",
+            "ConnectTimeout=10",
+            "ServerAliveInterval=30",
+            "ServerAliveCountMax=3",
+        ] {
+            assert!(ssh.contains(&bound.to_string()), "{bound} missing from ssh");
+            assert!(scp.contains(&bound.to_string()), "{bound} missing from scp");
+            assert!(rsync.contains(bound), "{bound} missing from rsync -e");
+        }
+
+        // Exactly one pair per transport: OpenSSH honors the first value of a
+        // repeated `-o`, so a caller that appends its own `ServerAlive*` after
+        // these would be silently ignored rather than tightening the bound.
+        for (name, opts) in [
+            ("ssh", ssh),
+            ("scp", scp),
+            ("mux", target.ssh_opts_mux()),
+            ("rsync", rsync.split(' ').map(str::to_string).collect()),
+        ] {
+            let pairs = opts.iter().filter(|o| o.starts_with("ServerAlive")).count();
+            assert_eq!(pairs, 2, "{name} must carry one ServerAlive* pair");
+        }
+    }
+
+    #[test]
+    fn ssh_and_scp_options_differ_only_in_the_port_flag() {
+        // Two hand-copied lists is how the last hardening change reached only
+        // one of them; they now derive from `transport_opts`.
+        let target = ssh_test_target();
+        let ssh = target.ssh_opts();
+        let scp = target.scp_opts();
+
+        assert_eq!(scp.first().map(String::as_str), Some("-q"));
+        assert_eq!(scp[1..scp.len() - 2], ssh[..ssh.len() - 2]);
+        assert!(scp.ends_with(&["-P".to_string(), "22".to_string()]));
+        assert!(ssh.ends_with(&["-p".to_string(), "22".to_string()]));
+    }
 
     #[test]
     fn boot_preflight_fails_on_missing_config_dir() {

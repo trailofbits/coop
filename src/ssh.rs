@@ -41,22 +41,6 @@ fn guest_term() -> String {
     }
 }
 
-/// Keepalive options for interactive sessions.
-///
-/// A paused/suspended VM or a dropped local connection leaves SSH
-/// blocked on a dead socket indefinitely. With these, SSH sends a probe
-/// every 30s and gives up after 3 unanswered probes — so an unreachable
-/// session terminates within ~90s instead of hanging. Scoped to
-/// interactive use; the short-lived non-interactive paths don't need it.
-fn keepalive_opts() -> [String; 4] {
-    [
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-    ]
-}
-
 /// Force a known OpenSSH escape character for emergency disconnects.
 ///
 /// OpenSSH only recognizes the escape at the start of a line, so users
@@ -68,7 +52,6 @@ fn escape_opts() -> [String; 2] {
 
 fn interactive_ssh_args(session: &SshSession, remote_cmd: String) -> Vec<String> {
     let mut args = session.ssh_opts();
-    args.extend(keepalive_opts());
     args.extend(escape_opts());
     args.extend(["-t".to_string(), session.target.addr(), remote_cmd]);
     args
@@ -202,19 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_opts_set_interval_and_count() {
-        assert_eq!(
-            keepalive_opts(),
-            [
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-            ],
-        );
-    }
-
-    #[test]
     fn escape_opts_force_tilde_escape() {
         assert_eq!(escape_opts(), ["-e", "~"]);
     }
@@ -232,9 +202,20 @@ mod tests {
             env: crate::backend::EnvForward::default(),
         };
 
+        // The `ServerAlive*` pair comes from `SshTarget::transport_opts`, which
+        // every transport shares; this session must not add a second one, since
+        // OpenSSH honors the first value of a repeated `-o`.
         assert_eq!(
             interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
             [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -247,10 +228,6 @@ mod tests {
                 "/tmp/coop-test-key",
                 "-p",
                 "1",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
                 "-e",
                 "~",
                 "-t",

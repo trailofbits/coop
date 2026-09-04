@@ -132,7 +132,11 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 - coop connects to the guest with `StrictHostKeyChecking=no`,
   `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`
-  (`backend.rs:SshTarget::ssh_opts`, `workspace.rs:ssh_config_block`). This is
+  (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
+  rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
+  own transports add `BatchMode=yes`, so a rejected key fails instead of
+  falling back to a password prompt; the `~/.ssh/config` block written for the
+  user's own `ssh coop-<name>` deliberately does not. This is
   deliberate: guest keys are ephemeral and regenerated per VM, so there is no
   stable host key to pin. The trade-off is that a MITM on the path to the guest
   is not detected — acceptable because that path is loopback / a local TAP link
