@@ -83,6 +83,13 @@
 
 ### Fixes
 
+- **Guest commands fail instead of hanging when a VM stops responding** — A
+  paused VM, a wedged sshd, or a lost TAP device left one-shot `ssh` calls
+  blocked on a dead socket with no deadline, so lifecycle commands hung until
+  interrupted. Those calls now set `BatchMode`, a connect timeout, and liveness
+  probes that abort after ~10s of silence. Interactive `coop shell` sessions and
+  background tunnels keep their longer keepalives.
+
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases
   use a companion `codex-code-mode-host` executable, but coop installed only
   the raw `codex` binary, causing Code Mode to fail closed at startup. Image

@@ -338,8 +338,17 @@ impl SshTarget {
     }
 
     /// SSH options for commands.
+    ///
+    /// `BatchMode` keeps a failed key exchange from stalling on a password
+    /// prompt, and `ConnectTimeout` bounds the handshake against a guest that
+    /// accepts TCP but never answers. Session-liveness probes deliberately
+    /// live in [`Self::command_opts`] instead — see the note there.
     pub fn ssh_opts(&self) -> Vec<String> {
         vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
             "-o".into(),
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
@@ -355,14 +364,35 @@ impl SshTarget {
         ]
     }
 
-    /// SSH options with connection multiplexing.
+    /// SSH options for a one-shot command, bounded against a wedged guest.
+    ///
+    /// A guest that stops answering — paused VM, hung sshd, lost TAP —
+    /// leaves a plain `ssh` blocked on a dead socket with no deadline.
+    /// These probes abort the command after ~10s of silence.
+    ///
+    /// This must not move into [`Self::ssh_opts`]: OpenSSH honors the *first*
+    /// value for a repeated `-o`, so a base value would win over the longer
+    /// intervals that interactive sessions (`ssh::keepalive_opts`) and
+    /// background tunnels (`port_forward`, `proxy`) append deliberately.
+    fn command_opts(&self) -> Vec<String> {
+        let mut opts = self.ssh_opts();
+        opts.extend([
+            "-o".into(),
+            "ServerAliveInterval=5".into(),
+            "-o".into(),
+            "ServerAliveCountMax=2".into(),
+        ]);
+        opts
+    }
+
+    /// One-shot command options with connection multiplexing.
     ///
     /// Only used during boot probing (`wait_until_ready`) where rapid
     /// retries benefit from a shared master connection. The master is
     /// torn down after probing to avoid poisoning later connections
     /// that need `SendEnv` for environment forwarding.
     fn ssh_opts_mux(&self) -> Vec<String> {
-        let mut opts = self.ssh_opts();
+        let mut opts = self.command_opts();
         opts.extend([
             "-o".into(),
             "ControlMaster=auto".into(),
@@ -401,7 +431,7 @@ impl SshTarget {
     /// Run a command on the guest via SSH.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
+        let mut args = self.command_opts();
         args.push(self.addr());
         args.push(cmd.clone());
 
@@ -423,7 +453,7 @@ impl SshTarget {
     /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
     pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: Vec<u8>) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
+        let mut args = self.command_opts();
         args.push(self.addr());
         args.push(cmd.clone());
         Cmd::new("ssh")
@@ -435,7 +465,7 @@ impl SshTarget {
 
     /// Check if a command succeeds on the guest.
     pub fn exec_ok(&self, command: RemoteCommand) -> bool {
-        let mut args = self.ssh_opts();
+        let mut args = self.command_opts();
         args.push(self.addr());
         args.push(command.into_string());
 
@@ -540,7 +570,7 @@ impl SshTarget {
 
     /// Run a command on the guest via SSH and capture stdout.
     pub fn capture(&self, cmd: &str) -> Result<String> {
-        let mut args = self.ssh_opts();
+        let mut args = self.command_opts();
         args.push(self.addr());
         args.push(cmd.to_string());
 
@@ -594,10 +624,17 @@ impl SshSession {
         opts
     }
 
+    /// [`SshTarget::command_opts`] with environment variable forwarding.
+    fn command_opts(&self) -> Vec<String> {
+        let mut opts = self.target.command_opts();
+        opts.extend(self.env.send_env_opts());
+        opts
+    }
+
     /// Run a command on the guest via SSH with env forwarding.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
+        let mut args = self.command_opts();
         args.push(self.target.addr());
         args.push(cmd.clone());
 
@@ -3266,6 +3303,40 @@ Buffers:          128000 kB
 Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
+
+    #[test]
+    fn ordinary_ssh_commands_fail_bounded_when_a_guest_stops_responding() {
+        let target = SshTarget {
+            host: Hostname::new("192.0.2.1").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: PathBuf::from("/tmp/test-key"),
+        };
+        let base = target.ssh_opts();
+        let command = target.command_opts();
+
+        // Handshake bounds are safe for every caller, so they belong in the base.
+        for required in ["BatchMode=yes", "ConnectTimeout=10"] {
+            assert!(
+                base.iter().any(|option| option == required),
+                "{required} missing from ssh_opts",
+            );
+        }
+
+        // The liveness probe must not: OpenSSH honors the first `-o`, so a base
+        // value would silently override the longer interval that interactive
+        // sessions and background tunnels append after these options.
+        assert!(
+            !base.iter().any(|option| option.starts_with("ServerAlive")),
+            "ssh_opts must leave ServerAlive* unset: {base:?}",
+        );
+        for required in ["ServerAliveInterval=5", "ServerAliveCountMax=2"] {
+            assert!(
+                command.iter().any(|option| option == required),
+                "{required} missing from command_opts",
+            );
+        }
+    }
 
     #[test]
     fn boot_preflight_fails_on_missing_config_dir() {

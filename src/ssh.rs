@@ -236,6 +236,10 @@ mod tests {
             interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
             [
                 "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
                 "UserKnownHostsFile=/dev/null",
@@ -257,6 +261,33 @@ mod tests {
                 "ubuntu@127.0.0.1",
                 "cd /workspace && 'claude' 'agents'",
             ],
+        );
+    }
+
+    #[test]
+    fn interactive_keepalive_is_not_shadowed_by_a_shorter_base_option() {
+        // OpenSSH honors the first value of a repeated `-o`, so a keepalive
+        // added to `SshTarget::ssh_opts` would silently win over this one and
+        // cut interactive sessions at that shorter deadline instead of ~90s.
+        let session = SshSession {
+            target: crate::backend::SshTarget {
+                host: crate::backend::Hostname::new("127.0.0.1")
+                    .expect("test host should be valid"),
+                port: std::num::NonZeroU16::MIN,
+                user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
+                key_path: "/tmp/coop-test-key".into(),
+            },
+            env: crate::backend::EnvForward::default(),
+        };
+
+        let args = interactive_ssh_args(&session, "cd /workspace && exec $SHELL -l".into());
+        let effective: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("ServerAlive"))
+            .collect();
+        assert_eq!(
+            effective,
+            ["ServerAliveInterval=30", "ServerAliveCountMax=3"],
         );
     }
 
