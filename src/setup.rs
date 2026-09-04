@@ -358,8 +358,10 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         .stdin_write(network_config.as_bytes())
         .context("Failed to write guest network config")?;
 
-    // Also patch hostname to include instance name
-    let hostname = format!("claude-{}\n", inst.name);
+    // Also patch hostname to include instance name and keep /etc/hosts in sync,
+    // otherwise sudo emits a resolver warning for every guest command.
+    let guest_hostname = format!("claude-{}", inst.name);
+    let hostname = format!("{guest_hostname}\n");
     let hostfile = format!("{mount_str}/etc/hostname");
     Cmd::new("tee")
         .arg(&hostfile)
@@ -367,8 +369,43 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         .stdin_write(hostname.as_bytes())
         .context("Failed to write hostname")?;
 
+    let hostsfile = format!("{mount_str}/etc/hosts");
+    let hosts = Cmd::new("cat")
+        .arg(&hostsfile)
+        .sudo()
+        .capture()
+        .context("Failed to read guest hosts file")?;
+    let hosts = hosts_with_hostname(&hosts, &guest_hostname);
+    Cmd::new("tee")
+        .arg(&hostsfile)
+        .sudo()
+        .stdin_write(hosts.as_bytes())
+        .context("Failed to write guest hosts file")?;
+
     // _guard dropped here → unmount + rmdir
     Ok(())
+}
+
+fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
+    let mut found = false;
+    let mut output = String::new();
+    for line in contents.lines() {
+        if line.split_whitespace().next() == Some("127.0.1.1") {
+            output.push_str("127.0.1.1 ");
+            output.push_str(hostname);
+            output.push('\n');
+            found = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !found {
+        output.push_str("127.0.1.1 ");
+        output.push_str(hostname);
+        output.push('\n');
+    }
+    output
 }
 
 // ── Template management ───────────────────────────────────────
@@ -1958,5 +1995,22 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("network is on fire"), "{err}");
+    }
+
+    #[test]
+    fn hosts_with_hostname_replaces_stale_guest_alias() {
+        let existing = "127.0.0.1 localhost\n127.0.1.1 claude-vm\n::1 localhost\n";
+        assert_eq!(
+            hosts_with_hostname(existing, "claude-auditor-1"),
+            "127.0.0.1 localhost\n127.0.1.1 claude-auditor-1\n::1 localhost\n"
+        );
+    }
+
+    #[test]
+    fn hosts_with_hostname_adds_missing_guest_alias() {
+        assert_eq!(
+            hosts_with_hostname("127.0.0.1 localhost\n", "claude-auditor-1"),
+            "127.0.0.1 localhost\n127.0.1.1 claude-auditor-1\n"
+        );
     }
 }
