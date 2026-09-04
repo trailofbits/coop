@@ -152,6 +152,16 @@ exclude_re = [
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
 
+  # network.rs — the guest-to-guest isolation shell-outs. Each drives `bridge`
+  # or `iptables` against a live br0, so a `--lib` test cannot observe whether
+  # the flag stuck or the rule landed; tests/integration.sh asserts the behavior
+  # with two running instances. The decision logic they were carved around stays
+  # IN scope and is unit-tested — port_is_isolated (the readback predicate),
+  # guest_isolation_spec (subnet scoping + rule tag), and guest_subnet_cidr (the
+  # network-address mask) — so a survivor on one of those is a real gap.
+  "\\bisolate_tap_port\\b",
+  "\\bensure_guest_isolation_rule\\b",
+
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into
   # src/commands/. Apply the SAME surgical treatment the flat shell-out

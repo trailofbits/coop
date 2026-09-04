@@ -3352,6 +3352,92 @@ test_appledouble_sidecars() {
 
 # ── Multi-instance tests (--full only) ────────────────────────
 
+# Read one guest's IPv4 address. The interface is eth0 on this backend —
+# src/setup.rs writes `[Match] Name=eth0` and src/vm.rs sets iface_id "eth0".
+guest_ip_of() {
+    GUEST_INSTANCE="$1"
+    guest_exec sh -c "ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1" \
+        2>/dev/null | tr -d '[:space:]'
+}
+
+# Install <dest>/32 via the gateway and confirm it took — a route that silently
+# failed to install would make the probe fall back to the on-link path that L2
+# isolation already blocks.
+guest_route_via() {
+    GUEST_INSTANCE="$1"
+    guest_exec sudo ip route replace "$2/32" via "$3" >/dev/null 2>&1 || return 1
+    guest_exec ip route get "$2" 2>/dev/null | grep -q "via $3"
+}
+
+# Two live instances must not reach each other by either path, without losing
+# guest->host. Firecracker-only; each Lima VM has its own user-mode NAT.
+# An unisolated guest boots and works exactly like an isolated one, so without
+# this a regression in either control is invisible.
+assert_guest_isolation() {
+    local inst_a="$1" inst_b="$2" ip_a ip_b gateway
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        skip "guest-to-guest isolation" "Firecracker-only (Lima VMs use per-VM NAT)"
+        return
+    fi
+
+    ip_a=$(guest_ip_of "$inst_a")
+    ip_b=$(guest_ip_of "$inst_b")
+    GUEST_INSTANCE="$inst_a"
+    gateway=$(guest_exec sh -c "ip -4 route show default | awk '{print \$3}' | head -1" \
+        2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$ip_a" || -z "$ip_b" || "$ip_a" == "$ip_b" || -z "$gateway" ]]; then
+        unset GUEST_INSTANCE
+        fail "guest-to-guest isolation" "bad addressing: a='$ip_a' b='$ip_b' gw='$gateway'"
+        return
+    fi
+
+    # Positive control first: every assertion below reads a ping failure as
+    # success, so a guest with no working ping would manufacture green
+    # negatives. Doubles as the guest->host non-regression.
+    if ! guest_exec ping -c1 -W2 "$gateway" >/dev/null 2>&1; then
+        unset GUEST_INSTANCE
+        fail "guest A still reaches the host gateway" "ping $gateway failed"
+        return
+    fi
+    pass "guest A still reaches the host gateway"
+
+    # L2: direct on-link path, blocked by the isolated bridge port.
+    if guest_exec ping -c1 -W2 "$ip_b" >/dev/null 2>&1; then
+        fail "guest A cannot ping guest B directly" "ping $ip_b from $inst_a succeeded"
+    else
+        pass "guest A cannot ping guest B directly"
+    fi
+
+    # L3: routed path, blocked by the FORWARD DROP. Both guests need the /32 —
+    # with only A's route, B answers over its connected /24 (two isolated
+    # ports), so the reply dies at L2 and the ping fails whether or not the
+    # rule exists. Attributable only under an ACCEPT policy; a DROP policy
+    # (any host that has run dockerd) would fail the ping either way.
+    if ! sudo -n iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD ACCEPT'; then
+        skip "guest A cannot reach guest B via the host gateway" \
+            "host FORWARD policy is not ACCEPT"
+    elif guest_route_via "$inst_a" "$ip_b" "$gateway" &&
+        guest_route_via "$inst_b" "$ip_a" "$gateway"; then
+        GUEST_INSTANCE="$inst_a"
+        if guest_exec ping -c1 -W2 "$ip_b" >/dev/null 2>&1; then
+            fail "guest A cannot reach guest B via the host gateway" \
+                "routed ping to $ip_b via $gateway succeeded"
+        else
+            pass "guest A cannot reach guest B via the host gateway"
+        fi
+        GUEST_INSTANCE="$inst_a"
+        guest_exec sudo ip route del "$ip_b/32" >/dev/null 2>&1 || true
+        GUEST_INSTANCE="$inst_b"
+        guest_exec sudo ip route del "$ip_a/32" >/dev/null 2>&1 || true
+    else
+        fail "guest A cannot reach guest B via the host gateway" \
+            "could not install the /32 routes the probe depends on"
+    fi
+
+    unset GUEST_INSTANCE
+}
+
 test_multi_instance() {
     echo ""
     echo "=== Phase: multi-instance ==="
@@ -3433,6 +3519,8 @@ test_multi_instance() {
     else
         fail "both instances reachable via SSH" "a='$hostname_a' b='$hostname_b'"
     fi
+
+    assert_guest_isolation "$inst_a" "$inst_b"
 
     # Clean up
     coop destroy "$inst_a" 2>/dev/null || true
