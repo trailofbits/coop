@@ -334,8 +334,9 @@ impl Drop for MountGuard {
     }
 }
 
-/// Mount the instance rootfs and rewrite the systemd-networkd config
-/// with the instance's unique guest IP.
+/// Mount the instance rootfs and rewrite its network identity: the
+/// systemd-networkd config with the instance's unique guest IP, plus
+/// `/etc/hostname` and the matching `/etc/hosts` alias.
 fn patch_guest_network(inst: &Instance) -> Result<()> {
     let rootfs_str = inst.rootfs_path().display().to_string();
     let mount_dir = inst.dir.join("rootfs-mount");
@@ -358,42 +359,136 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         .stdin_write(network_config.as_bytes())
         .context("Failed to write guest network config")?;
 
-    // Also patch hostname to include instance name and keep /etc/hosts in sync,
-    // otherwise sudo emits a resolver warning for every guest command.
-    let guest_hostname = format!("claude-{}", inst.name);
-    let hostname = format!("{guest_hostname}\n");
+    patch_guest_identity(&mount_str, &guest_hostname(inst.name.as_str()))?;
+
+    // _guard dropped here → unmount + rmdir
+    Ok(())
+}
+
+/// Debian/Ubuntu convention: the machine's own name lives on a `127.0.1.1`
+/// line, separate from `127.0.0.1 localhost`. That is the line the guest's
+/// resolver hits when looking up its own hostname.
+const GUEST_HOSTS_ALIAS_IP: &str = "127.0.1.1";
+
+/// Cap on the guest `/etc/hosts` read. The file is guest-authored — `coop
+/// commit` snapshots a mutated rootfs into an image template — so the guest
+/// must not get to choose how much the host allocates. A real hosts file is a
+/// few hundred bytes.
+const MAX_GUEST_HOSTS_BYTES: usize = 64 * 1024;
+
+/// Linux's `HOST_NAME_MAX` is 64 bytes including the terminator, so 63 usable.
+const MAX_GUEST_HOSTNAME_LEN: usize = 63;
+
+/// The guest hostname for an instance: `claude-<name>`, clamped to
+/// `HOST_NAME_MAX`.
+///
+/// Instance names allow 64 characters (`config.rs`'s `MAX_INSTANCE_NAME_LEN`),
+/// so the prefixed form reaches 71 — past the kernel's limit. systemd rejects
+/// an over-long `/etc/hostname` outright instead of truncating it, which would
+/// leave the running hostname different from the `/etc/hosts` alias written
+/// beside it and bring the resolver warning back.
+fn guest_hostname(name: &str) -> String {
+    let full = format!("claude-{name}");
+    // Instance names are validated ASCII, so this is also a char truncation;
+    // the boundary walk keeps a hypothetical non-ASCII name from panicking.
+    let mut end = MAX_GUEST_HOSTNAME_LEN.min(full.len());
+    while !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    full[..end].to_string()
+}
+
+/// Write `/etc/hostname` and the matching `/etc/hosts` alias inside a mounted
+/// guest rootfs.
+///
+/// `sudo` resolves the machine's own hostname on every invocation, so a
+/// hostname with no hosts entry makes it print `unable to resolve host` ahead
+/// of each `sudo` command in the guest. The template ships `claude-vm`
+/// (`scripts/guest/guest-config.sh`) while each instance gets its own name, so
+/// the two files have to move together.
+fn patch_guest_identity(mount_str: &str, hostname: &str) -> Result<()> {
     let hostfile = format!("{mount_str}/etc/hostname");
     Cmd::new("tee")
         .arg(&hostfile)
         .sudo()
-        .stdin_write(hostname.as_bytes())
+        .stdin_write(format!("{hostname}\n").as_bytes())
         .context("Failed to write hostname")?;
 
     let hostsfile = format!("{mount_str}/etc/hosts");
-    let hosts = Cmd::new("cat")
-        .arg(&hostsfile)
-        .sudo()
-        .capture()
-        .context("Failed to read guest hosts file")?;
-    let hosts = hosts_with_hostname(&hosts, &guest_hostname);
+    let hosts = hosts_with_hostname(&read_guest_hosts(&hostsfile), hostname);
     Cmd::new("tee")
         .arg(&hostsfile)
         .sudo()
         .stdin_write(hosts.as_bytes())
         .context("Failed to write guest hosts file")?;
 
-    // _guard dropped here → unmount + rmdir
-    Ok(())
+    // `tee` keeps an existing file's mode but creates a new one under the root
+    // session's umask, which comes from the host's PAM/`login.defs` rather than
+    // from coop: under the CIS baseline's `UMASK 027` a freshly created
+    // /etc/hosts would land unreadable to the guest's own resolver. Same trap
+    // the PID file hit (`vm.rs`'s `PID_TRAMPOLINE`).
+    Cmd::new("chmod")
+        .arg("644")
+        .arg(&hostsfile)
+        .sudo()
+        .run()
+        .context("Failed to set guest hosts file mode")
 }
 
+/// Read a guest `/etc/hosts` — bounded, and best-effort by design.
+///
+/// A committed image can carry a missing, oversized or non-UTF-8 `/etc/hosts`,
+/// because the guest is untrusted and `coop commit` preserves whatever it left
+/// behind. Such a rootfs booted fine before coop patched this file, so a
+/// cosmetic fix must not turn it into a failed `coop up`: an unusable file
+/// degrades to empty, and [`hosts_with_hostname`] synthesizes a default from
+/// there. `head -c` bounds the read one byte past the cap, so an oversized
+/// file is detected rather than silently written back truncated.
+fn read_guest_hosts(path: &str) -> String {
+    let read = Cmd::new("head")
+        .arg("-c")
+        .arg((MAX_GUEST_HOSTS_BYTES + 1).to_string())
+        .arg(path)
+        .sudo()
+        .capture();
+    match read {
+        Ok(contents) if contents.len() > MAX_GUEST_HOSTS_BYTES => {
+            tracing::warn!(
+                "Guest {path} is larger than {MAX_GUEST_HOSTS_BYTES} bytes — replacing it"
+            );
+            String::new()
+        }
+        Ok(contents) => contents,
+        Err(e) => {
+            // The error names the command and path, never the file's contents.
+            tracing::warn!("Guest {path} is unreadable ({e}) — writing a fresh one");
+            String::new()
+        }
+    }
+}
+
+/// Return `contents` with the guest's own-hostname entry set to `hostname`.
+///
+/// The first `127.0.1.1` line is replaced **whole**: any alias on it named the
+/// previous hostname (the template's `claude-vm`), so carrying those forward
+/// would keep a stale name resolvable. Later duplicates are dropped, every
+/// other line — comments, blanks, entries coop did not author — is passed
+/// through verbatim, and the entry is appended when absent. Blank input yields
+/// a minimal default file. Idempotent.
 fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
+    let entry = format!("{GUEST_HOSTS_ALIAS_IP} {hostname}\n");
+    if contents.trim().is_empty() {
+        return format!("127.0.0.1 localhost\n{entry}");
+    }
+
     let mut found = false;
     let mut output = String::new();
     for line in contents.lines() {
-        if line.split_whitespace().next() == Some("127.0.1.1") {
-            output.push_str("127.0.1.1 ");
-            output.push_str(hostname);
-            output.push('\n');
+        if line.split_whitespace().next() == Some(GUEST_HOSTS_ALIAS_IP) {
+            if found {
+                continue;
+            }
+            output.push_str(&entry);
             found = true;
         } else {
             output.push_str(line);
@@ -401,9 +496,7 @@ fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
         }
     }
     if !found {
-        output.push_str("127.0.1.1 ");
-        output.push_str(hostname);
-        output.push('\n');
+        output.push_str(&entry);
     }
     output
 }
@@ -2012,5 +2105,72 @@ mod tests {
             hosts_with_hostname("127.0.0.1 localhost\n", "claude-auditor-1"),
             "127.0.0.1 localhost\n127.0.1.1 claude-auditor-1\n"
         );
+    }
+
+    /// The documented contract: the matched line is replaced whole, so aliases
+    /// naming the *previous* hostname do not survive the rename.
+    #[test]
+    fn hosts_with_hostname_replaces_the_whole_matched_line() {
+        assert_eq!(
+            hosts_with_hostname("127.0.1.1 claude-vm claude-vm.local # old\n", "claude-a"),
+            "127.0.1.1 claude-a\n"
+        );
+    }
+
+    #[test]
+    fn hosts_with_hostname_collapses_duplicate_aliases() {
+        let existing = "127.0.1.1 claude-vm\n127.0.0.1 localhost\n127.0.1.1 claude-vm\n";
+        assert_eq!(
+            hosts_with_hostname(existing, "claude-a"),
+            "127.0.1.1 claude-a\n127.0.0.1 localhost\n"
+        );
+    }
+
+    #[test]
+    fn hosts_with_hostname_normalizes_a_missing_trailing_newline() {
+        assert_eq!(
+            hosts_with_hostname("127.0.0.1 localhost", "claude-a"),
+            "127.0.0.1 localhost\n127.0.1.1 claude-a\n"
+        );
+    }
+
+    /// The degraded path from [`read_guest_hosts`]: a missing, oversized or
+    /// non-UTF-8 guest file reads as empty, so the helper has to produce a
+    /// usable hosts file rather than one holding only the guest alias.
+    #[test]
+    fn hosts_with_hostname_synthesizes_a_default_from_blank_input() {
+        let expected = "127.0.0.1 localhost\n127.0.1.1 claude-a\n";
+        assert_eq!(hosts_with_hostname("", "claude-a"), expected);
+        assert_eq!(hosts_with_hostname(" \n\n", "claude-a"), expected);
+    }
+
+    #[test]
+    fn hosts_with_hostname_preserves_comments_and_blank_lines() {
+        let existing = "# managed by post-install\n\n10.0.0.5 registry.internal\n127.0.1.1 old\n";
+        assert_eq!(
+            hosts_with_hostname(existing, "claude-a"),
+            "# managed by post-install\n\n10.0.0.5 registry.internal\n127.0.1.1 claude-a\n"
+        );
+    }
+
+    #[test]
+    fn hosts_with_hostname_is_idempotent() {
+        let once = hosts_with_hostname("127.0.0.1 localhost\n127.0.1.1 claude-vm\n", "claude-a");
+        assert_eq!(hosts_with_hostname(&once, "claude-a"), once);
+    }
+
+    #[test]
+    fn guest_hostname_prefixes_the_instance_name() {
+        assert_eq!(guest_hostname("auditor-1"), "claude-auditor-1");
+    }
+
+    /// A 64-char instance name would yield 71 bytes, which systemd rejects
+    /// rather than truncates — leaving the running hostname out of sync with
+    /// the `/etc/hosts` entry written next to it.
+    #[test]
+    fn guest_hostname_clamps_to_host_name_max() {
+        let hostname = guest_hostname(&"n".repeat(64));
+        assert_eq!(hostname.len(), MAX_GUEST_HOSTNAME_LEN);
+        assert!(hostname.starts_with("claude-n"), "{hostname}");
     }
 }

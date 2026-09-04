@@ -1883,6 +1883,39 @@ test_sudo() {
     else
         fail "sudo can write to /root" "stderr: $(guest_stderr)"
     fi
+
+    # `sudo` resolves the machine's own hostname on every invocation, so
+    # /etc/hostname and /etc/hosts have to agree — setup writes both. Only
+    # unit-testable up to the string transform; this is the layer that can
+    # observe the two files agreeing at boot.
+    #
+    # Firecracker only: coop renames the guest there. Lima owns its own guest
+    # hostname configuration and coop does not patch it, so whether a Lima
+    # guest resolves its own name is Lima's business, not this assertion's.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        skip "guest hostname resolves" "Lima owns guest hostname configuration"
+        return
+    fi
+
+    local guest_host
+    guest_host=$(guest_exec hostname) || guest_host=""
+    if [[ -n "$guest_host" ]] && guest_exec getent hosts "$guest_host" >/dev/null; then
+        pass "guest hostname resolves ($guest_host)"
+    else
+        fail "guest hostname resolves" "hostname='$guest_host'; stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec sudo -n true; then
+        local sudo_err
+        sudo_err=$(guest_stderr)
+        if echo "$sudo_err" | grep -qi "unable to resolve host"; then
+            fail "sudo emits no resolver warning" "stderr: $sudo_err"
+        else
+            pass "sudo emits no resolver warning"
+        fi
+    else
+        fail "sudo emits no resolver warning" "sudo -n failed; stderr: $(guest_stderr)"
+    fi
 }
 
 test_network() {

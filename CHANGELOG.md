@@ -83,6 +83,18 @@
 
 ### Fixes
 
+- **The guest hostname resolves, so `sudo` stops warning** — Instance creation
+  renamed the Firecracker guest to `claude-<name>` in `/etc/hostname` but left
+  the image's `127.0.1.1 claude-vm` entry in `/etc/hosts`, so every `sudo` in
+  the guest printed `sudo: unable to resolve host claude-<name>` before running.
+  Both files are now written together at create and restore, and the guest
+  hostname is clamped to the kernel's 63-byte limit so long instance names
+  still get a resolvable name. No image rebuild is needed — the patch is
+  per-instance, and the image's own entry is what gets overwritten — but
+  `patch_guest_network` runs only on create and restore, so an existing VM
+  keeps the stale entry until `coop restore <vm> --image <image>` or a destroy
+  and recreate.
+
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases
   use a companion `codex-code-mode-host` executable, but coop installed only
   the raw `codex` binary, causing Code Mode to fail closed at startup. Image
