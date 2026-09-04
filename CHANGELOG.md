@@ -83,16 +83,13 @@
 
 ### Fixes
 
-- **Guest commands fail instead of hanging when a VM stops responding** — A
-  paused VM, a wedged sshd, or a lost TAP device left non-interactive `ssh`,
-  `scp`, and `rsync` calls blocked on a dead socket with no deadline, so
-  lifecycle commands, `coop exec`, and `coop push`/`pull` hung until
-  interrupted. Every transport now sets `BatchMode` and a connect timeout, and
-  gives up when the guest's sshd stops answering — after ~90s for guest work
-  (matching interactive sessions) or ~10s for a short readiness or capability
-  check. Bootstrap checks that ask the guest a yes/no question now tell an
-  unreachable VM apart from a missing feature, instead of advising an image
-  rebuild for a VM that is merely paused.
+- **Guest transports fail instead of hanging when a VM stops responding** — A
+  paused VM, a wedged sshd, or a lost TAP device left `ssh`, `scp`, and `rsync`
+  calls blocked on a dead socket with no deadline, so lifecycle commands,
+  `coop exec`, and `coop push`/`pull` hung until interrupted. Every transport
+  now derives from one option list that sets `BatchMode`, a connect timeout,
+  and a liveness probe, so a guest whose sshd stops answering fails after ~90s
+  — the bound interactive sessions already had.
 
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases
   use a companion `codex-code-mode-host` executable, but coop installed only

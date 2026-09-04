@@ -41,24 +41,6 @@ fn guest_term() -> String {
     }
 }
 
-/// Keepalive options for interactive sessions.
-///
-/// A paused/suspended VM or a dropped local connection leaves SSH
-/// blocked on a dead socket indefinitely. With these, SSH sends a probe
-/// every 30s and gives up after 3 unanswered probes — so an unreachable
-/// session terminates within ~90s instead of hanging. Appended rather than
-/// set in the base options because OpenSSH honors the *first* value for a
-/// repeated `-o`; the non-interactive paths get the same bound from
-/// `SshSession::command_opts`.
-fn keepalive_opts() -> [String; 4] {
-    [
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-    ]
-}
-
 /// Force a known OpenSSH escape character for emergency disconnects.
 ///
 /// OpenSSH only recognizes the escape at the start of a line, so users
@@ -70,7 +52,6 @@ fn escape_opts() -> [String; 2] {
 
 fn interactive_ssh_args(session: &SshSession, remote_cmd: String) -> Vec<String> {
     let mut args = session.ssh_opts();
-    args.extend(keepalive_opts());
     args.extend(escape_opts());
     args.extend(["-t".to_string(), session.target.addr(), remote_cmd]);
     args
@@ -135,7 +116,9 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     tracing::info!("Running (non-interactive): {remote_cmd}");
 
-    let args = session.command_args(remote_cmd);
+    let mut args = session.ssh_opts();
+    args.push(session.target.addr());
+    args.push(remote_cmd);
 
     let status = Command::new("ssh")
         .args(&args)
@@ -154,15 +137,15 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 ///
 /// Stdout and stderr from the remote command are written to the local
 /// stdout/stderr respectively. The process exits with the remote
-/// command's exit code, making this suitable for scripting and CI —
-/// which is also why it takes the bounded options: an unattended caller
-/// has no one to press Ctrl-C when the guest stops answering.
+/// command's exit code, making this suitable for scripting and CI.
 pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
     let remote_cmd = join_escaped(command);
 
     tracing::debug!("exec: {remote_cmd}");
 
-    let args = session.command_args(remote_cmd);
+    let mut args = session.ssh_opts();
+    args.push(session.target.addr());
+    args.push(remote_cmd);
 
     let output = Command::new("ssh")
         .args(&args)
@@ -202,25 +185,13 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_opts_set_interval_and_count() {
-        assert_eq!(
-            keepalive_opts(),
-            [
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-            ],
-        );
-    }
-
-    #[test]
     fn escape_opts_force_tilde_escape() {
         assert_eq!(escape_opts(), ["-e", "~"]);
     }
 
-    fn test_session() -> SshSession {
-        SshSession {
+    #[test]
+    fn interactive_args_force_escape_before_target() {
+        let session = SshSession {
             target: crate::backend::SshTarget {
                 host: crate::backend::Hostname::new("127.0.0.1")
                     .expect("test host should be valid"),
@@ -229,17 +200,11 @@ mod tests {
                 key_path: "/tmp/coop-test-key".into(),
             },
             env: crate::backend::EnvForward::default(),
-        }
-    }
+        };
 
-    #[test]
-    fn interactive_args_force_escape_before_target() {
-        let session = test_session();
-
-        // The `ServerAlive*` pair below must stay the only one in the vector:
-        // OpenSSH honors the first value of a repeated `-o`, so a keepalive
-        // added to `SshTarget::ssh_opts` would silently win over this one and
-        // cut interactive sessions at that shorter deadline instead of ~90s.
+        // The `ServerAlive*` pair comes from `SshTarget::transport_opts`, which
+        // every transport shares; this session must not add a second one, since
+        // OpenSSH honors the first value of a repeated `-o`.
         assert_eq!(
             interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
             [
@@ -247,6 +212,10 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -259,10 +228,6 @@ mod tests {
                 "/tmp/coop-test-key",
                 "-p",
                 "1",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
                 "-e",
                 "~",
                 "-t",
