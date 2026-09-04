@@ -46,8 +46,10 @@ fn guest_term() -> String {
 /// A paused/suspended VM or a dropped local connection leaves SSH
 /// blocked on a dead socket indefinitely. With these, SSH sends a probe
 /// every 30s and gives up after 3 unanswered probes — so an unreachable
-/// session terminates within ~90s instead of hanging. Scoped to
-/// interactive use; the short-lived non-interactive paths don't need it.
+/// session terminates within ~90s instead of hanging. Appended rather than
+/// set in the base options because OpenSSH honors the *first* value for a
+/// repeated `-o`; the non-interactive paths get the same bound from
+/// `SshSession::command_opts`.
 fn keepalive_opts() -> [String; 4] {
     [
         "-o".into(),
@@ -133,9 +135,7 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     tracing::info!("Running (non-interactive): {remote_cmd}");
 
-    let mut args = session.ssh_opts();
-    args.push(session.target.addr());
-    args.push(remote_cmd);
+    let args = session.command_args(remote_cmd);
 
     let status = Command::new("ssh")
         .args(&args)
@@ -154,15 +154,15 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 ///
 /// Stdout and stderr from the remote command are written to the local
 /// stdout/stderr respectively. The process exits with the remote
-/// command's exit code, making this suitable for scripting and CI.
+/// command's exit code, making this suitable for scripting and CI —
+/// which is also why it takes the bounded options: an unattended caller
+/// has no one to press Ctrl-C when the guest stops answering.
 pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
     let remote_cmd = join_escaped(command);
 
     tracing::debug!("exec: {remote_cmd}");
 
-    let mut args = session.ssh_opts();
-    args.push(session.target.addr());
-    args.push(remote_cmd);
+    let args = session.command_args(remote_cmd);
 
     let output = Command::new("ssh")
         .args(&args)
@@ -219,9 +219,8 @@ mod tests {
         assert_eq!(escape_opts(), ["-e", "~"]);
     }
 
-    #[test]
-    fn interactive_args_force_escape_before_target() {
-        let session = SshSession {
+    fn test_session() -> SshSession {
+        SshSession {
             target: crate::backend::SshTarget {
                 host: crate::backend::Hostname::new("127.0.0.1")
                     .expect("test host should be valid"),
@@ -230,8 +229,17 @@ mod tests {
                 key_path: "/tmp/coop-test-key".into(),
             },
             env: crate::backend::EnvForward::default(),
-        };
+        }
+    }
 
+    #[test]
+    fn interactive_args_force_escape_before_target() {
+        let session = test_session();
+
+        // The `ServerAlive*` pair below must stay the only one in the vector:
+        // OpenSSH honors the first value of a repeated `-o`, so a keepalive
+        // added to `SshTarget::ssh_opts` would silently win over this one and
+        // cut interactive sessions at that shorter deadline instead of ~90s.
         assert_eq!(
             interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
             [
@@ -261,33 +269,6 @@ mod tests {
                 "ubuntu@127.0.0.1",
                 "cd /workspace && 'claude' 'agents'",
             ],
-        );
-    }
-
-    #[test]
-    fn interactive_keepalive_is_not_shadowed_by_a_shorter_base_option() {
-        // OpenSSH honors the first value of a repeated `-o`, so a keepalive
-        // added to `SshTarget::ssh_opts` would silently win over this one and
-        // cut interactive sessions at that shorter deadline instead of ~90s.
-        let session = SshSession {
-            target: crate::backend::SshTarget {
-                host: crate::backend::Hostname::new("127.0.0.1")
-                    .expect("test host should be valid"),
-                port: std::num::NonZeroU16::MIN,
-                user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
-                key_path: "/tmp/coop-test-key".into(),
-            },
-            env: crate::backend::EnvForward::default(),
-        };
-
-        let args = interactive_ssh_args(&session, "cd /workspace && exec $SHELL -l".into());
-        let effective: Vec<&String> = args
-            .iter()
-            .filter(|arg| arg.starts_with("ServerAlive"))
-            .collect();
-        assert_eq!(
-            effective,
-            ["ServerAliveInterval=30", "ServerAliveCountMax=3"],
         );
     }
 

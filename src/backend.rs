@@ -299,6 +299,56 @@ pub struct SshTarget {
     pub key_path: PathBuf,
 }
 
+/// Answer to a yes/no question asked of the guest.
+///
+/// A bounded probe can fail for two unrelated reasons, and collapsing them
+/// into `false` makes coop tell the user to rebuild a perfectly good image
+/// when the VM is merely paused.
+pub enum GuestProbe {
+    /// The command ran on the guest and exited zero.
+    Yes,
+    /// The command ran on the guest and exited non-zero.
+    No,
+    /// SSH itself failed — the guest never answered.
+    Unreachable { details: String },
+}
+
+impl GuestProbe {
+    /// Collapse to yes/no, reporting an unreachable guest as an error.
+    ///
+    /// `subject` names what was being checked, so the message says the guest
+    /// stopped responding rather than making a claim about the guest image.
+    pub fn answered(self, subject: &str) -> Result<bool> {
+        match self {
+            Self::Yes => Ok(true),
+            Self::No => Ok(false),
+            Self::Unreachable { details } => bail!(
+                "The guest stopped responding while checking {subject}: {details}\n\
+                 The VM may be paused, or its sshd wedged — check `coop status`."
+            ),
+        }
+    }
+}
+
+/// One line of ssh's stderr, for an error message.
+///
+/// The bytes are guest-influenced, so control characters are stripped and
+/// the text is capped before it reaches a terminal.
+fn ssh_error_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output from ssh");
+    line.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 // ── SSH session ───────────────────────────────────────────────
 
 /// SSH operations that combine connection details with environment
@@ -337,13 +387,21 @@ impl SshTarget {
         dir.join(format!("coop-{short:08x}.sock"))
     }
 
-    /// SSH options for commands.
+    /// Options every transport shares, up to the port flag.
     ///
-    /// `BatchMode` keeps a failed key exchange from stalling on a password
-    /// prompt, and `ConnectTimeout` bounds the handshake against a guest that
-    /// accepts TCP but never answers. Session-liveness probes deliberately
-    /// live in [`Self::command_opts`] instead — see the note there.
-    pub fn ssh_opts(&self) -> Vec<String> {
+    /// `ssh`, `scp`, and rsync's `-e` command all take these; only the port
+    /// flag differs (`-p` vs `-P`), so all three derive from here instead of
+    /// hand-copying a list that then drifts.
+    ///
+    /// `BatchMode` refuses password and passphrase prompts, so a key the
+    /// guest rejects fails immediately instead of blocking on stdin where no
+    /// interactive user exists (`coop up` in CI). coop's own key is
+    /// passphrase-less by design, so this is defense in depth against a
+    /// user's `ssh_config` rather than a live failure mode. `ConnectTimeout`
+    /// bounds the TCP connect and banner exchange — not the key exchange and
+    /// authentication that follow, which only [`Self::keepalive_opts`] can
+    /// bound, and then only once the client loop starts.
+    fn transport_opts(&self) -> Vec<String> {
         vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -359,40 +417,70 @@ impl SshTarget {
             "LogLevel=ERROR".into(),
             "-i".into(),
             self.key_path.display().to_string(),
-            "-p".into(),
-            self.port.to_string(),
         ]
     }
 
-    /// SSH options for a one-shot command, bounded against a wedged guest.
+    /// Liveness probes that abort a command when the guest stops answering.
     ///
-    /// A guest that stops answering — paused VM, hung sshd, lost TAP —
-    /// leaves a plain `ssh` blocked on a dead socket with no deadline.
-    /// These probes abort the command after ~10s of silence.
+    /// `ServerAlive*` is transport-level and answered by sshd itself, so a
+    /// command that prints nothing for an hour is never at risk — only a
+    /// guest whose sshd cannot answer for `interval * count` seconds.
+    fn keepalive_opts(interval_secs: u32, count: u32) -> [String; 4] {
+        [
+            "-o".into(),
+            format!("ServerAliveInterval={interval_secs}"),
+            "-o".into(),
+            format!("ServerAliveCountMax={count}"),
+        ]
+    }
+
+    /// SSH options for commands.
     ///
-    /// This must not move into [`Self::ssh_opts`]: OpenSSH honors the *first*
-    /// value for a repeated `-o`, so a base value would win over the longer
+    /// Deliberately carries no `ServerAlive*`: OpenSSH honors the *first*
+    /// value for a repeated `-o`, so a value here would win over the longer
     /// intervals that interactive sessions (`ssh::keepalive_opts`) and
-    /// background tunnels (`port_forward`, `proxy`) append deliberately.
-    fn command_opts(&self) -> Vec<String> {
-        let mut opts = self.ssh_opts();
-        opts.extend([
-            "-o".into(),
-            "ServerAliveInterval=5".into(),
-            "-o".into(),
-            "ServerAliveCountMax=2".into(),
-        ]);
+    /// background tunnels (`port_forward`, `proxy`) append after it. Callers
+    /// that want a bound take [`Self::command_opts`] or [`Self::probe_opts`].
+    pub fn ssh_opts(&self) -> Vec<String> {
+        let mut opts = self.transport_opts();
+        opts.extend(["-p".into(), self.port.to_string()]);
         opts
     }
 
-    /// One-shot command options with connection multiplexing.
+    /// SSH options for guest work of arbitrary length, bounded against a
+    /// wedged guest.
+    ///
+    /// A guest that stops answering — paused VM, hung sshd, lost TAP —
+    /// leaves a plain `ssh` blocked on a dead socket with no deadline. These
+    /// calls carry installs, clones, and user hooks under the guest's heaviest
+    /// memory and CPU pressure, so they get the same ~90s of tolerance as an
+    /// interactive session rather than a bound tight enough for an unscheduled
+    /// sshd to trip mid-install.
+    pub(crate) fn command_opts(&self) -> Vec<String> {
+        let mut opts = self.ssh_opts();
+        opts.extend(Self::keepalive_opts(30, 3));
+        opts
+    }
+
+    /// SSH options for a short yes/no probe (~10s bound).
+    ///
+    /// Probes ask a question that is only useful promptly and are retried by
+    /// their callers (`wait_until_ready`, the Lima boot loop), so they give up
+    /// an order of magnitude sooner than [`Self::command_opts`].
+    fn probe_opts(&self) -> Vec<String> {
+        let mut opts = self.ssh_opts();
+        opts.extend(Self::keepalive_opts(5, 2));
+        opts
+    }
+
+    /// Probe options with connection multiplexing.
     ///
     /// Only used during boot probing (`wait_until_ready`) where rapid
     /// retries benefit from a shared master connection. The master is
     /// torn down after probing to avoid poisoning later connections
     /// that need `SendEnv` for environment forwarding.
     fn ssh_opts_mux(&self) -> Vec<String> {
-        let mut opts = self.command_opts();
+        let mut opts = self.probe_opts();
         opts.extend([
             "-o".into(),
             "ControlMaster=auto".into(),
@@ -405,22 +493,16 @@ impl SshTarget {
     }
 
     /// SCP options (uses -P for port instead of -p).
+    ///
+    /// Bounded like [`Self::command_opts`]: config and secret staging runs
+    /// after `wait_until_ready`, so a guest that wedges in between would
+    /// otherwise hang `coop up` with no deadline.
     pub fn scp_opts(&self) -> Vec<String> {
-        vec![
-            "-q".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "IdentitiesOnly=yes".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-i".into(),
-            self.key_path.display().to_string(),
-            "-P".into(),
-            self.port.to_string(),
-        ]
+        let mut opts = vec!["-q".to_string()];
+        opts.extend(self.transport_opts());
+        opts.extend(["-P".into(), self.port.to_string()]);
+        opts.extend(Self::keepalive_opts(30, 3));
+        opts
     }
 
     /// user@host address string.
@@ -428,12 +510,30 @@ impl SshTarget {
         format!("{}@{}", self.user, self.host)
     }
 
+    /// Full argv for a one-shot `ssh <opts> <addr> <cmd>` command.
+    ///
+    /// The single seam every non-interactive caller goes through, so the
+    /// bounds in [`Self::command_opts`] cannot be lost by a caller that
+    /// assembles argv from [`Self::ssh_opts`] instead.
+    pub(crate) fn command_args(&self, cmd: String) -> Vec<String> {
+        let mut args = self.command_opts();
+        args.push(self.addr());
+        args.push(cmd);
+        args
+    }
+
+    /// Full argv for a short yes/no probe. See [`Self::probe_opts`].
+    fn probe_args(&self, cmd: String) -> Vec<String> {
+        let mut args = self.probe_opts();
+        args.push(self.addr());
+        args.push(cmd);
+        args
+    }
+
     /// Run a command on the guest via SSH.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.command_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
+        let args = self.command_args(cmd.clone());
 
         let status = Command::new("ssh")
             .args(&args)
@@ -453,28 +553,46 @@ impl SshTarget {
     /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
     pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: Vec<u8>) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.command_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
         Cmd::new("ssh")
-            .args(args)
+            .args(self.command_args(cmd.clone()))
             .stdin_input(stdin)
             .run()
             .with_context(|| format!("SSH command failed: {cmd}"))
     }
 
-    /// Check if a command succeeds on the guest.
-    pub fn exec_ok(&self, command: RemoteCommand) -> bool {
-        let mut args = self.command_opts();
-        args.push(self.addr());
-        args.push(command.into_string());
+    /// Ask the guest a yes/no question, keeping "never answered" distinct.
+    ///
+    /// The probe is bounded, so "no" and "the guest is gone" are different
+    /// answers that a caller must not conflate — see [`GuestProbe`].
+    pub fn probe(&self, command: RemoteCommand) -> GuestProbe {
+        let args = self.probe_args(command.into_string());
 
-        Command::new("ssh")
+        let output = Command::new("ssh")
             .args(&args)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => GuestProbe::Yes,
+            // 255 is ssh's own failure code; the probe commands coop sends
+            // (`test`, `grep -q`, `command -v`) never exit with it themselves.
+            Ok(out) if out.status.code() == Some(255) => GuestProbe::Unreachable {
+                details: ssh_error_detail(&out.stderr),
+            },
+            Ok(_) => GuestProbe::No,
+            Err(e) => GuestProbe::Unreachable {
+                details: e.to_string(),
+            },
+        }
+    }
+
+    /// Check if a command succeeds on the guest.
+    ///
+    /// `false` folds "the command exited non-zero" together with "the guest
+    /// never answered". Use [`Self::probe`] wherever that difference changes
+    /// what the user should be told.
+    pub fn exec_ok(&self, command: RemoteCommand) -> bool {
+        matches!(self.probe(command), GuestProbe::Yes)
     }
 
     /// Like `exec_ok` but uses connection multiplexing for fast retries.
@@ -559,29 +677,34 @@ impl SshTarget {
     }
 
     /// SSH command string for rsync's -e flag.
+    ///
+    /// Derived from [`Self::command_opts`] so a transfer inherits the same
+    /// bounds as any other long-running guest command. rsync splits this
+    /// string on whitespace, so it stays unquoted — a key path containing
+    /// spaces has never worked here.
     pub fn rsync_ssh_cmd(&self) -> String {
-        format!(
-            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o IdentitiesOnly=yes -o LogLevel=ERROR -i {} -p {}",
-            self.key_path.display(),
-            self.port,
-        )
+        format!("ssh {}", self.command_opts().join(" "))
     }
 
     /// Run a command on the guest via SSH and capture stdout.
+    ///
+    /// Callers read short state files and `--version` strings, so this takes
+    /// the probe bound rather than the command one.
     pub fn capture(&self, cmd: &str) -> Result<String> {
-        let mut args = self.command_opts();
-        args.push(self.addr());
-        args.push(cmd.to_string());
+        let args = self.probe_args(cmd.to_string());
 
         let output = Command::new("ssh")
             .args(&args)
-            .stderr(std::process::Stdio::null())
             .output()
             .context("Failed to run SSH command")?;
 
         if !output.status.success() {
-            bail!("SSH command failed: {cmd}");
+            // Keep ssh's own diagnosis ("Timeout, server not responding") —
+            // on an unresponsive guest it is the only evidence of the cause.
+            bail!(
+                "SSH command failed: {cmd}: {}",
+                ssh_error_detail(&output.stderr)
+            );
         }
         String::from_utf8(output.stdout).context("SSH output is not valid UTF-8")
     }
@@ -625,18 +748,24 @@ impl SshSession {
     }
 
     /// [`SshTarget::command_opts`] with environment variable forwarding.
-    fn command_opts(&self) -> Vec<String> {
+    pub(crate) fn command_opts(&self) -> Vec<String> {
         let mut opts = self.target.command_opts();
         opts.extend(self.env.send_env_opts());
         opts
     }
 
+    /// [`SshTarget::command_args`] with environment variable forwarding.
+    pub(crate) fn command_args(&self, cmd: String) -> Vec<String> {
+        let mut args = self.command_opts();
+        args.push(self.target.addr());
+        args.push(cmd);
+        args
+    }
+
     /// Run a command on the guest via SSH with env forwarding.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.command_opts();
-        args.push(self.target.addr());
-        args.push(cmd.clone());
+        let args = self.command_args(cmd.clone());
 
         let status = Command::new("ssh")
             .args(&args)
@@ -1570,7 +1699,8 @@ fn bootstrap_claude(
         if needs_claude_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))
+                .probe(RemoteCommand::new().literal("test -x ").arg(&claude_bin))
+                .answered("the guest Claude Code CLI")?
         {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
@@ -1694,11 +1824,15 @@ fn bootstrap_codex(
             ensure_codex_account_guest_support(&session.target)?;
         }
 
-        if !session.target.exec_ok(
-            RemoteCommand::new()
-                .literal("test -x ")
-                .arg(crate::guest::codex_bin()),
-        ) {
+        if !session
+            .target
+            .probe(
+                RemoteCommand::new()
+                    .literal("test -x ")
+                    .arg(crate::guest::codex_bin()),
+            )
+            .answered("the guest Codex CLI")?
+        {
             // The caller's guard tears down the proxy started above on this error.
             bail!("{}", codex_missing_guest_cli_message());
         }
@@ -1846,10 +1980,12 @@ pub fn codex_keyring_not_configured_message() -> &'static str {
 /// *packages* are installed, and agent bootstrap only runs on start/up, so
 /// enabling the mode against a running VM reaches exactly this gap.
 pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
-    let configured = target.exec_ok(RemoteCommand::new().literal(
-        "grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*\"keyring\"' \
-         ~/.codex/config.toml",
-    ));
+    let configured = target
+        .probe(RemoteCommand::new().literal(
+            "grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*\"keyring\"' \
+             ~/.codex/config.toml",
+        ))
+        .answered("the guest Codex keyring setting")?;
     if configured {
         return Ok(());
     }
@@ -1857,14 +1993,16 @@ pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
 }
 
 pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
-    let supported = target.exec_ok(
-        RemoteCommand::new()
-            .literal("test -x ")
-            .arg(crate::guest::codex_account_bin())
-            .literal(" && command -v dbus-run-session >/dev/null 2>&1")
-            .literal(" && command -v gnome-keyring-daemon >/dev/null 2>&1")
-            .literal(" && command -v secret-tool >/dev/null 2>&1"),
-    );
+    let supported = target
+        .probe(
+            RemoteCommand::new()
+                .literal("test -x ")
+                .arg(crate::guest::codex_account_bin())
+                .literal(" && command -v dbus-run-session >/dev/null 2>&1")
+                .literal(" && command -v gnome-keyring-daemon >/dev/null 2>&1")
+                .literal(" && command -v secret-tool >/dev/null 2>&1"),
+        )
+        .answered("guest Secret Service support")?;
     if supported {
         return Ok(());
     }
@@ -3304,16 +3442,35 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 /dev/vda1          20480  3200     16000  17% /
 ";
 
-    #[test]
-    fn ordinary_ssh_commands_fail_bounded_when_a_guest_stops_responding() {
-        let target = SshTarget {
+    /// Whether `args` carries exactly the given `ServerAlive*` pair.
+    ///
+    /// Exact, not "contains": a second pair anywhere in the vector would be
+    /// shadowed by the first, which is the failure mode worth catching.
+    fn has_keepalive(args: &[String], interval: u32, count: u32) -> bool {
+        let present: Vec<&str> = args
+            .iter()
+            .filter(|a| a.starts_with("ServerAlive"))
+            .map(String::as_str)
+            .collect();
+        present
+            == [
+                format!("ServerAliveInterval={interval}"),
+                format!("ServerAliveCountMax={count}"),
+            ]
+    }
+
+    fn ssh_test_target() -> SshTarget {
+        SshTarget {
             host: Hostname::new("192.0.2.1").unwrap(),
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
-        };
-        let base = target.ssh_opts();
-        let command = target.command_opts();
+        }
+    }
+
+    #[test]
+    fn base_ssh_opts_bound_the_handshake_but_leave_keepalives_to_callers() {
+        let base = ssh_test_target().ssh_opts();
 
         // Handshake bounds are safe for every caller, so they belong in the base.
         for required in ["BatchMode=yes", "ConnectTimeout=10"] {
@@ -3330,12 +3487,114 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             !base.iter().any(|option| option.starts_with("ServerAlive")),
             "ssh_opts must leave ServerAlive* unset: {base:?}",
         );
-        for required in ["ServerAliveInterval=5", "ServerAliveCountMax=2"] {
+    }
+
+    #[test]
+    fn guest_work_is_bounded_at_the_interactive_budget_and_probes_ten_times_sooner() {
+        let target = ssh_test_target();
+
+        assert!(
+            has_keepalive(&target.command_opts(), 30, 3),
+            "command_opts must match the interactive ~90s budget: {:?}",
+            target.command_opts(),
+        );
+        assert!(
+            has_keepalive(&target.probe_opts(), 5, 2),
+            "probe_opts must give up ~10x sooner: {:?}",
+            target.probe_opts(),
+        );
+    }
+
+    #[test]
+    fn every_bounded_transport_carries_its_keepalive() {
+        let target = ssh_test_target();
+        let session = SshSession {
+            target: target.clone(),
+            env: EnvForward::default(),
+        };
+
+        // Each of these assembles its own argv, so each can lose the bound
+        // independently — the reason they are pinned one by one.
+        assert!(has_keepalive(&target.command_args("true".into()), 30, 3));
+        assert!(has_keepalive(&target.probe_args("true".into()), 5, 2));
+        assert!(has_keepalive(&target.ssh_opts_mux(), 5, 2));
+        assert!(has_keepalive(&target.scp_opts(), 30, 3));
+        assert!(has_keepalive(&session.command_opts(), 30, 3));
+        assert!(has_keepalive(&session.command_args("true".into()), 30, 3));
+
+        let rsync: Vec<String> = target
+            .rsync_ssh_cmd()
+            .split(' ')
+            .map(str::to_string)
+            .collect();
+        assert!(has_keepalive(&rsync, 30, 3), "rsync -e lost its keepalive");
+    }
+
+    #[test]
+    fn ssh_scp_and_rsync_share_one_option_set() {
+        // Three hand-copied lists is how the last hardening change reached
+        // only one of them; they now derive from `transport_opts`.
+        let target = ssh_test_target();
+        let scp = target.scp_opts();
+        let rsync = target.rsync_ssh_cmd();
+        for shared in [
+            "BatchMode=yes",
+            "ConnectTimeout=10",
+            "StrictHostKeyChecking=no",
+            "UserKnownHostsFile=/dev/null",
+            "IdentitiesOnly=yes",
+            "LogLevel=ERROR",
+        ] {
             assert!(
-                command.iter().any(|option| option == required),
-                "{required} missing from command_opts",
+                target.ssh_opts().iter().any(|o| o == shared),
+                "{shared} missing from ssh_opts",
+            );
+            assert!(
+                scp.iter().any(|o| o == shared),
+                "{shared} missing from scp_opts"
+            );
+            assert!(
+                rsync.contains(shared),
+                "{shared} missing from rsync_ssh_cmd"
             );
         }
+        // Only the port flag differs between ssh and scp.
+        assert!(scp.windows(2).any(|w| w == ["-P", "22"]));
+        assert!(target.ssh_opts().windows(2).any(|w| w == ["-p", "22"]));
+    }
+
+    #[test]
+    fn command_args_end_with_the_target_and_command() {
+        let args = ssh_test_target().command_args("echo hi".into());
+        assert_eq!(&args[args.len() - 2..], ["ubuntu@192.0.2.1", "echo hi"]);
+    }
+
+    #[test]
+    fn unreachable_guest_is_reported_as_unreachable_not_as_a_missing_feature() {
+        let err = GuestProbe::Unreachable {
+            details: "Timeout, server 192.0.2.1 not responding.".into(),
+        }
+        .answered("the guest Claude Code CLI")
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("stopped responding"), "{err}");
+        assert!(err.contains("Timeout, server"), "{err}");
+        assert!(!err.contains("rebuild"), "must not blame the image: {err}");
+
+        assert!(GuestProbe::Yes.answered("x").unwrap());
+        assert!(!GuestProbe::No.answered("x").unwrap());
+    }
+
+    #[test]
+    fn ssh_error_detail_keeps_the_last_line_and_strips_control_bytes() {
+        assert_eq!(
+            ssh_error_detail(b"Warning: something\nTimeout, server not responding.\n"),
+            "Timeout, server not responding.",
+        );
+        // Guest-influenced bytes must not carry an escape sequence to the terminal.
+        assert_eq!(ssh_error_detail(b"boom\x1b[31m\x07"), "boom[31m");
+        assert_eq!(ssh_error_detail(b"   \n"), "no output from ssh");
+        assert_eq!(ssh_error_detail(&vec![b'x'; 500]).len(), 200);
     }
 
     #[test]

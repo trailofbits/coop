@@ -198,9 +198,7 @@ pub fn tar_pipe_transfer_to(
         .context("Failed to get tar stderr")?;
 
     let extract_cmd = tar_extract_cmd(guest_path);
-    let mut ssh_args = target.ssh_opts();
-    ssh_args.push(target.addr());
-    ssh_args.push(extract_cmd.into_string());
+    let ssh_args = target.command_args(extract_cmd.into_string());
 
     let mut ssh_child = Command::new("ssh")
         .args(&ssh_args)
@@ -460,6 +458,18 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
     )
 }
 
+/// Whether the guest has rsync, failing loudly when it never answers.
+///
+/// The probe is bounded, so an unresponsive guest also answers "no" — and the
+/// tar-pipe fallback that answer selects has no better chance of reaching it.
+/// Reporting the real cause here beats a misleading "rsync not available on
+/// guest" followed by a second failure on the fallback.
+fn guest_has_rsync(target: &SshTarget) -> Result<bool> {
+    target
+        .probe(RemoteCommand::new().literal("which rsync"))
+        .answered("whether the guest has rsync")
+}
+
 /// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
 ///
 /// Takes a `RunningInstance` so the caller's proof of liveness is
@@ -489,7 +499,7 @@ pub fn push(
         state.guest_path
     );
 
-    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+    if guest_has_rsync(target)? {
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
@@ -528,7 +538,7 @@ pub fn pull(
         dest_dir.display()
     );
 
-    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+    if guest_has_rsync(target)? {
         rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
@@ -571,7 +581,7 @@ pub fn sync_mount_contents(
 
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
-        if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+        if guest_has_rsync(target)? {
             rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
@@ -858,10 +868,7 @@ fn tar_pipe_pull(
     exclude_git: bool,
 ) -> Result<()> {
     let remote_cmd = tar_pull_cmd(guest_path, exclude_git).into_string();
-
-    let mut ssh_args = target.ssh_opts();
-    ssh_args.push(target.addr());
-    ssh_args.push(remote_cmd);
+    let ssh_args = target.command_args(remote_cmd);
 
     let mut ssh_child = Command::new("ssh")
         .args(&ssh_args)
@@ -995,9 +1002,7 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
           fi",
         );
 
-    let mut args = target.ssh_opts();
-    args.push(target.addr());
-    args.push(check_cmd.into_string());
+    let args = target.command_args(check_cmd.into_string());
 
     let output = Command::new("ssh")
         .args(&args)

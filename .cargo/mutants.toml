@@ -113,6 +113,9 @@ exclude_re = [
   "\\blaunch_editor\\b",
   "\\brsync_push\\b",
   "\\brsync_pull\\b",
+  # SSH probe for guest rsync; the transport choice it feeds is only
+  # observable against a real VM (tests/integration.sh push/pull phases).
+  "\\bguest_has_rsync\\b",
   "\\bcheck_guest_dirty\\b",
   "\\bcheck_local_dirty\\b",
   "\\batomic_write\\b",
