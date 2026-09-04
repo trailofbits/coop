@@ -83,6 +83,20 @@
 
 ### Fixes
 
+- **Firecracker guests can no longer reach each other by IP** — Instances on the
+  same host share the `br0` bridge and a single subnet, so any guest could reach
+  any other guest's SSH and forwarded ports. coop now marks every TAP as an
+  isolated bridge port and inserts a `FORWARD -i br0 -o br0 -j DROP` rule; both are
+  needed, since the bridge flag alone leaves a guest able to route around it via
+  the host's bridge address. Guest→host and guest→internet are unaffected. A
+  host that cannot apply the flag fails the VM start instead of booting an
+  unisolated guest; this needs Linux ≥ 4.18 and iproute2 ≥ 4.19. **Restart any running VMs after
+  upgrading** — isolation applies per start, and because the kernel requires
+  both ports to be isolated, one pre-upgrade VM leaves the whole bridge
+  unisolated. This blocks reachability, not impersonation; see
+  [`docs/trust-model.md`](docs/trust-model.md) for the residuals. macOS is
+  unaffected — Lima gives each guest its own user-mode NAT.
+
 - **Install Codex's complete runtime package** (#442) — Recent Codex releases
   use a companion `codex-code-mode-host` executable, but coop installed only
   the raw `codex` binary, causing Code Mode to fail closed at startup. Image

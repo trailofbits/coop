@@ -98,8 +98,15 @@ The network is configured as follows:
 - A Linux bridge (`br0`) is created if it does not already exist, with the configured host IP (default `172.16.0.1/24`).
 - IP forwarding is enabled via `sysctl`.
 - iptables NAT masquerade and forwarding rules route guest traffic through the host's default network interface. The interface is auto-detected from the default route, or set explicitly via `network.host_iface` in the config.
-- Each instance's TAP device is created, attached to the bridge, and brought up.
+- A `FORWARD -i br0 -o br0 -j DROP` rule is inserted at the head of the chain.
+- Each instance's TAP device is created, attached to the bridge, marked as an isolated bridge port, and brought up.
 - Guest IPs are assigned statically: `172.16.0.{index + 2}`. Instance 0 gets `172.16.0.2`.
+
+**Instances cannot reach each other by IP.** Two controls enforce that and both are required: the isolated bridge-port flag blocks the direct L2 path, and the `FORWARD` rule blocks the L3 path a guest could otherwise take by routing through the host's bridge address. Each guest still reaches the host and the internet. The flag is read back after being set, so a host that cannot apply it fails the VM start rather than booting an unisolated guest; this needs Linux ≥ 4.18 and iproute2 ≥ 4.19.
+
+Isolation is applied per start. Because the kernel drops a frame only when both ports are isolated, a VM still running from before the upgrade leaves the *whole bridge* unisolated until it is stopped and started — not just itself.
+
+[`docs/trust-model.md`](trust-model.md) carries the full invariant and its known residuals (ARP/IP impersonation, IPv6, firewall reloads).
 
 On teardown, the TAP device is removed. If no TAP devices remain on the bridge, the bridge and all associated iptables rules are also removed.
 
@@ -113,7 +120,7 @@ The `network` section in `config.toml` controls Firecracker networking:
 | `subnet_mask` | `/24` | CIDR subnet mask for the bridge network |
 | `host_iface` | `auto` | Host interface for NAT. `auto` detects the default route interface. Set explicitly if auto-detection fails. |
 
-These settings are ignored on macOS. Lima handles its own networking.
+These settings are ignored on macOS. Lima handles its own networking. coop's generated Lima templates declare no `networks:` stanza, so each macOS guest gets its own user-mode NAT: instances are isolated from each other by construction there, with no shared bridge and nothing to enforce.
 
 ### Resize (disk, memory, vCPUs)
 

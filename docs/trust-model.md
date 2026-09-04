@@ -154,6 +154,54 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   TAP, enables `ip_forward`, and adds a `MASQUERADE` + `FORWARD` ruleset so the
   guest reaches the internet through the host's default interface. A change
   that widens guest egress or adds inbound reachability is a finding.
+- **Guest VMs cannot reach each other by IP.** All Firecracker guests share
+  `br0` and a single subnet, so this is enforced, not structural, and it takes
+  **two** complementary controls — removing either one re-opens the path:
+  1. Every TAP is an isolated bridge port (`bridge link set … isolated on`),
+     which stops the bridge forwarding frames between two guest ports. This is
+     the only control that covers the L2 path, because bridged frames reach the
+     `FORWARD` chain only when `br_netfilter` is loaded.
+  2. An `iptables -I FORWARD 1 -i br0 -o br0 -j DROP` rule, which stops a
+     routed guest→guest packet. Port isolation cannot cover this path: a frame
+     addressed to the bridge is *local delivery*, not port-to-port forwarding,
+     so the isolated flag never applies, and `ip_forward` would otherwise send
+     it back out `br0` from the bridge device — which has no isolated source
+     port either. Without the rule this falls through to the host's `FORWARD`
+     policy, `ACCEPT` on a stock host.
+
+  Both are asserted on every `setup_tap` and fail closed. The rule is
+  idempotent because `ensure_guest_isolation_rule` probes with `iptables -C`
+  first; it is asserted per call rather than in `ensure_bridge` because that
+  returns early on a pre-existing bridge. The bridge flag is read back after
+  being set — a kernel older than 4.18 caps the bridge-port attribute policy
+  below `IFLA_BRPORT_ISOLATED` and silently drops it, so `bridge` exits 0 on a
+  port that is not isolated. Requires Linux ≥ 4.18 and iproute2 ≥ 4.19.
+
+  **Known residuals**, in scope for a follow-up, not closed here:
+  - *Isolation is pairwise.* The kernel drops a frame only when both ports are
+    isolated, so one non-isolated member of `br0` re-opens L2 for every guest.
+    A VM still running from before the upgrade therefore leaves the whole
+    bridge unisolated, not just itself, until it is restarted.
+  - *A guest can still impersonate a peer.* Neither control governs ARP or the
+    guest's own addressing, and coop reaches guests by IP with host-key
+    checking deliberately disabled — so a connection meant for a peer could
+    land on an impostor along with its `SendEnv` payload.
+  - *IPv6 and firewall reloads.* Only `iptables` is touched, and any
+    `iptables-restore` (`firewall-cmd --reload`, `ufw reload`) discards the
+    rule until the next `coop up` re-asserts it.
+  - *A pre-existing `br0`.* `ensure_bridge` adopts a bridge it did not create
+    without inspecting its members or installing its other rules; on such a
+    host the DROP also applies to that bridge's traffic.
+
+  **Accepted by design:** guests *can* reach the host — that path carries the
+  local-model gateway and the credential proxy's `ssh -R` tunnel. A change that
+  drops either control, or that stops asserting them per start, is a finding.
+
+  On Lima this holds structurally instead: the generated templates declare no
+  `networks:` stanza, so each guest gets its own per-instance gvisor usernet
+  stack (not Apple's shared-segment `VZNATNetworkDeviceAttachment`) and has no
+  L2 neighbor to reach. Adding a `networks:` stanza would put guests on a
+  shared segment and void this.
 - `rewrite_host_url` rewrites a loopback local-model endpoint to the
   guest-visible gateway address so the guest can reach a model server running
   on the host; non-loopback URLs pass through unchanged.

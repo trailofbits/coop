@@ -1,11 +1,16 @@
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
 use crate::config::{HostInterface, Instance, NetworkConfig};
 
 const BRIDGE_NAME: &str = "br0";
+
+/// Match spec for the rule that drops routed guest-to-guest traffic. Shared by
+/// the `-C` probe, the `-I` insert, and the `-D` teardown so the three cannot
+/// drift — a teardown that misses by one argument leaks the rule.
+const GUEST_ISOLATION_SPEC: [&str; 6] = ["-i", BRIDGE_NAME, "-o", BRIDGE_NAME, "-j", "DROP"];
 
 /// Rewrite a host-visible endpoint URL into one reachable from inside the
 /// guest.
@@ -49,6 +54,9 @@ pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let tap = inst.tap_device();
 
     ensure_bridge(cfg, &host_iface)?;
+    // Outside ensure_bridge, which returns early on a pre-existing bridge —
+    // one left by a crashed teardown must still get the rule.
+    ensure_guest_isolation_rule()?;
 
     tracing::info!("Setting up TAP device {tap} on bridge {BRIDGE_NAME}");
 
@@ -70,16 +78,10 @@ pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
         .sudo()
         .run()
         .context("Failed to add TAP to bridge")?;
-    // The Linux bridge forwards guest-to-guest frames at L2. Those frames do
-    // not reliably traverse the host's iptables FORWARD chain, so firewall
-    // rules alone cannot establish VM isolation. Mark every TAP as an
-    // isolated bridge port: isolated ports may talk to the non-isolated host
-    // bridge port, but never to one another.
-    Cmd::new("bridge")
-        .args(["link", "set", "dev", &tap, "isolated", "on"])
-        .sudo()
-        .run()
-        .context("Failed to isolate TAP from peer guest ports")?;
+    // The L2 half: the bridge never forwards between two isolated ports. Set
+    // before the TAP goes up, so the port is never live and unisolated. The
+    // routed path is closed separately, in ensure_guest_isolation_rule.
+    isolate_tap_port(&tap)?;
     Cmd::new("ip")
         .args(["link", "set", &tap, "up"])
         .sudo()
@@ -118,6 +120,70 @@ pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
 pub fn teardown_all(cfg: &NetworkConfig) {
     let host_iface = resolve_host_iface(&cfg.host_iface).unwrap_or_else(|_| "eth0".into());
     teardown_bridge(&host_iface);
+}
+
+// ── Guest-to-guest isolation ──────────────────────────────────
+
+/// Apply the L2 half to one TAP and confirm it took effect.
+fn isolate_tap_port(tap: &str) -> Result<()> {
+    Cmd::new("bridge")
+        .args(["link", "set", "dev", tap, "isolated", "on"])
+        .sudo()
+        .run()
+        .context("Failed to isolate TAP from peer guest ports")?;
+    let flags = Cmd::new("bridge")
+        .args(["-d", "link", "show", "dev", tap])
+        .sudo()
+        .capture()
+        .with_context(|| format!("Failed to read back bridge port flags for {tap}"))?;
+    if !port_is_isolated(&flags) {
+        bail!(
+            "Bridge port {tap} did not accept the isolated flag, so peer guest VMs would be \
+             reachable from this one. Guest-to-guest isolation needs Linux >= 4.18 and \
+             iproute2 >= 4.19."
+        );
+    }
+    Ok(())
+}
+
+/// Whether `bridge -d link show dev <tap>` output reports the port isolated.
+///
+/// The readback exists because the set can succeed while doing nothing:
+/// `IFLA_BRPORT_ISOLATED` is attribute 33, and a kernel below 4.18 caps the
+/// bridge-port policy at 32 and silently drops out-of-range attributes, so
+/// `bridge` exits 0 on a port that is not isolated. `-d` is required — the
+/// flag is printed only in the detailed section.
+fn port_is_isolated(flags: &str) -> bool {
+    flags.contains("isolated on")
+}
+
+/// The L3 half: drop guest-to-guest traffic the host would otherwise route.
+///
+/// Port isolation governs only port-to-port forwarding. A frame a guest
+/// addresses to the bridge is local delivery, so the flag never applies, and
+/// `ip_forward` then sends it back out `br0` from the bridge device — which
+/// has no isolated source port either. Nothing else in the ruleset matches
+/// that, so without this it falls through to the FORWARD policy, ACCEPT on a
+/// stock host.
+///
+/// Inserted at the head so it cannot lose to a pre-existing permissive
+/// `-A FORWARD -j ACCEPT` from libvirt or another tool.
+fn ensure_guest_isolation_rule() -> Result<()> {
+    let present = Cmd::new("iptables")
+        .args(["-C", "FORWARD"])
+        .args(GUEST_ISOLATION_SPEC)
+        .sudo()
+        .capture()
+        .is_ok();
+    if !present {
+        Cmd::new("iptables")
+            .args(["-I", "FORWARD", "1"])
+            .args(GUEST_ISOLATION_SPEC)
+            .sudo()
+            .run()
+            .context("Failed to deny inter-guest routing across the bridge")?;
+    }
+    Ok(())
 }
 
 // ── Bridge management ─────────────────────────────────────────
@@ -209,6 +275,14 @@ fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str) -> Result<()> {
 fn teardown_bridge(host_iface: &str) {
     tracing::info!("Tearing down bridge {BRIDGE_NAME}");
 
+    if let Err(e) = Cmd::new("iptables")
+        .args(["-D", "FORWARD"])
+        .args(GUEST_ISOLATION_SPEC)
+        .sudo()
+        .run()
+    {
+        tracing::debug!("Failed to remove guest isolation rule (non-fatal): {e}");
+    }
     if let Err(e) = Cmd::new("iptables")
         .args([
             "-t",
@@ -388,6 +462,25 @@ mod tests {
             rewrite("https://localhost:9999/v1/chat?a=b", "10.0.0.1"),
             "https://10.0.0.1:9999/v1/chat?a=b"
         );
+    }
+
+    #[test]
+    fn port_is_isolated_reads_the_detailed_flag() {
+        // Real `bridge -d link show dev tap0` shapes: the flag is printed as
+        // `isolated on` / `isolated off`, and is absent entirely on a kernel
+        // that does not know the attribute — the silent-no-op case.
+        let isolated = "6: tap0: <BROADCAST,MULTICAST> mtu 1500 master br0 state disabled \
+             priority 32 cost 100 \n    hairpin off guard off root_block off fastleave off \
+             learning on flood on mcast_flood on neigh_suppress off vlan_tunnel off isolated on ";
+        let not_isolated = isolated.replace("isolated on", "isolated off");
+        let no_attribute = "6: tap0: <BROADCAST,MULTICAST> mtu 1500 master br0 state disabled \
+             priority 32 cost 100 \n    hairpin off guard off root_block off fastleave off \
+             learning on flood on mcast_flood on neigh_suppress off vlan_tunnel off ";
+
+        assert!(port_is_isolated(isolated));
+        assert!(!port_is_isolated(&not_isolated));
+        assert!(!port_is_isolated(no_attribute));
+        assert!(!port_is_isolated(""));
     }
 
     #[test]
