@@ -127,6 +127,11 @@ Security and billing guardrails in this mode:
   --env`.
 - `auth.json` from the host Codex config directory is not copied into the
   guest. Account tokens are stored in the guest OS credential store instead.
+- `CODEX_HOME` cannot redirect Codex around keyring storage in this mode. When
+  coop's managed config selects the keyring, the guest wrapper refuses any
+  explicitly set `CODEX_HOME`, preventing Codex from writing account
+  credentials to an unmanaged `auth.json`; unset `CODEX_HOME` when using
+  ChatGPT account auth.
 - `[proxy.openai]` is rejected with `auth = "chatgpt"`, because the proxy path
   uses an OpenAI API key and would switch Codex back to API billing.
 
@@ -147,14 +152,15 @@ disk across `coop stop` / `coop start`, so it will not pick up the new guest
 packages. Swap the rebuilt image in without losing the instance:
 
 ```bash
-coop stop my-project
-coop restore my-project --image default
-coop start my-project
+coop restore my-project --image default --reprovision
 ```
 
-[`restore`](commands.md#restore) keeps the instance's name, index, IP, and
-workspace association. Destroying and recreating the VM also works, but
-discards its guest disk.
+[`--reprovision`](commands.md#--reprovision) keeps the instance's name, index,
+IP, and workspace association, accepts a running instance, and leaves it
+running. It provisions the replaced disk as a first boot, so `/workspace` is
+restored and the agent plugins are reinstalled — a plain `restore` here would
+leave both empty, because the base image carries neither. Destroying and
+recreating the VM also works, but discards its guest disk.
 
 ### GitHub auth
 
