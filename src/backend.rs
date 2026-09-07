@@ -1810,8 +1810,8 @@ pub fn codex_keyring_not_configured_message() -> &'static str {
 /// enabling the mode against a running VM reaches exactly this gap.
 pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
     let configured = target.exec_ok(RemoteCommand::new().literal(
-        "grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*\"keyring\"' \
-         ~/.codex/config.toml",
+        "IFS= read -r first_line < ~/.codex/config.toml \
+         && [ \"$first_line\" = 'cli_auth_credentials_store = \"keyring\"' ]",
     ));
     if configured {
         return Ok(());
@@ -2771,18 +2771,11 @@ fn stage_codex_files(
         let TomlValue::Table(root) = &mut config else {
             bail!("Codex {CODEX_CONFIG_FILE} must deserialize to a TOML table");
         };
-        if auth.uses_chatgpt_account() {
-            root.insert(
-                "cli_auth_credentials_store".to_string(),
-                TomlValue::String("keyring".to_string()),
-            );
-        } else {
-            // Explicit, not incidental: the host's own config.toml may set
-            // this (the user may use keyring storage on the host too), and
-            // copying it into an `api_key` guest would make the wrapper
-            // demand a keyring password that mode does not need.
-            root.remove("cli_auth_credentials_store");
-        }
+        // This setting is coop-owned in both modes. ChatGPT mode prepends the
+        // managed value during serialization below; API-key mode leaves it
+        // absent so a host setting cannot make the guest wrapper demand an
+        // unnecessary keyring password.
+        root.remove("cli_auth_credentials_store");
     }
 
     // The Codex CLI records installed marketplaces under `[marketplaces.*]`
@@ -2824,12 +2817,15 @@ fn stage_codex_files(
     );
 
     if should_write_config {
-        std::fs::write(
-            staging.path().join(CODEX_CONFIG_FILE),
-            toml::to_string(&config)
-                .with_context(|| format!("Failed to serialize Codex {CODEX_CONFIG_FILE}"))?,
-        )
-        .with_context(|| format!("Failed to stage Codex {CODEX_CONFIG_FILE}"))?;
+        let serialized = toml::to_string(&config)
+            .with_context(|| format!("Failed to serialize Codex {CODEX_CONFIG_FILE}"))?;
+        let serialized = if auth.uses_chatgpt_account() {
+            format!("cli_auth_credentials_store = \"keyring\"\n{serialized}")
+        } else {
+            serialized
+        };
+        std::fs::write(staging.path().join(CODEX_CONFIG_FILE), serialized)
+            .with_context(|| format!("Failed to stage Codex {CODEX_CONFIG_FILE}"))?;
     }
 
     Ok(staging)
@@ -4040,9 +4036,15 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
-    fn stage_codex_files_chatgpt_mode_writes_config_without_source() {
+    fn stage_codex_files_chatgpt_mode_writes_keyring_setting_first() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("config.toml"),
+            "approval_policy = \"never\"\ninstructions = \"\"\"\n[not-a-table]\n\"\"\"\n",
+        )
+        .unwrap();
         let staging = stage_codex_files(
-            None,
+            Some(src.path()),
             &std::collections::HashMap::new(),
             None,
             false,
@@ -4054,7 +4056,16 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         .unwrap();
 
         let config = std::fs::read_to_string(staging.path().join("config.toml")).unwrap();
-        assert_eq!(config.trim(), "cli_auth_credentials_store = \"keyring\"");
+        assert!(
+            config.starts_with("cli_auth_credentials_store = \"keyring\"\n"),
+            "the shell guards require the coop-managed setting first: {config:?}",
+        );
+        let parsed = toml::from_str::<TomlValue>(&config).unwrap();
+        assert_eq!(
+            parsed["cli_auth_credentials_store"].as_str(),
+            Some("keyring"),
+        );
+        assert_eq!(parsed["instructions"].as_str(), Some("[not-a-table]\n"));
     }
 
     #[test]

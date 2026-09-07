@@ -840,6 +840,101 @@ test_ssh_config() {
     fi
 }
 
+# Exercises the host-side half of `coop editor` against a live VM. Stub editor
+# CLIs make the phase hermetic (no GUI is opened) while still pinning the argv
+# contract, Zed URL encoding, the legacy `vscode` alias, and SSH-config setup.
+test_editor() {
+    echo ""
+    echo "=== Phase: editor launch ==="
+
+    local editor_dir="$tmpdir/editor-bin"
+    local editor_log="$tmpdir/editor-argv"
+    local marker="# coop START coop-$INSTANCE"
+    local ssh_cfg="$HOME/.ssh/config"
+    mkdir -p "$editor_dir"
+
+    cat >"$editor_dir/zed" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" > "$COOP_TEST_EDITOR_LOG"
+STUB
+    cat >"$editor_dir/code" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" > "$COOP_TEST_EDITOR_LOG"
+STUB
+    chmod +x "$editor_dir/zed" "$editor_dir/code"
+
+    local zed_project='/workspace/editor path#part%done?'
+    if COOP_TEST_EDITOR_LOG="$editor_log" PATH="$editor_dir:$PATH" \
+        coop editor "$INSTANCE" --editor zed --project "$zed_project"; then
+        pass "editor --editor zed exits 0"
+    else
+        fail "editor --editor zed exits 0" "stderr: $HARNESS_ERR"
+        coop editor "$INSTANCE" --clean >/dev/null 2>&1 || true
+        return
+    fi
+
+    local expected_zed="ssh://coop-$INSTANCE/workspace/editor%20path%23part%25done%3F"
+    if [[ "$(cat "$editor_log" 2>/dev/null)" == "$expected_zed" ]]; then
+        pass "editor passes Zed an encoded SSH URL"
+    else
+        fail "editor passes Zed an encoded SSH URL" \
+            "expected=$expected_zed got=$(cat "$editor_log" 2>/dev/null)"
+    fi
+
+    if grep -qF "$marker" "$ssh_cfg" 2>/dev/null; then
+        pass "editor installs the shared SSH alias"
+    else
+        fail "editor installs the shared SSH alias" "no marker in $ssh_cfg"
+    fi
+
+    : >"$editor_log"
+    if COOP_TEST_EDITOR_LOG="$editor_log" PATH="$editor_dir:$PATH" \
+        coop editor "$INSTANCE" --project /workspace/auto; then
+        pass "editor auto-detection exits 0"
+    else
+        fail "editor auto-detection exits 0" "stderr: $HARNESS_ERR"
+    fi
+
+    local editor_argv
+    editor_argv=$(cat "$editor_log" 2>/dev/null)
+    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/auto' ]]; then
+        pass "editor auto-detection tries VS Code first"
+    else
+        fail "editor auto-detection tries VS Code first" "got: $editor_argv"
+    fi
+
+    # `vscode` remains a public compatibility alias for `editor`. Pin the real
+    # dispatch path, not only clap parsing, and check the VS Code Remote-SSH
+    # argv shape expected by the extension.
+    : >"$editor_log"
+    if COOP_TEST_EDITOR_LOG="$editor_log" PATH="$editor_dir:$PATH" \
+        coop vscode "$INSTANCE" --editor code --project /workspace/legacy; then
+        pass "vscode compatibility alias exits 0"
+    else
+        fail "vscode compatibility alias exits 0" "stderr: $HARNESS_ERR"
+    fi
+
+    editor_argv=$(cat "$editor_log" 2>/dev/null)
+    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/legacy' ]]; then
+        pass "vscode alias passes the VS Code Remote-SSH arguments"
+    else
+        fail "vscode alias passes the VS Code Remote-SSH arguments" "got: $editor_argv"
+    fi
+
+    # Leave the SSH config in the same clean state this phase inherited from
+    # test_ssh_config, so later restart tests do not accidentally cover alias
+    # refresh merely because this test ran.
+    if coop editor "$INSTANCE" --clean; then
+        if grep -qF "$marker" "$ssh_cfg" 2>/dev/null; then
+            fail "editor --clean removes its SSH block" "marker still present"
+        else
+            pass "editor --clean removes its SSH block"
+        fi
+    else
+        fail "editor --clean exits 0" "stderr: $HARNESS_ERR"
+    fi
+}
+
 test_exec() {
     echo ""
     echo "=== Phase: exec ==="
@@ -1185,32 +1280,57 @@ test_codex_account_auth_support() {
         fi
     done
 
-    # Default config is auth = "api_key", so the wrapper must be a transparent
-    # passthrough: no D-Bus session, no keyring, no password prompt. A hang
-    # here would mean it tried to unlock a keyring it should have skipped.
+    # Give the probe an explicit managed config with no credential-store
+    # setting. The wrapper checks $HOME/.codex/config.toml before consulting an
+    # explicit $CODEX_HOME, so both locations must be isolated for this test.
+    local account_probe_root="/tmp/coop-codex-account-probe"
+    local account_probe_home="$account_probe_root/home"
+    local account_probe_codex_home="$account_probe_root/codex-home"
+    if ! guest_exec sh -c '
+        set -eu
+        rm -rf "$1"
+        mkdir -p "$1/home/.codex" "$1/codex-home"
+        : > "$1/home/.codex/config.toml"
+        : > "$1/codex-home/config.toml"
+    ' sh "$account_probe_root"; then
+        fail "prepare codex-account probe config" "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
+        return
+    fi
+
+    # Without keyring mode the wrapper must be a transparent passthrough: no
+    # D-Bus session, keyring, or password prompt. A hang here would mean it
+    # tried to unlock a keyring it should have skipped.
     local version
-    if version=$(coop_exec /usr/local/bin/codex-account --version); then
+    if version=$(coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
+        /usr/local/bin/codex-account --version); then
         pass "codex-account passes through to codex without keyring mode ($version)"
     else
         fail "codex-account passes through to codex without keyring mode" \
             "stderr: $(guest_stderr)"
     fi
 
-    # Drive the keyring branch without reconfiguring the VM: the wrapper reads
-    # $CODEX_HOME, so a scratch config selects keyring mode for one call. This
-    # is the only place the `cli_auth_credentials_store` grep, the D-Bus
-    # re-exec, the tool guards and the TTY guard actually execute — the
-    # assertions above all run on the passthrough branch.
+    # Select keyring mode explicitly in the scratch CODEX_HOME while retaining
+    # the isolated managed config. This is the only place the
+    # `cli_auth_credentials_store` check, the D-Bus re-exec, the tool guards and
+    # the TTY guard actually execute — the assertions above all run on the
+    # passthrough branch.
     #
     # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
     # a password prompt. A hang here is the failure this asserts against.
-    guest_exec sh -c 'mkdir -p /tmp/coop-keyring-probe \
-        && printf "cli_auth_credentials_store = \"keyring\"\n" \
-            > /tmp/coop-keyring-probe/config.toml'
+    if ! guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
+        > "$1/config.toml"' sh "$account_probe_codex_home"; then
+        fail "prepare codex-account keyring probe config" \
+            "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
+        return
+    fi
 
     # </dev/null so the TTY guard is deterministic: run interactively, stdin
     # could otherwise be a terminal and the wrapper would prompt and block.
-    if coop_exec env CODEX_HOME=/tmp/coop-keyring-probe \
+    if coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
@@ -1221,7 +1341,136 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    guest_exec rm -rf /tmp/coop-keyring-probe
+    if ! guest_exec rm -rf "$account_probe_root"; then
+        fail "clean up codex-account probe config" "stderr: $(guest_stderr)"
+    fi
+}
+
+# The wrapper/package checks above use a scratch CODEX_HOME, but they do not
+# prove that `[codex] auth = "chatgpt"` drives the real lifecycle wiring. This
+# phase restarts the primary VM in account mode, checks the guest boundary, and
+# restores the default configuration for all later phases.
+test_codex_chatgpt_mode() {
+    echo ""
+    echo "=== Phase: configured Codex ChatGPT auth ==="
+
+    local cfg_dir="$tmpdir/codex-chatgpt"
+    local cfg_file="$cfg_dir/config.toml"
+    local host_openai="sk-host-openai-chatgpt-sentinel-LEAK"
+    local overlay_openai="sk-runtime-openai-chatgpt-sentinel-LEAK"
+    mkdir -p "$cfg_dir"
+    cat >"$cfg_file" <<'CFGEOF'
+[claude]
+github = "off"
+
+[codex]
+auth = "chatgpt"
+CFGEOF
+
+    chatgpt() {
+        local rc=0
+        HARNESS_OUT=$(OPENAI_API_KEY="$host_openai" \
+            "$BINARY" --config "$cfg_file" "$@" 2>"$tmpdir/stderr") || rc=$?
+        HARNESS_ERR=$(cat "$tmpdir/stderr")
+        return $rc
+    }
+    chatgpt_exec() {
+        RUST_LOG=off OPENAI_API_KEY="$host_openai" \
+            "$BINARY" --config "$cfg_file" exec "$INSTANCE" -- "$@" \
+            2>"$tmpdir/guest_stderr"
+    }
+
+    # Seed the credential file that account mode promises never to stage. A
+    # passing removal assertion therefore proves active cleanup, even on a host
+    # that has no ~/.codex/auth.json of its own.
+    if ! guest_exec sh -c 'mkdir -p ~/.codex && printf stale > ~/.codex/auth.json'; then
+        fail "seed stale Codex auth.json" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if chatgpt start "$INSTANCE" --env "OPENAI_API_KEY=$overlay_openai" \
+        --env "COOP_TEST_CHATGPT_PASSTHROUGH=kept"; then
+        pass "start with codex auth=chatgpt exits 0"
+    else
+        fail "start with codex auth=chatgpt exits 0" "stderr: $HARNESS_ERR"
+        coop start "$INSTANCE" || true
+        return
+    fi
+
+    local codex_cfg
+    if codex_cfg=$(chatgpt_exec cat ./.codex/config.toml) \
+        && echo "$codex_cfg" | grep -q 'cli_auth_credentials_store = "keyring"'; then
+        pass "chatgpt mode selects the guest keyring credential store"
+    else
+        fail "chatgpt mode selects the guest keyring credential store" \
+            "config=$codex_cfg stderr: $(guest_stderr)"
+    fi
+
+    # coop manages only ~/.codex. A session-level CODEX_HOME must not bypass the
+    # managed setting and let Codex write a plaintext refresh token into the
+    # alternate directory (which could be inside /workspace and copied back to
+    # the host). Give the alternate config the same first-line keyring marker
+    # so its contents cannot bypass the guard.
+    local alternate_codex_home="/tmp/coop-codex-home-bypass-probe"
+    chatgpt_exec sh -c 'mkdir -p "$1" && printf "%s\n" \
+        "cli_auth_credentials_store = \"keyring\"" > "$1/config.toml"' \
+        sh "$alternate_codex_home"
+    if chatgpt_exec env CODEX_HOME="$alternate_codex_home" \
+        /usr/local/bin/codex-account --version; then
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "wrapper honored CODEX_HOME instead of coop's managed config"
+    elif guest_stderr | grep -q "unset CODEX_HOME"; then
+        pass "chatgpt mode rejects an unmanaged CODEX_HOME"
+    else
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+    chatgpt_exec rm -rf "$alternate_codex_home"
+
+    # Positive witness for the supported path: the CODEX_HOME guard must not
+    # reject a normal ChatGPT launch. This non-TTY call should get past that
+    # guard and reach the existing keyring prompt check.
+    if chatgpt_exec env -u CODEX_HOME \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "expected the later non-TTY keyring refusal, but Codex ran"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "chatgpt mode accepts an unset CODEX_HOME"
+    else
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    local guest_env
+    guest_env=$(chatgpt_exec env || true)
+    if echo "$guest_env" | grep -q '^OPENAI_API_KEY=' \
+        || echo "$guest_env" | grep -qF "$host_openai" \
+        || echo "$guest_env" | grep -qF "$overlay_openai"; then
+        fail "chatgpt mode suppresses OPENAI_API_KEY" "raw host key reached the guest"
+    else
+        pass "chatgpt mode suppresses OPENAI_API_KEY"
+    fi
+    if echo "$guest_env" | grep -q '^COOP_TEST_CHATGPT_PASSTHROUGH=kept$'; then
+        pass "chatgpt mode preserves non-secret runtime env"
+    else
+        fail "chatgpt mode preserves non-secret runtime env" \
+            "positive-control env entry is missing"
+    fi
+
+    if chatgpt_exec test -e ./.codex/auth.json; then
+        fail "chatgpt mode removes Codex auth.json" "stale auth.json remains in the guest"
+    else
+        pass "chatgpt mode removes Codex auth.json"
+    fi
+
+    chatgpt stop "$INSTANCE" || true
+    if coop start "$INSTANCE"; then
+        pass "restart after chatgpt-mode test restores default config"
+    else
+        fail "restart after chatgpt-mode test restores default config" \
+            "stderr: $HARNESS_ERR"
+    fi
 }
 
 test_codex_sandbox_bypass() {
@@ -4924,6 +5173,49 @@ CFGEOF
         return
     fi
 
+    # Pin the user-facing status contract against the same running instance.
+    # Literal credentials are deliberately used above, so this also proves the
+    # command redacts them rather than leaking either value to stdout.
+    if px proxy status --vm "$inst_name"; then
+        if echo "$HARNESS_OUT" | grep -q 'anthropic.*default.*bearer.*redacted' \
+            && echo "$HARNESS_OUT" | grep -q 'openai.*default.*bearer.*redacted' \
+            && ! echo "$HARNESS_OUT" | grep -qF "$anthropic_secret" \
+            && ! echo "$HARNESS_OUT" | grep -qF "$openai_secret"; then
+            pass "proxy status shows redacted provider defaults"
+        else
+            fail "proxy status shows redacted provider defaults" "out: $HARNESS_OUT"
+        fi
+    else
+        fail "proxy status --vm exits 0" "stderr: $HARNESS_ERR"
+    fi
+
+    # Exercise the persisted per-VM representation used by `proxy setup --vm`.
+    # The wizard itself is intentionally interactive; seeding proxy.json keeps
+    # the suite noninteractive while testing load, precedence, status, and
+    # redaction through the public command.
+    local override_secret="sk-ant-coop-it-override-FAKE-do-not-use"
+    local proxy_state="$HOME/.coop/instances/$inst_name/proxy.json"
+    cat >"$proxy_state" <<STATEEOF
+{
+  "anthropic": {
+    "credential": "$override_secret",
+    "auth": "api_key"
+  }
+}
+STATEEOF
+    chmod 600 "$proxy_state"
+    if px proxy status --vm "$inst_name"; then
+        if echo "$HARNESS_OUT" | grep -q 'anthropic.*override.*api_key.*redacted' \
+            && echo "$HARNESS_OUT" | grep -q 'openai.*default.*bearer.*redacted' \
+            && ! echo "$HARNESS_OUT" | grep -qF "$override_secret"; then
+            pass "proxy status resolves and redacts a per-VM override"
+        else
+            fail "proxy status resolves and redacts a per-VM override" "out: $HARNESS_OUT"
+        fi
+    else
+        fail "proxy status reads a per-VM override" "stderr: $HARNESS_ERR"
+    fi
+
     # ── Codex (OpenAI) guest wiring ──
     local codex_cfg
     if codex_cfg=$(px_exec cat ./.codex/config.toml); then
@@ -4990,31 +5282,47 @@ CFGEOF
     # ── The proxy is reachable on host loopback and enforces the gate ──
     # The proxy binds 127.0.0.1:<port> on the host and is reverse-tunnelled into
     # the guest, so the host exercises the same listener. A request without the
-    # token is refused locally ("capability token"). With the token, an
-    # allowlisted operation is forwarded upstream (which fails closed at the
-    # real host — 502 with no egress, or an upstream auth error — but never the
-    # local refusal), so the presence/absence of the "capability" refusal
-    # distinguishes the two without needing a working upstream.
+    # token is refused locally with 401. With the token, an allowlisted
+    # operation reaches the real host, yielding 502 with no egress or an
+    # upstream auth error. Status alone is ambiguous because upstream auth can
+    # also return 401/403, so the fixed local bodies identify gate refusals.
     local oai_port cap_token
     oai_port=$(echo "$codex_cfg" | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
     cap_token=$(echo "$guest_env" | grep '^COOP_LOCAL_API_KEY=' | cut -d= -f2- || true)
     if [[ -n "$oai_port" ]]; then
-        local no_tok tok response_body
+        local no_tok tok no_tok_status tok_status response_body
+        local no_tok_body_file="$tmpdir/proxy-no-token-body"
+        local tok_body_file="$tmpdir/proxy-token-body"
         response_body='{"model":"gpt-4.1","input":"ping"}'
-        no_tok=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
-            -H "Content-Type: application/json" --data "$response_body" || true)
-        tok=$(curl -s --max-time 15 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
+        no_tok_status=$(curl -s --max-time 10 -X POST \
+            "http://127.0.0.1:$oai_port/v1/responses" \
+            -H "Content-Type: application/json" --data "$response_body" \
+            --output "$no_tok_body_file" --write-out '%{http_code}' || true)
+        no_tok=$(cat "$no_tok_body_file" 2>/dev/null || true)
+        tok_status=$(curl -s --max-time 15 -X POST \
+            "http://127.0.0.1:$oai_port/v1/responses" \
             -H "Authorization: Bearer $cap_token" -H "Content-Type: application/json" \
-            --data "$response_body" || true)
-        if echo "$no_tok" | grep -qi "capability"; then
+            --data "$response_body" --output "$tok_body_file" \
+            --write-out '%{http_code}' || true)
+        tok=$(cat "$tok_body_file" 2>/dev/null || true)
+        if [[ "$no_tok_status" == "401" ]] \
+            && echo "$no_tok" | grep -Fqi "missing or invalid coop-proxy capability token"; then
             pass "openai proxy refuses a request missing the capability token"
         else
-            fail "openai proxy refuses a request missing the capability token" "body: $no_tok"
+            fail "openai proxy refuses a request missing the capability token" \
+                "status: $no_tok_status body: $no_tok"
         fi
-        if echo "$tok" | grep -qi "capability"; then
-            fail "valid capability token forwards an allowed operation" "still refused: $tok"
-        else
+        if echo "$tok" | grep -Fqi "missing or invalid coop-proxy capability token"; then
+            fail "valid capability token forwards an allowed operation" \
+                "local capability refusal (status $tok_status): $tok"
+        elif echo "$tok" | grep -Fqi "operation is not allowed by coop-proxy"; then
+            fail "valid capability token forwards an allowed operation" \
+                "local operation-policy refusal (status $tok_status): $tok"
+        elif [[ "$tok_status" =~ ^[1-5][0-9][0-9]$ ]]; then
             pass "valid capability token forwards an allowed operation"
+        else
+            fail "valid capability token forwards an allowed operation" \
+                "no HTTP response (status: $tok_status body: $tok)"
         fi
     else
         fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"
@@ -5888,12 +6196,14 @@ main() {
     test_shell_connectivity
     test_ssh_alias
     test_ssh_config
+    test_editor
     test_exec
     test_claude_bin_path
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path
     test_codex_account_auth_support
+    test_codex_chatgpt_mode
     test_codex_sandbox_bypass
     test_agent_update
     test_github_token_forwarding

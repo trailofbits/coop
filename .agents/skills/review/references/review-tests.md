@@ -12,7 +12,7 @@ Only flag issues **introduced or materially changed by the diff**. Cross-referen
 ## coop's test layers
 
 - **Unit tests** live in the library crate (`src/lib.rs` target) as `#[cfg(test)] mod tests`. All logic is unit-testable there; `main.rs` is a thin shim.
-- **Integration tests** (`tests/integration.sh`, driven by `tests/run-integration.sh`) exercise the full VM lifecycle (setup → up → status → shell → guest env → docker → stop → destroy) on **both** backends (Firecracker/Linux and Lima/macOS). CI additionally runs `tests/integration-update.sh` and `tests/integration-uninstall.sh`.
+- **Integration tests** (`tests/integration.sh`, driven by `tests/run-integration.sh`) exercise the full VM lifecycle (setup → up → status → shell → guest env → docker → stop → destroy) on **both** backends (Firecracker/Linux and Lima/macOS). CI additionally runs `tests/integration-install.sh`, `tests/integration-update.sh`, and `tests/integration-uninstall.sh`.
 - **Mutation testing** scope is curated in `.cargo/mutants.toml`; the pure-logic helpers are kept in scope and expected to have unit tests that kill their mutants (AGENTS.md details this).
 
 ## What to flag

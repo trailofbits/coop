@@ -22,11 +22,16 @@ die() {
 # credentials from auth.json, where the D-Bus/keyring session is pure overhead
 # (and its password prompt is an outright regression). Gating on the config the
 # guest actually has lets every Codex entry point route through this wrapper.
+keyring_mode_in() {
+    local config=$1
+    local first_line=""
+    [ -r "$config" ] \
+        && IFS= read -r first_line < "$config" \
+        && [ "$first_line" = 'cli_auth_credentials_store = "keyring"' ]
+}
+
 keyring_mode() {
-    [ -r "$CODEX_CONFIG" ] \
-        && grep -Eq \
-            '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*"keyring"' \
-            "$CODEX_CONFIG"
+    keyring_mode_in "$CODEX_CONFIG"
 }
 
 keyring_exists() {
@@ -114,6 +119,17 @@ unlock_keyring() {
 
 if [ ! -x "$CODEX_BIN" ]; then
     die "$CODEX_BIN is missing; rebuild the coop image"
+fi
+
+# coop stages and maintains Codex state only in ~/.codex. In ChatGPT account
+# mode, an explicit CODEX_HOME could put auth.json outside coop's cleanup path
+# (including under /workspace, which is pulled back to the host). Refuse the
+# unsupported override before inspecting its config. coop writes the managed
+# credential-store key as the first line, so a same-named nested key cannot
+# trigger this guard.
+if [ -n "${CODEX_HOME:-}" ] \
+    && keyring_mode_in "$HOME/.codex/config.toml"; then
+    die "CODEX_HOME is set, but coop manages ~/.codex and it selects the keyring credential store; unset CODEX_HOME for Codex ChatGPT account auth"
 fi
 
 if ! keyring_mode; then

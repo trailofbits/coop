@@ -7,7 +7,7 @@ three are manual, run when a change warrants them.
 
 ## Integration tests
 
-Two scripts:
+VM integration uses two scripts:
 
 - `tests/integration.sh` — the test suite. Runs locally, requires `--binary`.
 - `tests/run-integration.sh` — the runner. Builds, deploys (if remote), and
@@ -34,8 +34,9 @@ You can also run the suite directly if you already have a binary:
 ```
 
 The test exercises the full VM lifecycle (setup → start → status → shell →
-guest environment → docker → stop → destroy). CI additionally runs
-`tests/integration-update.sh` and `tests/integration-uninstall.sh`.
+guest environment → docker → stop → destroy). CI additionally runs the fast,
+host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
+`tests/integration-uninstall.sh` suites.
 
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.

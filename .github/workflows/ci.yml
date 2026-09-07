@@ -47,6 +47,9 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+      - name: Integration test — installer provenance
+        run: ./tests/integration-install.sh
+
       - name: Integration test — coop update
         run: ./tests/integration-update.sh
 
