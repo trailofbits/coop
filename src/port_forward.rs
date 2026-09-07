@@ -172,8 +172,8 @@ pub fn spawn_ssh_forwards(
     // ExitOnForwardFailure=yes: refuse to background if a -L fails to
     //     bind — turns races with `check_host_port_collisions` into
     //     loud errors rather than silently lost forwards.
-    // ServerAliveInterval=30: detect dead VMs so the forwarder doesn't
-    //     hang around eating descriptors after a hard reboot.
+    // The `ServerAlive*` bound that keeps this tunnel from outliving a dead
+    // VM comes from `SshTarget::transport_opts` via `ssh_opts` above.
     args.extend([
         "-f".into(),
         "-N".into(),
@@ -186,8 +186,6 @@ pub fn spawn_ssh_forwards(
         "ControlPersist=yes".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
     ]);
 
     let mut spec_log: Vec<String> = Vec::new();
