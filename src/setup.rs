@@ -416,40 +416,66 @@ fn patch_guest_identity(mount_str: &str, hostname: &str) -> Result<()> {
         .stdin_write(format!("{hostname}\n").as_bytes())
         .context("Failed to write hostname")?;
 
-    let hostsfile = format!("{mount_str}/etc/hosts");
-    let hosts = hosts_with_hostname(&read_guest_hosts(&hostsfile), hostname);
-    Cmd::new("tee")
-        .arg(&hostsfile)
-        .sudo()
-        .stdin_write(hosts.as_bytes())
-        .context("Failed to write guest hosts file")?;
-
-    // `tee` preserves an existing file's mode but creates a new one under
-    // root's umask, which comes from the host's PAM/`login.defs`, not coop — a
-    // hardened umask hides /etc/hosts from the guest's resolver. Reachable only
-    // if the guest deleted the file before `coop commit`. Cf. `PID_TRAMPOLINE`.
-    Cmd::new("chmod")
-        .arg("644")
-        .arg(&hostsfile)
+    Cmd::new(std::env::current_exe()?)
+        .arg("__patch-guest-hosts")
+        .arg(mount_str)
+        .arg(hostname)
         .sudo()
         .run()
-        .context("Failed to set guest hosts file mode")
+        .context("Failed to patch guest hosts file")
 }
 
-/// Read a guest `/etc/hosts`, bounded one byte past the cap so that an
-/// oversized file is detected rather than written back truncated.
-///
-/// The file is guest-authored (see `docs/trust-model.md`), so the read is
-/// best-effort: a cosmetic fix must not fail `coop up` on a rootfs that used
-/// to boot. [`bound_guest_hosts`] holds that decision.
-fn read_guest_hosts(path: &str) -> String {
-    let read = Cmd::new("head")
-        .arg("-c")
-        .arg((MAX_GUEST_HOSTS_BYTES + 1).to_string())
-        .arg(path)
-        .sudo()
-        .capture();
-    bound_guest_hosts(read)
+/// Privileged hosts-file update. Keep directory descriptors alive throughout:
+/// `/proc/self/fd` anchors each operation to the opened directory, even if a
+/// directory entry is replaced. Never follow guest-authored symlinks.
+#[cfg(target_os = "linux")]
+pub(crate) fn patch_guest_hosts(mount: &Path, hostname: &str) -> Result<()> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let open_directory = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let root = open_directory(mount).context("Failed to open mounted rootfs")?;
+    let etc = open_directory(&PathBuf::from(format!(
+        "/proc/self/fd/{}/etc",
+        root.as_raw_fd()
+    )))
+    .context("Guest /etc must be a real directory")?;
+    let etc_path = PathBuf::from(format!("/proc/self/fd/{}", etc.as_raw_fd()));
+    let hosts_path = etc_path.join("hosts");
+
+    let read = (|| -> Result<String> {
+        // O_PATH obtains a descriptor without opening a FIFO or device for IO.
+        let entry = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(&hosts_path)?;
+        if !entry.metadata()?.is_file() {
+            bail!("Guest hosts entry is not a regular file");
+        }
+        // Reopen the checked descriptor, never the guest directory entry.
+        let file = fs::File::open(format!("/proc/self/fd/{}", entry.as_raw_fd()))?;
+        let mut contents = String::new();
+        file.take((MAX_GUEST_HOSTS_BYTES + 1) as u64)
+            .read_to_string(&mut contents)?;
+        Ok(contents)
+    })();
+    let hosts = hosts_with_hostname(&bound_guest_hosts(read), hostname);
+    let mut replacement = tempfile::NamedTempFile::new_in(&etc_path)?;
+    replacement.write_all(hosts.as_bytes())?;
+    replacement
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))?;
+    // Drop a failed replacement while the directory descriptor is still open.
+    replacement
+        .persist(&hosts_path)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Decide what a bounded read of the guest hosts file yields: the contents, or
@@ -463,7 +489,7 @@ fn bound_guest_hosts(read: Result<String>) -> String {
         }
         Ok(contents) => contents,
         Err(e) => {
-            // `capture`'s error text is the command line, not the file's bytes.
+            // IO errors contain no guest file contents.
             tracing::warn!("Guest hosts file is unreadable ({e}) — writing a fresh one");
             String::new()
         }
@@ -2156,6 +2182,105 @@ mod tests {
         assert_eq!(hosts_with_hostname(&once, "claude-a"), once);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_hosts_replaces_regular_file_without_modifying_hardlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc");
+        fs::create_dir(&etc).unwrap();
+        let original = "127.0.0.1 localhost\n127.0.1.1 old\n10.0.0.5 registry\n";
+        fs::write(etc.join("hosts"), original).unwrap();
+        fs::set_permissions(etc.join("hosts"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(etc.join("hosts"), root.path().join("original")).unwrap();
+
+        patch_guest_hosts(root.path(), "claude-a").unwrap();
+        assert_eq!(
+            fs::read_to_string(etc.join("hosts")).unwrap(),
+            "127.0.0.1 localhost\n127.0.1.1 claude-a\n10.0.0.5 registry\n"
+        );
+        assert_eq!(
+            fs::metadata(etc.join("hosts"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("original")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("original"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(&etc).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_hosts_replaces_unusable_entries_with_defaults() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["missing", "symlink", "fifo", "oversized", "non-utf8"] {
+            let root = tempfile::tempdir().unwrap();
+            let etc = root.path().join("etc");
+            fs::create_dir(&etc).unwrap();
+            let hosts = etc.join("hosts");
+            let other = root.path().join("other");
+            fs::write(&other, "10.0.0.1 other\n").unwrap();
+            match kind {
+                "symlink" => symlink(&other, &hosts).unwrap(),
+                "fifo" => assert!(
+                    Command::new("mkfifo")
+                        .arg(&hosts)
+                        .status()
+                        .unwrap()
+                        .success()
+                ),
+                "oversized" => fs::write(&hosts, vec![b'a'; MAX_GUEST_HOSTS_BYTES + 1]).unwrap(),
+                "non-utf8" => fs::write(&hosts, [0xff]).unwrap(),
+                _ => {}
+            }
+            patch_guest_hosts(root.path(), "claude-a").unwrap();
+            assert!(fs::symlink_metadata(&hosts).unwrap().is_file(), "{kind}");
+            assert_eq!(
+                fs::read_to_string(&hosts).unwrap(),
+                "127.0.0.1 localhost\n127.0.1.1 claude-a\n",
+                "{kind}"
+            );
+            assert_eq!(
+                fs::read_to_string(&other).unwrap(),
+                "10.0.0.1 other\n",
+                "{kind}"
+            );
+            assert_eq!(fs::read_dir(&etc).unwrap().count(), 1, "{kind}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_hosts_rejects_symlinked_etc_and_directory_hosts() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        symlink(other.path(), root.path().join("etc")).unwrap();
+        assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
+        assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
+
+        fs::remove_file(root.path().join("etc")).unwrap();
+        fs::create_dir_all(root.path().join("etc/hosts")).unwrap();
+        assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
+        assert_eq!(fs::read_dir(root.path().join("etc")).unwrap().count(), 1);
+    }
+
     fn instance_name(name: &str) -> InstanceName {
         InstanceName::new(name).unwrap()
     }
@@ -2197,7 +2322,7 @@ mod tests {
         assert_eq!(bound_guest_hosts(Ok(at_cap.clone())), at_cap);
     }
 
-    /// `head -c` reads one byte past the cap, so an oversized file arrives as
+    /// The read takes one byte past the cap, so an oversized file arrives as
     /// `MAX + 1` bytes and must be discarded rather than written back truncated.
     #[test]
     fn bound_guest_hosts_discards_a_file_over_the_cap() {

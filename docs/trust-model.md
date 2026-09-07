@@ -55,10 +55,12 @@ user launched it.
   authors both the contents and the directory entry at that path on every later
   create/restore. Contents are read bounded and best-effort
   (`bound_guest_hosts` degrades to a default rather than aborting the
-  lifecycle). The paths are **host** paths: `MountGuard::simple` is a loop
-  mount, not a chroot, so the traversal rule below applies to every
-  `{mount}/…` string there — compare `verify_chroot_binaries`, which runs
-  `test -x` *inside* a chroot for that reason. Not currently validated.
+  lifecycle). Hosts-file operations use pinned directory descriptors, reject
+  symlinked `/etc`, and read only regular files checked through an `O_PATH`
+  descriptor. Replacement is atomic; permissions are set on the new file's
+  descriptor. Other paths remain **host** paths: `MountGuard::simple` is a
+  loop mount, not a chroot, so the traversal rule below still applies to the
+  hostname and network-config writes. Those paths are not currently validated.
 - **Guest command output read by the host.** e.g. `check_guest_dirty` reads
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
