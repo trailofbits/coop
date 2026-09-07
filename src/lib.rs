@@ -97,6 +97,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal privileged helper for a mounted Firecracker rootfs.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__patch-guest-hosts", hide = true)]
+    PatchGuestHosts { mount: PathBuf, hostname: String },
+
     /// Ensure an environment for a project directory exists and is running.
     ///
     /// Re-runnable: if an instance already exists for DIR it is reused
@@ -107,6 +112,9 @@ enum Commands {
         /// Instance name to use when creating the project environment
         #[arg(long, value_parser = config::InstanceName::new)]
         name: Option<config::InstanceName>,
+        /// Create a separate named instance even when DIR already has one
+        #[arg(long, requires = "name")]
+        new_instance: bool,
         /// Copy/sync DIR into the guest as /workspace (default)
         #[arg(long, conflicts_with = "mount")]
         copy: bool,
@@ -926,6 +934,15 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
+    #[cfg(target_os = "linux")]
+    if let Commands::PatchGuestHosts {
+        ref mount,
+        ref hostname,
+    } = cli.command
+    {
+        return setup::patch_guest_hosts(mount, hostname);
+    }
+
     if let Commands::Completions { shell } = cli.command {
         completions::emit_static(shell);
         return Ok(());
@@ -997,9 +1014,12 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Commands::PatchGuestHosts { .. } => unreachable!("handled before config loading"),
         Commands::Up {
             dir,
             name,
+            new_instance,
             copy,
             mount,
             extra_mount,
@@ -1040,6 +1060,7 @@ pub fn run() -> Result<()> {
             let opts = UpOpts {
                 dir: dir.as_deref(),
                 name: name.as_ref(),
+                new_instance,
                 transport,
                 extra_mount,
                 git_repo: git_repo.as_deref(),
@@ -2294,6 +2315,28 @@ mod tests {
     fn up_copy_and_mount_conflict() {
         let err = parse_err(&["up", "--copy", "--mount"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn up_new_instance_parses_with_explicit_name() {
+        let cli = parse(&["up", "--name", "worker-2", "--new-instance"]);
+        let super::Commands::Up {
+            name, new_instance, ..
+        } = cli.command
+        else {
+            panic!("expected Up variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("worker-2")
+        );
+        assert!(new_instance);
+    }
+
+    #[test]
+    fn up_new_instance_requires_explicit_name() {
+        let err = parse_err(&["up", "--new-instance"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

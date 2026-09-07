@@ -107,6 +107,14 @@
   `zed ssh://coop-<name>/<path>`, reusing the same `~/.ssh/config` alias
   block that VS Code's Remote-SSH uses.
 
+- **`coop up --new-instance` — a second instance for the same project** — `up`
+  normally reuses the instance recorded for a project directory or `--git-repo`
+  URL. `--new-instance` skips that lookup and creates a sibling instance
+  instead, so two agents can work from one source tree. It requires `--name`,
+  since the project-derived name is already taken. Once a project has siblings,
+  `coop up` reports the ambiguity rather than picking one, so address them by
+  name (`coop start <name>`, `coop shell <name>`).
+
 ### Fixes
 
 - **Firecracker guests can no longer reach each other by IP** — Instances on the
@@ -130,6 +138,18 @@
   now derives from one option list that sets `BatchMode`, a connect timeout,
   and a liveness probe, so a guest whose sshd stops answering fails after ~90s
   — the bound interactive sessions already had.
+
+- **The guest hostname resolves, so `sudo` stops warning** — Instance creation
+  renamed the Firecracker guest to `claude-<name>` in `/etc/hostname` but left
+  the image's `127.0.1.1 claude-vm` entry in `/etc/hosts`, so every `sudo` in
+  the guest printed `sudo: unable to resolve host claude-<name>` before running.
+  Both files are now written together at create and restore, and the guest
+  hostname is clamped to fit the kernel's 64-byte hostname limit so long
+  instance names still get a resolvable name. No image rebuild is needed — the patch is
+  per-instance, and the image's own entry is what gets overwritten — but
+  `patch_guest_network` runs only on create and restore, so an existing VM
+  keeps the stale entry until `coop restore <vm> --image <image>` or a destroy
+  and recreate.
 
 - **Fail closed on an unmanaged `CODEX_HOME` in ChatGPT auth mode** (#441) —
   The guest wrapper now refuses an explicitly set `CODEX_HOME` when coop's

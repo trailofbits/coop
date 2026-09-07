@@ -77,7 +77,7 @@ All three steps are idempotent. If the artifact already exists and is up to date
 Creating an instance (`coop up`) follows this sequence:
 
 1. Copies the template rootfs to the instance directory using `cp --reflink=auto` for copy-on-write on supported filesystems.
-2. Mounts the copy and patches the guest network config with the instance's unique IP address and hostname.
+2. Mounts the copy and patches the guest network config with the instance's unique IP address, plus `/etc/hostname` and the matching `/etc/hosts` alias so the guest can resolve its own name.
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
 4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, network interface, and vsock device.
 5. Creates and attaches a TAP device to the bridge (see TAP networking below).

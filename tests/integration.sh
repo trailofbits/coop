@@ -1935,6 +1935,37 @@ test_sudo() {
     else
         fail "sudo can write to /root" "stderr: $(guest_stderr)"
     fi
+
+    # Firecracker only: coop renames the guest there. Lima configures its own
+    # guest hostname, so a Lima guest's self-resolution is Lima's business.
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        local guest_host
+        guest_host=$(guest_exec hostname) || guest_host=""
+        # Assert the answer comes from the hosts entry coop wrote: getent also
+        # consults DNS, which could resolve the bare name without one.
+        if [[ -n "$guest_host" ]] &&
+            guest_exec getent hosts "$guest_host" | grep -q '^127\.0\.1\.1'; then
+            pass "guest hostname resolves via /etc/hosts ($guest_host)"
+        else
+            fail "guest hostname resolves via /etc/hosts" \
+                "hostname='$guest_host'; stderr: $(guest_stderr)"
+        fi
+
+        if guest_exec sudo -n true; then
+            local sudo_err
+            sudo_err=$(guest_stderr)
+            if echo "$sudo_err" | grep -qi "unable to resolve host"; then
+                fail "sudo emits no resolver warning" "stderr: $sudo_err"
+            else
+                pass "sudo emits no resolver warning"
+            fi
+        else
+            fail "sudo emits no resolver warning" "sudo -n failed; stderr: $(guest_stderr)"
+        fi
+    else
+        skip "guest hostname resolves via /etc/hosts" "Lima owns guest hostname config"
+        skip "sudo emits no resolver warning" "Lima owns guest hostname config"
+    fi
 }
 
 test_network() {
@@ -3445,6 +3476,48 @@ test_up_project_workflow() {
     rm -rf "$mount_ws"
 }
 
+# Exercise both source lookup bypasses using the same assertions.
+# Arguments: original instance, sibling name, ambiguity message, source args.
+test_new_instance_sibling() {
+    local original="$1" sibling="$2" ambiguity="$3"
+    shift 3
+
+    STARTED_INSTANCES+=("$sibling")
+    if coop up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer; then
+        pass "--new-instance creates sibling $sibling"
+    else
+        fail "--new-instance creates sibling $sibling" "$HARNESS_ERR"
+        return 1
+    fi
+
+    # Distinct contents at the same guest-only path prove separate VM state.
+    local original_marker sibling_marker
+    if GUEST_INSTANCE="$original" guest_exec sh -c 'echo original > /tmp/coop-sibling-marker' &&
+            GUEST_INSTANCE="$sibling" guest_exec sh -c 'echo sibling > /tmp/coop-sibling-marker' &&
+            original_marker=$(GUEST_INSTANCE="$original" guest_exec cat /tmp/coop-sibling-marker) &&
+            sibling_marker=$(GUEST_INSTANCE="$sibling" guest_exec cat /tmp/coop-sibling-marker) &&
+            [[ "$original_marker" == original && "$sibling_marker" == sibling ]]; then
+        pass "$original and $sibling have independent guest state"
+    else
+        fail "$original and $sibling have independent guest state" "$(guest_stderr)"
+    fi
+
+    if coop_fails up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer &&
+            [[ "$HARNESS_ERR" == *"Instance '$sibling' already exists"* ]]; then
+        pass "--new-instance rejects duplicate name $sibling"
+    else
+        fail "--new-instance rejects duplicate name $sibling" "$HARNESS_ERR"
+    fi
+
+    if coop_fails up "$@" --no-agents --no-devcontainer &&
+            [[ "$HARNESS_ERR" == *"$ambiguity"* &&
+               "$HARNESS_ERR" == *"$original"* && "$HARNESS_ERR" == *"$sibling"* ]]; then
+        pass "plain up reports ambiguity between $original and $sibling"
+    else
+        fail "plain up reports ambiguity between $original and $sibling" "$HARNESS_ERR"
+    fi
+}
+
 # ── git-repo source (--full only) ─────────────────────────────
 
 # Exercise `coop up --git-repo`: the clone runs inside the guest, so this
@@ -3552,6 +3625,13 @@ test_git_repo() {
     else
         fail "up --git-repo reuses the running instance" \
             "list changed: $(diff <(echo "$pre_list") <(echo "$post_list"))"
+    fi
+
+    local gr_sibling="${INSTANCE}-git-sibling"
+    test_new_instance_sibling "$gr_instance" "$gr_sibling" \
+        "Multiple instances share git repo" --git-repo "$repo_url" || true
+    if coop destroy "$gr_sibling"; then
+        untrack_instance "$gr_sibling"
     fi
 
     # `restore --reprovision` against a GIT-REPO-source instance, so the
@@ -3925,10 +4005,9 @@ test_multi_instance() {
     local inst_a="${INSTANCE}-a"
     local inst_b="${INSTANCE}-b"
     local ws_a="$tmpdir/${inst_a}-ws"
-    local ws_b="$tmpdir/${inst_b}-ws"
-    mkdir -p "$ws_a" "$ws_b"
+    mkdir -p "$ws_a"
 
-    # Create two project instances
+    # Create two instances from the same project directory.
     if coop up "$ws_a" --name "$inst_a" --no-agents --no-devcontainer; then
         STARTED_INSTANCES+=("$inst_a")
         pass "up creates instance A ($inst_a)"
@@ -3937,14 +4016,8 @@ test_multi_instance() {
         return
     fi
 
-    if coop up "$ws_b" --name "$inst_b" --no-agents --no-devcontainer; then
-        STARTED_INSTANCES+=("$inst_b")
-        pass "up creates instance B ($inst_b)"
-    else
-        fail "up creates instance B ($inst_b)" "exit code: $?"
-        coop destroy "$inst_a" 2>/dev/null || true
-        return
-    fi
+    test_new_instance_sibling "$inst_a" "$inst_b" \
+        "Multiple instances share workspace" "$ws_a" || return
 
     # Status should list both
     if coop status; then

@@ -16,6 +16,19 @@ coop up ./my-project --name my-project
 
 Named instances pay off when you have several running at once. The name appears in `coop list` / `coop status` output and targets commands at a specific instance.
 
+### Several instances for one project
+
+`coop up` normally reuses the instance already recorded for a project directory (or `--git-repo` URL). Add `--new-instance` to create another one alongside it — useful for running two agents against the same source tree. It requires `--name`, since the project-derived name is already taken.
+
+```
+coop up ./my-project                                  # first instance
+coop up ./my-project --new-instance --name worker-2   # sibling instance
+```
+
+Each sibling is an independent instance with its own disk and workspace copy; the project directory is not shared state between them unless you use `--mount`.
+
+Once a directory has more than one instance, `coop up ./my-project` can no longer pick one for you: it reports the ambiguity and lists the names. Address the instances by name from then on — `coop start worker-2`, `coop shell worker-2` — or destroy the extra one.
+
 ### Name validation rules
 
 Instance names must satisfy all of the following:
