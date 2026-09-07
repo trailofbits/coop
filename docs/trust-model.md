@@ -171,7 +171,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
   Both are asserted on every `setup_tap` and fail closed. The rule is
   idempotent because `ensure_guest_isolation_rule` probes with `iptables -C`
-  first; it is asserted per call rather than in `ensure_bridge` because that
+  first, then checks that it is the first FORWARD rule. Startup fails if another
+  rule precedes it; move the DROP first in the host firewall configuration before
+  retrying. It is asserted per call rather than in `ensure_bridge` because that
   returns early on a pre-existing bridge. The bridge flag is read back after
   being set — a kernel older than 4.18 caps the bridge-port attribute policy
   below `IFLA_BRPORT_ISOLATED` and silently drops it, so `bridge` exits 0 on a

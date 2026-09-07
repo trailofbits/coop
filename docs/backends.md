@@ -98,7 +98,7 @@ The network is configured as follows:
 - A Linux bridge (`br0`) is created if it does not already exist, with the configured host IP (default `172.16.0.1/24`).
 - IP forwarding is enabled via `sysctl`.
 - iptables NAT masquerade and forwarding rules route guest traffic through the host's default network interface. The interface is auto-detected from the default route, or set explicitly via `network.host_iface` in the config.
-- A `FORWARD -i br0 -o br0 -j DROP` rule is inserted at the head of the chain.
+- A `FORWARD -i br0 -o br0 -j DROP` rule is inserted at the head of the chain. If an existing rule has lost that precedence, startup fails until the host firewall configuration places it first.
 - Each instance's TAP device is created, attached to the bridge, marked as an isolated bridge port, and brought up.
 - Guest IPs are assigned statically: `172.16.0.{index + 2}`. Instance 0 gets `172.16.0.2`.
 

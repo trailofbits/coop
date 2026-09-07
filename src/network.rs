@@ -167,7 +167,8 @@ fn port_is_isolated(flags: &str) -> bool {
 /// stock host.
 ///
 /// Inserted at the head so it cannot lose to a pre-existing permissive
-/// `-A FORWARD -j ACCEPT` from libvirt or another tool.
+/// `-A FORWARD -j ACCEPT` from libvirt or another tool. Existing rules are
+/// checked for precedence too; refuse startup if the firewall has shadowed it.
 fn ensure_guest_isolation_rule() -> Result<()> {
     let present = Cmd::new("iptables")
         .args(["-C", "FORWARD"])
@@ -183,7 +184,29 @@ fn ensure_guest_isolation_rule() -> Result<()> {
             .run()
             .context("Failed to deny inter-guest routing across the bridge")?;
     }
+    let rules = Cmd::new("iptables")
+        .args(["-S", "FORWARD"])
+        .sudo()
+        .capture()
+        .context("Failed to verify guest isolation rule precedence")?;
+    if !guest_isolation_rule_is_first(&rules) {
+        bail!(
+            "Guest isolation DROP must be the first FORWARD rule; \
+             move it ahead of other rules in the host firewall configuration before starting a VM"
+        );
+    }
     Ok(())
+}
+
+/// Ignore the chain policy; the first rule must enforce guest isolation.
+fn guest_isolation_rule_is_first(rules: &str) -> bool {
+    rules
+        .lines()
+        .find(|line| line.starts_with("-A "))
+        .is_some_and(|line| {
+            line.split_whitespace()
+                .eq(["-A", "FORWARD"].into_iter().chain(GUEST_ISOLATION_SPEC))
+        })
 }
 
 // ── Bridge management ─────────────────────────────────────────
@@ -462,6 +485,23 @@ mod tests {
             rewrite("https://localhost:9999/v1/chat?a=b", "10.0.0.1"),
             "https://10.0.0.1:9999/v1/chat?a=b"
         );
+    }
+
+    #[test]
+    fn guest_isolation_requires_the_first_forward_rule() {
+        let drop = "-A FORWARD -i br0 -o br0 -j DROP";
+        let accept = "-A FORWARD -j ACCEPT";
+        assert!(guest_isolation_rule_is_first(&format!(
+            "-P FORWARD ACCEPT\n{drop}\n{accept}\n"
+        )));
+        assert!(!guest_isolation_rule_is_first(&format!(
+            "-P FORWARD ACCEPT\n{accept}\n{drop}\n"
+        )));
+        assert!(!guest_isolation_rule_is_first("-P FORWARD DROP\n"));
+        assert!(!guest_isolation_rule_is_first(""));
+        assert!(!guest_isolation_rule_is_first(
+            "-A FORWARD -i br0 -o eth0 -j DROP"
+        ));
     }
 
     #[test]

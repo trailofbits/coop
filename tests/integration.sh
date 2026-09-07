@@ -3374,7 +3374,7 @@ guest_route_via() {
 # An unisolated guest boots and works exactly like an isolated one, so without
 # this a regression in either control is invisible.
 assert_guest_isolation() {
-    local inst_a="$1" inst_b="$2" ip_a ip_b gateway
+    local inst_a="$1" inst_b="$2" ip_a ip_b gateway ip tap
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
         skip "guest-to-guest isolation" "Firecracker-only (Lima VMs use per-VM NAT)"
@@ -3392,6 +3392,22 @@ assert_guest_isolation() {
         return
     fi
 
+    # Instance::guest_ip uses 172.16.0.(index + 2), and tap_device uses tap<index>.
+    # Read each flag directly: br_netfilter can make the FORWARD DROP mask a
+    # missing L2 control in the direct-ping assertion below.
+    for ip in "$ip_a" "$ip_b"; do
+        if [[ ! "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]]; then
+            fail "guest address identifies a TAP" "unexpected guest IPv4 address"
+            continue
+        fi
+        tap="tap$(( 10#${BASH_REMATCH[1]} - 2 ))"
+        if sudo -n bridge -d link show dev "$tap" 2>/dev/null | grep -q 'isolated on'; then
+            pass "$tap is an isolated bridge port"
+        else
+            fail "$tap is an isolated bridge port" "isolated on flag is absent"
+        fi
+    done
+
     # Positive control first: every assertion below reads a ping failure as
     # success, so a guest with no working ping would manufacture green
     # negatives. Doubles as the guest->host non-regression.
@@ -3402,7 +3418,8 @@ assert_guest_isolation() {
     fi
     pass "guest A still reaches the host gateway"
 
-    # L2: direct on-link path, blocked by the isolated bridge port.
+    # Direct on-link reachability (the FORWARD rule can also block this when
+    # br_netfilter is enabled; the flag assertions above independently check L2).
     if guest_exec ping -c1 -W2 "$ip_b" >/dev/null 2>&1; then
         fail "guest A cannot ping guest B directly" "ping $ip_b from $inst_a succeeded"
     else
