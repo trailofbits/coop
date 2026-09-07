@@ -113,7 +113,7 @@ are preferred.
 For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
 --rebuild`. An existing VM keeps its own guest disk across a restart, so also
-run `coop restore <vm> --image <image>` (see
+run `coop restore <vm> --image <image> --reprovision` (see
 [Codex integration](codex-integration.md)) to pick up the rebuilt image. Then
 run `coop codex -- login --device-auth` once.
 

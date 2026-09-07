@@ -789,15 +789,63 @@ coop start my-project
 ```
 
 ```
-coop restore [NAME] --image <name>
+coop restore [NAME] [--image <name>] [--reprovision] [-y] [--no-agents] [--no-prompt]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--image <name>` | Name of the image to restore from (required) |
+| `--image <name>` | Image to restore from. Required on its own; with `--reprovision` it defaults to the image the instance already records |
+| `--reprovision` | Provision the new disk as a first boot and leave the instance running (see below) |
+| `-y`, `--yes` | Skip the `--reprovision` confirmation prompt (required when stdin is not a TTY). Requires `--reprovision` |
+| `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM. Requires `--reprovision` |
+| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT. Requires `--reprovision` |
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
+
+#### `--reprovision`
+
+The `coop start` in the checkpoint recipe above deliberately does *not* re-sync `/workspace` or reinstall plugins: a checkpoint image already carries both, and overwriting them would defeat the rollback. Restoring a **base** image is the other case — nothing on that disk to preserve — so a plain `coop start` there leaves an empty `/workspace` and no plugins.
+
+`--reprovision` is that case. Unlike a plain `restore`, which requires a stopped instance, it also accepts a running one and stops it itself. The disk is replaced as usual, and the guest is then provisioned as a **first boot**: the recorded workspace is re-synced, re-cloned or re-mounted, agents are re-bootstrapped, and plugins, marketplaces and MCP servers are reinstalled. The instance is left **running** rather than stopped, so no follow-up `coop start` is needed.
+
+It is also the way to start an instance over without re-typing every flag it was created with — the inverse of "destroy it and remember what I passed":
+
+```
+coop restore my-project --reprovision                  # confirm, then reset to the recorded image
+coop restore my-project --reprovision -y               # no prompt (required in scripts)
+coop restore my-project --reprovision --image rust-24  # reset onto a different image
+```
+
+Kept across the wipe, because coop persists them host-side:
+
+| Setting | Where it lives |
+|---------|----------------|
+| Name, index, guest IP | `instance.json` |
+| Image | `instance.json` (updated when `--image` is given) |
+| Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
+| vCPUs and memory | backend VM config, which the swap does not touch |
+| Workspace association (copy, git clone, or mount) | `workspace.json` |
+| Port forwards, including a devcontainer's `forwardPorts` | `forwards.json` |
+| Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
+| Model mode and proxy settings | `model.json` / `proxy.json` |
+| GitHub PATs and provider credentials | host secret store (never on the guest disk) |
+
+**Not replayed**, because coop does not persist them:
+
+- Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
+- `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
+- A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
+
+Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running the same command finishes the job.
+
+Compared with the neighbouring commands:
+
+| Command | Disk | Instance identity | Workspace / plugins | Left |
+|---------|------|-------------------|---------------------|------|
+| `destroy` + `up` | fresh | **new** name, index, IP | re-synced; every flag re-typed | running |
+| `restore` + `start` | replaced | kept | left as the image had them | running |
+| `restore --reprovision` | replaced | kept | re-synced, plugins reinstalled | running |
 
 ### `profiles`
 

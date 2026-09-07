@@ -69,13 +69,14 @@ use backend::VmBackend as _;
 use commands::json;
 use commands::{
     AgentUpdateOpts, DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport,
-    QuickstartOpts, ResizeOpts, StartOpts, UninstallOpts, UpDevcontainerOpts, UpOpts,
-    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
-    cmd_destroy, cmd_devcontainer, cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images,
-    cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize,
-    cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
-    codex_launch_args, open_ssh_session, preflight_start_target, prepend_binary,
-    resolve_devcontainer, resolve_devcontainer_collect, resolve_running,
+    QuickstartOpts, ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts,
+    UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
+    apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy, cmd_devcontainer,
+    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
+    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
+    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
+    resolve_running,
 };
 
 #[derive(Parser)]
@@ -582,7 +583,20 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Roll a stopped instance back to an image's filesystem in place
+    /// Replace an instance's filesystem with an image's, in place
+    ///
+    /// Keeps the name, index, IP and workspace association; only the disk
+    /// changes.
+    ///
+    /// Needs a stopped instance, and leaves it stopped: the `coop commit` loop.
+    ///
+    /// --reprovision instead runs the first-boot path and leaves it running.
+    ///
+    /// It also accepts a running instance, stopping it itself.
+    ///
+    /// Use it for a base image, where `coop start` leaves /workspace empty.
+    ///
+    /// See docs/commands.md for what --reprovision does not replay.
     Restore {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -590,14 +604,26 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Name of the image to restore from
+        /// Image to restore from (--reprovision defaults to the recorded one)
         #[arg(
             long,
-            required = true,
+            required_unless_present = "reprovision",
             value_parser = config::ImageName::new,
             add = ArgValueCandidates::new(completions::image_candidates),
         )]
-        image: config::ImageName,
+        image: Option<config::ImageName>,
+        /// Provision the new disk as a first boot and leave the instance running
+        #[arg(long)]
+        reprovision: bool,
+        /// Skip the --reprovision confirmation prompt (required off a TTY)
+        #[arg(short = 'y', long, requires = "reprovision")]
+        yes: bool,
+        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        #[arg(long, alias = "no-claude", requires = "reprovision")]
+        no_agents: bool,
+        /// Suppress the interactive prompt to set up a scoped GitHub PAT
+        #[arg(long, requires = "reprovision")]
+        no_prompt: bool,
     },
     /// List or inspect available profiles
     Profiles {
@@ -1363,7 +1389,41 @@ pub fn run() -> Result<()> {
         Commands::Commit { name, image, force } => {
             cmd_commit(&be, &cfg, name.as_ref(), &image, force)
         }
-        Commands::Restore { name, image } => cmd_restore(&be, &cfg, name.as_ref(), &image),
+        Commands::Restore {
+            name,
+            image,
+            reprovision,
+            yes,
+            no_agents,
+            no_prompt,
+        } => {
+            // Collapse clap's `Option<ImageName>` into the shape each mode
+            // actually needs, once, here at the boundary: `--image` is
+            // `required_unless_present = "reprovision"`, so a `DiskOnly`
+            // restore always has one and the handler never has to guess.
+            let mode = if reprovision {
+                RestoreMode::Reprovision(ReprovisionOpts {
+                    image: image.as_ref(),
+                    yes,
+                    no_agents,
+                    no_prompt,
+                    config_path: &cli.config,
+                })
+            } else {
+                let Some(image) = image.as_ref() else {
+                    bail!("`--image` is required without `--reprovision`");
+                };
+                RestoreMode::DiskOnly { image }
+            };
+            cmd_restore(
+                &be,
+                &mut cfg,
+                &RestoreOpts {
+                    name: name.as_ref(),
+                    mode,
+                },
+            )
+        }
         Commands::Profiles { action } => cmd_profiles(
             &cfg,
             &action.unwrap_or(ProfilesAction::List { json: false }),
@@ -1635,19 +1695,122 @@ mod tests {
     #[test]
     fn restore_parses_name_and_image() {
         let cli = parse(&["restore", "myvm", "--image", "safe-point"]);
-        let super::Commands::Restore { name, image } = cli.command else {
+        let super::Commands::Restore {
+            name,
+            image,
+            reprovision,
+            yes,
+            no_agents,
+            no_prompt,
+        } = cli.command
+        else {
             panic!("expected Restore variant");
         };
         assert_eq!(
             name.as_ref().map(super::config::InstanceName::as_str),
             Some("myvm")
         );
-        assert_eq!(image.as_str(), "safe-point");
-        // `--image` is mandatory; `restore` has no `--force`.
+        assert_eq!(
+            image.as_ref().map(super::config::ImageName::as_str),
+            Some("safe-point")
+        );
+        // The checkpoint-rollback default: swap the disk and stop there.
+        assert!(!reprovision);
+        assert!(!yes);
+        assert!(!no_agents);
+        assert!(!no_prompt);
+    }
+
+    #[test]
+    fn restore_requires_image_without_reprovision() {
+        // Without `--reprovision` there is no image to fall back to, so the
+        // bare form must not silently restore from the recorded image.
         assert!(
             parse_err(&["restore", "myvm"]).kind()
                 == clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn restore_reprovision_defaults_image_to_none() {
+        // With `--reprovision`, omitting `--image` reuses the image the
+        // instance already records.
+        let cli = parse(&["restore", "myvm", "--reprovision"]);
+        let super::Commands::Restore {
+            image, reprovision, ..
+        } = cli.command
+        else {
+            panic!("expected Restore variant");
+        };
+        assert!(image.is_none());
+        assert!(reprovision);
+    }
+
+    #[test]
+    fn restore_reprovision_parses_all_flags() {
+        let cli = parse(&[
+            "restore",
+            "myvm",
+            "--image",
+            "rust",
+            "--reprovision",
+            "-y",
+            "--no-agents",
+            "--no-prompt",
+        ]);
+        let super::Commands::Restore {
+            name,
+            image,
+            reprovision,
+            yes,
+            no_agents,
+            no_prompt,
+        } = cli.command
+        else {
+            panic!("expected Restore variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(
+            image.as_ref().map(super::config::ImageName::as_str),
+            Some("rust")
+        );
+        assert!(reprovision);
+        assert!(yes);
+        assert!(no_agents);
+        assert!(no_prompt);
+    }
+
+    #[test]
+    fn restore_reprovision_accepts_no_claude_alias_and_bare_invocation() {
+        // `--no-claude` is the legacy spelling `up`/`start` still accept.
+        let cli = parse(&["restore", "--reprovision", "--no-claude"]);
+        let super::Commands::Restore {
+            name, no_agents, ..
+        } = cli.command
+        else {
+            panic!("expected Restore variant");
+        };
+        // NAME is optional — resolved to the single instance at run time.
+        assert!(name.is_none());
+        assert!(no_agents);
+    }
+
+    /// The reprovision-only flags must not attach to a plain checkpoint
+    /// rollback: `-y` there would suggest a prompt that never appears, and
+    /// `--no-agents` a bootstrap that never runs.
+    #[test]
+    fn restore_rejects_reprovision_flags_without_reprovision() {
+        for flag in ["-y", "--no-agents", "--no-prompt"] {
+            let err = parse_err(&["restore", "myvm", "--image", "safe-point", flag]);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{flag} should require --reprovision"
+            );
+        }
     }
 
     #[test]

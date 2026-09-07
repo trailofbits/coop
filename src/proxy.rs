@@ -379,8 +379,6 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         "-T".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
         "-R".into(),
         format!("127.0.0.1:{port}:127.0.0.1:{port}"),
     ]);
