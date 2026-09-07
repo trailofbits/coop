@@ -3321,8 +3321,6 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn ssh_and_scp_options_differ_only_in_the_port_flag() {
-        // Two hand-copied lists is how the last hardening change reached only
-        // one of them; they now derive from `transport_opts`.
         let target = ssh_test_target();
         let ssh = target.ssh_opts();
         let scp = target.scp_opts();
