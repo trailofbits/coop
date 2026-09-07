@@ -127,6 +127,11 @@ Security and billing guardrails in this mode:
   --env`.
 - `auth.json` from the host Codex config directory is not copied into the
   guest. Account tokens are stored in the guest OS credential store instead.
+- `CODEX_HOME` cannot redirect Codex around keyring storage in this mode. When
+  coop's managed config selects the keyring, the guest wrapper refuses any
+  explicitly set `CODEX_HOME`, preventing Codex from writing account
+  credentials to an unmanaged `auth.json`; unset `CODEX_HOME` when using
+  ChatGPT account auth.
 - `[proxy.openai]` is rejected with `auth = "chatgpt"`, because the proxy path
   uses an OpenAI API key and would switch Codex back to API billing.
 

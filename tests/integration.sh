@@ -1280,13 +1280,21 @@ test_codex_account_auth_support() {
         fi
     done
 
-    # The primary guest config may inherit the host's Codex credential-store
-    # setting. Use an explicit empty config so this assertion isolates the
-    # wrapper's non-keyring branch from the machine running the suite.
-    local account_probe_dir="/tmp/coop-codex-account-probe"
-    if ! guest_exec sh -c 'mkdir -p "$1" && : > "$1/config.toml"' \
-        sh "$account_probe_dir"; then
+    # Give the probe an explicit managed config with no credential-store
+    # setting. The wrapper checks $HOME/.codex/config.toml before consulting an
+    # explicit $CODEX_HOME, so both locations must be isolated for this test.
+    local account_probe_root="/tmp/coop-codex-account-probe"
+    local account_probe_home="$account_probe_root/home"
+    local account_probe_codex_home="$account_probe_root/codex-home"
+    if ! guest_exec sh -c '
+        set -eu
+        rm -rf "$1"
+        mkdir -p "$1/home/.codex" "$1/codex-home"
+        : > "$1/home/.codex/config.toml"
+        : > "$1/codex-home/config.toml"
+    ' sh "$account_probe_root"; then
         fail "prepare codex-account probe config" "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
         return
     fi
 
@@ -1294,7 +1302,8 @@ test_codex_account_auth_support() {
     # D-Bus session, keyring, or password prompt. A hang here would mean it
     # tried to unlock a keyring it should have skipped.
     local version
-    if version=$(coop_exec env CODEX_HOME="$account_probe_dir" \
+    if version=$(coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
         /usr/local/bin/codex-account --version); then
         pass "codex-account passes through to codex without keyring mode ($version)"
     else
@@ -1302,20 +1311,26 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    # Drive the keyring branch without reconfiguring the VM: the wrapper reads
-    # $CODEX_HOME, so a scratch config selects keyring mode for one call. This
-    # is the only place the `cli_auth_credentials_store` grep, the D-Bus
-    # re-exec, the tool guards and the TTY guard actually execute — the
-    # assertions above all run on the passthrough branch.
+    # Select keyring mode explicitly in the scratch CODEX_HOME while retaining
+    # the isolated managed config. This is the only place the
+    # `cli_auth_credentials_store` check, the D-Bus re-exec, the tool guards and
+    # the TTY guard actually execute — the assertions above all run on the
+    # passthrough branch.
     #
     # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
     # a password prompt. A hang here is the failure this asserts against.
-    guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
-        > "$1/config.toml"' sh "$account_probe_dir"
+    if ! guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
+        > "$1/config.toml"' sh "$account_probe_codex_home"; then
+        fail "prepare codex-account keyring probe config" \
+            "stderr: $(guest_stderr)"
+        guest_exec rm -rf "$account_probe_root" || true
+        return
+    fi
 
     # </dev/null so the TTY guard is deterministic: run interactively, stdin
     # could otherwise be a terminal and the wrapper would prompt and block.
-    if coop_exec env CODEX_HOME="$account_probe_dir" \
+    if coop_exec env HOME="$account_probe_home" \
+        CODEX_HOME="$account_probe_codex_home" \
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
@@ -1326,7 +1341,9 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    guest_exec rm -rf "$account_probe_dir"
+    if ! guest_exec rm -rf "$account_probe_root"; then
+        fail "clean up codex-account probe config" "stderr: $(guest_stderr)"
+    fi
 }
 
 # The wrapper/package checks above use a scratch CODEX_HOME, but they do not
@@ -1388,6 +1405,41 @@ CFGEOF
     else
         fail "chatgpt mode selects the guest keyring credential store" \
             "config=$codex_cfg stderr: $(guest_stderr)"
+    fi
+
+    # coop manages only ~/.codex. A session-level CODEX_HOME must not bypass the
+    # managed setting and let Codex write a plaintext refresh token into the
+    # alternate directory (which could be inside /workspace and copied back to
+    # the host). Give the alternate config the same first-line keyring marker
+    # so its contents cannot bypass the guard.
+    local alternate_codex_home="/tmp/coop-codex-home-bypass-probe"
+    chatgpt_exec sh -c 'mkdir -p "$1" && printf "%s\n" \
+        "cli_auth_credentials_store = \"keyring\"" > "$1/config.toml"' \
+        sh "$alternate_codex_home"
+    if chatgpt_exec env CODEX_HOME="$alternate_codex_home" \
+        /usr/local/bin/codex-account --version; then
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "wrapper honored CODEX_HOME instead of coop's managed config"
+    elif guest_stderr | grep -q "unset CODEX_HOME"; then
+        pass "chatgpt mode rejects an unmanaged CODEX_HOME"
+    else
+        fail "chatgpt mode rejects an unmanaged CODEX_HOME" \
+            "stderr: $(guest_stderr)"
+    fi
+    chatgpt_exec rm -rf "$alternate_codex_home"
+
+    # Positive witness for the supported path: the CODEX_HOME guard must not
+    # reject a normal ChatGPT launch. This non-TTY call should get past that
+    # guard and reach the existing keyring prompt check.
+    if chatgpt_exec env -u CODEX_HOME \
+        /usr/local/bin/codex-account --version </dev/null; then
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "expected the later non-TTY keyring refusal, but Codex ran"
+    elif guest_stderr | grep -q "interactive TTY"; then
+        pass "chatgpt mode accepts an unset CODEX_HOME"
+    else
+        fail "chatgpt mode accepts an unset CODEX_HOME" \
+            "stderr: $(guest_stderr)"
     fi
 
     local guest_env
@@ -4758,31 +4810,47 @@ STATEEOF
     # ── The proxy is reachable on host loopback and enforces the gate ──
     # The proxy binds 127.0.0.1:<port> on the host and is reverse-tunnelled into
     # the guest, so the host exercises the same listener. A request without the
-    # token is refused locally ("capability token"). With the token, an
-    # allowlisted operation is forwarded upstream (which fails closed at the
-    # real host — 502 with no egress, or an upstream auth error — but never the
-    # local refusal), so the presence/absence of the "capability" refusal
-    # distinguishes the two without needing a working upstream.
+    # token is refused locally with 401. With the token, an allowlisted
+    # operation reaches the real host, yielding 502 with no egress or an
+    # upstream auth error. Status alone is ambiguous because upstream auth can
+    # also return 401/403, so the fixed local bodies identify gate refusals.
     local oai_port cap_token
     oai_port=$(echo "$codex_cfg" | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
     cap_token=$(echo "$guest_env" | grep '^COOP_LOCAL_API_KEY=' | cut -d= -f2- || true)
     if [[ -n "$oai_port" ]]; then
-        local no_tok tok response_body
+        local no_tok tok no_tok_status tok_status response_body
+        local no_tok_body_file="$tmpdir/proxy-no-token-body"
+        local tok_body_file="$tmpdir/proxy-token-body"
         response_body='{"model":"gpt-4.1","input":"ping"}'
-        no_tok=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
-            -H "Content-Type: application/json" --data "$response_body" || true)
-        tok=$(curl -s --max-time 15 -X POST "http://127.0.0.1:$oai_port/v1/responses" \
+        no_tok_status=$(curl -s --max-time 10 -X POST \
+            "http://127.0.0.1:$oai_port/v1/responses" \
+            -H "Content-Type: application/json" --data "$response_body" \
+            --output "$no_tok_body_file" --write-out '%{http_code}' || true)
+        no_tok=$(cat "$no_tok_body_file" 2>/dev/null || true)
+        tok_status=$(curl -s --max-time 15 -X POST \
+            "http://127.0.0.1:$oai_port/v1/responses" \
             -H "Authorization: Bearer $cap_token" -H "Content-Type: application/json" \
-            --data "$response_body" || true)
-        if echo "$no_tok" | grep -qi "capability"; then
+            --data "$response_body" --output "$tok_body_file" \
+            --write-out '%{http_code}' || true)
+        tok=$(cat "$tok_body_file" 2>/dev/null || true)
+        if [[ "$no_tok_status" == "401" ]] \
+            && echo "$no_tok" | grep -Fqi "missing or invalid coop-proxy capability token"; then
             pass "openai proxy refuses a request missing the capability token"
         else
-            fail "openai proxy refuses a request missing the capability token" "body: $no_tok"
+            fail "openai proxy refuses a request missing the capability token" \
+                "status: $no_tok_status body: $no_tok"
         fi
-        if echo "$tok" | grep -qi "capability"; then
-            fail "valid capability token forwards an allowed operation" "still refused: $tok"
-        else
+        if echo "$tok" | grep -Fqi "missing or invalid coop-proxy capability token"; then
+            fail "valid capability token forwards an allowed operation" \
+                "local capability refusal (status $tok_status): $tok"
+        elif echo "$tok" | grep -Fqi "operation is not allowed by coop-proxy"; then
+            fail "valid capability token forwards an allowed operation" \
+                "local operation-policy refusal (status $tok_status): $tok"
+        elif [[ "$tok_status" =~ ^[1-5][0-9][0-9]$ ]]; then
             pass "valid capability token forwards an allowed operation"
+        else
+            fail "valid capability token forwards an allowed operation" \
+                "no HTTP response (status: $tok_status body: $tok)"
         fi
     else
         fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"
