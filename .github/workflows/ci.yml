@@ -47,6 +47,12 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+      - name: Install network test tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux
+
+      - name: Integration test — bridge isolation
+        run: ./tests/integration-network.sh
+
       - name: Integration test — installer provenance
         run: ./tests/integration-install.sh
 

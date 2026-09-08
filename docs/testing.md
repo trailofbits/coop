@@ -41,6 +41,28 @@ host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
+## Host-only bridge isolation test
+
+Run `./tests/integration-network.sh` on Linux to test bridge-port isolation
+without KVM or VM images. It builds a library test as the current user, then
+uses passwordless sudo to run it in disposable network, mount, UTS, and PID
+namespaces. Prerequisites are Rust/Cargo, Python 3, sudo, iproute2, iptables,
+iputils-ping, util-linux, hostname, and coreutils. Missing prerequisites fail
+the gate; macOS reports an explicit skip. Linux CI runs this gate.
+
+Two veth-backed endpoints first communicate through a bridge with no firewall
+rules. The test calls the production isolation helper on each bridge port:
+one isolated port still permits communication, while two block peer traffic
+in both directions and preserve gateway access. Removing isolation restores
+communication. Ping execution errors fail the test rather than counting as
+isolation. The runner bounds execution and destroys the namespace resources
+on success, failure, or timeout.
+
+This exercises the bridge mechanism shared by veths and TAPs. The existing
+Firecracker `--full` phase checks actual VM TAP flags and both direct and routed
+traffic; it also detects removal of the helper call from `setup_tap`. This
+host-only gate does not replace Firecracker or Lima VM integration.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

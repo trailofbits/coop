@@ -543,3 +543,7 @@ mod tests {
         assert!(!host_is_loopback(None));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod isolation_tests;
