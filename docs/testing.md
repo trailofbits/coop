@@ -41,11 +41,24 @@ host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
+Run `python3 tests/test-integration-probes.py` for host-only regression tests
+of address discovery, ping result handling, and bounded HTTP retries. These
+use a temporary loopback HTTP server and require Python 3, Bash, and curl;
+Linux CI runs them. The full VM suite additionally checks these probes against
+real guests. A host FORWARD policy other than ACCEPT still causes an explicit
+skip of the routed guest-isolation probe, since it would mask the coop rule.
+
 ## Host-only bridge isolation test
 
-Run `./tests/integration-network.sh` on Linux to test bridge-port isolation
-without KVM or VM images. It builds a library test as the current user, then
-uses passwordless sudo to run it in disposable network, mount, UTS, and PID
+`./tests/run-integration.sh --full` runs the bridge isolation gate before
+the VM suite, on the selected local or remote host. A failure stops the full
+run; macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables
+both gates. Remote full runs copy the tracked working-tree source and require
+the build and namespace prerequisites below on the remote host.
+
+Run `./tests/integration-network.sh` directly on Linux to test bridge-port
+isolation without KVM or VM images. It builds a library test as the current
+user, then uses passwordless sudo to run it in disposable network, mount, UTS, and PID
 namespaces. Prerequisites are Rust/Cargo, Python 3, sudo, iproute2, iptables,
 iputils-ping, util-linux, hostname, and coreutils. Missing prerequisites fail
 the gate; macOS reports an explicit skip. Linux CI runs this gate.

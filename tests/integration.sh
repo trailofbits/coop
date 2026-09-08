@@ -1981,16 +1981,35 @@ test_network() {
         fail "DNS resolution works" "all resolution methods failed; stderr: $(guest_stderr)"
     fi
 
-    # HTTP connectivity (use a reliable endpoint)
-    local http_code
-    if http_code=$(guest_exec curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com); then
+    if [[ "$(uname -s)" == Linux ]]; then
+        # shellcheck disable=SC2016 # Expand readlink inside the guest.
+        if guest_exec sh -c '[ "$(readlink /etc/systemd/system/fcnet.service)" = /dev/null ]'; then
+            pass "inherited fcnet service is masked"
+        else
+            fail "inherited fcnet service is masked" "the base image must not assign competing /30 addresses"
+        fi
+        local addresses expected_ip
+        expected_ip=$(guest_ip_of "$INSTANCE") || expected_ip=""
+        addresses=$(guest_exec sh -c "ip -4 -o addr show dev eth0 | awk '{print \$4}'") || addresses=""
+        if [[ -n "$expected_ip" && "$addresses" == "$expected_ip/24" ]]; then
+            pass "guest has exactly its configured /24 address"
+        else
+            fail "guest has exactly its configured /24 address" "addresses: $addresses"
+        fi
+    fi
+
+    # Retry transient HTTP failures, but keep persistent failures fatal and bounded.
+    local http_code rc
+    if http_code=$(guest_exec curl -sS --fail -o /dev/null -w '%{http_code}' \
+        --max-time 10 --retry 2 --retry-delay 1 --retry-max-time 30 https://api.github.com); then
         if [[ "$http_code" =~ ^[23] ]]; then
             pass "HTTPS connectivity works (HTTP $http_code)"
         else
             fail "HTTPS connectivity works" "HTTP $http_code"
         fi
     else
-        fail "HTTPS connectivity works" "curl failed"
+        rc=$?
+        fail "HTTPS connectivity works" "curl/transport exit $rc; HTTP $http_code; stderr: $(guest_stderr)"
     fi
 }
 
@@ -3898,9 +3917,69 @@ test_appledouble_sidecars() {
 # Read one guest's IPv4 address. The interface is eth0 on this backend —
 # src/setup.rs writes `[Match] Name=eth0` and src/vm.rs sets iface_id "eth0".
 guest_ip_of() {
+    local addresses
     GUEST_INSTANCE="$1"
-    guest_exec sh -c "ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1" \
-        2>/dev/null | tr -d '[:space:]'
+    if ! addresses=$(guest_exec ip -4 -o addr show dev eth0); then
+        echo "Cannot read guest IPv4 addresses: $(guest_stderr)" >&2
+        return 1
+    fi
+    # The kernel and systemd can install the same IP with different prefixes.
+    # Deduplicate addresses, not entire CIDRs; never concatenate separate IPs.
+    printf '%s\n' "$addresses" | awk '
+        NF {
+            split($4, cidr, "/")
+            n = split(cidr[1], octet, ".")
+            if ($3 != "inet" || n != 4) invalid = 1
+            for (i = 1; i <= n; i++)
+                if (octet[i] !~ /^[0-9]+$/ || octet[i] + 0 > 255) invalid = 1
+            if (!seen[cidr[1]]++) { count++; address = cidr[1] }
+        }
+        END {
+            if (invalid || count != 1) {
+                print "Expected one distinct valid guest IPv4 address; found " count > "/dev/stderr"
+                exit 1
+            }
+            print address
+        }
+    '
+}
+
+# coop shell collapses nonzero guest statuses to exit 1. Send a validated
+# result on stdout instead; keep ping diagnostics on stderr. Only the host
+# helper uses 42 for no reply, so sudo/SSH failures cannot manufacture a pass.
+guest_ping() {
+    local result
+    # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.
+    if ! result=$(guest_exec sudo -n sh -c '
+        ping -n -c 1 -W 2 -w 3 "$1" >&2
+        rc=$?
+        case "$rc" in
+            0) printf "reachable\n" ;;
+            1) printf "no-reply\n" ;;
+            *) exit 1 ;;
+        esac
+    ' sh "$1"); then
+        return 43
+    fi
+    case "$result" in
+        reachable) return 0 ;;
+        no-reply) return 42 ;;
+        *) echo "Unexpected ping result: $result" >&2; return 43 ;;
+    esac
+}
+
+assert_guest_ping_blocked() {
+    local address="$1" label="$2" output rc
+    if output=$(guest_ping "$address"); then
+        fail "$label" "ping $address succeeded"
+    else
+        rc=$?
+        if [[ "$rc" == 42 ]]; then
+            pass "$label"
+        else
+            fail "$label" "ping probe failed (exit $rc): $output; stderr: $(guest_stderr)"
+        fi
+    fi
 }
 
 # Install <dest>/32 via the gateway and confirm it took — a route that silently
@@ -3917,15 +3996,17 @@ guest_route_via() {
 # An unisolated guest boots and works exactly like an isolated one, so without
 # this a regression in either control is invisible.
 assert_guest_isolation() {
-    local inst_a="$1" inst_b="$2" ip_a ip_b gateway ip tap
+    local inst_a="$1" inst_b="$2" ip_a ip_b gateway ip tap output rc rules
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
         skip "guest-to-guest isolation" "Firecracker-only (Lima VMs use per-VM NAT)"
         return
     fi
 
-    ip_a=$(guest_ip_of "$inst_a")
-    ip_b=$(guest_ip_of "$inst_b")
+    if ! ip_a=$(guest_ip_of "$inst_a") || ! ip_b=$(guest_ip_of "$inst_b"); then
+        fail "guest-to-guest isolation" "cannot determine distinct guest IPv4 addresses"
+        return
+    fi
     GUEST_INSTANCE="$inst_a"
     gateway=$(guest_exec sh -c "ip -4 route show default | awk '{print \$3}' | head -1" \
         2>/dev/null | tr -d '[:space:]')
@@ -3940,8 +4021,14 @@ assert_guest_isolation() {
     # missing L2 control in the direct-ping assertion below.
     for ip in "$ip_a" "$ip_b"; do
         if [[ ! "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]]; then
-            fail "guest address identifies a TAP" "unexpected guest IPv4 address"
-            continue
+            fail "guest address identifies a TAP" "unexpected guest IPv4 address: $ip"
+            unset GUEST_INSTANCE
+            return
+        fi
+        if (( 10#${BASH_REMATCH[1]} < 2 || 10#${BASH_REMATCH[1]} > 254 )); then
+            fail "guest address identifies a TAP" "guest address outside instance range: $ip"
+            unset GUEST_INSTANCE
+            return
         fi
         tap="tap$(( 10#${BASH_REMATCH[1]} - 2 ))"
         if sudo -n bridge -d link show dev "$tap" 2>/dev/null | grep -q 'isolated on'; then
@@ -3951,48 +4038,48 @@ assert_guest_isolation() {
         fi
     done
 
-    # Positive control first: every assertion below reads a ping failure as
-    # success, so a guest with no working ping would manufacture green
-    # negatives. Doubles as the guest->host non-regression.
-    if ! guest_exec ping -c1 -W2 "$gateway" >/dev/null 2>&1; then
+    # A working gateway probe is the positive control for blocked-peer probes.
+    if output=$(guest_ping "$gateway"); then
+        pass "guest A still reaches the host gateway"
+    else
+        rc=$?
+        fail "guest A still reaches the host gateway" \
+            "ping probe exit $rc: $output; stderr: $(guest_stderr)"
         unset GUEST_INSTANCE
-        fail "guest A still reaches the host gateway" "ping $gateway failed"
         return
     fi
-    pass "guest A still reaches the host gateway"
 
-    # Direct on-link reachability (the FORWARD rule can also block this when
-    # br_netfilter is enabled; the flag assertions above independently check L2).
-    if guest_exec ping -c1 -W2 "$ip_b" >/dev/null 2>&1; then
-        fail "guest A cannot ping guest B directly" "ping $ip_b from $inst_a succeeded"
-    else
-        pass "guest A cannot ping guest B directly"
-    fi
+    # br_netfilter may also block this path; the TAP flags are checked above.
+    assert_guest_ping_blocked "$ip_b" "guest A cannot ping guest B directly"
 
     # L3: routed path, blocked by the FORWARD DROP. Both guests need the /32 —
     # with only A's route, B answers over its connected /24 (two isolated
     # ports), so the reply dies at L2 and the ping fails whether or not the
     # rule exists. Attributable only under an ACCEPT policy; a DROP policy
     # (any host that has run dockerd) would fail the ping either way.
-    if ! sudo -n iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD ACCEPT'; then
+    if ! rules=$(sudo -n iptables -S FORWARD 2>"$tmpdir/firewall_stderr"); then
+        fail "guest A cannot reach guest B via the host gateway" \
+            "cannot inspect host FORWARD policy: $(cat "$tmpdir/firewall_stderr")"
+        unset GUEST_INSTANCE
+        return
+    fi
+    if ! printf '%s\n' "$rules" | grep -q '^-P FORWARD ACCEPT'; then
         skip "guest A cannot reach guest B via the host gateway" \
             "host FORWARD policy is not ACCEPT"
     elif guest_route_via "$inst_a" "$ip_b" "$gateway" &&
         guest_route_via "$inst_b" "$ip_a" "$gateway"; then
         GUEST_INSTANCE="$inst_a"
-        if guest_exec ping -c1 -W2 "$ip_b" >/dev/null 2>&1; then
-            fail "guest A cannot reach guest B via the host gateway" \
-                "routed ping to $ip_b via $gateway succeeded"
-        else
-            pass "guest A cannot reach guest B via the host gateway"
-        fi
-        GUEST_INSTANCE="$inst_a"
-        guest_exec sudo ip route del "$ip_b/32" >/dev/null 2>&1 || true
-        GUEST_INSTANCE="$inst_b"
-        guest_exec sudo ip route del "$ip_a/32" >/dev/null 2>&1 || true
+        assert_guest_ping_blocked "$ip_b" "guest A cannot reach guest B via the host gateway"
     else
         fail "guest A cannot reach guest B via the host gateway" \
             "could not install the /32 routes the probe depends on"
+    fi
+    # The first route may have been installed even when the second failed.
+    if printf '%s\n' "$rules" | grep -q '^-P FORWARD ACCEPT'; then
+        GUEST_INSTANCE="$inst_a"
+        guest_exec sudo -n ip route del "$ip_b/32" >/dev/null 2>&1 || true
+        GUEST_INSTANCE="$inst_b"
+        guest_exec sudo -n ip route del "$ip_a/32" >/dev/null 2>&1 || true
     fi
 
     unset GUEST_INSTANCE

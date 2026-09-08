@@ -11,6 +11,7 @@ set -euo pipefail
 # Remote mode detects the remote host's architecture, cross-compiles
 # the matching musl binary, copies it and the test script, and runs tests there.
 #
+# --full also runs integration-network.sh on the test host before the VM suite.
 # All flags other than --remote are forwarded to integration.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,11 +19,13 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_SCRIPT="$SCRIPT_DIR/integration.sh"
 
 REMOTE_HOST=""
+FULL="${TEST_FULL:-0}"
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --remote)  REMOTE_HOST="$2";  shift 2 ;;
+        --full)    FULL=1; FORWARD_ARGS+=("$1"); shift ;;
         *)         FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
@@ -30,6 +33,11 @@ done
 # ── Local mode ───────────────────────────────────────────────────
 
 if [[ -z "$REMOTE_HOST" ]]; then
+    if [[ "$FULL" == "1" ]]; then
+        echo "Running bridge isolation integration test..."
+        "$SCRIPT_DIR/integration-network.sh"
+    fi
+
     echo "Building coop (release)..."
     cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
 
@@ -81,28 +89,47 @@ else
 fi
 
 REMOTE_DIR=$(ssh "$REMOTE_HOST" mktemp -d)
-trap 'ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
+source_archive=""
+trap '[[ -z "$source_archive" ]] || rm -f "$source_archive"; ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
 scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$REMOTE_HOST:$REMOTE_DIR/"
 
+# The full network gate builds on the remote, as does the proxy fallback.
+# Include tracked working-tree edits so the gate tests the same code as coop.
+if [[ "$FULL" == "1" || "$build_proxy_on_remote" == "1" ]]; then
+    source_archive=$(mktemp "${TMPDIR:-/tmp}/coop-integration-src.XXXXXX.tar.gz")
+    (
+        cd "$PROJECT_DIR"
+        git ls-files -z | tar --null -czf "$source_archive" -T -
+    )
+    scp -q "$source_archive" "$REMOTE_HOST:$REMOTE_DIR/coop-src.tar.gz"
+    rm -f "$source_archive"
+    source_archive=""
+    # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
+    ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR/src' && tar xzf '$REMOTE_DIR/coop-src.tar.gz' -C '$REMOTE_DIR/src'"
+fi
+
+if [[ "$FULL" == "1" ]]; then
+    echo "Running bridge isolation integration test on $REMOTE_HOST..."
+    # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
+    ssh "$REMOTE_HOST" "
+        set -e
+        . \"\$HOME/.cargo/env\" 2>/dev/null || true
+        cd '$REMOTE_DIR/src'
+        ./tests/integration-network.sh
+    "
+fi
+
 if [[ "$build_proxy_on_remote" == "0" ]]; then
     scp -q "$LOCAL_PROXY" "$REMOTE_HOST:$REMOTE_DIR/"
 else
-    # Native build on the remote from a clean source snapshot of the current
-    # commit. Best-effort: needs cargo + cmake + a C compiler on the remote; on
-    # any failure the proxy phase skips (a warning is printed, the suite runs).
+    # Best-effort: the proxy fallback requires cargo + cmake + a C compiler.
     echo "Building coop-proxy natively on $REMOTE_HOST..."
-    proxy_src=$(mktemp "${TMPDIR:-/tmp}/coop-proxy-src.XXXXXX.tar.gz")
-    git -C "$PROJECT_DIR" archive --format=tar.gz -o "$proxy_src" HEAD
-    scp -q "$proxy_src" "$REMOTE_HOST:$REMOTE_DIR/coop-src.tar.gz"
-    rm -f "$proxy_src"
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path; expand client-side
     ssh "$REMOTE_HOST" "
         set -e
         . \"\$HOME/.cargo/env\" 2>/dev/null || true
-        mkdir -p '$REMOTE_DIR/src'
-        tar xzf '$REMOTE_DIR/coop-src.tar.gz' -C '$REMOTE_DIR/src'
         cd '$REMOTE_DIR/src'
         cargo build --release -p coop-proxy
         cp target/release/coop-proxy '$REMOTE_DIR/coop-proxy'
@@ -112,6 +139,9 @@ fi
 # Build the remote command as an array, then printf %q to safely quote for ssh.
 # ssh doesn't forward arbitrary env vars, so pass opt-in flags explicitly.
 REMOTE_CMD=()
+if [[ "$FULL" == "1" ]]; then
+    REMOTE_CMD+=("TEST_FULL=1")
+fi
 if [[ -n "${COOP_TEST_DESTRUCTIVE:-}" ]]; then
     REMOTE_CMD+=("COOP_TEST_DESTRUCTIVE=$COOP_TEST_DESTRUCTIVE")
 fi

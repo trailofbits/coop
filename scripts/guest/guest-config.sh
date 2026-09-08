@@ -1,5 +1,11 @@
 set -euo pipefail
 
+# Firecracker's base image may enable fcnet, which derives a /30 address from
+# the MAC. It conflicts with coop's /24 networkd configuration (the next VM
+# can become a broadcast destination). Mask even an existing local unit file.
+systemctl disable fcnet.service 2>/dev/null || true
+ln -sfnT /dev/null /etc/systemd/system/fcnet.service
+
 echo '  [guest] Configuring guest networking...'
 mkdir -p /etc/systemd/network
 cat > /etc/systemd/network/10-eth0.network <<'NETEOF'

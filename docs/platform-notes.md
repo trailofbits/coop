@@ -60,3 +60,12 @@ Only scp's SFTP mode has this issue.
 
 The coop binary's tracing output (INFO/DEBUG/WARN logs) goes to **stderr**, so
 stdout stays clean for machine-readable (`--json`) output and piped consumers.
+
+## Firecracker base-image networking
+
+The upstream Firecracker image may enable `fcnet.service`, which assigns an
+address derived from the guest MAC with a `/30` prefix. Coop uses a `/24`
+network managed by systemd-networkd. Provisioning disables and masks the
+inherited service so it cannot install a second prefix and make another
+instance's IP a broadcast destination. Rebuild older images with `coop setup`
+to apply this guest-only fix; it does not change host networking or Lima.
