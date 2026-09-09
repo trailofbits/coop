@@ -24,7 +24,7 @@ Setup verifies that `limactl --version` is reachable. If it is not, setup fails 
 
 1. Generates an ed25519 SSH key pair, stored in the coop data directory.
 2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
-3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
+3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
 4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
 5. Stops the builder VM and extracts its disk as the golden image.
 6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
@@ -68,7 +68,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
-3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
+3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd.
 
 All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
 

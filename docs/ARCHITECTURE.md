@@ -1,7 +1,7 @@
 # Architecture
 
 `coop` is a Rust CLI that orchestrates isolated VM environments for running AI
-coding agents (Claude Code, Codex). It manages the full VM lifecycle — setup,
+coding agents (Claude Code, Codex, Grok Build). It manages the full VM lifecycle — setup,
 start, shell, stop, destroy, status, logs — behind two platform backends:
 
 - **Linux** — Firecracker microVMs on KVM.
@@ -87,7 +87,7 @@ backends.)
 
 Everything above the trait is **backend-shared**: the entire "shared guest
 operations" surface in `backend.rs` (env/secret forwarding, agent bootstrap,
-Claude/Codex config injection, git-repo cloning), plus `workspace.rs`,
+Claude/Codex/Grok config injection, git-repo cloning), plus `workspace.rs`,
 `ssh.rs`, `config.rs`, and the `commands/` handlers. When you touch shared
 code, it must hold for **both** backends. Known intentional divergences:
 

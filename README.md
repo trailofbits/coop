@@ -1,10 +1,10 @@
 # coop
 
-Isolated VM environments for running Claude Code and Codex.
+Isolated VM environments for running Claude Code, Codex, and Grok Build.
 
 > **Pronunciation:** "coop" (/kuːp/) — one syllable, rhymes with "loop", like the thing you keep chickens in. Not "co-op".
 
-coop is a Rust CLI that manages disposable virtual machines where Claude Code and Codex have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
+coop is a Rust CLI that manages disposable virtual machines where Claude Code, Codex, and Grok Build have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
 
 ## Setup
 
@@ -47,6 +47,8 @@ coop up
 coop claude
 # or
 coop codex
+# or
+coop grok
 ```
 
 ## Documentation
@@ -59,6 +61,7 @@ coop codex
 - [Workspace sync](docs/workspaces.md)
 - [Claude Code integration](docs/claude-integration.md)
 - [Codex integration](docs/codex-integration.md)
+- [Grok Build integration](docs/grok-integration.md)
 - [Editor integration](docs/editor.md)
 - [Multi-instance](docs/multi-instance.md)
 - [Platform backends](docs/backends.md)

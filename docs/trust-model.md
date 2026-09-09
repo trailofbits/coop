@@ -15,14 +15,17 @@ they don't introduce one.
 
 **coop's isolation boundary is the guest VM itself** — a Firecracker microVM on
 Linux, a Lima VM (Apple Virtualization.framework) on macOS. The point of the
-tool is to run AI coding agents (Claude Code, Codex) with broad autonomy
-*inside* that boundary, so the guest is deliberately permissive:
+tool is to run AI coding agents (Claude Code, Codex, Grok Build) with broad
+autonomy *inside* that boundary, so the guest is deliberately permissive:
 
 - The guest user has passwordless `sudo` (`NOPASSWD:ALL`).
 - Claude runs with a managed `~/.claude/settings.json` carrying
   `defaultMode: bypassPermissions`; the `codex`/`claude` launchers pass
   `--dangerously-bypass-approvals-and-sandbox` / `--dangerously-skip-permissions`
-  unless the user passes `--ask`.
+  unless the user passes `--ask`. Grok Build is launched with
+  `--always-approve` and a managed `ui.permission_mode = "always-approve"`;
+  `--ask` passes `--permission-mode default` so the guest config does not
+  keep always-approve for that session.
 
 This is intentional and correct: there is **no privilege boundary inside the
 guest to protect** — the whole VM is the blast radius. The security model is
@@ -77,7 +80,7 @@ user launched it.
 ## Secrets and how they cross into the guest
 
 coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
+`OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
 user `env_forward` entries, and the VM SSH key. The invariants:
 
 - **Never on argv.** Secrets ride SSH `SendEnv` (env channel) or process env
@@ -104,7 +107,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **Secret files stay `0600`, dirs `0700`.** File-backend PATs live at
   `<state_dir>/github-pat/<account>.txt` (`secret_store.rs:store_file`); all
   managed writes go through `fs_util::atomic_write_with_mode` / `atomic_write_ssh`,
-  which never relax permissions.
+  which never relax permissions. A host `~/.grok/auth.json` copied into the
+  guest is `chmod 0600` after `scp` (`backend.rs:restrict_guest_grok_auth`).
 - **Secrets stay out of logs.** `Cmd::redacted_arg` redacts argv in traces;
   `EnvForward`/`Secret<T>` custom `Debug` impls keep values out of debug output.
   Do not log a resolved secret.

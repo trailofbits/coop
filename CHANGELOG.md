@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### New features
+
+- **Grok Build** — `coop grok` launches Grok Build inside the guest with
+  `--always-approve`, `--trust`, and `--cwd /workspace`. The golden image
+  installs `~/.grok/bin/grok` (and an `agent` link) and a `grok-yolo`
+  shortcut. `[grok]` forwards `XAI_API_KEY`, copies an allowlist from
+  `config_dir` (`AGENTS.md`, `auth.json`, `config.toml`, `lsp.json`, `rules/`,
+  `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`;
+  directory symlinks skipped), drops the host `[plugins]` table, merges Model Context Protocol
+  servers and `permission_mode` into the guest `~/.grok/config.toml`,
+  records `/workspace` as a trusted folder, and installs configured
+  marketplaces/plugins on first boot. A copied host `auth.json` is set to
+  owner-only (`0600`) and signs the guest in; otherwise use `coop grok --
+  login --device-auth`.
+  `coop agent update --grok` runs `grok update`. Existing images need
+  `coop setup --rebuild`; existing VMs also need
+  `coop restore <vm> --image <image> --reprovision` (or destroy/recreate)
+  to pick up the new binary.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4
