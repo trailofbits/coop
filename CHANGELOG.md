@@ -157,12 +157,11 @@
   login` from silently writing a plaintext refresh token to the alternate
   directory, including a workspace path that syncs back to the host.
 
-- **Install Codex's complete runtime package** (#442) — Recent Codex releases
-  use a companion `codex-code-mode-host` executable, but coop installed only
-  the raw `codex` binary, causing Code Mode to fail closed at startup. Image
-  builds and `coop agent update --codex` now verify and install the upstream
-  package with its host and runtime resources intact, root-owned and behind a
-  shared current-release link.
+- **Install the full native Codex package** (#442) — Image provisioning and
+  `coop agent update --codex` use OpenAI's native installer, preserving bundled
+  tools and upstream setup. The guest user owns the installation and can run
+  `codex update` directly. `/usr/local/bin/codex` remains a compatibility link,
+  and host-driven updates migrate older direct-binary installations.
 
 - **`install.sh` and `coop update` verify provenance without a GitHub
   credential** (#421) — Verification ran `gh attestation verify --repo

@@ -26,9 +26,11 @@ Every template installs these packages regardless of profile selection.
 
 **Claude Code CLI:** installed via the native installer during the template build.
 
-**Codex CLI:** installed as a complete package during the template build. The
-package contains the CLI, its code-mode host, and bundled runtime resources;
-stable entrypoints under `/usr/local/bin` share one current-package link.
+**Codex CLI:** installed with OpenAI's native installer as the guest user during
+the template build. The full package, including bundled tools, stays under the
+user's home directory. `~/.local/bin/codex` is the native launcher;
+`/usr/local/bin/codex` is a compatibility link. The guest user can run
+`codex update` directly without sudo.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages
@@ -40,7 +42,7 @@ Codex, so it costs nothing at run time.
 
 Both agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 
-- **A live instance:** `coop agent update [--claude] [--codex]` updates the binaries inside a running VM in place (see [`agent update`](commands.md#agent-update)). Claude Code also auto-updates itself in the background; Codex does not, so it is the one that typically needs this.
+- **A live instance:** run `codex update` inside the VM, or `coop agent update [--claude] [--codex]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code also auto-updates itself in the background.
 - **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
 
 ## Built-in profiles
