@@ -427,7 +427,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             }
 
             if !wait_for_exit(pid, Duration::from_secs(5)) {
-                tracing::error!(
+                bail!(
                     "Firecracker PID {pid} did not exit \
                      after SIGKILL"
                 );
