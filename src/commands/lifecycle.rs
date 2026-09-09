@@ -1528,6 +1528,47 @@ pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String>
     args
 }
 
+/// Grok Build flags for running unrestricted (always-approve + folder trust).
+const GROK_ALWAYS_APPROVE: &str = "--always-approve";
+const GROK_TRUST: &str = "--trust";
+const GROK_PERMISSION_MODE: &str = "--permission-mode";
+const GROK_PERMISSION_ASK: &str = "default";
+const GROK_AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
+
+/// Prepend Grok Build's always-approve and folder-trust flags, and pin
+/// `--cwd /workspace`, unless the user opted into prompts or is running an
+/// auth subcommand.
+///
+/// The VM is the isolation boundary, so Grok's own permission prompts add
+/// no protection. `--trust` records `/workspace` as trusted so project
+/// `.grok/` hooks and MCP servers load without a first-run question.
+/// Guest `~/.grok/config.toml` also sets `ui.permission_mode =
+/// "always-approve"`, so `--ask` must pass `--permission-mode default`
+/// (Grok's ask mode). Omitting `--always-approve` alone leaves the
+/// config default in force. `login` / `logout` never start a session, so
+/// always-approve is dropped there (folder trust is still harmless and
+/// kept).
+pub(crate) fn grok_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    let is_auth_subcommand = args
+        .first()
+        .is_some_and(|arg| GROK_AUTH_SUBCOMMANDS.contains(&arg.as_str()));
+    let has_cwd = args
+        .iter()
+        .any(|arg| arg == "--cwd" || arg.starts_with("--cwd="));
+    if !has_cwd && !is_auth_subcommand {
+        args.insert(0, "/workspace".to_string());
+        args.insert(0, "--cwd".to_string());
+    }
+    args.insert(0, GROK_TRUST.to_string());
+    if ask {
+        args.insert(0, GROK_PERMISSION_ASK.to_string());
+        args.insert(0, GROK_PERMISSION_MODE.to_string());
+    } else if !is_auth_subcommand {
+        args.insert(0, GROK_ALWAYS_APPROVE.to_string());
+    }
+    args
+}
+
 pub(crate) fn cmd_exec(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -2708,6 +2749,54 @@ mod tests {
     fn codex_launch_args_bypass_flag_leads_empty_args() {
         let args = super::codex_launch_args(false, Vec::new());
         assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
+    }
+
+    #[test]
+    fn grok_launch_args_always_approves_and_trusts_by_default() {
+        let args = super::grok_launch_args(false, vec!["--model".into(), "grok-4.6".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--always-approve",
+                "--trust",
+                "--cwd",
+                "/workspace",
+                "--model",
+                "grok-4.6"
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_launch_args_ask_overrides_guest_permission_mode() {
+        let args = super::grok_launch_args(true, vec!["--model".into(), "grok-4.6".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode",
+                "default",
+                "--trust",
+                "--cwd",
+                "/workspace",
+                "--model",
+                "grok-4.6"
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_launch_args_login_and_logout_keep_trust() {
+        for subcommand in ["login", "logout"] {
+            let args =
+                super::grok_launch_args(false, vec![subcommand.into(), "--device-auth".into()]);
+            assert_eq!(args, vec!["--trust", subcommand, "--device-auth"]);
+        }
+    }
+
+    #[test]
+    fn grok_launch_args_respects_user_cwd() {
+        let args = super::grok_launch_args(false, vec!["--cwd".into(), "/tmp".into()]);
+        assert_eq!(args, vec!["--always-approve", "--trust", "--cwd", "/tmp"]);
     }
 
     #[test]

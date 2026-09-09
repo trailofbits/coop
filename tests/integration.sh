@@ -1034,6 +1034,128 @@ test_claude_bin_path() {
     fi
 }
 
+test_grok_bin_path() {
+    echo ""
+    echo "=== Phase: grok binary path ==="
+
+    if guest_exec test -x /home/ubuntu/.grok/bin/grok; then
+        pass "grok binary exists at GROK_BIN path"
+    else
+        skip "grok binary at GROK_BIN path" "not installed in this image"
+        return
+    fi
+
+    if coop_exec /home/ubuntu/.grok/bin/grok --version >/dev/null; then
+        pass "grok binary invocable via full path"
+    else
+        skip "grok --version" "binary exists but --version returned non-zero"
+    fi
+
+    local link_target
+    if link_target=$(guest_exec readlink /usr/local/bin/grok); then
+        if [[ "$link_target" == "/home/ubuntu/.grok/bin/grok" ]]; then
+            pass "grok symlink in /usr/local/bin"
+        else
+            fail "grok symlink in /usr/local/bin" "points to: $link_target"
+        fi
+    else
+        fail "grok symlink in /usr/local/bin" "not found"
+    fi
+
+    local guest_path
+    if guest_path=$(guest_exec printenv PATH); then
+        if [[ ":$guest_path:" == *":/home/ubuntu/.grok/bin:"* ]]; then
+            pass "~/.grok/bin on PATH in non-interactive session"
+        else
+            fail "~/.grok/bin on PATH in non-interactive session" "PATH=$guest_path"
+        fi
+    else
+        fail "~/.grok/bin on PATH in non-interactive session" "printenv PATH failed; stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec test -x /usr/local/bin/grok-yolo; then
+        pass "grok-yolo shortcut exists"
+    else
+        fail "grok-yolo shortcut exists" "stderr: $(guest_stderr)"
+    fi
+
+    local yolo_content
+    if yolo_content=$(guest_exec cat /usr/local/bin/grok-yolo); then
+        if echo "$yolo_content" | grep -q "always-approve"; then
+            pass "grok-yolo includes --always-approve"
+        else
+            fail "grok-yolo includes --always-approve" "content: $yolo_content"
+        fi
+    else
+        fail "grok-yolo includes --always-approve" "cat failed"
+    fi
+}
+
+test_grok_settings_merge() {
+    echo ""
+    echo "=== Phase: grok settings merge across restart ==="
+
+    # Host ~/.grok/config.toml is recopied every boot, then managed keys
+    # are merged into that copy. Seed a wrong permission_mode and a host-
+    # style [plugins] table so restart proves the merge. trusted_folders.toml
+    # is not copied from the host, so a guest /tmp entry must survive.
+    local seed='mkdir -p ~/.grok && printf "%s\n" '
+    seed+='"[ui]" "vim_mode = true" "permission_mode = \"default\"" "" '
+    seed+='"[plugins]" "sentinel = true" > ~/.grok/config.toml && '
+    seed+='printf "%s\n" "[folders.\"/tmp\"]" "trusted = true" '
+    seed+='> ~/.grok/trusted_folders.toml'
+    if coop_exec sh -c "$seed"; then
+        pass "seed grok config and trust files"
+    else
+        fail "seed grok config and trust files" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop start "$INSTANCE"; then
+        pass "restart for grok settings merge exits 0"
+    else
+        fail "restart for grok settings merge exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local merged
+    if ! merged=$(coop_exec sh -c 'cat ~/.grok/config.toml'); then
+        fail "read merged config.toml after restart" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$merged" | grep -q 'always-approve'; then
+        pass "managed grok permission_mode reapplied after restart"
+    else
+        fail "managed grok permission_mode reapplied after restart" "$merged"
+    fi
+
+    if echo "$merged" | grep -q sentinel; then
+        fail "host [plugins] table dropped after restart" "$merged"
+    else
+        pass "host [plugins] table dropped after restart"
+    fi
+
+    local trust
+    if ! trust=$(coop_exec sh -c 'cat ~/.grok/trusted_folders.toml'); then
+        fail "read trusted_folders.toml after restart" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$trust" | grep -q '/workspace'; then
+        pass "/workspace recorded in trusted_folders.toml"
+    else
+        fail "/workspace recorded in trusted_folders.toml" "$trust"
+    fi
+
+    if echo "$trust" | grep -q '/tmp'; then
+        pass "existing trusted folder survives restart"
+    else
+        fail "existing trusted folder survives restart" "$trust"
+    fi
+}
+
 test_claude_settings_merge() {
     echo ""
     echo "=== Phase: claude settings merge across restart ==="
@@ -1515,10 +1637,11 @@ test_agent_update() {
 
     if coop agent update "$INSTANCE" --check; then
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
-            && echo "$HARNESS_OUT" | grep -q "Codex"; then
-            pass "agent update --check reports both agents"
+            && echo "$HARNESS_OUT" | grep -q "Codex" \
+            && echo "$HARNESS_OUT" | grep -q "Grok Build"; then
+            pass "agent update --check reports all agents"
         else
-            fail "agent update --check reports both agents" "out: $HARNESS_OUT"
+            fail "agent update --check reports all agents" "out: $HARNESS_OUT"
         fi
     else
         fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
@@ -6912,6 +7035,8 @@ main() {
     test_editor
     test_exec
     test_claude_bin_path
+    test_grok_bin_path
+    test_grok_settings_merge
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path

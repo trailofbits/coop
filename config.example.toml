@@ -119,10 +119,10 @@
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
 # [grok]
-# config_dir = "~/.grok"  # AGENTS.md, auth.json, config.toml, rules/, skills/, commands/, plugins/ (false to disable)
+# config_dir = "~/.grok"  # AGENTS.md, auth.json, config.toml, lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/ (false to disable)
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["owner/grok-plugins"]  # owner/repo, git URL, or local path
-# plugins = ["my-skill@grok-plugins"]  # plugin to install (`grok plugin install --trust`)
+# plugins = ["my-skill"]  # plugin name (`grok plugin install --trust`)
 #
 # Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.
 #   api_key = "cmd:op read op://Private/xAI/credential"

@@ -724,10 +724,13 @@ fn needs_rebuild(
 
     let (wanted_m, wanted_p) = crate::guest::collect_baked_lists(cfg, profiles);
     let (wanted_cm, wanted_cp) = crate::guest::collect_codex_baked_lists(cfg);
+    let (wanted_gm, wanted_gp) = crate::guest::collect_grok_baked_lists(cfg);
     existing.marketplaces != wanted_m
         || existing.plugins != wanted_p
         || existing.codex_marketplaces != wanted_cm
         || existing.codex_plugins != wanted_cp
+        || existing.grok_marketplaces != wanted_gm
+        || existing.grok_plugins != wanted_gp
 }
 
 fn build_golden_image(
@@ -848,6 +851,8 @@ fn build_golden_image(
         plugins: baked.plugins,
         codex_marketplaces: baked.codex_marketplaces,
         codex_plugins: baked.codex_plugins,
+        grok_marketplaces: baked.grok_marketplaces,
+        grok_plugins: baked.grok_plugins,
         guest_user: guest_user.clone(),
         oci_features: installed_features(oci_features),
     };
@@ -992,6 +997,8 @@ struct BakedLists {
     plugins: Vec<String>,
     codex_marketplaces: Vec<String>,
     codex_plugins: Vec<String>,
+    grok_marketplaces: Vec<String>,
+    grok_plugins: Vec<String>,
 }
 
 impl BakedLists {
@@ -1000,12 +1007,14 @@ impl BakedLists {
             && self.plugins.is_empty()
             && self.codex_marketplaces.is_empty()
             && self.codex_plugins.is_empty()
+            && self.grok_marketplaces.is_empty()
+            && self.grok_plugins.is_empty()
     }
 }
 
-/// Install Claude and Codex marketplaces and plugins in the builder VM via
-/// SSH. Returns the lists that were installed (for recording in
-/// `TemplateConfig`).
+/// Install Claude, Codex, and Grok Build marketplaces and plugins in the
+/// builder VM via SSH. Returns the lists that were installed (for
+/// recording in `TemplateConfig`).
 fn install_builder_plugins(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
@@ -1013,11 +1022,14 @@ fn install_builder_plugins(
 ) -> Result<BakedLists> {
     let (marketplaces, plugins) = crate::guest::collect_baked_lists(cfg, profiles);
     let (codex_marketplaces, codex_plugins) = crate::guest::collect_codex_baked_lists(cfg);
+    let (grok_marketplaces, grok_plugins) = crate::guest::collect_grok_baked_lists(cfg);
     let baked = BakedLists {
         marketplaces,
         plugins,
         codex_marketplaces,
         codex_plugins,
+        grok_marketplaces,
+        grok_plugins,
     };
 
     if baked.is_empty() {
@@ -1053,6 +1065,14 @@ fn install_builder_plugins(
     }
     if !baked.codex_plugins.is_empty() {
         crate::backend::install_codex_plugins(&session, &codex_bin, &baked.codex_plugins)?;
+    }
+
+    let grok_bin = guest_user.grok_bin();
+    if !baked.grok_marketplaces.is_empty() {
+        crate::backend::install_grok_marketplaces(&session, &grok_bin, &baked.grok_marketplaces)?;
+    }
+    if !baked.grok_plugins.is_empty() {
+        crate::backend::install_grok_plugins(&session, &grok_bin, &baked.grok_plugins)?;
     }
 
     Ok(baked)

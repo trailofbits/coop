@@ -75,14 +75,14 @@ use commands::{
     apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy, cmd_devcontainer,
     cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
     cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
-    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, open_ssh_session,
-    preflight_start_target, prepend_binary, resolve_devcontainer, resolve_devcontainer_collect,
-    resolve_running,
+    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
+    open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
+    resolve_devcontainer_collect, resolve_running,
 };
 
 #[derive(Parser)]
 #[command(name = "coop", version = env!("COOP_VERSION_STR"))]
-#[command(about = "Isolated VM environment for running Claude Code and Codex")]
+#[command(about = "Isolated VM environment for running Claude Code, Codex, and Grok Build")]
 pub(crate) struct Cli {
     /// Path to coop config file
     #[arg(long, default_value_os_t = config::CoopConfig::default_path())]
@@ -137,7 +137,7 @@ enum Commands {
         /// Instance disk size in GiB (only used when creating a new instance)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
-        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
         /// Use github = "off" for this invocation and skip the GitHub PAT prompt
@@ -290,7 +290,7 @@ enum Commands {
         /// Project directory used to select an associated stopped instance
         #[arg(long)]
         workspace: Option<String>,
-        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
         /// Use github = "off" for this invocation and skip the GitHub PAT prompt
@@ -389,6 +389,21 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `codex`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch Grok Build inside the VM (always-approve by default)
+    Grok {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Prompt for permissions instead of skipping them
+        #[arg(long)]
+        ask: bool,
+        /// Extra arguments passed to `grok`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -633,7 +648,7 @@ enum Commands {
         /// Skip the --reprovision confirmation prompt (required off a TTY)
         #[arg(short = 'y', long, requires = "reprovision")]
         yes: bool,
-        /// Skip injecting Claude Code and Codex credentials/config into the VM
+        /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
         #[arg(long, alias = "no-claude", requires = "reprovision")]
         no_agents: bool,
         /// Suppress the interactive prompt to set up a scoped GitHub PAT
@@ -724,8 +739,8 @@ extra line in your shell rc:
 enum AgentAction {
     /// Update coding agent(s) to the latest version inside the VM.
     ///
-    /// With no agent flag, both Claude Code and Codex are updated. The VM
-    /// must be running.
+    /// With no agent flag, Claude Code, Codex, and Grok Build are updated.
+    /// The VM must be running.
     Update {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -733,12 +748,15 @@ enum AgentAction {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Update Claude Code (default: update both agents)
+        /// Update Claude Code (default: update every agent)
         #[arg(long)]
         claude: bool,
-        /// Update Codex (default: update both agents)
+        /// Update Codex (default: update every agent)
         #[arg(long)]
         codex: bool,
+        /// Update Grok Build (default: update every agent)
+        #[arg(long)]
+        grok: bool,
         /// Only report installed vs. latest versions — change nothing
         #[arg(long)]
         check: bool,
@@ -1367,6 +1385,12 @@ pub fn run() -> Result<()> {
             };
             ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
         }
+        Commands::Grok { name, ask, args } => {
+            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let args = grok_launch_args(ask, args);
+            let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
+            ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
+        }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
             cmd_stop(&be, &cfg, &inst)
@@ -1383,6 +1407,7 @@ pub fn run() -> Result<()> {
                     name,
                     claude,
                     codex,
+                    grok,
                     check,
                     yes,
                 },
@@ -1391,7 +1416,7 @@ pub fn run() -> Result<()> {
             &cfg,
             name.as_ref(),
             &AgentUpdateOpts {
-                selection: commands::AgentSelection::from_flags(claude, codex),
+                selection: commands::AgentSelection::from_flags(claude, codex, grok),
                 check,
                 yes,
             },
@@ -1754,6 +1779,7 @@ token = "test-pat"
                     name,
                     claude,
                     codex,
+                    grok,
                     check,
                     yes,
                 },
@@ -1767,6 +1793,7 @@ token = "test-pat"
         );
         assert!(!claude);
         assert!(codex);
+        assert!(!grok);
         assert!(check);
         assert!(!yes);
     }
@@ -1780,6 +1807,7 @@ token = "test-pat"
                     name,
                     claude,
                     codex,
+                    grok,
                     check,
                     yes,
                 },
@@ -1788,7 +1816,7 @@ token = "test-pat"
             panic!("expected Agent::Update variant");
         };
         assert!(name.is_none());
-        assert!(!claude && !codex && !check && !yes);
+        assert!(!claude && !codex && !grok && !check && !yes);
     }
 
     #[test]
@@ -2082,6 +2110,30 @@ token = "test-pat"
         };
         assert!(ask, "--ask keeps Codex's sandbox and approvals");
         assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn grok_name_and_trailing_args_parse() {
+        let cli = parse(&["grok", "myvm", "--", "--model", "grok-4.6"]);
+        let super::Commands::Grok { name, ask, args } = cli.command else {
+            panic!("expected Grok variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert!(!ask, "ask defaults to false (always-approve)");
+        assert_eq!(args, vec!["--model", "grok-4.6"]);
+    }
+
+    #[test]
+    fn grok_ask_flag_parses() {
+        let cli = parse(&["grok", "myvm", "--ask", "--", "--model", "grok-4.6"]);
+        let super::Commands::Grok { ask, args, .. } = cli.command else {
+            panic!("expected Grok variant");
+        };
+        assert!(ask, "--ask restores permission prompts");
+        assert_eq!(args, vec!["--model", "grok-4.6"]);
     }
 
     #[test]

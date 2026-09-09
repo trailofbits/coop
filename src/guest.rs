@@ -488,6 +488,21 @@ pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>)
     (marketplaces, plugins)
 }
 
+/// Collect Grok Build marketplace and plugin lists from global config.
+/// Results are sorted and deduplicated. Profiles contribute nothing here:
+/// profile plugin lists are Claude-only.
+pub fn collect_grok_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>) {
+    let mut marketplaces = cfg.grok.marketplaces.clone();
+    let mut plugins = cfg.grok.plugins.clone();
+
+    marketplaces.sort_unstable();
+    marketplaces.dedup();
+    plugins.sort_unstable();
+    plugins.dedup();
+
+    (marketplaces, plugins)
+}
+
 #[cfg(test)]
 #[expect(clippy::panic, reason = "tests use panic for assertion failures")]
 #[expect(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
@@ -687,6 +702,16 @@ mod tests {
         cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
         cfg.codex.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
         let (marketplaces, plugins) = collect_codex_baked_lists(&cfg);
+        assert_eq!(marketplaces, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(plugins, vec!["p1@a".to_string(), "p2@b".to_string()]);
+    }
+
+    #[test]
+    fn collect_grok_baked_lists_sorts_and_dedups() {
+        let mut cfg = CoopConfig::default();
+        cfg.grok.marketplaces = vec!["b".into(), "a".into(), "a".into()];
+        cfg.grok.plugins = vec!["p2@b".into(), "p1@a".into(), "p2@b".into()];
+        let (marketplaces, plugins) = collect_grok_baked_lists(&cfg);
         assert_eq!(marketplaces, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(plugins, vec!["p1@a".to_string(), "p2@b".to_string()]);
     }

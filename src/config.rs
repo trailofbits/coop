@@ -1558,9 +1558,26 @@ pub struct GrokConfig {
     pub mcp_servers: HashMap<String, McpServerDef>,
 
     /// Source directory for Grok Build files (AGENTS.md, auth.json, config.toml,
-    /// rules/, skills/, commands/, plugins/)
+    /// lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/,
+    /// workflows/)
     #[serde(default)]
     pub config_dir: ConfigDir,
+}
+
+impl GrokConfig {
+    /// Host environment variable names referenced by stdio MCP `env`
+    /// mappings. Grok expands those as `${NAME}` in the guest config, so
+    /// the names must be forwarded into the guest.
+    pub(crate) fn stdio_env_host_names(&self) -> Vec<EnvVarName> {
+        self.mcp_servers
+            .values()
+            .filter_map(|def| match def {
+                McpServerDef::Stdio { env, .. } => Some(env.values().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
 }
 
 /// Codex cloud authentication mode.

@@ -65,6 +65,10 @@ pub struct TemplateConfig {
     #[serde(default)]
     pub codex_plugins: Vec<String>,
     #[serde(default)]
+    pub grok_marketplaces: Vec<String>,
+    #[serde(default)]
+    pub grok_plugins: Vec<String>,
+    #[serde(default)]
     pub guest_user: GuestUser,
     #[serde(default)]
     pub oci_features: Vec<InstalledFeature>,
@@ -587,6 +591,8 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         plugins: Vec::new(),
         codex_marketplaces: Vec::new(),
         codex_plugins: Vec::new(),
+        grok_marketplaces: Vec::new(),
+        grok_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: installed_features(&opts.oci_features),
     };
@@ -1845,6 +1851,8 @@ mod tests {
         // must default to empty rather than failing to deserialize.
         assert!(tc.codex_marketplaces.is_empty());
         assert!(tc.codex_plugins.is_empty());
+        assert!(tc.grok_marketplaces.is_empty());
+        assert!(tc.grok_plugins.is_empty());
     }
 
     #[test]
