@@ -2230,10 +2230,33 @@ test_stop() {
     echo ""
     echo "=== Phase: stop ==="
 
+    local ip tap=""
+    if [[ "$(uname -s)" == Linux ]]; then
+        ip=$(guest_ip_of "$INSTANCE") || ip=""
+        if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
+            && (( 10#${BASH_REMATCH[1]} >= 2 && 10#${BASH_REMATCH[1]} <= 254 )); then
+            tap="tap$(( 10#${BASH_REMATCH[1]} - 2 ))"
+            if [[ -e "/sys/class/net/$tap" ]]; then
+                pass "instance TAP exists before stop"
+            else
+                fail "instance TAP exists before stop" "$tap is absent"
+            fi
+        else
+            fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
+        fi
+    fi
+
     if coop stop "$INSTANCE"; then
         pass "stop exits 0"
     else
         fail "stop exits 0" "exit code: $?"
+    fi
+    if [[ -n "$tap" ]]; then
+        if [[ -e "/sys/class/net/$tap" ]]; then
+            fail "stop removes instance TAP" "$tap still exists"
+        else
+            pass "stop removes instance TAP"
+        fi
     fi
 }
 

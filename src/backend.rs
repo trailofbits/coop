@@ -951,7 +951,12 @@ impl VmBackend for FirecrackerBackend {
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
-        vm.stop()
+        vm.stop()?;
+        // Keep later stop cleanup (including the credential proxy) reachable.
+        if let Err(error) = crate::network::teardown_tap(&cfg.network, &inst) {
+            tracing::warn!("VM stopped, but network cleanup failed: {error}");
+        }
+        Ok(())
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
