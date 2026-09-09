@@ -12,7 +12,7 @@ use crate::config::{CoopConfig, GiB, ImageName, Instance, InstanceName, MiB};
 use crate::devcontainer_oci::{ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
 };
 use crate::remote_command::RemoteCommand;
 use crate::setup::{SetupOptions, TEMPLATE_VERSION, TemplateConfig, utc_timestamp};
@@ -1496,6 +1496,10 @@ fn compose_provision_script(
     s.push_str(SCRIPT_CODEX_ACCOUNT);
     s.push('\n');
 
+    // Grok Build (official installer, runs as the guest user)
+    s.push_str(SCRIPT_GROK);
+    s.push('\n');
+
     // Test hook: inject a provision failure to exercise error detection.
     // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
     if std::env::var("COOP_TEST_INJECT_PROVISION_FAILURE").is_ok() {
@@ -1539,8 +1543,9 @@ echo "{user} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/{user}"
 chmod 440 "/etc/sudoers.d/{user}"
 
 echo "  [guest] Setting up home and SSH for {user} user..."
+# Image skel files arrive as root; this is the guest user's home.
 mkdir -p "{home}"
-chown "{user}:{user}" "{home}"
+chown -R "{user}:{user}" "{home}"
 chmod 755 "{home}"
 install -d -o "{user}" -g "{user}" "{home}/.local"
 install -d -o "{user}" -g "{user}" "{home}/.local/bin"
@@ -1551,29 +1556,36 @@ chown -R "{user}:{user}" "{home}/.ssh"
 chmod 700 "{home}/.ssh"
 chmod 600 "{home}/.ssh/authorized_keys"
 
-echo "  [guest] Adding {user} ~/.local/bin to /etc/environment PATH..."
+echo "  [guest] Adding {user} ~/.grok/bin and ~/.local/bin to /etc/environment PATH..."
 # pam_env reads /etc/environment for every SSH session — login, non-login,
 # and non-interactive (`ssh host cmd`) alike — so this is the one layer that
-# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
-# Code remote sessions. The .profile/.bashrc appends did not: .profile is
-# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
-# pam_env does no variable expansion, so the home path is baked in literally.
+# reaches `coop claude` / `coop grok` (a remote command), their Bash-tool
+# subshells, and VS Code remote sessions. The .profile/.bashrc appends did
+# not: .profile is login-only and the .bashrc line sat below Ubuntu's
+# non-interactive guard. pam_env does no variable expansion, so the home
+# path is baked in literally.
 #
 # /etc/environment is system-wide, so this prepends the guest user's writable
-# ~/.local/bin to PATH for every account, including root. That's safe here:
+# bin dirs to PATH for every account, including root. That's safe here:
 # sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
-# ~/.local/bin, and the guest is a single-user dev VM where that user already
+# those dirs, and the guest is a single-user dev VM where that user already
 # has passwordless root — there is no privilege boundary to cross.
-if ! grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
-    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
-        sed -i 's|^PATH="|PATH="{home}/.local/bin:|' /etc/environment
+if ! grep -q '^PATH="{home}/.grok/bin:' /etc/environment 2>/dev/null; then
+    if grep -q '^PATH="{home}/.local/bin:' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="{home}/.local/bin:|PATH="{home}/.grok/bin:{home}/.local/bin:|' /etc/environment
+    elif grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i 's|^PATH="|PATH="{home}/.grok/bin:{home}/.local/bin:|' /etc/environment
     else
-        echo 'PATH="{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
+        echo 'PATH="{home}/.grok/bin:{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"' >> /etc/environment
     fi
 fi
 
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
+
+echo '  [guest] Symlinking grok into system PATH...'
+ln -sf "{home}/.grok/bin/grok" /usr/local/bin/grok
+ln -sf "{home}/.grok/bin/agent" /usr/local/bin/agent
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -1581,6 +1593,13 @@ cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
 exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
+
+echo '  [guest] Installing grok-yolo shortcut...'
+cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
+#!/bin/bash
+exec grok --always-approve --trust --cwd /workspace "$@"
+YOLOEOF
+chmod 755 /usr/local/bin/grok-yolo
 
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'
@@ -1982,15 +2001,34 @@ mod tests {
         // PATH is set in /etc/environment (pam_env applies it to every SSH
         // session), with the guest home interpolated as a literal path.
         assert!(
-            script
-                .contains("sed -i 's|^PATH=\"|PATH=\"/home/ubuntu/.local/bin:|' /etc/environment"),
-            "should prepend ~/.local/bin to /etc/environment PATH",
+            script.contains(
+                "sed -i 's|^PATH=\"|PATH=\"/home/ubuntu/.grok/bin:/home/ubuntu/.local/bin:|' /etc/environment"
+            ),
+            "should prepend ~/.grok/bin and ~/.local/bin to /etc/environment PATH",
         );
         // The old PATH appends to .profile/.bashrc are gone (see issue #248).
         assert!(
             !script.contains(">> \"/home/ubuntu/.profile\"")
                 && !script.contains(">> \"/home/ubuntu/.bashrc\""),
             "should no longer append PATH to .profile/.bashrc",
+        );
+    }
+
+    #[test]
+    fn provision_script_chowns_guest_home_recursively() {
+        // Image skel files arrive as root; the guest must own their home.
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+        assert!(
+            script
+                .lines()
+                .any(|line| line.trim() == r#"chown -R "ubuntu:ubuntu" "/home/ubuntu""#),
+            "guest home must be chowned recursively so image skel files \
+             are writable by the guest user:\n{script}"
         );
     }
 
@@ -2077,6 +2115,25 @@ mod tests {
             script.contains("exec codex-account --dangerously-bypass-approvals-and-sandbox"),
             "codex-yolo should route through the account wrapper so keyring \
              mode works from an in-guest shell",
+        );
+    }
+
+    #[test]
+    fn provision_script_installs_grok() {
+        let script = compose_provision_script(
+            "ssh-ed25519 AAAA test@test",
+            &[],
+            &[],
+            &GuestUser::default(),
+        );
+
+        assert!(
+            script.contains("Installing Grok Build CLI"),
+            "Lima provision script should install Grok Build CLI",
+        );
+        assert!(
+            script.contains("https://x.ai/cli/install.sh"),
+            "Lima provision script should use the official Grok installer",
         );
     }
 

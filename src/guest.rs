@@ -113,6 +113,14 @@ impl GuestUser {
     pub fn claude_bin(&self) -> GuestPath {
         GuestPath::new(format!("/home/{}/.local/bin/claude", self.0))
     }
+
+    /// Where the Grok Build installer places the per-user binary.
+    /// The official installer writes to `~/.grok/bin/grok` and a same-file
+    /// `agent` link; coop calls this path directly so launch does not depend
+    /// on PATH resolution.
+    pub fn grok_bin(&self) -> GuestPath {
+        GuestPath::new(format!("/home/{}/.grok/bin/grok", self.0))
+    }
 }
 
 /// Stable system path linking to the guest user's native Codex launcher.
@@ -170,11 +178,12 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
+        user.grok_bin(),
         codex_bin(),
         codex_account_bin(),
         // The Secret Service stack `codex-account` drives. Checking the
@@ -229,6 +238,7 @@ pub const SCRIPT_DOCKER_REPO: &str = include_str!("../scripts/guest/docker-repo.
 pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.sh");
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
+pub const SCRIPT_GROK: &str = include_str!("../scripts/guest/grok.sh");
 
 /// Packages installed into every golden image.
 ///
@@ -682,6 +692,26 @@ mod tests {
     }
 
     #[test]
+    fn grok_script_downloads_installer_to_file() {
+        assert!(
+            SCRIPT_GROK.contains("https://x.ai/cli/install.sh"),
+            "Grok installer should download the official install script",
+        );
+        assert!(
+            SCRIPT_GROK.contains("su - \"${GUEST_USER}\""),
+            "Grok installer should run as the guest user",
+        );
+        assert!(
+            SCRIPT_GROK.contains("/.grok/bin/grok"),
+            "Grok installer should verify ~/.grok/bin/grok",
+        );
+        assert!(
+            !SCRIPT_GROK.contains("trap "),
+            "Grok installer must not replace the concatenated script's EXIT trap"
+        );
+    }
+
+    #[test]
     fn all_builtins_resolve() {
         let custom = HashMap::new();
         for bp in BUILTIN_PROFILES {
@@ -858,6 +888,11 @@ mod tests {
             bins.iter()
                 .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
             "guest image should include the Codex account-auth wrapper",
+        );
+        assert!(
+            bins.iter()
+                .any(|b| b.to_string() == "/home/ubuntu/.grok/bin/grok"),
+            "guest image should include Grok Build",
         );
         // The wrapper is written unconditionally by the provision script, so
         // verifying it alone cannot catch the packages failing to install.

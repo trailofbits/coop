@@ -83,9 +83,10 @@ fi
 echo "${GUEST_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${GUEST_USER}"
 chmod 440 "/etc/sudoers.d/${GUEST_USER}"
 
-# Ensure home directory exists with correct ownership
+# The image ships home skel files as root. This is the guest user's
+# home, so they must own its contents.
 mkdir -p "${GUEST_HOME}"
-chown "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}"
+chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}"
 chmod 755 "${GUEST_HOME}"
 
 # Create .local tree — the Claude Code installer expects to write here
@@ -100,29 +101,36 @@ chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}/.ssh"
 chmod 700 "${GUEST_HOME}/.ssh"
 chmod 600 "${GUEST_HOME}/.ssh/authorized_keys"
 
-echo "  [guest] Adding ${GUEST_USER} ~/.local/bin to /etc/environment PATH..."
+echo "  [guest] Adding ${GUEST_USER} ~/.grok/bin and ~/.local/bin to /etc/environment PATH..."
 # pam_env reads /etc/environment for every SSH session — login, non-login,
 # and non-interactive (`ssh host cmd`) alike — so this is the one layer that
-# reaches `coop claude` (a remote command), its Bash-tool subshells, and VS
-# Code remote sessions. The .profile/.bashrc appends did not: .profile is
-# login-only and the .bashrc line sat below Ubuntu's non-interactive guard.
-# pam_env does no variable expansion, so the home path is baked in literally.
+# reaches `coop claude` / `coop grok` (a remote command), their Bash-tool
+# subshells, and VS Code remote sessions. The .profile/.bashrc appends did
+# not: .profile is login-only and the .bashrc line sat below Ubuntu's
+# non-interactive guard. pam_env does no variable expansion, so the home
+# path is baked in literally.
 #
 # /etc/environment is system-wide, so this prepends the guest user's writable
-# ~/.local/bin to PATH for every account, including root. That's safe here:
+# bin dirs to PATH for every account, including root. That's safe here:
 # sudo keeps Ubuntu's default secure_path (we set no override), so it ignores
-# ~/.local/bin, and the guest is a single-user dev VM where that user already
+# those dirs, and the guest is a single-user dev VM where that user already
 # has passwordless root — there is no privilege boundary to cross.
-if ! grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
-    if grep -q '^PATH="' /etc/environment 2>/dev/null; then
-        sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.local/bin:|" /etc/environment
+if ! grep -q "^PATH=\"${GUEST_HOME}/.grok/bin:" /etc/environment 2>/dev/null; then
+    if grep -q "^PATH=\"${GUEST_HOME}/.local/bin:" /etc/environment 2>/dev/null; then
+        sed -i "s|^PATH=\"${GUEST_HOME}/.local/bin:|PATH=\"${GUEST_HOME}/.grok/bin:${GUEST_HOME}/.local/bin:|" /etc/environment
+    elif grep -q '^PATH="' /etc/environment 2>/dev/null; then
+        sed -i "s|^PATH=\"|PATH=\"${GUEST_HOME}/.grok/bin:${GUEST_HOME}/.local/bin:|" /etc/environment
     else
-        echo "PATH=\"${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
+        echo "PATH=\"${GUEST_HOME}/.grok/bin:${GUEST_HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games\"" >> /etc/environment
     fi
 fi
 
 echo '  [guest] Symlinking claude into system PATH...'
 ln -sf "${GUEST_HOME}/.local/bin/claude" /usr/local/bin/claude
+
+echo '  [guest] Symlinking grok into system PATH...'
+ln -sf "${GUEST_HOME}/.grok/bin/grok" /usr/local/bin/grok
+ln -sf "${GUEST_HOME}/.grok/bin/agent" /usr/local/bin/agent
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
@@ -130,6 +138,13 @@ cat > /usr/local/bin/claude-yolo <<'YOLOEOF'
 exec claude --dangerously-skip-permissions "$@"
 YOLOEOF
 chmod 755 /usr/local/bin/claude-yolo
+
+echo '  [guest] Installing grok-yolo shortcut...'
+cat > /usr/local/bin/grok-yolo <<'YOLOEOF'
+#!/bin/bash
+exec grok --always-approve --trust --cwd /workspace "$@"
+YOLOEOF
+chmod 755 /usr/local/bin/grok-yolo
 
 echo '  [guest] Installing codex-yolo shortcut...'
 cat > /usr/local/bin/codex-yolo <<'YOLOEOF'

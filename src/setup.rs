@@ -13,7 +13,8 @@ use crate::config::{CoopConfig, ImageName, Instance, InstanceName};
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
+    resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -690,7 +691,7 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, Codex, and profile packages");
+    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, and profile packages");
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -889,6 +890,8 @@ fn compose_recipe(
     // Codex's native installer keeps the full package under the guest user's home.
     s.push_str(SCRIPT_CODEX);
     s.push_str(SCRIPT_CODEX_ACCOUNT);
+    // Grok Build installs under ~/.grok/bin for the guest user.
+    s.push_str(SCRIPT_GROK);
 
     s
 }
@@ -1446,7 +1449,7 @@ fn install_guest_packages(
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
+    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -1789,6 +1792,14 @@ mod tests {
             "codex-yolo should route through the account wrapper so keyring \
              mode works from an in-guest shell",
         );
+        assert!(
+            script.contains("Installing Grok Build CLI"),
+            "base recipe should install Grok Build CLI",
+        );
+        assert!(
+            script.contains("https://x.ai/cli/install.sh"),
+            "base recipe should use the official Grok installer",
+        );
         no_consecutive_concat(&script);
     }
 
@@ -1799,6 +1810,19 @@ mod tests {
         assert!(
             script.contains("export GUEST_USER='vscode'"),
             "recipe must export GUEST_USER for the chroot scripts:\n{script}"
+        );
+    }
+
+    #[test]
+    fn compose_recipe_chowns_guest_home_recursively() {
+        // Image skel files arrive as root; the guest must own their home.
+        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        assert!(
+            script.lines().any(|line| {
+                line.trim() == r#"chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}""#
+            }),
+            "guest home must be chowned recursively so squashfs skel files \
+             are writable by the guest user:\n{script}"
         );
     }
 
