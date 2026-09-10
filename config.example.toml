@@ -46,7 +46,14 @@
 # MY_FLAG = "1"
 
 # [claude]
-# config_dir = "~/.claude"  # path to copy CLAUDE.md, rules/, commands/ from (false to disable)
+# Copies CLAUDE.md, keybindings.json, rules/, commands/, skills/, agents/,
+# output-styles/, themes/, workflows/ (complete bundles; follows symlinks).
+# Narrowly imports disableAllHooks, outputStyle and copied @skills-dir plugin
+# preferences; unrelated host settings and plugin installation state stay out.
+# Restarts overlay files; host deletions/false retain copies. Active-source
+# preference removal restores prior guest values; false retains last preferences.
+# Sources with skills/manifest.json sync bookkeeping need a separate custom source.
+# config_dir = "~/.claude"  # custom source path, or false to stop copying
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["https://github.com/anthropics/claude-plugins-official"]
 # plugins = ["rust-analyzer-lsp@claude-plugins-official"]

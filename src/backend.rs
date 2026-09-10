@@ -1520,10 +1520,10 @@ pub fn bootstrap_agents(
 /// Bootstrap Claude Code in the guest declaratively.
 ///
 /// Runs the bootstrap sequence: GitHub auth, user content
-/// (CLAUDE.md, rules), marketplaces, plugins, MCP servers.
+/// (allowlisted customizations and companion preferences), marketplaces, plugins, MCP servers.
 ///
-/// On `BootMode::Restart`, only refreshes ephemeral state
-/// (GitHub auth, CLAUDE.md, rules). Marketplaces, plugins, and
+/// On `BootMode::Restart`, refreshes GitHub auth, customizations and preferences.
+/// Marketplaces, plugins, and
 /// MCP servers persist on the guest disk across stop/start.
 ///
 /// Claude auth is NOT handled here — the user authenticates
@@ -1559,8 +1559,8 @@ fn bootstrap_claude(
         }
     }
 
-    // User config (CLAUDE.md, rules/, commands/) — host files may have changed
-    copy_claude_config(&session.target, &claude.config_dir)?;
+    // Overlay customizations and refresh their narrow preferences before any Claude invocation.
+    let staged_config = prepare_claude_config_import(&session.target, &claude.config_dir)?;
 
     // Managed permissions: pre-accept bypass mode so `coop ca` and
     // `coop claude` skip prompts without an interactive acceptance step.
@@ -1580,6 +1580,11 @@ fn bootstrap_claude(
     let result = (|| -> Result<()> {
         let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
         write_managed_claude_settings(&session.target, &local_env)?;
+        // Apply disables before extensions become visible, including partially
+        // copied bundles if a transfer fails and leaves the VM running.
+        if let Some(staged) = &staged_config {
+            copy_staged_to_guest(&session.target, staged, ".claude", "Claude")?;
+        }
 
         // Work around the onboarding wizard ignoring CLAUDE_CODE_OAUTH_TOKEN
         // (anthropics/claude-code#8938). Runs on every boot so a token added
@@ -2010,20 +2015,40 @@ fn setup_github_auth(session: &SshSession) -> Result<()> {
         .context("Failed to configure git credential helper in guest")
 }
 
-/// Stage allowlisted files from a host Claude config directory into
-/// a temp dir, then scp them to the guest's `~/.claude/`.
+/// Stage allowlisted host Claude content and persist its preference snapshot.
+/// The caller applies settings before transferring any staged content.
 ///
-/// Allowlist: `CLAUDE.md`, `rules/`, `commands/`.
+/// See `CLAUDE_ALLOWED_FILES` and `CLAUDE_ALLOWED_DIRS`. Complete bundles
+/// are copied, following symlinks through the existing copier. This is an
+/// overlay: removed host files and disabled copying never delete guest files.
 /// Missing source directory or missing individual entries are silently
 /// skipped (debug-logged).
-fn copy_claude_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+fn prepare_claude_config_import(
+    target: &SshTarget,
+    config_dir: &ConfigDir,
+) -> Result<Option<tempfile::TempDir>> {
     let Some(source_dir) = resolve_config_source_dir(config_dir, ".claude", "claude.config_dir")
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     let staged = stage_allowed_files(&source_dir).context("Failed to stage Claude config files")?;
-    copy_staged_to_guest(target, &staged, ".claude", "Claude")
+    // Resolve preferences from the staged tree: these are exactly the bundles
+    // being copied. Fail before copying if host preferences cannot be read.
+    let mut snapshot = read_claude_import_snapshot(target)?;
+    snapshot
+        .plugin_ids
+        .extend(claude_skills_plugin_ids(staged.path())?);
+    snapshot.preferences = claude_import_preferences(&source_dir, &snapshot.plugin_ids)?;
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
+    target.exec_with_stdin(
+        RemoteCommand::new().literal(
+            "t=\"$(mktemp ~/.claude/coop-import.json.XXXXXX)\" && \
+             cat > \"$t\" && mv \"$t\" ~/.claude/coop-import.json",
+        ),
+        serde_json::to_vec(&snapshot)?,
+    )?;
+    Ok(Some(staged))
 }
 
 /// Copy every entry staged in `staged` into the guest's `~/<guest_subdir>/`,
@@ -2068,6 +2093,265 @@ fn copy_staged_to_guest(
 
     tracing::info!("Copied {label} config into guest");
     Ok(())
+}
+
+/// Only preferences with a companion in the copied customization contract.
+/// Unknown host settings never enter the guest snapshot.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeImportPreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disable_all_hooks: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_style: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    enabled_plugins: BTreeMap<String, bool>,
+}
+
+/// Previously copied bundles remain in the overlay even when removed at source.
+/// Keep their identities eligible for explicit host preferences on later starts.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeImportSnapshot {
+    #[serde(default)]
+    preferences: ClaudeImportPreferences,
+    #[serde(default)]
+    plugin_ids: std::collections::BTreeSet<String>,
+}
+
+fn read_claude_import_snapshot(target: &SshTarget) -> Result<ClaudeImportSnapshot> {
+    let body = target.capture(
+        "if test -e ~/.claude/coop-import.json; then cat ~/.claude/coop-import.json; else printf '{}'; fi",
+    )?;
+    serde_json::from_str(&body)
+        .map_err(|_| anyhow::anyhow!("Invalid Claude import preference snapshot"))
+}
+
+/// Claude 2.1.259 discovers immediate, non-hidden skills directories with a
+/// plugin manifest, using its name verbatim plus @skills-dir. Sync ownership
+/// bookkeeping is a separate contract and fails explicitly instead of copying
+/// unrelated installation state or guessing which suppressed plugins may load.
+fn claude_skills_plugin_ids(
+    source: &std::path::Path,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let skills = source.join("skills");
+    let entries = match std::fs::read_dir(&skills) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // Claude's sync registry includes Unicode-normalized claims and escaped
+    // legacy names. Importing only some registry state can activate previously
+    // suppressed plugins. A dedicated export directory avoids that ambiguity.
+    match std::fs::symlink_metadata(skills.join("manifest.json")) {
+        Ok(_) => anyhow::bail!(
+            "Claude skills sync bookkeeping is not supported by customization import; use a custom config_dir without skills/manifest.json"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        let directory_name = entry.file_name();
+        let Some(directory_name) = directory_name.to_str() else {
+            anyhow::bail!("Claude skill directory names must be UTF-8 for preference import");
+        };
+        let without_formatting: String = directory_name.chars().filter(|c| !matches!(c,
+            '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+        )).collect();
+        // Claude's hidden-name check lowercases, strips formatting/ADS, and
+        // strips trailing dots/spaces. These operations cannot change the
+        // leading dot except formatting removal.
+        if without_formatting.starts_with('.') {
+            continue;
+        }
+        // Only equality to ASCII "synced" matters here: NFD cannot remove
+        // combining marks to create that name. Case folding handles long-s.
+        let reserved: String = directory_name.trim_end_matches(['.', ' ']).chars()
+            .filter(|c| !matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'))
+            .collect::<String>().to_uppercase().to_lowercase();
+        if reserved == "synced" {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let bytes = match std::fs::read(entry.path().join(".claude-plugin/plugin.json")) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Do not fall back to the directory basename: that is merely the
+        // diagnostic identity of an unloadable plugin in Claude's listing.
+        // Fail visibly rather than silently lose a disabled preference.
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let name = manifest
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Claude plugin manifest must contain a string name"))?;
+        if name.is_empty() || name.contains(' ') || name.chars().any(|c| matches!(c, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+            anyhow::bail!("Claude plugin manifest name is invalid; fix the plugin manifest in the configured source");
+        }
+        ids.insert(format!("{name}@skills-dir"));
+    }
+    Ok(ids)
+}
+
+/// Read the host settings as data only; never invoke host Claude or plugin code.
+/// Invalid relevant preferences stop bootstrap rather than silently enabling code.
+fn claude_import_preferences(
+    source: &Path,
+    plugin_ids: &std::collections::BTreeSet<String>,
+) -> Result<ClaudeImportPreferences> {
+    let body = match std::fs::read_to_string(source.join("settings.json")) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
+        Err(err) => return Err(err).context("Failed to read host Claude settings"),
+    };
+    let host: serde_json::Value =
+        serde_json::from_str(&body).context("Host Claude settings must be valid JSON")?;
+    let host = host
+        .as_object()
+        .context("Host Claude settings must be an object")?;
+    let mut selected = serde_json::Map::new();
+    for key in ["disableAllHooks", "outputStyle"] {
+        if let Some(value) = host.get(key) {
+            if (key == "disableAllHooks" && !value.is_boolean())
+                || (key == "outputStyle" && !value.is_string())
+            {
+                bail!("Invalid host Claude companion preference type for {key}");
+            }
+            selected.insert(key.to_owned(), value.clone());
+        }
+    }
+    let mut plugins = serde_json::Map::new();
+    if let Some(enabled) = host.get("enabledPlugins") {
+        let enabled = enabled
+            .as_object()
+            .context("Host enabledPlugins must be an object")?;
+        for id in plugin_ids {
+            if let Some(value) = enabled.get(id) {
+                if !value.is_boolean() {
+                    bail!("Invalid host Claude plugin preference type");
+                }
+                plugins.insert(id.clone(), value.clone());
+            }
+        }
+    }
+    selected.insert("enabledPlugins".to_owned(), plugins.into());
+    serde_json::from_value(selected.into()).context("Invalid imported Claude companion preference")
+}
+
+/// Restore previous guest values only while the old imported value is still
+/// present. A guest edit made after import becomes the baseline on refresh.
+fn merge_imported_values(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    incoming: &serde_json::Map<String, serde_json::Value>,
+    applied: &serde_json::Map<String, serde_json::Value>,
+    previous: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    for (key, value) in applied {
+        if target.get(key) == Some(value) {
+            if let Some(original) = previous.get(key) {
+                target.insert(key.clone(), original.clone());
+            } else {
+                target.remove(key);
+            }
+        }
+    }
+    let mut baseline = serde_json::Map::new();
+    for (key, value) in incoming {
+        if let Some(original) = target.insert(key.clone(), value.clone()) {
+            baseline.insert(key.clone(), original);
+        }
+    }
+    baseline
+}
+
+/// Atomically carry import ownership with settings, so refresh can remove host
+/// overrides without deleting guest preferences. The separate coop-import.json
+/// snapshot lets the same narrow preferences survive corrupt-settings recovery.
+fn merge_claude_import_preferences(
+    existing: &str,
+    imported: &ClaudeImportPreferences,
+) -> Result<String> {
+    const STATE_KEY: &str = "_coopImportedPreferences";
+    let mut root: serde_json::Value = serde_json::from_str(existing)?;
+    let root = root
+        .as_object_mut()
+        .context("Claude settings must be an object")?;
+    let empty = serde_json::Map::new();
+    let state = root.remove(STATE_KEY).unwrap_or_default();
+    let applied: ClaudeImportPreferences = serde_json::from_value(
+        state
+            .get("applied")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .map_err(|_| anyhow::anyhow!("Invalid Claude import ownership metadata"))?;
+    let previous = state
+        .get("previous")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(&empty);
+    let mut incoming = serde_json::to_value(imported)?
+        .as_object()
+        .context("Imported preferences must be an object")?
+        .clone();
+    let mut applied = serde_json::to_value(applied)?
+        .as_object()
+        .context("Applied preferences must be an object")?
+        .clone();
+    let incoming_plugins = incoming
+        .remove("enabledPlugins")
+        .unwrap_or_else(|| serde_json::json!({}));
+    let applied_plugins = applied
+        .remove("enabledPlugins")
+        .unwrap_or_else(|| serde_json::json!({}));
+    let incoming_plugins = incoming_plugins
+        .as_object()
+        .context("Imported plugins must be an object")?;
+    let applied_plugins = applied_plugins
+        .as_object()
+        .context("Applied plugins must be an object")?;
+    let mut baseline = merge_imported_values(root, &incoming, &applied, previous);
+    if !incoming_plugins.is_empty() || !applied_plugins.is_empty() {
+        let plugins = root
+            .entry("enabledPlugins")
+            .or_insert_with(|| serde_json::json!({}));
+        let plugins = plugins
+            .as_object_mut()
+            .context("Guest enabledPlugins must be an object")?;
+        let plugin_baseline = merge_imported_values(
+            plugins,
+            incoming_plugins,
+            applied_plugins,
+            previous
+                .get("enabledPlugins")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or(&empty),
+        );
+        baseline.insert("enabledPlugins".to_owned(), plugin_baseline.into());
+    }
+    if imported.disable_all_hooks.is_some()
+        || imported.output_style.is_some()
+        || !imported.enabled_plugins.is_empty()
+    {
+        root.insert(
+            STATE_KEY.to_owned(),
+            serde_json::json!({"applied": imported, "previous": baseline}),
+        );
+    }
+    serde_json::to_string(root).context("Failed to serialize imported Claude preferences")
 }
 
 /// JSON body of the managed `~/.claude/settings.json` written to every guest.
@@ -2168,8 +2452,9 @@ fn merge_managed_claude_settings(
 /// file and merges coop's managed `permissions` keys (and, in local-model
 /// mode, the `env` block) into it via [`merge_managed_claude_settings`], so
 /// plugin/marketplace state Claude Code persists in this file
-/// (`enabledPlugins`, `extraKnownMarketplaces`) survives across reboots. A
-/// file that cannot be parsed is replaced with managed defaults.
+/// (`enabledPlugins`, `extraKnownMarketplaces`) survives across reboots except
+/// for explicitly imported preferences. A file that cannot be parsed is
+/// replaced with managed defaults, then the import snapshot is reapplied.
 ///
 /// The write is staged to a temp file and renamed into place so a
 /// `claude`/`coop ca` session reading the file concurrently (during a
@@ -2190,10 +2475,34 @@ fn write_managed_claude_settings(
     // back with the write that follows; if that is ever shown to lose a
     // readable file in practice, distinguish a non-zero ssh exit from a decode
     // error and `?`-propagate the former.
-    let merged = match target
-        .capture("cat ~/.claude/settings.json 2>/dev/null || true")
-        .and_then(|existing| merge_managed_claude_settings(&existing, local_env))
-    {
+    // Keep the last snapshot when copying is disabled or its source disappears.
+    // Do not recover a corrupt snapshot as empty: that could activate extensions.
+    let imported = read_claude_import_snapshot(target)?.preferences;
+    let merged = claude_settings_with_import(
+        target.capture("cat ~/.claude/settings.json 2>/dev/null || true"),
+        local_env,
+        &imported,
+    )?;
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
+            ),
+            merged.into_bytes(),
+        )
+        .context("Failed to write managed ~/.claude/settings.json in guest")?;
+    tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
+    Ok(())
+}
+
+/// The normal merge and corrupt-settings recovery share one final import step.
+fn claude_settings_with_import(
+    existing: Result<String>,
+    local_env: &BTreeMap<String, String>,
+    imported: &ClaudeImportPreferences,
+) -> Result<String> {
+    let merged = match existing.and_then(|body| merge_managed_claude_settings(&body, local_env)) {
         Ok(merged) => merged,
         Err(err) => {
             tracing::warn!(
@@ -2210,17 +2519,8 @@ fn write_managed_claude_settings(
         }
     };
 
-    target
-        .exec_with_stdin(
-            RemoteCommand::new().literal(
-                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
-                 cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
-            ),
-            merged.into_bytes(),
-        )
-        .context("Failed to write managed ~/.claude/settings.json in guest")?;
-    tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
-    Ok(())
+    // Reapply even after settings recovery, before onboarding/plugin/MCP commands.
+    merge_claude_import_preferences(&merged, imported)
 }
 
 /// Work around Claude Code's onboarding wizard ignoring a forwarded OAuth
@@ -2666,8 +2966,23 @@ fn stage_selected_files(
     Ok(staging)
 }
 
+/// Top-level Claude content copied verbatim; settings are narrowly merged.
+const CLAUDE_ALLOWED_FILES: &[&str] = &["CLAUDE.md", "keybindings.json"];
+
+/// Complete recursive bundles, including plugin-local hooks and monitors.
+/// Top-level hooks/, monitors/, routines/ have no supported import contract.
+const CLAUDE_ALLOWED_DIRS: &[&str] = &[
+    "rules",
+    "commands",
+    "skills",
+    "agents",
+    "output-styles",
+    "themes",
+    "workflows",
+];
+
 fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
-    stage_selected_files(source_dir, &["CLAUDE.md"], &["rules", "commands"])
+    stage_selected_files(source_dir, CLAUDE_ALLOWED_FILES, CLAUDE_ALLOWED_DIRS)
 }
 
 /// Allowlisted files copied verbatim from the host Codex config dir. In proxy
@@ -3709,8 +4024,367 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert_eq!(usage.mem_used_mib, 0);
     }
 
+    fn claude_plugin_fixture(root: &Path, directory: &str, manifest: &str) {
+        let path = root.join("skills").join(directory).join(".claude-plugin");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("plugin.json"), manifest).unwrap();
+    }
+
     #[test]
-    fn stage_allowed_files_copies_all_allowlisted() {
+    fn claude_import_plugin_discovery_matches_native_identities() {
+        let src = tempfile::tempdir().unwrap();
+        assert!(claude_skills_plugin_ids(src.path()).unwrap().is_empty());
+        for (directory, name) in [
+            ("directory", "manifest-name"),
+            ("nested/inner", "nested"),
+            (".hidden", "hidden"),
+            ("synced", "sync"),
+            ("SyNcEd. ", "reserved"),
+            ("ſynced", "long-s-reserved"),
+            ("s\u{200c}ynced", "format-reserved"),
+            ("unicodé", "unicode-name"),
+            ("special", "some/name@source"),
+        ] {
+            claude_plugin_fixture(
+                src.path(),
+                directory,
+                &serde_json::json!({"name":name}).to_string(),
+            );
+        }
+        std::fs::write(
+            src.path().join("skills/directory/SKILL.md"),
+            "---\nname: frontmatter-name\n---\n",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_skills_plugin_ids(src.path()).unwrap(),
+            [
+                "manifest-name@skills-dir".into(),
+                "unicode-name@skills-dir".into(),
+                "some/name@source@skills-dir".into()
+            ]
+            .into()
+        );
+    }
+
+    #[test]
+    fn claude_import_reports_unsupported_sync_and_invalid_manifests() {
+        let src = tempfile::tempdir().unwrap();
+        claude_plugin_fixture(src.path(), "plugin", r#"{"name":"valid"}"#);
+        std::fs::write(src.path().join("skills/manifest.json"), r#"{"skills":[]}"#).unwrap();
+        assert!(
+            claude_skills_plugin_ids(src.path())
+                .unwrap_err()
+                .to_string()
+                .contains("sync bookkeeping")
+        );
+        std::fs::remove_file(src.path().join("skills/manifest.json")).unwrap();
+        for manifest in [
+            "invalid",
+            "{}",
+            r#"{"name":""}"#,
+            r#"{"name":"bad name"}"#,
+            r#"{"name":"bad\u0001name"}"#,
+        ] {
+            claude_plugin_fixture(src.path(), "plugin", manifest);
+            assert!(claude_skills_plugin_ids(src.path()).is_err(), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn claude_import_selects_only_companion_preferences_and_exact_copied_ids() {
+        let src = tempfile::tempdir().unwrap();
+        claude_plugin_fixture(
+            src.path(),
+            "directory",
+            r#"{"name":"identity","defaultEnabled":false}"#,
+        );
+        let ids = claude_skills_plugin_ids(src.path()).unwrap();
+        let empty = claude_import_preferences(src.path(), &ids).unwrap();
+        assert!(empty.enabled_plugins.is_empty()); // never synthesize enablement
+        assert!(empty.disable_all_hooks.is_none());
+        for enabled in [true, false] {
+            let host = serde_json::json!({"disableAllHooks":false,"outputStyle":"host-style",
+                "enabledPlugins":{"identity@skills-dir":enabled,"directory@skills-dir":!enabled,
+                    "IDENTITY@skills-dir":!enabled,"unrelated@market":true},
+                "permissions":{"defaultMode":"plan"},"env":{"TOKEN":"secret"},
+                "apiKeyHelper":"secret","hooks":{"SessionStart":[]},"extraKnownMarketplaces":{"excluded":{}}});
+            std::fs::write(src.path().join("settings.json"), host.to_string()).unwrap();
+            let selected = claude_import_preferences(src.path(), &ids).unwrap();
+            assert_eq!(
+                serde_json::to_value(selected).unwrap(),
+                serde_json::json!({
+                "disableAllHooks":false,"outputStyle":"host-style","enabledPlugins":{"identity@skills-dir":enabled}})
+            );
+        }
+        // Removed bundles remain on guest disk. Their recorded IDs must still
+        // select an explicit host disable without importing other plugins.
+        std::fs::remove_dir_all(src.path().join("skills")).unwrap();
+        assert!(
+            !claude_import_preferences(src.path(), &ids)
+                .unwrap()
+                .enabled_plugins["identity@skills-dir"]
+        );
+        std::fs::remove_file(src.path().join("settings.json")).unwrap();
+        assert!(
+            claude_import_preferences(src.path(), &ids)
+                .unwrap()
+                .enabled_plugins
+                .is_empty()
+        );
+        assert!(resolve_config_source_dir(&ConfigDir::Disabled, ".claude", "test").is_none());
+        assert!(
+            resolve_config_source_dir(
+                &ConfigDir::Custom(crate::config::ConfigPath::new(src.path().join("missing"))),
+                ".claude",
+                "test"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            resolve_config_source_dir(
+                &ConfigDir::Custom(crate::config::ConfigPath::new(src.path())),
+                ".claude",
+                "test"
+            )
+            .unwrap(),
+            src.path()
+        );
+    }
+
+    #[test]
+    fn claude_import_rejects_invalid_preferences_without_fallback_enablement() {
+        let src = tempfile::tempdir().unwrap();
+        let ids = ["identity@skills-dir".into()].into();
+        for body in [
+            "broken",
+            "[]",
+            r#"{"disableAllHooks":"true"}"#,
+            r#"{"disableAllHooks":null}"#,
+            r#"{"outputStyle":null}"#,
+            r#"{"outputStyle":false}"#,
+            r#"{"enabledPlugins":[]}"#,
+            r#"{"enabledPlugins":{"identity@skills-dir":"false"}}"#,
+        ] {
+            std::fs::write(src.path().join("settings.json"), body).unwrap();
+            assert!(
+                claude_import_preferences(src.path(), &ids).is_err(),
+                "{body}"
+            );
+        }
+        assert!(serde_json::from_str::<ClaudeImportSnapshot>("broken").is_err());
+        assert!(
+            serde_json::from_str::<ClaudeImportSnapshot>(
+                r#"{"preferences":{"env":{"SECRET":"x"}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn claude_import_complete_bundles_and_exclusions() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let files = [
+            "CLAUDE.md",
+            "keybindings.json",
+            "rules/nested/rule.md",
+            "commands/cmd.md",
+            "agents/agent.md",
+            "output-styles/style.md",
+            "themes/theme.json",
+            "workflows/flow.js",
+            "skills/tool/SKILL.md",
+            "skills/tool/references/nested/data.json",
+            "skills/tool/scripts/run.sh",
+            "skills/plugin/.claude-plugin/plugin.json",
+            "skills/plugin/hooks/hooks.json",
+            "skills/plugin/monitors/monitors.json",
+            "skills/plugin/skills/inner/SKILL.md",
+            "skills/plugin/.hidden/data",
+        ];
+        for file in files {
+            let path = src.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file).unwrap();
+        }
+        let executable = "skills/tool/scripts/run.sh";
+        std::fs::write(
+            src.path().join(executable),
+            "#!/bin/sh\nprintf bundle-executed",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            src.path().join(executable),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        for file in [
+            "settings.json",
+            ".credentials.json",
+            "plugins/installed_plugins.json",
+            "hooks/run.sh",
+            "monitors/monitors.json",
+            "routines/routine.json",
+            "coop-import.json",
+        ] {
+            let path = src.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "excluded").unwrap();
+        }
+        let staged = stage_allowed_files(src.path()).unwrap();
+        for file in files {
+            assert_eq!(
+                std::fs::read(staged.path().join(file)).unwrap(),
+                std::fs::read(src.path().join(file)).unwrap(),
+                "{file}"
+            );
+        }
+        let output = Command::new(staged.path().join(executable))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"bundle-executed");
+        for file in [
+            "settings.json",
+            ".credentials.json",
+            "plugins",
+            "hooks",
+            "monitors",
+            "routines",
+            "coop-import.json",
+        ] {
+            assert!(!staged.path().join(file).exists(), "{file}");
+        }
+    }
+
+    #[test]
+    fn claude_import_overlay_retains_deleted_files_and_follows_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("skills/example")).unwrap();
+        std::fs::write(external.path().join("support"), "external-target").unwrap();
+        std::os::unix::fs::symlink(external.path(), src.path().join("skills/example/support"))
+            .unwrap();
+        std::fs::write(src.path().join("CLAUDE.md"), "first").unwrap();
+        stage_selected_files_into(
+            src.path(),
+            dst.path(),
+            CLAUDE_ALLOWED_FILES,
+            CLAUDE_ALLOWED_DIRS,
+        )
+        .unwrap();
+        std::fs::remove_file(src.path().join("CLAUDE.md")).unwrap();
+        std::fs::write(external.path().join("support"), "refreshed").unwrap();
+        stage_selected_files_into(
+            src.path(),
+            dst.path(),
+            CLAUDE_ALLOWED_FILES,
+            CLAUDE_ALLOWED_DIRS,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("CLAUDE.md")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("skills/example/support/support")).unwrap(),
+            "refreshed"
+        );
+        assert!(
+            !dst.path()
+                .join("skills/example/support")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    fn import_prefs(value: serde_json::Value) -> ClaudeImportPreferences {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn claude_import_preferences_refresh_restores_guest_values() {
+        let guest = serde_json::json!({
+            "outputStyle": "guest-style", "disableAllHooks": false,
+            "enabledPlugins": {"copied@skills-dir": true, "guest@market": false},
+            "permissions": {"allow": ["Read"], "defaultMode": "bypassPermissions"},
+            "env": {"ANTHROPIC_BASE_URL": "coop-route"}, "apiKeyHelper": "guest-auth",
+            "extraKnownMarketplaces": {"guest": {}}, "unrelated": 42
+        });
+        let prefs = import_prefs(
+            serde_json::json!({"outputStyle":"host-style", "disableAllHooks":true,
+            "enabledPlugins":{"copied@skills-dir":false,"new@skills-dir":true}}),
+        );
+        let first = merge_claude_import_preferences(&guest.to_string(), &prefs).unwrap();
+        let first_value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first_value["outputStyle"], "host-style");
+        assert_eq!(first_value["disableAllHooks"], true);
+        assert_eq!(first_value["enabledPlugins"]["copied@skills-dir"], false);
+        assert_eq!(first_value["enabledPlugins"]["new@skills-dir"], true);
+        for key in [
+            "permissions",
+            "env",
+            "apiKeyHelper",
+            "extraKnownMarketplaces",
+            "unrelated",
+        ] {
+            assert_eq!(first_value[key], guest[key], "{key}");
+        }
+        assert_eq!(first_value["enabledPlugins"]["guest@market"], false);
+        let again = merge_claude_import_preferences(&first, &prefs).unwrap();
+        assert_eq!(first, again);
+        let cleared =
+            merge_claude_import_preferences(&again, &ClaudeImportPreferences::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cleared).unwrap(),
+            guest
+        );
+    }
+
+    #[test]
+    fn claude_import_preferences_preserve_guest_edits_on_removal() {
+        let prefs = import_prefs(
+            serde_json::json!({"outputStyle":"host", "disableAllHooks":true,
+            "enabledPlugins":{"copied@skills-dir":false}}),
+        );
+        let first = merge_claude_import_preferences("{}", &prefs).unwrap();
+        let mut edited: serde_json::Value = serde_json::from_str(&first).unwrap();
+        edited["outputStyle"] = "guest-edit".into();
+        edited["enabledPlugins"]["copied@skills-dir"] = true.into();
+        let removed = merge_claude_import_preferences(
+            &edited.to_string(),
+            &ClaudeImportPreferences::default(),
+        )
+        .unwrap();
+        let result: serde_json::Value = serde_json::from_str(&removed).unwrap();
+        assert_eq!(result["outputStyle"], "guest-edit");
+        assert_eq!(result["enabledPlugins"]["copied@skills-dir"], true);
+        assert!(result.get("disableAllHooks").is_none());
+        assert!(result.get("_coopImportedPreferences").is_none());
+    }
+
+    #[test]
+    fn claude_import_preferences_apply_to_managed_fallback() {
+        let prefs = import_prefs(serde_json::json!({"disableAllHooks":true,
+            "outputStyle":"host", "enabledPlugins":{"disabled@skills-dir":false}}));
+        for existing in ["", "not json", "[]", r#"{"permissions": false}"#] {
+            let merged =
+                claude_settings_with_import(Ok(existing.to_owned()), &BTreeMap::new(), &prefs)
+                    .unwrap();
+            let result: serde_json::Value = serde_json::from_str(&merged).unwrap();
+            assert_eq!(result["disableAllHooks"], true);
+            assert_eq!(result["enabledPlugins"]["disabled@skills-dir"], false);
+            assert_eq!(result["outputStyle"], "host");
+            assert_eq!(result["permissions"]["defaultMode"], "bypassPermissions");
+        }
+    }
+
+    #[test]
+    fn stage_allowed_files_retains_original_entries() {
         let src = tempfile::TempDir::new().unwrap();
         std::fs::write(src.path().join("CLAUDE.md"), "# Config").unwrap();
         std::fs::create_dir(src.path().join("rules")).unwrap();
