@@ -215,7 +215,7 @@ type = "http"
 url = "https://mcp.sentry.dev/mcp"
 ```
 
-**NOTE**: If the command requires a non-default tool (e.g., `npx`), then `coop up` needs to be supplied with that profile (e.g., `coop up --profile node`).
+**NOTE**: MCP server commands must be installed in the guest. For example, to make `npx` available when creating a new instance, use `coop up --profile node`. If your image already includes the required tools, no additional profile flag is needed. Profiles do not add tools to an existing instance; see [Images and Profiles](images-and-profiles.md) for image setup options.
 
 If `config_dir` also provides a `config.toml`, coop preserves its other settings but replaces the `mcp_servers` table with the one derived from `codex.mcp_servers`. When the VM is in [local-model mode](#local-model-support), coop also owns the `model` and `model_provider` keys and a `[model_providers.coop_local]` block; these are written on a switch to local and removed on a switch back to remote, so they are not preserved across a mode change.
 
