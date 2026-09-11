@@ -52,6 +52,10 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// exhaust host CPU/memory by opening unbounded upstream connections.
 const MAX_CONCURRENT_REQUESTS: usize = 256;
 
+/// Bound guest sockets separately: idle connections never reach the request
+/// semaphore, but still consume a host file descriptor and an HTTP task.
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
 /// The unified response body: either an upstream stream or a small local
 /// error page, both boxed to one type.
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -98,6 +102,7 @@ struct Ctx {
     cfg: Arc<ProxyConfig>,
     connector: TlsConnector,
     permits: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
 }
 
 impl Ctx {
@@ -107,6 +112,7 @@ impl Ctx {
             cfg: Arc::new(cfg),
             connector,
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
     }
 }
@@ -159,11 +165,19 @@ async fn accept_loop(
                     Ok((stream, _peer)) => stream,
                     Err(e) => {
                         tracing::warn!("accept failed: {e}");
+                        // Resource exhaustion can make accept fail immediately;
+                        // avoid spinning and filling the host log in that case.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
+                let Ok(permit) = ctx.connections.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| {
                         let ctx = ctx.clone();
@@ -458,6 +472,88 @@ mod tests {
     fn bearer_injection(secret: &str) -> Injection {
         let json = format!(r#"{{ "scheme": "bearer", "credential": "{secret}" }}"#);
         serde_json::from_str(&json).unwrap()
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test deadlines describe the missing behavior"
+    )]
+    async fn idle_connections_are_bounded_and_released_on_disconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = ProxyConfig::from_json(
+            r#"{
+                "listen": "127.0.0.1:0",
+                "capability_token": "test-token",
+                "upstream_host": "proxy-test.invalid",
+                "injection": { "scheme": "x_api_key", "credential": "fake" }
+            }"#,
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(cfg).unwrap();
+        ctx.connections = Arc::new(Semaphore::new(2));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(accept_loop(ctx, listener, async {
+            let _ = stopped.await;
+        }));
+        let budget = Duration::from_secs(5);
+        let mut held = Vec::new();
+        // A response proves each socket was accepted and entered HTTP serving.
+        // Keep it open afterward: these idle sockets hold no request permits.
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            timeout(budget, async {
+                while !response.windows(2).any(|pair| pair == b"\r\n") {
+                    assert_ne!(stream.read_buf(&mut response).await.unwrap(), 0);
+                }
+            })
+            .await
+            .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 401 "));
+            held.push(stream);
+        }
+
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        let mut byte = [0];
+        let n = timeout(budget, excess.read(&mut byte))
+            .await
+            .expect("excess idle connection must be closed without HTTP input")
+            .unwrap();
+        assert_eq!(n, 0);
+
+        drop(held);
+        // Disconnect releases capacity; wait for a real HTTP response, since
+        // connect alone can succeed even while the accept loop refuses sockets.
+        timeout(budget, async {
+            loop {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                if stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    let mut response = String::new();
+                    if stream.read_to_string(&mut response).await.is_ok()
+                        && response.contains("401")
+                    {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect must release connection capacity");
+        let _ = stop.send(());
+        server.await.unwrap();
     }
 
     // ── capability token ─────────────────────────────────────

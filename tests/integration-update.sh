@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Serves a synthetic GitHub-shaped fixture from a local HTTP server and
 # verifies that the update flow downloads, checksums, and atomically
-# replaces the running binary. Also verifies checksum rollback,
-# `--check` behaviour, and dev-build refusal.
+# replaces the running binary and its proxy companion. Also verifies checksum
+# rollback, `--check` behaviour, and dev-build refusal.
 #
 # Run manually:   ./tests/integration-update.sh
 # Run in CI:      same (fast — no VM, no external network)
@@ -168,7 +168,11 @@ cat > "$TMPDIR/build/${FAKE_DIR}/coop" << 'EOF'
 #!/bin/sh
 echo "MARKER: fake-replacement-binary"
 EOF
-chmod +x "$TMPDIR/build/${FAKE_DIR}/coop"
+cat > "$TMPDIR/build/${FAKE_DIR}/coop-proxy" << 'EOF'
+#!/bin/sh
+echo "MARKER: fake-proxy-binary"
+EOF
+chmod +x "$TMPDIR/build/${FAKE_DIR}/coop" "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
 (cd "$TMPDIR/build" && tar -czf "$FIXTURE/${FAKE_TARBALL}" "$FAKE_DIR")
 (cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
 
@@ -213,6 +217,13 @@ else
     fail "update --yes returned non-zero" "$(tail -5 "$TMPDIR/t1.log")"
 fi
 
+if [[ -x "$TMPDIR/bin/coop-proxy" ]] \
+    && [[ "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
+    pass "update installs the missing proxy companion"
+else
+    fail "update installs the missing proxy companion" "expected release proxy contents"
+fi
+
 # Confirm the update-check state file landed inside the test's tempdir,
 # not somewhere under the developer's real home. Searching $TMPDIR (not
 # $HOME) is deliberate: if a future edit accidentally drops the HOME
@@ -252,6 +263,8 @@ fi
 
 cp "$RELEASE_BIN" "$COOP_BIN"
 ORIG_SHA="$(sha_of "$COOP_BIN")"
+printf '%s\n' 'keep-existing-proxy' > "$TMPDIR/bin/coop-proxy"
+ORIG_PROXY_SHA="$(sha_of "$TMPDIR/bin/coop-proxy")"
 
 # Restore the newer-release fixture but corrupt SHA256SUMS.
 write_release_json \
@@ -266,14 +279,16 @@ if "$COOP_BIN" update --yes > "$TMPDIR/t3.log" 2>&1; then
     fail "update --yes should have failed on checksum mismatch"
 else
     new_sha="$(sha_of "$COOP_BIN")"
-    if [[ "$new_sha" == "$ORIG_SHA" ]]; then
-        pass "checksum mismatch leaves binary unchanged"
+    if grep -q "SHA-256 mismatch" "$TMPDIR/t3.log" \
+        && [[ "$new_sha" == "$ORIG_SHA" \
+           && "$(sha_of "$TMPDIR/bin/coop-proxy")" == "$ORIG_PROXY_SHA" ]]; then
+        pass "checksum mismatch leaves both binaries unchanged"
     else
-        fail "binary replaced despite checksum mismatch"
+        fail "checksum rejection must preserve both binaries" "$(tail -5 "$TMPDIR/t3.log")"
     fi
 fi
 
-# Restore valid SHA256SUMS for subsequent tests (not needed here — test 4 rebuilds).
+# Restore valid SHA256SUMS for subsequent tests.
 (cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
 
 # ── Test 4: dev build refuses to self-update ─────────────────────────────────
@@ -287,6 +302,34 @@ else
     else
         fail "dev-build refusal message missing" "$(cat "$TMPDIR/t4.log")"
     fi
+fi
+
+# ── Test 5: update replaces an existing companion ───────────────────────────
+
+echo "==> Test 5: update replaces both existing binaries"
+cp "$RELEASE_BIN" "$COOP_BIN"
+if "$COOP_BIN" update --yes > "$TMPDIR/t5.log" 2>&1 \
+    && [[ "$("$COOP_BIN")" == "MARKER: fake-replacement-binary" \
+       && "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
+    pass "update replaces the existing coop and coop-proxy"
+else
+    fail "update replaces the existing coop and coop-proxy" "$(tail -5 "$TMPDIR/t5.log")"
+fi
+
+# ── Test 6: older packages without a companion remain supported ──────────────
+
+echo "==> Test 6: legacy update without a proxy"
+cp "$RELEASE_BIN" "$COOP_BIN"
+rm "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
+(cd "$TMPDIR/build" && tar -czf "$FIXTURE/${FAKE_TARBALL}" "$FAKE_DIR")
+(cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
+ORIG_PROXY_SHA="$(sha_of "$TMPDIR/bin/coop-proxy")"
+if "$COOP_BIN" update --yes > "$TMPDIR/t6.log" 2>&1 \
+    && [[ "$("$COOP_BIN")" == "MARKER: fake-replacement-binary" \
+       && "$(sha_of "$TMPDIR/bin/coop-proxy")" == "$ORIG_PROXY_SHA" ]]; then
+    pass "legacy update replaces coop and preserves the existing companion"
+else
+    fail "legacy update replaces coop and preserves the existing companion" "$(tail -5 "$TMPDIR/t6.log")"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

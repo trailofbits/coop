@@ -87,7 +87,7 @@ step() {
 }
 
 cargo_toml_version() {
-  awk -F'"' '/^\[package\]/{p=1} p && /^version *=/{print $2; exit}' Cargo.toml
+  awk -F'"' '/^\[workspace\.package\]$/{p=1; next} /^\[/{p=0} p && /^version *=/{print $2; exit}' Cargo.toml
 }
 
 check_worktree() {
@@ -104,7 +104,7 @@ check_worktree() {
 }
 
 check_versions() {
-  local v tag lockv
+  local v tag lockv package
   v="$(cargo_toml_version)"
   if [[ -z "$v" ]]; then
     echo "Could not read version from Cargo.toml" >&2
@@ -113,11 +113,13 @@ check_versions() {
   tag="v$v"
   printf 'Cargo.toml version: %s  (release tag: %s)\n' "$v" "$tag"
 
-  lockv="$(awk '/^name = "coop"$/{getline; gsub(/version = "|"/, ""); print; exit}' Cargo.lock)"
-  if [[ "$lockv" != "$v" ]]; then
-    printf 'Cargo.lock coop version (%s) != Cargo.toml (%s) — run cargo build to refresh the lockfile\n' "$lockv" "$v"
-    return 1
-  fi
+  for package in coop coop-proxy; do
+    lockv="$(awk -v package="$package" '$0 == "name = \"" package "\"" {getline; gsub(/version = \"|\"/, ""); print; exit}' Cargo.lock)"
+    if [[ "$lockv" != "$v" ]]; then
+      printf 'Cargo.lock %s version (%s) != workspace version (%s) — run cargo build --workspace to refresh the lockfile\n' "$package" "$lockv" "$v"
+      return 1
+    fi
+  done
 
   # release.yml extracts notes with an exact whole-line match ($0 == "## vX.Y.Z"),
   # so the header must match exactly — a trailing date would pass a looser check
@@ -140,7 +142,31 @@ run_deny() {
     warn "cargo-deny not installed — supply-chain check skipped (CI still runs it; cargo install cargo-deny --locked)"
     return 0
   fi
-  cargo deny check
+  cargo deny --workspace check
+}
+
+run_bridge_isolation() {
+  if [[ "$(uname -s)" != Linux ]]; then
+    warn "Bridge isolation requires Linux — run tests/integration-network.sh on a Linux host before tagging"
+    return 0
+  fi
+  ./tests/integration-network.sh
+}
+
+run_proxy_forward() {
+  if [[ "$(uname -s)" != Linux ]]; then
+    warn "Proxy reverse forwarding requires Linux — run tests/integration-proxy-forward.sh on a Linux host before tagging"
+    return 0
+  fi
+  ./tests/integration-proxy-forward.sh
+}
+
+run_taplo() {
+  if ! have taplo; then
+    warn "taplo not installed — TOML formatting skipped (CI still runs it; use scripts/install-dev-tools.sh)"
+    return 0
+  fi
+  taplo format --check
 }
 
 run_zizmor() {
@@ -208,8 +234,8 @@ handle_missing_targets() {
   printf '\nMissing rustup targets for the release build: %s\n' "${targets[*]}"
   printf 'Install the standard libraries with:\n'
   printf '  rustup target add %s\n' "${targets[*]}"
-  printf 'Cross-LINKING also needs platform tools (musl-cross on macOS; musl-tools\n'
-  printf '+ gcc-aarch64-linux-gnu on Linux) — see .github/workflows/release.yml.\n'
+  printf 'Building coop-proxy also needs cmake and a target C compiler/linker.\n'
+  printf 'Release CI uses native runners with musl-gcc on Linux; see RELEASING.md.\n'
   if [[ "$RUN_INSTALL_TARGETS" == 1 ]]; then
     rustup target add "${targets[@]}" || warn "rustup target add failed for: ${targets[*]}"
   else
@@ -237,14 +263,14 @@ build_release_targets() {
   for target in "${RELEASE_TARGETS[@]}"; do
     if grep -qx "$target" <<<"$installed"; then
       printf 'Building %s...\n' "$target"
-      cargo build --release --target "$target" || return 1
+      cargo build --release --workspace --target "$target" || return 1
       built=$((built + 1))
     else
       warn "release target $target not built locally (toolchain absent) — release.yml builds it on the tag, uncaught here."
     fi
   done
   if [[ "$built" -eq 0 ]]; then
-    warn "no release targets built locally — cross-compile breakage won't surface until the tag is pushed. Run the preflight from a host that can cross-compile all three (macOS + musl-cross)."
+    warn "no release targets built locally — cross-compile breakage won't surface until the tag is pushed. Build each target on a matching host or configure its C compiler and linker (see RELEASING.md)."
   fi
   return 0
 }
@@ -269,11 +295,16 @@ prompt_for_remote() {
 step "Working tree clean" check_worktree
 step "Version consistency" check_versions
 step "Format (cargo fmt --check)" cargo fmt -- --check
-step "Clippy" cargo clippy --all-targets --all-features -- -D warnings
-step "Unit tests" cargo test
+step "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+step "Unit tests" cargo test --workspace
 step "Release target builds" build_release_targets
 step "Supply chain (cargo deny)" run_deny
 step "Workflow audit (zizmor)" run_zizmor
+step "TOML formatting" run_taplo
+step "Integration probe regression tests" python3 tests/test-integration-probes.py
+step "Release preflight regression tests" python3 tests/test-preflight-release.py
+step "Integration — bridge isolation" run_bridge_isolation
+step "Integration — proxy reverse forwarding" run_proxy_forward
 step "Integration — installer provenance" ./tests/integration-install.sh
 step "Integration — coop update" ./tests/integration-update.sh
 step "Integration — coop uninstall" ./tests/integration-uninstall.sh
@@ -317,5 +348,9 @@ if [[ ${#FAILURES[@]} -gt 0 ]]; then
   exit 1
 fi
 version="$(cargo_toml_version)"
+if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+  printf 'Completed checks passed for v%s; resolve the warnings and unrun gates before tagging.\n' "$version"
+  exit 0
+fi
 printf 'All required checks passed for v%s.\n' "$version"
 printf 'Next: tag v%s on the merge commit and push to trigger release.yml.\n' "$version"

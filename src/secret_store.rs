@@ -753,6 +753,25 @@ mod tests {
     }
 
     #[test]
+    fn file_backend_separates_services_for_the_same_account() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let account = AccountName::new("same-account").unwrap();
+        let services = [
+            (SERVICE, "github-pat", "github-token"),
+            (ANTHROPIC_SERVICE, "anthropic", "anthropic-token"),
+            (OPENAI_SERVICE, "openai", "openai-token"),
+            ("coop-openai-dev", "openai-dev", "vm-token"),
+        ];
+        for (service, _, token) in services {
+            store_file(service, &account, token, tmp.path()).unwrap();
+        }
+        for (_, directory, token) in services {
+            let path = tmp.path().join(directory).join("same-account.txt");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), format!("{token}\n"));
+        }
+    }
+
+    #[test]
     fn file_backend_round_trip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let acc = account("trailofbits/coop");

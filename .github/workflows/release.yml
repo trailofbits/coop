@@ -64,6 +64,20 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
+      - name: Verify release binaries
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          expected="coop ${TAG#v} ($(git rev-parse --short HEAD))"
+          actual="$("target/${TARGET}/release/coop" --version)"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Expected release version %s, got %s\n' "$expected" "$actual" >&2
+            exit 1
+          fi
+          test -x "target/${TARGET}/release/coop-proxy"
+
       - name: Package
         shell: bash
         run: |

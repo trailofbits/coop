@@ -14,11 +14,11 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
-Or build from source (requires [Rust](https://rustup.rs/)):
+Or build from source (requires [Rust](https://rustup.rs/) and CMake):
 
 ```shell
-cargo build --release
-cp target/release/coop /usr/local/bin/
+cargo build --workspace --release
+cp target/release/coop target/release/coop-proxy /usr/local/bin/
 ```
 
 Then build the VM template image:

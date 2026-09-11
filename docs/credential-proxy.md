@@ -32,6 +32,11 @@ for the lifetime of the VM:
   closes). Codex subscription is therefore out of scope in proxy mode; use an
   OpenAI API key.
 
+When agent bootstrap runs with an OpenAI proxy, coop also removes any existing
+`~/.codex/auth.json` left by a previous direct-auth boot. If removal fails,
+proxy bootstrap aborts and tears down the proxy. `--no-agents` skips this
+cleanup along with the rest of agent bootstrap.
+
 For Codex account or workspace access without API billing, use
 `[codex] auth = "chatgpt"` instead of `[proxy.openai]`. That mode stores Codex
 credentials in the guest Linux keyring and is rejected when an OpenAI proxy is
@@ -145,19 +150,24 @@ disk. It does **not**:
 The proxy itself is new attack surface, mitigated by a fixed per-route upstream
 (the guest controls only the path, never the host — closing SSRF), TLS
 verification against a pinned root set, a required capability token, and
-resource limits. The listener binds only host loopback and is reverse-tunnelled
+resource limits. Each proxy allows at most 256 accepted guest TCP connections
+and 256 concurrent requests; excess connections are closed immediately, so
+idle sockets cannot bypass the request limit. The listener binds only host
+loopback and is reverse-tunnelled
 to exactly one guest — never a non-loopback interface, never the LAN.
 
-It is also **jailed** to bound the blast radius of a proxy exploit: `coop-proxy`
-runs confined so it cannot write files, execute programs, or reach any host
-beyond the upstream `:443` and DNS `:53`. On Linux this is Landlock (self-applied
-before serving); on macOS it is a Seatbelt profile applied via `sandbox-exec`.
-The confinement is **fail-closed** — if it cannot be established the VM start
-aborts rather than running the credential-holding proxy unconfined. The jail is
-port-scoped, not host-scoped (the two upstreams' identity is enforced by the
-proxy's TLS verification, not the jail), and does not restrict UDP on Linux; see
-[`trust-model.md`](trust-model.md) for the full threat model and the accepted
-limitations.
+It is also **jailed** to bound the blast radius of a proxy exploit. On Linux,
+Landlock denies filesystem writes and program execution as a required floor;
+additional filesystem restrictions apply where the kernel supports them. TCP
+egress is limited to `:443` and `:53` on kernels ≥6.7. On kernels 5.13–6.6,
+the proxy can start with that TCP restriction absent. On macOS, `sandbox-exec`
+applies a Seatbelt profile that denies filesystem writes and program execution
+and limits egress to those ports.
+
+Startup fails closed if the required filesystem/exec floor cannot be applied.
+The network rules are port-scoped, not host-scoped, and Landlock does not
+restrict UDP. See [`trust-model.md`](trust-model.md) for the full threat model
+and accepted limitations.
 
 ## Platform support
 
@@ -165,5 +175,5 @@ limitations.
 host and is exposed into the guest with a per-instance `ssh -R` reverse tunnel,
 so it works identically on both backends (each already keeps an SSH channel to
 its guest). The host-side proxy process is jailed on both — Landlock on Linux
-(host kernel ≥6.7), Seatbelt via `sandbox-exec` on macOS. Not yet built:
-GitHub.
+(enabled on the host; kernel ≥5.13, with TCP scoping from ≥6.7), Seatbelt via
+`sandbox-exec` on macOS. GitHub credentials are not supported.

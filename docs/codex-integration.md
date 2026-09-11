@@ -159,8 +159,10 @@ coop restore my-project --image default --reprovision
 IP, and workspace association, accepts a running instance, and leaves it
 running. It provisions the replaced disk as a first boot, so `/workspace` is
 restored and the agent plugins are reinstalled — a plain `restore` here would
-leave both empty, because the base image carries neither. Destroying and
-recreating the VM also works, but discards its guest disk.
+leave both empty, because the base image carries neither. Both reprovisioning
+and destroying/recreating replace the guest disk. Save
+guest-only work first (for example with `coop pull`); the replacement also
+discards any guest keyring and cached account login.
 
 ### GitHub auth
 
@@ -212,6 +214,8 @@ args = ["-y", "@example/mcp-server"]
 type = "http"
 url = "https://mcp.sentry.dev/mcp"
 ```
+
+**NOTE**: MCP server commands must be installed in the guest. For example, to make `npx` available when creating a new instance, use `coop up --profile node`. If your image already includes the required tools, no additional profile flag is needed. Profiles do not add tools to an existing instance; see [Images and Profiles](images-and-profiles.md) for image setup options.
 
 If `config_dir` also provides a `config.toml`, coop preserves its other settings but replaces the `mcp_servers` table with the one derived from `codex.mcp_servers`. When the VM is in [local-model mode](#local-model-support), coop also owns the `model` and `model_provider` keys and a `[model_providers.coop_local]` block; these are written on a switch to local and removed on a switch back to remote, so they are not preserved across a mode change.
 

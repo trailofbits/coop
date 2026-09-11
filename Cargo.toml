@@ -9,7 +9,7 @@ members = ["coop-proxy"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/trailofbits/coop"

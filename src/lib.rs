@@ -139,6 +139,9 @@ enum Commands {
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
+        /// Use github = "off" for this invocation and skip the GitHub PAT prompt
+        #[arg(long)]
+        no_github: bool,
         /// Named image to use when creating a new instance (default: "default")
         #[arg(
             long,
@@ -289,6 +292,9 @@ enum Commands {
         /// Skip injecting Claude Code and Codex credentials/config into the VM
         #[arg(long, alias = "no-claude")]
         no_agents: bool,
+        /// Use github = "off" for this invocation and skip the GitHub PAT prompt
+        #[arg(long)]
+        no_github: bool,
         /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
         /// `--forward-port 3000` forwards guest 3000 to host 3000;
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
@@ -885,6 +891,26 @@ enum DevcontainerCheckStage {
     Both,
 }
 
+impl Commands {
+    fn apply_github_override(&self, cfg: &mut config::CoopConfig) {
+        if matches!(
+            self,
+            Self::Up {
+                no_github: true,
+                ..
+            } | Self::Start {
+                no_github: true,
+                ..
+            }
+        ) {
+            cfg.github = Some(config::GitHubAuth::Off);
+            // Off alone is eligible for the PAT wizard, which can replace
+            // cfg.github after writing a new credential to the config file.
+            cfg.setup.prompt_for_pat = false;
+        }
+    }
+}
+
 fn init_tracing(verbosity: u8) {
     let filter = match verbosity {
         0 => "coop=info",
@@ -1007,6 +1033,7 @@ pub fn run() -> Result<()> {
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
     update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
@@ -1028,6 +1055,7 @@ pub fn run() -> Result<()> {
             mem,
             disk,
             no_agents,
+            no_github,
             image,
             profile,
             exclude_git,
@@ -1071,6 +1099,7 @@ pub fn run() -> Result<()> {
                 profile_target,
                 runtime: UpRuntimeOpts {
                     no_agents,
+                    no_github,
                     exclude_git,
                     no_prompt,
                     forward_ports: forward_port,
@@ -1184,6 +1213,7 @@ pub fn run() -> Result<()> {
             name,
             workspace,
             no_agents,
+            no_github: _,
             no_prompt,
             post_start,
             guest_env,
@@ -1512,6 +1542,85 @@ mod tests {
         match Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())) {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
+        }
+    }
+
+    #[test]
+    fn no_github_overrides_each_mode_without_changing_other_settings() {
+        use crate::config::{CoopConfig, GitHubAuth};
+        use crate::pat_prompt::{Decision, PromptContext};
+
+        let repo = crate::github_repo::RepoSlug::new("owner/repo").unwrap();
+        for command in ["up", "start"] {
+            for github in [
+                "",
+                "github = \"off\"",
+                "github = \"auto\"",
+                "github = \"env\"",
+                "[github]\nmode = \"pat\"\n[github.pat.\"owner/repo\"]\ntoken = \"cmd:exit 42\"",
+            ] {
+                let mut cfg: CoopConfig = toml::from_str(github).unwrap();
+                cfg.claude.api_key =
+                    Some(crate::config::Secret::new("test-claude-key".to_string()));
+                cfg.codex.api_key = Some(crate::config::Secret::new("test-codex-key".to_string()));
+                cfg.setup.prompt_for_pat = true;
+                let original = serde_json::to_value(&cfg).unwrap();
+
+                parse(&[command]).command.apply_github_override(&mut cfg);
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), original);
+
+                let cli = parse(&[command, "--no-github"]);
+                match &cli.command {
+                    crate::Commands::Up { no_agents, .. }
+                    | crate::Commands::Start { no_agents, .. } => assert!(!no_agents),
+                    _ => panic!("expected a boot command"),
+                }
+                cli.command.apply_github_override(&mut cfg);
+                assert!(matches!(cfg.github, Some(GitHubAuth::Off)));
+                assert_eq!(
+                    Decision::resolve(
+                        &cfg,
+                        Some(&repo),
+                        PromptContext {
+                            is_tty: true,
+                            is_ci: false,
+                            no_prompt_flag: false,
+                        },
+                    ),
+                    Decision::Skip,
+                );
+                // The failing PAT command must never be evaluated. Model
+                // credentials still reach the same forwarding builder.
+                let env = crate::backend::prepare_env_forwarding(&cfg, Some(&repo), false, false)
+                    .unwrap();
+                assert!(!env.contains("GITHUB_TOKEN"));
+                assert!(env.contains("ANTHROPIC_API_KEY"));
+                assert!(env.contains("OPENAI_API_KEY"));
+
+                let mut expected = original;
+                expected["github"] = serde_json::to_value(GitHubAuth::Off).unwrap();
+                expected["setup"]["prompt_for_pat"] = false.into();
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn no_github_preserves_pat_forwarding_without_the_flag() {
+        let mut cfg: crate::config::CoopConfig = toml::from_str(
+            r#"[github]
+mode = "pat"
+[github.pat."owner/repo"]
+token = "test-pat"
+"#,
+        )
+        .unwrap();
+        let repo = crate::github_repo::RepoSlug::new("owner/repo").unwrap();
+        for command in ["up", "start", "list"] {
+            parse(&[command]).command.apply_github_override(&mut cfg);
+            let env =
+                crate::backend::prepare_env_forwarding(&cfg, Some(&repo), false, false).unwrap();
+            assert!(env.contains("GITHUB_TOKEN"));
         }
     }
 

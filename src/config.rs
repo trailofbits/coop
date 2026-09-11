@@ -4641,6 +4641,14 @@ skip = ["not-a-slug"]
     }
 
     #[test]
+    fn vm_memory_display_preserves_the_mib_quantity() {
+        for (input, expected) in [(128, "128"), (4096, "4096")] {
+            let memory = VmMemory::new(MiB::new(input).unwrap()).unwrap();
+            assert_eq!(memory.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn vm_memory_parse_cli_enforces_floor() {
         assert!(VmMemory::parse_cli("16").is_err());
         assert!(VmMemory::parse_cli("0").is_err());
@@ -4757,6 +4765,18 @@ skip = ["not-a-slug"]
             mp.contains("/codex-plugins"),
             "should preserve path suffix, got: {mp}"
         );
+    }
+
+    #[test]
+    fn validate_and_warn_preserves_validation_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = CoopConfig::default();
+        cfg.claude.config_dir =
+            ConfigDir::Custom(ConfigPath::new(tmp.path().join("missing-config")));
+
+        let expected = cfg.validate().unwrap_err().to_string();
+        assert!(expected.contains("claude.config_dir"));
+        assert_eq!(cfg.validate_and_warn().unwrap_err().to_string(), expected);
     }
 
     #[test]

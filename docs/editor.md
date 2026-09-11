@@ -117,7 +117,9 @@ The SSH config block supplies the hostname, port, user, key, and host-key verifi
 
 ## Port forwarding
 
-coop does not manage port forwarding. Use SSH directly:
+Use `--forward-port` with [`coop up`](commands.md#up) or
+[`coop start`](commands.md#start) for forwards managed for the VM lifetime.
+For a temporary forward while an editor is connected, use SSH directly:
 
 ```bash
 ssh -L 3000:localhost:3000 coop-my-instance

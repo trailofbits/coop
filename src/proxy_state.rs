@@ -152,6 +152,41 @@ mod tests {
     }
 
     #[test]
+    fn slot_mut_updates_each_provider_independently() {
+        let mut state = ProxyState::default();
+        *state.slot_mut(Provider::Anthropic) =
+            Some(upstream("cmd:anthropic", ProxyAuthScheme::ApiKey));
+        *state.slot_mut(Provider::Openai) = Some(upstream("cmd:openai", ProxyAuthScheme::Bearer));
+
+        assert_eq!(
+            state.anthropic.as_ref().unwrap().credential.expose(),
+            "cmd:anthropic"
+        );
+        assert_eq!(
+            state.openai.as_ref().unwrap().credential.expose(),
+            "cmd:openai"
+        );
+        *state.slot_mut(Provider::Anthropic) = None;
+        assert!(state.anthropic.is_none());
+        assert_eq!(state.openai.unwrap().credential.expose(), "cmd:openai");
+    }
+
+    #[test]
+    fn unreadable_state_does_not_fall_back_to_config_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inst = inst(tmp.path().to_path_buf());
+        fs::create_dir(inst.proxy_state_path()).unwrap();
+        let error = ProxyState::try_load(&inst).unwrap_err();
+        assert!(error.to_string().contains("Failed to read"));
+
+        let cfg = ProxyConfig {
+            openai: Some(upstream("cmd:default", ProxyAuthScheme::Bearer)),
+            ..Default::default()
+        };
+        assert!(effective_upstream(&inst, Provider::Openai, &cfg).is_err());
+    }
+
+    #[test]
     fn override_wins_over_default() {
         let cfg = ProxyConfig {
             anthropic: Some(upstream("cmd:default", ProxyAuthScheme::Bearer)),

@@ -651,6 +651,27 @@ mod tests {
     }
 
     #[test]
+    fn collect_baked_lists_merges_global_and_profile_entries() {
+        let mut cfg = CoopConfig::default();
+        cfg.claude.marketplaces = vec!["z".into(), "a".into(), "a".into()];
+        cfg.claude.plugins = vec!["p2@z".into(), "p1@a".into()];
+        cfg.codex.marketplaces = vec!["codex-only".into()];
+        cfg.codex.plugins = vec!["codex-only-plugin".into()];
+        let profile = ProfileDef {
+            name: "custom".into(),
+            apt_packages: vec![],
+            pre_install: None,
+            post_install: None,
+            marketplaces: vec!["b".into(), "a".into()],
+            plugins: vec!["p3@b".into(), "p1@a".into()],
+        };
+
+        let (marketplaces, plugins) = collect_baked_lists(&cfg, &[profile]);
+        assert_eq!(marketplaces, ["a", "b", "z"]);
+        assert_eq!(plugins, ["p1@a", "p2@z", "p3@b"]);
+    }
+
+    #[test]
     fn collect_codex_baked_lists_sorts_and_dedups() {
         let mut cfg = CoopConfig::default();
         cfg.codex.marketplaces = vec!["b".into(), "a".into(), "a".into()];
@@ -674,7 +695,13 @@ mod tests {
     #[test]
     fn unknown_profile_fails() {
         let custom = HashMap::new();
-        assert!(lookup_profile("nonexistent", &custom).is_err());
+        let message = lookup_profile("nonexistent", &custom)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("Available profiles: python, node, c, fuzz, rust, go"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -755,6 +782,26 @@ mod tests {
             let u = GuestUser::new(s).unwrap_or_else(|e| panic!("rejected {s:?}: {e}"));
             assert_eq!(u.as_str(), s);
         }
+    }
+
+    #[test]
+    fn guest_user_cli_parser_preserves_names_and_rejects_root() {
+        assert_eq!(GuestUser::parse("vscode").unwrap().as_str(), "vscode");
+        assert!(GuestUser::parse("root").is_err());
+    }
+
+    #[test]
+    fn guest_user_accepts_the_maximum_length() {
+        let name = "a".repeat(32);
+        assert_eq!(GuestUser::new(&name).unwrap().as_str(), name);
+    }
+
+    #[test]
+    fn guest_user_errors_distinguish_initial_and_later_characters() {
+        let initial = GuestUser::new("0user").unwrap_err().to_string();
+        assert!(initial.contains("must start with [a-z_]"), "{initial}");
+        let later = GuestUser::new("user.name").unwrap_err().to_string();
+        assert!(later.contains("contains invalid character"), "{later}");
     }
 
     #[test]

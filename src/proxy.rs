@@ -23,6 +23,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,11 +38,8 @@ use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cm
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
 
-/// How long to watch the reverse-tunnel `ssh` after spawn before treating it
-/// as established. With `ExitOnForwardFailure`, a refused `-R` bind makes `ssh`
-/// exit well within this window (the guest is already reachable — bootstrap
-/// SSH'd in moments earlier), so surviving it means the forward is bound.
-const TUNNEL_READY_GRACE: Duration = Duration::from_secs(2);
+/// Maximum time for SSH authentication and the guest's forwarding acknowledgment.
+const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for the freshly spawned proxy to accept a connection on
 /// its host-loopback listener before treating the launch as failed. This
@@ -364,23 +362,32 @@ const SEATBELT_PROFILE: &str = include_str!("seatbelt-proxy.sb");
 /// Establish a per-instance reverse SSH tunnel so the guest reaches the
 /// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
 /// and tracked by a PID file like the proxy process, so teardown needs no SSH
-/// target. `ExitOnForwardFailure` makes a bind clash on the guest a loud
-/// failure rather than a silently dead tunnel.
+/// target. An acknowledged forwarding request makes a bind clash on the guest
+/// a startup failure rather than a silently dead tunnel.
 fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: u16) -> Result<()> {
     kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
 
+    let control_dir = create_tunnel_control_dir()?;
+    let control_path = control_dir.path().join("ssh.sock");
     let log_path = inst.dir.join(format!("proxy-{name}-fwd.log"));
     let log = File::create(&log_path)
         .with_context(|| format!("Failed to create proxy tunnel log {}", log_path.display()))?;
+    let forward_log = log
+        .try_clone()
+        .context("Failed to clone proxy tunnel log")?;
 
     let mut args = target.ssh_opts();
     args.extend([
         "-N".into(),
         "-T".into(),
         "-o".into(),
-        "ExitOnForwardFailure=yes".into(),
-        "-R".into(),
-        format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+        "ControlMaster=yes".into(),
+        "-o".into(),
+        "ControlPersist=no".into(),
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
+        "-S".into(),
+        control_path.display().to_string(),
     ]);
     args.push(target.addr());
 
@@ -394,36 +401,100 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         .spawn()
         .context("Failed to spawn the reverse SSH tunnel for the credential proxy")?;
 
-    // Confirm the tunnel actually came up before returning Ok — otherwise the
-    // guest boots pointed at a dead endpoint. `ssh` was not given `-f`, so this
-    // child *is* the tunnel; with `ExitOnForwardFailure=yes` it exits promptly
-    // when the guest refuses the `-R` bind. If it survives the grace window the
-    // forward is bound; if it exits first, fail closed with the ssh log.
-    let deadline = Instant::now() + TUNNEL_READY_GRACE;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let setup = (|| -> Result<()> {
+        let deadline = Instant::now() + TUNNEL_READY_TIMEOUT;
+        loop {
+            crate::signal::check_shutdown()?;
+            if let Some(status) = child.try_wait().context("Failed to poll proxy tunnel")? {
                 bail!(
-                    "reverse SSH tunnel for the credential proxy exited before it was \
-                     established ({status}) — the guest may forbid TCP forwarding.\n{}",
-                    log.trim()
+                    "reverse SSH tunnel exited before its control socket became ready ({status})"
                 );
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(e).context("Failed to poll the reverse SSH tunnel process"),
+            if control_path.exists() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("Timed out waiting for proxy tunnel authentication");
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-    }
 
-    let pid = child.id();
-    let path = fwd_pid_path(inst, name);
-    if let Err(e) = fs::write(&path, pid.to_string()) {
+        // A live SSH process or control socket does not prove the guest has
+        // accepted a reverse forward. -O forward waits for that acknowledgment
+        // and returns nonzero for a rejected bind. The master stays the direct
+        // child, so its existing PID-file teardown remains authoritative.
+        let mut forward_args = target.ssh_opts();
+        forward_args.extend([
+            "-S".into(),
+            control_path.display().to_string(),
+            "-O".into(),
+            "forward".into(),
+            "-R".into(),
+            format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+        ]);
+        forward_args.push(target.addr());
+        let request = Command::new("ssh")
+            .args(&forward_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(forward_log))
+            .spawn()
+            .context("Failed to request the credential proxy's reverse forward")?;
+        await_forwarding_ack(request, deadline)?;
+
+        let path = fwd_pid_path(inst, name);
+        fs::write(&path, child.id().to_string())
+            .with_context(|| format!("Failed to write proxy tunnel pid file {}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = setup {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(e)
-            .with_context(|| format!("Failed to write proxy tunnel pid file {}", path.display()));
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        return Err(e).context(format!(
+            "Failed to establish the credential proxy's reverse SSH tunnel.\n{}",
+            log.trim()
+        ));
     }
+    // The master no longer needs a control socket: later teardown uses its PID.
     Ok(())
+}
+
+/// Use a short, private path even when TMPDIR or the instance path is long.
+fn create_tunnel_control_dir() -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("coop-proxy-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .context("Failed to create proxy tunnel control directory")
+}
+
+/// Reap the setup client on every path, including a guest that never replies.
+fn await_forwarding_ack(mut request: std::process::Child, deadline: Instant) -> Result<()> {
+    let result = (|| -> Result<()> {
+        loop {
+            crate::signal::check_shutdown()?;
+            if let Some(status) = request
+                .try_wait()
+                .context("Failed to poll forwarding request")?
+            {
+                anyhow::ensure!(
+                    status.success(),
+                    "Proxy reverse forwarding request failed ({status})"
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("Timed out waiting for proxy reverse forwarding acknowledgment");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })();
+    if result.is_err() {
+        let _ = request.kill();
+        let _ = request.wait();
+    }
+    result
 }
 
 /// SIGTERM the process named by a PID file and remove the file. Best-effort;
@@ -646,6 +717,193 @@ mod tests {
             "unexpected error: {msg}"
         );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn tunnel_control_directory_is_owner_only() {
+        let dir = create_tunnel_control_dir().unwrap();
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn forwarding_ack_waits_for_success_and_rejects_failure() {
+        let start = Instant::now();
+        let success = Command::new("sh")
+            .args(["-c", "sleep 0.2; exit 0"])
+            .spawn()
+            .unwrap();
+        await_forwarding_ack(success, start + Duration::from_secs(5)).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(200));
+
+        let failure = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let error =
+            await_forwarding_ack(failure, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(error.to_string().contains("request failed"));
+    }
+
+    #[test]
+    fn forwarding_ack_timeout_reaps_setup_client() {
+        let request = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = i32::try_from(request.id()).unwrap();
+        let error =
+            await_forwarding_ack(request, Instant::now() + Duration::from_millis(200)).unwrap_err();
+        assert!(error.to_string().contains("Timed out"));
+        // The setup client is gone, not merely dropped and left running.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn reverse_forward_rejects_a_live_ssh_without_an_established_connection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((connection, _)) => {
+                        // Outlive the old two-second readiness grace, then fail
+                        // the handshake without ever acknowledging a forward.
+                        std::thread::sleep(Duration::from_millis(2300));
+                        drop(connection);
+                        return Ok(true);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Ok(false);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+        let target = SshTarget {
+            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(port).unwrap(),
+            user: crate::backend::SshUser::new("coop").unwrap(),
+            key_path: tmp.path().join("unused-key"),
+        };
+        let result = spawn_reverse_forward(&inst, "test", &target, 8788);
+        let accepted = peer.join().unwrap().unwrap();
+        // Also clean up the old implementation when deliberately regressed.
+        kill_pid_file(&fwd_pid_path(&inst, "test"), "test tunnel");
+        assert!(accepted, "SSH must have reached the stalled peer");
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("before its control socket became ready"));
+        assert!(!fwd_pid_path(&inst, "test").exists());
+    }
+
+    // The runner supplies real OpenSSH in disposable network/PID namespaces:
+    // the host destination and guest reverse listener use the same port.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires tests/integration-proxy-forward.sh"]
+    fn reverse_forward_requires_authenticated_bind_acknowledgment() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let fixture = PathBuf::from(std::env::var("COOP_FORWARD_TEST_DIR").unwrap());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let target = SshTarget {
+            host: crate::backend::Hostname::new("192.0.2.2").unwrap(),
+            port: std::num::NonZeroU16::new(2222).unwrap(),
+            user: crate::backend::SshUser::new("root").unwrap(),
+            key_path: fixture.join("client"),
+        };
+        let master_pid = || -> i32 {
+            fs::read_to_string(fixture.join("master.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let port = destination.local_addr().unwrap().port();
+        spawn_reverse_forward(&inst, "test", &target, port).unwrap();
+        let pid = master_pid();
+        assert_eq!(
+            fs::read_to_string(fwd_pid_path(&inst, "test")).unwrap(),
+            pid.to_string()
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+
+        // Send through the guest listener and receive at the host destination.
+        // This also proves the authenticated master survives socket removal.
+        let mut sender = Command::new("ip")
+            .args(["netns", "exec", "guest", "python3", "-c"])
+            .arg("import socket,sys; s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=5); s.sendall(b'forwarded'); assert s.recv(2)==b'ok'")
+            .arg(port.to_string())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connection = loop {
+            match destination.accept() {
+                Ok((connection, _)) => break Ok(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "forwarded traffic never arrived");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        }
+        .unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut payload = [0; 9];
+        connection.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"forwarded");
+        connection.write_all(b"ok").unwrap();
+        assert!(sender.wait().unwrap().success());
+        kill_pid_file(&fwd_pid_path(&inst, "test"), "test tunnel");
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+
+        // Occupy exactly the guest loopback port. Authentication still works;
+        // only the subsequent reverse-forward bind must be refused.
+        let ready = fixture.join("occupied");
+        let mut blocker = Command::new("ip")
+            .args(["netns", "exec", "guest", "python3", "-c"])
+            .arg("import socket,sys,pathlib,time; s=socket.socket(); s.bind(('127.0.0.1',int(sys.argv[1]))); s.listen(); pathlib.Path(sys.argv[2]).touch(); time.sleep(30)")
+            .arg(port.to_string())
+            .arg(&ready)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(blocker.try_wait().unwrap().is_none(), "bind blocker exited");
+            assert!(Instant::now() < deadline, "bind blocker never became ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = spawn_reverse_forward(&inst, "test", &target, port);
+        let rejected_pid = master_pid();
+        assert!(
+            result.is_err(),
+            "authenticated reverse bind refusal must fail startup"
+        );
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("request failed"), "{error:#}");
+        assert!(!fwd_pid_path(&inst, "test").exists());
+        assert_eq!(unsafe { libc::kill(rejected_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        blocker.kill().unwrap();
+        blocker.wait().unwrap();
     }
 
     #[test]

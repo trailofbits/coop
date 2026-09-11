@@ -1018,24 +1018,19 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
 
 fn install_system_packages(skip_confirm: bool) -> Result<()> {
     let mut missing = Vec::new();
+    let mut missing_tools = Vec::new();
 
-    if !command_exists("setfacl") {
-        missing.push("acl");
-    }
-    if !command_exists("debootstrap") {
-        missing.push("debootstrap");
-    }
-    if !command_exists("unsquashfs") {
-        missing.push("squashfs-tools");
-    }
-    if !command_exists("mkfs.ext4") {
-        missing.push("e2fsprogs");
-    }
-    if !command_exists("ssh") {
-        missing.push("openssh-client");
-    }
-    if !command_exists("rsync") {
-        missing.push("rsync");
+    for (tool, package) in [
+        ("setfacl", "acl"),
+        ("unsquashfs", "squashfs-tools"),
+        ("mkfs.ext4", "e2fsprogs"),
+        ("ssh", "openssh-client"),
+        ("rsync", "rsync"),
+    ] {
+        if !command_exists(tool) {
+            missing.push(package);
+            missing_tools.push(tool);
+        }
     }
 
     if missing.is_empty() {
@@ -1044,6 +1039,16 @@ fn install_system_packages(skip_confirm: bool) -> Result<()> {
     }
 
     step("Missing system packages");
+    if !command_exists("apt-get") {
+        bail!(
+            "Missing host tools: {}.\n\
+             Automatic host package installation requires apt-get, which was not found on PATH.\n\
+             Install the packages providing these tools with your host's package manager, \
+             then rerun `coop setup`.",
+            missing_tools.join(", "),
+        );
+    }
+
     let pkg_list = missing.join(" ");
     eprintln!("  Need to install: {pkg_list}");
 
@@ -1699,6 +1704,52 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_packages_without_apt() {
+        const CHILD: &str = "COOP_TEST_SYSTEM_PACKAGES";
+        if let Ok(scenario) = std::env::var(CHILD) {
+            let result = install_system_packages(true);
+            if scenario == "present" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Missing host tools: unsquashfs, ssh, rsync."));
+                assert!(error.contains("apt-get, which was not found on PATH"));
+                assert!(error.contains("host's package manager"));
+                assert!(error.contains("rerun `coop setup`"));
+            }
+            return;
+        }
+
+        // Isolate PATH in child processes instead of mutating the test runner's
+        // environment. No fixture can invoke a real package manager or sudo.
+        for scenario in ["present", "missing"] {
+            let bin = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
+            for tool in ["setfacl", "unsquashfs", "mkfs.ext4", "ssh", "rsync"] {
+                if scenario == "present" || matches!(tool, "setfacl" | "mkfs.ext4") {
+                    std::os::unix::fs::symlink("/bin/sh", bin.path().join(tool)).unwrap();
+                }
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "setup::tests::system_packages_without_apt",
+                    "--nocapture",
+                ])
+                .env("PATH", bin.path())
+                .env(CHILD, scenario)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
 
     fn profile(name: &str, apt: &[&str], pre: Option<&str>, post: Option<&str>) -> ProfileDef {
         ProfileDef {

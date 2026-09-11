@@ -51,14 +51,18 @@ traces tainted/secret content; or softens the `coop update` verification chain.
 Runtime: Rust `1.94.0` (see `rust-toolchain.toml`), edition 2024.
 
 ```bash
-cargo build
+cargo build --workspace
 cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo deny check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo deny --workspace check
 taplo format --check
 prek run
 ```
+
+Workspace builds include `coop-proxy` and require CMake. Plain `cargo build`
+and the local clippy/test hooks cover only `coop`; run the workspace commands
+above before submitting.
 
 Install pinned local dev tools (prek, taplo, cargo-deny, cargo-mutants,
 cargo-fuzz, kani) with `./scripts/install-dev-tools.sh --all`, then `prek

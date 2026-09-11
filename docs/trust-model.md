@@ -93,7 +93,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   forwarded, `bootstrap_agents` runs `gh auth setup-git`, which makes the token
   **persistent guest state** (a git credential helper any guest process can
   read). A change that forwards it by default, or makes it persistent where it
-  wasn't, is a finding.
+  wasn't, is a finding. `up --no-github` / `start --no-github` override the
+  strategy to Off and disable the PAT wizard for that invocation. This does
+  not scrub existing guest credentials or block explicit environment entries
+  or one-shot clone authentication; see [GitHub auth](configuration.md#github-auth).
 - **Secret files stay `0600`, dirs `0700`.** File-backend PATs live at
   `<state_dir>/github-pat/<account>.txt` (`secret_store.rs:store_file`); all
   managed writes go through `fs_util::atomic_write_with_mode` / `atomic_write_ssh`,

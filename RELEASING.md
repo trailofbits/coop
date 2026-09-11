@@ -5,14 +5,17 @@ How a `coop` release is cut, and what to check before cutting one.
 ## How the automation works
 
 - **`ci.yml`** runs on pushes to `main` and on every PR: `fmt --check`, `clippy -D warnings`,
-  `cargo test`, `integration-install.sh`, `integration-update.sh`,
+  `cargo test --workspace`, the preflight/probe regression tests, Linux bridge
+  isolation, `integration-proxy-forward.sh`, `integration-install.sh`, `integration-update.sh`,
   `integration-uninstall.sh`,
-  `cargo deny check`, and `zizmor`.
+  `cargo deny --workspace check`, `taplo format --check`, and `zizmor`.
 - **`release.yml`** runs when a `v*` tag is pushed. It **re-runs all of CI as a
-  gate**, then cross-compiles the three target binaries
+  gate**, then builds both `coop` and `coop-proxy` on native runners for three
+  targets
   (`aarch64-apple-darwin`, `x86_64-unknown-linux-musl`,
-  `aarch64-unknown-linux-musl`), generates `SHA256SUMS`, attests build
-  provenance, extracts the `## vX.Y.Z` section from `CHANGELOG.md` as the
+  `aarch64-unknown-linux-musl`), checks the built CLI reports the tagged release
+  version, packages both binaries per target, generates `SHA256SUMS`, attests
+  build provenance, extracts the `## vX.Y.Z` section from `CHANGELOG.md` as the
   release notes, and publishes the GitHub release. **It fails if there is no
   matching CHANGELOG section.**
 
@@ -24,8 +27,8 @@ push succeeds and ships something correct.
 | Check | CI (on PR + on tag) | `preflight-release.sh` | Manual judgement |
 |-------|:---:|:---:|:---:|
 | fmt / clippy / unit tests | ✓ | ✓ | |
-| `cargo deny`, `zizmor` | ✓ | ✓ (if installed) | |
-| Host-only integration suites | ✓ | ✓ | |
+| `cargo deny --workspace`, `zizmor`, `taplo` | ✓ | ✓ (if installed) | |
+| Host-only integration and preflight/probe regression suites | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
 | Formal verification (`cargo kani`) | | ✓ (if installed) | |
@@ -45,8 +48,8 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    `CHANGELOG.md` to judge.
 
 3. **Bump the version.**
-   - Edit `version` in `Cargo.toml`.
-   - Run `cargo build` so `Cargo.lock` picks up the new `coop` version.
+   - Edit `[workspace.package].version` in `Cargo.toml`; both packages inherit it.
+   - Run `cargo build --workspace` so `Cargo.lock` picks up both package versions.
 
 4. **Promote the changelog.** Rename `## Unreleased` to `## vX.Y.Z` in
    `CHANGELOG.md`. The text under it becomes the GitHub release notes verbatim,
@@ -58,6 +61,9 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    ```bash
    ./scripts/preflight-release.sh
    ```
+
+   A successful exit with warnings is incomplete validation: resolve skipped
+   tools, targets, and platform gates before tagging.
 
    The full VM suite runs on **this machine** (one platform) plus **one remote
    host** you give for the other platform — so run the preflight from a
@@ -93,8 +99,8 @@ CI can't run the full VM integration suite or the extra-toolchain checks
    This triggers `release.yml`.
 
 9. **Verify the published release.** On the GitHub release page confirm:
-   - three `coop-vX.Y.Z-<target>.tar.gz` artifacts plus `SHA256SUMS` and
-     `attestations.jsonl`,
+   - three `coop-vX.Y.Z-<target>.tar.gz` artifacts, each containing both `coop`
+     and `coop-proxy`, plus `SHA256SUMS` and `attestations.jsonl`,
    - the build-provenance attestation is attached,
    - the notes match the `## vX.Y.Z` CHANGELOG section.
 
@@ -122,13 +128,18 @@ re-run the release. A red `release.yml` run means you **bump to the next patch
 version and cut a fresh release** — go back to step 2 with `vX.Y.(Z+1)`.
 
 This is why the preflight matters: `release.yml` re-runs CI and then builds the
-three target binaries, and a failure in *either* burns the version. Run
+workspace for three targets, and a failure in *either* burns the version. Run
 `./scripts/preflight-release.sh` before every tag — it mirrors the CI checks
-**and** builds the three release targets locally (for each rustup toolchain you
-have installed; pass `--install-targets` to `rustup target add` any that are
-missing — the cross-linker tools must already be installed), so the
-cross-compile matrix is exercised before the tag rather than after. Run it from
-a macOS/Lima box with `musl-cross` set up to cover all three targets at once.
+**and** builds both workspace binaries for release targets locally (for each
+rustup target you have installed; pass `--install-targets` to `rustup target add` any that are
+missing — the cross-linker tools must already be installed), so build failures
+can be caught before the tag. The release workflow uses
+native macOS ARM64, Linux x86_64, and Linux ARM64 runners; Linux needs
+`musl-tools` and `cmake` for the proxy's `aws-lc-sys` dependency, with `musl-gcc`
+as its C compiler and Rust linker (see `release.yml`). Cross-building locally
+also needs a C toolchain and linker configured for each target; installing the
+Rust target alone is insufficient. Check any targets skipped by the preflight
+on matching hosts before tagging.
 
 Do **not** attempt `git push origin :refs/tags/vX.Y.Z` to delete and reuse a
 tag — immutable releases reject it, and reusing a spent version is not allowed.

@@ -48,10 +48,16 @@ jobs:
         run: cargo test --workspace
 
       - name: Install network test tools
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server
+
+      - name: Release preflight regression tests
+        run: python3 tests/test-preflight-release.py
 
       - name: Integration probe regression tests
         run: python3 tests/test-integration-probes.py
+
+      - name: Integration test — proxy reverse forwarding
+        run: ./tests/integration-proxy-forward.sh
 
       - name: Integration test — bridge isolation
         run: ./tests/integration-network.sh

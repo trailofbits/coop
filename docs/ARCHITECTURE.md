@@ -31,6 +31,8 @@ coop/
 │   ├── git_repo_devcontainer.rs # fetch devcontainer.json from a remote repo
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
+│   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
+│   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
 │   ├── secret_store.rs     # pluggable secret backends (keychain/op/secret-tool/file)
 │   ├── github_pat.rs       # `coop github` PAT wizard (setup/rotate/status/forget)
@@ -51,6 +53,7 @@ coop/
 │   ├── prompt.rs           # TTY prompts
 │   ├── update.rs           # `coop update` self-update + background notifier
 │   └── commands/           # one module per command domain (see below)
+├── coop-proxy/             # separate binary crate: credential injection, policy, TLS, jail
 ├── scripts/guest/          # guest-image provisioning scripts (embedded at build)
 ├── guest/init.sh           # guest first-boot init
 ├── tests/                  # integration test scripts (see AGENTS.md "Before committing")
@@ -58,9 +61,11 @@ coop/
 └── docs/                   # this tree
 ```
 
-All application logic lives in the **library crate** (`src/lib.rs`); `main.rs`
-is a six-line shim calling `coop::run()`. This is why unit and mutation tests
-run against `--lib`.
+The main CLI logic lives in the **library crate** (`src/lib.rs`); `main.rs`
+is a thin shim calling `coop::run()`. Its unit and mutation tests target the
+library. The credential proxy is a separate binary crate in the same Cargo
+workspace; `--workspace` builds and tests both crates. Plain `cargo build`
+and `cargo test` select only the root `coop` package.
 
 ## The two-backend design
 
@@ -125,7 +130,8 @@ flags — this is a load-bearing design choice (see
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
 `devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
-`model.rs` (`coop model`), `github.rs`, `admin.rs` (init/validate/uninstall),
+`model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
+`admin.rs` (init/validate/uninstall),
 and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
 (`merge_runtime_guest_env`, `purge_all_data`).
@@ -169,19 +175,20 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
-`guest_env.json`, `model.json`, `devcontainer_state.json`, plus the Firecracker
-`.pid`/`.socket`/`.log`/vsock files.
+`guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
+the Firecracker `.pid`/`.socket`/`.log`/vsock files.
 
 ## `coop update`
 
-`update.rs` self-updates the binary: fetch release metadata from the pinned
-`trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
+`update.rs` self-updates the CLI and its proxy companion: fetch release metadata
+from the pinned `trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
 `attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
 when the release publishes no usable one (best-effort),
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
-binary over the running one. A background notifier checks for new versions on a
-24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and
+`coop-proxy` beside the CLI before replacing `coop`. Each replacement is
+atomic; the pair is not a single transaction. A background notifier checks for
+new versions on a 24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and
 its trust properties are documented in [`trust-model.md`](trust-model.md#coop-update-trust-chain).
 
 ## Guest image
@@ -193,7 +200,7 @@ embedded provisioning scripts in `scripts/guest/` (`preamble.sh`,
 from `guest.rs`. Firecracker uses a minimal CI kernel that is missing several
 netfilter modules; the resulting workarounds (iptables-legacy, static
 `resolv.conf`, `DOCKER_INSECURE_NO_IPTABLES_RAW=1`) are applied in
-`guest-config.sh` and explained in [`AGENTS.md`](../AGENTS.md) and
+`guest-config.sh` and explained in [`platform-notes.md`](platform-notes.md) and
 [`trust-model.md`](trust-model.md#documented-accepted-trade-offs).
 
 ## Architectural invariants

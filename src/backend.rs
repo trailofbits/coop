@@ -1714,8 +1714,17 @@ fn bootstrap_codex(
             model_state.save(inst)?;
         }
 
-        if wants_keyring {
-            remove_guest_codex_auth_json(&session.target);
+        if proxy.is_some() {
+            // The guest must not retain a direct credential when the proxy
+            // promises to keep that credential on the host. The outer guard
+            // tears down the proxy if cleanup fails.
+            remove_guest_codex_auth_json(&session.target)?;
+        } else if wants_keyring && let Err(e) = remove_guest_codex_auth_json(&session.target) {
+            tracing::warn!(
+                "Could not remove a possible stale plaintext ~/.codex/auth.json from the \
+                 guest; Codex account auth stores credentials in the guest keyring, so any \
+                 such file is unused but still readable: {e:#}"
+            );
         }
 
         // Marketplaces and plugins are persisted in the guest's config.toml and
@@ -1789,20 +1798,15 @@ pub fn ensure_codex_remote_auth_consistent(
 ///
 /// Dropping `auth.json` from the staged file set only stops coop *copying* a
 /// new one — `copy_staged_to_guest` is additive and deletes nothing — so a VM
-/// switched from `api_key` to `chatgpt` would keep a plaintext refresh token
-/// on its guest disk, which is precisely what this mode exists to avoid.
+/// switched from direct credentials to `chatgpt` or proxy mode would keep a
+/// plaintext refresh token on its guest disk despite no longer needing it.
 ///
-/// Best-effort: the credential store is already the keyring by this point, so
-/// a failure here leaves a stale file rather than breaking the boot. It is
-/// loud about it, because the file is a credential.
-fn remove_guest_codex_auth_json(target: &SshTarget) {
-    if let Err(e) = target.exec(RemoteCommand::new().literal("rm -f ~/.codex/auth.json")) {
-        tracing::warn!(
-            "Could not remove a possible stale plaintext ~/.codex/auth.json from the \
-             guest; Codex account auth stores credentials in the guest keyring, so any \
-             such file is unused but still readable: {e:#}"
-        );
-    }
+/// The caller fails proxy bootstrap closed on an error; account-auth mode
+/// preserves its existing best-effort cleanup with a warning.
+fn remove_guest_codex_auth_json(target: &SshTarget) -> Result<()> {
+    target
+        .exec(RemoteCommand::new().literal("rm -f ~/.codex/auth.json"))
+        .context("Failed to remove stale guest ~/.codex/auth.json")
 }
 
 pub fn codex_keyring_not_configured_message() -> &'static str {

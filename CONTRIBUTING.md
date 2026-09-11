@@ -43,7 +43,10 @@ cd coop
 cargo build --release
 ```
 
-The binary lands at `target/release/coop`.
+The binary lands at `target/release/coop`. This default build excludes the
+credential proxy. To build both release binaries, install CMake and run
+`cargo build --workspace --release`; keep `coop-proxy` next to `coop` when
+installing them.
 
 ## Pre-commit hooks
 
@@ -62,6 +65,10 @@ YAML, large files, merge conflicts). Run them by hand at any time with:
 prek run --all-files
 ```
 
+The local clippy and test hooks cover only `coop`. Before submitting, also
+run `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
+`cargo test --workspace` to cover `coop-proxy`, as CI does.
+
 Fix every warning before committing. coop has a zero-warnings policy — clippy
 runs with `-D warnings`, so a warning fails the build.
 
@@ -70,10 +77,11 @@ runs with `-D warnings`, so a warning fails the build.
 ### Unit tests
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-Unit tests live in the library crate and cover the pure logic: config parsing
+The workspace command also runs `coop-proxy` tests and requires CMake.
+The main CLI library tests cover the pure logic: config parsing
 and validation, workspace sync argument construction, env merging, secret
 routing, and the helpers the command handlers are built from. Test behavior,
 not implementation — a test that breaks under a refactor but not a behavior
@@ -109,7 +117,7 @@ parsing, the JSONC reader, the arithmetic kernels — see
 
 ## Code style
 
-- Format with `cargo fmt`; lint with `cargo clippy --all-targets
+- Format with `cargo fmt`; lint with `cargo clippy --workspace --all-targets
   --all-features -- -D warnings`. Both are enforced in CI.
 - Lean on the type system to make illegal states unrepresentable rather than
   validating at runtime: parse untrusted input into strong types at the
@@ -145,11 +153,18 @@ CI must pass before a pull request can merge. The
 [CI workflow](.github/workflows/ci.yml) runs:
 
 - **`cargo fmt -- --check`** — formatting.
-- **`cargo clippy --all-targets --all-features -- -D warnings`** — lints.
-- **`cargo test`** — unit tests.
-- **`./tests/integration-update.sh`** and
-  **`./tests/integration-uninstall.sh`** — the update and uninstall flows.
-- **`cargo deny check`** — advisories, licenses, bans, and sources.
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — lints.
+- **`cargo test --workspace`** — tests for both crates.
+- **`./tests/integration-install.sh`**, **`./tests/integration-update.sh`**,
+  and **`./tests/integration-uninstall.sh`** — installer provenance, update,
+  and uninstall flows.
+- **`./tests/integration-network.sh`** — Linux bridge isolation.
+- **`./tests/integration-proxy-forward.sh`** — authenticated SSH reverse
+  forwarding and rejected-bind cleanup on Linux.
+- **`python3 tests/test-preflight-release.py`** — release gate regression checks.
+- **`python3 tests/test-integration-probes.py`** — regression checks for
+  integration probes.
+- **`cargo deny --workspace check`** — advisories, licenses, bans, and sources.
 - **[zizmor](https://github.com/zizmorcore/zizmor)** — GitHub Actions security
   audit.
 

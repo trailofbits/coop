@@ -59,6 +59,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--mem <MiB>` | Memory in MiB when creating a new instance |
 | `--disk <GiB>` | Instance disk size when creating a new instance |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
 | `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
@@ -245,6 +246,7 @@ instances, pass the instance name.
 | `NAME` | Stopped instance name (optional only when exactly one stopped instance exists) |
 | `--workspace <dir>` | Restart the stopped instance associated with this project path |
 | `--no-agents` | Skip injecting Claude Code and Codex credentials/config into the VM |
+| `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
@@ -264,6 +266,7 @@ rules, and recreate guidance.
 coop start
 coop start my-project
 coop start my-project --no-agents
+coop start my-project --no-github
 coop start --env RUST_LOG=info --env MY_FLAG=1
 coop start --forward-port 3000 --forward-port 8080:18080
 ```
@@ -834,7 +837,7 @@ Kept across the wipe, because coop persists them host-side:
 | Port forwards, including a devcontainer's `forwardPorts` | `forwards.json` |
 | Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
-| GitHub PATs and provider credentials | host secret store (never on the guest disk) |
+| Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
 
 **Not replayed**, because coop does not persist them:
 
@@ -842,7 +845,11 @@ Kept across the wipe, because coop persists them host-side:
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
 - A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
 
-Everything that can fail cheaply is checked while the instance is still intact — the image exists, the state files parse, the recorded workspace directory is still there, and no host port for a forward is taken. Only then is the disk replaced. A failure after that point leaves the instance in place with a partly provisioned guest, and re-running the same command finishes the job.
+Before replacing the disk, coop checks that the image exists, the state files
+parse, the recorded workspace directory is still there, and host ports for
+forwards are available. A later failure leaves the instance in place with a
+partly provisioned guest. Re-running the command replaces the disk again and
+restarts provisioning; save any guest-only work before retrying.
 
 Compared with the neighbouring commands:
 

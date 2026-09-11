@@ -402,18 +402,21 @@ Ordered, independently shippable:
    Delivers Claude↔Codex parity at the API-key tier. Codex subscription is out of
    scope by vendor design (§7).
 3. **Jailing (shipped).** Bound a proxy-exploit blast radius by confining
-   `coop-proxy`. **Implemented with Landlock (ABI v4), not the uid+netns jailer
+   `coop-proxy`. **Implemented with tiered Landlock, not the uid+netns jailer
    sketched in §3/§11.3.** The settled architecture binds the listener on host
    `127.0.0.1` reached via `ssh -R`, and an isolated network namespace gets its
    own loopback the host-side tunnel could not reach — so instead of moving the
    bind, the proxy self-confines with Landlock (filesystem-write + `exec`
-   denied; TCP egress limited to `:443`/`:53`) applied before it binds. macOS,
-   which has no in-process sandbox, is confined externally with a Seatbelt
+   denied; TCP egress limited to `:443`/`:53` where supported) applied before
+   it binds. macOS, which has no in-process sandbox, is confined externally
+   with a Seatbelt
    profile via `sandbox-exec` — so this slice covers **both** backends, not just
    Firecracker. Fail-closed on both. See [`../trust-model.md`](../trust-model.md)
    and [`../credential-proxy.md`](../credential-proxy.md) for the shipped
    mechanism and its accepted limitations (port-scoped not host-scoped; UDP
-   unrestricted on Linux; host kernel ≥6.7).
+   unrestricted on Linux; enabled Landlock on host kernel ≥5.13, TCP scoping
+   from ≥6.7). The [tiered-jail design](proxy-jail-graceful-degradation.md)
+   describes the required floor and best-effort restrictions.
 4. **GitHub (separate, later).** No base-URL override exists for `gh`/`git`, and
    #73 already documented that URL/path filtering cannot constrain `gh api
    graphql`. Injection (token never crosses to the guest) is still worthwhile as

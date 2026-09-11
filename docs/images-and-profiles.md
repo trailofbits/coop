@@ -7,7 +7,7 @@ coop builds **golden images** (templates) once and copies them to create VM inst
 A template is a fully provisioned ext4 root filesystem. The build process:
 
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
-2. Provisions a base Ubuntu system (debootstrap on Firecracker, Ubuntu 24.04 cloud image on Lima)
+2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
 3. Installs base packages, Docker, GitHub CLI, Claude Code, and Codex
 4. Applies requested profiles and extra packages
 5. Runs post-install scripts if provided

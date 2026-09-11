@@ -17,6 +17,7 @@ coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it s
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
+- Setup also checks for `setfacl`, `unsquashfs`, `ssh`, and `rsync`. Automatic installation of missing tools requires `apt-get`; on other hosts, install the packages providing the reported tools manually and rerun `coop setup`. See [backend prerequisites](backends.md#prerequisites-1).
 
 ## Install
 
@@ -45,15 +46,30 @@ instead, which it will only do when `gh` is logged in. `install.sh` and `coop
 update` use that API path themselves for releases published without a usable
 bundle.
 
+## Upgrading from v0.5.4
+
+Rerun the installer above when upgrading from v0.5.4 to a release that includes
+credential proxy support. The v0.5.4 updater replaces only `coop`; it does not
+install the new `coop-proxy` companion. Proxy mode requires both binaries in
+the same directory. If you installed into a custom directory, pass the same
+`INSTALL_DIR` to the installer.
+
+The published v0.5.4 Linux ARM64 binary reports
+`coop 0.5.4-dev (8e24729+dirty)` and refuses `coop update` because it identifies
+itself as a development build. Rerunning the installer also bypasses that old
+updater.
+
 ## Build from source
 
-coop is a Rust project. Install [Rust](https://rustup.rs/), then:
+Install [Rust](https://rustup.rs/) and CMake, then:
 
 ```
-cargo build --release
+cargo build --workspace --release
 ```
 
-The binary lands at `target/release/coop`.
+The binaries land at `target/release/coop` and `target/release/coop-proxy`.
+Keep them in the same directory when installing: proxy mode looks for its
+companion next to `coop`.
 
 ## Configuration
 
@@ -114,7 +130,8 @@ For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
 --rebuild`. An existing VM keeps its own guest disk across a restart, so also
 run `coop restore <vm> --image <image> --reprovision` (see
-[Codex integration](codex-integration.md)) to pick up the rebuilt image. Then
+[Codex integration](codex-integration.md)) to pick up the rebuilt image.
+Reprovisioning replaces the guest disk, so save guest-only work first. Then
 run `coop codex -- login --device-auth` once.
 
 ## First run

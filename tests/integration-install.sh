@@ -173,14 +173,18 @@ fi
 
 echo "==> Test 2: bundle verification failure is fail-closed"
 printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"
+printf '%s\n' 'keep-existing-proxy' >"$INSTALL_DIR/coop-proxy"
 COOP_TEST_GH_VERIFY_FAIL=1
 export COOP_TEST_GH_VERIFY_FAIL
 if run_installer >"$TEST_ROOT/t2.log" 2>&1; then
     fail "failed bundle verification aborts installation" "installer exited 0"
-elif [[ "$(cat "$INSTALL_DIR/coop")" == "keep-existing-install" ]]; then
-    pass "failed bundle verification leaves the installed binary unchanged"
+elif grep -q "Attestation verification failed" "$TEST_ROOT/t2.log" \
+    && [[ "$(cat "$INSTALL_DIR/coop")" == "keep-existing-install" \
+       && "$(cat "$INSTALL_DIR/coop-proxy")" == "keep-existing-proxy" ]]; then
+    pass "failed bundle verification leaves both installed binaries unchanged"
 else
-    fail "failed bundle verification leaves the installed binary unchanged"
+    fail "failed bundle verification leaves both installed binaries unchanged" \
+        "$(tail -10 "$TEST_ROOT/t2.log")"
 fi
 unset COOP_TEST_GH_VERIFY_FAIL
 
@@ -201,6 +205,55 @@ if grep -q 'attestation verify .* --repo trailofbits/coop$' "$GH_LOG" \
     pass "legacy fallback verifies through the attestations API"
 else
     fail "legacy fallback verifies through the attestations API" "gh calls: $(cat "$GH_LOG")"
+fi
+
+echo "==> Test 4: checksum rejection preserves both binaries"
+printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"
+printf '%s\n' 'keep-existing-proxy' >"$INSTALL_DIR/coop-proxy"
+printf '%064d  %s\n' 0 "$TARBALL" >"$FIXTURE/SHA256SUMS"
+if run_installer >"$TEST_ROOT/t4.log" 2>&1; then
+    fail "checksum mismatch aborts installation" "installer exited 0"
+elif grep -q "Checksum mismatch" "$TEST_ROOT/t4.log" \
+    && [[ "$(cat "$INSTALL_DIR/coop")" == "keep-existing-install" \
+       && "$(cat "$INSTALL_DIR/coop-proxy")" == "keep-existing-proxy" ]]; then
+    pass "checksum mismatch leaves both installed binaries unchanged"
+else
+    fail "checksum mismatch leaves both installed binaries unchanged" \
+        "$(tail -10 "$TEST_ROOT/t4.log")"
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$FIXTURE" && sha256sum "$TARBALL" > SHA256SUMS)
+else
+    (cd "$FIXTURE" && shasum -a 256 "$TARBALL" > SHA256SUMS)
+fi
+
+echo "==> Test 5: reinstall replaces both existing binaries"
+if run_installer >"$TEST_ROOT/t5.log" 2>&1 \
+    && [[ "$("$INSTALL_DIR/coop")" == "installed-coop" \
+       && "$("$INSTALL_DIR/coop-proxy")" == "installed-coop-proxy" ]]; then
+    pass "reinstall replaces both binaries with verified release contents"
+else
+    fail "reinstall replaces both binaries with verified release contents" \
+        "$(tail -10 "$TEST_ROOT/t5.log")"
+fi
+
+echo "==> Test 6: legacy package without companion remains installable"
+rm "$FIXTURE/$ARCHIVE_DIR/coop-proxy"
+(cd "$FIXTURE" && tar -czf "$TARBALL" "$ARCHIVE_DIR")
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$FIXTURE" && sha256sum "$TARBALL" > SHA256SUMS)
+else
+    (cd "$FIXTURE" && shasum -a 256 "$TARBALL" > SHA256SUMS)
+fi
+printf '%s\n' 'old-coop' >"$INSTALL_DIR/coop"
+if run_installer >"$TEST_ROOT/t6.log" 2>&1 \
+    && [[ "$("$INSTALL_DIR/coop")" == "installed-coop" \
+       && "$("$INSTALL_DIR/coop-proxy")" == "installed-coop-proxy" ]]; then
+    pass "legacy install replaces coop and preserves the existing companion"
+else
+    fail "legacy install replaces coop and preserves the existing companion" \
+        "$(tail -10 "$TEST_ROOT/t6.log")"
 fi
 
 echo

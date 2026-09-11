@@ -31,6 +31,19 @@ The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:
 
 When a token is present, coop runs `gh auth setup-git` inside the guest to wire up git credential helpers.
 
+`coop up --no-github` and `coop start --no-github` force `github = "off"`
+for that invocation, regardless of the configured strategy, and suppress the
+PAT setup prompt. Configured PAT retrieval commands are not evaluated. Model
+credentials and other configuration remain in effect, and the config file is
+not changed. `coop up` rejects this flag for an already-running instance;
+stop it first, then repeat `up` with the flag.
+
+This has the same scope as `github = "off"`: it disables strategy-based token
+forwarding, but does not block explicit `env_forward`, `guest_env`, or `--env`
+entries, or the one-shot host-token fallback used for `--git-repo` clones.
+It does not erase credentials already stored in the guest. Later invocations
+(including `shell` and `exec`) use the configured strategy again.
+
 ### Fine-grained PAT (`github = "pat"`)
 
 In pat mode coop forwards a *per-repo* fine-grained personal access token: the resolved `owner/repo` at VM startup selects the matching entry in `[github.pat]`. Compared with `"auto"` / `"env"`, the effective reach of a leaked token is bounded by the repos and permissions GitHub recorded when it was created — GitHub rejects out-of-scope operations (REST and GraphQL) server-side, not in coop.

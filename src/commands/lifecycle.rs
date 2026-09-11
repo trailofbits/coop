@@ -47,8 +47,13 @@ impl UpOpts<'_> {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI switches, not mutually exclusive lifecycle states"
+)]
 pub(crate) struct UpRuntimeOpts {
     pub(crate) no_agents: bool,
+    pub(crate) no_github: bool,
     pub(crate) exclude_git: bool,
     pub(crate) no_prompt: bool,
     pub(crate) forward_ports: Vec<config::PortForward>,
@@ -713,6 +718,7 @@ fn ensure_up_git_repo_name_matches(
 
 fn up_has_restart_only_inputs(opts: &UpOpts<'_>) -> bool {
     opts.runtime.no_agents
+        || opts.runtime.no_github
         || !opts.runtime.forward_ports.is_empty()
         || opts.runtime.post_start.is_some()
         || !opts.runtime.guest_env.is_empty()
@@ -722,7 +728,7 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
     if up_has_restart_only_inputs(opts) {
         bail!(
             "Instance '{}' is already running for this project. \
-             --no-agents, --forward-port, --post-start, and --env only take \
+             --no-agents, --no-github, --forward-port, --post-start, and --env only take \
              effect during start or restart.\n\
              Run `coop stop {}` first, then repeat `coop up` with those options.",
             inst.name,
@@ -2554,6 +2560,7 @@ mod tests {
             profile_target: None,
             runtime: super::UpRuntimeOpts {
                 no_agents: false,
+                no_github: false,
                 exclude_git: false,
                 no_prompt: true,
                 forward_ports: Vec::new(),
@@ -3505,11 +3512,11 @@ mod tests {
             .allocate_instance(None, &img, Some(&project))
             .expect("inst");
         let mut opts = up_opts_for_tests(project.to_str());
-        opts.runtime.post_start = Some("echo hi".to_string());
+        opts.runtime.no_github = true;
 
         let err = super::reject_running_up_restart_inputs(&inst, &opts)
             .expect_err("expected restart-only rejection");
-        assert!(format!("{err}").contains("--post-start"));
+        assert!(format!("{err}").contains("--no-github"));
     }
 
     #[test]
@@ -3863,6 +3870,10 @@ mod tests {
         let mut no_agents = up_opts_for_tests(None);
         no_agents.runtime.no_agents = true;
         assert!(super::up_has_restart_only_inputs(&no_agents));
+
+        let mut no_github = up_opts_for_tests(None);
+        no_github.runtime.no_github = true;
+        assert!(super::up_has_restart_only_inputs(&no_github));
 
         let mut ports = up_opts_for_tests(None);
         ports.runtime.forward_ports = vec![super::config::PortForward::parse("3000").unwrap()];

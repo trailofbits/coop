@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## v0.6.0
+
+### Upgrading from v0.5.4
+
+- Rerun the [installer](docs/getting-started.md#install) to install both `coop`
+  and the new `coop-proxy` companion in the same directory. The v0.5.4 updater
+  replaces only `coop`, so its first upgrade does not install the companion
+  required for proxy mode. Preserve your `INSTALL_DIR` if you used a custom
+  installation directory.
+- The published v0.5.4 Linux ARM64 binary reports
+  `coop 0.5.4-dev (8e24729+dirty)` and refuses self-update as a development
+  build. Use the installer to upgrade it.
+- Restart all running Linux VMs after upgrading to apply guest-to-guest
+  network isolation. Every VM on the shared bridge needs the restart; a
+  pre-upgrade VM leaves peers reachable. macOS is unaffected.
+- Save guest-only work before `restore --reprovision`: it replaces the guest
+  disk, including any guest keyring and cached account login. Rebuilding an
+  image alone does not update existing VM disks.
+
 ### New features
 
 - **Codex ChatGPT account auth** — New `[codex] auth = "chatgpt"` mode for

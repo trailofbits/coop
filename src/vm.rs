@@ -570,14 +570,19 @@ fn kill_process_on_socket(socket_path: &std::path::Path) {
 /// the VM running. This shell records its own PID and execs in place, so
 /// the PID file names the process SIGKILL must reach.
 ///
-/// The mode is pinned because root's umask here comes from the host's
-/// PAM/`login.defs`, not ours: under a hardened `UMASK` (027 in the CIS
-/// baseline) the file would land unreadable to every unprivileged reader
-/// of it — `stop`, `status`, `check_alive` and `Instance::is_running`.
+/// A root-owned PID file must be readable by the unprivileged caller despite
+/// root's umask or the instance directory's default ACL. Set the mode before
+/// atomically publishing it, so startup never observes an unreadable file.
+/// Staging beside the destination keeps the rename on the same filesystem.
 const PID_TRAMPOLINE: &str = concat!(
-    r#"rm -f "$1" || exit 1; "#,
-    r#"echo $$ > "$1" || exit 1; "#,
-    r#"chmod 644 "$1" || exit 1; "#,
+    r#"rm -f -- "$1" || exit 1; "#,
+    r#"pid_tmp=$(mktemp -- "$1.XXXXXX") || exit 1; "#,
+    r#"trap 'rm -f -- "$pid_tmp"' EXIT; "#,
+    r#"trap 'exit 1' HUP INT TERM; "#,
+    r#"echo $$ > "$pid_tmp" || exit 1; "#,
+    r#"chmod 644 "$pid_tmp" || exit 1; "#,
+    r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
+    r#"trap - EXIT HUP INT TERM; "#,
     r#"shift; exec "$@""#,
 );
 
@@ -695,6 +700,128 @@ mod tests {
         let back: MachineConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vcpu_count, 4);
         assert_eq!(back.mem_size_mib, 3072);
+    }
+
+    #[test]
+    fn pid_trampoline_publishes_readable_pid_under_hardened_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        // Pause any post-publication chmod in the shell itself. This makes the
+        // old create-then-chmod window deterministic without sudo or a VM.
+        // The replacement process also stays alive until the test reaps it.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "published=$1; umask 077; chmod() {{ if [ \"$2\" = \"$published\" ]; then kill -STOP $$; fi; command chmod \"$@\"; }}; {}",
+                crate::vm::PID_TRAMPOLINE,
+            ))
+            .arg("sh")
+            .arg(&path)
+            .args(["sleep", "30"])
+            .spawn()
+            .unwrap();
+        let published = wait_for_pid_file(&path, Duration::from_secs(5));
+        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
+        let expected_pid = child.id();
+        // Reap even when an assertion below fails, including the stopped shell.
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(published.unwrap(), expected_pid);
+        assert_eq!(mode.unwrap(), 0o644);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_trampoline_normalizes_inherited_default_acl() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // Linux POSIX default ACL u::rwx,g::---,o::---. Such an ACL replaces
+        // the umask during file creation; changing the umask cannot grant read.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions) in [(1_u16, 7_u16), (4, 0), (32, 0)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        // SAFETY: both C strings and the ACL buffer live through setxattr;
+        // the buffer length describes its complete initialized contents.
+        let status = unsafe {
+            libc::setxattr(
+                directory.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "set default ACL: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Positive witness that this filesystem applies the restrictive ACL.
+        let witness = dir.path().join("inherited");
+        std::fs::write(&witness, "fixture").unwrap();
+        assert_eq!(
+            std::fs::metadata(&witness).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let path = dir.path().join("firecracker.pid");
+        let result = std::process::Command::new("sh")
+            .args(["-c", crate::vm::PID_TRAMPOLINE, "sh"])
+            .arg(&path)
+            .arg("true")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn pid_trampoline_cleans_staging_file_when_chmod_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.pid");
+        let result = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "chmod() {{ echo chmod-refused >&2; return 1; }}; {}",
+                    crate::vm::PID_TRAMPOLINE
+                ),
+                "sh",
+            ])
+            .arg(&path)
+            .arg("true")
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("chmod-refused"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

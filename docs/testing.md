@@ -38,6 +38,11 @@ guest environment → docker → stop → destroy). CI additionally runs the fas
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
 
+The `--full` suite includes a dedicated `--no-github` phase. It captures the
+boot session through `post_start` for fresh `up`, `start`, and a stopped-project
+`up`, checks that model credentials still arrive, and witnesses normal GitHub
+forwarding on an intervening invocation without the flag.
+
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
@@ -82,6 +87,24 @@ This exercises the bridge mechanism shared by veths and TAPs. The existing
 Firecracker `--full` phase checks actual VM TAP flags and both direct and routed
 traffic; it also detects removal of the helper call from `setup_tap`. This
 host-only gate does not replace Firecracker or Lima VM integration.
+
+## Host-only proxy reverse-forward test
+
+Run `./tests/integration-proxy-forward.sh` on Linux to exercise the production
+reverse-tunnel startup against real OpenSSH. It authenticates with throwaway
+keys, witnesses traffic through an accepted forward, then occupies the guest
+loopback port and requires startup to return an error without publishing a PID
+or leaving the SSH master alive. Separate host and guest network namespaces
+allow the destination and reverse listener to use the same port.
+
+The runner requires Rust/Cargo, Python 3, passwordless sudo, iproute2,
+util-linux, coreutils, hostname, and OpenSSH client/server tools. It builds
+unprivileged, then confines the fixture to disposable mount, network, UTS, and
+PID namespaces. No user SSH configuration or keys are used. Namespace teardown
+removes all children and temporary files on success, failure, or timeout.
+Linux CI and release preflight run this gate explicitly; ordinary unit tests
+mark it ignored, and macOS preflight reports it as unrun. This host test does
+not replace the Firecracker and Lima VM integration gates.
 
 ## Mutation testing
 
