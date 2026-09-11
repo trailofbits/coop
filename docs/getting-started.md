@@ -1,6 +1,6 @@
 # Getting Started
 
-coop runs Claude Code and Codex inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
 
 ## Prerequisites
 
@@ -93,7 +93,7 @@ All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
 
 The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
 
-### Claude Code and Codex integration
+### Agent integration
 
 Forward your API keys and GitHub credentials into the guest:
 
@@ -110,6 +110,9 @@ config_dir = "~/.claude"
 [codex]
 auth = "api_key"
 config_dir = "~/.codex"
+
+[grok]
+config_dir = "~/.grok"
 ```
 
 The `github` field controls how coop resolves a GitHub token for the guest:
@@ -121,10 +124,10 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 
 GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
 
-coop picks up `ANTHROPIC_API_KEY` and, in the default Codex API-key mode,
-`OPENAI_API_KEY` from your environment automatically. Setting them explicitly
-under `claude.api_key` or `codex.api_key` also works, but environment variables
-are preferred.
+coop picks up `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and, in the default Codex
+API-key mode, `OPENAI_API_KEY` from your environment automatically. Setting
+them explicitly under `claude.api_key`, `codex.api_key`, or `grok.api_key`
+also works, but environment variables are preferred.
 
 For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
@@ -225,6 +228,7 @@ After the environment is running, connect to it:
 coop shell
 coop claude
 coop codex
+coop grok
 ```
 
 ### 3. Restart a stopped instance
@@ -257,7 +261,7 @@ coop up ~/code/my-project --profile python,node
 coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
-Skip Claude Code and Codex credential/config injection:
+Skip Claude Code, Codex, and Grok Build credential/config injection:
 
 ```
 coop start my-project --no-agents
@@ -299,6 +303,27 @@ Pass extra arguments through to `codex`:
 
 ```
 coop codex -- --model gpt-5
+```
+
+**Launch Grok Build inside the VM:**
+
+```
+coop grok
+```
+
+coop launches `grok --always-approve --trust --cwd /workspace`. For permission
+prompts, pass `--ask` (coop passes `--permission-mode default`). A host
+`~/.grok/auth.json` is copied into the guest on boot. If you have not signed
+in on the host, use device-code auth (there is no browser in the guest):
+
+```
+coop grok -- login --device-auth
+```
+
+Pass extra arguments through to `grok`:
+
+```
+coop grok -- --model grok-4.6
 ```
 
 **Open a shell in the VM:**
@@ -416,6 +441,7 @@ coop images --delete python-dev
 - [Workspace sync](workspaces.md)
 - [Claude Code integration](claude-integration.md)
 - [Codex integration](codex-integration.md)
+- [Grok Build integration](grok-integration.md)
 - [Editor integration](editor.md)
 - [Running multiple instances](multi-instance.md)
 - [Platform backends](backends.md)

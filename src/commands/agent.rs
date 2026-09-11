@@ -1,12 +1,12 @@
 //! `coop agent update` — refresh the coding-agent binaries inside a running VM.
 //!
-//! Both agents are installed "latest at build time" during `coop setup`, so
+//! The three agents are installed "latest at build time" during `coop setup`, so
 //! they go stale in long-running VMs and in VMs created from an old image.
 //! This command updates them in place against a *running* instance, without
 //! rebuilding the golden image (`coop setup --rebuild` remains the path for
 //! refreshing the image itself).
 //!
-//! The two agents differ in how they update, and the difference is encoded in
+//! The agents differ in how they update, and the difference is encoded in
 //! [`UpdateStrategy`] so no caller can run the wrong one:
 //!
 //! - **Codex** is a root-owned package exposed through `/usr/local/bin` and has
@@ -17,6 +17,9 @@
 //!   auto-updates in the background. `coop agent update --claude` just runs
 //!   `claude update` synchronously as the guest user — a convenience, not a
 //!   fix.
+//! - **Grok Build** lives in the guest user's `~/.grok/bin` and already
+//!   auto-updates in the background. `coop agent update --grok` runs
+//!   `grok update` synchronously as the guest user.
 
 use std::io::Write as _;
 
@@ -47,6 +50,7 @@ const CODEX_REPO: &str = "openai/codex";
 enum Agent {
     Claude,
     Codex,
+    Grok,
 }
 
 impl Agent {
@@ -55,15 +59,16 @@ impl Agent {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
+            Self::Grok => "Grok Build",
         }
     }
 
     /// How this agent's binary is refreshed inside the guest. The
     /// root-vs-user asymmetry lives here so a caller can't run Claude's
-    /// self-update as root or Codex's reinstall without sudo.
+    /// or Grok's self-update as root or Codex's reinstall without sudo.
     fn strategy(self) -> UpdateStrategy {
         match self {
-            Self::Claude => UpdateStrategy::SelfUpdate,
+            Self::Claude | Self::Grok => UpdateStrategy::SelfUpdate,
             Self::Codex => UpdateStrategy::ReinstallAsRoot {
                 script: guest::SCRIPT_CODEX,
             },
@@ -80,33 +85,35 @@ enum UpdateStrategy {
     SelfUpdate,
 }
 
-/// Which agents a single `coop agent update` invocation targets. No variant
-/// can represent "update nothing", so [`agents`](Self::agents) is always
-/// non-empty.
+/// Which agents a single `coop agent update` invocation targets. No
+/// construction can represent "update nothing", so [`agents`](Self::agents)
+/// is always non-empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AgentSelection {
-    Claude,
-    Codex,
-    Both,
+pub(crate) struct AgentSelection {
+    agents: &'static [Agent],
 }
 
 impl AgentSelection {
-    /// Map the two CLI booleans to a selection. Selection is additive: no
-    /// flag, or both flags, means both agents.
-    pub(crate) fn from_flags(claude: bool, codex: bool) -> Self {
-        match (claude, codex) {
-            (true, false) => Self::Claude,
-            (false, true) => Self::Codex,
-            _ => Self::Both,
+    /// Map the CLI booleans to a selection. Selection is additive: no
+    /// flag, or every flag, means every agent.
+    pub(crate) fn from_flags(claude: bool, codex: bool, grok: bool) -> Self {
+        Self {
+            agents: match (claude, codex, grok) {
+                (false, false, false) | (true, true, true) => {
+                    &[Agent::Claude, Agent::Codex, Agent::Grok]
+                }
+                (true, false, false) => &[Agent::Claude],
+                (false, true, false) => &[Agent::Codex],
+                (false, false, true) => &[Agent::Grok],
+                (true, true, false) => &[Agent::Claude, Agent::Codex],
+                (true, false, true) => &[Agent::Claude, Agent::Grok],
+                (false, true, true) => &[Agent::Codex, Agent::Grok],
+            },
         }
     }
 
     fn agents(self) -> &'static [Agent] {
-        match self {
-            Self::Claude => &[Agent::Claude],
-            Self::Codex => &[Agent::Codex],
-            Self::Both => &[Agent::Claude, Agent::Codex],
-        }
+        self.agents
     }
 }
 
@@ -167,8 +174,8 @@ enum UpdateOutcome {
 enum CheckStatus {
     UpToDate,
     UpdateAvailable,
-    /// Claude Code updates itself in the background — coop does not track a
-    /// "latest" for it.
+    /// Claude Code and Grok Build update themselves in the background —
+    /// coop does not track a "latest" for them.
     AutoUpdates,
     /// Installed or latest version could not be determined.
     Unknown,
@@ -220,14 +227,19 @@ pub(crate) fn cmd_agent_update(
 /// Comma/and-joined agent names for the confirmation prompt.
 fn selection_phrase(selection: AgentSelection) -> String {
     let labels: Vec<&str> = selection.agents().iter().map(|a| a.display()).collect();
-    labels.join(" and ")
+    match labels.as_slice() {
+        [] => unreachable!("AgentSelection is never empty"),
+        [one] => (*one).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 // ── Update path ───────────────────────────────────────────────
 
 /// Update every selected agent, printing each result. Continues past a
 /// per-agent failure and returns an error only after all have run, so a
-/// `Both` update reports both outcomes even when one fails.
+/// multi-agent update reports every outcome even when one fails.
 fn run_updates(session: &SshSession, selection: AgentSelection) -> Result<()> {
     let out = &mut std::io::stdout();
     let mut failed = false;
@@ -235,10 +247,11 @@ fn run_updates(session: &SshSession, selection: AgentSelection) -> Result<()> {
         match update_one(session, agent) {
             Ok(outcome) => {
                 writeln!(out, "{}", outcome_line(agent, &outcome))?;
-                if agent == Agent::Claude {
+                if matches!(agent, Agent::Claude | Agent::Grok) {
                     writeln!(
                         out,
-                        "  note: Claude Code also auto-updates in the background."
+                        "  note: {} also auto-updates in the background.",
+                        agent.display()
                     )?;
                 }
             }
@@ -322,7 +335,7 @@ fn run_check(session: &SshSession, selection: AgentSelection) -> Result<()> {
 fn check_row(session: &SshSession, agent: Agent) -> CheckRow {
     let installed = capture_version(session, agent);
     let latest = match agent {
-        Agent::Claude => None,
+        Agent::Claude | Agent::Grok => None,
         Agent::Codex => codex_latest(),
     };
     let status = check_status(agent, installed.as_ref(), latest.as_ref());
@@ -353,7 +366,7 @@ fn check_status(
     latest: Option<&AgentVersion>,
 ) -> CheckStatus {
     match agent {
-        Agent::Claude => CheckStatus::AutoUpdates,
+        Agent::Claude | Agent::Grok => CheckStatus::AutoUpdates,
         Agent::Codex => match (installed, latest) {
             (Some(i), Some(l)) if i < l => CheckStatus::UpdateAvailable,
             (Some(_), Some(_)) => CheckStatus::UpToDate,
@@ -415,12 +428,13 @@ fn check_line(row: &CheckRow) -> String {
 
 // ── Guest binary resolution + version capture (IO) ────────────
 
-/// Absolute guest path of an agent's binary. Claude lives under the guest
-/// user's home; Codex is system-wide.
+/// Absolute guest path of an agent's binary. Claude and Grok Build live
+/// under the guest user's home; Codex is system-wide.
 fn agent_binary(session: &SshSession, agent: Agent) -> Result<GuestPath> {
     Ok(match agent {
         Agent::Claude => guest::GuestUser::new(session.target.user.as_ref())?.claude_bin(),
         Agent::Codex => guest::codex_bin(),
+        Agent::Grok => guest::GuestUser::new(session.target.user.as_ref())?.grok_bin(),
     })
 }
 
@@ -445,39 +459,79 @@ mod tests {
     // ── selection ──────────────────────────────────────────────
 
     #[test]
-    fn from_flags_maps_all_four_combinations() {
+    fn from_flags_maps_every_combination() {
         assert_eq!(
-            AgentSelection::from_flags(true, false),
-            AgentSelection::Claude
+            AgentSelection::from_flags(true, false, false).agents(),
+            &[Agent::Claude]
         );
         assert_eq!(
-            AgentSelection::from_flags(false, true),
-            AgentSelection::Codex
+            AgentSelection::from_flags(false, true, false).agents(),
+            &[Agent::Codex]
         );
         assert_eq!(
-            AgentSelection::from_flags(false, false),
-            AgentSelection::Both
+            AgentSelection::from_flags(false, false, true).agents(),
+            &[Agent::Grok]
         );
-        assert_eq!(AgentSelection::from_flags(true, true), AgentSelection::Both);
+        assert_eq!(
+            AgentSelection::from_flags(false, false, false).agents(),
+            &[Agent::Claude, Agent::Codex, Agent::Grok]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(true, true, true).agents(),
+            &[Agent::Claude, Agent::Codex, Agent::Grok]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(true, true, false).agents(),
+            &[Agent::Claude, Agent::Codex]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(true, false, true).agents(),
+            &[Agent::Claude, Agent::Grok]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(false, true, true).agents(),
+            &[Agent::Codex, Agent::Grok]
+        );
     }
 
     #[test]
-    fn agents_is_never_empty_and_both_lists_two() {
-        assert_eq!(AgentSelection::Claude.agents(), &[Agent::Claude]);
-        assert_eq!(AgentSelection::Codex.agents(), &[Agent::Codex]);
+    fn agents_is_never_empty_and_pairs_list_two() {
+        assert!(
+            !AgentSelection::from_flags(false, false, false)
+                .agents()
+                .is_empty()
+        );
         assert_eq!(
-            AgentSelection::Both.agents(),
-            &[Agent::Claude, Agent::Codex]
+            AgentSelection::from_flags(true, false, false).agents(),
+            &[Agent::Claude]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(false, true, false).agents(),
+            &[Agent::Codex]
+        );
+        assert_eq!(
+            AgentSelection::from_flags(true, true, false).agents().len(),
+            2
         );
     }
 
     #[test]
     fn selection_phrase_joins_with_and() {
-        assert_eq!(selection_phrase(AgentSelection::Claude), "Claude Code");
-        assert_eq!(selection_phrase(AgentSelection::Codex), "Codex");
         assert_eq!(
-            selection_phrase(AgentSelection::Both),
+            selection_phrase(AgentSelection::from_flags(true, false, false)),
+            "Claude Code"
+        );
+        assert_eq!(
+            selection_phrase(AgentSelection::from_flags(false, true, false)),
+            "Codex"
+        );
+        assert_eq!(
+            selection_phrase(AgentSelection::from_flags(true, true, false)),
             "Claude Code and Codex"
+        );
+        assert_eq!(
+            selection_phrase(AgentSelection::from_flags(false, false, false)),
+            "Claude Code, Codex, and Grok Build"
         );
     }
 
@@ -526,6 +580,14 @@ mod tests {
     fn claude_always_reports_auto_updates() {
         assert_eq!(
             check_status(Agent::Claude, Some(&ver("1.2.3")), None),
+            CheckStatus::AutoUpdates
+        );
+    }
+
+    #[test]
+    fn grok_reports_auto_updates() {
+        assert_eq!(
+            check_status(Agent::Grok, Some(&ver("1.0.24")), None),
             CheckStatus::AutoUpdates
         );
     }
@@ -606,6 +668,20 @@ mod tests {
     }
 
     #[test]
+    fn check_line_auto_updates_names_grok_build() {
+        let row = CheckRow {
+            agent: Agent::Grok,
+            installed: Some(ver("1.0.24")),
+            latest: None,
+            status: CheckStatus::AutoUpdates,
+        };
+        let line = check_line(&row);
+        assert!(line.contains("Grok Build"), "{line}");
+        assert!(line.contains("1.0.24"), "{line}");
+        assert!(line.contains("auto-updates in background"), "{line}");
+    }
+
+    #[test]
     fn check_line_unknown_shows_placeholder() {
         let row = CheckRow {
             agent: Agent::Codex,
@@ -633,8 +709,18 @@ mod tests {
                 latest: Some(ver("0.5.0")),
                 status: CheckStatus::UpdateAvailable,
             },
+            CheckRow {
+                agent: Agent::Grok,
+                installed: Some(ver("1.0.24")),
+                latest: None,
+                status: CheckStatus::AutoUpdates,
+            },
         ];
-        assert_eq!(check_report(&rows).len(), 2);
+        let lines = check_report(&rows);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Claude Code"), "{}", lines[0]);
+        assert!(lines[1].contains("Codex"), "{}", lines[1]);
+        assert!(lines[2].contains("Grok Build"), "{}", lines[2]);
     }
 
     // ── outcome lines ──────────────────────────────────────────

@@ -31,6 +31,7 @@ BINARY="${TEST_BINARY:-}"
 PROFILES="${TEST_PROFILES:-python,node}"
 INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
+SUITE_CONFIG=""
 
 # Track all instances we create for cleanup
 STARTED_INSTANCES=()
@@ -114,7 +115,21 @@ HARNESS_ERR=""
 
 coop() {
     local rc=0
-    HARNESS_OUT=$("$BINARY" "$@" 2>"$tmpdir/stderr") || rc=$?
+    local args=("$@")
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        local has_config=0
+        local a
+        for a in "${args[@]}"; do
+            if [[ "$a" == "--config" || "$a" == --config=* ]]; then
+                has_config=1
+                break
+            fi
+        done
+        if [[ "$has_config" -eq 0 ]]; then
+            args=(--config "$SUITE_CONFIG" "${args[@]}")
+        fi
+    fi
+    HARNESS_OUT=$("$BINARY" "${args[@]}" 2>"$tmpdir/stderr") || rc=$?
     HARNESS_ERR=$(cat "$tmpdir/stderr")
     return $rc
 }
@@ -1034,6 +1049,146 @@ test_claude_bin_path() {
     fi
 }
 
+test_grok_bin_path() {
+    echo ""
+    echo "=== Phase: grok binary path ==="
+
+    if guest_exec test -x /home/ubuntu/.grok/bin/grok; then
+        pass "grok binary exists at GROK_BIN path"
+    else
+        skip "grok binary at GROK_BIN path" "not installed in this image"
+        return
+    fi
+
+    if coop_exec /home/ubuntu/.grok/bin/grok --version >/dev/null; then
+        pass "grok binary invocable via full path"
+    else
+        skip "grok --version" "binary exists but --version returned non-zero"
+    fi
+
+    local link_target
+    if link_target=$(guest_exec readlink /usr/local/bin/grok); then
+        if [[ "$link_target" == "/home/ubuntu/.grok/bin/grok" ]]; then
+            pass "grok symlink in /usr/local/bin"
+        else
+            fail "grok symlink in /usr/local/bin" "points to: $link_target"
+        fi
+    else
+        fail "grok symlink in /usr/local/bin" "not found"
+    fi
+
+    local guest_path
+    if guest_path=$(guest_exec printenv PATH); then
+        if [[ ":$guest_path:" == *":/home/ubuntu/.grok/bin:"* ]]; then
+            pass "~/.grok/bin on PATH in non-interactive session"
+        else
+            fail "~/.grok/bin on PATH in non-interactive session" "PATH=$guest_path"
+        fi
+    else
+        fail "~/.grok/bin on PATH in non-interactive session" "printenv PATH failed; stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec test -x /usr/local/bin/grok-yolo; then
+        pass "grok-yolo shortcut exists"
+    else
+        fail "grok-yolo shortcut exists" "stderr: $(guest_stderr)"
+    fi
+
+    local yolo_content
+    if yolo_content=$(guest_exec cat /usr/local/bin/grok-yolo); then
+        if echo "$yolo_content" | grep -q "always-approve"; then
+            pass "grok-yolo includes --always-approve"
+        else
+            fail "grok-yolo includes --always-approve" "content: $yolo_content"
+        fi
+    else
+        fail "grok-yolo includes --always-approve" "cat failed"
+    fi
+}
+
+test_grok_settings_merge() {
+    echo ""
+    echo "=== Phase: grok settings merge across restart ==="
+
+    # Use a fixture host dir, not the developer's ~/.grok. The default
+    # suite config disables that copy so a multi-gigabyte skills tree
+    # cannot stall or fill the guest. This phase still proves recopy +
+    # merge: host config.toml is the base, managed keys are forced, and
+    # trusted_folders.toml (not copied) keeps a guest /tmp entry.
+    local grok_src="$tmpdir/grok-host-config"
+    mkdir -p "$grok_src"
+    printf '%s\n' \
+        '[ui]' 'vim_mode = true' 'permission_mode = "default"' '' \
+        '[plugins]' 'sentinel = true' \
+        > "$grok_src/config.toml"
+
+    local cfg_file="$tmpdir/grok-merge-coop.toml"
+    cat > "$cfg_file" <<CFGEOF
+[grok]
+config_dir = "$grok_src"
+CFGEOF
+
+    local seed='mkdir -p ~/.grok && printf "%s\n" '
+    seed+='"[folders.\"/tmp\"]" "trusted = true" '
+    seed+='> ~/.grok/trusted_folders.toml'
+    if coop_exec sh -c "$seed"; then
+        pass "seed grok config and trust files"
+    else
+        fail "seed grok config and trust files" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    coop stop "$INSTANCE" || true
+    if coop --config "$cfg_file" start "$INSTANCE"; then
+        pass "restart for grok settings merge exits 0"
+    else
+        fail "restart for grok settings merge exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local merged
+    if ! merged=$(coop_exec sh -c 'cat ~/.grok/config.toml'); then
+        fail "read merged config.toml after restart" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$merged" | grep -q 'vim_mode = true'; then
+        pass "non-managed grok ui key survives restart"
+    else
+        fail "non-managed grok ui key survives restart" "$merged"
+    fi
+
+    if echo "$merged" | grep -q 'always-approve'; then
+        pass "managed grok permission_mode reapplied after restart"
+    else
+        fail "managed grok permission_mode reapplied after restart" "$merged"
+    fi
+
+    if echo "$merged" | grep -q sentinel; then
+        fail "host [plugins] table dropped after restart" "$merged"
+    else
+        pass "host [plugins] table dropped after restart"
+    fi
+
+    local trust
+    if ! trust=$(coop_exec sh -c 'cat ~/.grok/trusted_folders.toml'); then
+        fail "read trusted_folders.toml after restart" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if echo "$trust" | grep -q '/workspace'; then
+        pass "/workspace recorded in trusted_folders.toml"
+    else
+        fail "/workspace recorded in trusted_folders.toml" "$trust"
+    fi
+
+    if echo "$trust" | grep -q '/tmp'; then
+        pass "existing trusted folder survives restart"
+    else
+        fail "existing trusted folder survives restart" "$trust"
+    fi
+}
+
 test_claude_settings_merge() {
     echo ""
     echo "=== Phase: claude settings merge across restart ==="
@@ -1509,10 +1664,11 @@ test_agent_update() {
 
     if coop agent update "$INSTANCE" --check; then
         if echo "$HARNESS_OUT" | grep -q "Claude Code" \
-            && echo "$HARNESS_OUT" | grep -q "Codex"; then
-            pass "agent update --check reports both agents"
+            && echo "$HARNESS_OUT" | grep -q "Codex" \
+            && echo "$HARNESS_OUT" | grep -q "Grok Build"; then
+            pass "agent update --check reports all agents"
         else
-            fail "agent update --check reports both agents" "out: $HARNESS_OUT"
+            fail "agent update --check reports all agents" "out: $HARNESS_OUT"
         fi
     else
         fail "agent update --check exits 0" "exit: $? stderr: $HARNESS_ERR"
@@ -3309,7 +3465,8 @@ PYEOF
     fi
 
     # `coop status` reports the host image file's size, which `resize_disk`
-    # changes with a bare `truncate` on Lima — the guest filesystem only grows
+    # changes with `truncate` (and a matching lima.yaml `disk:`) — the guest
+    # filesystem only grows
     # when the guest expands the partition on boot. So the host-side check
     # above cannot tell a real re-grow from a shrunken guest. Compare what the
     # guest itself sees, in 1K blocks.
@@ -6670,6 +6827,16 @@ main() {
 
     tmpdir=$(mktemp -d)
 
+    # Isolate the suite from the developer's ~/.grok. A real host tree can
+    # hold gigabytes of skills, venvs, and git lore; Linux CI usually has
+    # none, so the same suite would pass there and fail here. Phases that
+    # need a host copy pass their own --config with a fixture directory.
+    SUITE_CONFIG="$tmpdir/suite-config.toml"
+    cat > "$SUITE_CONFIG" <<'EOF'
+[grok]
+config_dir = false
+EOF
+
     verify_binary
 
     # Pre-VM tests
@@ -6695,6 +6862,8 @@ main() {
     test_editor
     test_exec
     test_claude_bin_path
+    test_grok_bin_path
+    test_grok_settings_merge
     test_claude_settings_merge
     test_claude_onboarding_seed
     test_codex_bin_path

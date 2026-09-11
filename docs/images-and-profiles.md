@@ -8,7 +8,7 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
 2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
-3. Installs base packages, Docker, GitHub CLI, Claude Code, and Codex
+3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, and Grok Build
 4. Applies requested profiles and extra packages
 5. Runs post-install scripts if provided
 
@@ -38,9 +38,15 @@ configs, so gating them would let a later `auth = "chatgpt"` edit meet an image
 that cannot serve it. When that mode is not configured the wrapper simply execs
 Codex, so it costs nothing at run time.
 
-Both agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
+**Grok Build CLI:** installed via the official installer
+(`https://x.ai/cli/install.sh`) during the template build. The binary lives at
+`~/.grok/bin/grok` with a same-file `agent` link; `/usr/local/bin/grok` and
+`/usr/local/bin/agent` point there. The image also installs a `grok-yolo`
+shortcut.
 
-- **A live instance:** `coop agent update [--claude] [--codex]` updates the binaries inside a running VM in place (see [`agent update`](commands.md#agent-update)). Claude Code also auto-updates itself in the background; Codex does not, so it is the one that typically needs this.
+The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
+
+- **A live instance:** `coop agent update [--claude] [--codex] [--grok]` updates the binaries inside a running VM in place (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background; Codex does not, so it is the one that typically needs this.
 - **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
 
 ## Built-in profiles

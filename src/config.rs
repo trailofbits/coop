@@ -722,6 +722,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub codex: CodexConfig,
 
+    /// Grok Build config forwarding settings
+    #[serde(default)]
+    pub grok: GrokConfig,
+
     /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
     /// upstream is configured, the real credential stays on the host and the
     /// guest is pointed at a local proxy instead of receiving the key.
@@ -1527,6 +1531,50 @@ pub struct CodexConfig {
     pub local_model: Option<LocalModel>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrokConfig {
+    /// xAI API key (forwarded via `SendEnv`, never written to disk)
+    pub api_key: Option<Secret<String>>,
+
+    /// Additional env var names to forward from host to guest via SSH
+    #[serde(default)]
+    pub env_forward: Vec<EnvVarName>,
+
+    /// Plugin marketplace sources (URL, path, or GitHub repo)
+    #[serde(default)]
+    pub marketplaces: Vec<String>,
+
+    /// Plugins to install from marketplaces
+    #[serde(default)]
+    pub plugins: Vec<String>,
+
+    /// MCP servers to merge into the guest `~/.grok/config.toml`
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerDef>,
+
+    /// Source directory for Grok Build files (AGENTS.md, auth.json, config.toml,
+    /// lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/,
+    /// workflows/)
+    #[serde(default)]
+    pub config_dir: ConfigDir,
+}
+
+impl GrokConfig {
+    /// Host environment variable names referenced by stdio MCP `env`
+    /// mappings. Grok expands those as `${NAME}` in the guest config, so
+    /// the names must be forwarded into the guest.
+    pub(crate) fn stdio_env_host_names(&self) -> Vec<EnvVarName> {
+        self.mcp_servers
+            .values()
+            .filter_map(|def| match def {
+                McpServerDef::Stdio { env, .. } => Some(env.values().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+}
+
 /// Codex cloud authentication mode.
 ///
 /// `ApiKey` preserves the historical behavior: coop forwards
@@ -1973,6 +2021,7 @@ impl CoopConfig {
     fn expand_user_paths(&mut self) {
         expand_marketplaces(&mut self.claude.marketplaces);
         expand_marketplaces(&mut self.codex.marketplaces);
+        expand_marketplaces(&mut self.grok.marketplaces);
         for profile in self.profiles.values_mut() {
             expand_marketplaces(&mut profile.marketplaces);
         }
@@ -2069,6 +2118,15 @@ impl CoopConfig {
             ));
         }
 
+        if let ConfigDir::Custom(ref path) = self.grok.config_dir
+            && !path.is_dir()
+        {
+            errors.push(format!(
+                "grok.config_dir '{}' does not exist or is not a directory",
+                path.display()
+            ));
+        }
+
         if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
             errors.push(
                 "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
@@ -2084,6 +2142,7 @@ impl CoopConfig {
             &mut errors,
         );
         check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
+        check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2368,6 +2427,7 @@ impl Default for CoopConfig {
             setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            grok: GrokConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
@@ -2425,6 +2485,19 @@ impl Default for CodexConfig {
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
             local_model: None,
+        }
+    }
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            api_key: std::env::var("XAI_API_KEY").ok().map(Secret::new),
+            env_forward: Vec::new(),
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            mcp_servers: HashMap::new(),
+            config_dir: ConfigDir::Default,
         }
     }
 }
@@ -3535,6 +3608,47 @@ mod tests {
     fn codex_config_rejects_unknown_auth_mode() {
         let json = r#"{"auth": "subscription"}"#;
         assert!(serde_json::from_str::<CodexConfig>(json).is_err());
+    }
+
+    #[test]
+    fn grok_config_all_fields() {
+        let json = r#"{
+            "api_key": "xai-test",
+            "env_forward": ["MYORG_KEY"],
+            "marketplaces": ["https://github.com/example/grok-plugins"],
+            "plugins": ["my-skill@grok-plugins"],
+            "mcp_servers": {
+                "sentry": {
+                    "type": "http",
+                    "url": "https://mcp.sentry.dev/mcp"
+                }
+            }
+        }"#;
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("xai-test")
+        );
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
+        assert_eq!(
+            cfg.marketplaces,
+            vec!["https://github.com/example/grok-plugins".to_string()]
+        );
+        assert_eq!(cfg.plugins, vec!["my-skill@grok-plugins".to_string()]);
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert!(cfg.mcp_servers.contains_key("sentry"));
+    }
+
+    #[test]
+    fn grok_config_all_defaults() {
+        let json = "{}";
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.env_forward.is_empty());
+        assert!(cfg.marketplaces.is_empty());
+        assert!(cfg.plugins.is_empty());
+        assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(cfg.config_dir, ConfigDir::Default);
     }
 
     // ── LocalModel ───────────────────────────────────────────
@@ -5443,6 +5557,16 @@ skip = ["not-a-slug"]
     }
 
     #[test]
+    fn grok_config_dir_deserializes_custom_path() {
+        let json = r#"{"grok": {"config_dir": "/custom/path"}}"#;
+        let cfg: CoopConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.grok.config_dir,
+            ConfigDir::Custom(ConfigPath::new("/custom/path"))
+        );
+    }
+
+    #[test]
     fn config_dir_deserializes_disabled() {
         let json = r#"{"claude": {"config_dir": false}}"#;
         let cfg: CoopConfig = serde_json::from_str(json).unwrap();
@@ -5515,6 +5639,17 @@ skip = ["not-a-slug"]
         assert!(
             err.to_string().contains("codex.config_dir"),
             "expected codex config_dir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nonexistent_grok_config_dir() {
+        let mut cfg = CoopConfig::default();
+        cfg.grok.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("grok.config_dir"),
+            "expected grok config_dir error, got: {err}"
         );
     }
 
@@ -5939,6 +6074,17 @@ skip = ["not-a-slug"]
         assert!(
             !debug.contains("sk-openai-real-secret"),
             "CodexConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn grok_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "xai-real-secret"}"#;
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("xai-real-secret"),
+            "GrokConfig Debug leaked api_key: {debug}"
         );
     }
 

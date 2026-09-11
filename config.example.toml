@@ -111,6 +111,24 @@
 # model = "gpt-oss:120b"
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
+# [grok]
+# config_dir = "~/.grok"  # AGENTS.md, auth.json, config.toml, lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/; skips hidden dirs and *.git (false to disable)
+# env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
+# marketplaces = ["owner/grok-plugins"]  # owner/repo, git URL, or local path
+# plugins = ["my-skill"]  # plugin name (`grok plugin install --trust`)
+#
+# Secrets: `api_key` accepts the same "cmd:" prefix as `claude.api_key`.
+#   api_key = "cmd:op read op://Private/xAI/credential"
+#   api_key = "xai-..."
+# Host `~/.grok/auth.json` is copied into the guest (same as Codex). A
+# copied session token takes precedence over `XAI_API_KEY`. If there is
+# no host file, sign in with `coop grok -- login --device-auth`.
+
+# [grok.mcp_servers.my-server]
+# command = "npx"
+# args = ["-y", "@example/mcp-server"]
+# env = { API_KEY = "MY_HOST_ENV_VAR" }
+
 # [proxy]                           # Host-side credential-injecting proxy
 #                                   # (issue #411). Opt-in: when set, coop runs
 #                                   # a `coop-proxy` process on the host and the
