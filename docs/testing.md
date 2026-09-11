@@ -47,11 +47,18 @@ When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
 Run `python3 tests/test-integration-probes.py` for host-only regression tests
-of address discovery, ping result handling, and bounded HTTP retries. These
-use a temporary loopback HTTP server and require Python 3, Bash, and curl;
+of Codex installer failure propagation, update/config assertions, address
+discovery, ping result handling, and bounded HTTP retries. These use a
+temporary loopback HTTP server and require Python 3, Bash, and curl;
 Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
+
+The full Codex update tests install native release `0.153.0` before running
+`codex update` as the guest user, and require the installed version to change.
+They compare the actual `config.toml` contents across host updates, self-updates,
+and migration from a profile-provided system command. Package layout and
+completeness remain the native installer's responsibility.
 
 ## Host-only bridge isolation test
 

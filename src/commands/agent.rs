@@ -9,10 +9,10 @@
 //! The two agents differ in how they update, and the difference is encoded in
 //! [`UpdateStrategy`] so no caller can run the wrong one:
 //!
-//! - **Codex** is a root-owned package exposed through `/usr/local/bin` and has
-//!   no background updater. coop re-runs its own installer
-//!   ([`guest::SCRIPT_CODEX`]) as root with `COOP_FORCE_INSTALL=1` to install
-//!   the current release and atomically switch its entrypoints.
+//! - **Codex** uses a native per-user installation. coop re-runs its
+//!   installer wrapper ([`guest::SCRIPT_CODEX`]) with `COOP_FORCE_INSTALL=1`
+//!   to refresh the package or migrate an older direct-binary installation.
+//!   The guest user can also run `codex update` directly.
 //! - **Claude Code** lives in the guest user's `~/.local/bin` and already
 //!   auto-updates in the background. `coop agent update --claude` just runs
 //!   `claude update` synchronously as the guest user — a convenience, not a
@@ -73,8 +73,8 @@ impl Agent {
 
 /// How an agent's binary is refreshed in the guest.
 enum UpdateStrategy {
-    /// Re-run coop's installer as root and activate its package. Carries the
-    /// embedded installer script.
+    /// Run the installer wrapper with sudo so it can replace the system link.
+    /// The wrapper runs the native installer as the configured guest user.
     ReinstallAsRoot { script: &'static str },
     /// Invoke the agent's own updater as the guest user (no sudo).
     SelfUpdate,
@@ -287,8 +287,12 @@ fn update_one(session: &SshSession, agent: Agent) -> Result<UpdateOutcome> {
 /// Re-run an embedded installer script as root with the force flag set,
 /// piping the script over stdin so it never lands on argv.
 fn reinstall_as_root(session: &SshSession, script: &str) -> Result<()> {
+    let user = guest::GuestUser::new(session.target.user.as_ref())?;
     session.target.exec_with_stdin(
-        RemoteCommand::new().literal("sudo env COOP_FORCE_INSTALL=1 bash -s"),
+        RemoteCommand::new()
+            .literal("sudo env GUEST_USER=")
+            .arg(user.as_str())
+            .literal(" COOP_FORCE_INSTALL=1 bash -s"),
         script.as_bytes().to_vec(),
     )
 }
@@ -416,7 +420,7 @@ fn check_line(row: &CheckRow) -> String {
 // ── Guest binary resolution + version capture (IO) ────────────
 
 /// Absolute guest path of an agent's binary. Claude lives under the guest
-/// user's home; Codex is system-wide.
+/// user's home; Codex is reached through its system compatibility link.
 fn agent_binary(session: &SshSession, agent: Agent) -> Result<GuestPath> {
     Ok(match agent {
         Agent::Claude => guest::GuestUser::new(session.target.user.as_ref())?.claude_bin(),

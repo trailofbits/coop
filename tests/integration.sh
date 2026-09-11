@@ -1158,72 +1158,27 @@ test_claude_onboarding_seed() {
     fi
 }
 
-validate_codex_package() {
-    local context="$1"
+check_native_codex() {
+    local guest_home launcher version
+    guest_home=$(guest_exec printenv HOME)
+    launcher="$guest_home/.local/bin/codex"
 
-    if guest_exec test -x /usr/local/bin/codex; then
-        pass "codex binary exists at /usr/local/bin/codex ($context)"
+    if guest_exec test -x "$launcher" \
+        && guest_exec test -L /usr/local/bin/codex \
+        && guest_exec test /usr/local/bin/codex -ef "$launcher" \
+        && [[ "$(guest_exec sh -c 'command -v codex')" == "$launcher" ]]; then
+        pass "Codex resolves through the guest's native launcher and compatibility link"
     else
-        fail "codex binary exists at /usr/local/bin/codex ($context)" \
-            "stderr: $(guest_stderr)"
-        return
+        fail "Codex resolves through the guest's native launcher and compatibility link" \
+            "expected launcher: $launcher; stderr: $(guest_stderr)"
     fi
 
-    if coop_exec /usr/local/bin/codex --version >/dev/null; then
-        pass "codex binary invocable via full path ($context)"
+    if version=$(guest_exec /usr/local/bin/codex --version) \
+        && [[ "$version" =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        pass "Codex is executable through the compatibility link ($version)"
     else
-        fail "codex binary invocable via full path ($context)" \
-            "stderr: $(guest_stderr)"
-    fi
-
-    if guest_exec test -x /usr/local/bin/codex-code-mode-host; then
-        pass "codex code-mode host exists and is executable ($context)"
-    else
-        fail "codex code-mode host exists and is executable ($context)" \
-            "stderr: $(guest_stderr)"
-        return
-    fi
-
-    # `--help` exits before the host initializes its transport. Stdio with EOF
-    # exercises the real entrypoint without starting a persistent service; the
-    # timeout makes a regression fail instead of hanging the integration run.
-    if coop_exec sh -c \
-        'timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio </dev/null >/dev/null'; then
-        pass "codex code-mode host accepts stdio transport ($context)"
-    else
-        fail "codex code-mode host accepts stdio transport ($context)" \
-            "stderr: $(guest_stderr)"
-    fi
-
-    local codex_path code_mode_path codex_release
-    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
-    code_mode_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
-    if [[ "$codex_path" =~ ^(/usr/local/lib/codex/releases/[0-9a-f]{64})/bin/codex$ ]] \
-        && [[ "$code_mode_path" == "${BASH_REMATCH[1]}/bin/codex-code-mode-host" ]]; then
-        codex_release="${BASH_REMATCH[1]}"
-        pass "codex and code-mode host come from the same package ($context)"
-    else
-        fail "codex and code-mode host come from the same package ($context)" \
-            "codex=$codex_path host=$code_mode_path"
-        return
-    fi
-
-    if guest_exec test -x "$codex_release/codex-path/rg" \
-        -a -x "$codex_release/codex-resources/bwrap" \
-        -a -x "$codex_release/codex-resources/zsh/bin/zsh" \
-        -a -f "$codex_release/codex-package.json"; then
-        pass "codex package runtime resources are installed ($context)"
-    else
-        fail "codex package runtime resources are installed ($context)" \
-            "release=$codex_release stderr: $(guest_stderr)"
-    fi
-
-    if guest_exec test ! -w "$codex_release/bin/codex" \
-        -a ! -w "$codex_release/bin/codex-code-mode-host"; then
-        pass "codex package executables are not guest-writable ($context)"
-    else
-        fail "codex package executables are not guest-writable ($context)" \
-            "release=$codex_release stderr: $(guest_stderr)"
+        fail "Codex is executable through the compatibility link" \
+            "output: $version; stderr: $(guest_stderr)"
     fi
 }
 
@@ -1231,7 +1186,20 @@ test_codex_bin_path() {
     echo ""
     echo "=== Phase: codex binary path ==="
 
-    validate_codex_package "after provisioning"
+    if guest_exec test -x /usr/local/bin/codex; then
+        pass "codex binary exists at /usr/local/bin/codex"
+    else
+        fail "codex binary exists at /usr/local/bin/codex" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    check_native_codex
+
+    if coop_exec /usr/local/bin/codex --version >/dev/null; then
+        pass "codex binary invocable via full path"
+    else
+        fail "codex binary invocable via full path" "stderr: $(guest_stderr)"
+    fi
 
     if guest_exec test -x /usr/local/bin/codex-yolo; then
         pass "codex-yolo shortcut exists"
@@ -1498,6 +1466,44 @@ test_codex_sandbox_bypass() {
     fi
 }
 
+seed_codex_update_config() {
+    # shellcheck disable=SC2016 # Keep the config and its snapshot inside the guest.
+    guest_exec sh -c '
+        set -eu
+        umask 077
+        mkdir -p "$HOME/.codex"
+        printf "\n[profiles.coop_update_test]\nmodel_reasoning_effort = \"low\"\n" \
+            >> "$HOME/.codex/config.toml"
+        cp "$HOME/.codex/config.toml" "$HOME/.codex/coop-update-config.expected"
+    '
+}
+
+check_codex_config_preserved() {
+    # shellcheck disable=SC2016 # Compare guest files without copying config to the host.
+    if guest_exec sh -c 'cmp -s "$HOME/.codex/config.toml" "$HOME/.codex/coop-update-config.expected"'; then
+        pass "$1 preserves Codex config"
+    else
+        fail "$1 preserves Codex config" "could not confirm unchanged config.toml; stderr: $(guest_stderr)"
+    fi
+}
+
+check_codex_self_update() {
+    local before="$1" after
+    if ! guest_exec codex update </dev/null; then
+        fail "guest user can run codex update without sudo" "stderr: $(guest_stderr)"
+        return
+    fi
+
+    if after=$(guest_exec codex --version) \
+        && [[ "$after" =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+ ]] \
+        && [[ "$after" != "$before" ]]; then
+        pass "guest self-update changes the installed version ($before -> $after)"
+    else
+        fail "guest self-update changes the installed version" \
+            "before: $before; after: $after; stderr: $(guest_stderr)"
+    fi
+}
+
 # `coop agent update` refreshes the in-guest agent binaries (issue #402).
 # `--check` is cheap and network-tolerant (the Codex latest-version lookup
 # degrades to "unknown" on failure, so the command still exits 0). The actual
@@ -1519,65 +1525,9 @@ test_agent_update() {
     fi
 
     if [[ "$FULL" == "1" ]]; then
-        # Model the broken legacy/corrupt-package state from #442. The forced
-        # updater must rebuild an incomplete same-SHA release, not merely keep
-        # an already healthy host executable in place.
-        local installed_host installed_codex_version
-        local inactive_sha active_sha inactive_release active_release active_pid active_exe
-        inactive_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        active_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        inactive_release="/usr/local/lib/codex/releases/$inactive_sha"
-        active_release="/usr/local/lib/codex/releases/$active_sha"
-        active_pid=""
-
-        # Seed one collectable release and one whose executable is live. The
-        # updater should bound disk growth without breaking an in-flight Codex
-        # session that still needs files from its package directory.
-        # shellcheck disable=SC2016 # Variables expand in the guest's sh, not here.
-        if guest_exec sudo sh -c '
-            set -eu
-            inactive_release=$1
-            active_release=$2
-            install -d -m 755 "$inactive_release" "$active_release/bin"
-            cp /bin/sleep "$active_release/bin/hold"
-            chmod 755 "$active_release/bin/hold"
-            nohup "$active_release/bin/hold" 300 </dev/null >/dev/null 2>&1 &
-            active_pid=$!
-            echo "$active_pid" >/tmp/coop-codex-active-release.pid
-            attempt=0
-            while [ "$attempt" -lt 50 ]; do
-                executable=$(readlink -f "/proc/$active_pid/exe" 2>/dev/null || true)
-                [ "$executable" = "$active_release/bin/hold" ] && exit 0
-                attempt=$((attempt + 1))
-                sleep 0.1
-            done
-            exit 1
-        ' sh "$inactive_release" "$active_release"; then
-            active_pid=$(guest_exec cat /tmp/coop-codex-active-release.pid) \
-                || active_pid=""
-            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
-                || active_exe=""
-            if [[ "$active_exe" == "$active_release/bin/hold" ]]; then
-                pass "seeded inactive and live Codex releases for garbage collection"
-            else
-                fail "seeded inactive and live Codex releases for garbage collection" \
-                    "pid=${active_pid:-unknown} exe=${active_exe:-unknown} stderr: $(guest_stderr)"
-            fi
-        else
-            active_pid=$(guest_exec cat /tmp/coop-codex-active-release.pid) \
-                || active_pid=""
-            fail "seeded inactive and live Codex releases for garbage collection" \
-                "stderr: $(guest_stderr)"
-        fi
-
-        installed_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
-        installed_codex_version=$(guest_exec codex --version)
-        if guest_exec sudo rm -f "$installed_host" \
-            && guest_exec test ! -e /usr/local/bin/codex-code-mode-host; then
-            pass "removed code-mode host before updater repair test"
-        else
-            fail "removed code-mode host before updater repair test" \
-                "host=$installed_host stderr: $(guest_stderr)"
+        if ! seed_codex_update_config; then
+            fail "prepare Codex config before update" "stderr: $(guest_stderr)"
+            return
         fi
 
         if coop agent update "$INSTANCE" --codex -y; then
@@ -1596,49 +1546,36 @@ test_agent_update() {
                 "got: $ver stderr: $(guest_stderr)"
         fi
 
-        local repaired_host repaired_codex_version
-        repaired_host=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
-        repaired_codex_version=$(guest_exec codex --version)
-        if guest_exec test -x /usr/local/bin/codex-code-mode-host \
-            && { [[ "$repaired_codex_version" != "$installed_codex_version" ]] \
-                || [[ "$repaired_host" == "$installed_host" ]]; }; then
-            pass "codex update repairs missing code-mode host"
+        check_native_codex
+        check_codex_config_preserved "host update"
+
+        # Seed a release that supports native self-update. Starting from latest
+        # would only exercise the up-to-date path, allowing a no-op to pass.
+        local older_version="0.153.0" before
+        # shellcheck disable=SC2016 # Installer cleanup runs inside the guest.
+        if guest_exec sh -c '
+            set -eu
+            installer=$(mktemp)
+            trap '\''rm -f "$installer"'\'' EXIT
+            curl -fsSL --retry 3 --retry-all-errors \
+                -o "$installer" https://chatgpt.com/codex/install.sh
+            CODEX_NON_INTERACTIVE=1 sh "$installer" --release "$1"
+        ' sh "$older_version" \
+            && before=$(guest_exec codex --version) \
+            && [[ "$before" == "codex-cli $older_version" ]] \
+            && [[ "$before" != "$ver" ]]; then
+            pass "seed an older native Codex release ($before)"
+            check_codex_config_preserved "older-release installation"
+            check_codex_self_update "$before"
+            check_native_codex
+            check_codex_config_preserved "direct update"
         else
-            fail "codex update repairs missing code-mode host" \
-                "before=$installed_host ($installed_codex_version) after=$repaired_host ($repaired_codex_version) stderr: $(guest_stderr)"
+            fail "seed an older native Codex release" \
+                "expected: codex-cli $older_version; latest: $ver; stderr: $(guest_stderr)"
         fi
 
-        validate_codex_package "after updater repair"
-
-        if guest_exec test ! -e "$inactive_release"; then
-            pass "codex update prunes an inactive release"
-        else
-            fail "codex update prunes an inactive release" \
-                "release still exists: $inactive_release"
-        fi
-        active_exe=""
-        if [[ -n "$active_pid" ]]; then
-            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
-                || active_exe=""
-        fi
-        if [[ "$active_exe" == "$active_release/bin/hold" ]] \
-            && guest_exec test -d "$active_release" \
-            && guest_exec sudo kill -0 "$active_pid"; then
-            pass "codex update preserves a release with a live executable"
-        else
-            fail "codex update preserves a release with a live executable" \
-                "release=$active_release pid=${active_pid:-unknown} exe=${active_exe:-unknown} stderr: $(guest_stderr)"
-        fi
-
-        if [[ -n "$active_pid" ]]; then
-            active_exe=$(guest_exec sudo readlink -f "/proc/$active_pid/exe") \
-                || active_exe=""
-            if [[ "$active_exe" == "$active_release/bin/hold" ]]; then
-                guest_exec sudo kill "$active_pid" 2>/dev/null || true
-            fi
-        fi
-        guest_exec sudo rm -rf -- "$active_release" "$inactive_release" \
-            /tmp/coop-codex-active-release.pid || true
+        # shellcheck disable=SC2016 # Expand HOME in the guest.
+        guest_exec sh -c 'rm -f "$HOME/.codex/coop-update-config.expected"'
     else
         skip "agent update --codex" "use --full; downloads the release in-guest"
     fi
@@ -4383,7 +4320,11 @@ test_custom_profiles() {
     cat > "$cfg_file" <<'CFGEOF'
 [profiles.test-custom]
 apt_packages = ["cowsay"]
-post_install = "echo 'custom-profile-marker' > /etc/custom-profile-installed"
+post_install = '''
+echo 'custom-profile-marker' > /etc/custom-profile-installed
+printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
+chmod 0755 /usr/local/bin/codex
+'''
 CFGEOF
 
     # Build an image with the custom profile
@@ -4415,6 +4356,34 @@ CFGEOF
     GUEST_INSTANCE="$inst_name"
     local marker
     marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
+    if [[ "$(guest_exec /usr/local/bin/codex --version)" == "codex-cli 9.9.9-profile" ]]; then
+        pass "custom profile's Codex is not replaced by the native installer"
+    else
+        fail "custom profile's Codex is not replaced by the native installer" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    # This image skipped the native installer, so it exercises migration from
+    # a system command without depending on the native package's cache layout.
+    # shellcheck disable=SC2016 # Inspect the guest user's launcher.
+    if guest_exec sh -c 'test ! -e "$HOME/.local/bin/codex"'; then
+        pass "custom image has no native Codex launcher before migration"
+    else
+        fail "custom image has no native Codex launcher before migration" \
+            "stderr: $(guest_stderr)"
+    fi
+    if seed_codex_update_config; then
+        if coop agent update "$inst_name" --codex -y; then
+            pass "agent update migrates the profile's system Codex installation"
+        else
+            fail "agent update migrates the profile's system Codex installation" \
+                "stderr: $HARNESS_ERR"
+        fi
+        check_native_codex
+        check_codex_config_preserved "migration"
+    else
+        fail "prepare Codex config before migration" "stderr: $(guest_stderr)"
+    fi
     unset GUEST_INSTANCE
 
     if echo "$marker" | grep -q "custom-profile-marker"; then
@@ -6505,6 +6474,14 @@ test_guest_user_alt() {
         skip "claude binary at /home/$alt_user/.local/bin/claude" \
             "not installed in this image (no Claude profile)"
     fi
+
+    check_native_codex
+    if coop agent update "$inst_name" --codex -y; then
+        pass "agent update --codex uses the configured guest user"
+    else
+        fail "agent update --codex uses the configured guest user" "stderr: $HARNESS_ERR"
+    fi
+    check_native_codex
 
     # The alt user must be in sudo + docker groups so the lifecycle
     # parity with `ubuntu` actually holds.

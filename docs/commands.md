@@ -489,11 +489,11 @@ coop agent update [NAME] [--claude] [--codex] [--check] [-y]
 With no agent flag, both agents are updated; passing both `--claude` and
 `--codex` is the same as passing neither. The VM must be running.
 
-Codex has no background updater, so `coop agent update --codex` re-runs coop's
-own installer inside the guest as root. It installs the complete upstream
-package, verifies its published checksums, and switches the CLI and code-mode
-host through the same current-release link.
-Claude Code already auto-updates in the background;
+`coop agent update --codex` re-runs OpenAI's native installer as the guest
+user, including when migrating an older direct-binary installation. The full
+package stays in the user's home directory, with `/usr/local/bin/codex` linked
+to `~/.local/bin/codex`. The guest user can also run `codex update` directly
+without sudo. Claude Code already auto-updates in the background;
 `coop agent update --claude` runs `claude update` now, synchronously — a
 convenience rather than a fix.
 

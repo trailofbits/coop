@@ -28,6 +28,112 @@ def shell(script, **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_codex_installer_checks_its_compatibility_link(self):
+        installer = (Path(__file__).parent.parent / "scripts/guest/codex.sh").read_text()
+        for download_status, install_status, launch_status in [
+            (0, 0, 0), (7, 0, 0), (0, 9, 0), (0, 0, 11),
+        ]:
+            with self.subTest(download=download_status, install=install_status,
+                              launch=launch_status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                native = root / "guest/.local/bin/codex"
+                system_bin = root / "bin"
+                system_bin.mkdir()
+                binary = root / "codex"
+                binary.write_text('#!/bin/sh\necho codex-cli 1.2.3\nexit "$LAUNCH_STATUS"\n')
+                upstream = root / "install.sh"
+                upstream.write_text('''
+                    set -eu
+                    test "$INSTALL_STATUS" = 0 || exit "$INSTALL_STATUS"
+                    mkdir -p "$(dirname "$NATIVE_BIN")"
+                    cp "$FIXTURE_BINARY" "$NATIVE_BIN"
+                    chmod +x "$NATIVE_BIN"
+                ''')
+                fragment = installer.replace("/home/${GUEST_USER}", str(root / "guest"))
+                fragment = fragment.replace("/usr/local/bin", str(system_bin))
+                result = shell('''
+                    curl() {
+                        test "$DOWNLOAD_STATUS" = 0 || return "$DOWNLOAD_STATUS"
+                        while [[ "$1" != -o ]]; do shift; done
+                        cp "$UPSTREAM_INSTALLER" "$2"
+                    }
+                    su() {
+                        [[ "$1" == - && "$2" == ubuntu && "$3" == -c ]] || return 99
+                        bash -c "$4"
+                    }
+                    mv() { shift; command mv -f "$@"; }
+                ''' + fragment, GUEST_USER="ubuntu", COOP_FORCE_INSTALL="1",
+                    DOWNLOAD_STATUS=str(download_status), INSTALL_STATUS=str(install_status),
+                    LAUNCH_STATUS=str(launch_status), NATIVE_BIN=str(native),
+                    FIXTURE_BINARY=str(binary), UPSTREAM_INSTALLER=str(upstream))
+                self.assertEqual(result.returncode == 0,
+                                 not (download_status or install_status or launch_status),
+                                 result.stdout + result.stderr)
+                link = system_bin / "codex"
+                if download_status or install_status:
+                    self.assertFalse(link.is_symlink())
+                else:
+                    self.assertTrue(link.samefile(native))
+                    self.assertIn("codex-cli 1.2.3", result.stdout)
+                self.assertFalse(list(system_bin.glob("codex.new.*")))
+
+    def test_codex_self_update_requires_a_version_change(self):
+        for update_status, version_status, after, succeeds in [
+            (0, 0, "codex-cli 0.154.0", True),
+            (0, 0, "codex-cli 0.153.0", False),
+            (1, 0, "codex-cli 0.154.0", False),
+            (0, 1, "codex-cli 0.154.0", False),
+            (0, 0, "", False),
+        ]:
+            with self.subTest(update=update_status, version=version_status, after=after):
+                result = shell(functions("check_codex_self_update") + '''
+                    current="codex-cli 0.153.0"
+                    update_called=0
+                    guest_exec() {
+                        case "$*" in
+                            "codex update")
+                                update_called=1
+                                current="$AFTER"
+                                return "$UPDATE_STATUS" ;;
+                            "codex --version")
+                                printf '%s\\n' "$current"
+                                return "$VERSION_STATUS" ;;
+                            *) return 99 ;;
+                        esac
+                    }
+                    guest_stderr() { echo fixture-error; }
+                    pass() { echo "PASS $*"; }
+                    fail() { echo "FAIL $*"; }
+                    check_codex_self_update "$current"
+                    test "$update_called" = 1
+                ''', UPDATE_STATUS=str(update_status), VERSION_STATUS=str(version_status),
+                    AFTER=after)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.startswith("PASS"), succeeds, result.stdout)
+
+    def test_codex_config_preservation_checks_actual_contents(self):
+        fragment = functions("seed_codex_update_config", "check_codex_config_preserved")
+        fragment = fragment.replace("$HOME/", "$FIXTURE_HOME/")
+        for mutation in ("unchanged", "changed", "deleted", "missing-snapshot"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                result = shell(fragment + '''
+                    set -eu
+                    guest_exec() { "$@"; }
+                    guest_stderr() { echo fixture-error; }
+                    pass() { echo "PASS $*"; }
+                    fail() { echo "FAIL $*"; }
+                    seed_codex_update_config
+                    case "$MUTATION" in
+                        changed) echo '# changed' >> "$FIXTURE_HOME/.codex/config.toml" ;;
+                        deleted) rm "$FIXTURE_HOME/.codex/config.toml" ;;
+                        missing-snapshot) rm "$FIXTURE_HOME/.codex/coop-update-config.expected" ;;
+                    esac
+                    check_codex_config_preserved update
+                ''', FIXTURE_HOME=directory, MUTATION=mutation)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.startswith("PASS"), mutation == "unchanged",
+                                 result.stdout)
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux guest provisioning")
     def test_fcnet_mask_replaces_existing_unit(self):
         setup = (Path(__file__).parent.parent / "scripts/guest/guest-config.sh").read_text()

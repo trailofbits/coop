@@ -380,6 +380,13 @@ These are deliberate and documented in [`AGENTS.md`](../AGENTS.md) /
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Don't "fix" them without
 understanding the rationale; do flag a change that *widens* them:
 
+- **Native agent installers are trusted build inputs.** Provisioning fetches
+  Claude's installer from `claude.ai` and Codex's from
+  `https://chatgpt.com/codex/install.sh` over HTTPS, then runs them as the
+  configured guest user. On Firecracker this happens in the host-side chroot;
+  a chroot does not provide VM isolation. Lima provisioning and live agent
+  updates execute inside a VM. This build-time trust is distinct from the
+  untrusted guest boundary described above.
 - **`DOCKER_INSECURE_NO_IPTABLES_RAW=1`** in the guest. The Firecracker CI
   kernel lacks `iptable_raw`, so Docker 28+ can't install its raw-table
   "direct access filtering" rule. Without it, other hosts on the guest's LAN
