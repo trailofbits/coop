@@ -275,8 +275,9 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
 /// Resize the disk of a stopped Lima instance.
 ///
-/// Truncates the disk to the new size. Cloud-init's `growpart`
-/// will expand the partition and filesystem on next boot.
+/// Truncates the disk to the new size and updates `lima.yaml` `disk:`
+/// to match, so the next start sees the grown size. Cloud-init's
+/// `growpart` expands the partition and filesystem on next boot.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let disk = disk_path(inst)?;
 
@@ -310,6 +311,18 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
         inst.name,
     );
+
+    // Lima re-reads `disk:` from lima.yaml on start. Growing the file
+    // without updating that field makes the next start look like a
+    // shrink, which Lima rejects.
+    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
+    let original = fs::read_to_string(&yaml_path)
+        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    let disk_value = format!("\"{}GiB\"", new_size.as_u32());
+    let edited = set_yaml_scalar(&original, "disk", &disk_value)
+        .with_context(|| format!("No top-level 'disk' key in {}", yaml_path.display()))?;
+    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
+
     let status = Command::new("truncate")
         .arg("-s")
         .arg(format!("{new_size}G"))
@@ -318,6 +331,12 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         .context("Failed to run truncate")?;
 
     if !status.success() {
+        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
+            tracing::error!(
+                "Failed to restore {} after a failed truncate: {restore}",
+                yaml_path.display()
+            );
+        }
         bail!("truncate failed for {}", disk.display());
     }
 
@@ -1911,6 +1930,20 @@ mod tests {
         assert!(
             edited.contains("disk: \"20GiB\"\n"),
             "unrelated key changed: {edited}"
+        );
+    }
+
+    #[test]
+    fn set_yaml_scalar_replaces_top_level_disk() {
+        let yaml = "cpus: 2\ndisk: \"8GiB\"\nmemory: \"4GiB\"\n";
+        let edited = set_yaml_scalar(yaml, "disk", "\"9GiB\"").unwrap();
+        assert!(
+            edited.contains("disk: \"9GiB\"\n"),
+            "disk not updated: {edited}"
+        );
+        assert!(
+            edited.contains("cpus: 2\n") && edited.contains("memory: \"4GiB\"\n"),
+            "unrelated keys changed: {edited}"
         );
     }
 

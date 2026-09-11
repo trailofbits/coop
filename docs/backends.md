@@ -43,7 +43,7 @@ The Lima template configures:
 
 ### Resize (disk, memory, vCPUs)
 
-Resizing a stopped instance's disk truncates the Lima disk to the new size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
+Resizing a stopped instance's disk truncates the Lima disk to the new size and updates the instance `lima.yaml` `disk:` field to match, so the next start sees the grown size. Cloud-init's `growpart` module expands the partition and filesystem on next boot. Shrinking is not supported.
 
 Memory and vCPU changes rewrite the `cpus`/`memory` fields in the instance's `lima.yaml`, which Lima re-reads on `limactl start`. The edit is written atomically, then coop starts the instance to validate and apply the new spec — if `limactl` rejects it (e.g. a spec larger than the host), the previous `lima.yaml` is restored. Without `--start` the instance is stopped again after the validating boot. The `lima.yaml` is authoritative: the global `[vm]` `cpus`/`memory` settings only seed *new* instances.
 
@@ -159,7 +159,7 @@ Both backends support the same CLI commands and guest capabilities:
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
-| `coop resize` | Disk: truncates Lima disk. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: truncates + resize2fs on rootfs. Mem/vCPU: edits per-instance JSON |
+| `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: truncates + resize2fs on rootfs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |
 | `--mount` host mounts | Live virtiofs (changes visible immediately) | One-time rsync sync (use `push`/`pull` to re-sync) |
