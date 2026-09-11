@@ -2359,11 +2359,10 @@ fn copy_staged_to_guest(
         let path = entry.path();
         let local = HostPath::new(&path);
         if path.is_dir() {
-            // A previous boot may have copied read-only files (git packs).
-            // scp cannot overwrite those; replace the dest directory first.
+            // A previous boot may have copied read-only files. scp cannot
+            // overwrite those; replace the dest directory first.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                let dest = format!("~/{guest_subdir}/{name}");
-                target.exec(RemoteCommand::new().literal("rm -rf -- ").arg(&dest))?;
+                target.exec(remove_guest_staged_dir(guest_subdir, name))?;
             }
             target
                 .scp_to_recursive(&local, &guest_dir)
@@ -2636,6 +2635,17 @@ fn merge_claude_import_preferences(
         );
     }
     serde_json::to_string(root).context("Failed to serialize imported Claude preferences")
+
+/// Guest-side `rm -rf` of one previously copied allowlist directory.
+///
+/// `~/` stays in a literal so the guest shell expands the home directory.
+/// `.arg(name)` quotes only the directory basename. Passing the whole
+/// `~/.grok/skills` path through `.arg` quotes the tilde and the remove
+/// becomes a no-op (`rm -rf -- '~/.grok/skills'`).
+fn remove_guest_staged_dir(guest_subdir: &str, name: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal(format!("rm -rf -- ~/{guest_subdir}/"))
+        .arg(name)
 }
 
 /// JSON body of the managed `~/.claude/settings.json` written to every guest.
@@ -3497,8 +3507,22 @@ fn resolve_mcp_header_secrets(
     Ok(resolved)
 }
 
+/// Hidden directories (`.git`, `.venv`, caches) and bare git repos
+/// (`lkml-19.git`) are host-machine state, not guest config.
+fn is_host_only_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(n) = name.to_str() else {
+        return false;
+    };
+    n.starts_with('.')
+        || std::path::Path::new(n)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+}
+
 /// Recursively copy a directory tree. Directory symlinks are skipped so a
 /// host checkout linked into `plugins/` cannot be followed into the guest.
+/// Hidden directories and bare git repos are skipped so a host skill tree
+/// cannot drag venvs or lore object stores into the guest.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
     for entry in
@@ -3514,6 +3538,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             continue;
         }
         if meta.is_dir() {
+            if is_host_only_dir(&entry.file_name()) {
+                tracing::debug!("Skipping host-only directory {}", src_path.display());
+                continue;
+            }
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             if dst_path.exists() {
@@ -4882,6 +4910,41 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn stage_grok_files_skips_host_only_dirs_under_skills() {
+        let src = tempfile::TempDir::new().unwrap();
+        let skill = src.path().join("skills/review");
+        std::fs::create_dir_all(skill.join(".git/objects")).unwrap();
+        std::fs::write(skill.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(skill.join("data/lore/lkml-19.git/objects")).unwrap();
+        std::fs::write(skill.join("data/lore/lkml-19.git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(skill.join(".venv/bin")).unwrap();
+        std::fs::write(skill.join(".venv/bin/python"), "py").unwrap();
+        std::fs::write(skill.join("SKILL.md"), "skill").unwrap();
+
+        let staging =
+            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("skills/review/SKILL.md")).unwrap(),
+            "skill"
+        );
+        assert!(
+            !staging.path().join("skills/review/.git").exists(),
+            ".git must not be staged"
+        );
+        assert!(
+            !staging
+                .path()
+                .join("skills/review/data/lore/lkml-19.git")
+                .exists(),
+            "bare git repos must not be staged"
+        );
+        assert!(
+            !staging.path().join("skills/review/.venv").exists(),
+            ".venv must not be staged"
+        );
+    }
+
+    #[test]
     fn stage_allowed_files_empty_source() {
         let src = tempfile::TempDir::new().unwrap();
         let staging = stage_allowed_files(src.path()).unwrap();
@@ -5887,6 +5950,33 @@ url = "https://example.com/m"
             std::fs::read_to_string(target.join("b/c.txt")).unwrap(),
             "nested"
         );
+    }
+
+    #[test]
+    fn remove_guest_staged_dir_keeps_tilde_unquoted() {
+        let cmd = remove_guest_staged_dir(".grok", "skills");
+        assert_eq!(cmd.into_string(), "rm -rf -- ~/.grok/'skills'");
+    }
+
+    #[test]
+    fn copy_dir_recursive_skips_hidden_and_git_dirs() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
+        std::fs::create_dir_all(src.path().join(".venv/bin")).unwrap();
+        std::fs::write(src.path().join(".venv/bin/python"), "py").unwrap();
+        std::fs::create_dir_all(src.path().join("lore/lkml-19.git/objects")).unwrap();
+        std::fs::write(src.path().join("lore/lkml-19.git/HEAD"), "ref").unwrap();
+
+        let dst = tempfile::TempDir::new().unwrap();
+        let target = dst.path().join("out");
+        copy_dir_recursive(src.path(), &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "ok"
+        );
+        assert!(!target.join(".venv").exists());
+        assert!(!target.join("lore/lkml-19.git").exists());
+        assert!(target.join("lore").is_dir());
     }
 
     #[test]

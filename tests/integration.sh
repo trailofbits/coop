@@ -31,6 +31,7 @@ BINARY="${TEST_BINARY:-}"
 PROFILES="${TEST_PROFILES:-python,node}"
 INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
+SUITE_CONFIG=""
 
 # Track all instances we create for cleanup
 STARTED_INSTANCES=()
@@ -114,7 +115,21 @@ HARNESS_ERR=""
 
 coop() {
     local rc=0
-    HARNESS_OUT=$("$BINARY" "$@" 2>"$tmpdir/stderr") || rc=$?
+    local args=("$@")
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        local has_config=0
+        local a
+        for a in "${args[@]}"; do
+            if [[ "$a" == "--config" || "$a" == --config=* ]]; then
+                has_config=1
+                break
+            fi
+        done
+        if [[ "$has_config" -eq 0 ]]; then
+            args=(--config "$SUITE_CONFIG" "${args[@]}")
+        fi
+    fi
+    HARNESS_OUT=$("$BINARY" "${args[@]}" 2>"$tmpdir/stderr") || rc=$?
     HARNESS_ERR=$(cat "$tmpdir/stderr")
     return $rc
 }
@@ -1095,14 +1110,26 @@ test_grok_settings_merge() {
     echo ""
     echo "=== Phase: grok settings merge across restart ==="
 
-    # Host ~/.grok/config.toml is recopied every boot, then managed keys
-    # are merged into that copy. Seed a wrong permission_mode and a host-
-    # style [plugins] table so restart proves the merge. trusted_folders.toml
-    # is not copied from the host, so a guest /tmp entry must survive.
+    # Use a fixture host dir, not the developer's ~/.grok. The default
+    # suite config disables that copy so a multi-gigabyte skills tree
+    # cannot stall or fill the guest. This phase still proves recopy +
+    # merge: host config.toml is the base, managed keys are forced, and
+    # trusted_folders.toml (not copied) keeps a guest /tmp entry.
+    local grok_src="$tmpdir/grok-host-config"
+    mkdir -p "$grok_src"
+    printf '%s\n' \
+        '[ui]' 'vim_mode = true' 'permission_mode = "default"' '' \
+        '[plugins]' 'sentinel = true' \
+        > "$grok_src/config.toml"
+
+    local cfg_file="$tmpdir/grok-merge-coop.toml"
+    cat > "$cfg_file" <<CFGEOF
+[grok]
+config_dir = "$grok_src"
+CFGEOF
+
     local seed='mkdir -p ~/.grok && printf "%s\n" '
-    seed+='"[ui]" "vim_mode = true" "permission_mode = \"default\"" "" '
-    seed+='"[plugins]" "sentinel = true" > ~/.grok/config.toml && '
-    seed+='printf "%s\n" "[folders.\"/tmp\"]" "trusted = true" '
+    seed+='"[folders.\"/tmp\"]" "trusted = true" '
     seed+='> ~/.grok/trusted_folders.toml'
     if coop_exec sh -c "$seed"; then
         pass "seed grok config and trust files"
@@ -1112,7 +1139,7 @@ test_grok_settings_merge() {
     fi
 
     coop stop "$INSTANCE" || true
-    if coop start "$INSTANCE"; then
+    if coop --config "$cfg_file" start "$INSTANCE"; then
         pass "restart for grok settings merge exits 0"
     else
         fail "restart for grok settings merge exits 0" "stderr: $HARNESS_ERR"
@@ -1123,6 +1150,12 @@ test_grok_settings_merge() {
     if ! merged=$(coop_exec sh -c 'cat ~/.grok/config.toml'); then
         fail "read merged config.toml after restart" "stderr: $(guest_stderr)"
         return
+    fi
+
+    if echo "$merged" | grep -q 'vim_mode = true'; then
+        pass "non-managed grok ui key survives restart"
+    else
+        fail "non-managed grok ui key survives restart" "$merged"
     fi
 
     if echo "$merged" | grep -q 'always-approve'; then
@@ -3369,7 +3402,8 @@ PYEOF
     fi
 
     # `coop status` reports the host image file's size, which `resize_disk`
-    # changes with a bare `truncate` on Lima — the guest filesystem only grows
+    # changes with `truncate` (and a matching lima.yaml `disk:`) — the guest
+    # filesystem only grows
     # when the guest expands the partition on boot. So the host-side check
     # above cannot tell a real re-grow from a shrunken guest. Compare what the
     # guest itself sees, in 1K blocks.
@@ -7009,6 +7043,16 @@ main() {
     echo ""
 
     tmpdir=$(mktemp -d)
+
+    # Isolate the suite from the developer's ~/.grok. A real host tree can
+    # hold gigabytes of skills, venvs, and git lore; Linux CI usually has
+    # none, so the same suite would pass there and fail here. Phases that
+    # need a host copy pass their own --config with a fixture directory.
+    SUITE_CONFIG="$tmpdir/suite-config.toml"
+    cat > "$SUITE_CONFIG" <<'EOF'
+[grok]
+config_dir = false
+EOF
 
     verify_binary
 
