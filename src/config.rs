@@ -1457,7 +1457,12 @@ pub struct ClaudeConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerDef>,
 
-    /// Source directory for Claude config files (CLAUDE.md, rules/, commands/)
+    /// Claude customization source: CLAUDE.md, keybindings.json, rules/,
+    /// commands/, skills/, agents/, output-styles/, themes/, workflows/.
+    /// Complete bundles are overlaid on each start; deletions and false retain
+    /// guest copies. Imports only companion disableAllHooks/outputStyle and
+    /// copied skills-directory plugin preferences, never whole host settings.
+    /// See docs/claude-integration.md for refresh, symlinks and sync limitations.
     #[serde(default)]
     pub config_dir: ConfigDir,
 

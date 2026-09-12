@@ -102,14 +102,91 @@ When a token is available, coop runs `gh auth setup-git` in the guest during boo
 
 ### Config directory
 
-`config_dir` specifies a host directory from which coop copies an allowlist of entries (`CLAUDE.md`, `rules/`, `commands/`) into `~/.claude/` in the guest. This provides Claude Code's global instructions and rules.
+`config_dir` selects a host directory to overlay into the guest's `~/.claude/`
+on every agent bootstrap (`coop up` or `coop start`, without `--no-agents`).
+The default is `~/.claude`; a custom path supports `~` expansion:
 
 ```toml
 [claude]
-config_dir = "~/.claude"
+config_dir = "~/claude-customizations"
 ```
 
-The default is `~/.claude`. Set to `false` to disable config file copying entirely.
+The copied entries are `CLAUDE.md`, `keybindings.json`, `rules/`, `commands/`, `skills/`, `agents/`, `output-styles/`, `themes/`, and `workflows/`.
+Directories are copied recursively in full, including nested skill references,
+scripts, executable assets, hidden supporting files, and skills-directory plugin
+bundles. This uses the existing copier: symlinks are followed and materialized,
+including targets outside the source. Directory names do **not** guarantee that
+recursive content is free of credentials; select a source containing only content
+you intend to put in the VM. Absolute host paths inside content are not rewritten.
+
+Current Claude Code loading contracts (verified with 2.1.259):
+
+| Content | Native behavior |
+| --- | --- |
+| `CLAUDE.md`, `rules/`, `commands/` | Personal instructions, rules and commands. |
+| `skills/<name>/SKILL.md` | Personal skills with supporting files in the same bundle; see [skills](https://code.claude.com/docs/en/skills). |
+| `skills/<directory>/.claude-plugin/plugin.json` | Immediate, non-hidden directories load as `<manifest-name>@skills-dir` without installation. Names are matched exactly in preferences; directory names and skill frontmatter do not determine plugin IDs. Hidden and reserved `synced` directories are not discovered. See [skills-directory plugins](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins). |
+| `agents/` | Personal [subagents](https://code.claude.com/docs/en/sub-agents). |
+| `output-styles/` | Personal [output styles](https://code.claude.com/docs/en/output-styles), selected by `outputStyle`. |
+| `themes/` | Personal theme JSON files with `base` and `overrides`, available in `/theme`; selection from host `.claude.json` is not imported. See [themes](https://code.claude.com/docs/en/terminal-config). |
+| `workflows/` | Personal `.js` workflows with a literal `export const meta` name/description, discovered as commands; see [workflows](https://code.claude.com/docs/en/workflows). Availability depends on Claude's workflow feature support. |
+| `keybindings.json` | Native [keybindings](https://code.claude.com/docs/en/keybindings), read from the user config directory. |
+
+Top-level `hooks/`, `monitors/`, and `routines/` are excluded. Merely copying a
+hook script does not register it. Hooks and monitors **inside plugin bundles**
+are copied with their registration files; Claude's own loading restrictions still
+apply (plugin monitors are interactive-only). Host settings, credentials, sessions,
+marketplaces, and `plugins/` installation/cache state are not copied wholesale.
+Claude's separate synced-skills ownership registry, `skills/manifest.json`, is
+also unsupported: import stops before transferring content when it is present.
+Use a custom source with the personal bundles you want and without sync state.
+Unreadable manifests or invalid plugin names likewise stop import rather than
+risk dropping a disable preference. Invalid directory encoding is unsupported.
+
+#### Companion preferences and refresh
+
+From host `settings.json`, coop selects only:
+
+- `disableAllHooks` (boolean): applies to all guest Claude hooks, including hooks
+  within copied skills/plugins and pre-existing guest hooks.
+- `outputStyle` (string): selects the guest output style by name. Claude resolves
+  the name; a style supplied by an excluded marketplace installation is not
+  installed by this import.
+- Boolean `enabledPlugins` entries whose exact IDs belong to copied,
+  discoverable skills-directory plugins, including IDs recorded from previous
+  copies retained by the overlay. Absent entries leave guest choices or
+  Claude's manifest/default enablement in effect; coop never synthesizes `true`.
+
+Explicit imported values override the corresponding guest user preferences.
+Unrelated guest settings and plugin entries survive. Coop's managed permissions,
+authentication handling, and model/proxy routing retain their existing precedence;
+none can be supplied through this narrow host-settings merge. Claude's own
+project/managed settings precedence still applies above user settings.
+
+On each successful active-source refresh, removed host overrides restore the
+previous guest values, or remove the key if none existed before import. A guest
+edit that differs from the last imported value is retained when the host override
+is removed. Removing an explicit disable therefore can enable that extension
+again, according to the restored guest preference or Claude's default.
+An absent host `settings.json` is an empty preference set; malformed settings or
+invalid relevant preference types stop bootstrap before any Claude invocation.
+
+Coop retains a narrow `~/.claude/coop-import.json` snapshot for recovery, and
+`_coopImportedPreferences` ownership metadata in guest `settings.json` for atomic
+restoration of previous values. Imported preferences are applied before transferring staged extensions and before onboarding,
+marketplace/plugin installation, or MCP registration, including after the existing
+corrupt-settings fallback. The fallback still loses unrelated corrupt guest state,
+but reapplies imported disables and style selection. An invalid import snapshot
+stops bootstrap rather than treating disabled extensions as enabled.
+
+Files follow an overlay lifecycle: restart overwrites files still present on the
+host, but host deletions do not delete previous guest copies. `config_dir = false`
+stops copying and retains both previous copies and the last preference snapshot.
+A missing default source likewise retains previous imports; custom paths must
+exist at config validation time. If a source disappears after validation, copying
+is skipped and the snapshot retained. To remove retained content, remove it in the
+guest or recreate the VM. Deletion synchronization and broader symlink/copier
+hardening are outside this import contract.
 
 ### Environment variable forwarding
 
@@ -183,13 +260,14 @@ Server definitions can include an `env` map for environment variable name mappin
 When `coop up` creates/restarts a project VM or `coop start` restarts a stopped VM (without `--no-agents`), coop executes the following steps after the VM boots and SSH becomes available:
 
 1. **GitHub auth**: If a `GITHUB_TOKEN` is available, run `gh auth setup-git` in the guest.
-2. **User content**: Copy the allowlisted entries (`CLAUDE.md`, `rules/`, `commands/`) from `config_dir` to `~/.claude/` in the guest.
-3. **Managed permissions**: Merge coop's managed permission keys (`permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`) into the guest's `~/.claude/settings.json`, preserving any other keys it holds. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. Other keys Claude Code stores in this file (notably `enabledPlugins` and `extraKnownMarketplaces`) are left intact so plugin and marketplace state survives a stop/start cycle. The one exception is the `env` block, which coop owns for local-model routing (see [Local model support](#local-model-support)): it is set when the VM is in local-model mode and removed in remote mode, so any hand-authored `env` entries in this file are not preserved. A file that cannot be parsed is replaced with managed defaults.
+2. **User content preparation**: Stage the [allowlisted customizations](#config-directory) from `config_dir` and refresh their narrow companion-preference snapshot.
+3. **Managed permissions**: Merge coop's managed permission keys (`permissions.defaultMode: bypassPermissions` and `permissions.skipDangerousModePermissionPrompt: true`) into the guest's `~/.claude/settings.json`, preserving unrelated keys and applying the imported companion preferences described above. The setting must live in user scope — Claude Code ignores `skipDangerousModePermissionPrompt` from project settings. Other keys Claude Code stores in this file (notably `enabledPlugins` and `extraKnownMarketplaces`) are preserved except for the explicitly imported plugin IDs, so unrelated plugin and marketplace state survives a stop/start cycle. Coop also owns the `env` block for local-model routing (see [Local model support](#local-model-support)): it is set when the VM is in local-model mode and removed in remote mode, so any hand-authored `env` entries in this file are not preserved. A file that cannot be parsed is replaced with managed defaults, then the imported companion preferences are reapplied before invoking Claude.
+   After settings are written, transfer the staged content into guest `~/.claude/`, then seed onboarding when required.
 4. **Marketplaces**: Register each marketplace source (local directories are copied to the guest first). On first boot, coop compares the configured marketplaces against those already baked into the golden image (from `coop setup --profile`) and only installs the ones that are missing.
 5. **Plugins**: Install each plugin from the registered marketplaces. Like marketplaces, coop computes the delta against plugins already present in the golden image and skips those that are already installed.
 6. **MCP servers**: Register each MCP server definition.
 
-On restart (`coop start` of a stopped instance), only ephemeral state is refreshed: GitHub auth (step 1), config directory contents (step 2), and the managed `~/.claude/settings.json` (step 3). Marketplaces, plugins, and MCP servers persist on the guest disk and are not re-installed.
+On restart (`coop start` of a stopped instance), coop refreshes GitHub auth (step 1), config directory contents (step 2), and the managed `~/.claude/settings.json` (step 3). Marketplaces, plugins, and MCP servers persist on the guest disk and are not re-installed.
 
 ### Skipping bootstrap
 

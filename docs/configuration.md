@@ -243,7 +243,7 @@ Claude Code configuration injected into the guest VM at start time. Every field 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `api_key` | string | unset (reads `$ANTHROPIC_API_KEY` from environment) | Anthropic API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
-| `config_dir` | string (path) or `false` | `~/.claude` | Source directory for Claude config files. Copies an allowlist of entries (`CLAUDE.md`, `rules/`, `commands/`) from this directory to `~/.claude/` in the guest on start. Set to `false` to disable. Supports `~` expansion. |
+| `config_dir` | string (path) or `false` | `~/.claude` | Source for `CLAUDE.md`, `keybindings.json`, `rules/`, `commands/`, `skills/`, `agents/`, `output-styles/`, `themes/`, and `workflows/`, copied into guest `~/.claude/` on each start. Complete bundles and narrow companion preferences are imported. Supports `~` expansion; `false` stops copying while retaining prior files/preferences. Host deletions do not delete guest files. See [import semantics and limitations](claude-integration.md#config-directory). |
 | `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
 | `marketplaces` | array of strings | `[]` | Plugin marketplace sources. Each entry is a GitHub repo URL or an absolute local directory path. Local directories are copied into the guest before registration. |
 | `plugins` | array of strings | `[]` | Plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
