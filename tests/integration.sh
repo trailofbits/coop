@@ -1063,7 +1063,8 @@ test_grok_bin_path() {
     if coop_exec /home/ubuntu/.grok/bin/grok --version >/dev/null; then
         pass "grok binary invocable via full path"
     else
-        skip "grok --version" "binary exists but --version returned non-zero"
+        fail "grok binary invocable via full path" \
+            "installed binary could not report its version"
     fi
 
     local link_target
