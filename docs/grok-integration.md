@@ -86,15 +86,17 @@ forwarded API key. That file comes from the host copy on boot, or from
 ### Config directory
 
 `config_dir` specifies a host directory from which coop copies an allowlist
-of entries (`AGENTS.md`, `auth.json`, `config.toml`, `lsp.json`, `rules/`,
+of entries (`AGENTS.md`, `auth.json`, `lsp.json`, `rules/`,
 `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`) into
 `~/.grok/` in the guest.
 
-`config.toml` is the merge base: coop then forces
+Guest `config.toml` is the merge base. Host `config.toml` keys are
+overlaid except `[plugins]`. coop then forces
 `ui.permission_mode = "always-approve"` and, when `[grok.mcp_servers]` is
 set, replaces the `mcp_servers` table. The host `[plugins]` table is
 dropped: those names resolve through `installed-plugins/`, which is not
-copied. UI, model, and HTTP Model Context Protocol entries travel.
+copied. Guest `[plugins]` (especially `enabled`) is kept. UI, model, and
+HTTP Model Context Protocol entries travel.
 Host-absolute paths (`auth_provider_command`, local marketplace `path =`)
 will not resolve in the guest.
 
@@ -167,11 +169,13 @@ stopped VM (without `--no-agents`), coop executes the following steps after
 the VM boots and SSH becomes available:
 
 1. **User content**: Copy the allowlisted entries from `config_dir` to
-   `~/.grok/` in the guest, including `auth.json`, `config.toml`, and
-   `plugins/` when present.
-2. **Managed settings**: Merge `ui.permission_mode = "always-approve"` into
-   the guest `~/.grok/config.toml`, drop the host `[plugins]` table, and
-   merge configured MCP servers. Other keys in that file are preserved.
+   `~/.grok/` in the guest, including `auth.json` and `plugins/` when
+   present. Host `config.toml` is merged in the next step, not copied
+   over the guest file.
+2. **Managed settings**: Overlay host `config.toml` keys onto the guest
+   `~/.grok/config.toml` (except `[plugins]`), set
+   `ui.permission_mode = "always-approve"`, and merge configured MCP
+   servers. Guest `[plugins]` and other guest keys are kept.
 3. **Folder trust**: Record `/workspace` in `~/.grok/trusted_folders.toml`.
 4. **Marketplaces & plugins** (first boot only): Install the configured
    `marketplaces`/`plugins` not already baked into the golden image.

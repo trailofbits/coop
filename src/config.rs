@@ -1557,9 +1557,10 @@ pub struct GrokConfig {
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerDef>,
 
-    /// Source directory for Grok Build files (AGENTS.md, auth.json, config.toml,
-    /// lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/,
-    /// workflows/)
+    /// Source directory for Grok Build files (AGENTS.md, auth.json, lsp.json,
+    /// rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/).
+    /// Host `config.toml` is merged into the guest file (except `[plugins]`),
+    /// not copied over it.
     #[serde(default)]
     pub config_dir: ConfigDir,
 }

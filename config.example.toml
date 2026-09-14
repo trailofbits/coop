@@ -119,7 +119,8 @@
 # auth_token = "sk-..."             # Optional; permissive servers ignore it.
 
 # [grok]
-# config_dir = "~/.grok"  # AGENTS.md, auth.json, config.toml, lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/; skips hidden dirs and *.git (false to disable)
+# config_dir = "~/.grok"  # AGENTS.md, auth.json, lsp.json, rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/; skips hidden dirs and *.git (false to disable)
+#                         # host config.toml is merged (except [plugins]), not copied
 # env_forward = ["CUSTOM_TOKEN"]  # Extra env vars to forward to guest
 # marketplaces = ["owner/grok-plugins"]  # owner/repo, git URL, or local path
 # plugins = ["my-skill"]  # plugin name (`grok plugin install --trust`)

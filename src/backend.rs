@@ -1820,7 +1820,7 @@ fn bootstrap_grok(
     }
 
     copy_grok_config(&session.target, &grok.config_dir)?;
-    write_managed_grok_config(&session.target, &grok.mcp_servers)?;
+    write_managed_grok_config(&session.target, &grok.config_dir, &grok.mcp_servers)?;
     write_workspace_folder_trust(&session.target)?;
 
     if let BootMode::FirstBoot = mode {
@@ -2146,6 +2146,8 @@ fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
         return Ok(());
     };
 
+    // `config.toml` is merged into the guest file by
+    // `write_managed_grok_config`, not overwritten via scp.
     let staged = stage_selected_files(&source_dir, GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS)
         .context("Failed to stage Grok Build config files")?;
     copy_staged_to_guest(target, &staged, ".grok", "Grok Build")?;
@@ -2163,7 +2165,7 @@ fn restrict_guest_grok_auth(target: &SshTarget) -> Result<()> {
         .context("Failed to restrict guest ~/.grok/auth.json to owner-only")
 }
 
-const GROK_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json", "config.toml", "lsp.json"];
+const GROK_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json", "lsp.json"];
 const GROK_ALLOWED_DIRS: &[&str] = &[
     "rules",
     "skills",
@@ -2176,14 +2178,21 @@ const GROK_ALLOWED_DIRS: &[&str] = &[
 
 /// Merge coop-owned keys into the guest `~/.grok/config.toml`.
 ///
-/// `ui.permission_mode` is always set to always-approve so a bare `grok`
-/// from `coop shell` matches `coop grok`. Configured MCP servers replace
-/// the `mcp_servers` table. Host `[plugins]` is dropped (those names
-/// resolve through `installed-plugins/`, which is not copied). Every
-/// other key is preserved. A missing file is treated as empty; a read
-/// or parse failure is an error.
+/// Starts from the guest file. Host `config.toml` keys are overlaid
+/// except `[plugins]`. When both sides have a table at the same key,
+/// the tables are merged (host wins on a conflict); otherwise the host
+/// value replaces. `ui.permission_mode` is always set to always-approve
+/// so a bare `grok` from `coop shell` matches `coop grok`. Configured
+/// MCP servers replace the `mcp_servers` table. Guest `[plugins]`
+/// (especially `enabled`) is kept; a host `[plugins]` table is not
+/// imported (those names resolve through `installed-plugins/`, which is
+/// not copied). Other preserved keys are those already on the guest
+/// that the host does not name, plus host keys that are not `[plugins]`.
+/// A missing guest or host file is treated as empty; a read or parse
+/// failure is an error.
 fn write_managed_grok_config(
     target: &SshTarget,
+    config_dir: &ConfigDir,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
 ) -> Result<()> {
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.grok"))?;
@@ -2191,7 +2200,8 @@ fn write_managed_grok_config(
     let existing = target
         .capture("cat ~/.grok/config.toml 2>/dev/null || true")
         .context("Failed to read guest ~/.grok/config.toml")?;
-    let merged = merge_managed_grok_config(&existing, mcp_servers)?;
+    let host = read_host_grok_config_toml(config_dir)?;
+    let merged = merge_managed_grok_config(&existing, &host, mcp_servers)?;
 
     target
         .exec_with_stdin(
@@ -2205,8 +2215,34 @@ fn write_managed_grok_config(
     Ok(())
 }
 
+/// Read the host `config.toml` that will be overlaid onto the guest file.
+/// Missing or disabled config is empty; a present but unreadable file is
+/// an error.
+fn read_host_grok_config_toml(config_dir: &ConfigDir) -> Result<String> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, ".grok", "grok.config_dir") else {
+        return Ok(String::new());
+    };
+    let path = source_dir.join("config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("Failed to read host {}", path.display())),
+    }
+}
+
+/// Merge managed Grok keys into a guest `config.toml`.
+///
+/// `existing` is the guest file. `host` is the host `config.toml` (empty
+/// when `config_dir` is disabled or the file is absent). Host keys are
+/// overlaid except `[plugins]`. When both values are tables, the tables
+/// are merged and the host wins on a conflict; otherwise the host value
+/// replaces. Guest `[plugins]` is kept. Managed `ui.permission_mode`
+/// and configured `mcp_servers` are applied last. Other preserved keys
+/// are those already on the guest that the host does not name, plus
+/// host keys that are not `[plugins]`.
 fn merge_managed_grok_config(
     existing: &str,
+    host: &str,
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
 ) -> Result<String> {
     let mut root = if existing.trim().is_empty() {
@@ -2216,6 +2252,20 @@ fn merge_managed_grok_config(
             .parse::<toml::Table>()
             .context("existing ~/.grok/config.toml is not valid TOML")?
     };
+
+    if !host.trim().is_empty() {
+        let mut host_table = host
+            .parse::<toml::Table>()
+            .context("host ~/.grok/config.toml is not valid TOML")?;
+        if host_table.remove("plugins").is_some() {
+            tracing::warn!(
+                "Dropping [plugins] from host ~/.grok/config.toml; \
+                 those names resolve through installed-plugins/, which is not copied. \
+                 Put marketplace plugins in [grok] plugins"
+            );
+        }
+        overlay_toml_table(&mut root, host_table);
+    }
 
     let ui = root
         .entry("ui")
@@ -2228,14 +2278,6 @@ fn merge_managed_grok_config(
         toml::Value::String("always-approve".to_string()),
     );
 
-    if root.remove("plugins").is_some() {
-        tracing::warn!(
-            "Dropping [plugins] from guest ~/.grok/config.toml; \
-             those names resolve through installed-plugins/, which is not copied. \
-             Put marketplace plugins in [grok] plugins"
-        );
-    }
-
     if !mcp_servers.is_empty() {
         let resolved = resolve_mcp_header_secrets("Grok Build MCP server", mcp_servers)?;
         if root.contains_key("mcp_servers") {
@@ -2247,6 +2289,24 @@ fn merge_managed_grok_config(
     }
 
     toml::to_string(&root).context("Failed to serialize managed ~/.grok/config.toml")
+}
+
+/// Overlay `src` onto `dest`. Host wins on the same key. When both
+/// values are tables, merge the tables; otherwise replace.
+fn overlay_toml_table(dest: &mut toml::Table, src: toml::Table) {
+    for (key, src_val) in src {
+        match dest.get_mut(&key) {
+            Some(dest_val) => match (dest_val, src_val) {
+                (toml::Value::Table(dest_table), toml::Value::Table(src_table)) => {
+                    overlay_toml_table(dest_table, src_table);
+                }
+                (dest_val, src_val) => *dest_val = src_val,
+            },
+            None => {
+                dest.insert(key, src_val);
+            }
+        }
+    }
 }
 
 /// Grok expands MCP `env` values as `${NAME}` from the guest process
@@ -2360,9 +2420,9 @@ fn copy_staged_to_guest(
         let local = HostPath::new(&path);
         if path.is_dir() {
             // A previous boot may have copied read-only files. scp cannot
-            // overwrite those; replace the dest directory first.
+            // overwrite those; make the dest writable, then overlay.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                target.exec(remove_guest_staged_dir(guest_subdir, name))?;
+                target.exec(make_guest_staged_dir_writable(guest_subdir, name))?;
             }
             target
                 .scp_to_recursive(&local, &guest_dir)
@@ -2635,17 +2695,21 @@ fn merge_claude_import_preferences(
         );
     }
     serde_json::to_string(root).context("Failed to serialize imported Claude preferences")
+}
 
-/// Guest-side `rm -rf` of one previously copied allowlist directory.
+/// Guest-side `chmod -R u+w` of one previously copied allowlist directory
+/// so an overlay `scp` can replace matching files. Guest-only entries
+/// stay in place. A missing dest is a no-op; `scp_to_recursive` creates it.
 ///
 /// `~/` stays in a literal so the guest shell expands the home directory.
 /// `.arg(name)` quotes only the directory basename. Passing the whole
-/// `~/.grok/skills` path through `.arg` quotes the tilde and the remove
-/// becomes a no-op (`rm -rf -- '~/.grok/skills'`).
-fn remove_guest_staged_dir(guest_subdir: &str, name: &str) -> RemoteCommand {
+/// `~/.grok/skills` path through `.arg` quotes the tilde and the chmod
+/// becomes a no-op (`chmod ... -- '~/.grok/skills'`).
+fn make_guest_staged_dir_writable(guest_subdir: &str, name: &str) -> RemoteCommand {
     RemoteCommand::new()
-        .literal(format!("rm -rf -- ~/{guest_subdir}/"))
+        .literal(format!("chmod -R u+w -- ~/{guest_subdir}/"))
         .arg(name)
+        .literal(" 2>/dev/null || true")
 }
 
 /// JSON body of the managed `~/.claude/settings.json` written to every guest.
@@ -4841,9 +4905,9 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             "{\"access_token\":\"test\"}"
         );
         assert!(staging.path().join("AGENTS.md").is_file());
-        assert_eq!(
-            std::fs::read_to_string(staging.path().join("config.toml")).unwrap(),
-            "permission_mode = \"ask\""
+        assert!(
+            !staging.path().join("config.toml").exists(),
+            "config.toml is merged into the guest file, not staged for scp"
         );
         assert!(staging.path().join("plugins/SKILL.md").is_file());
         assert!(
@@ -5815,7 +5879,7 @@ url = "https://example.com/m"
     fn merge_managed_grok_config_sets_permission_mode_and_preserves_other_keys() {
         let existing = "[ui]\nvim_mode = true\n[models]\ndefault = \"grok-4.6\"\n";
         let merged =
-            merge_managed_grok_config(existing, &std::collections::HashMap::new()).unwrap();
+            merge_managed_grok_config(existing, "", &std::collections::HashMap::new()).unwrap();
         let table: toml::Table = merged.parse().unwrap();
         let ui = table["ui"].as_table().unwrap();
         assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
@@ -5827,19 +5891,75 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn merge_managed_grok_config_drops_plugins_table() {
+    fn merge_managed_grok_config_keeps_guest_plugins_table() {
         let existing = "[plugins]\nenabled = [\"nest\", \"fdm-print\"]\n\
              [ui]\nvim_mode = true\n";
         let merged =
-            merge_managed_grok_config(existing, &std::collections::HashMap::new()).unwrap();
+            merge_managed_grok_config(existing, "", &std::collections::HashMap::new()).unwrap();
         let table: toml::Table = merged.parse().unwrap();
-        assert!(
-            !table.contains_key("plugins"),
-            "[plugins] names resolve through installed-plugins/ and must not be copied"
+        assert_eq!(
+            table["plugins"].as_table().unwrap()["enabled"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            ["nest", "fdm-print"],
+            "guest [plugins].enabled must survive the merge"
         );
         let ui = table["ui"].as_table().unwrap();
         assert_eq!(ui["vim_mode"].as_bool(), Some(true));
         assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_preserves_guest_keys_under_host_overlay() {
+        let existing = "[ui]\nvim_mode = true\n[models]\ndefault = \"grok-4.6\"\n";
+        let host = "default_mode = \"fast\"\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        assert_eq!(
+            table["models"].as_table().unwrap()["default"].as_str(),
+            Some("grok-4.6")
+        );
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+        assert_eq!(table["default_mode"].as_str(), Some("fast"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_merges_guest_and_host_ui_tables() {
+        let existing = "[ui]\nvim_mode = true\n";
+        let host = "[ui]\ntheme = \"dark\"\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(ui["theme"].as_str(), Some("dark"));
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_does_not_import_host_plugins() {
+        let existing = "[plugins]\nenabled = [\"nest\", \"fdm-print\"]\n";
+        let host = "default_mode = \"fast\"\n[plugins]\nenabled = [\"from-host\"]\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        assert_eq!(
+            table["plugins"].as_table().unwrap()["enabled"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            ["nest", "fdm-print"],
+            "guest [plugins].enabled wins; host [plugins] is not imported"
+        );
+        assert_eq!(table["default_mode"].as_str(), Some("fast"));
     }
 
     #[test]
@@ -5858,7 +5978,7 @@ url = "https://example.com/m"
                 env,
             },
         );
-        let merged = merge_managed_grok_config("", &servers).unwrap();
+        let merged = merge_managed_grok_config("", "", &servers).unwrap();
         let table: toml::Table = merged.parse().unwrap();
         let server = table["mcp_servers"]["playwright"].as_table().unwrap();
         assert_eq!(
@@ -5871,13 +5991,17 @@ url = "https://example.com/m"
     #[test]
     fn merge_managed_grok_config_rejects_invalid_toml() {
         let empty = std::collections::HashMap::new();
-        assert!(merge_managed_grok_config("not toml", &empty).is_err());
+        assert!(merge_managed_grok_config("not toml", "", &empty).is_err());
         assert!(
-            merge_managed_grok_config("[ui]\npermission_mode = [", &empty).is_err(),
+            merge_managed_grok_config("", "not toml", &empty).is_err(),
+            "invalid host TOML must be rejected, not skipped",
+        );
+        assert!(
+            merge_managed_grok_config("[ui]\npermission_mode = [", "", &empty).is_err(),
             "invalid TOML must be rejected, not replaced with managed defaults",
         );
         assert!(
-            merge_managed_grok_config("ui = \"nope\"\n", &empty).is_err(),
+            merge_managed_grok_config("ui = \"nope\"\n", "", &empty).is_err(),
             "a non-table `ui` value must be rejected, not silently clobbered",
         );
     }
@@ -5953,9 +6077,17 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn remove_guest_staged_dir_keeps_tilde_unquoted() {
-        let cmd = remove_guest_staged_dir(".grok", "skills");
-        assert_eq!(cmd.into_string(), "rm -rf -- ~/.grok/'skills'");
+    fn make_guest_staged_dir_writable_keeps_tilde_unquoted() {
+        let cmd = make_guest_staged_dir_writable(".grok", "skills");
+        let rendered = cmd.into_string();
+        assert!(
+            !rendered.contains("rm -rf"),
+            "dest dirs must stay in place so guest-only files survive a restart"
+        );
+        assert_eq!(
+            rendered,
+            "chmod -R u+w -- ~/.grok/'skills' 2>/dev/null || true"
+        );
     }
 
     #[test]

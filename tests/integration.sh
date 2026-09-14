@@ -1113,15 +1113,17 @@ test_grok_settings_merge() {
 
     # Use a fixture host dir, not the developer's ~/.grok. The default
     # suite config disables that copy so a multi-gigabyte skills tree
-    # cannot stall or fill the guest. This phase still proves recopy +
-    # merge: host config.toml is the base, managed keys are forced, and
+    # cannot stall or fill the guest. Guest config.toml is the merge
+    # base; host keys overlay except [plugins]; managed keys are forced;
+    # a guest-only skills file survives the dest overlay;
     # trusted_folders.toml (not copied) keeps a guest /tmp entry.
     local grok_src="$tmpdir/grok-host-config"
-    mkdir -p "$grok_src"
+    mkdir -p "$grok_src/skills"
     printf '%s\n' \
         '[ui]' 'vim_mode = true' 'permission_mode = "default"' '' \
         '[plugins]' 'sentinel = true' \
         > "$grok_src/config.toml"
+    printf '%s\n' 'from-host' > "$grok_src/skills/host.md"
 
     local cfg_file="$tmpdir/grok-merge-coop.toml"
     cat > "$cfg_file" <<CFGEOF
@@ -1129,9 +1131,12 @@ test_grok_settings_merge() {
 config_dir = "$grok_src"
 CFGEOF
 
-    local seed='mkdir -p ~/.grok && printf "%s\n" '
+    local seed='mkdir -p ~/.grok/skills && printf "%s\n" '
     seed+='"[folders.\"/tmp\"]" "trusted = true" '
-    seed+='> ~/.grok/trusted_folders.toml'
+    seed+='> ~/.grok/trusted_folders.toml && printf "%s\n" '
+    seed+='"[plugins]" "enabled = [\"guest-only-plugin\"]" '
+    seed+='> ~/.grok/config.toml && printf "%s\n" '
+    seed+='"guest-only" > ~/.grok/skills/guest-only.md'
     if coop_exec sh -c "$seed"; then
         pass "seed grok config and trust files"
     else
@@ -1169,6 +1174,25 @@ CFGEOF
         fail "host [plugins] table dropped after restart" "$merged"
     else
         pass "host [plugins] table dropped after restart"
+    fi
+
+    if echo "$merged" | grep -q 'guest-only-plugin'; then
+        pass "guest [plugins].enabled survives restart"
+    else
+        fail "guest [plugins].enabled survives restart" "$merged"
+    fi
+
+    if coop_exec sh -c 'test -f ~/.grok/skills/guest-only.md'; then
+        pass "guest-only skills file survives dest overlay"
+    else
+        fail "guest-only skills file survives dest overlay" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    if coop_exec sh -c 'test -f ~/.grok/skills/host.md'; then
+        pass "host skills file copied on restart"
+    else
+        fail "host skills file copied on restart" "stderr: $(guest_stderr)"
     fi
 
     local trust
