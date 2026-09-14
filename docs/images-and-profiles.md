@@ -42,8 +42,8 @@ Codex, so it costs nothing at run time.
 
 **Grok Build CLI:** installed via the official installer
 (`https://x.ai/cli/install.sh`) during the template build. The binary lives at
-`~/.grok/bin/grok` with a same-file `agent` link; `/usr/local/bin/grok` and
-`/usr/local/bin/agent` point there. The image also installs a `grok-yolo`
+`~/.grok/bin/grok` with a same-file `agent` link; `/usr/local/bin/grok`
+points there. The image also installs a `grok-yolo`
 shortcut.
 
 The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:

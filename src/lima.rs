@@ -1634,7 +1634,6 @@ ln -sf "{home}/.local/bin/claude" /usr/local/bin/claude
 
 echo '  [guest] Symlinking grok into system PATH...'
 ln -sf "{home}/.grok/bin/grok" /usr/local/bin/grok
-ln -sf "{home}/.grok/bin/agent" /usr/local/bin/agent
 
 echo '  [guest] Installing claude-yolo shortcut...'
 cat > /usr/local/bin/claude-yolo <<'YOLOEOF'

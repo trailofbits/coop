@@ -6,7 +6,7 @@
 
 - **Grok Build** — `coop grok` launches Grok Build inside the guest with
   `--always-approve`, `--trust`, and `--cwd /workspace`. The golden image
-  installs `~/.grok/bin/grok` (and an `agent` link) and a `grok-yolo`
+  installs `~/.grok/bin/grok` and a `grok-yolo`
   shortcut. `[grok]` forwards `XAI_API_KEY`, copies an allowlist from
   `config_dir` (`AGENTS.md`, `auth.json`, `lsp.json`, `rules/`,
   `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`;
