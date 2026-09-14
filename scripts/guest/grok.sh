@@ -26,8 +26,9 @@ else
     for attempt in $(seq 1 "$MAX_RETRIES"); do
         if curl -fsSL -o "$INSTALLER" https://x.ai/cli/install.sh 2>/tmp/grok-curl-err; then
             break
+        else
+            CURL_EXIT=$?
         fi
-        CURL_EXIT=$?
         CURL_ERR=$(cat /tmp/grok-curl-err 2>/dev/null || true)
         if [ "$attempt" -eq "$MAX_RETRIES" ]; then
             echo "  [guest] ERROR: Failed to download Grok Build installer" \
