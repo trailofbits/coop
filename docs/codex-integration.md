@@ -60,7 +60,32 @@ locking the keyring cannot erase credentials already cached in running clients.
 Concurrent OAuth refresh and logout across clients require real-account testing.
 Desktop SSH does not use coop's API-key/proxy secret forwarding.
 
-To keep Codex's sandbox and approval prompts for a single session, pass `--ask`. coop then launches `codex` with no bypass flag, so Codex applies its normal defaults:
+#### Desktop execution permissions
+
+Select **Full access** in the desktop thread's permissions control when using
+the VM as the isolation boundary. An explicit desktop selection overrides
+guest defaults, including when continuing an existing thread. Auto mode uses
+the Linux workspace sandbox and may fail to initialize on guests without
+working bubblewrap/user-namespace support. Changing authentication or unlocking
+the keyring does not change a thread's permissions.
+
+Image provisioning and agent bootstrap install `/etc/codex/config.toml` when
+that file does not already exist, in both authentication modes:
+
+```toml
+approval_policy = "never"
+default_permissions = ":danger-full-access"
+```
+
+These are system defaults for Codex 0.154.0, below user/project configuration
+and explicit thread selections. Existing system configuration is preserved.
+After upgrading an existing VM, restart it with agent bootstrap enabled to
+install the defaults, then reconnect the desktop. `--no-agents` skips this
+installation on existing images. The defaults do not disable separate app/MCP
+approval policies or organization requirements.
+
+To restore workspace sandboxing and on-request approval prompts for a single
+session, pass `--ask`. coop explicitly overrides the unrestricted guest defaults:
 
 ```bash
 coop codex --ask

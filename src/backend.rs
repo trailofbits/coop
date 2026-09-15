@@ -1635,6 +1635,12 @@ fn bootstrap_codex(
 ) -> Result<()> {
     let mut model_state = ModelState::load_or_default(inst)?;
     ensure_codex_remote_auth_consistent(cfg, inst, &model_state)?;
+    // Refresh existing images too, including API-key guests without copied
+    // Codex config. This system layer leaves explicit user choices intact.
+    session.target.exec_with_stdin(
+        RemoteCommand::new().literal("sudo sh -s"),
+        crate::guest::SCRIPT_CODEX_PERMISSIONS.as_bytes().to_vec(),
+    )?;
     // Proxy mode (issue #411): in remote mode with `[proxy.openai]` (or a
     // per-VM override) configured, start the host-side injecting proxy and
     // point Codex at it. The guest holds only the capability token; the real

@@ -62,6 +62,13 @@ CI). Shared guest readiness and storage decisions run with:
 /usr/bin/python3 tests/test-codex-keyring.py
 ```
 
+Run `python3 tests/test-codex-permissions.py` for system-default installation
+and preservation tests. In a provisioned Linux guest, set
+`COOP_TEST_CODEX=/usr/local/bin/codex` to also test the real app-server's system
+defaults, user overrides, terminal `--ask` settings, desktop thread selections,
+and unrestricted command execution. The real test uses temporary Codex homes
+without account credentials; it requires the installed system defaults.
+
 The production helper's PAM, systemd, native server recovery and fresh SSH
 connections are exercised on Linux with a disposable user:
 
