@@ -233,6 +233,9 @@ pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 
+/// Low-priority VM defaults shared by terminal and desktop Codex sessions.
+pub const SCRIPT_CODEX_PERMISSIONS: &str = include_str!("../scripts/guest/codex-permissions.sh");
+
 pub const SCRIPT_CODEX_KEYRING_MIGRATE: &str =
     include_str!("../scripts/guest/codex-keyring-migrate.sh");
 

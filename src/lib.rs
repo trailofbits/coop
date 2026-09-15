@@ -385,7 +385,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Keep Codex's sandbox and approval prompts instead of bypassing them
+        /// Restore workspace sandboxing and on-request approvals (caller arguments override)
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `codex`

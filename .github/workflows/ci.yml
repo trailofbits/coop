@@ -59,6 +59,9 @@ jobs:
       - name: Codex account wrapper regression tests
         run: python3 tests/test-codex-account.py
 
+      - name: Codex permission defaults regression tests
+        run: python3 tests/test-codex-permissions.py
+
       - name: Codex shared keyring readiness tests
         run: /usr/bin/python3 tests/test-codex-keyring.py
 
