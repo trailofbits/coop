@@ -352,7 +352,7 @@ pub const BUILTIN_PROFILES: &[BuiltinProfile] = &[
         apt_packages: &["clang", "llvm", "gdb", "valgrind", "cmake"],
         pre_install: None,
         post_install: None,
-        marketplaces: &[],
+        marketplaces: &["https://github.com/anthropics/claude-plugins-official"],
         plugins: &["clangd-lsp@claude-plugins-official"],
     },
     BuiltinProfile {
@@ -368,7 +368,7 @@ pub const BUILTIN_PROFILES: &[BuiltinProfile] = &[
         apt_packages: &[],
         pre_install: None,
         post_install: Some(include_str!("../scripts/guest/profiles/rust-post.sh")),
-        marketplaces: &[],
+        marketplaces: &["https://github.com/anthropics/claude-plugins-official"],
         plugins: &["rust-analyzer-lsp@claude-plugins-official"],
     },
     BuiltinProfile {
