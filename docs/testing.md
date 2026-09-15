@@ -54,6 +54,22 @@ Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
 
+Run `python3 tests/test-codex-account.py` for the account wrapper's argument,
+login/logout, API-key passthrough, and `codex-yolo` regressions (also in Linux
+CI). To additionally test implicit daemon reuse with a real Linux Codex binary:
+
+```bash
+COOP_TEST_CODEX="$(command -v codex)" python3 tests/test-codex-account.py
+```
+
+This requires `dbus-run-session`, `gnome-keyring-daemon`, `secret-tool`, and
+`strace`. It uses temporary homes and disposable keyring passwords, starts a
+real app-server on a separate unusable keyring session, and observes terminal
+socket connections. It checks that sign-in is reached without reusing that
+server and that removing the wrapper override restores reuse. No account login
+or real tokens are needed. Run it when upgrading Codex: daemon selection is
+version-dependent. This opt-in test does not replace either VM backend gate.
+
 The full Codex update tests install native release `0.153.0` before running
 `codex update` as the guest user, and require the installed version to change.
 They compare the actual `config.toml` contents across host updates, self-updates,
