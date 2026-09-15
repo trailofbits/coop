@@ -48,7 +48,7 @@ shortcut.
 
 The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 
-- **A live instance:** run `codex update` inside the VM, or `coop agent update [--claude] [--codex] [--grok]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update in the background.
+- **A live instance:** run `codex update` or `grok update` inside the VM, or `coop agent update [--claude] [--codex] [--grok]` from the host (see [`agent update`](commands.md#agent-update)). Claude Code and Grok Build also auto-update themselves in the background.
 - **The golden image:** `coop setup --rebuild` rebuilds the template from a fresh base, so every new instance ships the latest agents.
 
 ## Built-in profiles

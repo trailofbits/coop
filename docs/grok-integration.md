@@ -85,10 +85,11 @@ forwarded API key. That file comes from the host copy on boot, or from
 
 ### Config directory
 
-`config_dir` specifies a host directory from which coop copies an allowlist
-of entries (`AGENTS.md`, `auth.json`, `lsp.json`, `rules/`,
-`skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, `workflows/`) into
-`~/.grok/` in the guest.
+`config_dir` selects a host directory to overlay into the guest's `~/.grok/`
+on every agent bootstrap (`coop up` or `coop start`, without `--no-agents`).
+The default is `~/.grok`; a custom path supports `~` expansion. The copied
+entries are `AGENTS.md`, `auth.json`, `lsp.json`, `rules/`, `skills/`,
+`commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`.
 
 Guest `config.toml` is the merge base. Host `config.toml` keys are
 overlaid except `[plugins]`. coop then forces
@@ -117,9 +118,15 @@ A copied `auth.json` is set to owner-only (`0600`) on the guest.
 config_dir = "~/.grok"
 ```
 
-The default is `~/.grok`. Set to `false` to disable config file copying
-entirely. Project files under `/workspace` (`AGENTS.md`, `.grok/`) are
-already in the workspace and do not need to be copied.
+Files follow an overlay lifecycle: restart overwrites files still present on
+the host, but host deletions do not delete previous guest copies.
+`config_dir = false` stops copying and retains previous copies, including
+guest `[plugins]`. A missing default source likewise retains previous
+copies; custom paths must exist at config validation time. To remove
+retained content, remove it in the guest or recreate the VM.
+
+Project files under `/workspace` (`AGENTS.md`, `.grok/`) are already in the
+workspace and do not need to be copied.
 
 ### Environment variable forwarding
 
@@ -168,10 +175,9 @@ When `coop up` creates/restarts a project VM or `coop start` restarts a
 stopped VM (without `--no-agents`), coop executes the following steps after
 the VM boots and SSH becomes available:
 
-1. **User content**: Copy the allowlisted entries from `config_dir` to
-   `~/.grok/` in the guest, including `auth.json` and `plugins/` when
-   present. Host `config.toml` is merged in the next step, not copied
-   over the guest file.
+1. **User content**: Overlay the allowlisted entries from `config_dir`
+   into `~/.grok/` in the guest, including `auth.json` and `plugins/`
+   when present. Host `config.toml` is merged in the next step.
 2. **Managed settings**: Overlay host `config.toml` keys onto the guest
    `~/.grok/config.toml` (except `[plugins]`), set
    `ui.permission_mode = "always-approve"`, and merge configured MCP
@@ -180,8 +186,9 @@ the VM boots and SSH becomes available:
 4. **Marketplaces & plugins** (first boot only): Install the configured
    `marketplaces`/`plugins` not already baked into the golden image.
 
-On restart, the same config files are refreshed so host-side updates are
-reflected in the guest; marketplaces and plugins are not reinstalled.
+On restart, allowlisted files still present on the host are overlaid again
+so host-side updates reach the guest. Guest-only files stay in place.
+Marketplaces and plugins are not reinstalled.
 
 ### Skipping bootstrap
 
@@ -196,11 +203,11 @@ Grok Build CLI because it is baked into the image during `coop setup`.
 ## Updating Grok Build
 
 Grok Build auto-updates in the background by default. To force an update
-immediately:
+immediately, run `grok update` inside the VM, or from the host:
 
 ```bash
 coop agent update --grok
 ```
 
-This runs `grok update` synchronously inside the guest as the guest user.
-See [`agent update`](commands.md#agent-update).
+`coop agent update --grok` runs `grok update` synchronously as the guest
+user. See [`agent update`](commands.md#agent-update).
