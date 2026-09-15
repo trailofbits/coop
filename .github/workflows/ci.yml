@@ -56,6 +56,9 @@ jobs:
       - name: Integration probe regression tests
         run: python3 tests/test-integration-probes.py
 
+      - name: Codex account wrapper regression tests
+        run: python3 tests/test-codex-account.py
+
       - name: Integration test — proxy reverse forwarding
         run: ./tests/integration-proxy-forward.sh
 
