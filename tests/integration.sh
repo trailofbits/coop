@@ -1195,6 +1195,18 @@ test_codex_bin_path() {
 
     check_native_codex
 
+    # Empty temporary Codex homes exercise the provisioned system defaults,
+    # explicit --ask settings and desktop thread overrides without OAuth.
+    local permissions_probe
+    permissions_probe=$(cat "$(dirname "$0")/test-codex-permissions.py")
+    if guest_exec env COOP_TEST_CODEX=/usr/local/bin/codex \
+        python3 -c "$permissions_probe" ServerTests; then
+        pass "Codex system permissions and explicit overrides work through app-server"
+    else
+        fail "Codex system permissions and explicit overrides work through app-server" \
+            "stderr: $(guest_stderr)"
+    fi
+
     if coop_exec /usr/local/bin/codex --version >/dev/null; then
         pass "codex binary invocable via full path"
     else
