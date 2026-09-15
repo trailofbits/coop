@@ -10,31 +10,55 @@ coop codex [instance-name] [-- extra-args...]
 
 This SSHes into the guest and runs the `codex` CLI. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with how `coop claude` runs unrestricted. The VM is the isolation boundary, so Codex's own sandbox is redundant; it also does not work in the guest, which lacks a functioning bubblewrap, so leaving it enabled makes every shell command Codex runs fail.
 
-When `[codex] auth = "chatgpt"` is enabled, `coop codex` launches a small
-guest wrapper (`/usr/local/bin/codex-account`) that starts a D-Bus session,
-unlocks GNOME Keyring, and then runs the real Codex binary. In keyring mode
-each launch gets a fresh private D-Bus session, so the wrapper asks for the
-guest keyring password every time before Codex starts.
+With `[codex] auth = "chatgpt"`, the guest wrapper (`codex-account`) verifies
+and unlocks the guest user's shared GNOME Keyring service before launching
+Codex. The systemd user bus and keyring survive closing the terminal; a VM
+restart locks the keyring again. Nested launches reuse the unlocked service.
 
-The wrapper also supplies `-c 'cli_auth_credentials_store="keyring"'`.
-In Codex 0.153.0 and 0.154.0, this override prevents implicit reuse of a desktop
-app-server whose D-Bus session may have an unusable keyring. Terminal sign-in
-then uses the session unlocked by the wrapper, including through `codex-yolo`.
-Caller arguments follow this default and retain their precedence; explicitly
-selecting a remote app-server still selects that server and its auth session.
-API-key mode remains a passthrough. This daemon-selection behavior is
-version-dependent and should be rechecked when updating Codex.
+The wrapper supplies `-c 'cli_auth_credentials_store="keyring"'` to keep the
+terminal app-server independent of the desktop app-server (#481). Both read
+one guest credential store. Caller arguments retain their precedence,
+including an explicitly selected remote app-server. API-key mode passes through.
 
-The in-guest `codex-yolo` shortcut routes through the same wrapper, so it works
-in either auth mode. Running the bare `codex` binary from `coop shell` does
-not: it has no D-Bus session, and `keyring` credential storage has no
-`auth.json` fallback, so Codex will not find its credentials. Inside the guest,
-run `codex-account` (or `codex-yolo`) instead of `codex`. The wrapper is a
-transparent passthrough unless the guest `~/.codex/config.toml` asks for
-keyring storage, so it is safe to use in either mode. It gates on the guest
-file rather than on coop's `auth` setting, which is what keeps `codex-yolo`
-working from inside the guest; coop keeps that file in step when you switch
-modes, rewriting it on the next `coop start` to drop the keyring setting.
+Use `codex-account` or `codex-yolo` inside the guest for automatic readiness
+checks. After unlock, ordinary SSH sessions can also run bare `codex` against
+the standard user bus. The wrapper gates on the managed guest configuration;
+coop updates that configuration when you change authentication modes and start
+the VM again.
+
+### Desktop over SSH
+
+Desktop authentication is implemented for validation with GNOME Keyring 46.1
+and native Codex 0.154.0. Actual desktop UI connection and real-account OAuth
+validation remain release gates; see the [implementation record](design/issue-480-desktop-auth-implementation.md).
+
+```bash
+coop ssh-config my-project
+ssh coop-my-project codex --version
+coop codex-unlock my-project
+```
+
+Then enable the SSH host in the desktop app's Settings → Connections, select
+`/workspace`, and complete Codex login inside the guest. Desktop sign-in, SSH
+access, the keyring password and guest account login are separate steps. Close
+the unlock terminal and reconnect to verify that credentials remain available.
+
+On an existing VM, the first `codex-unlock` installs shared service support in
+place. Stop and start that VM before running unlock again. This retires old
+private keyring daemons and updaters together. Installation preserves the Codex
+home and encrypted credentials. Multiple running keyring daemons must be
+resolved before migration so their cached credential histories are not silently
+selected at reboot. Conflicting keyring files, unsupported formats
+and plaintext stores require explicit migration; coop never selects a history
+or replaces them automatically. Back up the files inside the guest before
+resolving conflicts or reauthenticating.
+
+After a keyring crash or locked-to-unlocked transition, rerun `codex-unlock`
+and reconnect the desktop. Recovery retires the desktop server through Codex's
+native `daemon stop`; the desktop owns its next startup and updater. Closing or
+locking the keyring cannot erase credentials already cached in running clients.
+Concurrent OAuth refresh and logout across clients require real-account testing.
+Desktop SSH does not use coop's API-key/proxy secret forwarding.
 
 To keep Codex's sandbox and approval prompts for a single session, pass `--ask`. coop then launches `codex` with no bypass flag, so Codex applies its normal defaults:
 
@@ -120,14 +144,13 @@ agent session, so there is nothing to sandbox — and no `--ask` is needed.)
 A fresh VM has no keyring, so the first prompt is *choosing* a password, not
 entering one. The wrapper says so and asks for confirmation. That password
 encrypts the Codex account credentials at rest inside the guest and is
-requested again on later launches; it is unrelated to your ChatGPT or host
+requested again after a VM restart or keyring lock; it is unrelated to your ChatGPT or host
 credentials. Because it is per-guest, `coop destroy` discards it along with the
 cached login.
 
-The prompt needs a terminal. `coop codex` provides one. Anything that runs
-the wrapper without one — invoking `codex-account` yourself through
-`coop exec`, or a `post_start` script — fails with a clear message rather than
-hanging.
+Unlocking needs a terminal, supplied by `coop codex` and `coop codex-unlock`.
+Noninteractive launches work after successful unlock in the current service
+generation; otherwise they fail with guidance to run an interactive unlock.
 
 Security and billing guardrails in this mode:
 
@@ -150,28 +173,10 @@ own state in it — installed marketplaces and plugins, and the
 `[projects.*]` workspace-trust records — is read back and preserved across the
 rewrite, so you are not re-approving workspace trust after each restart.
 
-Images built before this support existed need a rebuild:
-
-```bash
-coop setup --rebuild
-```
-
-A rebuild only changes the golden image. An existing VM keeps its own guest
-disk across `coop stop` / `coop start`, so it will not pick up the new guest
-packages. Swap the rebuilt image in without losing the instance:
-
-```bash
-coop restore my-project --image default --reprovision
-```
-
-[`--reprovision`](commands.md#--reprovision) keeps the instance's name, index,
-IP, and workspace association, accepts a running instance, and leaves it
-running. It provisions the replaced disk as a first boot, so `/workspace` is
-restored and the agent plugins are reinstalled — a plain `restore` here would
-leave both empty, because the base image carries neither. Both reprovisioning
-and destroying/recreating replace the guest disk. Save
-guest-only work first (for example with `coop pull`); the replacement also
-discards any guest keyring and cached account login.
+For existing guests, use `coop codex-unlock <vm>` to install shared keyring
+support in place, then stop and start the VM. To include support in future
+VMs, rebuild the golden image with `coop setup --rebuild`. Rebuilding an image
+does not change an existing guest disk.
 
 ### GitHub auth
 

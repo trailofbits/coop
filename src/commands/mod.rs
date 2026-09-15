@@ -4,6 +4,8 @@
 //! re-exports the `pub(crate)` dispatch surface [`crate::run`] consumes
 //! and holds the cross-domain orchestration helpers the submodules share.
 
+mod codex;
+pub(crate) use codex::cmd_codex_unlock;
 mod admin;
 mod agent;
 mod devcontainer;
