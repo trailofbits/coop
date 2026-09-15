@@ -1493,6 +1493,7 @@ fn compose_provision_script(
     // Codex CLI (native per-user package with a system compatibility link)
     s.push_str(SCRIPT_CODEX);
     s.push('\n');
+    s.push_str(crate::guest::SCRIPT_CODEX_KEYRING);
     s.push_str(SCRIPT_CODEX_ACCOUNT);
     s.push('\n');
 

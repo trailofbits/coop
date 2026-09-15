@@ -1240,7 +1240,7 @@ test_codex_account_auth_support() {
     # The wrapper is written unconditionally by the provision script, so the
     # packages behind it are what actually need asserting.
     local tool
-    for tool in dbus-run-session gnome-keyring-daemon secret-tool; do
+    for tool in systemctl gnome-keyring-daemon secret-tool codex-keyring /usr/local/libexec/coop-codex-keyring-pam; do
         if guest_exec command -v "$tool"; then
             pass "guest Secret Service tool present: $tool"
         else
@@ -1279,14 +1279,8 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    # Select keyring mode explicitly in the scratch CODEX_HOME while retaining
-    # the isolated managed config. This is the only place the
-    # `cli_auth_credentials_store` check, the D-Bus re-exec, the tool guards and
-    # the TTY guard actually execute — the assertions above all run on the
-    # passthrough branch.
-    #
-    # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
-    # a password prompt. A hang here is the failure this asserts against.
+    # A scratch home selecting keyring mode must fail the managed-home policy
+    # instead of silently passing through to Codex and writing plaintext auth.
     if ! guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
         > "$1/config.toml"' sh "$account_probe_codex_home"; then
         fail "prepare codex-account keyring probe config" \
@@ -1302,10 +1296,10 @@ test_codex_account_auth_support() {
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
-    elif guest_stderr | grep -q "interactive TTY"; then
-        pass "codex-account enters keyring mode and refuses a non-TTY session"
+    elif guest_stderr | grep -q "managed ChatGPT keyring policy"; then
+        pass "codex-account enters keyring mode and refuses an unmanaged home"
     else
-        fail "codex-account enters keyring mode and refuses a non-TTY session" \
+        fail "codex-account enters keyring mode and refuses an unmanaged home" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -1403,7 +1397,7 @@ CFGEOF
         /usr/local/bin/codex-account --version </dev/null; then
         fail "chatgpt mode accepts an unset CODEX_HOME" \
             "expected the later non-TTY keyring refusal, but Codex ran"
-    elif guest_stderr | grep -q "interactive TTY"; then
+    elif guest_stderr | grep -q "run coop codex-unlock in an interactive terminal"; then
         pass "chatgpt mode accepts an unset CODEX_HOME"
     else
         fail "chatgpt mode accepts an unset CODEX_HOME" \
