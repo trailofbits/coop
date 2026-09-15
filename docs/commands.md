@@ -359,6 +359,26 @@ coop codex my-project -- --model gpt-5
 coop codex my-project -- login --device-auth
 ```
 
+### `codex-unlock`
+
+```text
+coop codex-unlock [NAME]
+```
+
+Unlock the guest's shared encrypted keyring for ChatGPT account authentication.
+Requires `[codex] auth = "chatgpt"` and a running VM with the managed guest
+configuration. First use confirms a nonempty password; later unlocks reuse the
+same store. The keyring stays unlocked after SSH logout and locks at VM restart.
+
+Existing guests receive support files and packages in place on the first call;
+stop and start the VM before retrying. Invalid, plaintext, unsupported or
+conflicting stores are preserved and refused. Successful recovery retires the
+native desktop server's cached authentication; reconnect the desktop afterward.
+See [desktop SSH setup](codex-integration.md#desktop-over-ssh) for validation
+status and the account login steps.
+
+`coop codex unlock` still launches Codex in a VM named `unlock`.
+
 ### `exec`
 
 Run a command in the VM and print its output. No PTY is allocated and stdin is not forwarded; use `shell` for interactive work.

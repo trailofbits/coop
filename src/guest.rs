@@ -120,7 +120,7 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
-/// Wrapper that runs Codex with a guest Linux Secret Service session.
+/// Wrapper that runs Codex against the shared guest Secret Service.
 pub fn codex_account_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex-account")
 }
@@ -170,7 +170,7 @@ impl From<GuestUser> for String {
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 11] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
@@ -179,8 +179,11 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 8] {
         codex_account_bin(),
         // The Secret Service stack `codex-account` drives. Checking the
         // wrapper alone proves nothing — the provision script always writes
-        // it — so verify the three tools its BASE_PACKAGES entries install.
-        GuestPath::new("/usr/bin/dbus-run-session"),
+        // it — so verify its interpreter, compiled helper, and service tools.
+        GuestPath::new("/usr/bin/systemctl"),
+        GuestPath::new("/usr/bin/python3"),
+        GuestPath::new("/usr/local/bin/codex-keyring"),
+        GuestPath::new("/usr/local/libexec/coop-codex-keyring-pam"),
         GuestPath::new("/usr/bin/gnome-keyring-daemon"),
         GuestPath::new("/usr/bin/secret-tool"),
     ]
@@ -230,6 +233,23 @@ pub const SCRIPT_CLAUDE_CODE: &str = include_str!("../scripts/guest/claude-code.
 pub const SCRIPT_CODEX: &str = include_str!("../scripts/guest/codex.sh");
 pub const SCRIPT_CODEX_ACCOUNT: &str = include_str!("../scripts/guest/codex-account.sh");
 
+pub const SCRIPT_CODEX_KEYRING_MIGRATE: &str =
+    include_str!("../scripts/guest/codex-keyring-migrate.sh");
+
+/// Shared headless authentication support, compiled inside either Linux guest.
+/// File installation does not start services; migration requires a guest reboot.
+pub const SCRIPT_CODEX_KEYRING: &str = concat!(
+    "(\nset -euo pipefail\nKEYRING_BUILD=$(mktemp -d)\n",
+    "trap 'rm -rf \"$KEYRING_BUILD\"' EXIT\n",
+    "cat >\"$KEYRING_BUILD/pam.c\" <<'COOPPAMEOF'\n",
+    include_str!("../scripts/guest/codex-keyring-pam.c"),
+    "COOPPAMEOF\ncat >\"$KEYRING_BUILD/keyring.py\" <<'COOPKEYRINGEOF'\n",
+    include_str!("../scripts/guest/codex-keyring.py"),
+    "COOPKEYRINGEOF\n",
+    include_str!("../scripts/guest/codex-keyring-setup.sh"),
+    ")\n",
+);
+
 /// Packages installed into every golden image.
 ///
 /// `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` back the
@@ -263,6 +283,11 @@ pub const BASE_PACKAGES: &[&str] = &[
     "zip",
     "file",
     "gnome-keyring",
+    "libpam-gnome-keyring",
+    "libpam0g-dev",
+    "libpam-systemd",
+    "python3",
+    "python3-dbus",
     "less",
     "libsecret-tools",
 ];
@@ -484,128 +509,8 @@ pub fn collect_codex_baked_lists(cfg: &CoopConfig) -> (Vec<String>, Vec<String>)
 mod tests {
     use super::*;
 
-    #[test]
-    fn codex_account_script_uses_secret_service() {
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("cat >/usr/local/bin/codex-account"),
-            "Codex account wrapper should be installed in the guest image",
-        );
-        for expected in [
-            // Anchored on the re-exec itself: a bare "dbus-run-session" also
-            // matches the `command -v` guard and its die message, so it would
-            // pass even with the re-exec deleted.
-            "exec dbus-run-session -- ",
-            "gnome-keyring-daemon --unlock",
-            "secret-tool store",
-            // The probe item must be removed again, not left in the keyring.
-            "secret-tool clear",
-        ] {
-            assert!(
-                SCRIPT_CODEX_ACCOUNT.contains(expected),
-                "Codex account wrapper is missing {expected:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn codex_account_script_unlocks_before_touching_the_bus() {
-        // `gnome-keyring-daemon --unlock` only creates and unlocks the login
-        // collection when it is the process that starts the daemon. Once any
-        // daemon owns `org.freedesktop.secrets` — including one the probe's
-        // `secret-tool` would D-Bus-activate — the unlock is handed to the
-        // graphical gcr-prompter, which cannot run on a headless guest, and
-        // ChatGPT auth fails on every invocation. So the unlock must be the
-        // first thing the main flow does.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("    unlock_keyring\n    probe_keyring \\"),
-            "on a bus this wrapper created, the unlock must precede the probe",
-        );
-        assert!(
-            !SCRIPT_CODEX_ACCOUNT.contains("gnome-keyring-daemon --start"),
-            "starting the daemon before the unlock is what breaks the unlock",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_reuses_an_inherited_unlocked_session() {
-        // A nested codex-account (an in-guest agent shelling out to
-        // `codex-account` / `codex-yolo`) inherits the bus and its unlocked
-        // keyring. Unlocking again there hits the very gcr-prompter trap the
-        // ordering above exists to avoid, so the nested call must probe and
-        // reuse rather than re-unlock — and the outer call must publish the
-        // marker that says so.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_UNLOCKED=1"),
-            "the unlocking call must mark the session as reusable",
-        );
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_UNLOCKED:-0}\" = \"1\""),
-            "a nested call must branch on the inherited-session marker",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_guards_against_dbus_reexec_recursion() {
-        // `exec dbus-run-session -- "$0"` re-runs this same script. Without the
-        // env guard around it that is an unbounded fork loop inside the guest,
-        // and no other test would notice.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("\"${COOP_CODEX_ACCOUNT_DBUS:-0}\" != \"1\""),
-            "the re-exec must be guarded, or it recurses forever",
-        );
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("export COOP_CODEX_ACCOUNT_DBUS=1"),
-            "the guard must be set before the re-exec, or it never takes effect",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_bounds_its_secret_service_calls() {
-        // A wedged Secret Service must fail the launch, not hang it. The
-        // tool-presence loop checks for `timeout`; these pin that it is
-        // actually used on both probe calls.
-        assert_eq!(
-            SCRIPT_CODEX_ACCOUNT
-                .matches("timeout 5 secret-tool")
-                .count(),
-            2,
-            "both probe secret-tool calls must be time-bounded",
-        );
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("timeout 30 gnome-keyring-daemon --unlock"),
-            "the unlock must be time-bounded too: it runs inside a command \
-             substitution, which waits for EOF rather than for exit",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_requires_a_tty_before_prompting() {
-        // Without this guard `read -rsp` blocks forever on a non-interactive
-        // session (agent bootstrap, `coop exec`), turning a clear failure into
-        // a hang.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("[ ! -t 0 ]"),
-            "the wrapper must refuse to prompt without a TTY",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_captures_probe_stderr() {
-        // The redirect order is load-bearing and easy to "correct" wrongly:
-        // `2>&1 >/dev/null` captures stderr because `2>&1` binds while stdout
-        // is still the substitution pipe. The tidier-looking `>/dev/null 2>&1`
-        // sends both to /dev/null, leaving PROBE_ERROR always empty and the
-        // die message back to guessing at the password.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("2>&1 >/dev/null"),
-            "the probe must capture secret-tool's stderr, not discard it",
-        );
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("${PROBE_ERROR:+"),
-            "the die message must report the captured cause when there is one",
-        );
-    }
-
+    // Runtime wrapper and singleton behavior is tested by the Python suites;
+    // avoid assertions that merely repeat the shell implementation.
     #[test]
     fn codex_account_script_guards_alternate_home_and_otherwise_passes_through() {
         // Every Codex entry point routes through the wrapper, so it must be a
@@ -632,21 +537,6 @@ mod tests {
                 "unset CODEX_HOME for Codex ChatGPT account auth\"\nfi\n\nif ! keyring_mode; then\n    exec \"$CODEX_BIN\" \"$@\""
             ),
             "wrapper should exec Codex directly when keyring mode is off",
-        );
-    }
-
-    #[test]
-    fn codex_account_script_confirms_a_newly_created_keyring_password() {
-        // A fresh guest has no keyring, so the prompt creates one; an
-        // unconfirmed typo would lock credentials behind an unreproducible
-        // password.
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("Confirm keyring password: "),
-            "wrapper should confirm the password when creating a keyring",
-        );
-        assert!(
-            SCRIPT_CODEX_ACCOUNT.contains("this VM has no guest keyring yet"),
-            "wrapper should explain that the first prompt chooses a password",
         );
     }
 
@@ -862,7 +752,9 @@ mod tests {
         // The wrapper is written unconditionally by the provision script, so
         // verifying it alone cannot catch the packages failing to install.
         for tool in [
-            "/usr/bin/dbus-run-session",
+            "/usr/bin/systemctl",
+            "/usr/local/bin/codex-keyring",
+            "/usr/local/libexec/coop-codex-keyring-pam",
             "/usr/bin/gnome-keyring-daemon",
             "/usr/bin/secret-tool",
         ] {
