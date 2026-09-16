@@ -62,6 +62,9 @@ jobs:
       - name: Codex permission defaults regression tests
         run: python3 tests/test-codex-permissions.py
 
+      - name: Codex SSH session provisioning regression tests
+        run: python3 tests/test-codex-session.py
+
       - name: Codex shared keyring readiness tests
         run: /usr/bin/python3 tests/test-codex-keyring.py
 

@@ -249,6 +249,7 @@ pub const SCRIPT_CODEX_KEYRING: &str = concat!(
     "COOPPAMEOF\ncat >\"$KEYRING_BUILD/keyring.py\" <<'COOPKEYRINGEOF'\n",
     include_str!("../scripts/guest/codex-keyring.py"),
     "COOPKEYRINGEOF\n",
+    include_str!("../scripts/guest/codex-session.sh"),
     include_str!("../scripts/guest/codex-keyring-setup.sh"),
     ")\n",
 );

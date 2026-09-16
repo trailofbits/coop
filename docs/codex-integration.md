@@ -53,6 +53,11 @@ and plaintext stores require explicit migration; coop never selects a history
 or replaces them automatically. Back up the files inside the guest before
 resolving conflicts or reauthenticating.
 
+`codex-unlock` also upgrades guests missing the SSH session support required
+by older Firecracker images, then requests the same stop/start cycle. See
+[Firecracker SSH user sessions](platform-notes.md#firecracker-ssh-user-sessions)
+for the PAM and persistent-linger details.
+
 After a keyring crash or locked-to-unlocked transition, rerun `codex-unlock`
 and reconnect the desktop. Recovery retires the desktop server through Codex's
 native `daemon stop`; the desktop owns its next startup and updater. Closing or

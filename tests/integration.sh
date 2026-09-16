@@ -1242,6 +1242,21 @@ test_codex_account_auth_support() {
     echo ""
     echo "=== Phase: codex account-auth (Secret Service) support ==="
 
+    # Earlier phases restarted the VM. This must work through fresh SSH using
+    # provisioned PAM/linger, without a manual loginctl or service-start repair.
+    if guest_exec sh -ec '
+        test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
+        test -f "/var/lib/systemd/linger/$(id -un)"
+        test -S "$XDG_RUNTIME_DIR/bus"
+        systemctl --user is-active --quiet gnome-keyring-daemon.service
+        busctl --user status org.freedesktop.secrets >/dev/null
+    '; then
+        pass "fresh SSH has a persistent user manager and shared Secret Service after reboot"
+    else
+        fail "fresh SSH has a persistent user manager and shared Secret Service after reboot" \
+            "stderr: $(guest_stderr)"
+    fi
+
     if guest_exec test -x /usr/local/bin/codex-account; then
         pass "codex-account wrapper exists"
     else
@@ -1401,6 +1416,35 @@ CFGEOF
             "stderr: $(guest_stderr)"
     fi
     chatgpt_exec rm -rf "$alternate_codex_home"
+
+    # Model each incomplete session-support state independently. The helper
+    # and old boot marker remain, so each prerequisite must trigger migration.
+    local session_file
+    for session_file in /etc/tmpfiles.d/coop-codex-keyring.conf /var/lib/coop/codex-session-v1; do
+        if chatgpt_exec sudo rm "$session_file"; then
+            if chatgpt codex-unlock "$INSTANCE" </dev/null; then
+                fail "codex-unlock upgrades existing keyring session support" "expected restart instruction"
+            elif [[ "$HARNESS_ERR" == *"Guest keyring support installed. Stop and start"* ]]; then
+                pass "codex-unlock upgrades existing keyring session support"
+            else
+                fail "codex-unlock upgrades existing keyring session support" "stderr: $HARNESS_ERR"
+            fi
+            if chatgpt_exec /usr/local/bin/codex-keyring </dev/null; then
+                fail "session upgrade requires reboot" "helper unexpectedly succeeded"
+            elif guest_stderr | grep -q "installed this boot; restart"; then
+                pass "session upgrade requires reboot"
+            else
+                fail "session upgrade requires reboot" "stderr: $(guest_stderr)"
+            fi
+            if chatgpt stop "$INSTANCE" && chatgpt start "$INSTANCE"; then
+                pass "restart after session-support upgrade"
+            else
+                fail "restart after session-support upgrade" "stderr: $HARNESS_ERR"
+            fi
+        else
+            fail "prepare existing keyring session upgrade" "stderr: $(guest_stderr)"
+        fi
+    done
 
     # Positive witness for the supported path: the CODEX_HOME guard must not
     # reject a normal ChatGPT launch. This non-TTY call should get past that
