@@ -336,11 +336,16 @@ Push local changes into a running VM:
 coop push
 ```
 
-Pull guest changes back to the host:
+Mirror guest changes back to the host, including deletions:
 
 ```
-coop pull
+coop pull --delete
 ```
+
+This can remove host-only files and Git branches, even with a clean working
+tree. To copy files additively while preserving host Git metadata, use
+`coop pull --exclude-git`. Ordinary additive pulls refuse to overlay an
+existing Git repository; see [workspace sync](workspaces.md#pulling-guest-to-host).
 
 Both commands default to the workspace path recorded by `coop up`. Override with `--dir`:
 
