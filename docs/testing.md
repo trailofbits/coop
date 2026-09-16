@@ -69,6 +69,12 @@ defaults, user overrides, terminal `--ask` settings, desktop thread selections,
 and unrestricted command execution. The real test uses temporary Codex homes
 without account credentials; it requires the installed system defaults.
 
+Run `python3 tests/test-codex-session.py` for SSH PAM preservation, idempotent
+session installation, and incomplete-upgrade detection. These tests use a
+temporary filesystem and never modify host PAM. The VM suite verifies the
+user bus and keyring after reboot, then independently removes each session
+support marker to exercise `codex-unlock` upgrades and their reboot barrier.
+
 The production helper's PAM, systemd, native server recovery and fresh SSH
 connections are exercised on Linux with a disposable user:
 

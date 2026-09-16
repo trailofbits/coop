@@ -25,6 +25,8 @@ pub(crate) fn cmd_codex_unlock(
     if !session.target.exec_ok(RemoteCommand::new().literal(
         "test -x /usr/local/bin/codex-keyring \
          && test -x /usr/local/libexec/coop-codex-keyring-pam \
+         && test -f /etc/tmpfiles.d/coop-codex-keyring.conf \
+         && test -f /var/lib/coop/codex-session-v1 \
          && test -f /var/lib/coop/codex-keyring-install-boot",
     )) {
         // All installer bytes are embedded trusted source. SSH user is a

@@ -69,3 +69,16 @@ network managed by systemd-networkd. Provisioning disables and masks the
 inherited service so it cannot install a second prefix and make another
 instance's IP a broadcast destination. Rebuild older images with `coop setup`
 to apply this guest-only fix; it does not change host networking or Lima.
+
+## Firecracker SSH user sessions
+
+The Firecracker base image mounts `/var/lib/systemd` as tmpfs and has a custom
+PAM session stack that can prevent package installation from enabling
+`pam_systemd`. Codex keyring provisioning installs a tmpfiles rule to recreate
+the guest user's linger marker at each boot. It adds an SSH `pam_systemd`
+session entry when neither SSH nor `common-session` already contains one,
+preserving the existing common PAM stack. This gives fresh SSH sessions the
+shared user bus and `XDG_RUNTIME_DIR` required by desktop authentication.
+Rebuild older images with `coop setup`. For existing ChatGPT-auth guests, run
+`coop codex-unlock` to install the missing session support, stop and start the
+VM, then rerun `coop codex-unlock`.

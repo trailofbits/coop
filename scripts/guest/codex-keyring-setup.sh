@@ -19,13 +19,14 @@ chmod 644 /etc/pam.d/coop-codex-keyring
 # Ubuntu's package enables a common-password hook. Coop uses only the dedicated
 # service above; explicitly remove that global hook after package installation.
 DEBIAN_FRONTEND=noninteractive pam-auth-update --package --remove gnome-keyring
-# Offline-safe equivalent of enabling linger; works while building in a chroot.
-install -d -m 755 /var/lib/systemd/linger
-touch "/var/lib/systemd/linger/$GUEST_USER"
 systemctl --global add-wants default.target gnome-keyring-daemon.service
 systemctl --global enable gnome-keyring-daemon.socket
-# Never overwrite a migration barrier on repeated installs in the same boot.
-if [ ! -f /var/lib/coop/codex-keyring-install-boot ]; then
+# A session-support upgrade needs a fresh reboot barrier too. Ordinary repeated
+# installs preserve the barrier, so they cannot hide an outstanding restart.
+if [ ! -f /var/lib/coop/codex-keyring-install-boot ] || [ "$KEYRING_SESSION_UPGRADE" = 1 ]; then
     cat /proc/sys/kernel/random/boot_id >/var/lib/coop/codex-keyring-install-boot
 fi
 chmod 644 /var/lib/coop/codex-keyring-install-boot
+# Publish upgrade completion only after every installer step succeeded.
+touch /var/lib/coop/codex-session-v1
+chmod 644 /var/lib/coop/codex-session-v1
