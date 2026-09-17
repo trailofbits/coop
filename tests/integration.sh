@@ -4559,6 +4559,66 @@ test_builtin_profiles() {
     rm -rf "$prof_ws"
 }
 
+test_builtin_profile_plugins() {
+    echo ""
+    echo "=== Phase: built-in profile plugins ==="
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        skip "built-in profile plugins" \
+            "Firecracker does not yet install profile-provided Claude plugins"
+        return
+    fi
+
+    local img_name="c-rust-plugins-$$"
+    coop images --delete "$img_name" 2>/dev/null || true
+
+    if coop setup -y --image "$img_name" --profile c,rust; then
+        pass "setup fresh c,rust profile image exits 0"
+    else
+        fail "setup fresh c,rust profile image exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+
+    local inst_name="${INSTANCE}-profile-plugins"
+    local prof_ws="$tmpdir/${inst_name}-ws"
+    mkdir -p "$prof_ws"
+    if coop up "$prof_ws" --name "$inst_name" --image "$img_name" --no-devcontainer; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up with c,rust profile image exits 0"
+    else
+        fail "up with c,rust profile image exits 0" "stderr: $HARNESS_ERR"
+        coop images --delete "$img_name" 2>/dev/null || true
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+
+    local marketplaces
+    if marketplaces=$(guest_exec /home/ubuntu/.local/bin/claude plugin marketplace list --json) \
+        && python3 -c 'import json, sys; assert any(m.get("name") == "claude-plugins-official" for m in json.load(sys.stdin))' \
+            <<< "$marketplaces"; then
+        pass "official Claude plugin marketplace registered"
+    else
+        fail "official Claude plugin marketplace registered" \
+            "state: ${marketplaces:-<unavailable>} stderr: $(guest_stderr)"
+    fi
+
+    local plugins
+    if plugins=$(guest_exec /home/ubuntu/.local/bin/claude plugin list --json) \
+        && python3 -c 'import json, sys; ids = {p.get("id") for p in json.load(sys.stdin)}; assert {"clangd-lsp@claude-plugins-official", "rust-analyzer-lsp@claude-plugins-official"} <= ids' \
+            <<< "$plugins"; then
+        pass "built-in profile Claude plugins installed"
+    else
+        fail "built-in profile Claude plugins installed" \
+            "state: ${plugins:-<unavailable>} stderr: $(guest_stderr)"
+    fi
+
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    coop images --delete "$img_name" 2>/dev/null || true
+}
+
 # ── Host mount tests (--full only) ────────────────────────────
 #
 # Lima: virtiofs (live bidirectional sync)
@@ -6904,6 +6964,7 @@ main() {
         test_guest_user_alt
         test_custom_profiles
         test_builtin_profiles
+        test_builtin_profile_plugins
         test_post_start
         test_devcontainer_apply
         test_devcontainer_oci_feature
