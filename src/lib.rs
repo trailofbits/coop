@@ -491,10 +491,13 @@ enum Commands {
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
         #[arg(long)]
         dir: Option<String>,
-        /// Overwrite local changes without confirmation
+        /// Skip the local dirty check (does not bypass the Git overlay guard)
         #[arg(long)]
         force: bool,
-        /// Skip the `.git` directory in this transfer
+        /// Delete non-excluded destination paths absent from the guest (requires rsync)
+        #[arg(long)]
+        delete: bool,
+        /// Skip all `.git` entries in this transfer
         #[arg(long)]
         exclude_git: bool,
     },
@@ -1421,10 +1424,21 @@ pub fn run() -> Result<()> {
             name,
             dir,
             force,
+            delete,
             exclude_git,
         } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
-            workspace::pull(&running, dir.as_deref(), force, exclude_git)
+            workspace::pull(
+                &running,
+                dir.as_deref(),
+                force,
+                exclude_git,
+                if delete {
+                    workspace::PullMode::Mirror
+                } else {
+                    workspace::PullMode::Additive
+                },
+            )
         }
         Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_ref(), &command),
         Commands::Editor {
@@ -2250,6 +2264,26 @@ token = "test-pat"
         assert!(name.is_none());
         assert!(dir.is_none());
         assert!(!force);
+    }
+
+    #[test]
+    fn pull_delete_is_explicit_and_independent_of_force() {
+        for (args, expected_delete, expected_force) in [
+            (vec!["pull"], false, false),
+            (vec!["pull", "--force"], false, true),
+            (vec!["pull", "--delete"], true, false),
+            (
+                vec!["pull", "--delete", "--exclude-git", "--force"],
+                true,
+                true,
+            ),
+        ] {
+            let super::Commands::Pull { delete, force, .. } = parse(&args).command else {
+                panic!("expected Pull variant");
+            };
+            assert_eq!(delete, expected_delete);
+            assert_eq!(force, expected_force);
+        }
     }
 
     #[test]

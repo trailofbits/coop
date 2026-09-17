@@ -61,6 +61,13 @@ user launched it.
   descriptor. Other paths remain **host** paths: `MountGuard::simple` is a
   loop mount, not a chroot, so the traversal rule below still applies to the
   hostname and network-config writes. Those paths are not currently validated.
+  `pull --delete` explicitly authorizes removal of non-excluded host paths
+  absent from the guest, including host-only Git refs. It requires rsync and
+  does not fall back to tar. `--force` bypasses only the dirty check; additive
+  pulls cannot overwrite existing root Git metadata unless it is excluded.
+  Root gitfiles and symlinked `.git` entries require `--exclude-git`. These
+  preflight checks are compatibility guards, not protection against a guest
+  changing its files during transfer.
 - **Guest command output read by the host.** e.g. `check_guest_dirty` reads
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
