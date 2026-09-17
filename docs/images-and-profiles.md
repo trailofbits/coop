@@ -18,7 +18,7 @@ coop stores the result under `~/.coop/images/<name>/`. When creating an instance
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`
+**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `libpam-gnome-keyring`, `libpam0g-dev`, `libpam-systemd`, `python3`, `python3-dbus`, `less`, `libsecret-tools`
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
@@ -34,7 +34,8 @@ user's home directory. `~/.local/bin/codex` is the native launcher;
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages
-(`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) are installed in every
+(`dbus-user-session`, `gnome-keyring`, `libpam-gnome-keyring`,
+`libpam0g-dev`, `libpam-systemd`, `python3`, `python3-dbus`, `libsecret-tools`) are installed in every
 image, not gated on the `auth` setting: an image is built once and reused across
 configs, so gating them would let a later `auth = "chatgpt"` edit meet an image
 that cannot serve it. When that mode is not configured the wrapper simply execs

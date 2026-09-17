@@ -132,6 +132,7 @@ The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
 `devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
+`codex.rs` (shared guest keyring installation and `coop codex-unlock`),
 `admin.rs` (init/validate/uninstall),
 and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
