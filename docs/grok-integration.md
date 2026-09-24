@@ -135,7 +135,8 @@ the host to the guest via SSH `SendEnv`. These are forwarded on every SSH
 session, not just during bootstrap.
 
 `XAI_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms
-and do not need to appear here.
+and do not need to appear here. An active VM PAT assignment rejects
+`GITHUB_TOKEN` and `GH_TOKEN` in this list.
 
 ### MCP server registration
 
@@ -143,7 +144,8 @@ and do not need to appear here.
 definitions into the guest `~/.grok/config.toml` under `mcp_servers`.
 Stdio `env` values are host variable names in coop config; they are written
 as `${NAME}` so Grok expands them from the guest environment, and those
-host names are forwarded automatically.
+host names are forwarded automatically. An active VM PAT assignment
+rejects a mapping whose host name is `GITHUB_TOKEN` or `GH_TOKEN`.
 
 Definitions use the same schema as Claude and Codex integration.
 
