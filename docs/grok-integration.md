@@ -105,7 +105,9 @@ will not resolve in the guest.
 auto-trusted. Directory symlinks inside it (or `plugins/` itself as a
 link) are skipped so a host checkout cannot be followed into the guest.
 Hidden directories (`.git`, `.venv`, caches) and bare git repos (`*.git`)
-inside a copied tree stay on the host.
+inside a copied tree stay on the host. `.grok-plugin/` and
+`.claude-plugin/` are copied so a manifest that points at a custom
+component path still reaches the guest.
 `installed-plugins/` and `registry.json` are **not** copied: they record
 absolute host paths and local checkouts, so they are not portable from
 macOS to a Linux guest. Marketplace plugins belong in `[grok] plugins` so

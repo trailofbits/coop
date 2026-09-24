@@ -2148,8 +2148,13 @@ fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
 
     // `config.toml` is merged into the guest file by
     // `write_managed_grok_config`, not overwritten via scp.
-    let staged = stage_selected_files(&source_dir, GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS)
-        .context("Failed to stage Grok Build config files")?;
+    let staged = stage_selected_files(
+        &source_dir,
+        GROK_ALLOWED_FILES,
+        GROK_ALLOWED_DIRS,
+        TreeCopy::SkipHostTrees,
+    )
+    .context("Failed to stage Grok Build config files")?;
     copy_staged_to_guest(target, &staged, ".grok", "Grok Build")?;
     restrict_guest_grok_auth(target)
 }
@@ -2438,6 +2443,21 @@ fn copy_staged_to_guest(
     Ok(())
 }
 
+/// Guest-side `chmod -R u+w` of one previously copied allowlist directory
+/// so an overlay `scp` can replace matching files. Guest-only entries
+/// stay in place. A missing dest is a no-op; `scp_to_recursive` creates it.
+///
+/// `~/` stays in a literal so the guest shell expands the home directory.
+/// `.arg(name)` quotes only the directory basename. Passing the whole
+/// `~/.grok/skills` path through `.arg` quotes the tilde and the chmod
+/// becomes a no-op (`chmod ... -- '~/.grok/skills'`).
+fn make_guest_staged_dir_writable(guest_subdir: &str, name: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal(format!("chmod -R u+w -- ~/{guest_subdir}/"))
+        .arg(name)
+        .literal(" 2>/dev/null || true")
+}
+
 /// Only preferences with a companion in the copied customization contract.
 /// Unknown host settings never enter the guest snapshot.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -2695,21 +2715,6 @@ fn merge_claude_import_preferences(
         );
     }
     serde_json::to_string(root).context("Failed to serialize imported Claude preferences")
-}
-
-/// Guest-side `chmod -R u+w` of one previously copied allowlist directory
-/// so an overlay `scp` can replace matching files. Guest-only entries
-/// stay in place. A missing dest is a no-op; `scp_to_recursive` creates it.
-///
-/// `~/` stays in a literal so the guest shell expands the home directory.
-/// `.arg(name)` quotes only the directory basename. Passing the whole
-/// `~/.grok/skills` path through `.arg` quotes the tilde and the chmod
-/// becomes a no-op (`chmod ... -- '~/.grok/skills'`).
-fn make_guest_staged_dir_writable(guest_subdir: &str, name: &str) -> RemoteCommand {
-    RemoteCommand::new()
-        .literal(format!("chmod -R u+w -- ~/{guest_subdir}/"))
-        .arg(name)
-        .literal(" 2>/dev/null || true")
 }
 
 /// JSON body of the managed `~/.claude/settings.json` written to every guest.
@@ -3285,11 +3290,22 @@ fn resolve_config_source_dir(
 }
 
 /// Copy allowlisted entries from source into the target staging directory.
+/// How allowlisted directories are copied into staging.
+#[derive(Clone, Copy)]
+enum TreeCopy {
+    /// Follow directory symlinks and copy hidden trees (Claude, Codex).
+    Follow,
+    /// Skip directory symlinks, hidden directories other than plugin
+    /// manifests, and bare git repos (Grok).
+    SkipHostTrees,
+}
+
 fn stage_selected_files_into(
     source_dir: &Path,
     staging_dir: &Path,
     files: &[&str],
     dirs: &[&str],
+    tree: TreeCopy,
 ) -> Result<()> {
     for file_name in files {
         let src = source_dir.join(file_name);
@@ -3302,19 +3318,30 @@ fn stage_selected_files_into(
 
     for dir_name in dirs {
         let src = source_dir.join(dir_name);
-        let Ok(meta) = std::fs::symlink_metadata(&src) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            tracing::warn!(
-                "Skipping symlink {dir_name}/ (directory links are not copied into the guest)"
-            );
-            continue;
-        }
-        if meta.is_dir() {
-            copy_dir_recursive(&src, &staging_dir.join(dir_name))
-                .with_context(|| format!("Failed to stage {dir_name}/"))?;
-            tracing::debug!("Staged {dir_name}/");
+        match tree {
+            TreeCopy::SkipHostTrees => {
+                let Ok(meta) = std::fs::symlink_metadata(&src) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    tracing::warn!(
+                        "Skipping symlink {dir_name}/ (directory links are not copied into the guest)"
+                    );
+                    continue;
+                }
+                if meta.is_dir() {
+                    copy_dir_recursive(&src, &staging_dir.join(dir_name), tree)
+                        .with_context(|| format!("Failed to stage {dir_name}/"))?;
+                    tracing::debug!("Staged {dir_name}/");
+                }
+            }
+            TreeCopy::Follow => {
+                if src.is_dir() {
+                    copy_dir_recursive(&src, &staging_dir.join(dir_name), tree)
+                        .with_context(|| format!("Failed to stage {dir_name}/"))?;
+                    tracing::debug!("Staged {dir_name}/");
+                }
+            }
         }
     }
 
@@ -3327,9 +3354,10 @@ fn stage_selected_files(
     source_dir: &Path,
     files: &[&str],
     dirs: &[&str],
+    tree: TreeCopy,
 ) -> Result<tempfile::TempDir> {
     let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
-    stage_selected_files_into(source_dir, staging.path(), files, dirs)?;
+    stage_selected_files_into(source_dir, staging.path(), files, dirs, tree)?;
     Ok(staging)
 }
 
@@ -3349,7 +3377,12 @@ const CLAUDE_ALLOWED_DIRS: &[&str] = &[
 ];
 
 fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
-    stage_selected_files(source_dir, CLAUDE_ALLOWED_FILES, CLAUDE_ALLOWED_DIRS)
+    stage_selected_files(
+        source_dir,
+        CLAUDE_ALLOWED_FILES,
+        CLAUDE_ALLOWED_DIRS,
+        TreeCopy::Follow,
+    )
 }
 
 /// Allowlisted files copied verbatim from the host Codex config dir. In proxy
@@ -3423,8 +3456,14 @@ fn stage_codex_files(
 
     let mut config = match source_dir {
         Some(path) => {
-            stage_selected_files_into(path, staging.path(), &allowed_files, CODEX_ALLOWED_DIRS)
-                .context("Failed to stage Codex allowlisted files")?;
+            stage_selected_files_into(
+                path,
+                staging.path(),
+                &allowed_files,
+                CODEX_ALLOWED_DIRS,
+                TreeCopy::Follow,
+            )
+            .context("Failed to stage Codex allowlisted files")?;
 
             let config_path = path.join(CODEX_CONFIG_FILE);
             if config_path.is_file() {
@@ -3573,21 +3612,28 @@ fn resolve_mcp_header_secrets(
 
 /// Hidden directories (`.git`, `.venv`, caches) and bare git repos
 /// (`lkml-19.git`) are host-machine state, not guest config.
+/// `.grok-plugin` and `.claude-plugin` are plugin manifests and are copied.
 fn is_host_only_dir(name: &std::ffi::OsStr) -> bool {
     let Some(n) = name.to_str() else {
         return false;
     };
+    if n == ".grok-plugin" || n == ".claude-plugin" {
+        return false;
+    }
     n.starts_with('.')
         || std::path::Path::new(n)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
 }
 
-/// Recursively copy a directory tree. Directory symlinks are skipped so a
-/// host checkout linked into `plugins/` cannot be followed into the guest.
-/// Hidden directories and bare git repos are skipped so a host skill tree
-/// cannot drag venvs or lore object stores into the guest.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Recursively copy a directory tree.
+///
+/// [`TreeCopy::Follow`] materializes directory symlinks and hidden trees
+/// (Claude/Codex). [`TreeCopy::SkipHostTrees`] leaves those out so a Grok
+/// host skill tree cannot drag a checkout, venv, or lore object store into
+/// the guest. Plugin manifest directories (`.grok-plugin`,
+/// `.claude-plugin`) are still copied.
+fn copy_dir_recursive(src: &Path, dst: &Path, tree: TreeCopy) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
     for entry in
         std::fs::read_dir(src).with_context(|| format!("Failed to read {}", src.display()))?
@@ -3595,18 +3641,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry.context("Failed to read directory entry")?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        let meta = std::fs::symlink_metadata(&src_path)
-            .with_context(|| format!("Failed to stat {}", src_path.display()))?;
-        if meta.file_type().is_symlink() && std::fs::metadata(&src_path).is_ok_and(|m| m.is_dir()) {
-            tracing::warn!("Skipping directory symlink {}", src_path.display());
-            continue;
-        }
-        if meta.is_dir() {
-            if is_host_only_dir(&entry.file_name()) {
+        if matches!(tree, TreeCopy::SkipHostTrees) {
+            let meta = std::fs::symlink_metadata(&src_path)
+                .with_context(|| format!("Failed to stat {}", src_path.display()))?;
+            if meta.file_type().is_symlink()
+                && std::fs::metadata(&src_path).is_ok_and(|m| m.is_dir())
+            {
+                tracing::warn!("Skipping directory symlink {}", src_path.display());
+                continue;
+            }
+            if meta.is_dir() && is_host_only_dir(&entry.file_name()) {
                 tracing::debug!("Skipping host-only directory {}", src_path.display());
                 continue;
             }
-            copy_dir_recursive(&src_path, &dst_path)?;
+        }
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path, tree)?;
         } else {
             if dst_path.exists() {
                 let mut perms = std::fs::metadata(&dst_path)
@@ -4744,6 +4794,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             dst.path(),
             CLAUDE_ALLOWED_FILES,
             CLAUDE_ALLOWED_DIRS,
+            TreeCopy::Follow,
         )
         .unwrap();
         std::fs::remove_file(src.path().join("CLAUDE.md")).unwrap();
@@ -4753,6 +4804,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             dst.path(),
             CLAUDE_ALLOWED_FILES,
             CLAUDE_ALLOWED_DIRS,
+            TreeCopy::Follow,
         )
         .unwrap();
         assert_eq!(
@@ -4898,8 +4950,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::fs::create_dir(src.path().join("installed-plugins")).unwrap();
         std::fs::write(src.path().join("installed-plugins/registry.json"), "{}").unwrap();
 
-        let staging =
-            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
             "{\"access_token\":\"test\"}"
@@ -4927,8 +4984,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::fs::write(src.path().join("workflows/desk.rhai"), "let meta = #{}").unwrap();
         std::fs::write(src.path().join("lsp.json"), "{\"servers\":{}}").unwrap();
 
-        let staging =
-            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
         assert!(staging.path().join("hooks/session-start.json").is_file());
         assert!(staging.path().join("agents/review.md").is_file());
         assert!(staging.path().join("workflows/desk.rhai").is_file());
@@ -4949,8 +5011,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::os::unix::fs::symlink(checkout.path(), plugins.join("grok-nest")).unwrap();
         std::fs::write(plugins.join("SKILL.md"), "portable").unwrap();
 
-        let staging =
-            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
         assert!(staging.path().join("plugins/SKILL.md").is_file());
         assert!(
             !staging.path().join("plugins/grok-nest").exists(),
@@ -4965,8 +5032,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::fs::write(checkout.path().join("SKILL.md"), "from-link").unwrap();
         std::os::unix::fs::symlink(checkout.path(), src.path().join("plugins")).unwrap();
 
-        let staging =
-            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
         assert!(
             !staging.path().join("plugins").exists(),
             "a symlinked plugins/ directory must not be copied"
@@ -4985,8 +5057,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::fs::write(skill.join(".venv/bin/python"), "py").unwrap();
         std::fs::write(skill.join("SKILL.md"), "skill").unwrap();
 
-        let staging =
-            stage_selected_files(src.path(), GROK_ALLOWED_FILES, GROK_ALLOWED_DIRS).unwrap();
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(staging.path().join("skills/review/SKILL.md")).unwrap(),
             "skill"
@@ -5006,6 +5083,63 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             !staging.path().join("skills/review/.venv").exists(),
             ".venv must not be staged"
         );
+    }
+
+    #[test]
+    fn stage_grok_files_keeps_plugin_manifest_dirs() {
+        let src = tempfile::TempDir::new().unwrap();
+        let plugin = src.path().join("plugins/custom");
+        std::fs::create_dir_all(plugin.join(".grok-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".grok-plugin/plugin.json"),
+            r#"{"name":"custom","skills":"./custom-skills"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"custom","skills":"./custom-skills"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join("custom-skills")).unwrap();
+        std::fs::write(plugin.join("custom-skills/SKILL.md"), "from-manifest").unwrap();
+        std::fs::create_dir_all(plugin.join(".git")).unwrap();
+        std::fs::write(plugin.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(plugin.join(".venv/bin")).unwrap();
+        std::fs::write(plugin.join(".venv/bin/python"), "py").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                staging
+                    .path()
+                    .join("plugins/custom/.grok-plugin/plugin.json")
+            )
+            .unwrap(),
+            r#"{"name":"custom","skills":"./custom-skills"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                staging
+                    .path()
+                    .join("plugins/custom/.claude-plugin/plugin.json")
+            )
+            .unwrap(),
+            r#"{"name":"custom","skills":"./custom-skills"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("plugins/custom/custom-skills/SKILL.md"))
+                .unwrap(),
+            "from-manifest"
+        );
+        assert!(!staging.path().join("plugins/custom/.git").exists());
+        assert!(!staging.path().join("plugins/custom/.venv").exists());
     }
 
     #[test]
@@ -6069,7 +6203,7 @@ url = "https://example.com/m"
 
         let dst = tempfile::TempDir::new().unwrap();
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path().join("a").as_path(), &target).unwrap();
+        copy_dir_recursive(src.path().join("a").as_path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(
             std::fs::read_to_string(target.join("b/c.txt")).unwrap(),
             "nested"
@@ -6101,7 +6235,7 @@ url = "https://example.com/m"
 
         let dst = tempfile::TempDir::new().unwrap();
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path(), &target).unwrap();
+        copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
             std::fs::read_to_string(target.join("keep.txt")).unwrap(),
             "ok"
@@ -6123,11 +6257,11 @@ url = "https://example.com/m"
 
         let dst = tempfile::TempDir::new().unwrap();
         let target = dst.path().join("out");
-        copy_dir_recursive(src1.path(), &target).unwrap();
+        copy_dir_recursive(src1.path(), &target, TreeCopy::Follow).unwrap();
 
         let src2 = tempfile::TempDir::new().unwrap();
         std::fs::write(src2.path().join("pack"), b"v2").unwrap();
-        copy_dir_recursive(src2.path(), &target).unwrap();
+        copy_dir_recursive(src2.path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(std::fs::read(target.join("pack")).unwrap(), b"v2");
     }
 
@@ -6141,7 +6275,7 @@ url = "https://example.com/m"
 
         let dst = tempfile::TempDir::new().unwrap();
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path(), &target).unwrap();
+        copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
             std::fs::read_to_string(target.join("keep.txt")).unwrap(),
             "ok"
