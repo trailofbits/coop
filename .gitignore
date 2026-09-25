@@ -1,4 +1,6 @@
 /target
+/result
+/result-*
 *.ext4
 *.img
 vmlinux
