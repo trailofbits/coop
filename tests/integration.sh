@@ -3847,6 +3847,123 @@ test_git_repo() {
 
 # ── Workspace sync tests (--full only) ────────────────────────
 
+# Runs in the disposable copy-mode VM owned by test_workspace_sync.
+test_workspace_pull_mirror() {
+    local ws_instance="$1" pull_root pull_dir before after
+    pull_root=$(mktemp -d)
+    pull_dir="$pull_root/checkout"
+    if ! guest_exec sh -ec '
+        cd /workspace
+        git config user.name CI
+        git config user.email ci@test
+        git add .
+        git -c commit.gpgsign=false commit -qm "before mirror"
+        git branch removed-branch
+    '; then
+        fail "prepare mirror fixture" "$(guest_stderr)"
+        rm -rf "$pull_root"
+        return
+    fi
+    if ! coop pull "$ws_instance" --dir "$pull_dir"; then
+        fail "initial additive pull into fresh directory" "$HARNESS_ERR"
+        rm -rf "$pull_root"
+        return
+    fi
+    before=$(git -C "$pull_dir" rev-parse HEAD)
+    if ! guest_exec sh -ec '
+        cd /workspace
+        git rm hello.txt
+        printf "cache/\n.git/\n" > .gitignore
+        printf "*.local\n" > subdir/.gitignore
+        printf "new content\n" > incoming.txt
+        git add .gitignore subdir/.gitignore incoming.txt
+        git -c commit.gpgsign=false commit -qm "after mirror"
+        git branch -D removed-branch
+        git pack-refs --all
+        test ! -e .git/refs/heads/main
+    '; then
+        fail "pack guest refs and delete tracked file" "$(guest_stderr)"
+        rm -rf "$pull_root"
+        return
+    fi
+    after=$(guest_exec git -C /workspace rev-parse HEAD)
+    if coop pull "$ws_instance" --force --dir "$pull_dir"; then
+        fail "additive Git overlay refuses even with force" "pull unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"--delete"* && "$HARNESS_ERR" == *"--exclude-git"* ]] &&
+         [[ "$(git -C "$pull_dir" rev-parse HEAD)" == "$before" && ! -e "$pull_dir/incoming.txt" ]]; then
+        pass "additive Git overlay refuses before copying"
+    else
+        fail "additive Git overlay refuses before copying" "$HARNESS_ERR"
+    fi
+    if coop pull "$ws_instance" --exclude-git --dir "$pull_dir" &&
+       [[ "$(git -C "$pull_dir" rev-parse HEAD)" == "$before" && -f "$pull_dir/hello.txt" && -f "$pull_dir/incoming.txt" ]]; then
+        pass "additive exclude-git preserves refs and destination-only files"
+    else
+        fail "additive exclude-git preserves refs and destination-only files" "$HARNESS_ERR"
+    fi
+    # Remove the just-received ignore files so mirror must use incoming rules.
+    rm -f "$pull_dir/.gitignore" "$pull_dir/subdir/.gitignore"
+    mkdir -p "$pull_dir/cache" "$pull_dir/node_modules"
+    echo keep > "$pull_dir/cache/sentinel"
+    echo keep > "$pull_dir/node_modules/sentinel"
+    echo keep > "$pull_dir/subdir/keep.local"
+    if coop pull "$ws_instance" --delete --force --dir "$pull_dir" &&
+       [[ "$before" != "$after" && "$(git -C "$pull_dir" rev-parse HEAD)" == "$after" ]] &&
+       [[ ! -e "$pull_dir/hello.txt" && -f "$pull_dir/incoming.txt" ]] &&
+       [[ -z "$(git -C "$pull_dir" branch --list removed-branch)" ]] &&
+       [[ "$(git -C "$pull_dir" status --porcelain)" == "?? node_modules/" ]] &&
+       [[ -f "$pull_dir/cache/sentinel" && -f "$pull_dir/node_modules/sentinel" && -f "$pull_dir/subdir/keep.local" ]]; then
+        pass "mirror updates packed refs, removes deletions, and preserves exclusions"
+    else
+        fail "mirror updates packed refs, removes deletions, and preserves exclusions" "$HARNESS_ERR"
+    fi
+    git -C "$pull_dir" branch host-only
+    echo obsolete > "$pull_dir/obsolete"
+    if coop pull "$ws_instance" --delete --exclude-git --force --dir "$pull_dir" &&
+       [[ ! -e "$pull_dir/obsolete" ]] &&
+       [[ "$(git -C "$pull_dir" rev-parse host-only)" == "$after" ]]; then
+        pass "mirror exclude-git preserves host-only refs"
+    else
+        fail "mirror exclude-git preserves host-only refs" "$HARNESS_ERR"
+    fi
+
+    mkdir "$pull_root/bin"
+    printf '#!/bin/sh\nexit 127\n' > "$pull_root/bin/rsync"
+    chmod +x "$pull_root/bin/rsync"
+    if PATH="$pull_root/bin:$PATH" coop pull "$ws_instance" --delete --dir "$pull_root/no-host-rsync"; then
+        fail "mirror refuses unavailable host rsync" "pull unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"requires working rsync"* && ! -e "$pull_root/no-host-rsync" ]]; then
+        pass "mirror refuses unavailable host rsync before creating destination"
+    else
+        fail "mirror refuses unavailable host rsync before creating destination" "$HARNESS_ERR"
+    fi
+
+    # Hide rsync only inside this disposable VM; restore before further checks.
+    if guest_exec sudo sh -ec 'p=$(command -v rsync); test "$p" = /usr/bin/rsync; mv "$p" /usr/bin/rsync.coop-test'; then
+        echo unchanged > "$pull_dir/sentinel"
+        if coop pull "$ws_instance" --delete --force --dir "$pull_dir"; then
+            fail "mirror refuses unavailable guest rsync" "pull unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"requires working rsync"* && -f "$pull_dir/sentinel" ]] &&
+             [[ "$(git -C "$pull_dir" rev-parse host-only)" == "$after" ]]; then
+            pass "mirror refuses unavailable guest rsync before modifying destination"
+        else
+            fail "mirror refuses unavailable guest rsync before modifying destination" "$HARNESS_ERR"
+        fi
+        if coop pull "$ws_instance" --force --exclude-git --dir "$pull_root/tar-copy" &&
+           [[ -f "$pull_root/tar-copy/incoming.txt" && ! -e "$pull_root/tar-copy/.git" ]]; then
+            pass "additive tar fallback remains available"
+        else
+            fail "additive tar fallback remains available" "$HARNESS_ERR"
+        fi
+        if ! guest_exec sudo mv /usr/bin/rsync.coop-test /usr/bin/rsync; then
+            fail "restore guest rsync" "$(guest_stderr)"
+        fi
+    else
+        fail "hide guest rsync for fallback test" "$(guest_stderr)"
+    fi
+    rm -rf "$pull_root"
+}
+
 test_workspace_sync() {
     echo ""
     echo "=== Phase: workspace sync ==="
@@ -3954,6 +4071,8 @@ test_workspace_sync() {
     else
         fail "push exits 0" "exit code: $?"
     fi
+
+    test_workspace_pull_mirror "$ws_instance"
 
     unset GUEST_INSTANCE
 

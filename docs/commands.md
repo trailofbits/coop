@@ -623,13 +623,20 @@ coop pull [NAME] [FLAGS]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--dir <dir>` | Local directory to pull into (defaults to the workspace host path) |
-| `--force` | Overwrite local changes without confirmation |
-| `--exclude-git` | Skip the `.git/` directory in this transfer |
+| `--force` | Skip the local dirty check (does not enable deletion or bypass the Git overlay guard) |
+| `--delete` | Mirror the guest, removing non-excluded host-only paths; requires rsync on both ends |
+| `--exclude-git` | Preserve all host `.git` entries, including gitfiles and symlinks |
 
 ```
-coop pull
+coop pull --delete
 coop pull my-project --dir ./local-copy --force
 ```
+
+Additive pulls into an existing Git repository require `--exclude-git`; use
+`--delete` to include Git metadata safely with respect to stale refs. Mirror
+mode can remove host-only branches even when the working tree is clean.
+See [workspace sync](workspaces.md#pulling-guest-to-host) for exclusions,
+transport requirements, and worktree limitations.
 
 ### `editor`
 

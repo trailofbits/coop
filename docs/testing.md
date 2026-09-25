@@ -43,6 +43,12 @@ boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
 forwarding on an intervening invocation without the flag.
 
+The `--full` workspace phase exercises mirror pulls: packed refs, guest-deleted
+files and branches, incoming ignore rules, Git exclusions, additive-overlay
+refusal, and refusal to fall back to tar when mirror mode lacks rsync. Library
+workspace tests additionally use local Git and rsync, which must be on `PATH`.
+Run this phase on both Firecracker and Lima in copy mode.
+
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
