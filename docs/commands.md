@@ -492,7 +492,8 @@ With no agent flag, both agents are updated; passing both `--claude` and
 `coop agent update --codex` re-runs OpenAI's native installer as the guest
 user, including when migrating an older direct-binary installation. The full
 package stays in the user's home directory, with `/usr/local/bin/codex` linked
-to `~/.local/bin/codex`. The guest user can also run `codex update` directly
+to `~/.local/bin/codex` and `/usr/local/bin/codex-code-mode-host` linked to the
+same native release. The guest user can also run `codex update` directly
 without sudo. Claude Code already auto-updates in the background;
 `coop agent update --claude` runs `claude update` now, synchronously — a
 convenience rather than a fix.

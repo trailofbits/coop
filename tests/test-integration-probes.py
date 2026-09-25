@@ -28,19 +28,33 @@ def shell(script, **env):
 
 
 class ProbeTests(unittest.TestCase):
-    def test_codex_installer_checks_its_compatibility_link(self):
+    def test_codex_installer_requires_complete_pair(self):
         installer = (Path(__file__).parent.parent / "scripts/guest/codex.sh").read_text()
-        for download_status, install_status, launch_status in [
-            (0, 0, 0), (7, 0, 0), (0, 9, 0), (0, 0, 11),
+        for download_status, install_status, launch_status, host_status, cli_only_profile in [
+            (0, 0, 0, 0, False),
+            (7, 0, 0, 0, False),
+            (0, 9, 0, 0, False),
+            (0, 0, 11, 0, False),
+            (0, 0, 0, 1, False),
+            (0, 0, 0, 0, True),
         ]:
             with self.subTest(download=download_status, install=install_status,
-                              launch=launch_status), tempfile.TemporaryDirectory() as directory:
+                              launch=launch_status, host=host_status,
+                              cli_only_profile=cli_only_profile), \
+                    tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 native = root / "guest/.local/bin/codex"
+                native_host = root / "guest/.local/bin/codex-code-mode-host"
                 system_bin = root / "bin"
                 system_bin.mkdir()
+                if cli_only_profile:
+                    profile_cli = system_bin / "codex"
+                    profile_cli.write_text("#!/bin/sh\necho codex-cli 0.0.0\n")
+                    profile_cli.chmod(0o755)
                 binary = root / "codex"
                 binary.write_text('#!/bin/sh\necho codex-cli 1.2.3\nexit "$LAUNCH_STATUS"\n')
+                host = root / "codex-code-mode-host"
+                host.write_text("#!/bin/sh\nexit 0\n")
                 upstream = root / "install.sh"
                 upstream.write_text('''
                     set -eu
@@ -48,6 +62,11 @@ class ProbeTests(unittest.TestCase):
                     mkdir -p "$(dirname "$NATIVE_BIN")"
                     cp "$FIXTURE_BINARY" "$NATIVE_BIN"
                     chmod +x "$NATIVE_BIN"
+                    if test "$HOST_STATUS" = 0; then
+                        mkdir -p "$(dirname "$NATIVE_HOST")"
+                        cp "$FIXTURE_HOST" "$NATIVE_HOST"
+                        chmod +x "$NATIVE_HOST"
+                    fi
                 ''')
                 fragment = installer.replace("/home/${GUEST_USER}", str(root / "guest"))
                 fragment = fragment.replace("/usr/local/bin", str(system_bin))
@@ -62,20 +81,31 @@ class ProbeTests(unittest.TestCase):
                         bash -c "$4"
                     }
                     mv() { shift; command mv -f "$@"; }
-                ''' + fragment, GUEST_USER="ubuntu", COOP_FORCE_INSTALL="1",
+                ''' + fragment, GUEST_USER="ubuntu",
+                    COOP_FORCE_INSTALL="" if cli_only_profile else "1",
                     DOWNLOAD_STATUS=str(download_status), INSTALL_STATUS=str(install_status),
-                    LAUNCH_STATUS=str(launch_status), NATIVE_BIN=str(native),
-                    FIXTURE_BINARY=str(binary), UPSTREAM_INSTALLER=str(upstream))
+                    LAUNCH_STATUS=str(launch_status), HOST_STATUS=str(host_status),
+                    NATIVE_BIN=str(native), NATIVE_HOST=str(native_host),
+                    FIXTURE_BINARY=str(binary), FIXTURE_HOST=str(host),
+                    UPSTREAM_INSTALLER=str(upstream))
                 self.assertEqual(result.returncode == 0,
-                                 not (download_status or install_status or launch_status),
+                                 not (download_status or install_status or launch_status
+                                      or host_status),
                                  result.stdout + result.stderr)
                 link = system_bin / "codex"
-                if download_status or install_status:
+                host_link = system_bin / "codex-code-mode-host"
+                if download_status or install_status or host_status:
                     self.assertFalse(link.is_symlink())
+                    self.assertFalse(host_link.is_symlink())
                 else:
+                    self.assertTrue(native.is_file())
+                    self.assertTrue(native_host.is_file())
+                    self.assertTrue(link.is_symlink())
+                    self.assertTrue(host_link.is_symlink())
                     self.assertTrue(link.samefile(native))
-                    self.assertIn("codex-cli 1.2.3", result.stdout)
+                    self.assertTrue(host_link.samefile(native_host))
                 self.assertFalse(list(system_bin.glob("codex.new.*")))
+                self.assertFalse(list(system_bin.glob("codex-code-mode-host.new.*")))
 
     def test_codex_self_update_requires_a_version_change(self):
         for update_status, version_status, after, succeeds in [
