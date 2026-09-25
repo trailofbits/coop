@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- `coop stop` now removes a Firecracker instance's TAP after the VM exits and
+  returns an error if the Firecracker process survives `SIGKILL`.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4

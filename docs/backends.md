@@ -154,7 +154,7 @@ Both backends support the same CLI commands and guest capabilities:
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
 | `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
-| `coop stop` | `limactl stop` | API socket shutdown, SIGTERM, SIGKILL |
+| `coop stop` | `limactl stop` | API socket shutdown, SIGTERM/SIGKILL fallback, remove TAP |
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
