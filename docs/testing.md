@@ -57,8 +57,10 @@ skip of the routed guest-isolation probe, since it would mask the coop rule.
 The full Codex update tests install native release `0.153.0` before running
 `codex update` as the guest user, and require the installed version to change.
 They compare the actual `config.toml` contents across host updates, self-updates,
-and migration from a profile-provided system command. Package layout and
-completeness remain the native installer's responsibility.
+and migration from a profile-provided system command. The native installer owns
+package validation; coop additionally verifies that the CLI and Code Mode host
+are executable, exposed through stable system links, and resolve to the same
+native release.
 
 ## Host-only bridge isolation test
 
