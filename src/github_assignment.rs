@@ -77,12 +77,15 @@ pub fn active(cfg: &CoopConfig, inst: &Instance) -> Result<Option<Assignment>> {
     if let Some(assignment) = &assignment {
         assignment.validate(cfg)?;
         reject_overrides(cfg.guest_env.keys().map(AsRef::as_ref))?;
+        let grok_mcp_hosts = cfg.grok.stdio_env_host_names();
         reject_overrides(
             cfg.claude
                 .env_forward
                 .iter()
                 .chain(&cfg.codex.env_forward)
-                .map(AsRef::as_ref),
+                .chain(&cfg.grok.env_forward)
+                .map(AsRef::as_ref)
+                .chain(grok_mcp_hosts.iter().map(AsRef::as_ref)),
         )?;
         if let Some(state) = GuestEnvState::try_load(inst)? {
             reject_overrides(state.entries.keys().map(AsRef::as_ref))?;
@@ -95,7 +98,7 @@ pub fn reject_overrides<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
     for name in names {
         if matches!(name, "GITHUB_TOKEN" | "GH_TOKEN") {
             bail!(
-                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, and persisted guest_env.json (including --env/containerEnv), or unassign the PAT"
+                "VM PAT assignment conflicts with managed {name}; remove it from guest_env, env_forward, a Grok stdio MCP env mapping, and persisted guest_env.json (including --env/containerEnv), or unassign the PAT"
             );
         }
     }
@@ -337,5 +340,33 @@ mod tests {
             }
         }
         reject_overrides(["GH_TOKEN_OTHER", "OTHER_GITHUB_TOKEN", "NORMAL"]).unwrap();
+    }
+
+    #[test]
+    fn assignment_rejects_grok_token_forwarding() {
+        for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+            for source in 0..2 {
+                let (_tmp, mut cfg, inst) = fixture();
+                assign(&cfg, &inst);
+                let key = EnvVarName::new(name).unwrap();
+                if source == 0 {
+                    cfg.grok.env_forward.push(key);
+                } else {
+                    let mut env = std::collections::BTreeMap::new();
+                    env.insert(EnvVarName::new("TOKEN").unwrap(), key);
+                    cfg.grok.mcp_servers.insert(
+                        "tool".into(),
+                        crate::config::McpServerDef::Stdio {
+                            command: "npx".into(),
+                            args: vec![],
+                            env,
+                        },
+                    );
+                }
+                let err = session_token(&cfg, &inst, None).unwrap_err().to_string();
+                assert!(err.contains(name), "{err}");
+                assert!(!err.contains("not-printed"));
+            }
+        }
     }
 }

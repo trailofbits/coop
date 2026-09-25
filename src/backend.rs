@@ -4,7 +4,7 @@ use std::fs;
 use std::num::{NonZeroU8, NonZeroU16};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -49,7 +49,7 @@ pub enum LogMode {
 /// mutation of the process-global environment.
 ///
 /// The whole struct is secret-bearing by construction (entries are
-/// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, plus any
+/// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`, plus any
 /// user-configured `env_forward` values), so `Debug` redacts every
 /// value. Variable *names* are preserved because they are useful in
 /// diagnostics and are not themselves secret.
@@ -1376,6 +1376,7 @@ pub fn prepare_env_forwarding(
 ) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let codex = &cfg.codex;
+    let grok = &cfg.grok;
     let codex_account_auth = codex.auth.uses_chatgpt_account();
     let suppress_openai_key = suppress_openai_key || codex_account_auth;
     // Only ever read under `suppress_openai_key`, so there is no "not
@@ -1418,6 +1419,16 @@ pub fn prepare_env_forwarding(
         env.set("OPENAI_API_KEY", key);
     }
 
+    // XAI_API_KEY: prefer config, fall back to process env. Never written
+    // to guest disk — forwarded via SSH SendEnv on every session.
+    if let Some(key) = &grok.api_key {
+        let resolved = crate::config::resolve_cmd_value(key.expose())
+            .context("Failed to resolve grok.api_key")?;
+        env.set("XAI_API_KEY", resolved);
+    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+        env.set("XAI_API_KEY", key);
+    }
+
     // GITHUB_TOKEN: resolve via configured strategy
     if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
         env.set("GITHUB_TOKEN", token);
@@ -1444,8 +1455,17 @@ pub fn prepare_env_forwarding(
         }
     };
 
-    // User-specified env_forward vars from process environment
-    for name in claude.env_forward.iter().chain(codex.env_forward.iter()) {
+    // User-specified env_forward vars from process environment, plus
+    // host names referenced by Grok stdio MCP `env` mappings (those
+    // become `${NAME}` in the guest config and must exist there).
+    let grok_mcp_env_names = grok.stdio_env_host_names();
+    for name in claude
+        .env_forward
+        .iter()
+        .chain(codex.env_forward.iter())
+        .chain(grok.env_forward.iter())
+        .chain(grok_mcp_env_names.iter())
+    {
         if suppressed.contains(&name.as_str()) {
             let reason = suppression_reason(name.as_str());
             tracing::warn!("{reason}: ignoring env_forward entry '{name}'");
@@ -1513,6 +1533,7 @@ pub fn bootstrap_agents(
 
     bootstrap_claude(session, cfg, inst, mode, guest_host)?;
     bootstrap_codex(session, cfg, inst, mode, guest_host)?;
+    bootstrap_grok(session, cfg, inst, mode)?;
 
     Ok(())
 }
@@ -1764,6 +1785,60 @@ fn bootstrap_codex(
     result
 }
 
+/// Bootstrap Grok Build in the guest declaratively.
+///
+/// Copies allowlisted user content, writes managed permission settings and
+/// workspace folder trust, merges configured MCP servers into
+/// `~/.grok/config.toml`, and (on first boot) installs marketplaces/plugins
+/// not already baked into the golden image.
+fn bootstrap_grok(
+    session: &SshSession,
+    cfg: &CoopConfig,
+    inst: &crate::config::Instance,
+    mode: BootMode,
+) -> Result<()> {
+    let grok = &cfg.grok;
+    let grok_bin = persisted_guest_user(cfg, &inst.image).grok_bin();
+
+    if let BootMode::FirstBoot = mode {
+        let needs_grok_cli = !grok.marketplaces.is_empty()
+            || !grok.plugins.is_empty()
+            || !grok.mcp_servers.is_empty();
+
+        if needs_grok_cli
+            && !session
+                .target
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&grok_bin))
+        {
+            bail!(
+                "Grok Build CLI is not installed in the guest.\n\
+                 The golden image may have been built before the \
+                 installer was added, or the install failed silently.\n\
+                 Run `coop setup --rebuild` to rebuild the image."
+            );
+        }
+    }
+
+    copy_grok_config(&session.target, &grok.config_dir)?;
+    write_managed_grok_config(&session.target, &grok.config_dir, &grok.mcp_servers)?;
+    write_workspace_folder_trust(&session.target)?;
+
+    if let BootMode::FirstBoot = mode {
+        let (missing_marketplaces, missing_plugins) = compute_grok_plugin_delta(cfg, &inst.image);
+
+        if !missing_marketplaces.is_empty() {
+            install_grok_marketplaces(session, &grok_bin, &missing_marketplaces)?;
+        }
+
+        if !missing_plugins.is_empty() {
+            install_grok_plugins(session, &grok_bin, &missing_plugins)?;
+        }
+    }
+
+    tracing::info!("Grok Build bootstrap complete");
+    Ok(())
+}
+
 fn codex_missing_guest_cli_message() -> &'static str {
     "Codex CLI is not installed in the guest.\n\
      The golden image may have been built before Codex support \
@@ -1934,6 +2009,21 @@ fn compute_codex_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<Strin
     )
 }
 
+/// Compute which Grok Build marketplaces and plugins are missing from the
+/// golden image and need to be installed at start time.
+fn compute_grok_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String>, Vec<String>) {
+    let (baked_m, baked_p) = crate::setup::TemplateConfig::load_for(cfg, image)
+        .ok()
+        .map(|tc| (tc.grok_marketplaces, tc.grok_plugins))
+        .unwrap_or_default();
+    plugin_delta(
+        &cfg.grok.marketplaces,
+        &cfg.grok.plugins,
+        &baked_m,
+        &baked_p,
+    )
+}
+
 /// Resolve a GitHub token for the guest given the configured auth strategy
 /// and the resolved target repo (when known).
 ///
@@ -2051,6 +2141,259 @@ fn prepare_claude_config_import(
     Ok(Some(staged))
 }
 
+fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, ".grok", "grok.config_dir") else {
+        return Ok(());
+    };
+
+    // `config.toml` is merged into the guest file by
+    // `write_managed_grok_config`, not overwritten via scp.
+    let staged = stage_selected_files(
+        &source_dir,
+        GROK_ALLOWED_FILES,
+        GROK_ALLOWED_DIRS,
+        TreeCopy::SkipHostTrees,
+    )
+    .context("Failed to stage Grok Build config files")?;
+    copy_staged_to_guest(target, &staged, ".grok", "Grok Build")?;
+    restrict_guest_grok_auth(target)
+}
+
+/// Owner-only mode for a copied host `~/.grok/auth.json`. `scp` without `-p`
+/// creates the guest file with the remote umask (typically 0644).
+fn restrict_guest_grok_auth(target: &SshTarget) -> Result<()> {
+    if !target.exec_ok(RemoteCommand::new().literal("test -f ~/.grok/auth.json")) {
+        return Ok(());
+    }
+    target
+        .exec(RemoteCommand::new().literal("chmod 0600 ~/.grok/auth.json"))
+        .context("Failed to restrict guest ~/.grok/auth.json to owner-only")
+}
+
+const GROK_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json", "lsp.json"];
+const GROK_ALLOWED_DIRS: &[&str] = &[
+    "rules",
+    "skills",
+    "commands",
+    "plugins",
+    "hooks",
+    "agents",
+    "workflows",
+];
+
+/// Merge coop-owned keys into the guest `~/.grok/config.toml`.
+///
+/// Starts from the guest file. Host `config.toml` keys are overlaid
+/// except `[plugins]`. When both sides have a table at the same key,
+/// the tables are merged (host wins on a conflict); otherwise the host
+/// value replaces. `ui.permission_mode` is always set to always-approve
+/// so a bare `grok` from `coop shell` matches `coop grok`. Configured
+/// MCP servers replace the `mcp_servers` table. Guest `[plugins]`
+/// (especially `enabled`) is kept; a host `[plugins]` table is not
+/// imported (those names resolve through `installed-plugins/`, which is
+/// not copied). Other preserved keys are those already on the guest
+/// that the host does not name, plus host keys that are not `[plugins]`.
+/// A missing guest or host file is treated as empty; a read or parse
+/// failure is an error.
+fn write_managed_grok_config(
+    target: &SshTarget,
+    config_dir: &ConfigDir,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<()> {
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.grok"))?;
+
+    let existing = target
+        .capture("cat ~/.grok/config.toml 2>/dev/null || true")
+        .context("Failed to read guest ~/.grok/config.toml")?;
+    let host = read_host_grok_config_toml(config_dir)?;
+    let merged = merge_managed_grok_config(&existing, &host, mcp_servers)?;
+
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.grok/config.toml.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.grok/config.toml",
+            ),
+            merged.into_bytes(),
+        )
+        .context("Failed to write managed ~/.grok/config.toml")?;
+    Ok(())
+}
+
+/// Read the host `config.toml` that will be overlaid onto the guest file.
+/// Missing or disabled config is empty; a present but unreadable file is
+/// an error.
+fn read_host_grok_config_toml(config_dir: &ConfigDir) -> Result<String> {
+    let Some(source_dir) = resolve_config_source_dir(config_dir, ".grok", "grok.config_dir") else {
+        return Ok(String::new());
+    };
+    let path = source_dir.join("config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("Failed to read host {}", path.display())),
+    }
+}
+
+/// Merge managed Grok keys into a guest `config.toml`.
+///
+/// `existing` is the guest file. `host` is the host `config.toml` (empty
+/// when `config_dir` is disabled or the file is absent). Host keys are
+/// overlaid except `[plugins]`. When both values are tables, the tables
+/// are merged and the host wins on a conflict; otherwise the host value
+/// replaces. Guest `[plugins]` is kept. Managed `ui.permission_mode`
+/// and configured `mcp_servers` are applied last. Other preserved keys
+/// are those already on the guest that the host does not name, plus
+/// host keys that are not `[plugins]`.
+fn merge_managed_grok_config(
+    existing: &str,
+    host: &str,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<String> {
+    let mut root = if existing.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        existing
+            .parse::<toml::Table>()
+            .context("existing ~/.grok/config.toml is not valid TOML")?
+    };
+
+    if !host.trim().is_empty() {
+        let mut host_table = host
+            .parse::<toml::Table>()
+            .context("host ~/.grok/config.toml is not valid TOML")?;
+        if host_table.remove("plugins").is_some() {
+            tracing::warn!(
+                "Dropping [plugins] from host ~/.grok/config.toml; \
+                 those names resolve through installed-plugins/, which is not copied. \
+                 Put marketplace plugins in [grok] plugins"
+            );
+        }
+        overlay_toml_table(&mut root, host_table);
+    }
+
+    let ui = root
+        .entry("ui")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let ui_table = ui
+        .as_table_mut()
+        .context("`ui` in ~/.grok/config.toml is not a table")?;
+    ui_table.insert(
+        "permission_mode".to_string(),
+        toml::Value::String("always-approve".to_string()),
+    );
+
+    if !mcp_servers.is_empty() {
+        let resolved = resolve_mcp_header_secrets("Grok Build MCP server", mcp_servers)?;
+        if root.contains_key("mcp_servers") {
+            tracing::warn!(
+                "Replacing existing [mcp_servers] in ~/.grok/config.toml with servers from coop config"
+            );
+        }
+        root.insert("mcp_servers".to_string(), grok_mcp_servers_toml(&resolved)?);
+    }
+
+    toml::to_string(&root).context("Failed to serialize managed ~/.grok/config.toml")
+}
+
+/// Overlay `src` onto `dest`. Host wins on the same key. When both
+/// values are tables, merge the tables; otherwise replace.
+fn overlay_toml_table(dest: &mut toml::Table, src: toml::Table) {
+    for (key, src_val) in src {
+        match dest.get_mut(&key) {
+            Some(dest_val) => match (dest_val, src_val) {
+                (toml::Value::Table(dest_table), toml::Value::Table(src_table)) => {
+                    overlay_toml_table(dest_table, src_table);
+                }
+                (dest_val, src_val) => *dest_val = src_val,
+            },
+            None => {
+                dest.insert(key, src_val);
+            }
+        }
+    }
+}
+
+/// Grok expands MCP `env` values as `${NAME}` from the guest process
+/// environment. coop's `McpServerDef` stores the host variable *name*,
+/// so rewrite those values before they land in guest `config.toml`.
+fn grok_mcp_servers_toml(
+    servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<toml::Value> {
+    let mut value =
+        toml::Value::try_from(servers).context("Failed to serialize Grok Build MCP servers")?;
+    let Some(table) = value.as_table_mut() else {
+        return Ok(value);
+    };
+    let server_names: Vec<String> = table.keys().cloned().collect();
+    for server_name in server_names {
+        let Some(server) = table.get_mut(&server_name) else {
+            continue;
+        };
+        let Some(env) = server.get_mut("env").and_then(toml::Value::as_table_mut) else {
+            continue;
+        };
+        let env_keys: Vec<String> = env.keys().cloned().collect();
+        for env_key in env_keys {
+            let Some(val) = env.get(&env_key).and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let expanded = format!("${{{val}}}");
+            env.insert(env_key, toml::Value::String(expanded));
+        }
+    }
+    Ok(value)
+}
+
+/// Record `/workspace` as a trusted folder so project `.grok/` hooks,
+/// MCP servers, and permission rules load without a first-run prompt.
+fn write_workspace_folder_trust(target: &SshTarget) -> Result<()> {
+    target.exec(RemoteCommand::new().literal("mkdir -p ~/.grok"))?;
+
+    let existing = target
+        .capture("cat ~/.grok/trusted_folders.toml 2>/dev/null || true")
+        .context("Failed to read guest ~/.grok/trusted_folders.toml")?;
+    let merged = merge_workspace_folder_trust(&existing)?;
+
+    target
+        .exec_with_stdin(
+            RemoteCommand::new().literal(
+                "t=\"$(mktemp ~/.grok/trusted_folders.toml.XXXXXX)\" && \
+                 cat > \"$t\" && mv \"$t\" ~/.grok/trusted_folders.toml",
+            ),
+            merged.into_bytes(),
+        )
+        .context("Failed to write ~/.grok/trusted_folders.toml")?;
+    Ok(())
+}
+
+fn merge_workspace_folder_trust(existing: &str) -> Result<String> {
+    let mut root = if existing.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        existing
+            .parse::<toml::Table>()
+            .context("existing ~/.grok/trusted_folders.toml is not valid TOML")?
+    };
+
+    let folders = root
+        .entry("folders")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let folders_table = folders
+        .as_table_mut()
+        .context("`folders` in ~/.grok/trusted_folders.toml is not a table")?;
+    let mut workspace = toml::Table::new();
+    workspace.insert("trusted".to_string(), toml::Value::Boolean(true));
+    let decided_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    workspace.insert("decided_at".to_string(), toml::Value::Integer(decided_at));
+    folders_table.insert("/workspace".to_string(), toml::Value::Table(workspace));
+
+    toml::to_string(&root).context("Failed to serialize ~/.grok/trusted_folders.toml")
+}
+
 /// Copy every entry staged in `staged` into the guest's `~/<guest_subdir>/`,
 /// creating the directory first. Files go via `scp_to`, subdirectories via
 /// `scp_to_recursive`. An empty staging dir is a no-op (debug-logged).
@@ -2081,6 +2424,11 @@ fn copy_staged_to_guest(
         let path = entry.path();
         let local = HostPath::new(&path);
         if path.is_dir() {
+            // A previous boot may have copied read-only files. scp cannot
+            // overwrite those; make the dest writable, then overlay.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                target.exec(make_guest_staged_dir_writable(guest_subdir, name))?;
+            }
             target
                 .scp_to_recursive(&local, &guest_dir)
                 .with_context(|| format!("Failed to copy {} to guest", path.display()))?;
@@ -2093,6 +2441,21 @@ fn copy_staged_to_guest(
 
     tracing::info!("Copied {label} config into guest");
     Ok(())
+}
+
+/// Guest-side `chmod -R u+w` of one previously copied allowlist directory
+/// so an overlay `scp` can replace matching files. Guest-only entries
+/// stay in place. A missing dest is a no-op; `scp_to_recursive` creates it.
+///
+/// `~/` stays in a literal so the guest shell expands the home directory.
+/// `.arg(name)` quotes only the directory basename. Passing the whole
+/// `~/.grok/skills` path through `.arg` quotes the tilde and the chmod
+/// becomes a no-op (`chmod ... -- '~/.grok/skills'`).
+fn make_guest_staged_dir_writable(guest_subdir: &str, name: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal(format!("chmod -R u+w -- ~/{guest_subdir}/"))
+        .arg(name)
+        .literal(" 2>/dev/null || true")
 }
 
 /// Only preferences with a companion in the copied customization contract.
@@ -2927,11 +3290,22 @@ fn resolve_config_source_dir(
 }
 
 /// Copy allowlisted entries from source into the target staging directory.
+/// How allowlisted directories are copied into staging.
+#[derive(Clone, Copy)]
+enum TreeCopy {
+    /// Follow directory symlinks and copy hidden trees (Claude, Codex).
+    Follow,
+    /// Skip directory symlinks, hidden directories other than plugin
+    /// manifests, and bare git repos (Grok).
+    SkipHostTrees,
+}
+
 fn stage_selected_files_into(
     source_dir: &Path,
     staging_dir: &Path,
     files: &[&str],
     dirs: &[&str],
+    tree: TreeCopy,
 ) -> Result<()> {
     for file_name in files {
         let src = source_dir.join(file_name);
@@ -2944,10 +3318,30 @@ fn stage_selected_files_into(
 
     for dir_name in dirs {
         let src = source_dir.join(dir_name);
-        if src.is_dir() {
-            copy_dir_recursive(&src, &staging_dir.join(dir_name))
-                .with_context(|| format!("Failed to stage {dir_name}/"))?;
-            tracing::debug!("Staged {dir_name}/");
+        match tree {
+            TreeCopy::SkipHostTrees => {
+                let Ok(meta) = std::fs::symlink_metadata(&src) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    tracing::warn!(
+                        "Skipping symlink {dir_name}/ (directory links are not copied into the guest)"
+                    );
+                    continue;
+                }
+                if meta.is_dir() {
+                    copy_dir_recursive(&src, &staging_dir.join(dir_name), tree)
+                        .with_context(|| format!("Failed to stage {dir_name}/"))?;
+                    tracing::debug!("Staged {dir_name}/");
+                }
+            }
+            TreeCopy::Follow => {
+                if src.is_dir() {
+                    copy_dir_recursive(&src, &staging_dir.join(dir_name), tree)
+                        .with_context(|| format!("Failed to stage {dir_name}/"))?;
+                    tracing::debug!("Staged {dir_name}/");
+                }
+            }
         }
     }
 
@@ -2960,9 +3354,10 @@ fn stage_selected_files(
     source_dir: &Path,
     files: &[&str],
     dirs: &[&str],
+    tree: TreeCopy,
 ) -> Result<tempfile::TempDir> {
     let staging = tempfile::TempDir::new().context("Failed to create staging directory")?;
-    stage_selected_files_into(source_dir, staging.path(), files, dirs)?;
+    stage_selected_files_into(source_dir, staging.path(), files, dirs, tree)?;
     Ok(staging)
 }
 
@@ -2982,7 +3377,12 @@ const CLAUDE_ALLOWED_DIRS: &[&str] = &[
 ];
 
 fn stage_allowed_files(source_dir: &Path) -> Result<tempfile::TempDir> {
-    stage_selected_files(source_dir, CLAUDE_ALLOWED_FILES, CLAUDE_ALLOWED_DIRS)
+    stage_selected_files(
+        source_dir,
+        CLAUDE_ALLOWED_FILES,
+        CLAUDE_ALLOWED_DIRS,
+        TreeCopy::Follow,
+    )
 }
 
 /// Allowlisted files copied verbatim from the host Codex config dir. In proxy
@@ -3056,8 +3456,14 @@ fn stage_codex_files(
 
     let mut config = match source_dir {
         Some(path) => {
-            stage_selected_files_into(path, staging.path(), &allowed_files, CODEX_ALLOWED_DIRS)
-                .context("Failed to stage Codex allowlisted files")?;
+            stage_selected_files_into(
+                path,
+                staging.path(),
+                &allowed_files,
+                CODEX_ALLOWED_DIRS,
+                TreeCopy::Follow,
+            )
+            .context("Failed to stage Codex allowlisted files")?;
 
             let config_path = path.join(CODEX_CONFIG_FILE);
             if config_path.is_file() {
@@ -3188,17 +3594,46 @@ fn codex_bootstrap_needed(
 fn resolve_codex_mcp_servers(
     mcp_servers: &std::collections::HashMap<String, McpServerDef>,
 ) -> Result<std::collections::HashMap<String, McpServerDef>> {
+    resolve_mcp_header_secrets("Codex MCP server", mcp_servers)
+}
+
+fn resolve_mcp_header_secrets(
+    label: &str,
+    mcp_servers: &std::collections::HashMap<String, McpServerDef>,
+) -> Result<std::collections::HashMap<String, McpServerDef>> {
     let mut resolved = std::collections::HashMap::with_capacity(mcp_servers.len());
     for (name, def) in mcp_servers {
         let mut cloned = def.clone();
-        cloned.resolve_header_secrets("Codex MCP server", name)?;
+        cloned.resolve_header_secrets(label, name)?;
         resolved.insert(name.clone(), cloned);
     }
     Ok(resolved)
 }
 
+/// Hidden directories (`.git`, `.venv`, caches) and bare git repos
+/// (`lkml-19.git`) are host-machine state, not guest config.
+/// `.grok-plugin` and `.claude-plugin` are plugin manifests and are copied.
+fn is_host_only_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(n) = name.to_str() else {
+        return false;
+    };
+    if n == ".grok-plugin" || n == ".claude-plugin" {
+        return false;
+    }
+    n.starts_with('.')
+        || std::path::Path::new(n)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+}
+
 /// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+///
+/// [`TreeCopy::Follow`] materializes directory symlinks and hidden trees
+/// (Claude/Codex). [`TreeCopy::SkipHostTrees`] leaves those out so a Grok
+/// host skill tree cannot drag a checkout, venv, or lore object store into
+/// the guest. Plugin manifest directories (`.grok-plugin`,
+/// `.claude-plugin`) are still copied.
+fn copy_dir_recursive(src: &Path, dst: &Path, tree: TreeCopy) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
     for entry in
         std::fs::read_dir(src).with_context(|| format!("Failed to read {}", src.display()))?
@@ -3206,9 +3641,36 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry.context("Failed to read directory entry")?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        if matches!(tree, TreeCopy::SkipHostTrees) {
+            let meta = std::fs::symlink_metadata(&src_path)
+                .with_context(|| format!("Failed to stat {}", src_path.display()))?;
+            if meta.file_type().is_symlink()
+                && std::fs::metadata(&src_path).is_ok_and(|m| m.is_dir())
+            {
+                tracing::warn!("Skipping directory symlink {}", src_path.display());
+                continue;
+            }
+            if meta.is_dir() && is_host_only_dir(&entry.file_name()) {
+                tracing::debug!("Skipping host-only directory {}", src_path.display());
+                continue;
+            }
+        }
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive(&src_path, &dst_path, tree)?;
         } else {
+            if dst_path.exists() {
+                let mut perms = std::fs::metadata(&dst_path)
+                    .with_context(|| format!("Failed to stat {}", dst_path.display()))?
+                    .permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    perms.set_mode(perms.mode() | 0o200);
+                }
+                std::fs::set_permissions(&dst_path, perms).with_context(|| {
+                    format!("Failed to make {} owner-writable", dst_path.display())
+                })?;
+            }
             std::fs::copy(&src_path, &dst_path).with_context(|| {
                 format!(
                     "Failed to copy {} -> {}",
@@ -3230,9 +3692,9 @@ const GUEST_MARKETPLACE_DIR: &str = "~/.coop/marketplaces";
 /// shorthand is passed through unchanged. `made_dir` tracks whether the
 /// guest marketplace dir has been created yet so it is only `mkdir -p`'d
 /// once per install pass. Shared by the Claude and Codex marketplace
-/// installers; `tool` (`"claude"` / `"codex"`) namespaces the copy dir so two
-/// local marketplaces with the same directory basename — one per agent — do
-/// not overwrite each other in the guest.
+/// installers; `tool` (`"claude"` / `"codex"` / `"grok"`) namespaces the
+/// copy dir so two local marketplaces with the same directory basename —
+/// one per agent — do not overwrite each other in the guest.
 fn stage_marketplace_source(
     session: &SshSession,
     tool: &str,
@@ -3357,6 +3819,53 @@ pub(crate) fn install_codex_plugins(
         session
             .exec(cmd)
             .with_context(|| format!("Failed to install Codex plugin '{plugin}'"))?;
+    }
+    Ok(())
+}
+
+/// Register Grok Build marketplaces via `grok plugin marketplace add`.
+///
+/// Local directories are copied into the guest first, mirroring
+/// [`install_marketplaces`].
+pub(crate) fn install_grok_marketplaces(
+    session: &SshSession,
+    grok_bin: &GuestPath,
+    marketplaces: &[String],
+) -> Result<()> {
+    let mut made_dir = false;
+    for source in marketplaces {
+        let guest_source = stage_marketplace_source(session, "grok", source, &mut made_dir)?;
+        tracing::info!("Adding Grok Build marketplace: {guest_source}");
+        let cmd = RemoteCommand::new()
+            .arg(grok_bin)
+            .literal(" plugin marketplace add ")
+            .arg(&guest_source);
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to add Grok Build marketplace '{source}'"))?;
+    }
+    Ok(())
+}
+
+/// Install Grok Build plugins via `grok plugin install <source> --trust`.
+///
+/// `--trust` is required: without it Grok prints a warning and stops,
+/// which would fail first-boot bootstrap.
+pub(crate) fn install_grok_plugins(
+    session: &SshSession,
+    grok_bin: &GuestPath,
+    plugins: &[String],
+) -> Result<()> {
+    for plugin in plugins {
+        tracing::info!("Installing Grok Build plugin: {plugin}");
+        let cmd = RemoteCommand::new()
+            .arg(grok_bin)
+            .literal(" plugin install ")
+            .arg(plugin)
+            .literal(" --trust");
+        session
+            .exec(cmd)
+            .with_context(|| format!("Failed to install Grok Build plugin '{plugin}'"))?;
     }
     Ok(())
 }
@@ -3597,6 +4106,7 @@ fn gh_auth_token() -> Option<String> {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
@@ -4284,6 +4794,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             dst.path(),
             CLAUDE_ALLOWED_FILES,
             CLAUDE_ALLOWED_DIRS,
+            TreeCopy::Follow,
         )
         .unwrap();
         std::fs::remove_file(src.path().join("CLAUDE.md")).unwrap();
@@ -4293,6 +4804,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             dst.path(),
             CLAUDE_ALLOWED_FILES,
             CLAUDE_ALLOWED_DIRS,
+            TreeCopy::Follow,
         )
         .unwrap();
         assert_eq!(
@@ -4425,6 +4937,209 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         assert!(staging.path().join("CLAUDE.md").is_file());
         assert!(!staging.path().join("settings.json").exists());
         assert!(!staging.path().join("projects").exists());
+    }
+
+    #[test]
+    fn stage_grok_files_copies_auth_json() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
+        std::fs::write(src.path().join("AGENTS.md"), "rules").unwrap();
+        std::fs::write(src.path().join("config.toml"), "permission_mode = \"ask\"").unwrap();
+        std::fs::create_dir(src.path().join("plugins")).unwrap();
+        std::fs::write(src.path().join("plugins/SKILL.md"), "plugin").unwrap();
+        std::fs::create_dir(src.path().join("installed-plugins")).unwrap();
+        std::fs::write(src.path().join("installed-plugins/registry.json"), "{}").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
+            "{\"access_token\":\"test\"}"
+        );
+        assert!(staging.path().join("AGENTS.md").is_file());
+        assert!(
+            !staging.path().join("config.toml").exists(),
+            "config.toml is merged into the guest file, not staged for scp"
+        );
+        assert!(staging.path().join("plugins/SKILL.md").is_file());
+        assert!(
+            !staging.path().join("installed-plugins").exists(),
+            "installed-plugins is a host-path registry and must not be copied"
+        );
+    }
+
+    #[test]
+    fn stage_grok_files_copies_hooks_agents_workflows_and_lsp() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(src.path().join("hooks")).unwrap();
+        std::fs::write(src.path().join("hooks/session-start.json"), "{}").unwrap();
+        std::fs::create_dir(src.path().join("agents")).unwrap();
+        std::fs::write(src.path().join("agents/review.md"), "# review").unwrap();
+        std::fs::create_dir(src.path().join("workflows")).unwrap();
+        std::fs::write(src.path().join("workflows/desk.rhai"), "let meta = #{}").unwrap();
+        std::fs::write(src.path().join("lsp.json"), "{\"servers\":{}}").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert!(staging.path().join("hooks/session-start.json").is_file());
+        assert!(staging.path().join("agents/review.md").is_file());
+        assert!(staging.path().join("workflows/desk.rhai").is_file());
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("lsp.json")).unwrap(),
+            "{\"servers\":{}}"
+        );
+    }
+
+    #[test]
+    fn stage_grok_files_skips_directory_symlink() {
+        let src = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        std::fs::write(checkout.path().join("secret.txt"), "host-checkout").unwrap();
+
+        let plugins = src.path().join("plugins");
+        std::fs::create_dir(&plugins).unwrap();
+        std::os::unix::fs::symlink(checkout.path(), plugins.join("grok-nest")).unwrap();
+        std::fs::write(plugins.join("SKILL.md"), "portable").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert!(staging.path().join("plugins/SKILL.md").is_file());
+        assert!(
+            !staging.path().join("plugins/grok-nest").exists(),
+            "directory symlinks must not be followed into a host checkout"
+        );
+    }
+
+    #[test]
+    fn stage_grok_files_skips_symlinked_plugins_dir() {
+        let src = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        std::fs::write(checkout.path().join("SKILL.md"), "from-link").unwrap();
+        std::os::unix::fs::symlink(checkout.path(), src.path().join("plugins")).unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert!(
+            !staging.path().join("plugins").exists(),
+            "a symlinked plugins/ directory must not be copied"
+        );
+    }
+
+    #[test]
+    fn stage_grok_files_skips_host_only_dirs_under_skills() {
+        let src = tempfile::TempDir::new().unwrap();
+        let skill = src.path().join("skills/review");
+        std::fs::create_dir_all(skill.join(".git/objects")).unwrap();
+        std::fs::write(skill.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(skill.join("data/lore/lkml-19.git/objects")).unwrap();
+        std::fs::write(skill.join("data/lore/lkml-19.git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(skill.join(".venv/bin")).unwrap();
+        std::fs::write(skill.join(".venv/bin/python"), "py").unwrap();
+        std::fs::write(skill.join("SKILL.md"), "skill").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("skills/review/SKILL.md")).unwrap(),
+            "skill"
+        );
+        assert!(
+            !staging.path().join("skills/review/.git").exists(),
+            ".git must not be staged"
+        );
+        assert!(
+            !staging
+                .path()
+                .join("skills/review/data/lore/lkml-19.git")
+                .exists(),
+            "bare git repos must not be staged"
+        );
+        assert!(
+            !staging.path().join("skills/review/.venv").exists(),
+            ".venv must not be staged"
+        );
+    }
+
+    #[test]
+    fn stage_grok_files_keeps_plugin_manifest_dirs() {
+        let src = tempfile::TempDir::new().unwrap();
+        let plugin = src.path().join("plugins/custom");
+        std::fs::create_dir_all(plugin.join(".grok-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".grok-plugin/plugin.json"),
+            r#"{"name":"custom","skills":"./custom-skills"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"custom","skills":"./custom-skills"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join("custom-skills")).unwrap();
+        std::fs::write(plugin.join("custom-skills/SKILL.md"), "from-manifest").unwrap();
+        std::fs::create_dir_all(plugin.join(".git")).unwrap();
+        std::fs::write(plugin.join(".git/HEAD"), "ref").unwrap();
+        std::fs::create_dir_all(plugin.join(".venv/bin")).unwrap();
+        std::fs::write(plugin.join(".venv/bin/python"), "py").unwrap();
+
+        let staging = stage_selected_files(
+            src.path(),
+            GROK_ALLOWED_FILES,
+            GROK_ALLOWED_DIRS,
+            TreeCopy::SkipHostTrees,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                staging
+                    .path()
+                    .join("plugins/custom/.grok-plugin/plugin.json")
+            )
+            .unwrap(),
+            r#"{"name":"custom","skills":"./custom-skills"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                staging
+                    .path()
+                    .join("plugins/custom/.claude-plugin/plugin.json")
+            )
+            .unwrap(),
+            r#"{"name":"custom","skills":"./custom-skills"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(staging.path().join("plugins/custom/custom-skills/SKILL.md"))
+                .unwrap(),
+            "from-manifest"
+        );
+        assert!(!staging.path().join("plugins/custom/.git").exists());
+        assert!(!staging.path().join("plugins/custom/.venv").exists());
     }
 
     #[test]
@@ -5266,6 +5981,198 @@ url = "https://example.com/m"
     }
 
     #[test]
+    fn compute_grok_plugin_delta_returns_unbaked_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(tmp.path()),
+            ..CoopConfig::default()
+        };
+        cfg.grok.marketplaces = vec!["m-baked".into(), "m-new".into()];
+        cfg.grok.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
+        let image = ImageName::new("default").unwrap();
+
+        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        let json = r#"{
+            "version": 1,
+            "created": "2026-01-01T00:00:00Z",
+            "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "profiles": [],
+            "extra_packages": [],
+            "post_install_hash": null,
+            "grok_marketplaces": ["m-baked"],
+            "grok_plugins": ["p-baked@m"]
+        }"#;
+        std::fs::write(cfg.template_config_path_for(&image), json).unwrap();
+
+        let (missing_m, missing_p) = compute_grok_plugin_delta(&cfg, &image);
+        assert_eq!(missing_m, vec!["m-new".to_string()]);
+        assert_eq!(missing_p, vec!["p-new@m".to_string()]);
+    }
+
+    #[test]
+    fn merge_managed_grok_config_sets_permission_mode_and_preserves_other_keys() {
+        let existing = "[ui]\nvim_mode = true\n[models]\ndefault = \"grok-4.6\"\n";
+        let merged =
+            merge_managed_grok_config(existing, "", &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(
+            table["models"].as_table().unwrap()["default"].as_str(),
+            Some("grok-4.6")
+        );
+    }
+
+    #[test]
+    fn merge_managed_grok_config_keeps_guest_plugins_table() {
+        let existing = "[plugins]\nenabled = [\"nest\", \"fdm-print\"]\n\
+             [ui]\nvim_mode = true\n";
+        let merged =
+            merge_managed_grok_config(existing, "", &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        assert_eq!(
+            table["plugins"].as_table().unwrap()["enabled"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            ["nest", "fdm-print"],
+            "guest [plugins].enabled must survive the merge"
+        );
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_preserves_guest_keys_under_host_overlay() {
+        let existing = "[ui]\nvim_mode = true\n[models]\ndefault = \"grok-4.6\"\n";
+        let host = "default_mode = \"fast\"\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        assert_eq!(
+            table["models"].as_table().unwrap()["default"].as_str(),
+            Some("grok-4.6")
+        );
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+        assert_eq!(table["default_mode"].as_str(), Some("fast"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_merges_guest_and_host_ui_tables() {
+        let existing = "[ui]\nvim_mode = true\n";
+        let host = "[ui]\ntheme = \"dark\"\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let ui = table["ui"].as_table().unwrap();
+        assert_eq!(ui["vim_mode"].as_bool(), Some(true));
+        assert_eq!(ui["theme"].as_str(), Some("dark"));
+        assert_eq!(ui["permission_mode"].as_str(), Some("always-approve"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_does_not_import_host_plugins() {
+        let existing = "[plugins]\nenabled = [\"nest\", \"fdm-print\"]\n";
+        let host = "default_mode = \"fast\"\n[plugins]\nenabled = [\"from-host\"]\n";
+        let merged =
+            merge_managed_grok_config(existing, host, &std::collections::HashMap::new()).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        assert_eq!(
+            table["plugins"].as_table().unwrap()["enabled"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            ["nest", "fdm-print"],
+            "guest [plugins].enabled wins; host [plugins] is not imported"
+        );
+        assert_eq!(table["default_mode"].as_str(), Some("fast"));
+    }
+
+    #[test]
+    fn merge_managed_grok_config_expands_stdio_env_as_grok_substitution() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            crate::guest_env_state::EnvVarName::new("API_KEY").unwrap(),
+            crate::guest_env_state::EnvVarName::new("MY_HOST_TOKEN").unwrap(),
+        );
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "playwright".into(),
+            McpServerDef::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@playwright/mcp".into()],
+                env,
+            },
+        );
+        let merged = merge_managed_grok_config("", "", &servers).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let server = table["mcp_servers"]["playwright"].as_table().unwrap();
+        assert_eq!(
+            server["env"].as_table().unwrap()["API_KEY"].as_str(),
+            Some("${MY_HOST_TOKEN}"),
+            "Grok expands MCP env values as ${{NAME}} from the guest process"
+        );
+    }
+
+    #[test]
+    fn merge_managed_grok_config_rejects_invalid_toml() {
+        let empty = std::collections::HashMap::new();
+        assert!(merge_managed_grok_config("not toml", "", &empty).is_err());
+        assert!(
+            merge_managed_grok_config("", "not toml", &empty).is_err(),
+            "invalid host TOML must be rejected, not skipped",
+        );
+        assert!(
+            merge_managed_grok_config("[ui]\npermission_mode = [", "", &empty).is_err(),
+            "invalid TOML must be rejected, not replaced with managed defaults",
+        );
+        assert!(
+            merge_managed_grok_config("ui = \"nope\"\n", "", &empty).is_err(),
+            "a non-table `ui` value must be rejected, not silently clobbered",
+        );
+    }
+
+    #[test]
+    fn merge_workspace_folder_trust_adds_workspace() {
+        let merged = merge_workspace_folder_trust("").unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let folders = table["folders"].as_table().unwrap();
+        let workspace = folders["/workspace"].as_table().unwrap();
+        assert_eq!(workspace["trusted"].as_bool(), Some(true));
+        assert!(
+            workspace["decided_at"].as_integer().is_some_and(|t| t > 0),
+            "Grok's trust store records decided_at as a unix timestamp"
+        );
+    }
+
+    #[test]
+    fn merge_workspace_folder_trust_preserves_other_folders() {
+        let existing = "[folders.\"/tmp\"]\ntrusted = true\n";
+        let merged = merge_workspace_folder_trust(existing).unwrap();
+        let table: toml::Table = merged.parse().unwrap();
+        let folders = table["folders"].as_table().unwrap();
+        assert_eq!(folders["/tmp"]["trusted"].as_bool(), Some(true));
+        assert_eq!(folders["/workspace"]["trusted"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn merge_workspace_folder_trust_rejects_invalid_toml() {
+        assert!(merge_workspace_folder_trust("not toml").is_err());
+        assert!(
+            merge_workspace_folder_trust("folders = \"nope\"\n").is_err(),
+            "a non-table `folders` value must be rejected, not silently clobbered",
+        );
+    }
+
+    #[test]
     fn codex_missing_guest_cli_message_mentions_skip_and_rebuild_paths() {
         let msg = codex_missing_guest_cli_message();
         assert!(msg.contains("--no-agents"));
@@ -5296,10 +6203,86 @@ url = "https://example.com/m"
 
         let dst = tempfile::TempDir::new().unwrap();
         let target = dst.path().join("out");
-        copy_dir_recursive(src.path().join("a").as_path(), &target).unwrap();
+        copy_dir_recursive(src.path().join("a").as_path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(
             std::fs::read_to_string(target.join("b/c.txt")).unwrap(),
             "nested"
+        );
+    }
+
+    #[test]
+    fn make_guest_staged_dir_writable_keeps_tilde_unquoted() {
+        let cmd = make_guest_staged_dir_writable(".grok", "skills");
+        let rendered = cmd.into_string();
+        assert!(
+            !rendered.contains("rm -rf"),
+            "dest dirs must stay in place so guest-only files survive a restart"
+        );
+        assert_eq!(
+            rendered,
+            "chmod -R u+w -- ~/.grok/'skills' 2>/dev/null || true"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_skips_hidden_and_git_dirs() {
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
+        std::fs::create_dir_all(src.path().join(".venv/bin")).unwrap();
+        std::fs::write(src.path().join(".venv/bin/python"), "py").unwrap();
+        std::fs::create_dir_all(src.path().join("lore/lkml-19.git/objects")).unwrap();
+        std::fs::write(src.path().join("lore/lkml-19.git/HEAD"), "ref").unwrap();
+
+        let dst = tempfile::TempDir::new().unwrap();
+        let target = dst.path().join("out");
+        copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "ok"
+        );
+        assert!(!target.join(".venv").exists());
+        assert!(!target.join("lore/lkml-19.git").exists());
+        assert!(target.join("lore").is_dir());
+    }
+
+    #[test]
+    fn copy_dir_recursive_overwrites_readonly_file() {
+        let src1 = tempfile::TempDir::new().unwrap();
+        std::fs::write(src1.path().join("pack"), b"v1").unwrap();
+        let mut perms = std::fs::metadata(src1.path().join("pack"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(src1.path().join("pack"), perms).unwrap();
+
+        let dst = tempfile::TempDir::new().unwrap();
+        let target = dst.path().join("out");
+        copy_dir_recursive(src1.path(), &target, TreeCopy::Follow).unwrap();
+
+        let src2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(src2.path().join("pack"), b"v2").unwrap();
+        copy_dir_recursive(src2.path(), &target, TreeCopy::Follow).unwrap();
+        assert_eq!(std::fs::read(target.join("pack")).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn copy_dir_recursive_skips_directory_symlink() {
+        let src = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "host-checkout").unwrap();
+        std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
+        std::os::unix::fs::symlink(outside.path(), src.path().join("linked")).unwrap();
+
+        let dst = tempfile::TempDir::new().unwrap();
+        let target = dst.path().join("out");
+        copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "ok"
+        );
+        assert!(
+            !target.join("linked").exists(),
+            "directory symlinks must not be followed"
         );
     }
 
@@ -5596,6 +6579,97 @@ url = "https://example.com/m"
         );
     }
 
+    #[test]
+    fn grok_api_key_is_forwarded_as_xai_api_key() {
+        let mut cfg = CoopConfig::default();
+        cfg.grok.api_key = Some(crate::config::Secret::new("xai-realkey".to_string()));
+        cfg.github = None;
+
+        let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+        assert!(
+            env.contains("XAI_API_KEY"),
+            "configured grok.api_key must be forwarded as XAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn grok_forwards_process_xai_api_key_when_config_omits_it() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior = std::env::var("XAI_API_KEY").ok();
+        // SAFETY: this is the only test that mutates XAI_API_KEY, it holds
+        // ENV_LOCK while doing so, and it restores the prior value before
+        // returning. Tests that construct CoopConfig::default() may copy a
+        // process-inherited XAI_API_KEY into grok.api_key; they then either
+        // overwrite that field or do not assert on it.
+        unsafe { std::env::set_var("XAI_API_KEY", "xai-from-host-env") };
+
+        let mut cfg = CoopConfig::default();
+        cfg.grok.api_key = None;
+        cfg.github = None;
+
+        let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("XAI_API_KEY", v),
+                None => std::env::remove_var("XAI_API_KEY"),
+            }
+        }
+
+        assert_eq!(
+            env.as_envs().get("XAI_API_KEY").map(String::as_str),
+            Some("xai-from-host-env"),
+            "process XAI_API_KEY must be forwarded when grok.api_key is unset"
+        );
+    }
+
+    #[test]
+    fn grok_stdio_mcp_env_host_names_are_forwarded() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prior = std::env::var("MY_HOST_TOKEN").ok();
+        unsafe { std::env::set_var("MY_HOST_TOKEN", "token-from-host") };
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            crate::guest_env_state::EnvVarName::new("API_KEY").unwrap(),
+            crate::guest_env_state::EnvVarName::new("MY_HOST_TOKEN").unwrap(),
+        );
+        let mut cfg = CoopConfig::default();
+        cfg.grok.api_key = None;
+        cfg.github = None;
+        cfg.grok.mcp_servers.insert(
+            "playwright".into(),
+            McpServerDef::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env,
+            },
+        );
+
+        let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("MY_HOST_TOKEN", v),
+                None => std::env::remove_var("MY_HOST_TOKEN"),
+            }
+        }
+
+        assert_eq!(
+            forwarded.as_envs().get("MY_HOST_TOKEN").map(String::as_str),
+            Some("token-from-host"),
+            "Grok MCP env mappings must forward the referenced host variable"
+        );
+    }
+
     // ── ensure_codex_remote_auth_consistent ─────────────────
 
     fn auth_check_cfg(auth: CodexAuthMode, openai: bool, anthropic: bool) -> CoopConfig {
@@ -5719,7 +6793,7 @@ url = "https://example.com/m"
 
     /// Build a `CoopConfig` whose env-resolving inputs are all empty
     /// except `guest_env`. Defaults read `ANTHROPIC_API_KEY` /
-    /// `OPENAI_API_KEY` from the process environment, which would make
+    /// `OPENAI_API_KEY` / `XAI_API_KEY` from the process environment, which would make
     /// these tests flaky; clearing them keeps the assertions about
     /// `guest_env` precise.
     fn cfg_with_guest_env(entries: &[(&str, &str)]) -> CoopConfig {
@@ -5728,6 +6802,8 @@ url = "https://example.com/m"
         cfg.claude.env_forward = Vec::new();
         cfg.codex.api_key = None;
         cfg.codex.env_forward = Vec::new();
+        cfg.grok.api_key = None;
+        cfg.grok.env_forward = Vec::new();
         cfg.github = None;
         for (k, v) in entries {
             cfg.guest_env.insert(
