@@ -888,7 +888,9 @@ fn compose_recipe(
     s.push_str(SCRIPT_CLAUDE_CODE);
     // Codex's native installer keeps the full package under the guest user's home.
     s.push_str(SCRIPT_CODEX);
+    s.push_str(crate::guest::SCRIPT_CODEX_KEYRING);
     s.push_str(SCRIPT_CODEX_ACCOUNT);
+    s.push_str(crate::guest::SCRIPT_CODEX_PERMISSIONS);
 
     s
 }

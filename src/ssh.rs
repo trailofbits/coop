@@ -108,6 +108,22 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Interactive authentication must propagate refusal/cancellation to the host.
+pub fn run_interactive_checked(session: &SshSession, command: &[String]) -> Result<()> {
+    let args = interactive_ssh_args(session, render_remote(command));
+    let status = Command::new("ssh")
+        .args(&args)
+        .envs(session.env.as_envs())
+        .env("TERM", guest_term())
+        .status()
+        .context("Failed to launch SSH")?;
+    if !status.success() {
+        restore_terminal();
+        anyhow::bail!("Guest authentication operation failed ({status})");
+    }
+    Ok(())
+}
+
 /// Run a command non-interactively over SSH (no PTY).
 ///
 /// Propagates the remote command's exit code via the process exit code.

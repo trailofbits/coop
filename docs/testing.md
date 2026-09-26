@@ -56,19 +56,40 @@ skip of the routed guest-isolation probe, since it would mask the coop rule.
 
 Run `python3 tests/test-codex-account.py` for the account wrapper's argument,
 login/logout, API-key passthrough, and `codex-yolo` regressions (also in Linux
-CI). To additionally test implicit daemon reuse with a real Linux Codex binary:
+CI). Shared guest readiness and storage decisions run with:
 
 ```bash
-COOP_TEST_CODEX="$(command -v codex)" python3 tests/test-codex-account.py
+/usr/bin/python3 tests/test-codex-keyring.py
 ```
 
-This requires `dbus-run-session`, `gnome-keyring-daemon`, `secret-tool`, and
-`strace`. It uses temporary homes and disposable keyring passwords, starts a
-real app-server on a separate unusable keyring session, and observes terminal
-socket connections. It checks that sign-in is reached without reusing that
-server and that removing the wrapper override restores reuse. No account login
-or real tokens are needed. Run it when upgrading Codex: daemon selection is
-version-dependent. This opt-in test does not replace either VM backend gate.
+Run `python3 tests/test-codex-permissions.py` for system-default installation
+and preservation tests. In a provisioned Linux guest, set
+`COOP_TEST_CODEX=/usr/local/bin/codex` to also test the real app-server's system
+defaults, user overrides, terminal `--ask` settings, desktop thread selections,
+and unrestricted command execution. The real test uses temporary Codex homes
+without account credentials; it requires the installed system defaults.
+
+Run `python3 tests/test-codex-session.py` for SSH PAM preservation, idempotent
+session installation, and incomplete-upgrade detection. These tests use a
+temporary filesystem and never modify host PAM. The VM suite verifies the
+user bus and keyring after reboot, then independently removes each session
+support marker to exercise `codex-unlock` upgrades and their reboot barrier.
+
+The production helper's PAM, systemd, native server recovery and fresh SSH
+connections are exercised on Linux with a disposable user:
+
+```bash
+sudo COOP_TEST_KEYRING_SYSTEMD=1 COOP_TEST_CODEX=/absolute/native/bin/codex \
+  /usr/bin/python3 tests/test-codex-keyring-systemd.py -v
+```
+
+Requires a running systemd and localhost SSH server, `python3-dbus`, `python3-websocket`,
+`strace`, a C
+compiler, PAM development headers and `libpam-gnome-keyring`. The fixture refuses
+an existing `/etc/pam.d/coop-codex-keyring`, creates its own dedicated PAM entry,
+and removes it and the disposable user afterward. It never uses real account
+credentials. This gate does not replace desktop UI/OAuth or VM lifecycle tests
+on both backends. The host-only readiness test runs in Linux CI.
 
 The full Codex update tests install native release `0.153.0` before running
 `codex update` as the guest user, and require the installed version to change.

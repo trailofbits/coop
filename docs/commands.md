@@ -340,7 +340,7 @@ coop ca my-project -- --cwd /workspace
 
 ### `codex`
 
-Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag: they never start an agent session, so there is nothing to sandbox.
+Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to explicitly restore workspace sandboxing and on-request approvals for that session, overriding the guest's full-access defaults. Caller arguments can override those settings. For desktop permission selection and system defaults, see [Codex integration](codex-integration.md#desktop-execution-permissions). With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag: they never start an agent session, so there is nothing to sandbox.
 
 ```
 coop codex [NAME] [FLAGS] [ARGS...]
@@ -358,6 +358,26 @@ coop codex my-project --ask
 coop codex my-project -- --model gpt-5
 coop codex my-project -- login --device-auth
 ```
+
+### `codex-unlock`
+
+```text
+coop codex-unlock [NAME]
+```
+
+Unlock the guest's shared encrypted keyring for ChatGPT account authentication.
+Requires `[codex] auth = "chatgpt"` and a running VM with the managed guest
+configuration. First use confirms a nonempty password; later unlocks reuse the
+same store. The keyring stays unlocked after SSH logout and locks at VM restart.
+
+Existing guests receive support files and packages in place on the first call;
+stop and start the VM before retrying. Invalid, plaintext, unsupported or
+conflicting stores are preserved and refused. Successful recovery retires the
+native desktop server's cached authentication; reconnect the desktop afterward.
+See [desktop SSH setup](codex-integration.md#desktop-over-ssh) for validation
+status and the account login steps.
+
+`coop codex unlock` still launches Codex in a VM named `unlock`.
 
 ### `exec`
 
