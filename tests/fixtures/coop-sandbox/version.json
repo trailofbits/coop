@@ -1,0 +1,6 @@
+{
+  "containerization" : "0.45.0",
+  "name" : "coop-sandbox",
+  "protocol" : 2,
+  "version" : "0.2.0"
+}

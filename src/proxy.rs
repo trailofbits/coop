@@ -21,7 +21,7 @@
 //! credential upstream.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -203,10 +203,163 @@ pub fn stop_provider(inst: &Instance, provider: Provider) {
     }
 }
 
-/// Tear down every provider's proxy for `inst` (stop/destroy). Best-effort.
+/// Tear down every provider's proxy and every local-model tunnel for `inst`
+/// (stop/destroy). Best-effort.
 pub fn stop(inst: &Instance) {
     for provider in Provider::ALL {
         stop_provider(inst, provider);
+    }
+    stop_model_tunnels(inst);
+}
+
+/// Reconcile this instance's local-model reverse tunnels with `wanted`
+/// (keyed by guest port), for backends whose guests have no route to the host
+/// (see [`crate::backend::LocalEndpointRoute::ReverseTunnel`]).
+///
+/// A tunnel that is still alive and was opened for the same SSH target and
+/// destination is kept, so re-running bootstrap never rebinds a guest port
+/// while the old listener may still hold it. The spec does not identify the
+/// guest's boot, so callers that just booted the guest must first close every
+/// recorded tunnel with [`stop_model_tunnels`]. Tunnels no longer wanted — local
+/// mode switched off, or an endpoint moved — are closed. Fails closed: a
+/// forward the guest does not acknowledge aborts the bootstrap before any URL
+/// depending on it is published.
+pub fn sync_model_tunnels(
+    inst: &Instance,
+    target: &SshTarget,
+    wanted: &std::collections::BTreeMap<u16, crate::backend::ReverseTunnel>,
+) -> Result<()> {
+    let mut kept = std::collections::BTreeSet::new();
+    for port in recorded_model_tunnels(inst) {
+        let keep = wanted
+            .get(&port)
+            .is_some_and(|&t| model_tunnel_is_current(inst, port, &model_tunnel_spec(target, t)));
+        if keep {
+            kept.insert(port);
+        } else {
+            stop_model_tunnel(inst, port);
+        }
+    }
+    for (&port, tunnel) in wanted {
+        if kept.contains(&port) {
+            continue;
+        }
+        let spec = model_tunnel_spec(target, *tunnel);
+        let name = model_tunnel_name(port);
+        spawn_reverse_forward_to(
+            inst,
+            &name,
+            target,
+            port,
+            tunnel.host_addr,
+            tunnel.host_port,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to tunnel local model {}:{} into the guest",
+                tunnel.host_addr, tunnel.host_port
+            )
+        })?;
+        crate::fs_util::atomic_write_with_mode(&model_spec_path(inst, port), &spec, 0o600)?;
+    }
+    Ok(())
+}
+
+fn model_tunnel_name(port: u16) -> String {
+    format!("model-{port}")
+}
+
+fn model_spec_path(inst: &Instance, port: u16) -> PathBuf {
+    inst.dir
+        .join(format!("proxy-{}-fwd.spec", model_tunnel_name(port)))
+}
+
+/// Identity of a tunnel: which guest it serves (the SSH target, including its
+/// host-key alias when pinned) and where it forwards to on the host.
+fn model_tunnel_spec(target: &SshTarget, tunnel: crate::backend::ReverseTunnel) -> String {
+    let alias = match &target.host_keys {
+        crate::backend::HostKeyPolicy::Pinned(pin) => pin.alias.to_string(),
+        crate::backend::HostKeyPolicy::Unverified => String::new(),
+    };
+    format!(
+        "{}:{} {alias} {}:{}:{}",
+        target.addr(),
+        target.port,
+        tunnel.guest_port,
+        tunnel.host_addr,
+        tunnel.host_port,
+    )
+}
+
+/// The live `ssh` process recorded for the tunnel on `port`, if any. A PID
+/// file can outlive its process (host reboot, crash) and the number be reused
+/// by something else, so the PID only counts while it still names an `ssh`
+/// process.
+fn model_tunnel_pid(inst: &Instance, port: u16) -> Option<i32> {
+    let pid = fs::read_to_string(fwd_pid_path(inst, &model_tunnel_name(port)))
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|&pid| pid > 0)?;
+    let comm = Command::new("/bin/ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    is_ssh_command(&String::from_utf8_lossy(&comm.stdout)).then_some(pid)
+}
+
+/// Whether a `ps -o comm=` value names the ssh client.
+fn is_ssh_command(comm: &str) -> bool {
+    Path::new(comm.trim())
+        .file_name()
+        .is_some_and(|name| name == "ssh")
+}
+
+/// Whether the tunnel recorded for `port` is alive and matches `spec`.
+fn model_tunnel_is_current(inst: &Instance, port: u16, spec: &str) -> bool {
+    let recorded = fs::read_to_string(model_spec_path(inst, port)).ok();
+    model_tunnel_pid(inst, port).is_some() && recorded.as_deref() == Some(spec)
+}
+
+/// Close the tunnel on `port`. Signals the recorded PID only while it is
+/// still an `ssh` process, so a reused PID is never killed.
+fn stop_model_tunnel(inst: &Instance, port: u16) {
+    if let Some(pid) = model_tunnel_pid(inst, port) {
+        // Safety: `kill` with a verified positive pid and a constant signal.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    let _ = fs::remove_file(fwd_pid_path(inst, &model_tunnel_name(port)));
+    let _ = fs::remove_file(model_spec_path(inst, port));
+}
+
+/// Guest ports of every `proxy-model-<port>-fwd.pid` recorded for `inst`.
+fn recorded_model_tunnels(inst: &Instance) -> Vec<u16> {
+    let Ok(entries) = fs::read_dir(&inst.dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("proxy-model-")?
+                .strip_suffix("-fwd.pid")?
+                .parse::<u16>()
+                .ok()
+        })
+        .collect()
+}
+
+/// Kill every local-model tunnel recorded for `inst`.
+pub fn stop_model_tunnels(inst: &Instance) {
+    for port in recorded_model_tunnels(inst) {
+        stop_model_tunnel(inst, port);
     }
 }
 
@@ -365,6 +518,26 @@ const SEATBELT_PROFILE: &str = include_str!("seatbelt-proxy.sb");
 /// target. An acknowledged forwarding request makes a bind clash on the guest
 /// a startup failure rather than a silently dead tunnel.
 fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: u16) -> Result<()> {
+    spawn_reverse_forward_to(
+        inst,
+        name,
+        target,
+        port,
+        std::net::Ipv4Addr::LOCALHOST,
+        port,
+    )
+}
+
+/// [`spawn_reverse_forward`] with an explicit host destination:
+/// `-R 127.0.0.1:{guest_port}:{host_addr}:{host_port}`.
+fn spawn_reverse_forward_to(
+    inst: &Instance,
+    name: &str,
+    target: &SshTarget,
+    guest_port: u16,
+    host_addr: std::net::Ipv4Addr,
+    host_port: u16,
+) -> Result<()> {
     kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
 
     let control_dir = create_tunnel_control_dir()?;
@@ -430,7 +603,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
             "-O".into(),
             "forward".into(),
             "-R".into(),
-            format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+            format!("127.0.0.1:{guest_port}:{host_addr}:{host_port}"),
         ]);
         forward_args.push(target.addr());
         let request = Command::new("ssh")
@@ -562,12 +735,7 @@ fn locate_proxy_binary() -> Result<PathBuf> {
 /// Mint a 256-bit capability token from the OS CSPRNG, hex-encoded. Worthless
 /// off the host, so exfiltration by a compromised guest gains nothing.
 fn mint_capability_token() -> Result<String> {
-    let mut buf = [0u8; 32];
-    let mut urandom = File::open("/dev/urandom").context("Failed to open /dev/urandom")?;
-    urandom
-        .read_exact(&mut buf)
-        .context("Failed to read from /dev/urandom")?;
-    Ok(hex::encode(buf))
+    crate::fs_util::random_hex(32)
 }
 
 /// The stdin startup blob for `coop-proxy`, matching its `ProxyConfig` shape.
@@ -621,6 +789,101 @@ mod tests {
             dir: PathBuf::from("/tmp/coop-test"),
             image: ImageName::new("t.img").unwrap(),
         }
+    }
+
+    #[test]
+    fn model_tunnel_records_and_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("t").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+        };
+        for name in [
+            "proxy-model-11434-fwd.pid",
+            "proxy-model-40443-fwd.pid",
+            "proxy-anthropic-fwd.pid",
+            "proxy-model-x-fwd.pid",
+        ] {
+            fs::write(tmp.path().join(name), "0").unwrap();
+        }
+        let mut ports = recorded_model_tunnels(&inst);
+        ports.sort_unstable();
+        assert_eq!(ports, [11434, 40443]);
+
+        let target = SshTarget {
+            host: crate::backend::Hostname::new("192.168.64.3").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: crate::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("k"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
+        };
+        let a = crate::backend::ReverseTunnel {
+            guest_port: 8000,
+            host_addr: std::net::Ipv4Addr::LOCALHOST,
+            host_port: 8000,
+        };
+        let b = crate::backend::ReverseTunnel {
+            host_addr: std::net::Ipv4Addr::new(127, 0, 0, 2),
+            ..a
+        };
+        assert_ne!(model_tunnel_spec(&target, a), model_tunnel_spec(&target, b));
+        // A recorded spec without a live process is not current.
+        fs::write(model_spec_path(&inst, 8000), model_tunnel_spec(&target, a)).unwrap();
+        assert!(!model_tunnel_is_current(
+            &inst,
+            8000,
+            &model_tunnel_spec(&target, a)
+        ));
+        stop_model_tunnels(&inst);
+        assert!(recorded_model_tunnels(&inst).is_empty());
+
+        assert!(is_ssh_command("/usr/bin/ssh\n"));
+        assert!(is_ssh_command("ssh"));
+        assert!(!is_ssh_command("sshd"));
+        assert!(!is_ssh_command(
+            "/Applications/Safari.app/Contents/MacOS/Safari"
+        ));
+        // A reused PID that is not ssh is neither current nor signalled.
+        fs::write(
+            fwd_pid_path(&inst, &model_tunnel_name(8000)),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert_eq!(model_tunnel_pid(&inst, 8000), None);
+        stop_model_tunnel(&inst, 8000);
+        assert!(!fwd_pid_path(&inst, &model_tunnel_name(8000)).exists());
+    }
+
+    #[test]
+    fn stop_model_tunnels_clears_every_recorded_tunnel() {
+        // The post-boot teardown in `bootstrap_and_post_start`: tunnels a
+        // previous boot recorded must not survive to pass as current.
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("t").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+        };
+        for port in [8000, 40443] {
+            fs::write(fwd_pid_path(&inst, &model_tunnel_name(port)), "0").unwrap();
+            fs::write(model_spec_path(&inst, port), "spec").unwrap();
+        }
+        let provider_pid = fwd_pid_path(&inst, Provider::Anthropic.name());
+        fs::write(&provider_pid, "0").unwrap();
+
+        stop_model_tunnels(&inst);
+
+        assert!(recorded_model_tunnels(&inst).is_empty());
+        for port in [8000, 40443] {
+            assert!(!model_spec_path(&inst, port).exists());
+        }
+        assert!(
+            provider_pid.exists(),
+            "provider proxies are not model tunnels"
+        );
     }
 
     #[test]
@@ -793,6 +1056,7 @@ mod tests {
             port: std::num::NonZeroU16::new(port).unwrap(),
             user: crate::backend::SshUser::new("coop").unwrap(),
             key_path: tmp.path().join("unused-key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
@@ -822,6 +1086,7 @@ mod tests {
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: crate::backend::SshUser::new("root").unwrap(),
             key_path: fixture.join("client"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let master_pid = || -> i32 {
             fs::read_to_string(fixture.join("master.pid"))

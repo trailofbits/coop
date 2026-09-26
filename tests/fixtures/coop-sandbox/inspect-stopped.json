@@ -1,0 +1,25 @@
+{
+  "disk" : {
+    "allocatedBytes" : 752058368,
+    "logicalBytes" : 8724152320,
+    "name" : "rootfs"
+  },
+  "record" : {
+    "cpus" : 2,
+    "createdAt" : "2026-09-25T22:56:17Z",
+    "diskBytes" : 8589934592,
+    "diskGeneration" : 0,
+    "environment" : [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "container=container",
+      "DEBIAN_FRONTEND=noninteractive"
+    ],
+    "id" : "coop-0a1b2c3d-00112233445566ff",
+    "imageDigest" : "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3",
+    "imageReference" : "local/coop-exp:fx",
+    "memoryBytes" : 2147483648,
+    "owner" : "0a1b2c3d00112233445566778899aabb",
+    "subnetIndex" : 1
+  },
+  "status" : "stopped"
+}

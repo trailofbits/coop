@@ -169,6 +169,19 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   or copies it off the host.
 - Flag any change that extends the no-host-key-checking options to a
   **non-guest** host.
+- The host-key policy is one field, `SshTarget::host_keys`
+  (`backend.rs:HostKeyPolicy`), so every transport and the editor block derive
+  from the same choice. Firecracker and Lima use `Unverified` (above). The
+  opt-in Apple sandbox backend uses `Pinned`: its guest address is on a
+  runtime-managed network and can be reassigned, so the Ed25519 host key is
+  read once over the runtime's native control channel (`coop-sandbox exec`
+  over vsock to the owned sandbox, never `ssh-keyscan`), written to a
+  per-instance `known_hosts`, and enforced with `StrictHostKeyChecking=yes`,
+  `HostKeyAlias=<machine>.coop-apple`, `UpdateHostKeys=no`, `ForwardAgent=no`,
+  and `IdentityAgent=none`, so coop's guest-facing SSH authenticates with its
+  own key file and never consults the host agent.
+  A missing or changed key is a hard error. Flag any path that re-enrolls
+  automatically or builds a pinned target with the unverified options.
 
 ## Network
 
@@ -301,6 +314,152 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   These match the design's "Cross-platform hardening" note: the Firecracker
   (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
   with Seatbelt, with the stated caveats.
+
+## Apple sandbox backend (opt-in `apple-container` feature)
+
+The same VM boundary applies. The backend drives coop-sandbox
+(`macos/coop-sandbox`), a runtime coop builds on `apple/containerization`. The
+isolation contract lives in two layers: the runtime cannot express host
+exposure, and coop verifies the effective configuration anyway
+(`src/apple_container/`).
+
+- **Runtime shape.** Each instance is its own VM on its own vmnet network
+  (`10.231.N.0/24`). The runtime's `SandboxRecord` has no field for a host
+  mount, socket relay, published port, network choice, or agent forwarding, and
+  its VM configuration is built in one function (`Owner.machineConfiguration`)
+  with kernel pseudo-filesystems only. Adding any such field or `create` flag is
+  a finding.
+- **Runtime qualification.** `security::qualify` accepts only `coop-sandbox`
+  with protocol 2 and `containerization` 0.45.0. The runtime itself accepts
+  only a kernel whose sha256 is in `KernelPin.allowed`. On first `coop setup`,
+  `coop-sandbox init` pulls `ghcr.io/apple/containerization/vminit:0.45.0`
+  (the runtime's only outbound fetch) and refuses it unless it resolves to the
+  pinned digest. No config key or flag relaxes these checks; adding one is a
+  finding.
+- **Isolation gate.** Before first boot, on every restart, and before every SSH
+  target is handed out, `security::verify_effective` checks the configuration
+  the running VM's owner reports. The effective config is parsed with
+  unknown-field rejection, so a new host-facing knob fails closed. It requires:
+  - `/sbin/init`, without nested virtualization;
+  - a root disk at exactly `<runtime root>/sandboxes/<id>/rootfs.ext4`;
+  - only the seven kernel pseudo-filesystem mounts, each from its fixed source
+    and destination;
+  - zero socket relays and published ports, and no agent forwarding;
+  - exactly one interface on a per-sandbox vmnet subnet, carrying the reported
+    address;
+  - CPUs, memory, owner, and image digest matching the record.
+
+  The address must lie inside the reported subnet. The published-port count,
+  agent-forwarding flag, and network mode are constants of the owner's code
+  rather than values read back from the VM. Checking them catches a runtime
+  that changes them, not a VM that differs from its configuration. The mount,
+  root-disk, relay, and interface checks read the configuration the VM was
+  created from. The proof (`SecurityReady`) is process-local and never persisted. The runtime
+  root is canonicalized (realpath) on both sides, so the path comparison is
+  exact.
+- **Separate networks are not proof of isolation.** Guest-to-guest
+  unreachability has to be demonstrated on real hardware for each qualified
+  runtime. `tests/integration-apple-sandbox.sh` (`docs/testing.md`) does so
+  for TCP, UDP, and ICMP over IPv4 and IPv6, plus
+  forged routes, static neighbours, spoofed sources, and broadcast/multicast,
+  from both sides and after restarts, with the host as the positive control.
+  Guest firewall rules do not count, because the guest has root. Rerun it before
+  changing the `containerization` pin or the VM configuration.
+- **Guests can reach host services.** Like every coop backend (see
+  [Network](#network)), a guest reaches the host through its NAT gateway and
+  the host's LAN address. On a Mac that includes anything listening on all
+  interfaces, such as sshd when Remote Login is on, AirPlay Receiver, and
+  rapportd. **Accepted by design**, consistent with Lima and Firecracker: those
+  services authenticate their clients, and coop's own host listeners bind
+  loopback and reach a guest only through its SSH tunnel. vmnet has no
+  per-network filter, so closing this would need a root-owned `pf` anchor on
+  every Mac. The Apple default network (other workloads' containers) and host
+  vsock are not reachable from a sandbox. A change that exposes a host
+  *credential* service to guests is a finding.
+- **Native control channel.** Host keys are read, and image checks run, through
+  `coop-sandbox exec`: an argv delivered over vsock to the guest agent, never a
+  shell string. Only fixed commands and coop-chosen paths go through it;
+  guest-controlled text never does. The owner's control socket is `0600` in a
+  `0700` per-user directory and checks the peer UID.
+- **Host-key pinning and re-enrollment.** A changed key fails with
+  `APPLE_HOST_KEY_CHANGED`. The only path that replaces a pin is a start after
+  `coop restore`: coop replaced the disk itself, and the restore removed the
+  host keys. That path is journaled with an operation id. After a crash, the
+  runtime's record must show both a higher disk generation and that
+  operation as its last committed one before the flag is set. Flag any other
+  path that re-enrolls.
+- **Runtime subprocesses** get a cleared environment. Only `HOME`, `USER`,
+  `LOGNAME`, `TMPDIR`, locale, and a fixed `PATH` are passed (`cli.rs`), so
+  `SSH_AUTH_SOCK`, provider and GitHub tokens, `DYLD_*`, and `CONTAINER_*`
+  never reach the runtime or the builder. The launchd job that runs each owner
+  gets a fixed `PATH`/`HOME` of its own. `EnvForward` is for SSH sessions only.
+  Output is size-bounded and deadline-bound. A timeout means the outcome is
+  uncertain, not that the operation failed. Only builds, creates, and boots
+  honour Ctrl-C; stop/delete/cleanup never do.
+- **Runtime binaries** are resolved only from the user's config or fixed
+  install paths, never from `PATH` or project files. After symlinks are
+  resolved, the binary must be a regular executable file owned by the user or
+  root and not group- or world-writable. Every ancestor directory must also be
+  owned by the user or root, and must not be world-writable unless it is
+  sticky, nor group-writable unless it is sticky or its group is `wheel` or
+  `admin` (whose members can already use sudo; Homebrew's prefix is
+  `admin`-writable). The check reads mode bits only; an ACL that grants
+  others write access is not detected. `scripts/build-coop-sandbox.sh` signs the runtime with the
+  hardened runtime and refuses an install `bin/` that is owned by neither
+  you nor root, world-writable, or group-writable by a group other than
+  `wheel` or `admin`. The runtime runs with umask `077`
+  and keeps its state directories `0700` and disk files `0600`.
+- **Guest-controlled text** that coop displays (host-key comments,
+  runtime/guest error text, console-log excerpts, and `coop logs` in both
+  snapshot and `--follow` mode) has its control characters replaced first.
+- **Local-model tunnels** (`proxy::sync_model_tunnels`) are reconciled on
+  every bootstrap, and every boot first closes those recorded for the
+  previous boot. A tunnel the current model config no longer needs is
+  closed, so switching local mode off really removes the guest's path to the
+  host server. Tunnel PIDs are only trusted or signalled while `ps` still
+  reports them as an `ssh` process.
+- **Ownership.** Sandboxes and committed disks are named
+  `coop-<owner8>-<random16>`. Nothing is deleted unless the local owner record
+  and the instance record both match, and the runtime refuses to delete a
+  sandbox recorded for another owner tag. The `coop-` prefix alone is never
+  enough.
+- **Image build context** is a private temporary directory holding rendered
+  files and the VM-access **public** key only. There are no build args or
+  secrets. The OCI build runs in stock `container`'s builder. The result is
+  imported into the runtime's private store as an OCI archive, and the
+  builder's copy is deleted.
+- **Committed disks** (`coop commit`) have their SSH host keys and machine-id
+  removed before they are saved, so instances created from them normally
+  generate their own identity. This is not a uniqueness guarantee: the disk
+  still boots guest-authored code, which can restore an identity it stashed.
+  Pinning does not depend on it, since each instance's key is read from that
+  sandbox over its own control channel. The removal runs in a maintenance VM
+  booted from a disposable clone of the maintenance image (never the guest's
+  own disk), with the committed disk mounted `nosuid,nodev,noexec` as data. It
+  refuses a symlinked `/etc` or `/etc/ssh`, and removes a symlinked key or
+  machine-id rather than following it. Disk growth runs the same way.
+  Maintenance VMs have no network, and whatever they run stays inside that VM.
+- **The maintenance image** is built by `coop setup` like the instance image
+  (stock builder, the same digest-pinned Ubuntu base and apt, so no new
+  outbound URL), from a fixed recipe with no build context beyond its
+  Dockerfile: Ubuntu plus e2fsprogs. The runtime unpacks it into its own
+  `maintenance/` directory, records its version and digest, checks that it
+  holds the programs the maintenance scripts run, and keeps it apart from the
+  image store; the store copy is deleted. No application image is ever used
+  for maintenance.
+- **Mutation integrity.** Disk and resource changes follow the invariants in
+  [`design/apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md)
+  (INV-01…INV-10). The security-relevant ones:
+  - no disk is replaced under a VM that can use it (the runtime's per-sandbox
+    guard covers owner startup, including launchd respawns);
+  - a rollback never overwrites a newer change;
+  - a host key is re-pinned only after a restore correlated with coop's own
+    operation id. The only exception is the pre-operation-id journal fallback
+    described under host-key pinning above.
+
+  Weakening any of these (skipping the guard, re-pinning on generation alone
+  outside that fallback, or guessing at unreadable staged state) is a
+  finding.
 
 ## `coop update` trust chain
 

@@ -63,7 +63,7 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
 
     let backend = pick_backend()?;
     let account = AccountName::from_repo(&repo);
-    let state_dir = cfg.data_dir.join("state");
+    let state_dir = cfg.state_root().join("state");
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
 
@@ -357,7 +357,7 @@ pub fn run_forget_pat(cfg: &CoopConfig, repo: &RepoSlug, config_path: &Path) -> 
         })?;
     let backend = CmdToken::parse(entry.token.expose()).map(|t| t.backend());
     let account = AccountName::from_repo(repo);
-    let state_dir = cfg.data_dir.join("state");
+    let state_dir = cfg.state_root().join("state");
     if let Some(b) = backend {
         if let Err(e) = delete_secret(b, SERVICE, &account, &state_dir) {
             tracing::warn!("Failed to remove secret from backend (continuing): {e}");

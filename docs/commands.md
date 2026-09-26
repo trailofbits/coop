@@ -6,7 +6,7 @@ coop creates isolated VM environments for running Claude Code and Codex. It runs
 
 | Flag | Description |
 |------|-------------|
-| `--config <path>` | Path to config file (default: `~/.coop/config.toml`) |
+| `--config <path>` | Path to config file (default: `~/.coop/config.toml`, or `~/.coop-apple/config.toml` in the `apple-container` build) |
 | `-v`, `--verbose` | Increase log verbosity. Once for debug, twice for trace. |
 | `--version` | Print version and exit. |
 
@@ -144,7 +144,7 @@ mounting (or bails in a non-TTY); pass `--no-workspace` to skip the mount.
 
 ### `init`
 
-Generate a starter config file at `~/.coop/config.toml`.
+Generate a starter config file at `~/.coop/config.toml` (`~/.coop-apple/config.toml` in the `apple-container` build).
 
 ```
 coop init
@@ -416,7 +416,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state: `running`, `stopped`, or `unknown` when the backend cannot determine it (shown with a warning, for example an Apple sandbox instance with an unfinished operation). It never connects to a guest over SSH, so it returns quickly even when VMs are unreachable; Lima and Firecracker read local state, and the Apple sandbox backend asks the runtime (`coop-sandbox inspect`). Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list
@@ -431,7 +431,7 @@ Alias: `ls`.
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). An instance whose state cannot be probed is listed as `unknown` with a warning, rather than failing the whole listing. With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
@@ -449,7 +449,8 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
+(`running`/`stopped`, or `unknown` in the bare-`status` array), `image`, `backend`
+(`firecracker`/`lima`/`apple-container`), and `usage`
 (raw MiB / load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
@@ -686,10 +687,13 @@ a restart. On macOS/Lima the forwarded SSH port changes on each start; the
 refresh keeps the alias current without you re-running the command. On
 Linux/Firecracker the host and port are stable, so the refresh is a no-op.
 
-The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
-so `ssh coop-*` connections skip host-key verification. This is intentional —
-these VMs regenerate their host keys, so pinning them would only produce
-spurious mismatch warnings.
+On Lima and Firecracker the block sets `StrictHostKeyChecking no` and
+`UserKnownHostsFile /dev/null`, so `ssh coop-*` connections skip host-key
+verification. This is intentional — these VMs regenerate their host keys, so
+pinning them would only produce spurious mismatch warnings. The Apple sandbox
+backend instead pins each guest's host key: its `coop-apple-*` block sets
+`StrictHostKeyChecking yes` with the instance's own `known_hosts`, plus
+`ForwardAgent no` and `IdentityAgent none`, and a changed key is refused.
 
 Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
 workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.
@@ -715,7 +719,9 @@ coop images --delete old-image
 With `--json`, each element is `{ "name", "profiles", "created", "size_bytes" }`.
 Absence is modelled honestly: `profiles` is `[]` (not `"none"`), `created` is
 `null` (not `"unknown"`), and `size_bytes` is the raw byte count (the text path's
-`"8.0 GiB"` is presentation only).
+`"8.0 GiB"` is presentation only), or `null` on the Apple sandbox backend,
+whose images live in the runtime's image store rather than coop's data
+directory.
 
 ### `resize`
 
@@ -783,6 +789,8 @@ coop up . --image my-project-baseline --name fork
 ### `restore`
 
 Roll a stopped instance back to an image's filesystem in place. The instance keeps its name, index, IP, and workspace association — only the disk is replaced and its recorded image is updated. Run `coop start` afterwards to bring it back up.
+
+On the Apple sandbox backend, the restored disk has no SSH host keys, so the next `coop start` pins the key the guest generates. The address is not guaranteed either: a sandbox moves to a new subnet when its old one has been quarantined (see [backends.md](backends.md#stop-destroy-recovery)).
 
 This pairs with `commit` for a known-good checkpoint before a risky run:
 

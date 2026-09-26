@@ -295,7 +295,7 @@ prompt_for_remote() {
 step "Working tree clean" check_worktree
 step "Version consistency" check_versions
 step "Format (cargo fmt --check)" cargo fmt -- --check
-step "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
+step "Clippy" cargo clippy --workspace --all-targets -- -D warnings
 step "Unit tests" cargo test --workspace
 step "Release target builds" build_release_targets
 step "Supply chain (cargo deny)" run_deny

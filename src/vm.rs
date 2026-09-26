@@ -481,6 +481,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             port: self.cfg.ssh_port,
             user: crate::backend::SshUser::new(guest_user.as_str())?,
             key_path: self.cfg.ssh_key_path(),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
             let _ = write!(out, "\n  {usage}");

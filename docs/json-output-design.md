@@ -109,11 +109,11 @@ use serde::Serialize;
 
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum InstanceState { Running, Stopped }
+pub(crate) enum InstanceState { Running, Stopped, Unknown }
 
 #[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum BackendKind { Firecracker, Lima }
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BackendKind { Firecracker, Lima, AppleContainer }
 ```
 
 Provide the projection from the live backend enum (match on `PlatformBackend`'s
@@ -255,10 +255,10 @@ clap tests that assert `matches!(cli.command, Commands::List)` (`src/lib.rs:1670
 and `:1676`) — update them to `Commands::List { .. }`.
 
 Deliberately **smaller** than `InstanceStatus`: `cmd_list` only calls
-`is_running` and does **not** run the per-instance usage SSH query that `status`
-runs. Keep `list` cheap — do not add usage here. Consumers who want usage call
-`status --json`. Reusing `InstanceState` keeps the two consistent where they
-overlap.
+`probe_running` (by default `is_running`; an error lists as `unknown`) and does
+**not** run the per-instance usage SSH query that `status` runs. Keep `list`
+cheap — do not add usage here. Consumers who want usage call `status --json`.
+Reusing `InstanceState` keeps the two consistent where they overlap.
 
 ```json
 [ { "name": "my-project", "state": "running" },
@@ -276,7 +276,7 @@ pub(crate) struct ImageInfo<'a> {
     pub name: &'a config::ImageName,
     pub profiles: Vec<String>,     // String: profile names are plain String in the domain
     pub created: Option<&'a str>,  // None where the human path prints "unknown"
-    pub size_bytes: u64,           // raw bytes; human path keeps format_dir_size ("8.0 GiB")
+    pub size_bytes: Option<u64>,   // raw bytes; null when images live in a runtime store (Apple sandbox)
 }
 ```
 

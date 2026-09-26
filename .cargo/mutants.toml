@@ -27,6 +27,8 @@
 # Whole modules that only shell out, drive SSH, or talk to external services.
 # (CLAUDE.md "Don't bother with" list.) Unit tests cannot observe their effects.
 exclude_globs = [
+  # Pure helpers split out into src/backend/ (host-key options, capabilities,
+  # local-endpoint planning, the unproven-stop decision) stay in scope.
   "src/backend.rs",
   "src/lima.rs",
   "src/setup.rs",
@@ -151,6 +153,41 @@ exclude_re = [
   "\\bstore_keychain\\b",
   "find-generic-password",
 
+  # apple_container/mod.rs — the backend's calls to the real system (platform
+  # probe, key generation, default install/kernel paths, instance-dir removal).
+  # Everything else there runs against the scripted runtime in its tests, so it
+  # stays in scope for the `--features apple-container` sweep (docs/testing.md).
+  "\\bcheck_platform\\b",
+  "apple_container.*\\bensure_ssh_key\\b",
+  "\\bdefault_runtimes\\b",
+  "apple_container.*\\bdefault_kernel\\b",
+  "\\bremove_instance_dir\\b",
+  # `status` is its tested describe_sandbox text plus guest usage over real SSH.
+  "AppleContainerBackend>::status ->",
+  # Equivalent: only picks the wording of a reconcile warning.
+  "\\bresource_change_outcome\\b",
+  # apple_container/cli.rs — process spawning, deadline polling, and log IO
+  # for the real runtime binaries. read_bounded, for_each_bounded_line,
+  # apply_sanitized_env, and sanitize_for_display stay in scope.
+  "RealExec::",
+  "\\bwait_with_deadline\\b",
+  "\\bjoin_reader\\b",
+  "\\blog_tail\\b",
+  # proxy.rs — local-model reverse tunnels: SSH process spawn and PID-file /
+  # signal IO. model_tunnel_spec and recorded_model_tunnels stay in scope.
+  "\\bsync_model_tunnels\\b",
+  "\\bspawn_reverse_forward_to\\b",
+  "\\bmodel_tunnel_is_current\\b",
+  "\\bmodel_tunnel_pid\\b",
+  # stop_model_tunnel signals the recorded ssh; stop_model_tunnels (the
+  # post-boot teardown of every recorded tunnel) stays in scope, pinned by
+  # stop_model_tunnels_clears_every_recorded_tunnel.
+  "\\bstop_model_tunnel\\b",
+
+  # base64.rs — equivalent: `acc << 6` has zero low bits, so `| v` and `^ v`
+  # agree in decode.
+  "base64\\.rs.*replace \\| with \\^ in decode\\b",
+
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
 
@@ -217,6 +254,12 @@ exclude_re = [
   # plan. Their pure inputs — InstanceState::from_running, BackendKind::of,
   # up_translator_inputs — stay in scope and are unit-tested.
   "\\binstance_status\\b",
+  # status_record / listed_instance_status (the `coop list --json` shape and
+  # its per-instance `unknown` fallback) take `&PlatformBackend`, so no
+  # `--lib` test can build their input; InstanceState and BackendKind::of
+  # stay in scope and are unit-tested.
+  "\\bstatus_record\\b",
+  "\\blisted_instance_status\\b",
   "\\bemit_up_dry_run\\b",
 
   # ---- src/commands/json.rs (#385): --json output ----

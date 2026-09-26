@@ -9,6 +9,11 @@ The runner is `./tests/run-integration.sh`. Empty arguments run locally on
 macOS/Lima; `--remote user@host` cross-compiles and runs on Linux/Firecracker.
 Other supported arguments include `--full`, `--profile LIST`, and `--name NAME`.
 
+The opt-in Apple sandbox runtime (`apple-container` build) has its own
+real-hardware suite, `./tests/integration-apple-sandbox.sh` (macOS 26+, stock
+`container` for image builds; `--only PHASES`). Run it for changes to
+`macos/coop-sandbox`, its `containerization` pin, or the isolation gate.
+
 Confirm the requested platform and prerequisites. A single host covers only one
 backend; never describe one backend as proving both. Run the suite with output
 redirected to a file, narrate progress during the long run, inspect the complete

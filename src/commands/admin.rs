@@ -132,11 +132,13 @@ pub(crate) fn cmd_uninstall(
 
     if remove_data {
         purge_all_data(be, cfg)?;
-        wipe_data_dir(&cfg.data_dir);
+        wipe_data_dir(&cfg.owned_data_dir());
         if let Err(e) = update::remove_state() {
             tracing::debug!("Failed to remove update-check state (non-fatal): {e}");
         }
-        if !config_path_is_under_data_dir(config_path, &cfg.data_dir) && config_path.exists() {
+        if !config_path_is_under_data_dir(config_path, &cfg.owned_data_dir())
+            && config_path.exists()
+        {
             tracing::info!(
                 "Config at {} is outside the data directory and was not removed",
                 config_path.display()
@@ -146,10 +148,10 @@ pub(crate) fn cmd_uninstall(
         if let Err(e) = workspace::remove_all_ssh_config() {
             tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
         }
-        if cfg.data_dir.exists() {
+        if cfg.owned_data_dir().exists() {
             tracing::info!(
                 "Keeping {}; reinstall coop to manage existing instances.",
-                cfg.data_dir.display()
+                cfg.owned_data_dir().display()
             );
         }
     }
@@ -166,13 +168,14 @@ fn print_uninstall_summary(cfg: &config::CoopConfig, binary_path: &Path) {
     let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
     tracing::info!("This will remove:");
     tracing::info!("  binary:    {}", binary_path.display());
-    if cfg.data_dir.exists() {
+    let data_dir = cfg.owned_data_dir();
+    if data_dir.exists() {
         tracing::info!(
             "  data dir:  {} ({instance_count} instance(s), {image_count} image(s))",
-            cfg.data_dir.display()
+            data_dir.display()
         );
     } else {
-        tracing::info!("  data dir:  {} (already absent)", cfg.data_dir.display());
+        tracing::info!("  data dir:  {} (already absent)", data_dir.display());
     }
 }
 
@@ -196,7 +199,7 @@ fn decide_remove_data(
     let image_count = cfg.list_images().map(|v| v.len()).unwrap_or(0);
     confirm(&format!(
         "Also remove data directory {} ({instance_count} instance(s), {image_count} image(s))?",
-        cfg.data_dir.display()
+        cfg.owned_data_dir().display()
     ))
 }
 

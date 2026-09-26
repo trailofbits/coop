@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### New features
+
+- **Opt-in Apple sandbox backend (macOS)** — building with
+  `--features apple-container` replaces Lima with coop-sandbox
+  ([`macos/coop-sandbox`](macos/coop-sandbox)), a Swift runtime on Apple's
+  `containerization` 0.45.0 built with `scripts/build-coop-sandbox.sh`. Each
+  instance is its own VM on its own vmnet network with no host mounts, socket
+  relays, published ports, or host SSH-agent forwarding. coop verifies the
+  running VM's effective configuration and pins its SSH host key before every
+  hand-out; workspaces are copied. It supports explicit disk sizes, offline
+  disk growth (`coop resize --size`), CPU/memory changes, and
+  `coop commit`/`coop restore`. Committed disks have their guest identity
+  removed, and a restore re-pins the new host key. Sandbox owners run as
+  launchd jobs, and a crash restarts them on the same disk. Stock Apple
+  `container` 1.4.1 is used only to build images and supply the guest kernel.
+  State lives in `~/.coop-apple`, and `coop update` is disabled for this
+  build. See [`docs/backends.md`](docs/backends.md). The choice over stock
+  Apple containers and a `container machine` fork is recorded in
+  [`docs/design/apple-sandbox-runtime.md`](docs/design/apple-sandbox-runtime.md);
+  [`tests/integration-apple-sandbox.sh`](tests/integration-apple-sandbox.sh)
+  checks it on real hardware.
+
+### Fixes
+
+- **`coop stop` no longer reports an instance stopped when its liveness probe
+  fails** — a failed probe used to be treated as "not running", so `coop stop`
+  printed "stopped" while the VM kept running. It now tears down the
+  credential proxy and stops the instance through the backend's control plane
+  (PID file, `limactl`, or the runtime), or returns an error if that fails.
+- **`coop status` lists every instance even when one cannot be probed** — that
+  instance is shown as `unknown` (JSON `"state": "unknown"`) with a warning,
+  instead of the whole listing failing.
+- **rsync transfers work when the VM key path contains a space** — SSH options
+  containing whitespace are now quoted in rsync's `-e` command.
+- **Editor SSH aliases work when the VM key path contains a space** — the
+  `IdentityFile` in the `coop-<name>` block of `~/.ssh/config` is now quoted.
+- **Lima: an instance starts again after `coop resize --size`** — Lima 2.x
+  refuses to boot ("disk shrinking is not supported") when `lima.yaml` records
+  a smaller disk than the file on disk. Growing the disk now updates `disk:`
+  in `lima.yaml` too.
+
+### Internal
+
+- **CI no longer runs clippy with `--all-features`**; the macOS-only
+  `apple-container` feature is linted and tested in its own macOS job, and
+  Linux checks that enabling it fails to compile.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4

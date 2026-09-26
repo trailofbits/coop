@@ -99,6 +99,8 @@ time.sleep(60)
             executable(wrapper, WRAPPER.replace('/usr/local/bin/codex', str(binary)))
             for tool in ['secret-tool', 'gnome-keyring-daemon']:
                 executable(root / tool, '#!/bin/sh\nexit 0\n')
+            # The guest has GNU timeout; macOS does not. Drop the duration and run.
+            executable(root / 'timeout', '#!/bin/sh\nshift\nexec "$@"\n')
             env['PATH'] = str(root) + ':' + env['PATH']
             env.update(COOP_CODEX_ACCOUNT_DBUS='1', COOP_CODEX_ACCOUNT_UNLOCKED='1')
             config = root / '.codex/config.toml'

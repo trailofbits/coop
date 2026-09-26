@@ -1,0 +1,141 @@
+{
+  "disk" : {
+    "allocatedBytes" : 752058368,
+    "logicalBytes" : 8724152320,
+    "name" : "rootfs"
+  },
+  "effective" : {
+    "cpus" : 2,
+    "id" : "coop-0a1b2c3d-00112233445566ff",
+    "imageDigest" : "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3",
+    "imageReference" : "local/coop-exp:fx",
+    "initArgv" : [
+      "/sbin/init"
+    ],
+    "interfaces" : [
+      {
+        "ipv4" : "10.231.2.2/24",
+        "ipv4Gateway" : "10.231.2.1",
+        "ipv6" : "fd41:33a9:4c99:b892::2/64",
+        "network" : "vmnet-shared:10.231.2.0/24"
+      }
+    ],
+    "maskedPaths" : [
+
+    ],
+    "memoryBytes" : 2147483648,
+    "mounts" : [
+      {
+        "destination" : "/proc",
+        "options" : [
+
+        ],
+        "source" : "proc",
+        "type" : "proc"
+      },
+      {
+        "destination" : "/sys",
+        "options" : [
+          "nosuid",
+          "noexec",
+          "nodev"
+        ],
+        "source" : "sysfs",
+        "type" : "sysfs"
+      },
+      {
+        "destination" : "/dev",
+        "options" : [
+          "nosuid",
+          "mode=755"
+        ],
+        "source" : "none",
+        "type" : "devtmpfs"
+      },
+      {
+        "destination" : "/dev/mqueue",
+        "options" : [
+          "nosuid",
+          "noexec",
+          "nodev"
+        ],
+        "source" : "mqueue",
+        "type" : "mqueue"
+      },
+      {
+        "destination" : "/dev/shm",
+        "options" : [
+          "nosuid",
+          "noexec",
+          "nodev",
+          "mode=1777",
+          "size=65536k"
+        ],
+        "source" : "tmpfs",
+        "type" : "tmpfs"
+      },
+      {
+        "destination" : "/sys/fs/cgroup",
+        "options" : [
+          "nosuid",
+          "noexec",
+          "nodev"
+        ],
+        "source" : "none",
+        "type" : "cgroup2"
+      },
+      {
+        "destination" : "/dev/pts",
+        "options" : [
+          "nosuid",
+          "noexec",
+          "newinstance",
+          "gid=5",
+          "mode=0620",
+          "ptmxmode=0666"
+        ],
+        "source" : "devpts",
+        "type" : "devpts"
+      }
+    ],
+    "publishedPorts" : 0,
+    "readonlyPaths" : [
+
+    ],
+    "rootfs" : {
+      "destination" : "/",
+      "options" : [
+
+      ],
+      "source" : "/Users/me/.coop-apple/backends/apple-container-v1/runtime/sandboxes/coop-0a1b2c3d-00112233445566ff/rootfs.ext4",
+      "type" : "ext4"
+    },
+    "socketRelays" : 0,
+    "sshAgentForwarding" : false,
+    "virtualization" : false
+  },
+  "live" : {
+    "ipv4" : "10.231.2.2",
+    "ipv6" : "fd41:33a9:4c99:b892::2",
+    "pid" : 81564,
+    "startedAt" : "2026-09-25T22:56:17Z"
+  },
+  "record" : {
+    "cpus" : 2,
+    "createdAt" : "2026-09-25T22:56:17Z",
+    "diskBytes" : 8589934592,
+    "diskGeneration" : 0,
+    "environment" : [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "container=container",
+      "DEBIAN_FRONTEND=noninteractive"
+    ],
+    "id" : "coop-0a1b2c3d-00112233445566ff",
+    "imageDigest" : "sha256:3c8ada4041838a362f1d3c0805e487beff8ef85383044efeb07844cdd7c1e0b3",
+    "imageReference" : "local/coop-exp:fx",
+    "memoryBytes" : 2147483648,
+    "owner" : "0a1b2c3d00112233445566778899aabb",
+    "subnetIndex" : 2
+  },
+  "status" : "running"
+}

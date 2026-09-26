@@ -155,6 +155,7 @@ mod tests {
             port: std::num::NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: inst.dir.join("unused"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
         let session = crate::commands::prepare_session_from_target(cfg, Some(inst), target, repo)?;
         Ok(session.env.as_envs().get("GITHUB_TOKEN").cloned())

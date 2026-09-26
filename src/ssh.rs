@@ -198,6 +198,7 @@ mod tests {
                 port: std::num::NonZeroU16::MIN,
                 user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
                 key_path: "/tmp/coop-test-key".into(),
+                host_keys: crate::backend::HostKeyPolicy::Unverified,
             },
             env: crate::backend::EnvForward::default(),
         };

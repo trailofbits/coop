@@ -275,8 +275,10 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
 /// Resize the disk of a stopped Lima instance.
 ///
-/// Truncates the disk to the new size. Cloud-init's `growpart`
-/// will expand the partition and filesystem on next boot.
+/// Records the new size as `disk:` in lima.yaml, then truncates the disk to
+/// it. Cloud-init's `growpart` expands the partition and filesystem on next
+/// boot. Re-running at the current size re-records `disk:`, which repairs an
+/// instance whose lima.yaml lags its disk.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let disk = disk_path(inst)?;
 
@@ -292,7 +294,8 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     let current_bytes = std::fs::metadata(&disk)
         .with_context(|| format!("Failed to stat {}", disk.display()))?
         .len();
-    let current_gib = current_bytes / (1024 * 1024 * 1024);
+    // Round up so a re-run never records a `disk:` below the image's size.
+    let current_gib = current_bytes.div_ceil(1024 * 1024 * 1024);
     let new_gib = u64::from(new_size.as_u32());
 
     if new_gib < current_gib {
@@ -301,6 +304,12 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
              requested: {new_gib} GiB)"
         );
     }
+    // Lima 2.x compares `disk:` in lima.yaml with the disk image on every
+    // start and refuses to boot ("disk shrinking is not supported") when the
+    // image is larger than `disk:`. Record the size first: if the truncate
+    // below then fails, `disk:` is the larger one, which Lima grows into.
+    // A re-run at the current size repairs a lima.yaml left behind.
+    record_disk_size(inst, new_gib)?;
     if new_gib == current_gib {
         tracing::info!("Disk is already {current_gib} GiB — nothing to do");
         return Ok(());
@@ -326,6 +335,30 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
          (cloud-init growpart)."
     );
     Ok(())
+}
+
+/// Set `disk:` in the instance's lima.yaml to `gib` GiB.
+fn record_disk_size(inst: &Instance, gib: u64) -> Result<()> {
+    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
+    let yaml = fs::read_to_string(&yaml_path)
+        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    crate::fs_util::atomic_write_with_mode(&yaml_path, &with_disk_size(&yaml, gib), 0o644)
+}
+
+/// `yaml` with its top-level `disk:` set to `gib` GiB, appending the key
+/// when the file has none.
+fn with_disk_size(yaml: &str, gib: u64) -> String {
+    let value = format!("\"{gib}GiB\"");
+    set_yaml_scalar(yaml, "disk", &value).unwrap_or_else(|| {
+        let mut out = yaml.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("disk: ");
+        out.push_str(&value);
+        out.push('\n');
+        out
+    })
 }
 
 /// Change a stopped Lima instance's cpus/memory by editing its
@@ -525,6 +558,32 @@ pub fn is_running(inst: &Instance) -> bool {
     lima_state(&inst.name).is_some_and(|s| s.is_running())
 }
 
+/// Like [`is_running`], but a failed `limactl` query is an error rather
+/// than "not running". A VM that a successful listing does not contain is
+/// confirmed not running; a `Broken` or unrecognized status is an error,
+/// since it confirms neither.
+pub fn probe_running(inst: &Instance) -> Result<bool> {
+    let Some(info) = find_limactl_entry(&lima_name_for(&inst.name))? else {
+        return Ok(false);
+    };
+    let status = info["status"]
+        .as_str()
+        .context("limactl reported no status")?;
+    running_from_state(&LimaState::from_status_str(status))
+}
+
+/// Whether a Lima status confirms the VM running (`Ok(true)`) or stopped
+/// (`Ok(false)`); any other status is an error.
+fn running_from_state(state: &LimaState) -> Result<bool> {
+    match state {
+        LimaState::Running => Ok(true),
+        LimaState::Stopped => Ok(false),
+        LimaState::Broken | LimaState::Unknown(_) => {
+            bail!("Lima reports the VM as {state}; its running state is unknown")
+        }
+    }
+}
+
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let info = limactl_info(&inst.name)?;
@@ -627,6 +686,7 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -982,6 +1042,7 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -1406,7 +1467,7 @@ provision:
     )
 }
 
-fn compose_provision_script(
+pub(crate) fn compose_provision_script(
     ssh_pubkey: &str,
     profiles: &[ProfileDef],
     oci_features: &[ResolvedFeature],
@@ -1658,6 +1719,7 @@ fn wait_for_lima_ssh(
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     };
     let mut delay = Duration::from_millis(500);
 
@@ -1818,6 +1880,13 @@ fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
 /// Find a `limactl list --json` entry by its Lima VM name (the
 /// `coop-<instance>` form, or the special `coop-builder`).
 fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
+    find_limactl_entry(lima_name)?
+        .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
+}
+
+/// [`limactl_list_entry`], with `Ok(None)` when the listing succeeded but has
+/// no VM named `lima_name`.
+fn find_limactl_entry(lima_name: &str) -> Result<Option<serde_json::Value>> {
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .output()
@@ -1841,11 +1910,11 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
             )
         })?;
         if val["name"].as_str() == Some(lima_name) {
-            return Ok(val);
+            return Ok(Some(val));
         }
     }
 
-    bail!("Lima instance '{lima_name}' not found in limactl list")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1873,6 +1942,16 @@ mod tests {
             edited.contains("disk: \"20GiB\"\n"),
             "unrelated key changed: {edited}"
         );
+    }
+
+    #[test]
+    fn with_disk_size_updates_or_appends_the_disk_key() {
+        let yaml = "cpus: 2\ndisk: \"20GiB\"\nmounts: []\n";
+        assert_eq!(
+            with_disk_size(yaml, 40),
+            "cpus: 2\ndisk: \"40GiB\"\nmounts: []\n"
+        );
+        assert_eq!(with_disk_size("cpus: 2", 40), "cpus: 2\ndisk: \"40GiB\"\n");
     }
 
     #[test]
@@ -2283,6 +2362,14 @@ Host h
             LimaState::from_status_str("Restarting"),
             LimaState::Unknown("Restarting".to_string()),
         );
+    }
+
+    #[test]
+    fn only_running_or_stopped_is_a_confirmed_state() {
+        assert!(running_from_state(&LimaState::Running).unwrap());
+        assert!(!running_from_state(&LimaState::Stopped).unwrap());
+        assert!(running_from_state(&LimaState::Broken).is_err());
+        assert!(running_from_state(&LimaState::Unknown("Restarting".into())).is_err());
     }
 
     #[test]

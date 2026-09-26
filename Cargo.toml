@@ -49,6 +49,12 @@ url = { version = "2", features = ["serde"] }
 [dev-dependencies]
 proptest = "1.11.0"
 
+[features]
+# Opt-in macOS backend: coop-sandbox VMs on apple/containerization
+# (macos/coop-sandbox) instead of Lima. Selecting it on any other target is a
+# compile error. See docs/backends.md.
+apple-container = []
+
 [lints]
 workspace = true
 

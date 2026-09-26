@@ -24,6 +24,9 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     "__pycache__/",
     ".venv/",
     ".coop/",
+    // The apple-container build's default data directory: it holds the VM
+    // access key and stored secrets, which must never be copied into a guest.
+    ".coop-apple/",
 ];
 
 const GIT_EXCLUDE: &str = ".git/";
@@ -630,6 +633,18 @@ pub fn open_editor(
     Ok(())
 }
 
+/// What the printed alias guarantees about the guest's host key.
+fn host_key_note(policy: &crate::backend::HostKeyPolicy) -> &'static str {
+    match policy {
+        crate::backend::HostKeyPolicy::Unverified => {
+            "These connections skip host-key verification (the VM's keys are ephemeral)."
+        }
+        crate::backend::HostKeyPolicy::Pinned(_) => {
+            "These connections verify the VM's pinned host key; a changed key is refused."
+        }
+    }
+}
+
 /// Install (or refresh) the `coop-<name>` SSH alias and print it.
 ///
 /// Writes the `Host coop-<name>` block to `~/.ssh/config` idempotently,
@@ -647,6 +662,7 @@ pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
 
     let host = ssh_config_host(inst);
     let block = ssh_config_block(target, inst);
+    let host_key_note = host_key_note(&target.host_keys);
     writeln!(
         std::io::stderr(),
         "\nSSH alias '{host}' is ready:\n\n{block}\n\n\
@@ -654,8 +670,7 @@ pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
          \x20   ssh {host}\n\
          \x20   scp ./file {host}:/workspace/\n\
          \x20   rsync -az ./dir/ {host}:/workspace/dir/\n\n\
-         These connections skip host-key verification \
-         (the VM's keys are ephemeral)."
+         {host_key_note}"
     )
     .context("Failed to write SSH config info")?;
 
@@ -1049,11 +1064,31 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     crate::fs_util::atomic_write_ssh(path, content)
 }
 
+// The Apple sandbox build keeps its own marker and alias namespace so it
+// can share `~/.ssh/config` with a default build: neither build's cleanup
+// matches the other's blocks, and same-named instances do not collide.
+#[cfg(not(feature = "apple-container"))]
 const MARKER_PREFIX: &str = "# coop START";
+#[cfg(not(feature = "apple-container"))]
 const MARKER_END: &str = "# coop END";
+#[cfg(not(feature = "apple-container"))]
+const HOST_ALIAS_PREFIX: &str = "coop-";
+#[cfg(feature = "apple-container")]
+const MARKER_PREFIX: &str = "# coop-apple START";
+#[cfg(feature = "apple-container")]
+const MARKER_END: &str = "# coop-apple END";
+#[cfg(feature = "apple-container")]
+const HOST_ALIAS_PREFIX: &str = "coop-apple-";
+/// The other build's marker. The two alias namespaces overlap (a default
+/// build instance named `apple-foo` is `coop-apple-foo`), so neither build
+/// writes an alias the other already owns.
+#[cfg(not(feature = "apple-container"))]
+const FOREIGN_MARKER_PREFIX: &str = "# coop-apple START";
+#[cfg(feature = "apple-container")]
+const FOREIGN_MARKER_PREFIX: &str = "# coop START";
 
 fn ssh_config_host(inst: &Instance) -> String {
-    format!("coop-{}", inst.name)
+    format!("{HOST_ALIAS_PREFIX}{}", inst.name)
 }
 
 #[mutants::skip] // equivalent: constant getter ($HOME/.ssh/config); no caller asserts the returned PathBuf
@@ -1063,7 +1098,12 @@ fn ssh_config_path() -> Result<PathBuf> {
 }
 
 fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
+    use std::fmt::Write as _;
     let host = ssh_config_host(inst);
+    let mut host_keys = String::new();
+    for line in target.host_keys.ssh_config_lines() {
+        let _ = writeln!(host_keys, "    {line}");
+    }
     format!(
         "{MARKER_PREFIX} {host}\n\
          Host {host}\n\
@@ -1072,14 +1112,13 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
-         \x20   StrictHostKeyChecking no\n\
-         \x20   UserKnownHostsFile /dev/null\n\
+         {host_keys}\
          \x20   LogLevel ERROR\n\
          {MARKER_END}",
         target.host,
         target.port,
         target.user,
-        target.key_path.display(),
+        crate::backend::quote_ssh_value(&target.key_path.to_string_lossy()),
     )
 }
 
@@ -1099,6 +1138,7 @@ fn update_ssh_config(target: &SshTarget, inst: &Instance) -> Result<()> {
         String::new()
     };
 
+    check_alias_not_foreign(&existing, &host)?;
     let cleaned = remove_named_marker_block(&existing, &host);
     let new_content = if cleaned.is_empty() {
         format!("{block}\n")
@@ -1109,6 +1149,20 @@ fn update_ssh_config(target: &SshTarget, inst: &Instance) -> Result<()> {
     atomic_write(&ssh_config, &new_content).context("Failed to write ~/.ssh/config")?;
 
     tracing::info!("Updated SSH config at {}", ssh_config.display());
+    Ok(())
+}
+
+/// Refuse `host` when the other coop build already manages an alias of the
+/// same name: ssh uses the first matching `Host`, so both entries would
+/// silently point one build's editor at the other's VM.
+fn check_alias_not_foreign(content: &str, host: &str) -> Result<()> {
+    let foreign = format!("{FOREIGN_MARKER_PREFIX} {host}");
+    if content.lines().any(|l| l.trim() == foreign) {
+        bail!(
+            "~/.ssh/config already has an alias '{host}' managed by the other coop build; \
+             rename one of the instances or remove that entry"
+        );
+    }
     Ok(())
 }
 
@@ -1349,6 +1403,52 @@ mod tests {
     use super::*;
     use crate::config::{ImageName, InstanceIndex, InstanceName};
     use proptest::prelude::*;
+
+    #[test]
+    fn host_key_note_matches_the_policy() {
+        use crate::backend::{HostKeyPolicy, Hostname, PinnedHostKey};
+        assert!(host_key_note(&HostKeyPolicy::Unverified).contains("skip host-key verification"));
+        let pinned = HostKeyPolicy::Pinned(PinnedHostKey {
+            known_hosts: std::path::PathBuf::from("/state/known_hosts"),
+            alias: Hostname::new("coop-abc").unwrap(),
+        });
+        let note = host_key_note(&pinned);
+        assert!(note.contains("pinned host key"), "{note}");
+        assert!(!note.contains("skip"), "{note}");
+    }
+
+    /// Rewrite default-build marker and alias literals into this build's
+    /// namespace (identity for the default build).
+    fn build(s: &str) -> String {
+        s.replace("# coop START", MARKER_PREFIX)
+            .replace("# coop END", MARKER_END)
+            .replace("coop-test", &format!("{HOST_ALIAS_PREFIX}test"))
+            .replace("coop-other", &format!("{HOST_ALIAS_PREFIX}other"))
+    }
+
+    #[test]
+    fn alias_owned_by_the_other_build_is_refused() {
+        let foreign = format!(
+            "{FOREIGN_MARKER_PREFIX} {HOST_ALIAS_PREFIX}test\nHost {HOST_ALIAS_PREFIX}test\n"
+        );
+        let host = format!("{HOST_ALIAS_PREFIX}test");
+        assert!(check_alias_not_foreign(&foreign, &host).is_err());
+        assert!(check_alias_not_foreign(&build("# coop START coop-test\n"), &host).is_ok());
+        assert!(check_alias_not_foreign(&foreign, &format!("{HOST_ALIAS_PREFIX}other")).is_ok());
+    }
+
+    #[cfg(feature = "apple-container")]
+    #[test]
+    fn apple_build_leaves_default_build_blocks_alone() {
+        let default_blocks = "\
+# coop START coop-test\n\
+Host coop-test\n\
+    HostName 172.16.0.2\n\
+# coop END\n";
+        assert_eq!(remove_marker_blocks(default_blocks), default_blocks);
+        let mixed = format!("{default_blocks}{}", build(default_blocks));
+        assert_eq!(remove_marker_blocks(&mixed), default_blocks);
+    }
 
     fn temp_instance(dir: &Path) -> Instance {
         Instance {
@@ -1853,7 +1953,8 @@ mod tests {
 
     #[test]
     fn remove_all_blocks() {
-        let input = "\
+        let input = &build(
+            "\
 Host other\n\
     HostName 1.2.3.4\n\
 # coop START coop-0\n\
@@ -1865,7 +1966,8 @@ Host another\n\
 # coop START coop-1\n\
 Host coop-1\n\
     HostName 172.16.0.3\n\
-# coop END\n";
+# coop END\n",
+        );
 
         let result = remove_marker_blocks(input);
         assert!(!result.contains("coop-0"));
@@ -1876,7 +1978,8 @@ Host coop-1\n\
 
     #[test]
     fn remove_named_block_leaves_others() {
-        let input = "\
+        let input = &build(
+            "\
 # coop START coop-a\n\
 Host coop-a\n\
     HostName 172.16.0.2\n\
@@ -1884,11 +1987,12 @@ Host coop-a\n\
 # coop START coop-b\n\
 Host coop-b\n\
     HostName 172.16.0.3\n\
-# coop END\n";
+# coop END\n",
+        );
 
         let result = remove_named_marker_block(input, "coop-a");
-        assert!(!result.contains("coop-a"));
-        assert!(result.contains("coop-b"));
+        assert!(!result.contains("Host coop-a"));
+        assert!(result.contains("Host coop-b"));
         assert!(result.contains("172.16.0.3"));
     }
 
@@ -1901,21 +2005,25 @@ Host coop-b\n\
 
     #[test]
     fn marker_block_present_detects_matching_host() {
-        let input = "\
+        let input = &build(
+            "\
 # coop START coop-a\n\
 Host coop-a\n\
     HostName 172.16.0.2\n\
-# coop END\n";
+# coop END\n",
+        );
         assert!(marker_block_present(input, "coop-a"));
     }
 
     #[test]
     fn marker_block_present_false_for_other_host() {
-        let input = "\
+        let input = &build(
+            "\
 # coop START coop-a\n\
 Host coop-a\n\
     HostName 172.16.0.2\n\
-# coop END\n";
+# coop END\n",
+        );
         // A different instance's block must not count as present, or
         // restart would refresh an alias the user never installed.
         assert!(!marker_block_present(input, "coop-b"));
@@ -1930,11 +2038,13 @@ Host coop-a\n\
     fn marker_block_present_ignores_host_substring() {
         // `coop-a` is a prefix of `coop-app`; a substring match would
         // wrongly report the block present.
-        let input = "\
+        let input = &build(
+            "\
 # coop START coop-app\n\
 Host coop-app\n\
     HostName 172.16.0.2\n\
-# coop END\n";
+# coop END\n",
+        );
         assert!(!marker_block_present(input, "coop-a"));
     }
 
@@ -1944,9 +2054,9 @@ Host coop-app\n\
         let inst = temp_instance(dir.path());
         let block = ssh_config_block(&fake_ssh_target(), &inst);
 
-        assert!(block.starts_with("# coop START coop-test"));
-        assert!(block.trim_end().ends_with("# coop END"));
-        assert!(block.contains("Host coop-test"));
+        assert!(block.starts_with(&build("# coop START coop-test")));
+        assert!(block.trim_end().ends_with(MARKER_END));
+        assert!(block.contains(&build("Host coop-test")));
         assert!(block.contains("HostName 127.0.0.1"));
         assert!(block.contains("Port 2222"));
         assert!(block.contains("User ubuntu"));
@@ -1956,12 +2066,29 @@ Host coop-app\n\
     }
 
     #[test]
+    fn ssh_config_block_quotes_identity_file_with_space() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let target = SshTarget {
+            key_path: PathBuf::from("/Users/me/my data/vm_key"),
+            ..fake_ssh_target()
+        };
+        let block = ssh_config_block(&target, &inst);
+        assert!(
+            block.contains("IdentityFile \"/Users/me/my data/vm_key\"\n"),
+            "{block}"
+        );
+    }
+
+    #[test]
     fn remove_all_from_only_moat_blocks_returns_empty() {
-        let input = "\
+        let input = &build(
+            "\
 # coop START coop-0\n\
 Host coop-0\n\
     HostName 172.16.0.2\n\
-# coop END\n";
+# coop END\n",
+        );
 
         let result = remove_marker_blocks(input);
         assert!(result.is_empty());
@@ -1974,7 +2101,8 @@ Host coop-0\n\
         // both inside and outside a block. A `&&`→`||` mutant would drop the
         // surviving block's END line; a `==`→`!=` mutant would leave the
         // target block's body behind. Asserting the exact result kills both.
-        let input = "\
+        let input = &build(
+            "\
 Host before\n\
     HostName 1.1.1.1\n\
 # coop START coop-target\n\
@@ -1986,11 +2114,13 @@ Host after\n\
 # coop START coop-other\n\
 Host coop-other\n\
     HostName 4.4.4.4\n\
-# coop END\n";
+# coop END\n",
+        );
 
         let result = remove_named_marker_block(input, "coop-target");
 
-        let expected = "\
+        let expected = &build(
+            "\
 Host before\n\
     HostName 1.1.1.1\n\
 Host after\n\
@@ -1998,21 +2128,24 @@ Host after\n\
 # coop START coop-other\n\
 Host coop-other\n\
     HostName 4.4.4.4\n\
-# coop END\n";
-        assert_eq!(result, expected);
+# coop END\n",
+        );
+        assert_eq!(&result, expected);
     }
 
     #[test]
     fn remove_all_ssh_config_at_strips_coop_keeps_rest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config");
-        let original = "\
+        let original = &build(
+            "\
 Host keep\n\
     HostName 9.9.9.9\n\
 # coop START coop-test\n\
 Host coop-test\n\
     HostName 172.16.0.2\n\
-# coop END\n";
+# coop END\n",
+        );
         std::fs::write(&path, original).expect("write config");
 
         remove_all_ssh_config_at(&path).expect("remove all");
@@ -2049,7 +2182,8 @@ Host coop-test\n\
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config");
         let inst = temp_instance(dir.path()); // host coop-test
-        let original = "\
+        let original = &build(
+            "\
 # coop START coop-test\n\
 Host coop-test\n\
     HostName 172.16.0.2\n\
@@ -2057,7 +2191,8 @@ Host coop-test\n\
 # coop START coop-other\n\
 Host coop-other\n\
     HostName 172.16.0.3\n\
-# coop END\n";
+# coop END\n",
+        );
         std::fs::write(&path, original).expect("write config");
 
         remove_ssh_config_at(&path, &inst).expect("remove one");
@@ -2068,7 +2203,7 @@ Host coop-other\n\
             "target instance block survived: {rewritten}"
         );
         assert!(
-            rewritten.contains("# coop START coop-other"),
+            rewritten.contains(&build("# coop START coop-other")),
             "other instance block was dropped: {rewritten}"
         );
         assert!(
@@ -2107,6 +2242,7 @@ Host coop-other\n\
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").expect("valid user"),
             key_path: PathBuf::from("/tmp/key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         }
     }
 

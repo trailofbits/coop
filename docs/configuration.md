@@ -1,6 +1,6 @@
 # Configuration Reference
 
-coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <path>` to use a different file. Files with a `.json` extension are parsed as JSON for backward compatibility.
+coop reads configuration from `~/.coop/config.toml` by default (`~/.coop-apple/config.toml` in the `apple-container` build). Pass `--config <path>` to use a different file. Files with a `.json` extension are parsed as JSON for backward compatibility.
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
@@ -12,7 +12,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
+| `data_dir` | string (path) | `~/.coop` (`~/.coop-apple` in the `apple-container` build) | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
@@ -440,6 +440,24 @@ label = "postgres"
 
 Collision with an in-use host port fails fast before the VM is created. The error names the offending port and suggests a `GUEST:HOST` override.
 
+## `apple_container` section
+
+Read only by a build with the `apple-container` feature; see [Apple sandbox configuration](backends.md#configuration) for how each value is used. Unknown keys are rejected.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `binary` | string (absolute path) | search order in [backends.md](backends.md) | `coop-sandbox` runtime binary. |
+| `builder` | string (absolute path) | search order in [backends.md](backends.md) | `container` binary used only to build images. |
+| `kernel` | string (absolute path) | the kernel stock Apple `container` installs | Guest kernel; must be one the runtime pins. |
+| `probe_timeout_seconds` | integer | `10` | `version`, `inspect`, `list`. |
+| `operation_timeout_seconds` | integer | `60` | Resource changes, deletes, guest commands. |
+| `create_timeout_seconds` | integer | `600` | Create, grow, commit, restore, init, maintenance install. |
+| `boot_timeout_seconds` | integer | `120` | Boot to SSH-ready. |
+| `stop_timeout_seconds` | integer | `90` | Clean guest shutdown. |
+| `build_timeout_seconds` | integer | `3600` | Image build; `setup --builder-timeout` overrides. |
+
+Each timeout must be between 1 and 86400 seconds.
+
 ## `updates` section
 
 Background update-check behavior for `coop update`. Defaults are safe; most users do not need to set anything here.
@@ -467,7 +485,7 @@ Several config values accept per-invocation overrides via flags:
 | `--template-size <GiB>` | `setup` | `vm.template_size_gib` |
 | `--disk <GiB>` | `up` | Per-instance disk size (grows from template if larger) |
 | `--env KEY=VALUE` | `up`, `start` | Adds or overrides a `guest_env` entry (repeatable) |
-| `--config <path>` | all commands | Config file path (default: `~/.coop/config.toml`) |
+| `--config <path>` | all commands | Config file path (default: `~/.coop/config.toml`, or `~/.coop-apple/config.toml` in the `apple-container` build) |
 
 ## Examples
 

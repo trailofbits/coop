@@ -1204,6 +1204,12 @@ fn start_instance(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
+    // An explicit disk size is a request, not a default: reject it before any
+    // VM cost on a backend that cannot honour it rather than dropping it.
+    if opts.disk.is_some() {
+        be.require(backend::Capability::DiskResize)?;
+    }
+
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
     // forwarding works at bootstrap time.
@@ -1363,7 +1369,7 @@ fn provision_first_boot(
                 workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
             }
             tracing::warn!(
-                "Firecracker mounts use one-time sync, not live filesystem sharing. \
+                "{be} mounts use one-time sync, not live filesystem sharing. \
                  Use `coop push` / `coop pull` to sync changes."
             );
         }
@@ -1581,6 +1587,10 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
+    // The guest just booted, so a recorded local-model tunnel belongs to an
+    // earlier boot (a crash skips `cmd_stop`). Its ssh can outlive that boot
+    // and would otherwise pass as current while this guest has no listener.
+    proxy::stop_model_tunnels(inst);
     let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
@@ -1622,8 +1632,8 @@ fn bootstrap_and_post_start(
     if opts.no_agents {
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
     } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+        let route = be.local_endpoint_route(&cfg.network);
+        backend::bootstrap_agents(&session, cfg, inst, mode, &route)?;
     }
     if let Some(cmd) = post_start {
         // Agent bootstrap may have just minted the per-instance capability
@@ -1771,7 +1781,24 @@ pub(crate) fn cmd_stop(
     // Probe live state once. The `RunningInstance` proof flows into
     // `be.stop`, so the type system witnesses that we only ask the
     // backend to stop something that was actually running.
-    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
+    // A failed probe is not "not running": reporting the instance stopped
+    // while it may still be up would leave its agent running unnoticed.
+    // The backend gets one more chance via its control-plane
+    // `stop_unproven`; the credential proxy is torn down either way.
+    let probe = match be.as_running(cfg, inst.clone()) {
+        Ok(probe) => probe,
+        Err(probe_err) => {
+            crate::proxy::stop(inst);
+            return be.stop_unproven(cfg, inst).map_err(|stop_err| {
+                probe_err.context(format!(
+                    "Could not determine whether instance '{}' is running, and it could \
+                     not be stopped without that ({stop_err:#})",
+                    inst.name
+                ))
+            });
+        }
+    };
+    if let Some(running) = probe {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
@@ -1819,6 +1846,18 @@ pub(crate) fn cmd_destroy(
     Ok(())
 }
 
+/// A listing's state for one instance: a probe error is shown as `unknown`
+/// (with a warning), never as `stopped`.
+fn listed_state(name: &config::InstanceName, probe: Result<bool>) -> json::InstanceState {
+    match probe {
+        Ok(running) => json::InstanceState::from_running(running),
+        Err(e) => {
+            tracing::warn!("Could not determine the state of '{name}': {e:#}");
+            json::InstanceState::Unknown
+        }
+    }
+}
+
 pub(crate) fn cmd_list(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1830,7 +1869,7 @@ pub(crate) fn cmd_list(
         .iter()
         .map(|inst| json::InstanceSummary {
             name: &inst.name,
-            state: json::InstanceState::from_running(be.is_running(inst)),
+            state: listed_state(&inst.name, be.probe_running(inst)),
         })
         .collect();
 
@@ -1864,19 +1903,42 @@ fn instance_status<'a>(
     cfg: &config::CoopConfig,
     inst: &'a config::Instance,
 ) -> Result<json::InstanceStatus<'a>> {
-    let (state, usage) = match be.as_running(cfg, inst.clone())? {
-        Some(running) => (
-            json::InstanceState::Running,
-            backend::query_resource_usage(running.target()),
-        ),
-        None => (json::InstanceState::Stopped, None),
-    };
-    Ok(json::InstanceStatus {
+    if let Some(running) = be.as_running(cfg, inst.clone())? {
+        let usage = backend::query_resource_usage(running.target());
+        return Ok(status_record(be, inst, json::InstanceState::Running, usage));
+    }
+    // `as_running` may read an unconfirmed state (Lima's `Broken`) as not
+    // running; ask the probe `coop list` uses, so both agree.
+    be.probe_running(inst)?;
+    Ok(status_record(be, inst, json::InstanceState::Stopped, None))
+}
+
+fn status_record<'a>(
+    be: &backend::PlatformBackend,
+    inst: &'a config::Instance,
+    state: json::InstanceState,
+    usage: Option<backend::ResourceUsage>,
+) -> json::InstanceStatus<'a> {
+    json::InstanceStatus {
         name: &inst.name,
         state,
         image: &inst.image,
         backend: json::BackendKind::of(be),
         usage,
+    }
+}
+
+/// [`instance_status`] for a listing: one instance whose state cannot be
+/// probed is reported `unknown` (with a warning) instead of failing the
+/// whole listing.
+fn listed_instance_status<'a>(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &'a config::Instance,
+) -> json::InstanceStatus<'a> {
+    instance_status(be, cfg, inst).unwrap_or_else(|e| {
+        tracing::warn!("Could not determine the state of '{}': {e:#}", inst.name);
+        status_record(be, inst, json::InstanceState::Unknown, None)
     })
 }
 
@@ -1903,10 +1965,10 @@ pub(crate) fn cmd_status(
     } else {
         let instances = cfg.list_instances()?;
         if json_out {
-            let statuses = instances
+            let statuses: Vec<_> = instances
                 .iter()
-                .map(|inst| instance_status(be, cfg, inst))
-                .collect::<Result<Vec<_>>>()?;
+                .map(|inst| listed_instance_status(be, cfg, inst))
+                .collect();
             return json::render_json(&statuses);
         }
         if instances.is_empty() {
@@ -1915,15 +1977,13 @@ pub(crate) fn cmd_status(
             return Ok(());
         }
         for inst in &instances {
-            let (state, usage_str) = match be.as_running(cfg, inst.clone())? {
-                Some(running) => {
-                    let usage = backend::query_resource_usage(running.target())
-                        .map(|u| format!("  {}", u.summary()))
-                        .unwrap_or_default();
-                    ("running", usage)
-                }
-                None => ("stopped", String::new()),
-            };
+            let status = listed_instance_status(be, cfg, inst);
+            let state = status.state.label();
+            let usage_str = status
+                .usage
+                .as_ref()
+                .map(|u| format!("  {}", u.summary()))
+                .unwrap_or_default();
             writeln!(
                 std::io::stdout(),
                 "{:<16} {:<10} {:<10} {}{usage_str}",
@@ -1959,6 +2019,15 @@ pub(crate) fn cmd_resize(
     // `VmMemory::parse_cli`, so `opts.mem` is already provably bootable
     // here; no half-applied instance can result from a bad value. (The CLI
     // ArgGroup guarantees at least one of size/mem/vcpus is present.)
+    // Checked before the stopped-state probe so an unsupported request has no
+    // side effects and never reaches `disk_path`.
+    if opts.disk.is_some() {
+        be.require(backend::Capability::DiskResize)?;
+    }
+    if opts.mem.is_some() || opts.vcpus.is_some() {
+        be.require(backend::Capability::MachineResources)?;
+    }
+
     let inst = cfg.resolve_instance(opts.name)?;
     let stopped = be.as_stopped(inst)?;
 
@@ -1992,6 +2061,7 @@ pub(crate) fn cmd_commit(
     image: &config::ImageName,
     force: bool,
 ) -> Result<()> {
+    be.require(backend::Capability::DiskSnapshots)?;
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
@@ -2088,6 +2158,9 @@ pub(crate) fn cmd_restore(
     cfg: &mut config::CoopConfig,
     opts: &RestoreOpts<'_>,
 ) -> Result<()> {
+    // Both modes replace the disk; reject before the reprovision prompt,
+    // the stop, or any metadata write.
+    be.require(backend::Capability::DiskSnapshots)?;
     let image = match &opts.mode {
         RestoreMode::Reprovision(reprovision) => {
             return reprovision_instance(be, cfg, opts.name, reprovision);
@@ -2221,7 +2294,8 @@ fn reprovision_instance(
     // `proxy::stop` (the guest's copy of the capability token dies with the
     // disk; the first-boot bootstrap reissues it).
     //
-    // It swallows a failed `as_running` probe, which is fine here: the
+    // A failed `as_running` probe falls back to the backend's control-plane
+    // stop; if that fails too, this aborts before the disk is touched. The
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
 
@@ -2632,6 +2706,23 @@ mod tests {
     }
 
     #[test]
+    fn listed_state_reports_probe_errors_as_unknown() {
+        let name = super::config::InstanceName::new("myvm").expect("valid instance name");
+        assert!(matches!(
+            super::listed_state(&name, Ok(true)),
+            super::json::InstanceState::Running
+        ));
+        assert!(matches!(
+            super::listed_state(&name, Ok(false)),
+            super::json::InstanceState::Stopped
+        ));
+        assert!(matches!(
+            super::listed_state(&name, Err(anyhow::anyhow!("probe failed"))),
+            super::json::InstanceState::Unknown
+        ));
+    }
+
+    #[test]
     fn no_agents_warns_only_when_the_guest_keyring_was_never_set_up() {
         use super::config::CodexAuthMode;
         use super::no_agents_skips_codex_keyring as warns;
@@ -2760,6 +2851,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2816,6 +2908,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2864,6 +2957,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -2906,6 +3000,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
@@ -2953,6 +3048,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
@@ -2983,6 +3079,7 @@ mod tests {
             port: NonZeroU16::new(22).expect("non-zero"),
             user: super::backend::SshUser::new("ubuntu").expect("valid user"),
             key_path: tmp.path().join("id_test"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         };
 
         let session =
@@ -3145,7 +3242,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // 0xFF is not valid UTF-8 in any position.
         let host_path = tmp.path().join(std::ffi::OsStr::from_bytes(b"proj-\xff"));
-        std::fs::create_dir(&host_path).expect("create non-UTF-8 dir");
+        if let Err(e) = std::fs::create_dir(&host_path) {
+            // UTF-8-only filesystems (APFS) refuse the name, so no such
+            // directory can exist there and there is nothing to check.
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EILSEQ),
+                "create non-UTF-8 dir: {e}"
+            );
+            return;
+        }
         assert!(
             host_path.is_dir(),
             "the is-dir guard must not be what trips"

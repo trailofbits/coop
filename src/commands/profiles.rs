@@ -211,7 +211,7 @@ pub(crate) fn cmd_images(
                     .as_ref()
                     .map_or(&[][..], |c| c.profiles.as_slice()),
                 created: img.config.as_ref().map(|c| c.created.as_str()),
-                size_bytes: dir_size_bytes(&img.dir),
+                size_bytes: image_size_bytes(be.images_in_data_dir(), &img.dir),
             })
             .collect();
         return json::render_json(&infos);
@@ -236,7 +236,8 @@ pub(crate) fn cmd_images(
             .config
             .as_ref()
             .map_or("unknown", |c| c.created.as_str());
-        let size = format_dir_size(dir_size_bytes(&img.dir));
+        let size = image_size_bytes(be.images_in_data_dir(), &img.dir)
+            .map_or_else(|| "n/a (runtime image store)".to_string(), format_dir_size);
         writeln!(
             std::io::stdout(),
             "{:<20} profiles: {:<30} created: {:<24} size: {}",
@@ -248,6 +249,12 @@ pub(crate) fn cmd_images(
         .map_err(|e| anyhow::anyhow!("Failed to write: {e}"))?;
     }
     Ok(())
+}
+
+/// An image's size, or `None` when its content lives outside `dir` (in a
+/// runtime-owned image store), where the directory size would understate it.
+fn image_size_bytes(in_data_dir: bool, dir: &std::path::Path) -> Option<u64> {
+    in_data_dir.then(|| dir_size_bytes(dir))
 }
 
 /// Sum the byte sizes of the files directly under `dir`. Best-effort: an
@@ -276,7 +283,7 @@ fn format_dir_size(total_bytes: u64) -> String {
 mod tests {
     use super::{
         builtin_summary, collect_profiles_list, format_custom_summary, format_dir_size,
-        script_summary,
+        image_size_bytes, script_summary,
     };
     use crate::config::{CoopConfig, CustomProfile};
     use crate::guest::BuiltinProfile;
@@ -377,6 +384,14 @@ mod tests {
         assert!(v["builtin"].is_array());
         assert_eq!(v["custom"][0]["name"], serde_json::json!("alpha"));
         assert_eq!(v["custom"][0]["summary"], serde_json::json!("(empty)"));
+    }
+
+    #[test]
+    fn image_size_bytes_is_none_outside_the_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("template-config.json"), [0u8; 10]).expect("write");
+        assert_eq!(image_size_bytes(true, tmp.path()), Some(10));
+        assert_eq!(image_size_bytes(false, tmp.path()), None);
     }
 
     #[test]

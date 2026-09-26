@@ -762,7 +762,138 @@ pub struct CoopConfig {
     /// Self-update behaviour
     #[serde(default)]
     pub updates: crate::update::UpdateConfig,
+
+    /// Apple sandbox backend settings. Parsed by every build so one
+    /// `config.toml` stays portable; only the `apple-container` build reads it.
+    #[serde(default)]
+    pub apple_container: AppleContainerConfig,
 }
+
+/// A timeout in whole seconds, bounded to `1..=MAX_TIMEOUT_SECS` at parse
+/// time so a zero or runaway deadline is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TimeoutSecs(u32);
+
+/// Upper bound for [`TimeoutSecs`]: one day, enough for an image build over
+/// a slow link.
+pub const MAX_TIMEOUT_SECS: u32 = 86_400;
+
+impl TimeoutSecs {
+    pub fn new(secs: u32) -> Result<Self> {
+        if secs == 0 || secs > MAX_TIMEOUT_SECS {
+            bail!("timeout must be between 1 and {MAX_TIMEOUT_SECS} seconds, got {secs}");
+        }
+        Ok(Self(secs))
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeoutSecs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `[apple_container]` — settings for the Apple sandbox backend.
+///
+/// Deliberately small: there is no knob to mount the host home, forward the
+/// host SSH agent, share a network between instances, or skip the runtime
+/// qualification gate. Those are fixed policy, not configuration.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppleContainerConfig {
+    /// Absolute path to the `coop-sandbox` runtime binary. When unset, the
+    /// backend searches a fixed list of host-owned install locations, never
+    /// `PATH` entries inside the project directory.
+    #[serde(default)]
+    pub binary: Option<ConfigPath>,
+    /// Absolute path to the stock Apple `container` CLI, used only to build
+    /// images. Searched in fixed install locations when unset.
+    #[serde(default)]
+    pub builder: Option<ConfigPath>,
+    /// Guest kernel for the runtime. Defaults to the kernel stock Apple
+    /// `container` installs; the runtime accepts only kernels it was
+    /// validated with, whatever this points at.
+    #[serde(default)]
+    pub kernel: Option<ConfigPath>,
+    /// Deadline for read-only runtime probes (version, inspect, list).
+    #[serde(default = "default_apple_probe_timeout")]
+    pub probe_timeout_seconds: TimeoutSecs,
+    /// Deadline for other state-changing runtime calls: resource changes,
+    /// image and disk deletion, delete, and fixed guest commands.
+    #[serde(default = "default_apple_operation_timeout")]
+    pub operation_timeout_seconds: TimeoutSecs,
+    /// Deadline for creating a sandbox disk (unpacking an image on first
+    /// use), growing, committing, or restoring one, and for runtime setup.
+    #[serde(default = "default_apple_create_timeout")]
+    pub create_timeout_seconds: TimeoutSecs,
+    /// Deadline for a sandbox to boot and report a guest address.
+    #[serde(default = "default_apple_boot_timeout")]
+    pub boot_timeout_seconds: TimeoutSecs,
+    /// Deadline for a sandbox to halt cleanly and confirm it stopped.
+    #[serde(default = "default_apple_stop_timeout")]
+    pub stop_timeout_seconds: TimeoutSecs,
+    /// Deadline for building the machine image. Package installation is slow,
+    /// so this is separate from (and much longer than) the boot deadline.
+    /// `coop setup --builder-timeout` overrides it for one run.
+    #[serde(default = "default_apple_build_timeout")]
+    pub build_timeout_seconds: TimeoutSecs,
+}
+
+impl Default for AppleContainerConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            builder: None,
+            kernel: None,
+            probe_timeout_seconds: default_apple_probe_timeout(),
+            operation_timeout_seconds: default_apple_operation_timeout(),
+            create_timeout_seconds: default_apple_create_timeout(),
+            boot_timeout_seconds: default_apple_boot_timeout(),
+            stop_timeout_seconds: default_apple_stop_timeout(),
+            build_timeout_seconds: default_apple_build_timeout(),
+        }
+    }
+}
+
+fn default_apple_probe_timeout() -> TimeoutSecs {
+    TimeoutSecs(10)
+}
+
+fn default_apple_operation_timeout() -> TimeoutSecs {
+    TimeoutSecs(60)
+}
+
+fn default_apple_create_timeout() -> TimeoutSecs {
+    TimeoutSecs(600)
+}
+
+fn default_apple_boot_timeout() -> TimeoutSecs {
+    TimeoutSecs(120)
+}
+
+/// systemd's full shutdown; the runtime forces the VM down after 60 s.
+fn default_apple_stop_timeout() -> TimeoutSecs {
+    TimeoutSecs(90)
+}
+
+fn default_apple_build_timeout() -> TimeoutSecs {
+    TimeoutSecs(3600)
+}
+
+/// Subdirectory of the configured `data_dir` that this build's backend owns,
+/// if any: the Apple sandbox build keeps everything under
+/// `backends/apple-container-v1`; the default backends use `data_dir` itself.
+/// See [`CoopConfig::state_root`].
+const BACKEND_ROOT: Option<&str> = if cfg!(feature = "apple-container") {
+    Some("backends/apple-container-v1")
+} else {
+    None
+};
 
 /// User-defined profile in `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1941,7 +2072,8 @@ fn check_local_marketplaces(field: &str, entries: &[String], errors: &mut Vec<St
 }
 
 impl CoopConfig {
-    /// Default config path: `~/.coop/config.toml`.
+    /// Default config path: `~/.coop/config.toml` (`~/.coop-apple/config.toml`
+    /// in the `apple-container` build).
     pub fn default_path() -> PathBuf {
         default_data_dir().join("config.toml")
     }
@@ -1960,6 +2092,29 @@ impl CoopConfig {
         };
         cfg.expand_user_paths();
         Ok(cfg)
+    }
+
+    /// Root of this build's persistent state: `data_dir` itself for the
+    /// default backends, `data_dir/backends/apple-container-v1` for the
+    /// Apple sandbox build. Images, instances, the VM key, and stored
+    /// secrets all live beneath it; `data_dir` keeps its configured meaning.
+    pub fn state_root(&self) -> PathBuf {
+        BACKEND_ROOT.map_or_else(
+            || self.data_dir.to_path_buf(),
+            |sub| self.data_dir.join(sub),
+        )
+    }
+
+    /// The directory `uninstall --purge` may remove wholesale: `data_dir`
+    /// when this build owns it outright (the default backends, or the Apple
+    /// build's own `~/.coop-apple`), otherwise only [`Self::state_root`], so a
+    /// `data_dir` shared with another build is never wiped.
+    pub fn owned_data_dir(&self) -> PathBuf {
+        if BACKEND_ROOT.is_none() || self.data_dir == default_data_dir() {
+            self.data_dir.to_path_buf()
+        } else {
+            self.state_root()
+        }
     }
 
     /// Expand a leading `~` in the marketplace entries that are paths.
@@ -2108,7 +2263,7 @@ impl CoopConfig {
 
     /// Directory containing all named images.
     pub fn images_dir(&self) -> PathBuf {
-        self.data_dir.join("images")
+        self.state_root().join("images")
     }
 
     /// Directory for a specific named image.
@@ -2184,18 +2339,18 @@ impl CoopConfig {
 
     /// Path to the SSH private key for guest access
     pub fn ssh_key_path(&self) -> PathBuf {
-        self.data_dir.join("vm_key")
+        self.state_root().join("vm_key")
     }
 
     /// Directory containing all instances
     pub fn instances_dir(&self) -> PathBuf {
-        self.data_dir.join("instances")
+        self.state_root().join("instances")
     }
 
     /// Path to per-project devcontainer discovery preferences.
     #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
     pub fn devcontainer_preferences_path(&self) -> PathBuf {
-        self.data_dir.join("devcontainer_preferences.json")
+        self.state_root().join("devcontainer_preferences.json")
     }
 
     /// List all existing instances, sorted by index.
@@ -2379,6 +2534,7 @@ impl Default for CoopConfig {
             post_start: None,
             forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
+            apple_container: AppleContainerConfig::default(),
         }
     }
 }
@@ -2651,11 +2807,20 @@ fn is_firecracker_process(pid: u32) -> bool {
 
 // ── Defaults ──────────────────────────────────────────────────
 
+/// `~/.coop`, or `~/.coop-apple` for the `apple-container` build. The feature
+/// build gets its own application directory so an older default build's
+/// `uninstall --purge` (which removes its whole `data_dir`) cannot reach
+/// Apple sandbox state.
 fn default_data_dir() -> ConfigPath {
+    let dir = if cfg!(feature = "apple-container") {
+        ".coop-apple"
+    } else {
+        ".coop"
+    };
     ConfigPath::new(
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".coop"),
+            .join(dir),
     )
 }
 
@@ -2786,6 +2951,15 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
+    /// The state root a config with `data_dir = dir` uses in this build.
+    fn state_root_of(dir: &Path) -> PathBuf {
+        CoopConfig {
+            data_dir: ConfigPath::new(dir),
+            ..CoopConfig::default()
+        }
+        .state_root()
+    }
+
     fn test_config(tmp: &TempDir) -> CoopConfig {
         CoopConfig {
             data_dir: ConfigPath::new(tmp.path()),
@@ -2840,7 +3014,7 @@ mod tests {
         let inst = Instance {
             name: InstanceName::new(name).unwrap(),
             index,
-            dir: dir.join("instances").join(name),
+            dir: state_root_of(dir).join("instances").join(name),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
         };
         inst.save().unwrap();
@@ -3217,7 +3391,7 @@ mod tests {
         make_instance(tmp.path(), "zero", idx(0));
 
         // Remove index 0
-        fs::remove_dir_all(tmp.path().join("instances/zero")).unwrap();
+        fs::remove_dir_all(cfg.instances_dir().join("zero")).unwrap();
 
         // Next should fill gap at 0 since highest (252) is at ceiling
         let inst = cfg
@@ -3413,7 +3587,7 @@ mod tests {
         // `wanted` instance living under a differently-named directory.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
-        let instances = tmp.path().join("instances");
+        let instances = state_root_of(tmp.path()).join("instances");
 
         let stale = Instance {
             name: iname("decoy"),
@@ -4597,7 +4771,8 @@ skip = ["not-a-slug"]
             (cfg.instances_dir(), "/my/data/instances"),
             (cfg.images_dir(), "/my/data/images"),
         ] {
-            assert_eq!(got, PathBuf::from(want));
+            let rel = want.strip_prefix("/my/data/").unwrap();
+            assert_eq!(got, cfg.state_root().join(rel));
         }
 
         // Default-value getters compose the same filenames under the
@@ -4613,10 +4788,61 @@ skip = ["not-a-slug"]
     #[test]
     fn default_data_dir_is_under_home() {
         let dir = default_data_dir();
+        let expected = if cfg!(feature = "apple-container") {
+            ".coop-apple"
+        } else {
+            ".coop"
+        };
         assert!(
-            dir.ends_with(".coop"),
-            "expected path ending with .coop, got: {dir:?}"
+            dir.ends_with(expected),
+            "expected path ending with {expected}, got: {dir:?}"
         );
+    }
+
+    #[test]
+    fn timeout_secs_rejects_zero_and_runaway() {
+        assert!(TimeoutSecs::new(0).is_err());
+        assert!(TimeoutSecs::new(MAX_TIMEOUT_SECS + 1).is_err());
+        assert_eq!(
+            TimeoutSecs::new(5).unwrap().duration(),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn apple_container_section_parses_and_rejects_unknown_keys() {
+        let cfg: CoopConfig = toml::from_str(
+            "[apple_container]\nbinary = \"/opt/coop-sandbox/bin/coop-sandbox\"\nbuilder = \"/opt/homebrew/bin/container\"\nkernel = \"/opt/k/vmlinux\"\nboot_timeout_seconds = 60\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.apple_container.boot_timeout_seconds, TimeoutSecs(60));
+        assert_eq!(cfg.apple_container.probe_timeout_seconds, TimeoutSecs(10));
+        assert!(
+            toml::from_str::<CoopConfig>("[apple_container]\nallow_insecure = true\n").is_err()
+        );
+        assert!(
+            toml::from_str::<CoopConfig>("[apple_container]\nstop_timeout_seconds = 0\n").is_err()
+        );
+    }
+
+    #[test]
+    fn state_root_nests_only_for_the_apple_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, format!("data_dir = {:?}\n", tmp.path().join("d"))).unwrap();
+        let cfg = CoopConfig::load(&path).unwrap();
+        assert_eq!(&*cfg.data_dir, tmp.path().join("d").as_path());
+        let root = if cfg!(feature = "apple-container") {
+            tmp.path().join("d/backends/apple-container-v1")
+        } else {
+            tmp.path().join("d")
+        };
+        assert_eq!(cfg.state_root(), root);
+        assert_eq!(cfg.instances_dir(), root.join("instances"));
+        assert_eq!(cfg.ssh_key_path(), root.join("vm_key"));
+        // A data_dir shared with another build is never wiped wholesale.
+        assert_eq!(cfg.owned_data_dir(), root);
+        assert_eq!(CoopConfig::default().owned_data_dir(), *default_data_dir());
     }
 
     // ── Config validation ─────────────────────────────────────
@@ -4867,7 +5093,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        let image_dir = state_root_of(&data_dir).join("images").join(DEFAULT_IMAGE);
         fs::create_dir_all(&image_dir).unwrap();
         fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
 
@@ -4888,7 +5114,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
-        let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
+        let image_dir = state_root_of(&data_dir).join("images").join(DEFAULT_IMAGE);
         fs::create_dir_all(&image_dir).unwrap();
         fs::write(image_dir.join("rootfs-template.ext4"), b"").unwrap();
         let kernel = data_dir.join("vmlinux");
@@ -5076,22 +5302,23 @@ skip = ["not-a-slug"]
             ..CoopConfig::default()
         };
         let foo = ImageName::new("foo").unwrap();
-        assert_eq!(cfg.image_dir(&foo), PathBuf::from("/data/images/foo"));
+        let root = cfg.state_root();
+        assert_eq!(cfg.image_dir(&foo), root.join("images/foo"));
         assert_eq!(
             cfg.template_path_for(&foo),
-            PathBuf::from("/data/images/foo/rootfs-template.ext4")
+            root.join("images/foo/rootfs-template.ext4")
         );
         assert_eq!(
             cfg.template_config_path_for(&foo),
-            PathBuf::from("/data/images/foo/template-config.json")
+            root.join("images/foo/template-config.json")
         );
         assert_eq!(
             cfg.lima_base_path(&foo),
-            PathBuf::from("/data/images/foo/lima-base.img")
+            root.join("images/foo/lima-base.img")
         );
         assert_eq!(
             cfg.lima_template_path(&foo),
-            PathBuf::from("/data/images/foo/lima-template.yaml")
+            root.join("images/foo/lima-template.yaml")
         );
     }
 
@@ -5192,7 +5419,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with no instance.json (crashed mid-create)
-        let orphan = tmp.path().join("instances").join("orphan");
+        let orphan = state_root_of(tmp.path()).join("instances").join("orphan");
         fs::create_dir_all(&orphan).unwrap();
 
         let instances = cfg.list_instances().unwrap();
@@ -5208,7 +5435,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with garbage JSON (truncated write)
-        let broken = tmp.path().join("instances").join("broken");
+        let broken = state_root_of(tmp.path()).join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), r#"{"name": "bro"#).unwrap();
 
@@ -5225,7 +5452,7 @@ skip = ["not-a-slug"]
         make_instance(tmp.path(), "good", idx(0));
 
         // Create a dir with empty file (truncated before any content)
-        let empty = tmp.path().join("instances").join("empty");
+        let empty = state_root_of(tmp.path()).join("instances").join("empty");
         fs::create_dir_all(&empty).unwrap();
         fs::write(empty.join("instance.json"), "").unwrap();
 
@@ -5240,7 +5467,7 @@ skip = ["not-a-slug"]
         let cfg = test_config(&tmp);
 
         // Create a corrupted instance dir occupying no valid index
-        let broken = tmp.path().join("instances").join("broken");
+        let broken = state_root_of(tmp.path()).join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 

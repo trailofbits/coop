@@ -77,7 +77,7 @@ fn run_setup(
     let service = service_for(provider, inst.as_ref().map(|i| i.name.as_str()));
     let account =
         AccountName::new(provider.name()).context("internal error: invalid proxy account name")?;
-    let state_dir = cfg.data_dir.join("state");
+    let state_dir = cfg.state_root().join("state");
     let cmd_token = secret_store::store_secret(backend, &service, &account, &token, &state_dir)
         .with_context(|| {
             format!(
