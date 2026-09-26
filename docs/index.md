@@ -17,9 +17,6 @@ short navigational entrypoint; durable detail lives here.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
 
-- [Desktop authentication implementation](design/issue-480-desktop-auth-implementation.md)
-  — shared guest service, adoption policy, recovery and remaining release gates.
-
 ## For users
 
 - [`getting-started.md`](getting-started.md) — install and first VM.

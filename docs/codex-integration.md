@@ -28,9 +28,9 @@ the VM again.
 
 ### Desktop over SSH
 
-Desktop authentication is implemented for validation with GNOME Keyring 46.1
-and native Codex 0.154.0. Actual desktop UI connection and real-account OAuth
-validation remain release gates; see the [implementation record](design/issue-480-desktop-auth-implementation.md).
+The desktop app connects to Codex in the guest over SSH. Terminal and desktop
+sessions share the guest's encrypted GNOME Keyring, while each uses its own
+Codex app-server. Unlock the keyring once per VM boot before connecting.
 
 ```bash
 coop ssh-config my-project
