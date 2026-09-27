@@ -13,7 +13,9 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -57,6 +59,7 @@ class Failure(enum.Enum):
     GENERATION = 'keyring service changed during unlock; reconnect and retry'
     NATIVE_BUSY = 'native Codex lifecycle lock or stop timed out; retry after desktop startup finishes'
     NATIVE_OWNER = 'native Codex server ownership conflict; resolve it with the native daemon commands'
+    NATIVE_UNMANAGED = 'unmanaged Codex app-server could not be retired; disconnect the desktop, restart the VM, and unlock before reconnecting'
     NATIVE = 'native Codex server recovery failed; no ready state was recorded'
     TERMINATION = 'native stop did not retire the observed server; retry after concurrent startup finishes'
 
@@ -260,8 +263,65 @@ class Keyring:
             raise Error(Failure.WRITE) from original
 
 
+def retire_unmanaged_server(home):
+    """Retire only the Codex process owning the user's native control socket.
+
+    The desktop can launch a direct app-server before the keyring is unlocked.
+    Native daemon stop refuses that process. Peer credentials bind the socket
+    to a PID, and a pidfd keeps the signal bound to that process across races.
+    """
+    path = home / '.codex/app-server-control/app-server-control.sock'
+    try:
+        link = path.lstat()
+        if stat.S_ISLNK(link.st_mode):
+            if link.st_uid != os.getuid():
+                raise Error(Failure.NATIVE_UNMANAGED)
+            target = path.resolve(strict=True)
+            parent = target.parent.stat()
+            if parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+                raise Error(Failure.NATIVE_UNMANAGED)
+            info = target.lstat()
+        else:
+            info = link
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise Error(Failure.NATIVE_UNMANAGED)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(3)
+            connection.connect(str(path))
+            credentials = connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+        pid, uid, _ = struct.unpack('3i', credentials)
+        if pid <= 0 or uid != os.getuid():
+            raise Error(Failure.NATIVE_UNMANAGED)
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # The observed server exited after the socket handshake.
+        try:
+            if select.select([descriptor], [], [], 0)[0]:
+                return
+            command = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
+            executable = Path(os.readlink(Path('/proc') / str(pid) / 'exe')
+                              .removesuffix(' (deleted)'))
+            release_root = home / '.codex/packages/standalone/releases'
+            native_binary = Path(CODEX).resolve()
+            known_binary = (executable == native_binary or
+                            (executable.is_relative_to(release_root) and
+                             executable.parts[-2:] == ('bin', 'codex')))
+            if (not known_binary or b'app-server' not in command or
+                    b'--listen' not in command or b'unix://' not in command):
+                raise Error(Failure.NATIVE_UNMANAGED)
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            if not select.select([descriptor], [], [], 5)[0]:
+                raise Error(Failure.TERMINATION)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise Error(Failure.NATIVE_UNMANAGED) from error
+
+
 def retire_server(home):
-    """Use native ownership checks; pidfd observes termination but never signals.
+    """Use native stop for managed servers and a verified pidfd for direct ones.
 
     Do not start/bootstrap here: native failed-start rollback cannot be scoped
     to our invocation when the desktop also bootstraps. Retirement alone clears
@@ -286,7 +346,8 @@ def retire_server(home):
             raise Error(Failure.NATIVE_BUSY) from error
         if result.returncode:
             if b'not managed by codex' in result.stderr:
-                raise Error(Failure.NATIVE_OWNER)
+                retire_unmanaged_server(home)
+                return
             if b'operation lock' in result.stderr:
                 raise Error(Failure.NATIVE_BUSY)
             raise Error(Failure.NATIVE)

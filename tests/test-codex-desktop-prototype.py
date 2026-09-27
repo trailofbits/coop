@@ -7,6 +7,7 @@ dbus-daemon, gnome-keyring-daemon, and secret-tool. All state is temporary.
 The native installer package is referenced, never modified or downloaded.
 """
 import json
+import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -15,9 +16,16 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location('keyring', ROOT / 'scripts/guest/codex-keyring.py')
+keyring = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(keyring)
 
 
 class Session:
@@ -338,6 +346,62 @@ class DesktopPrototypeTests(unittest.TestCase):
         self.assertCountEqual([result['status'] for result in results],
                               ['started', 'alreadyRunning'])
         self.assertEqual(results[0]['socketPath'], results[1]['socketPath'])
+
+    def test_direct_desktop_server_can_be_retired_before_unlock(self):
+        session = self.session('desktop')
+        server = subprocess.Popen(
+            [str(self.binary), '-c', 'features.code_mode_host=true',
+             'app-server', '--listen', 'unix://'],
+            env=session.env, cwd=self.root, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def cleanup_server():
+            if server.poll() is None:
+                server.terminate()
+            server.wait(timeout=5)
+        self.addCleanup(cleanup_server)
+        socket_path = self.home / 'app-server-control/app-server-control.sock'
+        deadline = time.monotonic() + 10
+        while not socket_path.exists():
+            self.assertIsNone(server.poll(), 'direct desktop server exited before readiness')
+            self.assertLess(time.monotonic(), deadline, 'direct desktop server did not start')
+            time.sleep(0.05)
+        result = subprocess.run(
+            [str(self.binary), 'app-server', 'daemon', 'stop'],
+            env=session.env, cwd=self.root, text=True, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not managed by codex', result.stderr)
+        with patch.object(keyring, 'CODEX', str(self.binary)), patch.dict(os.environ, session.env):
+            keyring.retire_server(self.root)
+        self.assertIsNotNone(server.wait(timeout=5))
+
+    def test_unmanaged_socket_does_not_authorize_signaling_another_process(self):
+        socket_path = self.home / 'app-server-control/app-server-control.sock'
+        socket_path.parent.mkdir()
+        server = subprocess.Popen(
+            [sys.executable, '-c',
+             'import socket,sys\n'
+             'server=socket.socket(socket.AF_UNIX)\n'
+             'server.bind(sys.argv[1])\n'
+             'server.listen()\n'
+             'while True:\n'
+             '    client,_=server.accept()\n'
+             '    client.close()\n', str(socket_path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        def cleanup_server():
+            if server.poll() is None:
+                server.terminate()
+            server.wait(timeout=5)
+        self.addCleanup(cleanup_server)
+        deadline = time.monotonic() + 5
+        while not socket_path.exists():
+            self.assertIsNone(server.poll())
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        with self.assertRaises(keyring.Error) as raised:
+            keyring.retire_unmanaged_server(self.root)
+        self.assertEqual(raised.exception.kind, keyring.Failure.NATIVE_UNMANAGED)
+        self.assertIsNone(server.poll())
 
     def test_native_reuses_existing_server_on_a_different_bus(self):
         first = self.session('first')

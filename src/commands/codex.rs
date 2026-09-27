@@ -49,5 +49,9 @@ pub(crate) fn cmd_codex_unlock(
             "Guest keyring support installed. Stop and start this VM, then rerun `coop codex-unlock`."
         );
     }
+    session.target.exec_with_stdin(
+        RemoteCommand::new().literal("sudo bash -s"),
+        guest::SCRIPT_CODEX_KEYRING_REFRESH.as_bytes().to_vec(),
+    )?;
     ssh::run_interactive_checked(&session, &["/usr/local/bin/codex-keyring".into()])
 }

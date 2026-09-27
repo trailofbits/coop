@@ -254,6 +254,18 @@ pub const SCRIPT_CODEX_KEYRING: &str = concat!(
     ")\n",
 );
 
+/// Refresh the helper on an existing guest without replacing its service or
+/// requiring another reboot. The source is embedded trusted code.
+pub const SCRIPT_CODEX_KEYRING_REFRESH: &str = concat!(
+    "set -euo pipefail\n",
+    "KEYRING_HELPER=$(mktemp /usr/local/bin/.codex-keyring.XXXXXX)\n",
+    "trap 'rm -f \"$KEYRING_HELPER\"' EXIT\n",
+    "cat >\"$KEYRING_HELPER\" <<'COOPKEYRINGEOF'\n",
+    include_str!("../scripts/guest/codex-keyring.py"),
+    "COOPKEYRINGEOF\nchmod 755 \"$KEYRING_HELPER\"\n",
+    "mv -f \"$KEYRING_HELPER\" /usr/local/bin/codex-keyring\n",
+);
+
 /// Packages installed into every golden image.
 ///
 /// `dbus-user-session`, `gnome-keyring`, and `libsecret-tools` back the

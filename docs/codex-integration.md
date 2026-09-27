@@ -59,8 +59,11 @@ by older Firecracker images, then requests the same stop/start cycle. See
 for the PAM and persistent-linger details.
 
 After a keyring crash or locked-to-unlocked transition, rerun `codex-unlock`
-and reconnect the desktop. Recovery retires the desktop server through Codex's
-native `daemon stop`; the desktop owns its next startup and updater. Closing or
+and reconnect the desktop. If the desktop connects before unlock, the command
+retires that guest app-server and completes the unlock; you do not need to
+restart the VM again. Recovery uses Codex's native `daemon stop` for managed
+servers and verifies the control socket owner before stopping a directly
+launched server. The desktop owns its next startup and updater. Closing or
 locking the keyring cannot erase credentials already cached in running clients.
 Concurrent OAuth refresh and logout across clients require real-account testing.
 Desktop SSH does not use coop's API-key/proxy secret forwarding.
