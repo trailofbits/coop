@@ -1510,7 +1510,9 @@ const CODEX_AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
 /// The VM is the isolation boundary, so Codex's own sandbox is redundant — and
 /// broken in the guest, which lacks a working bubblewrap. Bypassing by default
 /// gives `coop codex` parity with `coop claude`'s `bypassPermissions`. `ask`
-/// (from `--ask`) keeps Codex's sandbox and approval prompts.
+/// (from `--ask`) explicitly restores workspace sandboxing and approvals even
+/// when the guest's system config defaults to full access. Config overrides
+/// precede caller arguments so explicit caller settings still take precedence.
 ///
 /// `codex login` / `codex logout` never start a session, so there is nothing
 /// to sandbox and the flag is dropped regardless of `ask`. Codex does accept it
@@ -1522,8 +1524,21 @@ pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String>
     let is_auth_subcommand = args
         .first()
         .is_some_and(|arg| CODEX_AUTH_SUBCOMMANDS.contains(&arg.as_str()));
-    if !ask && !is_auth_subcommand {
-        args.insert(0, CODEX_BYPASS_FLAG.to_string());
+    if !is_auth_subcommand {
+        if ask {
+            args.splice(
+                0..0,
+                [
+                    "-c",
+                    "sandbox_mode=\"workspace-write\"",
+                    "-c",
+                    "approval_policy=\"on-request\"",
+                ]
+                .map(str::to_owned),
+            );
+        } else {
+            args.insert(0, CODEX_BYPASS_FLAG.to_string());
+        }
     }
     args
 }
@@ -2701,7 +2716,35 @@ mod tests {
     #[test]
     fn codex_launch_args_with_ask_keeps_sandbox() {
         let args = super::codex_launch_args(true, vec!["--model".into(), "gpt-5".into()]);
-        assert_eq!(args, vec!["--model", "gpt-5"]);
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"on-request\"",
+                "--model",
+                "gpt-5"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_launch_args_ask_preserves_caller_overrides_and_auth() {
+        let overrides = vec![
+            "--sandbox".into(),
+            "read-only".into(),
+            "-c".into(),
+            "approval_policy=\"never\"".into(),
+        ];
+        let args = super::codex_launch_args(true, overrides.clone());
+        assert_eq!(&args[4..], overrides);
+        for command in ["login", "logout"] {
+            assert_eq!(
+                super::codex_launch_args(true, vec![command.into()]),
+                vec![command]
+            );
+        }
     }
 
     #[test]

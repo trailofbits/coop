@@ -48,7 +48,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Install network test tools
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server python3-dbus
 
       - name: Release preflight regression tests
         run: python3 tests/test-preflight-release.py
@@ -58,6 +58,15 @@ jobs:
 
       - name: Codex account wrapper regression tests
         run: python3 tests/test-codex-account.py
+
+      - name: Codex permission defaults regression tests
+        run: python3 tests/test-codex-permissions.py
+
+      - name: Codex SSH session provisioning regression tests
+        run: python3 tests/test-codex-session.py
+
+      - name: Codex shared keyring readiness tests
+        run: /usr/bin/python3 tests/test-codex-keyring.py
 
       - name: Integration test — proxy reverse forwarding
         run: ./tests/integration-proxy-forward.sh

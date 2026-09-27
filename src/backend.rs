@@ -1635,6 +1635,12 @@ fn bootstrap_codex(
 ) -> Result<()> {
     let mut model_state = ModelState::load_or_default(inst)?;
     ensure_codex_remote_auth_consistent(cfg, inst, &model_state)?;
+    // Refresh existing images too, including API-key guests without copied
+    // Codex config. This system layer leaves explicit user choices intact.
+    session.target.exec_with_stdin(
+        RemoteCommand::new().literal("sudo sh -s"),
+        crate::guest::SCRIPT_CODEX_PERMISSIONS.as_bytes().to_vec(),
+    )?;
     // Proxy mode (issue #411): in remote mode with `[proxy.openai]` (or a
     // per-VM override) configured, start the host-side injecting proxy and
     // point Codex at it. The guest holds only the capability token; the real
@@ -1848,7 +1854,8 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
         RemoteCommand::new()
             .literal("test -x ")
             .arg(crate::guest::codex_account_bin())
-            .literal(" && command -v dbus-run-session >/dev/null 2>&1")
+            .literal(" && test -x /usr/local/bin/codex-keyring")
+            .literal(" && test -x /usr/local/libexec/coop-codex-keyring-pam")
             .literal(" && command -v gnome-keyring-daemon >/dev/null 2>&1")
             .literal(" && command -v secret-tool >/dev/null 2>&1"),
     );
@@ -1857,16 +1864,8 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
     }
 
     bail!(
-        "Codex ChatGPT account auth requires guest Secret Service support, \
-         but this VM image does not have it.\n\
-         Rebuild the image with `coop setup --rebuild` (or \
-         `coop setup --image <name> --rebuild` for a named image).\n\
-         A rebuild does not touch this VM's existing guest disk, and a \
-         restart reuses it. To pick up the rebuilt image, either \
-         `coop restore <vm> --image <image> --reprovision` (in place, \
-         keeping the instance), or destroy and recreate the VM. \
-         Alternatively, install `dbus-user-session`, `gnome-keyring`, and \
-         `libsecret-tools` in the running guest by hand."
+        "Codex ChatGPT account auth requires shared guest keyring support.\n\
+         Run `coop codex-unlock <vm>` to install it in place, then stop and start the VM."
     );
 }
 

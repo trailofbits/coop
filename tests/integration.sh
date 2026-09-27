@@ -1195,6 +1195,18 @@ test_codex_bin_path() {
 
     check_native_codex
 
+    # Empty temporary Codex homes exercise the provisioned system defaults,
+    # explicit --ask settings and desktop thread overrides without OAuth.
+    local permissions_probe
+    permissions_probe=$(cat "$(dirname "$0")/test-codex-permissions.py")
+    if guest_exec env COOP_TEST_CODEX=/usr/local/bin/codex \
+        python3 -c "$permissions_probe" ServerTests; then
+        pass "Codex system permissions and explicit overrides work through app-server"
+    else
+        fail "Codex system permissions and explicit overrides work through app-server" \
+            "stderr: $(guest_stderr)"
+    fi
+
     if coop_exec /usr/local/bin/codex --version >/dev/null; then
         pass "codex binary invocable via full path"
     else
@@ -1230,6 +1242,21 @@ test_codex_account_auth_support() {
     echo ""
     echo "=== Phase: codex account-auth (Secret Service) support ==="
 
+    # Earlier phases restarted the VM. This must work through fresh SSH using
+    # provisioned PAM/linger, without a manual loginctl or service-start repair.
+    if guest_exec sh -ec '
+        test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
+        test -f "/var/lib/systemd/linger/$(id -un)"
+        test -S "$XDG_RUNTIME_DIR/bus"
+        systemctl --user is-active --quiet gnome-keyring-daemon.service
+        busctl --user status org.freedesktop.secrets >/dev/null
+    '; then
+        pass "fresh SSH has a persistent user manager and shared Secret Service after reboot"
+    else
+        fail "fresh SSH has a persistent user manager and shared Secret Service after reboot" \
+            "stderr: $(guest_stderr)"
+    fi
+
     if guest_exec test -x /usr/local/bin/codex-account; then
         pass "codex-account wrapper exists"
     else
@@ -1240,7 +1267,7 @@ test_codex_account_auth_support() {
     # The wrapper is written unconditionally by the provision script, so the
     # packages behind it are what actually need asserting.
     local tool
-    for tool in dbus-run-session gnome-keyring-daemon secret-tool; do
+    for tool in systemctl gnome-keyring-daemon secret-tool codex-keyring /usr/local/libexec/coop-codex-keyring-pam; do
         if guest_exec command -v "$tool"; then
             pass "guest Secret Service tool present: $tool"
         else
@@ -1279,14 +1306,8 @@ test_codex_account_auth_support() {
             "stderr: $(guest_stderr)"
     fi
 
-    # Select keyring mode explicitly in the scratch CODEX_HOME while retaining
-    # the isolated managed config. This is the only place the
-    # `cli_auth_credentials_store` check, the D-Bus re-exec, the tool guards and
-    # the TTY guard actually execute — the assertions above all run on the
-    # passthrough branch.
-    #
-    # `coop exec` is not a TTY, so the wrapper must refuse rather than block on
-    # a password prompt. A hang here is the failure this asserts against.
+    # A scratch home selecting keyring mode must fail the managed-home policy
+    # instead of silently passing through to Codex and writing plaintext auth.
     if ! guest_exec sh -c 'printf "cli_auth_credentials_store = \"keyring\"\n" \
         > "$1/config.toml"' sh "$account_probe_codex_home"; then
         fail "prepare codex-account keyring probe config" \
@@ -1302,10 +1323,10 @@ test_codex_account_auth_support() {
         /usr/local/bin/codex-account --version </dev/null; then
         fail "codex-account enters keyring mode from the guest config" \
             "expected a non-TTY refusal, but the wrapper passed through to codex"
-    elif guest_stderr | grep -q "interactive TTY"; then
-        pass "codex-account enters keyring mode and refuses a non-TTY session"
+    elif guest_stderr | grep -q "managed ChatGPT keyring policy"; then
+        pass "codex-account enters keyring mode and refuses an unmanaged home"
     else
-        fail "codex-account enters keyring mode and refuses a non-TTY session" \
+        fail "codex-account enters keyring mode and refuses an unmanaged home" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -1396,6 +1417,35 @@ CFGEOF
     fi
     chatgpt_exec rm -rf "$alternate_codex_home"
 
+    # Model each incomplete session-support state independently. The helper
+    # and old boot marker remain, so each prerequisite must trigger migration.
+    local session_file
+    for session_file in /etc/tmpfiles.d/coop-codex-keyring.conf /var/lib/coop/codex-session-v1; do
+        if chatgpt_exec sudo rm "$session_file"; then
+            if chatgpt codex-unlock "$INSTANCE" </dev/null; then
+                fail "codex-unlock upgrades existing keyring session support" "expected restart instruction"
+            elif [[ "$HARNESS_ERR" == *"Guest keyring support installed. Stop and start"* ]]; then
+                pass "codex-unlock upgrades existing keyring session support"
+            else
+                fail "codex-unlock upgrades existing keyring session support" "stderr: $HARNESS_ERR"
+            fi
+            if chatgpt_exec /usr/local/bin/codex-keyring </dev/null; then
+                fail "session upgrade requires reboot" "helper unexpectedly succeeded"
+            elif guest_stderr | grep -q "installed this boot; restart"; then
+                pass "session upgrade requires reboot"
+            else
+                fail "session upgrade requires reboot" "stderr: $(guest_stderr)"
+            fi
+            if chatgpt stop "$INSTANCE" && chatgpt start "$INSTANCE"; then
+                pass "restart after session-support upgrade"
+            else
+                fail "restart after session-support upgrade" "stderr: $HARNESS_ERR"
+            fi
+        else
+            fail "prepare existing keyring session upgrade" "stderr: $(guest_stderr)"
+        fi
+    done
+
     # Positive witness for the supported path: the CODEX_HOME guard must not
     # reject a normal ChatGPT launch. This non-TTY call should get past that
     # guard and reach the existing keyring prompt check.
@@ -1403,7 +1453,7 @@ CFGEOF
         /usr/local/bin/codex-account --version </dev/null; then
         fail "chatgpt mode accepts an unset CODEX_HOME" \
             "expected the later non-TTY keyring refusal, but Codex ran"
-    elif guest_stderr | grep -q "interactive TTY"; then
+    elif guest_stderr | grep -q "run coop codex-unlock in an interactive terminal"; then
         pass "chatgpt mode accepts an unset CODEX_HOME"
     else
         fail "chatgpt mode accepts an unset CODEX_HOME" \

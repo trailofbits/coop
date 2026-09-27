@@ -385,12 +385,21 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Keep Codex's sandbox and approval prompts instead of bypassing them
+        /// Restore workspace sandboxing and on-request approvals (caller arguments override)
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Unlock the shared guest keyring for Codex desktop SSH connections
+    CodexUnlock {
+        /// Instance name (required if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
     },
     /// Gracefully stop the VM
     Stop {
@@ -1349,6 +1358,7 @@ pub fn run() -> Result<()> {
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
+        Commands::CodexUnlock { name } => commands::cmd_codex_unlock(&be, &cfg, name.as_ref()),
         Commands::Codex { name, ask, args } => {
             let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
             let args = codex_launch_args(ask, args);
@@ -2072,6 +2082,21 @@ token = "test-pat"
         );
         assert!(!ask, "ask defaults to false (sandbox bypassed)");
         assert_eq!(args, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn codex_unlock_preserves_vm_named_unlock() {
+        let cli = parse(&["codex", "unlock"]);
+        let super::Commands::Codex { name, args, .. } = cli.command else {
+            panic!("expected ordinary Codex launch");
+        };
+        assert_eq!(name.unwrap().as_str(), "unlock");
+        assert!(args.is_empty());
+        let cli = parse(&["codex-unlock", "unlock"]);
+        let super::Commands::CodexUnlock { name } = cli.command else {
+            panic!("expected CodexUnlock");
+        };
+        assert_eq!(name.unwrap().as_str(), "unlock");
     }
 
     #[test]

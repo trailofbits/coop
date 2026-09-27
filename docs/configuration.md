@@ -355,7 +355,8 @@ config means no proxy — credentials are forwarded into the guest exactly as
 before.
 
 Every golden image installs the Secret Service packages this mode needs
-(`dbus-user-session`, `gnome-keyring`, `libsecret-tools`) regardless of the
+(`dbus-user-session`, `gnome-keyring`, `libpam-gnome-keyring`,
+`libpam0g-dev`, `libpam-systemd`, `python3`, `python3-dbus`, `libsecret-tools`) regardless of the
 `auth` setting, because the image is built once and reused across configs —
 gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
 serve it.

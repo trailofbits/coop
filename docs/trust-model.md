@@ -24,6 +24,13 @@ tool is to run AI coding agents (Claude Code, Codex) with broad autonomy
   `--dangerously-bypass-approvals-and-sandbox` / `--dangerously-skip-permissions`
   unless the user passes `--ask`.
 
+Codex image provisioning and agent bootstrap also install unrestricted system
+defaults in `/etc/codex/config.toml` if absent. These apply to desktop SSH and
+bare Codex launches, independently of authentication mode. Existing system
+configuration, user/project overrides and explicit desktop thread choices are
+preserved. `coop codex --ask` explicitly restores workspace sandboxing and
+on-request approvals; it does not rely on the unrestricted system defaults.
+
 This is intentional and correct: there is **no privilege boundary inside the
 guest to protect** — the whole VM is the blast radius. The security model is
 "anything the agent does stays in the VM." Every rule below exists to keep that

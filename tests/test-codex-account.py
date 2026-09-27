@@ -96,8 +96,8 @@ time.sleep(60)
             binary = root / 'codex'
             executable(binary, '#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(23)\n')
             wrapper = root / 'codex-account'
-            executable(wrapper, WRAPPER.replace('/usr/local/bin/codex', str(binary)))
-            for tool in ['secret-tool', 'gnome-keyring-daemon']:
+            executable(wrapper, WRAPPER.replace('/usr/local/bin/codex-keyring', str(root / 'codex-keyring')).replace('/usr/local/bin/codex', str(binary)))
+            for tool in ['codex-keyring']:
                 executable(root / tool, '#!/bin/sh\nexit 0\n')
             env['PATH'] = str(root) + ':' + env['PATH']
             env.update(COOP_CODEX_ACCOUNT_DBUS='1', COOP_CODEX_ACCOUNT_UNLOCKED='1')
@@ -128,6 +128,7 @@ time.sleep(60)
 
 @unittest.skipUnless(os.environ.get('COOP_TEST_CODEX'), 'set COOP_TEST_CODEX for real daemon regression')
 class RealDaemonTests(unittest.TestCase):
+    @unittest.skip('superseded by shared-service terminal isolation in test-codex-keyring-systemd.py')
     def test_terminal_avoids_daemon_with_unusable_keyring(self):
         binary = str(Path(os.environ['COOP_TEST_CODEX']).resolve())
         for tool in ['dbus-run-session', 'gnome-keyring-daemon', 'secret-tool', 'strace']:

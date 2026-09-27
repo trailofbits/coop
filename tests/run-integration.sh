@@ -93,7 +93,8 @@ source_archive=""
 trap '[[ -z "$source_archive" ]] || rm -f "$source_archive"; ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
-scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$REMOTE_HOST:$REMOTE_DIR/"
+scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$SCRIPT_DIR/test-codex-permissions.py" \
+    "$REMOTE_HOST:$REMOTE_DIR/"
 
 # The full network gate builds on the remote, as does the proxy fallback.
 # Include tracked working-tree edits so the gate tests the same code as coop.
