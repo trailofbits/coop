@@ -2012,7 +2012,9 @@ pub(crate) fn cmd_resize(
         // instance itself (Lima must boot to validate regardless).
         be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
     } else if opts.start {
-        be.start_existing(cfg, stopped.instance())?;
+        let inst = stopped.instance().clone();
+        drop(stopped);
+        be.start_existing(cfg, &inst)?;
     }
 
     Ok(())
@@ -2321,10 +2323,11 @@ fn reprovision_instance(
     inst.set_image(image.clone()).with_context(partial)?;
 
     if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        let stopped = be.as_stopped(inst.clone()).with_context(partial)?;
         be.resize_disk(cfg, &stopped, previous_disk)
             .with_context(partial)?;
     }
+
+    drop(stopped);
 
     signal::check_shutdown().with_context(partial)?;
 

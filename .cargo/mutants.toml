@@ -153,6 +153,7 @@ exclude_re = [
 
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
+  "\\block_sibling_bounded\\b",
 
   # network.rs — the guest-to-guest isolation shell-outs. Each drives `bridge`
   # or `iptables` against a live br0, so a `--lib` test cannot observe whether

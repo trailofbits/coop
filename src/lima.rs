@@ -227,8 +227,8 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
 /// Stop a Lima instance that has already been verified as running.
 ///
-/// The caller's `RunningInstance` token proves the precondition, so
-/// this skips the live-state probe and only handles the shutdown.
+/// The caller re-probes state while holding the instance operation lock;
+/// this function only handles the shutdown command.
 pub fn stop_running(inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
 

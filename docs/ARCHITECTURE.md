@@ -106,14 +106,20 @@ flags — this is a load-bearing design choice (see
 
 - **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields
   and are minted by `as_running` / `as_stopped` after a state probe. They record
-  a point-in-time observation, not a durable liveness guarantee or operation
-  lock. Lima only mints `StoppedInstance` for a confirmed `Stopped` state;
-  absent, broken, unknown, and failed probes remain distinct outcomes.
+  a point-in-time observation. `StoppedInstance` also holds the per-instance
+  operation lock through stopped-only disk mutations. Lima only mints it for
+  confirmed `Stopped`; absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
   path calls first; it runs `cfg.validate()` so no VM starts on an invalid
   config.
+
+An instance operation lock is held from the stopped-state probe through disk
+resize, commit, or restore. Start, stop, and destroy acquire the same bounded
+lock. Its file is a sibling of the instance directory, so directory removal
+does not replace the lock inode. Allocation releases its directory lock before
+any instance operation lock is acquired.
 
 ## Command dispatch
 
@@ -217,9 +223,9 @@ Hold these when changing the code; the review agents check for their violation:
    filesystem escape. See [`trust-model.md`](trust-model.md).
 2. **Backend selection is compile-time.** Don't add a runtime backend enum;
    keep shared code correct for both Firecracker and Lima.
-3. **State-gated operations use fallible probes.** Route VM operations through
-   `RunningInstance`/`StoppedInstance` and `boot_preflight`; a token records
-   the state at the probe instant and does not serialize a later mutation.
+3. **State-gated operations use probes and locks.** Route VM operations through
+   `RunningInstance`/`StoppedInstance` and `boot_preflight`; the stopped token
+   holds the operation lock until the disk mutation is complete.
 4. **Value invariants live in constructors.** Parse into a newtype at the
    boundary; don't re-validate primitives downstream.
 5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in

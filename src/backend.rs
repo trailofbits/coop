@@ -15,6 +15,7 @@ use crate::config::{
     CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
     McpServerDef, NetworkConfig, VmMemory,
 };
+use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
@@ -143,13 +144,16 @@ impl RunningInstance {
 
 // ── Stopped instance ──────────────────────────────────────────
 
-/// Point-in-time observation that an instance was stopped. Construct via
-/// [`VmBackend::as_stopped`]. A token does not prevent a concurrent start.
+/// Observation that an instance was stopped, with an operation lock held.
+/// Construct via [`VmBackend::as_stopped`]. The constructor probes live state
+/// while holding the lock, so a concurrent lifecycle mutation waits until
+/// the token is dropped.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
 /// The field is private so callers cannot construct one without a backend probe.
 pub struct StoppedInstance {
     inst: Instance,
+    _lock: FileLock,
 }
 
 impl StoppedInstance {
@@ -157,13 +161,19 @@ impl StoppedInstance {
     ///
     /// Crate-private so only backend impls can construct one. Callers
     /// use [`VmBackend::as_stopped`] (which delegates here).
-    pub(crate) fn new(inst: Instance) -> Self {
-        Self { inst }
+    pub(crate) fn new(inst: Instance, lock: FileLock) -> Self {
+        Self { inst, _lock: lock }
     }
 
     pub fn instance(&self) -> &Instance {
         &self.inst
     }
+}
+
+const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+    lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 
 // ── SSH target ────────────────────────────────────────────────
@@ -783,8 +793,8 @@ pub trait VmBackend: std::fmt::Display {
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
-    /// Resize an instance observed stopped at the preceding probe. Callers
-    /// must serialize the probe and mutation against concurrent starts.
+    /// Resize a stopped instance's disk. The [`StoppedInstance`] holds the
+    /// operation lock from the state probe through this mutation.
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
@@ -814,8 +824,7 @@ pub trait VmBackend: std::fmt::Display {
     /// Save a stopped instance's filesystem as image `image` (the
     /// backend-specific disk artifacts only — the caller carries over
     /// the shared `template-config.json`). Takes a [`StoppedInstance`]
-    /// observation from the state probe. Callers must serialize the probe
-    /// and mutation against concurrent starts. Overwriting an
+    /// observation and lock through the filesystem copy. Overwriting an
     /// existing image is the caller's decision, gated before this call.
     fn commit_disk(
         &self,
@@ -904,6 +913,19 @@ impl std::fmt::Display for FirecrackerBackend {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    if inst.probe_running()? {
+        bail!("Instance '{}' is already running", inst.name);
+    }
+    boot_preflight(cfg)?;
+    let vm = crate::vm::FirecrackerVm::new(cfg, inst);
+    vm.configure()?;
+    crate::network::setup_tap(&cfg.network, inst)?;
+    let running = vm.start()?;
+    running.wait_for_boot()
+}
+
+#[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
@@ -917,6 +939,10 @@ impl VmBackend for FirecrackerBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        if inst.probe_running()? {
+            bail!("Instance '{}' is already running", inst.name);
+        }
         boot_preflight(cfg)?;
         // Mounts are handled after boot via rsync (not virtiofs).
         // Validation already happened in Mount::parse().
@@ -930,21 +956,22 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        boot_preflight(cfg)?;
-        let vm = crate::vm::FirecrackerVm::new(cfg, inst);
-        vm.configure()?;
-        crate::network::setup_tap(&cfg.network, inst)?;
-        let running = vm.start()?;
-        running.wait_for_boot()
+        let _operation = lock_instance_operation(inst)?;
+        start_firecracker_existing(cfg, inst)
     }
 
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
+        let _operation = lock_instance_operation(&inst)?;
+        if !inst.probe_running()? {
+            return Ok(());
+        }
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
         vm.stop()
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         if inst.probe_running()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
@@ -1025,7 +1052,7 @@ impl VmBackend for FirecrackerBackend {
         // every subsequent `coop start` and the instance would stay wedged.
         let previous = crate::vm::machine_resources(inst)?;
         crate::vm::set_machine_resources(inst, mem.map(VmMemory::get), vcpus)?;
-        if start_after && let Err(e) = self.start_existing(cfg, inst) {
+        if start_after && let Err(e) = start_firecracker_existing(cfg, inst) {
             if let Err(revert) =
                 crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
             {
@@ -1067,6 +1094,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
+        let lock = lock_instance_operation(&inst)?;
         if inst.probe_running()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
@@ -1075,7 +1103,7 @@ impl VmBackend for FirecrackerBackend {
                 inst.name,
             );
         }
-        Ok(StoppedInstance::new(inst))
+        Ok(StoppedInstance::new(inst, lock))
     }
 
     fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
@@ -1154,21 +1182,30 @@ impl VmBackend for LimaBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         crate::lima::create_and_start(cfg, inst, disk_gib, mounts)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         crate::lima::start_existing(cfg, inst)
     }
 
     fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
-        crate::lima::stop_running(&inst)
+        let _operation = lock_instance_operation(&inst)?;
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
+            Some(crate::lima::LimaState::Stopped) => Ok(()),
+            Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
+            None => bail!("Lima instance '{}' is absent", inst.name),
+        }
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         crate::lima::destroy(inst)?;
         if inst.dir.exists()
             && let Err(e) = fs::remove_dir_all(&inst.dir)
@@ -1264,12 +1301,13 @@ impl VmBackend for LimaBackend {
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
+        let lock = lock_instance_operation(&inst)?;
         match crate::lima::probe_state(&inst)? {
             Some(crate::lima::LimaState::Stopped) => {}
             Some(state) => bail!("Lima instance '{}' is {state}, not stopped", inst.name),
             None => bail!("Lima instance '{}' is absent, not stopped", inst.name),
         }
-        Ok(StoppedInstance::new(inst))
+        Ok(StoppedInstance::new(inst, lock))
     }
 
     fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
@@ -4112,6 +4150,160 @@ fn gh_auth_token() -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn start_rejects_unknown_pid_before_boot_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
+        std::fs::write(inst.rootfs_path(), "disk sentinel").unwrap();
+
+        let error = FirecrackerBackend::new()
+            .start_existing(&CoopConfig::default(), &inst)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(inst.rootfs_path()).unwrap(),
+            "disk sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(inst.pid_file_path()).unwrap(),
+            "invalid-pid"
+        );
+    }
+
+    #[test]
+    fn lima_stop_reprobes_state_without_rebuilding_ssh_target() {
+        let Ok(root) = std::env::var("COOP_TEST_LIMA_STOP_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let script = root.path().join("limactl");
+            std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_STOP_CALLS\"\ncase \"$1\" in\n list) echo '{\"name\":\"coop-test\",\"status\":\"Running\"}';;\n stop) exit 0;;\nesac\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::lima_stop_reprobes_state_without_rebuilding_ssh_target",
+                ])
+                .env("COOP_TEST_LIMA_STOP_ROOT", root.path())
+                .env("COOP_TEST_LIMA_STOP_CALLS", root.path().join("calls"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+            assert_eq!(
+                calls.lines().filter(|line| *line == "list --json").count(),
+                1
+            );
+            assert!(calls.contains("stop coop-test"), "{calls}");
+            return;
+        };
+
+        let root = PathBuf::from(root);
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        LimaBackend::new()
+            .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stop_reprobes_after_acquiring_operation_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let cfg = CoopConfig::default();
+        let backend = FirecrackerBackend::new();
+        let target = backend.ssh_target(&cfg, &inst).unwrap();
+        let lock = lock_instance_operation(&inst).unwrap();
+        let stale_running = RunningInstance::new(inst, target);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            done_tx.send(backend.stop(&cfg, stale_running)).unwrap();
+        });
+
+        // Another stop completed before this token reached the operation lock.
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stopped_probe_holds_lock_until_disk_mutation_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let disk = inst.dir.join("rootfs.ext4");
+        std::fs::write(&disk, "before").unwrap();
+        let backend = FirecrackerBackend::new();
+        let stopped = backend.as_stopped(inst.clone()).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut cfg = CoopConfig::default();
+        cfg.claude.config_dir = ConfigDir::Custom(crate::config::ConfigPath::new(
+            root.path().join("missing-claude-config"),
+        ));
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(backend.start_existing(&cfg, &inst).is_err())
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        std::fs::write(&disk, "after").unwrap();
+        drop(stopped);
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        thread.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&disk).unwrap(), "after");
+    }
 
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
