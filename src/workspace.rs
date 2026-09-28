@@ -462,8 +462,8 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
 
 /// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — no surprise SSH failure inside.
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature. The guest can still stop before SSH connects.
 pub fn push(
     running: &RunningInstance,
     dir: Option<&str>,
@@ -502,8 +502,8 @@ pub fn push(
 
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — no surprise SSH failure inside.
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature. The guest can still stop before SSH connects.
 pub fn pull(
     running: &RunningInstance,
     dir: Option<&str>,
@@ -611,8 +611,8 @@ pub enum EditorKind {
 
 /// Generate SSH config and launch an editor connected over SSH.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — the editor needs a live SSH target.
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature — the editor needs an SSH target.
 pub fn open_editor(
     running: &RunningInstance,
     project: Option<&str>,

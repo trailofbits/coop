@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
 use std::num::{NonZeroU8, NonZeroU16};
 use std::path::{Path, PathBuf};
@@ -105,16 +105,14 @@ impl EnvForward {
 
 // ── Running instance ──────────────────────────────────────────
 
-/// Proof that an instance is currently running. Construct via
+/// Point-in-time observation that an instance was running. Construct via
 /// [`VmBackend::as_running`] — the constructor is the single place
-/// that probes live state, so operations taking a `RunningInstance`
-/// can rely on the precondition without re-checking. Carries the
+/// that probes live state. This token does not prevent a concurrent state
+/// transition. Carries the
 /// SSH target so connection details are always available without
 /// further fallible lookups.
 ///
-/// Fields are private so a `RunningInstance` cannot be forged; the
-/// only way to obtain one is through a backend method that verified
-/// the instance is alive.
+/// Fields are private so callers cannot construct one without a backend probe.
 pub struct RunningInstance {
     inst: Instance,
     target: SshTarget,
@@ -145,16 +143,11 @@ impl RunningInstance {
 
 // ── Stopped instance ──────────────────────────────────────────
 
-/// Proof that an instance is currently *not* running. Construct via
-/// [`VmBackend::as_stopped`] — like [`RunningInstance`], the
-/// constructor is the single place that probes live state, so
-/// operations taking a `StoppedInstance` can rely on the precondition
-/// without re-checking.
+/// Point-in-time observation that an instance was stopped. Construct via
+/// [`VmBackend::as_stopped`]. A token does not prevent a concurrent start.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
-/// The field is private so a `StoppedInstance` cannot be forged; the
-/// only way to obtain one is through a backend method that verified
-/// the instance is not alive.
+/// The field is private so callers cannot construct one without a backend probe.
 pub struct StoppedInstance {
     inst: Instance,
 }
@@ -785,16 +778,13 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    /// Stop a running instance. Consumes the `RunningInstance` proof
-    /// so the type system witnesses that the precondition held when
-    /// the call was made.
+    /// Stop an instance observed running at the preceding probe.
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
-    /// Resize a stopped instance's disk. Takes a [`StoppedInstance`]
-    /// proof so the "must be stopped" precondition is enforced by the
-    /// type system rather than a runtime guard.
+    /// Resize an instance observed stopped at the preceding probe. Callers
+    /// must serialize the probe and mutation against concurrent starts.
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
@@ -824,8 +814,8 @@ pub trait VmBackend: std::fmt::Display {
     /// Save a stopped instance's filesystem as image `image` (the
     /// backend-specific disk artifacts only — the caller carries over
     /// the shared `template-config.json`). Takes a [`StoppedInstance`]
-    /// proof so the "must be stopped" precondition (filesystem
-    /// consistency) is enforced by the type system. Overwriting an
+    /// observation from the state probe. Callers must serialize the probe
+    /// and mutation against concurrent starts. Overwriting an
     /// existing image is the caller's decision, gated before this call.
     fn commit_disk(
         &self,
@@ -857,9 +847,9 @@ pub trait VmBackend: std::fmt::Display {
     /// clone before calling.
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>>;
     /// Probe the live state of `inst` and return a [`StoppedInstance`]
-    /// if it is not running. The dual of [`Self::as_running`] — used
+    /// only when it is confirmed stopped. The dual of [`Self::as_running`] — used
     /// to gate operations (like `resize_disk`) that require the VM to
-    /// be stopped. Returns `Err` when the instance is running.
+    /// be stopped. Returns `Err` for running, absent, unknown, or failed probes.
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance>;
     /// Render a human-readable status report for a running instance.
     /// Takes `&RunningInstance` so the precondition is part of the
@@ -1132,24 +1122,24 @@ impl VmBackend for FirecrackerBackend {
 
 // ── Lima backend ──────────────────────────────────────────────
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub struct LimaBackend;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl LimaBackend {
     pub fn new() -> Self {
         Self
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl std::fmt::Display for LimaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("lima")
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
@@ -1259,21 +1249,24 @@ impl VmBackend for LimaBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !crate::lima::is_running(&inst) {
-            return Ok(None);
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Running) => {}
+            Some(crate::lima::LimaState::Stopped) => return Ok(None),
+            None => bail!("Lima instance '{}' is absent", inst.name),
+            Some(state) => bail!(
+                "Lima instance '{}' is {state}; running state is unknown",
+                inst.name
+            ),
         }
         let target = crate::lima::ssh_target(cfg, &inst)?;
         Ok(Some(RunningInstance::new(inst, target)))
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
-        if crate::lima::is_running(&inst) {
-            bail!(
-                "Instance '{}' is running — stop it first with \
-                 `coop stop {}`",
-                inst.name,
-                inst.name,
-            );
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Stopped) => {}
+            Some(state) => bail!("Lima instance '{}' is {state}, not stopped", inst.name),
+            None => bail!("Lima instance '{}' is absent, not stopped", inst.name),
         }
         Ok(StoppedInstance::new(inst))
     }

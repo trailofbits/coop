@@ -1804,15 +1804,13 @@ pub(crate) fn prepare_session_from_target(
 }
 
 pub(crate) fn cmd_stop(
-    be: &backend::PlatformBackend,
+    be: &impl backend::VmBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Probe live state once. The `RunningInstance` proof flows into
-    // `be.stop`, so the type system witnesses that we only ask the
-    // backend to stop something that was actually running.
-    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
+    // Keep probe errors distinct from confirmed stopped state.
+    if let Some(running) = be.as_running(cfg, inst.clone())? {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.

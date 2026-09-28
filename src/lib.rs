@@ -32,7 +32,10 @@ mod remote_command;
 mod secret_store;
 mod sha256_hash;
 // Lima is an interactive CLI workflow — stderr output is intentional user communication.
-#[cfg_attr(not(target_os = "macos"), expect(dead_code, reason = "Lima-only"))]
+#[cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(dead_code, reason = "Lima-only")
+)]
 #[expect(
     clippy::print_stderr,
     reason = "lima setup is interactive CLI — stderr is user communication"

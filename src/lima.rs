@@ -110,16 +110,20 @@ pub fn create_and_start(
     };
 
     // Clean up leftover Lima instance from a previous failed start
-    if let Some(state) = lima_state(&inst.name) {
+    if let Some(state) = lima_state(&inst.name)? {
+        if matches!(state, LimaState::Unknown(_)) {
+            bail!("Lima instance '{name}' has state {state}; refusing to replace it");
+        }
         tracing::warn!(
             "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
-        if let Err(e) = Command::new("limactl")
+        let deletion = Command::new("limactl")
             .args(["delete", "--force", &name])
             .status()
-        {
-            tracing::debug!("Failed to force-delete stale instance (non-fatal): {e}");
+            .context("Failed to delete stale Lima instance")?;
+        if !deletion.success() {
+            bail!("Failed to delete stale Lima instance '{name}'");
         }
     }
 
@@ -178,8 +182,10 @@ pub fn create_and_start(
 pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     let name = lima_name(inst);
 
-    if is_running(inst) {
-        bail!("Lima instance '{name}' is already running");
+    match lima_state(&inst.name)? {
+        Some(LimaState::Stopped) => {}
+        Some(state) => bail!("Lima instance '{name}' is {state}, not stopped"),
+        None => bail!("Lima instance '{name}' is absent"),
     }
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
@@ -247,16 +253,21 @@ pub fn destroy(inst: &Instance) -> Result<()> {
     tracing::info!("Deleting Lima instance '{name}'");
 
     // If the instance doesn't exist in Lima, nothing to do
-    if lima_state(&inst.name).is_none() {
+    let state = lima_state(&inst.name)?;
+    if state.is_none() {
         tracing::debug!("Lima instance '{name}' not found — already deleted");
         return Ok(());
     }
 
     // Stop first if running
-    if is_running(inst)
+    if state == Some(LimaState::Running)
         && let Err(e) = Command::new("limactl").args(["stop", &name]).status()
     {
         tracing::debug!("Failed to stop Lima instance '{name}' before delete (non-fatal): {e}");
+    }
+
+    if let Some(LimaState::Unknown(status)) = &state {
+        bail!("Lima instance '{name}' has unknown state '{status}' — refusing delete");
     }
 
     let status = Command::new("limactl")
@@ -513,7 +524,7 @@ pub fn disk_path(inst: &Instance) -> Result<PathBuf> {
 /// preserves anything else verbatim in `Unknown` so a new Lima state
 /// can't be silently misread as "not running".
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LimaState {
+pub(crate) enum LimaState {
     Running,
     Stopped,
     Broken,
@@ -527,13 +538,6 @@ impl LimaState {
             "Stopped" => Self::Stopped,
             "Broken" => Self::Broken,
             other => Self::Unknown(other.to_string()),
-        }
-    }
-
-    fn is_running(&self) -> bool {
-        match self {
-            Self::Running => true,
-            Self::Stopped | Self::Broken | Self::Unknown(_) => false,
         }
     }
 }
@@ -551,7 +555,11 @@ impl std::fmt::Display for LimaState {
 
 /// Check if a Lima instance is running.
 pub fn is_running(inst: &Instance) -> bool {
-    lima_state(&inst.name).is_some_and(|s| s.is_running())
+    matches!(lima_state(&inst.name), Ok(Some(LimaState::Running)))
+}
+
+pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
+    lima_state(&inst.name)
 }
 
 /// Get a human-readable status string.
@@ -585,7 +593,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         cfg.ssh_key_path().display(),
     );
 
-    if state.is_running()
+    if matches!(state, LimaState::Running)
         && let Ok(target) = ssh_target(cfg, inst)
         && let Some(usage) = crate::backend::query_resource_usage(&target)
     {
@@ -1870,11 +1878,16 @@ fn lima_home() -> Result<PathBuf> {
     Ok(home.join(".lima"))
 }
 
-/// Get the lifecycle state for a Lima instance, or `None` if the
-/// instance is not present in `limactl list`.
-fn lima_state(name: &InstanceName) -> Option<LimaState> {
-    let info = limactl_info(name).ok()?;
-    info["status"].as_str().map(LimaState::from_status_str)
+/// Get the lifecycle state for a Lima instance. Absence is distinct from
+/// malformed output and a failed `limactl` probe.
+fn lima_state(name: &InstanceName) -> Result<Option<LimaState>> {
+    let Some(info) = limactl_list_entry_optional(&lima_name_for(name))? else {
+        return Ok(None);
+    };
+    let status = info["status"]
+        .as_str()
+        .context("Lima status is missing or invalid")?;
+    Ok(Some(LimaState::from_status_str(status)))
 }
 
 /// Get full instance info from limactl for a coop instance.
@@ -1885,13 +1898,21 @@ fn limactl_info(name: &InstanceName) -> Result<serde_json::Value> {
 /// Find a `limactl list --json` entry by its Lima VM name (the
 /// `coop-<instance>` form, or the special `coop-builder`).
 fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
+    limactl_list_entry_optional(lima_name)?
+        .with_context(|| format!("Lima instance '{lima_name}' not found in limactl list"))
+}
+
+fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
     let output = Command::new("limactl")
         .args(["list", "--json"])
         .output()
         .context("Failed to run limactl list")?;
 
     if !output.status.success() {
-        bail!("limactl list failed");
+        bail!(
+            "limactl list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     // limactl list --json outputs one JSON object per line (NDJSON)
@@ -1908,17 +1929,129 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
             )
         })?;
         if val["name"].as_str() == Some(lima_name) {
-            return Ok(val);
+            return Ok(Some(val));
         }
     }
 
-    bail!("Lima instance '{lima_name}' not found in limactl list")
+    Ok(None)
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
+    use crate::backend::VmBackend as _;
+
+    #[test]
+    fn backend_lima_state_gates_disk_and_metadata_mutations() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(mode) = std::env::var("COOP_TEST_LIMA_STATE") else {
+            for mode in [
+                "nonzero",
+                "malformed",
+                "missing_status",
+                "absent",
+                "Broken",
+                "Restarting",
+                "Running",
+                "Stopped",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let script = root.path().join("limactl");
+                std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_CALLS\"\ncase \"$1\" in\n list) case \"$COOP_TEST_LIMA_STATE\" in\n nonzero) exit 2;;\n malformed) echo 'bad json';;\n missing_status) echo '{\"name\":\"coop-test\"}';;\n absent) :;;\n *) printf '{\"name\":\"coop-test\",\"status\":\"%s\",\"sshLocalPort\":2222}\\n' \"$COOP_TEST_LIMA_STATE\";;\n esac;;\n stop) exit 0;;\n delete) rm -rf \"$LIMA_HOME/coop-test\";;\nesac\n").unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "lima::tests::backend_lima_state_gates_disk_and_metadata_mutations",
+                    ])
+                    .env("COOP_TEST_LIMA_STATE", mode)
+                    .env("COOP_TEST_LIMA_ROOT", root.path())
+                    .env("COOP_TEST_LIMA_CALLS", root.path().join("calls"))
+                    .env("LIMA_HOME", root.path().join("lima"))
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            root.path().display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(std::env::var("COOP_TEST_LIMA_ROOT").unwrap());
+        run_lima_state_case(&root, &mode);
+    }
+
+    fn run_lima_state_case(root: &Path, mode: &str) {
+        let cfg = CoopConfig::default();
+        let backend = crate::backend::LimaBackend::new();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let metadata = inst.dir.join("instance.json");
+        std::fs::write(&metadata, "metadata sentinel").unwrap();
+        let lima_dir = root.join("lima/coop-test");
+        std::fs::create_dir_all(&lima_dir).unwrap();
+        let disk = lima_dir.join("disk");
+        std::fs::write(&disk, "disk sentinel").unwrap();
+        std::fs::write(lima_dir.join("lima.yaml"), "disk: \"1GiB\"\n").unwrap();
+
+        let stopped = backend.as_stopped(inst.clone());
+        if mode == "Stopped" {
+            let stopped = stopped.unwrap();
+            backend
+                .resize_disk(&cfg, &stopped, crate::config::GiB::new(1).unwrap())
+                .unwrap();
+            assert_eq!(std::fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+        } else {
+            assert!(stopped.is_err(), "{mode} minted StoppedInstance");
+            assert_eq!(std::fs::read_to_string(&disk).unwrap(), "disk sentinel");
+        }
+        let running = backend.as_running(&cfg, inst.clone());
+        match mode {
+            "Running" => assert!(running.unwrap().is_some()),
+            "Stopped" => assert!(running.unwrap().is_none()),
+            "absent" => {
+                let error = running.err().unwrap().to_string();
+                assert!(error.contains("absent"), "{error}");
+                let error = crate::commands::cmd_stop(&backend, &cfg, &inst)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("absent"), "{error}");
+            }
+            _ => assert!(running.is_err(), "{mode} was treated as stopped"),
+        }
+
+        let destroyed = backend.destroy_instance(&cfg, &inst);
+        if matches!(
+            mode,
+            "nonzero" | "malformed" | "missing_status" | "Restarting"
+        ) {
+            assert!(destroyed.is_err(), "{mode} removed metadata");
+            assert_eq!(
+                std::fs::read_to_string(&metadata).unwrap(),
+                "metadata sentinel"
+            );
+            assert!(disk.exists());
+        } else {
+            assert!(destroyed.is_ok(), "{mode}: {destroyed:?}");
+            assert!(!metadata.exists());
+        }
+    }
 
     struct RestoreEnv {
         lima_home: Option<std::ffi::OsString>,
@@ -2485,14 +2618,6 @@ Host h
             LimaState::from_status_str("Restarting"),
             LimaState::Unknown("Restarting".to_string()),
         );
-    }
-
-    #[test]
-    fn lima_state_only_running_is_running() {
-        assert!(LimaState::Running.is_running());
-        assert!(!LimaState::Stopped.is_running());
-        assert!(!LimaState::Broken.is_running());
-        assert!(!LimaState::Unknown("Restarting".to_string()).is_running());
     }
 
     #[test]

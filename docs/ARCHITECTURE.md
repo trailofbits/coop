@@ -104,10 +104,11 @@ Two lifecycle machines are encoded in the type system rather than in runtime
 flags — this is a load-bearing design choice (see
 [`code-style.md`](code-style.md#type-state-for-lifecycles)):
 
-- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) are unforgeable
-  liveness proofs with private fields, minted only by the probes `as_running`
-  / `as_stopped`. Operations that require a live (or stopped) VM take the proof
-  by value, so the precondition is checked once and then witnessed by the type.
+- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields
+  and are minted by `as_running` / `as_stopped` after a state probe. They record
+  a point-in-time observation, not a durable liveness guarantee or operation
+  lock. Lima only mints `StoppedInstance` for a confirmed `Stopped` state;
+  absent, broken, unknown, and failed probes remain distinct outcomes.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
@@ -216,9 +217,9 @@ Hold these when changing the code; the review agents check for their violation:
    filesystem escape. See [`trust-model.md`](trust-model.md).
 2. **Backend selection is compile-time.** Don't add a runtime backend enum;
    keep shared code correct for both Firecracker and Lima.
-3. **Liveness is a type, not a flag.** Route VM operations through
-   `RunningInstance`/`StoppedInstance` and `boot_preflight`, not ad-hoc
-   `if is_running` checks.
+3. **State-gated operations use fallible probes.** Route VM operations through
+   `RunningInstance`/`StoppedInstance` and `boot_preflight`; a token records
+   the state at the probe instant and does not serialize a later mutation.
 4. **Value invariants live in constructors.** Parse into a newtype at the
    boundary; don't re-validate primitives downstream.
 5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in
