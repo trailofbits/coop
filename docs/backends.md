@@ -38,7 +38,7 @@ Each instance is a Lima VM created with `limactl start` using the fast-start tem
 The Lima template configures:
 - `vmType: "vz"` (Virtualization.framework, not QEMU)
 - Rosetta enabled for x86_64 binary translation on Apple Silicon
-- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides.
+- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides. Host and guest paths are serialized as YAML scalars so special characters remain part of the path.
 - Lima's built-in containerd disabled (Docker is installed in the guest instead)
 
 ### Resize (disk, memory, vCPUs)

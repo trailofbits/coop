@@ -48,6 +48,7 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
+serde_yaml = "0.9"
 
 [lints]
 workspace = true
