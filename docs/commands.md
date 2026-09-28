@@ -640,6 +640,9 @@ coop push [NAME] [FLAGS]
 | `--force` | Overwrite guest changes without confirmation |
 | `--exclude-git` | Skip the `.git/` directory in this transfer |
 
+Without `--force`, push refuses to transfer if the guest Git status check fails
+or reports changes. Pull does the same for a failing or dirty local Git status.
+
 ```
 coop push
 coop push my-project --dir ./src --force

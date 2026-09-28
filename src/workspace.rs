@@ -979,15 +979,15 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // commits are the real signal that an agent has done work the host
     // doesn't yet know about.
     let check_cmd = RemoteCommand::new()
-        .literal("if [ -d ")
+        .literal("if [ -e ")
         .arg(guest_path)
         .literal("/.git ]; then cd ")
         .arg(guest_path)
         .literal(
-            " && \
-             git status --porcelain --untracked-files=no && \
+            " || exit 20; \
+             git status --porcelain --untracked-files=no || exit 21; \
              if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
-                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null); \
+                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null) || exit 22; \
                  if [ \"${ahead:-0}\" -gt 0 ]; then \
                      echo \"AHEAD $ahead\"; \
                  fi; \
@@ -1003,6 +1003,19 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
         .args(&args)
         .output()
         .context("Failed to check guest workspace status")?;
+
+    if !output.status.success() {
+        let reason = match output.status.code() {
+            Some(20) => "guest workspace directory could not be opened",
+            Some(21) => "guest git status failed",
+            Some(22) => "guest git rev-list failed",
+            _ => "SSH or guest workspace status probe failed",
+        };
+        bail!(
+            "Cannot determine guest workspace cleanliness: {reason}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -1027,6 +1040,13 @@ fn check_local_dirty(dest: &Path) -> Result<()> {
         .args(["status", "--porcelain"])
         .output()
         .context("Failed to check local git status")?;
+
+    if !output.status.success() {
+        bail!(
+            "Cannot determine local workspace cleanliness: git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -1346,7 +1366,10 @@ fn launch_editor(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::num::NonZeroU16;
+
     use super::*;
+    use crate::backend::{Hostname, SshUser};
     use crate::config::{ImageName, InstanceIndex, InstanceName};
     use proptest::prelude::*;
 
@@ -1356,6 +1379,131 @@ mod tests {
             index: InstanceIndex::new(0).expect("0 is in range"),
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
+        }
+    }
+
+    #[test]
+    fn failed_or_dirty_status_prevents_transfer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(mode) = std::env::var("COOP_TEST_CLEANLINESS_MODE") else {
+            for mode in [
+                "guest_git_failure",
+                "guest_git_file_failure",
+                "ssh_failure",
+                "guest_dirty",
+                "clean",
+                "force",
+                "local_git_failure",
+                "local_dirty",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let ssh = temp.path().join("ssh");
+                fs::write(&ssh, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_CAPTURE\"\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) for last; do :; done; exec sh -c \"$last\";;\n ssh_failure) exit 255;;\n guest_dirty) echo ' M guest-file'; exit 0;;\n clean|force) case \"$*\" in *'which rsync'*) exit 1;; esac; cat >/dev/null; exit 0;;\nesac\n").unwrap();
+                fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+                let git = temp.path().join("git");
+                fs::write(&git, "#!/bin/sh\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure|local_git_failure) exit 42;;\n local_dirty) echo ' M local-file'; exit 0;;\nesac\n").unwrap();
+                fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+                let path = format!(
+                    "{}:{}",
+                    temp.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "workspace::tests::failed_or_dirty_status_prevents_transfer",
+                    ])
+                    .env("COOP_TEST_CLEANLINESS_MODE", mode)
+                    .env("COOP_TEST_CLEANLINESS_ROOT", temp.path())
+                    .env("COOP_TEST_CAPTURE", temp.path().join("ssh-calls"))
+                    .env("PATH", path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let calls = fs::read_to_string(temp.path().join("ssh-calls")).unwrap_or_default();
+                if mode == "clean" || mode == "force" {
+                    assert!(calls.contains("tar xf - -C"), "{calls}");
+                    if mode == "force" {
+                        assert!(!calls.contains("git status"), "{calls}");
+                    }
+                } else {
+                    assert!(!calls.contains("tar xf - -C"), "{mode}: {calls}");
+                    assert!(!calls.contains("which rsync"), "{mode}: {calls}");
+                }
+            }
+            return;
+        };
+
+        let root = PathBuf::from(std::env::var("COOP_TEST_CLEANLINESS_ROOT").unwrap());
+        run_cleanliness_case(&root, &mode);
+    }
+
+    fn run_cleanliness_case(root: &Path, mode: &str) {
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "content").unwrap();
+        let guest = root.join("guest");
+        fs::create_dir(&guest).unwrap();
+        if mode == "guest_git_file_failure" {
+            fs::write(guest.join(".git"), "gitdir: /tmp/worktree\n").unwrap();
+        } else {
+            fs::create_dir_all(guest.join(".git")).unwrap();
+        }
+        let inst = temp_instance(&root.join("instance"));
+        WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: source.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        let running = RunningInstance::new(inst, target);
+        let result = if mode.starts_with("local_") {
+            fs::create_dir(source.join(".git")).unwrap();
+            pull(&running, None, false, false)
+        } else {
+            push(&running, None, mode == "force", false)
+        };
+        match mode {
+            "clean" | "force" => assert!(result.is_ok(), "{result:?}"),
+            "guest_git_failure" | "guest_git_file_failure" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("guest git status failed")
+            ),
+            "ssh_failure" => assert!(result.unwrap_err().to_string().contains("SSH or guest")),
+            "guest_dirty" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Guest workspace has changes")
+            ),
+            "local_git_failure" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("local workspace cleanliness")
+            ),
+            "local_dirty" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Local directory has uncommitted")
+            ),
+            _ => unreachable!(),
         }
     }
 
