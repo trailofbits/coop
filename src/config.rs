@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -2681,21 +2680,42 @@ impl Instance {
     /// (guards against PID reuse). Removes stale PID files as a side
     /// effect when the process is gone or belongs to something else.
     pub fn is_running(&self) -> bool {
-        let pid_path = self.pid_file_path();
-        if !pid_path.exists() {
-            return false;
-        }
-        let Ok(pid_str) = fs::read_to_string(&pid_path) else {
-            return false;
-        };
-        let Ok(pid) = pid_str.trim().parse::<u32>() else {
-            return false;
-        };
+        self.probe_running().unwrap_or_else(|error| {
+            tracing::warn!(
+                "Could not determine whether instance '{}' is running: {error}",
+                self.name
+            );
+            false
+        })
+    }
 
-        let alive = Cmd::new("kill")
-            .args(["-0", &pid.to_string()])
-            .sudo()
-            .status_ok();
+    /// Fallible Firecracker state probe for operations that must distinguish
+    /// confirmed absence from a failed liveness or identity check.
+    pub fn probe_running(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid_str = match fs::read_to_string(&pid_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+        let pid: u32 = pid_str
+            .trim()
+            .parse()
+            .context("Invalid Firecracker PID file")?;
+        let pid_i32 = i32::try_from(pid).context("Firecracker PID is out of range")?;
+        if pid_i32 <= 0 {
+            bail!("Firecracker PID must be positive");
+        }
+        // SAFETY: signal 0 only probes liveness; it does not signal the process.
+        let alive = if unsafe { libc::kill(pid_i32, 0) } == 0 {
+            true
+        } else {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => false,
+                Some(libc::EPERM) => true,
+                _ => bail!("Failed to probe Firecracker PID {pid}"),
+            }
+        };
 
         if !alive {
             tracing::debug!(
@@ -2705,10 +2725,16 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        if !is_firecracker_process(pid) {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).with_context(|| {
+            format!("Failed to read Firecracker process identity for PID {pid}")
+        })?;
+        if !cmdline
+            .windows(b"firecracker".len())
+            .any(|w| w == b"firecracker")
+        {
             tracing::debug!(
                 "Removing stale PID file for instance '{}' \
                  (PID {pid} is not a Firecracker process)",
@@ -2717,26 +2743,11 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
-}
-
-/// Check if a PID belongs to a Firecracker process by reading
-/// `/proc/{pid}/cmdline`. Returns `false` if the file is unreadable
-/// or the command line does not contain "firecracker".
-fn is_firecracker_process(pid: u32) -> bool {
-    let Ok(cmdline) = Cmd::new("cat")
-        .arg(format!("/proc/{pid}/cmdline"))
-        .sudo()
-        .capture()
-    else {
-        return false;
-    };
-    // /proc/pid/cmdline uses NUL as separator
-    cmdline.contains("firecracker")
 }
 
 // ── Defaults ──────────────────────────────────────────────────
@@ -3187,37 +3198,6 @@ mod tests {
             pid_file_kept,
             "PID file should be preserved while firecracker is running"
         );
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_dead_pid() {
-        assert!(!is_firecracker_process(DEAD_PID));
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_live_non_firecracker_pid() {
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(!result);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_true_for_firecracker_named_pid() {
-        let mut child = spawn_firecracker_like();
-        let pid = child.id();
-        wait_for_firecracker_cmdline(pid);
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(result);
     }
 
     // ── Allocate instance ────────────────────────────────────

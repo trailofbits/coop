@@ -1809,7 +1809,7 @@ pub(crate) fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Keep probe errors distinct from confirmed stopped state.
+    // Preserve probe errors: unknown state cannot be reported as stopped.
     if let Some(running) = be.as_running(cfg, inst.clone())? {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
@@ -2554,6 +2554,44 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    use crate::backend::VmBackend as _;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_reports_unknown_process_state_and_preserves_pid_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
+        let disk = inst.rootfs_path();
+        std::fs::write(&disk, "disk sentinel").expect("disk sentinel");
+        let cfg = cfg_with_data_dir(root.path().to_path_buf());
+        let backend = super::backend::FirecrackerBackend::new();
+
+        let error = super::cmd_stop(&backend, &cfg, &inst)
+            .expect_err("failed probe cannot report stopped")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(inst.pid_file_path()).expect("retained pid"),
+            "invalid-pid"
+        );
+        let error = backend
+            .destroy_instance(&cfg, &inst)
+            .expect_err("unknown liveness cannot authorize destroy")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&disk).expect("retained disk"),
+            "disk sentinel"
+        );
+        assert!(inst.dir.is_dir());
+    }
 
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {

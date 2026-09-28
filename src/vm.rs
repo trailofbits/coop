@@ -19,7 +19,7 @@ use crate::config::{CoopConfig, Instance, MiB};
 
 /// VM has been constructed but not yet started.
 pub struct Configured;
-/// VM is running (either just started or attached via `from_running`).
+/// VM was started or observed running by its caller.
 pub struct Running;
 
 /// Represents a Firecracker VM instance.
@@ -229,9 +229,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
         let socket_path = self.inst.api_socket_path();
 
         // Kill an orphaned Firecracker if the socket is present without a
-        // PID file: stop() removes the PID file unconditionally, and
-        // is_running() drops it whenever its liveness probe fails, so the
-        // file can go missing while the process still holds the socket.
+        // PID file: a prior stale-PID cleanup or interrupted startup can leave
+        // the socket behind while its process is still alive.
         let pid_path = self.inst.pid_file_path();
         if socket_path.exists() && !pid_path.exists() {
             tracing::warn!(
@@ -308,32 +307,9 @@ impl<'a> FirecrackerVm<'a, Configured> {
 // ── Running state ─────────────────────────────────────────────
 
 impl<'a> FirecrackerVm<'a, Running> {
-    /// Attach to an already-running Firecracker VM by reading the
-    /// PID file.
-    ///
-    /// Validates that the PID is alive and belongs to a Firecracker
-    /// process, cleaning up stale PID files if not. Callers that
-    /// already hold a `RunningInstance` proof should use
-    /// [`Self::from_running_unchecked`] instead to avoid the
-    /// redundant live-state probe.
-    pub fn from_running(cfg: &'a CoopConfig, inst: &'a Instance) -> Result<Self> {
-        if !inst.is_running() {
-            let pid_path = inst.pid_file_path();
-            bail!(
-                "No running VM found for instance '{}' \
-                 (no PID file at {})",
-                inst.name,
-                pid_path.display()
-            );
-        }
-
-        Ok(Self::from_running_unchecked(cfg, inst))
-    }
-
     /// Attach to a Firecracker VM whose running state has already
-    /// been established by the caller (e.g. via a
-    /// [`crate::backend::RunningInstance`] proof). Skips the
-    /// `is_running()` probe that [`Self::from_running`] performs.
+    /// been observed by the caller. The observation may become stale;
+    /// lifecycle callers must serialize and recheck before mutation.
     pub fn from_running_unchecked(cfg: &'a CoopConfig, inst: &'a Instance) -> Self {
         Self {
             cfg,
@@ -375,9 +351,26 @@ impl<'a> FirecrackerVm<'a, Running> {
     /// Stop the Firecracker VM by sending a shutdown request via
     /// the API socket, falling back to SIGTERM then SIGKILL.
     pub fn stop(self) -> Result<()> {
+        self.stop_with_timeouts(Duration::from_secs(10), Duration::from_secs(5))
+    }
+
+    fn stop_with_timeouts(self, term_timeout: Duration, kill_timeout: Duration) -> Result<()> {
+        self.stop_with_probe(term_timeout, kill_timeout, wait_for_exit)
+    }
+
+    fn stop_with_probe(
+        self,
+        term_timeout: Duration,
+        kill_timeout: Duration,
+        mut wait: impl FnMut(u32, Duration) -> Result<bool>,
+    ) -> Result<()> {
         let pid_path = self.inst.pid_file_path();
         let pid_str = fs::read_to_string(&pid_path).context("Failed to read PID file")?;
         let pid: u32 = pid_str.trim().parse().context("Invalid PID")?;
+        let pid_i32 = i32::try_from(pid).context("Firecracker PID is out of range")?;
+        if pid_i32 <= 0 {
+            bail!("Firecracker PID must be positive");
+        }
 
         // Try graceful shutdown via SendCtrlAltDel action
         let socket_path = self.inst.api_socket_path();
@@ -412,7 +405,7 @@ impl<'a> FirecrackerVm<'a, Running> {
         }
 
         // Wait for process to exit after SIGTERM
-        let exited = wait_for_exit(pid, Duration::from_secs(10));
+        let exited = wait(pid, term_timeout)?;
 
         if !exited {
             tracing::warn!(
@@ -426,10 +419,9 @@ impl<'a> FirecrackerVm<'a, Running> {
                 );
             }
 
-            if !wait_for_exit(pid, Duration::from_secs(5)) {
-                tracing::error!(
-                    "Firecracker PID {pid} did not exit \
-                     after SIGKILL"
+            if !wait(pid, kill_timeout)? {
+                bail!(
+                    "Firecracker PID {pid} is still alive after SIGKILL; PID file and socket retained for retry"
                 );
             }
         }
@@ -610,27 +602,170 @@ fn wait_for_pid_file(pid_path: &Path, timeout: Duration) -> Result<u32> {
     );
 }
 
-/// Poll `kill -0` until the process exits or the timeout elapses.
-/// Returns `true` if the process exited within the timeout.
-fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+/// Poll process liveness until exit or timeout. EPERM means the process is
+/// alive; ESRCH proves exit. Any other probe error leaves identity evidence.
+fn wait_for_exit(pid: u32, timeout: Duration) -> Result<bool> {
     let start = Instant::now();
-    let pid_str = pid.to_string();
-    while start.elapsed() < timeout {
-        if !Cmd::new("kill").args(["-0", &pid_str]).sudo().status_ok() {
-            return true;
+    let pid = i32::try_from(pid).context("Firecracker PID is out of range")?;
+    if pid <= 0 {
+        bail!("Firecracker PID must be positive");
+    }
+    loop {
+        // SAFETY: signal 0 performs a liveness check without sending a signal.
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => return Ok(true),
+                Some(libc::EPERM) => {}
+                _ => {
+                    return Err(error).with_context(|| {
+                        format!("Cannot determine liveness of Firecracker PID {pid}")
+                    });
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    false
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::{
-        Duration, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        read_machine_config, wait_for_pid_file,
+        Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
+        read_machine_config, wait_for_exit, wait_for_pid_file,
     };
+    use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "isolated child-process stop cases share one fixture"
+    )]
+    fn stop_retains_pid_when_signals_fail_or_probe_is_invalid() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let Ok(mode) = std::env::var("COOP_TEST_STOP_MODE") else {
+            for mode in [
+                "signals_fail",
+                "probe_invalid",
+                "probe_out_of_range",
+                "probe_failure",
+                "already_exited",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let sudo = root.path().join("sudo");
+                fs::write(
+                    &sudo,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_STOP_CALLS\"\nexit 1\n",
+                )
+                .unwrap();
+                fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "vm::tests::stop_retains_pid_when_signals_fail_or_probe_is_invalid",
+                    ])
+                    .env("COOP_TEST_STOP_MODE", mode)
+                    .env("COOP_TEST_STOP_ROOT", root.path())
+                    .env("COOP_TEST_STOP_CALLS", root.path().join("calls"))
+                    .env(
+                        "PATH",
+                        format!(
+                            "{}:{}",
+                            root.path().display(),
+                            std::env::var("PATH").unwrap_or_default()
+                        ),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let calls = fs::read_to_string(root.path().join("calls")).unwrap_or_default();
+                if matches!(mode, "probe_invalid" | "probe_out_of_range") {
+                    assert!(calls.is_empty(), "invalid PID reached sudo: {calls}");
+                } else {
+                    assert!(calls.contains("kill"), "{mode}: {calls}");
+                }
+                if mode == "signals_fail" {
+                    assert!(calls.contains("kill -9"), "{calls}");
+                }
+            }
+            return;
+        };
+
+        let root = std::path::PathBuf::from(std::env::var("COOP_TEST_STOP_ROOT").unwrap());
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        fs::create_dir(&inst.dir).unwrap();
+        let pid = match mode.as_str() {
+            "signals_fail" | "probe_failure" => std::process::id(),
+            "probe_invalid" => 0,
+            "probe_out_of_range" => i32::MAX as u32 + 1,
+            "already_exited" => {
+                let mut child = Command::new("true").spawn().unwrap();
+                let pid = child.id();
+                child.wait().unwrap();
+                pid
+            }
+            _ => unreachable!(),
+        };
+        fs::write(inst.pid_file_path(), pid.to_string()).unwrap();
+        let cfg = CoopConfig::default();
+        let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
+        let result = if mode == "probe_failure" {
+            vm.stop_with_probe(Duration::ZERO, Duration::ZERO, |_, _| {
+                Err(anyhow::anyhow!("injected liveness probe failure"))
+            })
+        } else {
+            vm.stop_with_timeouts(Duration::ZERO, Duration::ZERO)
+        };
+        if mode == "already_exited" {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!inst.pid_file_path().exists());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(match mode.as_str() {
+                    "signals_fail" => "still alive",
+                    "probe_invalid" => "positive",
+                    "probe_out_of_range" => "out of range",
+                    "probe_failure" => "injected liveness probe failure",
+                    _ => unreachable!(),
+                }),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read_to_string(inst.pid_file_path()).unwrap(),
+                pid.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn wait_for_exit_distinguishes_alive_and_exited_processes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert!(!wait_for_exit(child.id(), Duration::ZERO).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(wait_for_exit(child.id(), Duration::ZERO).unwrap());
+        assert!(wait_for_exit(0, Duration::ZERO).is_err());
+    }
 
     const SAMPLE_CONFIG_JSON: &str = r#"{
         "boot-source": {"kernel_image_path": "/k", "boot_args": "console=ttyS0"},

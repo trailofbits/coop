@@ -945,7 +945,8 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        if let Ok(vm) = crate::vm::FirecrackerVm::from_running(cfg, inst) {
+        if inst.probe_running()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
         crate::network::teardown_tap(&cfg.network, inst)?;
@@ -1058,7 +1059,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !inst.is_running() {
+        if !inst.probe_running()? {
             return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
@@ -1066,7 +1067,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
-        if inst.is_running() {
+        if inst.probe_running()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
                  `coop stop {}`",
