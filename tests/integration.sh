@@ -1056,15 +1056,22 @@ test_grok_bin_path() {
     if guest_exec test -x /home/ubuntu/.grok/bin/grok; then
         pass "grok binary exists at GROK_BIN path"
     else
-        skip "grok binary at GROK_BIN path" "not installed in this image"
+        if [[ "$FULL" == 1 ]]; then
+            fail "grok binary at GROK_BIN path" "missing after --full rebuilt the image"
+        else
+            skip "grok binary at GROK_BIN path" \
+                "short mode may reuse a pre-Grok image; run --full to validate a rebuilt image"
+        fi
         return
     fi
 
-    if coop_exec /home/ubuntu/.grok/bin/grok --version >/dev/null; then
-        pass "grok binary invocable via full path"
+    local version
+    if version=$(coop_exec /home/ubuntu/.grok/bin/grok --version) \
+        && [[ "$version" =~ [0-9]+([.][0-9]+)+ ]]; then
+        pass "grok binary reports a version via full path ($version)"
     else
-        fail "grok binary invocable via full path" \
-            "installed binary could not report its version"
+        fail "grok binary reports a version via full path" \
+            "version invocation failed or returned no version: ${version:-}"
     fi
 
     local link_target
