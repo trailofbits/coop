@@ -2182,10 +2182,12 @@ const GROK_ALLOWED_DIRS: &[&str] = &[
 ];
 
 const GROK_CONFIG_READ_COMMAND: &str = concat!(
+    "test -x ~/.grok || exit 1; ",
     "if [ -e ~/.grok/config.toml ] || [ -L ~/.grok/config.toml ]; then ",
     "cat -- ~/.grok/config.toml; fi"
 );
 const GROK_TRUSTED_FOLDERS_READ_COMMAND: &str = concat!(
+    "test -x ~/.grok || exit 1; ",
     "if [ -e ~/.grok/trusted_folders.toml ] || [ -L ~/.grok/trusted_folders.toml ]; then ",
     "cat -- ~/.grok/trusted_folders.toml; fi"
 );
@@ -6201,28 +6203,63 @@ url = "https://example.com/m"
             };
 
             let missing = read();
-            assert!(missing.status.success(), "missing {filename} should be empty");
+            assert!(
+                missing.status.success(),
+                "missing {filename} should be empty"
+            );
             assert!(missing.stdout.is_empty());
 
             std::fs::write(&path, "[plugins]\nenabled = [\"nest\"]\n").unwrap();
             let present = read();
-            assert!(present.status.success(), "existing {filename} should be read");
+            assert!(
+                present.status.success(),
+                "existing {filename} should be read"
+            );
             assert_eq!(present.stdout, b"[plugins]\nenabled = [\"nest\"]\n");
+
+            std::fs::set_permissions(&grok_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // A failed lookup in an inaccessible parent must not make the
+            // existing file look absent. Root can still traverse mode-000.
+            if !Command::new("cat")
+                .arg(&path)
+                .output()
+                .unwrap()
+                .status
+                .success()
+            {
+                assert!(
+                    !read().status.success(),
+                    "inaccessible .grok must fail for {filename}"
+                );
+            }
+            std::fs::set_permissions(&grok_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
             // Root can still read mode-000 files; the other failure cases below
             // exercise the error path regardless of the test runner's UID.
-            if !Command::new("cat").arg(&path).output().unwrap().status.success() {
+            if !Command::new("cat")
+                .arg(&path)
+                .output()
+                .unwrap()
+                .status
+                .success()
+            {
                 assert!(!read().status.success(), "unreadable {filename} must fail");
             }
             std::fs::remove_file(&path).unwrap();
 
             std::fs::create_dir(&path).unwrap();
-            assert!(!read().status.success(), "directory at {filename} must fail");
+            assert!(
+                !read().status.success(),
+                "directory at {filename} must fail"
+            );
             std::fs::remove_dir(&path).unwrap();
 
             std::os::unix::fs::symlink("missing-target", &path).unwrap();
-            assert!(!read().status.success(), "dangling {filename} symlink must fail");
+            assert!(
+                !read().status.success(),
+                "dangling {filename} symlink must fail"
+            );
         }
     }
 
