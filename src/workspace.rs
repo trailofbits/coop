@@ -493,7 +493,7 @@ pub fn push(
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_transfer(target, &source_dir, exclude_git)?;
+        tar_pipe_transfer_to(target, &source_dir, &state.guest_path, exclude_git)?;
     }
 
     tracing::info!("Push complete");
@@ -1347,6 +1347,7 @@ fn launch_editor(
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::backend::{Hostname, SshTarget, SshUser};
     use crate::config::{ImageName, InstanceIndex, InstanceName};
     use proptest::prelude::*;
 
@@ -1357,6 +1358,70 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    #[test]
+    fn push_fallback_uses_recorded_guest_path() {
+        use std::num::NonZeroU16;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(root) = std::env::var("COOP_TEST_PUSH_FALLBACK_ROOT") else {
+            let temp = tempfile::tempdir().unwrap();
+            let fake_ssh = temp.path().join("ssh");
+            fs::write(
+                &fake_ssh,
+                "#!/bin/sh\ncase \"$*\" in *'which rsync'*) exit 1;; esac\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_PUSH_CAPTURE\"\ncat >/dev/null\n",
+            )
+            .unwrap();
+            fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::push_fallback_uses_recorded_guest_path",
+                ])
+                .env("COOP_TEST_PUSH_FALLBACK_ROOT", temp.path())
+                .env("COOP_TEST_PUSH_CAPTURE", temp.path().join("ssh-commands"))
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let commands = fs::read_to_string(temp.path().join("ssh-commands")).unwrap();
+            assert!(
+                commands.contains("tar xf - -C '/custom mount'"),
+                "{commands}"
+            );
+            assert!(!commands.contains("tar xf - -C '/workspace'"), "{commands}");
+            return;
+        };
+
+        let root = Path::new(&root);
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("witness"), "content").unwrap();
+        let inst = temp_instance(&root.join("instance"));
+        WorkspaceState {
+            guest_path: GuestPath::absolute("/custom mount").unwrap(),
+            source: WorkspaceSource::Workspace { host_path: source },
+        }
+        .save(&inst)
+        .unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        let running = RunningInstance::new(inst, target);
+        push(&running, None, true, false).unwrap();
     }
 
     #[test]
