@@ -178,6 +178,9 @@ Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
 `guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files.
+Allocation refuses an occupied instance path. If any instance directory has
+unreadable metadata, allocation stops because its network index cannot be
+trusted; existing healthy instances remain available through normal lookup.
 
 ## `coop update`
 

@@ -2275,10 +2275,10 @@ impl CoopConfig {
                 Err(e) => {
                     // Instance dir exists but has missing or corrupted
                     // instance.json — leftover from a crashed start.
-                    // Log and skip so callers aren't blocked.
+                    // Keep healthy instances available for lookup.
                     tracing::warn!(
                         "Skipping corrupted instance dir {} ({}). \
-                         Remove it manually or run `destroy --all`.",
+                         Repair or remove it manually before creating another instance.",
                         entry.path().display(),
                         e,
                     );
@@ -2359,6 +2359,21 @@ impl CoopConfig {
     ) -> Result<Instance> {
         let _lock = lock_dir(&self.instances_dir())?;
 
+        // A directory with unreadable metadata may own any index. Keep it
+        // reserved until the owner repairs or removes it; guessing a free
+        // index could give two VMs the same network identity.
+        for entry in fs::read_dir(self.instances_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                Instance::load(&entry.path()).with_context(|| {
+                    format!(
+                        "Cannot allocate while instance directory {} has invalid metadata",
+                        entry.path().display()
+                    )
+                })?;
+            }
+        }
+
         let instances = self.list_instances()?;
         let used_indices: HashSet<InstanceIndex> = instances.iter().map(|i| i.index).collect();
 
@@ -2393,11 +2408,12 @@ impl CoopConfig {
             InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
         };
 
-        if instances.iter().any(|i| i.name == name) {
-            bail!("Instance '{name}' already exists");
-        }
-
         let dir = self.instances_dir().join(name.as_str());
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => bail!("Instance '{name}' already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to check instance directory"),
+        }
         let instance = Instance {
             name,
             index,
@@ -3213,6 +3229,42 @@ mod tests {
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
+    }
+
+    #[test]
+    fn allocate_rejects_corrupt_instance_directory_without_touching_its_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let healthy = cfg
+            .allocate_instance(Some(&iname("healthy")), &default_img(), None)
+            .unwrap();
+        let corrupt = cfg.instances_dir().join("project");
+        fs::create_dir(&corrupt).unwrap();
+        let metadata = corrupt.join("instance.json");
+        let disk = corrupt.join("rootfs.ext4");
+        fs::write(&metadata, "{bad json").unwrap();
+        fs::write(&disk, "disk sentinel").unwrap();
+
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        for (name, workspace) in [
+            (Some(iname("project")), None),
+            (None, Some(project.as_path())),
+            (None, None),
+        ] {
+            let error = cfg
+                .allocate_instance(name.as_ref(), &default_img(), workspace)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid metadata"), "{error}");
+            assert_eq!(fs::read_to_string(&metadata).unwrap(), "{bad json");
+            assert_eq!(fs::read_to_string(&disk).unwrap(), "disk sentinel");
+            assert!(corrupt.is_dir());
+            assert_eq!(
+                cfg.resolve_instance(Some(&healthy.name)).unwrap().index,
+                healthy.index
+            );
+        }
     }
 
     #[test]
@@ -5350,19 +5402,23 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn allocate_works_alongside_corrupted_dirs() {
+    fn allocate_refuses_unknown_index_until_corrupt_dir_is_removed() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        // Create a corrupted instance dir occupying no valid index
+        // The malformed metadata may have held any valid index.
         let broken = tmp.path().join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
-        // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg
-            .allocate_instance(None, &ImageName::new(DEFAULT_IMAGE).unwrap(), None)
-            .unwrap();
+        assert!(
+            cfg.allocate_instance(None, &default_img(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid metadata")
+        );
+        fs::remove_dir_all(&broken).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
 
