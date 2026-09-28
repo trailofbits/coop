@@ -105,16 +105,46 @@ Transfer method selection is automatic:
 ## Pulling: guest to host
 
 ```bash
-coop pull                                       # uses host_path from workspace.json
+coop pull --delete                              # mirror back to the recorded host path
 coop pull --dir ./local-copy                    # pull into a specific directory
-coop pull --force                               # skip local dirty check
-coop pull my-instance                           # target a specific instance
+coop pull --delete --force                       # mirror, skipping the local dirty check
+coop pull my-instance --exclude-git              # additive copy, preserving host Git metadata
 coop pull my-instance --dir ./local-copy        # combined
 ```
 
 Before overwriting the local destination, `pull` runs `git status --porcelain` against it. If the directory has a `.git` and any uncommitted changes (tracked or untracked), pull refuses unless you pass `--force`. Unlike push's guest-side check, the local check does not inspect unpushed commits — committing your local work first is enough to satisfy it.
 
-The destination directory is created if absent. Transport selection follows the same rsync-then-tar-pipe order. The tar-pipe fallback verifies SHA-256 checksums end-to-end.
+Without `--delete`, pull is additive: destination-only files remain. An additive
+pull refuses to overwrite an existing destination `.git` directory, even with
+`--force`, because copying Git metadata without deletions can leave stale loose
+refs that override newer packed refs. Choose `--delete` to mirror the guest or
+`--exclude-git` to preserve host Git metadata. Pulling into a fresh directory
+can include Git metadata normally.
+
+`--delete` removes non-excluded destination paths absent from the guest,
+including host-only Git branches and commits' references. A clean working tree
+does **not** protect host-only committed work. This is a filesystem mirror, not
+a Git fetch or merge. `--force` only skips the dirty check; it never enables
+deletion or bypasses the additive Git guard. A failed Git status check also
+blocks pull unless `--force` is supplied.
+
+Mirror mode requires working rsync on both host and guest and checks that
+before creating or modifying the destination. It never falls back to tar.
+Rsync uses `--delete-after` so incoming `.gitignore` rules are available before
+deletions; default exclusions and matching ignore rules protect host paths.
+Changing or removing ignore rules can therefore change which paths are deleted.
+If a `.gitignore` file itself is removed, rsync can retain its previously
+protected files until a subsequent pull.
+`--delete --exclude-git` mirrors files while preserving host Git metadata.
+
+When including Git metadata, a root `.git` file (linked worktree) or symlink
+on either side is unsupported; use `--exclude-git` instead. On pull this flag
+excludes `.git` entries of every type, including files and symlinks.
+
+The destination directory is created if absent. Additive transfers use rsync
+when available in the guest, otherwise tar-pipe. The tar-pipe fallback verifies
+SHA-256 checksums end-to-end. Transfers are not atomic snapshots: avoid concurrent
+Git operations in either repository and treat interrupted transfers as incomplete.
 
 ## Default exclusions
 

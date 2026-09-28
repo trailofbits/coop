@@ -500,7 +500,47 @@ pub fn push(
     Ok(())
 }
 
-/// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
+/// Whether a pull preserves destination-only paths or mirrors the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullMode {
+    Additive,
+    Mirror,
+}
+
+/// Check the destination before any transfer or directory creation.
+fn check_pull_destination(dest: &Path, mode: PullMode, exclude_git: bool) -> Result<()> {
+    if exclude_git {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(dest.join(".git")) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("Failed to inspect destination Git metadata"),
+    };
+    if !metadata.is_dir() {
+        bail!(
+            "Pulling Git metadata into a worktree or symlinked .git is unsupported. \
+               Use --exclude-git or pull into a fresh directory."
+        );
+    }
+    if mode == PullMode::Additive {
+        bail!(
+            "Additive pull cannot safely overwrite existing Git metadata. \
+               Use --delete to mirror the guest (including removal of host-only files and refs), \
+               or --exclude-git to preserve host Git metadata. --force does not bypass this check."
+        );
+    }
+    Ok(())
+}
+
+fn check_guest_git_cmd(guest_path: &GuestPath) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal("git_entry=")
+        .arg(format!("{guest_path}/.git"))
+        .literal("; if [ -L \"$git_entry\" ] || { [ -e \"$git_entry\" ] && [ ! -d \"$git_entry\" ]; }; then printf '%s\\n' 'Guest .git must be a directory; use --exclude-git for worktrees or symlinks' >&2; exit 1; fi")
+}
+
+/// Pull guest workspace to a local directory. Mirror mode requires rsync.
 ///
 /// Takes a `RunningInstance` so the caller's proof of liveness is
 /// visible in the signature — no surprise SSH failure inside.
@@ -509,11 +549,39 @@ pub fn pull(
     dir: Option<&str>,
     force: bool,
     exclude_git: bool,
+    mode: PullMode,
 ) -> Result<()> {
     let inst = running.instance();
     let target = running.target();
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir(dir, &state, "pull")?;
+
+    check_pull_destination(&dest_dir, mode, exclude_git)?;
+    if !exclude_git {
+        // Gitfiles and symlinks can name metadata outside this workspace.
+        target
+            .exec(check_guest_git_cmd(&state.guest_path))
+            .context("Failed to check guest Git metadata before pull")?;
+    }
+    let use_rsync = if mode == PullMode::Mirror {
+        let status = Command::new("rsync")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("pull --delete requires working rsync on the host and guest")?;
+        if !status.success() {
+            bail!("pull --delete requires working rsync on the host and guest");
+        }
+        target
+            .exec(RemoteCommand::new().literal("rsync --version >/dev/null"))
+            .context(
+                "pull --delete requires working rsync on the guest; no files were transferred",
+            )?;
+        true
+    } else {
+        target.exec_ok(RemoteCommand::new().literal("which rsync"))
+    };
 
     if !force && dest_dir.exists() {
         check_local_dirty(&dest_dir)?;
@@ -528,8 +596,8 @@ pub fn pull(
         dest_dir.display()
     );
 
-    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
-        rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
+    if use_rsync {
+        rsync_pull(target, &state.guest_path, &dest_dir, exclude_git, mode)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
         tar_pipe_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
@@ -783,13 +851,27 @@ pub(crate) fn rsync_push(
     Ok(())
 }
 
+fn rsync_pull_args(target: &SshTarget, exclude_git: bool, mode: PullMode) -> Vec<String> {
+    let mut args = rsync_base_args(target, exclude_git);
+    if exclude_git {
+        // Protect gitfiles and symlinks as well as directories, before ignore rules.
+        args.insert(3, "--exclude=.git".to_string());
+    }
+    if mode == PullMode::Mirror {
+        // Read newly transferred .gitignore files before deciding what to delete.
+        args.push("--delete-after".to_string());
+    }
+    args
+}
+
 fn rsync_pull(
     target: &SshTarget,
     guest_path: &GuestPath,
     dest: &Path,
     exclude_git: bool,
+    mode: PullMode,
 ) -> Result<()> {
-    let mut args = rsync_base_args(target, exclude_git);
+    let mut args = rsync_pull_args(target, exclude_git, mode);
     args.push(format!("{}:{guest_path}/", target.addr()));
     args.push(format!("{}/", dest.display()));
 
@@ -842,7 +924,7 @@ fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
         .map(|exc| format!("--exclude={exc}"))
         .collect();
     if exclude_git {
-        excludes.push(format!("--exclude={GIT_EXCLUDE}"));
+        excludes.push("--exclude=.git".to_string());
     }
     let exclude_str = excludes.join(" ");
     RemoteCommand::new()
@@ -1025,8 +1107,17 @@ fn check_local_dirty(dest: &Path) -> Result<()> {
         .arg("-C")
         .arg(dest)
         .args(["status", "--porcelain"])
+        // A parent Git hook must not redirect this check to another repository.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .context("Failed to check local git status")?;
+
+    if !output.status.success() {
+        bail!("Failed to check local git status; use --force to skip the dirty check");
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -2096,6 +2187,195 @@ Host coop-other\n\
             rewritten, original,
             "removing an absent host must not rewrite the file"
         );
+    }
+
+    #[test]
+    fn guest_git_check_rejects_gitfiles_and_symlinks_with_quoted_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guest = tmp.path().join("workspace ' ; $(false)");
+        fs::create_dir(&guest).unwrap();
+        let path = GuestPath::absolute(guest.to_str().unwrap()).unwrap();
+        let check = || {
+            Command::new("sh")
+                .arg("-c")
+                .arg(check_guest_git_cmd(&path).into_string())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(check());
+        fs::create_dir(guest.join(".git")).unwrap();
+        assert!(check());
+        fs::remove_dir(guest.join(".git")).unwrap();
+        fs::write(guest.join(".git"), "gitdir: /outside").unwrap();
+        assert!(!check());
+        fs::remove_file(guest.join(".git")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), guest.join(".git")).unwrap();
+        assert!(!check());
+    }
+
+    #[test]
+    fn pull_destination_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("checkout");
+        for mode in [PullMode::Additive, PullMode::Mirror] {
+            check_pull_destination(&dest, mode, false).unwrap();
+        }
+        let non_directory = tmp.path().join("file");
+        fs::write(&non_directory, "not a directory").unwrap();
+        assert!(check_pull_destination(&non_directory, PullMode::Mirror, false).is_err());
+        fs::create_dir_all(dest.join(".git")).unwrap();
+        assert!(check_pull_destination(&dest, PullMode::Additive, false).is_err());
+        check_pull_destination(&dest, PullMode::Mirror, false).unwrap();
+        check_pull_destination(&dest, PullMode::Additive, true).unwrap();
+        fs::remove_dir(dest.join(".git")).unwrap();
+        fs::write(dest.join(".git"), "gitdir: /outside\n").unwrap();
+        for mode in [PullMode::Additive, PullMode::Mirror] {
+            assert!(check_pull_destination(&dest, mode, false).is_err());
+            check_pull_destination(&dest, mode, true).unwrap();
+        }
+        fs::remove_file(dest.join(".git")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), dest.join(".git")).unwrap();
+        for mode in [PullMode::Additive, PullMode::Mirror] {
+            assert!(check_pull_destination(&dest, mode, false).is_err());
+            check_pull_destination(&dest, mode, true).unwrap();
+        }
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+            ])
+            .arg(dir)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn test_local_pull(source: &Path, dest: &Path, exclude_git: bool, mode: PullMode) {
+        let status = Command::new("rsync")
+            .args(rsync_pull_args(&fake_ssh_target(), exclude_git, mode))
+            .arg(format!("{}/", source.display()))
+            .arg(format!("{}/", dest.display()))
+            .status()
+            .expect("workspace transfer tests require rsync");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn mirror_pull_updates_packed_refs_and_removes_deleted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guest = tmp.path().join("guest");
+        let host = tmp.path().join("host");
+        fs::create_dir(&guest).unwrap();
+        test_git(&guest, &["init", "-q", "--initial-branch=work"]);
+        fs::write(guest.join("deleted.txt"), "old").unwrap();
+        test_git(&guest, &["add", "."]);
+        test_git(&guest, &["commit", "-qm", "A"]);
+        test_git(&guest, &["branch", "deleted-branch"]);
+        test_local_pull(&guest, &host, false, PullMode::Additive);
+        let before = test_git(&host, &["rev-parse", "work"]);
+        test_git(&guest, &["rm", "deleted.txt"]);
+        test_git(&guest, &["commit", "-qm", "B"]);
+        test_git(&guest, &["branch", "-D", "deleted-branch"]);
+        test_git(&guest, &["pack-refs", "--all"]);
+        assert!(!guest.join(".git/refs/heads/work").exists());
+        test_local_pull(&guest, &host, false, PullMode::Mirror);
+        let after = test_git(&host, &["rev-parse", "work"]);
+        assert_ne!(before, after);
+        assert_eq!(after, test_git(&guest, &["rev-parse", "work"]));
+        assert!(!host.join("deleted.txt").exists());
+        assert_eq!(test_git(&host, &["branch", "--list", "deleted-branch"]), "");
+        assert_eq!(test_git(&host, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn mirror_pull_preserves_exclusions_and_uses_incoming_ignore_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guest = tmp.path().join("guest");
+        let host = tmp.path().join("host");
+        fs::create_dir_all(guest.join("nested")).unwrap();
+        fs::create_dir_all(host.join("nested")).unwrap();
+        fs::write(guest.join(".gitignore"), "cache/\n.git/\n").unwrap();
+        fs::write(guest.join("nested/.gitignore"), "*.local\n").unwrap();
+        fs::write(host.join("nested/keep.local"), "keep").unwrap();
+        for name in DEFAULT_EXCLUDES.iter().copied().chain(["cache/"]) {
+            fs::create_dir_all(host.join(name)).unwrap();
+            fs::write(host.join(name).join("sentinel"), "keep").unwrap();
+        }
+        fs::write(host.join("remove"), "old").unwrap();
+        fs::write(guest.join("incoming"), "new").unwrap();
+        fs::create_dir(guest.join(".git")).unwrap();
+        fs::write(guest.join(".git/HEAD"), "guest").unwrap();
+        test_local_pull(&guest, &host, false, PullMode::Mirror);
+        assert_eq!(fs::read_to_string(host.join("incoming")).unwrap(), "new");
+        assert!(!host.join("remove").exists());
+        assert_eq!(fs::read_to_string(host.join(".git/HEAD")).unwrap(), "guest");
+        assert!(host.join("nested/keep.local").exists());
+        for name in DEFAULT_EXCLUDES.iter().copied().chain(["cache/"]) {
+            assert!(host.join(name).join("sentinel").exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn pull_exclude_git_preserves_directories_gitfiles_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guest = tmp.path().join("guest");
+        let host = tmp.path().join("host");
+        fs::create_dir_all(guest.join(".git")).unwrap();
+        fs::create_dir_all(host.join(".git")).unwrap();
+        fs::write(guest.join(".git/HEAD"), "guest").unwrap();
+        fs::write(host.join(".git/HEAD"), "host").unwrap();
+        for mode in [PullMode::Additive, PullMode::Mirror] {
+            fs::write(host.join("host-only"), "keep").unwrap();
+            fs::write(guest.join("incoming"), "new").unwrap();
+            test_local_pull(&guest, &host, true, mode);
+            assert_eq!(fs::read_to_string(host.join(".git/HEAD")).unwrap(), "host");
+            assert!(host.join("incoming").exists());
+            assert_eq!(host.join("host-only").exists(), mode == PullMode::Additive);
+        }
+        fs::remove_dir_all(host.join(".git")).unwrap();
+        fs::write(host.join(".git"), "gitdir: /outside\n").unwrap();
+        test_local_pull(&guest, &host, true, PullMode::Mirror);
+        assert_eq!(
+            fs::read_to_string(host.join(".git")).unwrap(),
+            "gitdir: /outside\n"
+        );
+        fs::remove_file(host.join(".git")).unwrap();
+        std::os::unix::fs::symlink("/missing-outside", host.join(".git")).unwrap();
+        test_local_pull(&guest, &host, true, PullMode::Mirror);
+        assert_eq!(
+            fs::read_link(host.join(".git")).unwrap(),
+            Path::new("/missing-outside")
+        );
+    }
+
+    #[test]
+    fn local_dirty_check_rejects_git_failure_and_dirty_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(check_local_dirty(tmp.path()).is_err());
+        test_git(tmp.path(), &["init", "-q"]);
+        check_local_dirty(tmp.path()).unwrap();
+        fs::write(tmp.path().join("untracked"), "dirty").unwrap();
+        assert!(check_local_dirty(tmp.path()).is_err());
     }
 
     // ── exclude_git policy ────────────────────────────────────
