@@ -100,8 +100,12 @@ pub(crate) struct Cli {
 enum Commands {
     /// Internal privileged helper for a mounted Firecracker rootfs.
     #[cfg(target_os = "linux")]
-    #[command(name = "__patch-guest-hosts", hide = true)]
-    PatchGuestHosts { mount: PathBuf, hostname: String },
+    #[command(name = "__patch-guest-network", hide = true)]
+    PatchGuestNetwork {
+        mount: PathBuf,
+        hostname: String,
+        ip: std::net::Ipv4Addr,
+    },
 
     /// Ensure an environment for a project directory exists and is running.
     ///
@@ -1012,12 +1016,13 @@ pub fn run() -> Result<()> {
     init_tracing(cli.verbose);
 
     #[cfg(target_os = "linux")]
-    if let Commands::PatchGuestHosts {
+    if let Commands::PatchGuestNetwork {
         ref mount,
         ref hostname,
+        ip,
     } = cli.command
     {
-        return setup::patch_guest_hosts(mount, hostname);
+        return setup::patch_guest_network_files(mount, hostname, ip);
     }
 
     if let Commands::Completions { shell } = cli.command {
@@ -1093,7 +1098,7 @@ pub fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
         #[cfg(target_os = "linux")]
-        Commands::PatchGuestHosts { .. } => unreachable!("handled before config loading"),
+        Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
         Commands::Up {
             dir,
             name,

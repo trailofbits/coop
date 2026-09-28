@@ -61,9 +61,10 @@ user launched it.
   lifecycle). Hosts-file operations use pinned directory descriptors, reject
   symlinked `/etc`, and read only regular files checked through an `O_PATH`
   descriptor. Replacement is atomic; permissions are set on the new file's
-  descriptor. Other paths remain **host** paths: `MountGuard::simple` is a
-  loop mount, not a chroot, so the traversal rule below still applies to the
-  hostname and network-config writes. Those paths are not currently validated.
+  descriptor. The hostname and network-config writes likewise open each parent
+  through pinned directory descriptors and replace the final entry by rename,
+  so guest-authored symlinks cannot redirect those privileged writes outside
+  the mounted rootfs.
 - **Guest command output read by the host.** e.g. `check_guest_dirty` reads
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
