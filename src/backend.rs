@@ -2181,6 +2181,15 @@ const GROK_ALLOWED_DIRS: &[&str] = &[
     "workflows",
 ];
 
+const GROK_CONFIG_READ_COMMAND: &str = concat!(
+    "if [ -e ~/.grok/config.toml ] || [ -L ~/.grok/config.toml ]; then ",
+    "cat -- ~/.grok/config.toml; fi"
+);
+const GROK_TRUSTED_FOLDERS_READ_COMMAND: &str = concat!(
+    "if [ -e ~/.grok/trusted_folders.toml ] || [ -L ~/.grok/trusted_folders.toml ]; then ",
+    "cat -- ~/.grok/trusted_folders.toml; fi"
+);
+
 /// Merge coop-owned keys into the guest `~/.grok/config.toml`.
 ///
 /// Starts from the guest file. Host `config.toml` keys are overlaid
@@ -2203,7 +2212,7 @@ fn write_managed_grok_config(
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.grok"))?;
 
     let existing = target
-        .capture("cat ~/.grok/config.toml 2>/dev/null || true")
+        .capture(GROK_CONFIG_READ_COMMAND)
         .context("Failed to read guest ~/.grok/config.toml")?;
     let host = read_host_grok_config_toml(config_dir)?;
     let merged = merge_managed_grok_config(&existing, &host, mcp_servers)?;
@@ -2351,7 +2360,7 @@ fn write_workspace_folder_trust(target: &SshTarget) -> Result<()> {
     target.exec(RemoteCommand::new().literal("mkdir -p ~/.grok"))?;
 
     let existing = target
-        .capture("cat ~/.grok/trusted_folders.toml 2>/dev/null || true")
+        .capture(GROK_TRUSTED_FOLDERS_READ_COMMAND)
         .context("Failed to read guest ~/.grok/trusted_folders.toml")?;
     let merged = merge_workspace_folder_trust(&existing)?;
 
@@ -6170,6 +6179,51 @@ url = "https://example.com/m"
             merge_workspace_folder_trust("folders = \"nope\"\n").is_err(),
             "a non-table `folders` value must be rejected, not silently clobbered",
         );
+    }
+
+    #[test]
+    fn grok_guest_reads_only_treat_missing_files_as_empty() {
+        for (command, filename) in [
+            (GROK_CONFIG_READ_COMMAND, "config.toml"),
+            (GROK_TRUSTED_FOLDERS_READ_COMMAND, "trusted_folders.toml"),
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let grok_dir = home.path().join(".grok");
+            std::fs::create_dir(&grok_dir).unwrap();
+            let path = grok_dir.join(filename);
+            let read = || {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .env("HOME", home.path())
+                    .output()
+                    .unwrap()
+            };
+
+            let missing = read();
+            assert!(missing.status.success(), "missing {filename} should be empty");
+            assert!(missing.stdout.is_empty());
+
+            std::fs::write(&path, "[plugins]\nenabled = [\"nest\"]\n").unwrap();
+            let present = read();
+            assert!(present.status.success(), "existing {filename} should be read");
+            assert_eq!(present.stdout, b"[plugins]\nenabled = [\"nest\"]\n");
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root can still read mode-000 files; the other failure cases below
+            // exercise the error path regardless of the test runner's UID.
+            if !Command::new("cat").arg(&path).output().unwrap().status.success() {
+                assert!(!read().status.success(), "unreadable {filename} must fail");
+            }
+            std::fs::remove_file(&path).unwrap();
+
+            std::fs::create_dir(&path).unwrap();
+            assert!(!read().status.success(), "directory at {filename} must fail");
+            std::fs::remove_dir(&path).unwrap();
+
+            std::os::unix::fs::symlink("missing-target", &path).unwrap();
+            assert!(!read().status.success(), "dangling {filename} symlink must fail");
+        }
     }
 
     #[test]
