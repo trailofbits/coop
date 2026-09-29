@@ -24,12 +24,15 @@ pub(crate) fn render_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// Instance run state — the closed set the human path prints as
-/// `"running"` / `"stopped"`.
+/// `"running"` / `"stopped"`, or `"unknown"` in a listing when the backend
+/// could not probe one instance.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstanceState {
     Running,
     Stopped,
+    /// The backend could not determine the state (listings only).
+    Unknown,
 }
 
 impl InstanceState {
@@ -47,28 +50,36 @@ impl InstanceState {
         match self {
             Self::Running => "running",
             Self::Stopped => "stopped",
+            Self::Unknown => "unknown",
         }
     }
 }
 
 /// Which VM backend is in use. Like [`backend::PlatformBackend`] and
 /// [`crate::secret_store::Backend`], the variants are `#[cfg]`-gated per
-/// OS — only the host's backend can ever be selected, so only its token
-/// (`"firecracker"` on Linux, `"lima"` on macOS) is ever serialized.
+/// OS and feature set — only this build's backend can ever be selected, so
+/// only its token (`"firecracker"` on Linux, `"lima"` on macOS, or
+/// `"apple-container"` with that feature) is ever serialized.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum BackendKind {
     #[cfg(not(target_os = "macos"))]
     Firecracker,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "apple-container")))]
     Lima,
+    #[cfg(all(target_os = "macos", feature = "apple-container"))]
+    AppleContainer,
 }
 
 impl BackendKind {
-    /// The backend kind for the current platform. `PlatformBackend` is a
-    /// compile-time type alias, so this is fixed per target OS.
+    /// The backend kind for this build. `PlatformBackend` is a compile-time
+    /// type alias, so this is fixed per target OS and feature set.
     pub(crate) fn of(_be: &backend::PlatformBackend) -> Self {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "apple-container"))]
+        {
+            Self::AppleContainer
+        }
+        #[cfg(all(target_os = "macos", not(feature = "apple-container")))]
         {
             Self::Lima
         }
@@ -111,7 +122,8 @@ pub(crate) struct ImageInfo<'a> {
     pub name: &'a config::ImageName,
     pub profiles: &'a [String],
     pub created: Option<&'a str>,
-    pub size_bytes: u64,
+    /// `None` when the backend keeps image content outside coop's data dir.
+    pub size_bytes: Option<u64>,
 }
 
 // ── profiles list ────────────────────────────────────────────
@@ -183,7 +195,9 @@ mod tests {
     /// The backend token for the host — the only variant that exists in
     /// this build.
     fn platform_backend_token() -> &'static str {
-        if cfg!(target_os = "macos") {
+        if cfg!(all(target_os = "macos", feature = "apple-container")) {
+            "apple-container"
+        } else if cfg!(target_os = "macos") {
             "lima"
         } else {
             "firecracker"
@@ -269,11 +283,11 @@ mod tests {
             name: &name,
             profiles: &[],
             created: None,
-            size_bytes: 0,
+            size_bytes: None,
         };
         assert_eq!(
             to_value(&view),
-            json!({ "name": "default", "profiles": [], "created": Value::Null, "size_bytes": 0 })
+            json!({ "name": "default", "profiles": [], "created": Value::Null, "size_bytes": Value::Null })
         );
     }
 
@@ -285,7 +299,7 @@ mod tests {
             name: &name,
             profiles: &profiles,
             created: Some("2026-06-01T12:00:00Z"),
-            size_bytes: 8_589_934_592,
+            size_bytes: Some(8_589_934_592),
         };
         assert_eq!(
             to_value(&view),

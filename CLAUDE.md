@@ -13,7 +13,7 @@ Shared entrypoint for Claude, Codex, and humans. Keep this short and
 navigational; durable detail lives in [`docs/`](docs/).
 
 - [`docs/index.md`](docs/index.md) — system-of-record map.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module map, the two-backend
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module map, the backend
   design, host→guest data flow, architectural invariants.
 - [`docs/trust-model.md`](docs/trust-model.md) — trust boundaries and taint
   sources (the security spec; read before touching secrets, subprocess,
@@ -28,12 +28,13 @@ navigational; durable detail lives in [`docs/`](docs/).
 ## Architecture (one paragraph)
 
 A Rust CLI that orchestrates VM lifecycle (setup → up/start → shell → stop →
-destroy → status/logs). Two backends are selected at **compile time** by
-`#[cfg]` behind the `backend::VmBackend` trait / `PlatformBackend` alias:
-Firecracker microVMs on Linux (KVM), Lima VMs on macOS
-(Virtualization.framework). Everything above the trait — SSH, workspace sync,
+destroy → status/logs). Backends are selected at **compile time** by `#[cfg]`
+behind the `backend::VmBackend` trait / `PlatformBackend` alias: Firecracker
+microVMs on Linux (KVM), Lima VMs on macOS (Virtualization.framework), or the
+opt-in Apple sandbox backend on macOS (`apple-container` Cargo feature, which
+replaces Lima). Everything above the trait — SSH, workspace sync,
 config/secret injection, agent bootstrap, `commands/` — is backend-shared and
-must hold for both. Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+must hold for all of them. Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Trust model
 
@@ -57,7 +58,8 @@ Runtime: Rust `1.94.0` (see `rust-toolchain.toml`), edition 2024.
 ```bash
 cargo build                                                    # debug build
 cargo fmt -- --check                                           # format check
-cargo clippy --all-targets --all-features -- -D warnings       # lints (zero-warnings)
+cargo clippy --all-targets -- -D warnings                      # lints (zero-warnings)
+cargo clippy --all-targets --features apple-container -- -D warnings  # macOS: Apple backend
 cargo test                                                     # unit tests (lib)
 cargo deny check                                               # advisories/licenses/bans
 taplo format --check                                           # TOML formatting

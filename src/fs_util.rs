@@ -59,6 +59,17 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
     Ok(())
 }
 
+/// `len` bytes from the kernel CSPRNG (`/dev/urandom`), hex-encoded.
+pub fn random_hex(len: usize) -> Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; len];
+    File::open("/dev/urandom")
+        .context("Failed to open /dev/urandom")?
+        .read_exact(&mut buf)
+        .context("Failed to read from /dev/urandom")?;
+    Ok(hex::encode(buf))
+}
+
 /// RAII file lock acquired via `flock(LOCK_EX)`. Releases on drop.
 ///
 /// Use [`lock_sibling`] for an indefinite wait or [`lock_sibling_bounded`]

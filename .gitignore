@@ -9,3 +9,4 @@ firecracker
 /mutants.out
 /mutants.out.old
 .claude/settings.local.json
+__pycache__/

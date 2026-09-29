@@ -447,7 +447,7 @@ pub fn compose_install_snippet(feature: &ResolvedFeature) -> String {
     out.push_str("base64 -d > \"$archive\" <<'");
     out.push_str(&archive_delimiter);
     out.push_str("'\n");
-    out.push_str(&base64_encode(&feature.archive));
+    out.push_str(&crate::base64::encode(&feature.archive));
     out.push('\n');
     out.push_str(&archive_delimiter);
     out.push('\n');
@@ -465,29 +465,6 @@ pub fn compose_install_snippet(feature: &ResolvedFeature) -> String {
     out.push_str("cd \"$feature_dir\"\n");
     out.push_str("./install.sh\n");
     out.push_str(")\n");
-    out
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
     out
 }
 
@@ -575,15 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_encoder_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"archive-bytes"), "YXJjaGl2ZS1ieXRlcw==");
-    }
-
-    #[test]
     fn parses_sample_manifest_metadata() {
         let manifest: OciManifest = serde_json::from_value(serde_json::json!({
             "config": { "digest": "sha256:config" },
@@ -653,7 +621,9 @@ mod tests {
         assert_eq!(resolved.installed.digest.to_string(), SAMPLE_DIGEST);
         assert!(resolved.install_script.contains("./helper.sh"));
         assert_eq!(resolved.archive, std::fs::read(&archive).unwrap());
-        assert!(compose_install_snippet(&resolved).contains(&base64_encode(&resolved.archive)));
+        assert!(
+            compose_install_snippet(&resolved).contains(&crate::base64::encode(&resolved.archive))
+        );
     }
 
     #[test]

@@ -12,14 +12,36 @@ use toml::Value as TomlValue;
 
 use crate::cmd::Cmd;
 use crate::config::{
-    CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
-    McpServerDef, NetworkConfig, VmMemory,
+    CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, McpServerDef,
+    NetworkConfig, VmMemory,
 };
 use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
 use crate::setup::SetupOptions;
+
+mod capabilities;
+mod endpoint_plan;
+mod host_keys;
+#[cfg(any(not(target_os = "macos"), test))]
+mod unproven_stop;
+
+pub use crate::backend::capabilities::{BackendCapabilities, Capability};
+pub use crate::backend::endpoint_plan::{LocalEndpointRoute, ReverseTunnel, plan_local_endpoint};
+use crate::backend::endpoint_plan::{local_endpoint, local_endpoint_tunnels};
+pub use crate::backend::host_keys::HostKeyPolicy;
+#[cfg_attr(
+    all(not(feature = "apple-container"), not(test)),
+    expect(
+        unused_imports,
+        reason = "constructed only by the apple-container backend"
+    )
+)]
+pub use crate::backend::host_keys::PinnedHostKey;
+pub(crate) use crate::backend::host_keys::quote_ssh_value;
+#[cfg(not(target_os = "macos"))]
+use crate::backend::unproven_stop::stop_if_probed_running;
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -172,7 +194,7 @@ impl StoppedInstance {
 
 const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+pub(crate) fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
     lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 
@@ -300,6 +322,7 @@ pub struct SshTarget {
     pub port: NonZeroU16,
     pub user: SshUser,
     pub key_path: PathBuf,
+    pub host_keys: HostKeyPolicy,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -330,8 +353,14 @@ impl SshTarget {
         // Hash host:port to keep the filename short and predictable.
         // 8 hex chars (32 bits) is enough to avoid collisions across
         // the handful of concurrent instances this tool manages.
+        // A pinned target also hashes its alias: the address of a pinned
+        // backend can be reassigned to another instance, and a master opened
+        // for one instance must never be reused for another.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&(&self.host, self.port), &mut hasher);
+        if let HostKeyPolicy::Pinned(pin) = &self.host_keys {
+            std::hash::Hash::hash(&pin.alias, &mut hasher);
+        }
         let hash = std::hash::Hasher::finish(&hasher);
         // Truncation to 32 bits is intentional — we only need enough
         // uniqueness to distinguish a handful of concurrent instances.
@@ -356,7 +385,7 @@ impl SshTarget {
     /// the remote command, so a silent hour-long install is never at risk —
     /// only a guest whose sshd cannot answer for 90s.
     fn transport_opts(&self) -> Vec<String> {
-        vec![
+        let mut opts: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
@@ -365,17 +394,19 @@ impl SshTarget {
             "ServerAliveInterval=30".into(),
             "-o".into(),
             "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
+        ];
+        for opt in self.host_keys.ssh_options() {
+            opts.extend(["-o".into(), opt]);
+        }
+        opts.extend([
             "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-o".into(),
             "LogLevel=ERROR".into(),
             "-i".into(),
             self.key_path.display().to_string(),
-        ]
+        ]);
+        opts
     }
 
     /// SSH options for commands.
@@ -550,10 +581,22 @@ impl SshTarget {
     /// SSH command string for rsync's -e flag.
     ///
     /// Derived from [`Self::ssh_opts`] so a transfer inherits the same bounds
-    /// as any other guest command. rsync splits this string on whitespace, so
-    /// it stays unquoted — a key path containing spaces has never worked here.
+    /// as any other guest command.
     pub fn rsync_ssh_cmd(&self) -> String {
-        format!("ssh {}", self.ssh_opts().join(" "))
+        // rsync splits `-e` on whitespace but honours quotes, so an option
+        // containing whitespace is single-quoted to reach ssh intact.
+        let opts: Vec<String> = self
+            .ssh_opts()
+            .into_iter()
+            .map(|o| {
+                if o.chars().any(char::is_whitespace) {
+                    format!("'{o}'")
+                } else {
+                    o
+                }
+            })
+            .collect();
+        format!("ssh {}", opts.join(" "))
     }
 
     /// Run a command on the guest via SSH and capture stdout.
@@ -775,10 +818,16 @@ pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
 
 /// VM backend for managing guest lifecycle.
 ///
-/// Two impls: `FirecrackerBackend` (Linux) and `LimaBackend` (macOS).
-/// The `PlatformBackend` type alias selects the correct one at compile
-/// time via `#[cfg]`.
+/// Impls: `FirecrackerBackend` (Linux), `LimaBackend` (macOS), and
+/// `AppleContainerBackend` (macOS, `apple-container` feature). The
+/// `PlatformBackend` type alias selects one at compile time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
+    /// What this backend supports; see [`BackendCapabilities`].
+    fn capabilities(&self) -> BackendCapabilities;
+    /// Fail with [`capabilities::UnsupportedCapability`] unless this backend supports `cap`.
+    fn require(&self, cap: Capability) -> Result<()> {
+        self.capabilities().require(self, cap)
+    }
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
     fn create_and_start(
         &self,
@@ -790,6 +839,10 @@ pub trait VmBackend: std::fmt::Display {
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     /// Stop an instance observed running at the preceding probe.
     fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop `inst` when [`Self::as_running`] failed, so no
+    /// [`RunningInstance`] proof exists. Uses only the backend's own control
+    /// plane (PID file, `limactl`, the runtime) — never a guest connection.
+    fn stop_unproven(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
@@ -842,6 +895,18 @@ pub trait VmBackend: std::fmt::Display {
         image: &ImageName,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// Whether an image's content lives under its coop data directory, so
+    /// that directory's size is the image's size. `false` for backends whose
+    /// images live in a runtime-owned store.
+    fn images_in_data_dir(&self) -> bool {
+        true
+    }
+    /// [`Self::is_running`] for listings, where a state the backend cannot
+    /// determine must surface as an error (shown as `unknown`) rather than as
+    /// "not running".
+    fn probe_running(&self, inst: &Instance) -> Result<bool> {
+        Ok(self.is_running(inst))
+    }
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM
@@ -875,15 +940,16 @@ pub trait VmBackend: std::fmt::Display {
     -> Result<()>;
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
-    /// The address the guest uses to reach a server running on the host,
-    /// for rewriting local-model endpoints (see
-    /// [`crate::network::rewrite_host_url`]). Firecracker guests route
+    /// How the guest reaches a server running on the host, for local-model
+    /// endpoints (see [`plan_local_endpoint`]). Firecracker guests route
     /// through the TAP gateway (`network.host_ip`); Lima injects
-    /// `host.lima.internal`.
-    fn guest_host_address(&self, network: &NetworkConfig) -> String;
+    /// `host.lima.internal`; Apple sandbox guests get a reverse tunnel.
+    fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute;
     /// Whether mounts use live filesystem sharing (Lima/virtiofs)
     /// vs one-time sync (Firecracker/rsync).
-    fn mounts_are_live(&self) -> bool;
+    fn mounts_are_live(&self) -> bool {
+        self.capabilities().has(Capability::LiveMounts)
+    }
     /// Whether `image` has its backend-specific build artifacts on disk.
     ///
     /// On Firecracker this means the template rootfs (`rootfs-template.ext4`).
@@ -902,6 +968,13 @@ pub struct FirecrackerBackend;
 impl FirecrackerBackend {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Construct for a loaded config. This backend has no config-dependent
+    /// state; the constructor exists so every `PlatformBackend` is built the
+    /// same way.
+    pub fn for_config(_cfg: &CoopConfig) -> Self {
+        Self::new()
     }
 }
 
@@ -927,6 +1000,14 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new(&[
+            Capability::DiskResize,
+            Capability::DiskSnapshots,
+            Capability::MachineResources,
+        ])
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
         crate::setup::run(cfg, opts)
@@ -968,6 +1049,13 @@ impl VmBackend for FirecrackerBackend {
         }
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
         vm.stop()
+    }
+
+    fn stop_unproven(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        stop_if_probed_running(inst.probe_running(), || {
+            crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst).stop()
+        })
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1128,6 +1216,7 @@ impl VmBackend for FirecrackerBackend {
             port: cfg.ssh_port,
             user: SshUser::new(guest_user.as_str())?,
             key_path: cfg.ssh_key_path(),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         })
     }
 
@@ -1135,13 +1224,9 @@ impl VmBackend for FirecrackerBackend {
         Ok(inst.rootfs_path())
     }
 
-    fn guest_host_address(&self, network: &NetworkConfig) -> String {
+    fn local_endpoint_route(&self, network: &NetworkConfig) -> LocalEndpointRoute {
         // The guest's default gateway is the bridge's host IP.
-        network.host_ip.to_string()
-    }
-
-    fn mounts_are_live(&self) -> bool {
-        false
+        LocalEndpointRoute::HostAddress(network.host_ip.to_string())
     }
 
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
@@ -1155,9 +1240,21 @@ impl VmBackend for FirecrackerBackend {
 pub struct LimaBackend;
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(
+    feature = "apple-container",
+    expect(dead_code, reason = "apple-container replaces Lima as PlatformBackend")
+)]
 impl LimaBackend {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Construct for a loaded config. This backend has no config-dependent
+    /// state; the constructor exists so every `PlatformBackend` is built the
+    /// same way.
+    #[cfg(target_os = "macos")]
+    pub fn for_config(_cfg: &CoopConfig) -> Self {
+        Self::new()
     }
 }
 
@@ -1170,6 +1267,15 @@ impl std::fmt::Display for LimaBackend {
 
 #[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new(&[
+            Capability::LiveMounts,
+            Capability::DiskResize,
+            Capability::DiskSnapshots,
+            Capability::MachineResources,
+        ])
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         boot_preflight(cfg)?;
         crate::lima::setup(cfg, opts)
@@ -1193,11 +1299,15 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
-        match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
+        self.stop_unproven(cfg, &inst)
+    }
+
+    fn stop_unproven(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        match crate::lima::probe_state(inst)? {
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(inst),
             Some(crate::lima::LimaState::Stopped) => Ok(()),
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
@@ -1286,6 +1396,10 @@ impl VmBackend for LimaBackend {
         crate::lima::is_running(inst)
     }
 
+    fn probe_running(&self, inst: &Instance) -> Result<bool> {
+        crate::lima::probe_running(inst)
+    }
+
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
         match crate::lima::probe_state(&inst)? {
             Some(crate::lima::LimaState::Running) => {}
@@ -1331,13 +1445,9 @@ impl VmBackend for LimaBackend {
         crate::lima::disk_path(inst)
     }
 
-    fn guest_host_address(&self, _network: &NetworkConfig) -> String {
+    fn local_endpoint_route(&self, _network: &NetworkConfig) -> LocalEndpointRoute {
         // Lima injects this hostname into the guest, resolving to the host.
-        crate::lima::HOST_GATEWAY.to_string()
-    }
-
-    fn mounts_are_live(&self) -> bool {
-        true
+        LocalEndpointRoute::HostAddress(crate::lima::HOST_GATEWAY.to_string())
     }
 
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool {
@@ -1347,7 +1457,10 @@ impl VmBackend for LimaBackend {
 
 // ── Platform type alias ───────────────────────────────────────
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "apple-container"))]
+pub type PlatformBackend = crate::apple_container::AppleContainerBackend;
+
+#[cfg(all(target_os = "macos", not(feature = "apple-container")))]
 pub type PlatformBackend = LimaBackend;
 
 #[cfg(not(target_os = "macos"))]
@@ -1546,15 +1659,15 @@ pub fn run_post_start(session: &SshSession, command: &str) {
 
 /// Bootstrap configured guest agents in the guest declaratively.
 ///
-/// `guest_host` is the backend's guest-visible host address (from
-/// [`VmBackend::guest_host_address`]), used to rewrite any local-model
-/// endpoint so the guest can reach a server running on the host.
+/// `route` is how the guest reaches the host (from
+/// [`VmBackend::local_endpoint_route`]), used to make any local-model endpoint
+/// reachable from inside the guest.
 pub fn bootstrap_agents(
     session: &SshSession,
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     // GitHub auth is guest-global state. Refresh it once before either
     // agent bootstrap if a token is available.
@@ -1563,8 +1676,15 @@ pub fn bootstrap_agents(
         setup_github_auth(session)?;
     }
 
-    bootstrap_claude(session, cfg, inst, mode, guest_host)?;
-    bootstrap_codex(session, cfg, inst, mode, guest_host)?;
+    // Reconcile local-model tunnels once for both agents, before either
+    // publishes a URL that depends on one: open what the current config
+    // needs, keep what is already live, and close what it no longer needs
+    // (local mode switched off, or an endpoint moved).
+    let tunnels = local_endpoint_tunnels(&ModelState::load_or_default(inst)?, cfg, route)?;
+    crate::proxy::sync_model_tunnels(inst, &session.target, &tunnels)?;
+
+    bootstrap_claude(session, cfg, inst, mode, route)?;
+    bootstrap_codex(session, cfg, inst, mode, route)?;
     bootstrap_grok(session, cfg, inst, mode)?;
 
     Ok(())
@@ -1588,7 +1708,7 @@ fn bootstrap_claude(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     let claude = &cfg.claude;
     let claude_bin = persisted_guest_user(cfg, &inst.image).claude_bin();
@@ -1631,7 +1751,7 @@ fn bootstrap_claude(
     // credential-holding process after a failed boot. A clean bootstrap leaves
     // it running for the VM's lifetime. Mirrors `bootstrap_codex`.
     let result = (|| -> Result<()> {
-        let local_env = claude_local_env(&model_state, cfg, guest_host, proxy.as_ref())?;
+        let local_env = claude_local_env(&model_state, cfg, route, proxy.as_ref())?;
         write_managed_claude_settings(&session.target, &local_env)?;
         // Apply disables before extensions become visible, including partially
         // copied bundles if a transfer fails and leaves the VM running.
@@ -1684,7 +1804,7 @@ fn bootstrap_codex(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
 ) -> Result<()> {
     let mut model_state = ModelState::load_or_default(inst)?;
     ensure_codex_remote_auth_consistent(cfg, inst, &model_state)?;
@@ -1700,7 +1820,7 @@ fn bootstrap_codex(
     let result = (|| -> Result<()> {
         let codex = &cfg.codex;
         let source_dir = resolve_config_source_dir(&codex.config_dir, ".codex", "codex.config_dir");
-        let local = codex_provider_table(&model_state, cfg, guest_host, proxy.as_ref())?;
+        let local = codex_provider_table(&model_state, cfg, route, proxy.as_ref())?;
         // coop_local is the provider id for both the local-model block and the
         // proxy block. Remember once coop has materialized it so a later
         // switch-off (to cloud, or after removing the config) reliably rewrites a
@@ -3062,13 +3182,13 @@ fn claude_json_with_onboarding_complete(current: Option<&str>) -> Result<String>
 fn claude_local_env(
     state: &ModelState,
     cfg: &CoopConfig,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
     proxy: Option<&crate::proxy::ProxyHandle>,
 ) -> Result<BTreeMap<String, String>> {
     // Local mode takes precedence over proxy mode: both rewrite the base URL,
     // and a VM switched to local should route at the user's model server.
     if let Some(ep) = local_endpoint(state, state.resolved_claude(&cfg.claude)) {
-        let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+        let base_url = plan_local_endpoint(route, ep.host_url())?.guest_url;
         return Ok(crate::model_state::claude_env_block(
             base_url.as_str(),
             ep.model(),
@@ -3154,11 +3274,11 @@ fn start_agent_proxy(
 fn codex_provider_table(
     state: &ModelState,
     cfg: &CoopConfig,
-    guest_host: &str,
+    route: &LocalEndpointRoute,
     proxy: Option<&crate::proxy::ProxyHandle>,
 ) -> Result<Option<toml::Table>> {
     if let Some(ep) = local_endpoint(state, state.resolved_codex(&cfg.codex)) {
-        let base_url = crate::network::rewrite_host_url(ep.host_url(), guest_host)?;
+        let base_url = plan_local_endpoint(route, ep.host_url())?.guest_url;
         return Ok(Some(crate::model_state::codex_local_config(
             base_url.as_str(),
             ep.model(),
@@ -3168,19 +3288,6 @@ fn codex_provider_table(
         return Ok(Some(crate::model_state::codex_proxy_config(&p.base_url)));
     }
     Ok(None)
-}
-
-/// Gate an already-resolved endpoint on the VM being in local mode. In
-/// remote mode the materialization is intentionally empty so cloud
-/// defaults apply.
-fn local_endpoint<'a>(
-    state: &ModelState,
-    resolved: Option<&'a LocalModel>,
-) -> Option<&'a LocalModel> {
-    match state.mode {
-        crate::model_state::ModelMode::Local => resolved,
-        crate::model_state::ModelMode::Remote => None,
-    }
 }
 
 fn copy_codex_config(
@@ -4231,6 +4338,7 @@ mod tests {
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_keys: HostKeyPolicy::Unverified,
         };
         LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
@@ -4305,6 +4413,93 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&disk).unwrap(), "after");
     }
 
+    fn test_route() -> LocalEndpointRoute {
+        LocalEndpointRoute::HostAddress("172.16.0.1".into())
+    }
+
+    #[test]
+    fn pinned_policy_emits_strict_options_once() {
+        let pinned = HostKeyPolicy::Pinned(PinnedHostKey {
+            known_hosts: PathBuf::from("/state/known_hosts"),
+            alias: Hostname::new("coop-abc").unwrap(),
+        });
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/k"),
+            host_keys: pinned.clone(),
+        };
+        let opts = target.ssh_opts();
+        let joined = opts.join(" ");
+        assert!(joined.contains("StrictHostKeyChecking=yes"));
+        assert!(joined.contains("UserKnownHostsFile=/state/known_hosts"));
+        assert!(joined.contains("HostKeyAlias=coop-abc"));
+        assert!(joined.contains("ForwardAgent=no"));
+        assert!(joined.contains("IdentityAgent=none"));
+        assert!(!joined.contains("StrictHostKeyChecking=no"));
+        assert!(!joined.contains("/dev/null") || joined.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(!joined.contains("UserKnownHostsFile=/dev/null"));
+        assert!(target.rsync_ssh_cmd().contains("StrictHostKeyChecking=yes"));
+        assert!(
+            target
+                .scp_opts()
+                .join(" ")
+                .contains("HostKeyAlias=coop-abc")
+        );
+
+        let unpinned = SshTarget {
+            host_keys: HostKeyPolicy::Unverified,
+            ..target.clone()
+        };
+        assert_ne!(target.control_path(), unpinned.control_path());
+        let other_instance = SshTarget {
+            host_keys: HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/state/known_hosts"),
+                alias: Hostname::new("coop-def").unwrap(),
+            }),
+            ..target.clone()
+        };
+        assert_ne!(
+            target.control_path(),
+            other_instance.control_path(),
+            "a reassigned address must not share another instance's master"
+        );
+        assert_eq!(
+            pinned.ssh_config_lines()[0],
+            "StrictHostKeyChecking yes".to_string()
+        );
+    }
+
+    #[test]
+    fn pinned_known_hosts_path_with_space_stays_one_value() {
+        let target = SshTarget {
+            host: Hostname::new("192.168.64.5").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("coop").unwrap(),
+            key_path: PathBuf::from("/Users/me/Application Support/vm_key"),
+            host_keys: HostKeyPolicy::Pinned(PinnedHostKey {
+                known_hosts: PathBuf::from("/Users/me/Application Support/known_hosts"),
+                alias: Hostname::new("coop-abc").unwrap(),
+            }),
+        };
+        assert!(
+            target.ssh_opts().contains(
+                &"UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
+        let rsync = target.rsync_ssh_cmd();
+        assert!(
+            rsync.contains("'UserKnownHostsFile=\"/Users/me/Application Support/known_hosts\"'")
+        );
+        assert!(rsync.contains("'/Users/me/Application Support/vm_key'"));
+        assert!(
+            target.host_keys.ssh_config_lines().contains(
+                &"UserKnownHostsFile \"/Users/me/Application Support/known_hosts\"".into()
+            )
+        );
+    }
+
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
 MemTotal:        2048000 kB
@@ -4321,6 +4516,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
+            host_keys: crate::backend::HostKeyPolicy::Unverified,
         }
     }
 
@@ -4397,7 +4593,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             base_url: "http://172.16.0.1:8788".to_string(),
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
-        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        let env = claude_local_env(&state, &cfg, &test_route(), Some(&proxy)).unwrap();
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://172.16.0.1:8788");
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "cap-token");
         // Proxy mode is transparent — no model pinning (unlike local mode).
@@ -4423,7 +4619,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins.
-        let env = claude_local_env(&state, &cfg, "172.16.0.1", Some(&proxy)).unwrap();
+        let env = claude_local_env(&state, &cfg, &test_route(), Some(&proxy)).unwrap();
         assert_eq!(env["ANTHROPIC_MODEL"], "qwen");
         assert!(env["ANTHROPIC_BASE_URL"].starts_with("http://172.16.0.1:11434"));
     }
@@ -4433,7 +4629,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let env = claude_local_env(
             &ModelState::default(),
             &CoopConfig::default(),
-            "172.16.0.1",
+            &test_route(),
             None,
         )
         .unwrap();
@@ -4451,7 +4647,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             base_url: "http://127.0.0.1:9788".to_string(),
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
-        let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
+        let table = codex_provider_table(&state, &cfg, &test_route(), Some(&proxy))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4488,7 +4684,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             capability_token: crate::config::Secret::new("cap-token".to_string()),
         };
         // Even with a proxy handle present, local mode wins (mirrors Claude).
-        let table = codex_provider_table(&state, &cfg, "172.16.0.1", Some(&proxy))
+        let table = codex_provider_table(&state, &cfg, &test_route(), Some(&proxy))
             .unwrap()
             .unwrap();
         assert_eq!(table["model"].as_str().unwrap(), "qwen");
@@ -4508,7 +4704,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let table = codex_provider_table(
             &ModelState::default(),
             &CoopConfig::default(),
-            "172.16.0.1",
+            &test_route(),
             None,
         )
         .unwrap();

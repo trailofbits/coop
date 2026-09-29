@@ -122,6 +122,78 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+## Apple sandbox backend (macOS, opt-in)
+
+The `apple-container` feature builds only on macOS. Its unit tests replace the
+`coop-sandbox` runtime (and the stock `container` builder) with a scripted
+executor, so they run without either installed. The runtime itself is a Swift
+package with its own unit tests (IDs, records, subnet allocation, the control
+protocol, reconcile, and in `TransactionTests.swift` disk-update failure
+injection and same-sandbox locking); none of them boots a VM:
+
+```bash
+cargo clippy --all-targets --features apple-container -- -D warnings
+cargo test --features apple-container
+swift test --package-path macos/coop-sandbox --no-parallel
+```
+
+The Swift tests run serially: several take, release, and re-probe `flock`
+locks, and in a parallel run about one in five runs sees a released lock as
+still held. Serial runs have not shown it. The cause is not yet identified
+(subprocesses started by other tests are the main suspect; switching them to
+`posix_spawn` did not remove it).
+
+Parser fixtures in `tests/fixtures/coop-sandbox/` are real `coop-sandbox`
+output; the directory's README says how they were captured.
+
+### Real-hardware checks
+
+`tests/integration-apple-sandbox.sh` boots real `coop-sandbox` VMs and checks
+what unit tests cannot:
+
+- peer isolation between sandboxes over IPv4/IPv6 TCP, UDP, and ICMP,
+  including forged routes, static neighbours, spoofed sources, and
+  broadcast/multicast;
+- host exposure (mounts, agent sockets, a host canary file, vsock) and a canary
+  secret in the caller's environment;
+- pinned SSH over the native channel;
+- stop/start persistence, CPU/memory changes, disk sizes and offline growth,
+  commit/restore (including a guest that disables its own `rm`), and crash
+  recovery with launchd respawn;
+- interrupted mutations: a `grow`, `commit`, or `restore` client killed at
+  fractions of its uninterrupted duration (`KILL_FRACTIONS`) must reconcile
+  to the old or the new state, with no staged or scratch files and a record
+  that matches the installed disk;
+- rounds of 1, 4, and 8 sandboxes booted at once (`CONCURRENCY`), each
+  running the full peer probe against a fixed peer and its ring neighbour
+  in parallel;
+- the maintenance image (install, and survival after its store image is
+  deleted) and same-sandbox races (concurrent grows, start against grow);
+- `coop` itself end to end (the `coop` phase): `setup`, `up`, `status`,
+  `exec`, `stop`/`start`, `resize --mem/--vcpus/--size`, rollback of a
+  `resize --start` whose boot fails, `commit`, `restore` with host-key
+  re-pinning, `destroy`, and image deletion. The phase also checks coop's
+  own sandbox for host mounts, agent forwarding, and canary leakage. It
+  requires coop to refuse a changed host key and a restore it did not
+  make. It kills `coop restore` and `coop resize --size` partway
+  (`COOP_KILL_FRACTIONS`), and the next `start` must recover.
+
+It builds the runtime, a small test image (`tests/fixtures/apple-sandbox/`),
+and an `apple-container` build of coop, all under a temporary work directory,
+and removes its state root, sandboxes, and images on exit:
+
+```bash
+./tests/integration-apple-sandbox.sh                   # ~20 min
+./tests/integration-apple-sandbox.sh --only isolation,snapshots
+```
+
+Run it before changing the `containerization` pin, the runtime's VM
+configuration, or the isolation gate, and whenever the macOS major version
+changes. [`design/apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md)
+records why this runtime was chosen;
+[`design/apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md)
+lists the mutation invariants these tests defend and what is still untested.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
@@ -152,6 +224,14 @@ parsing, or state composition:
   carved into: input-compatibility guards, summary/message builders, the
   `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
   `discovered_local_devcontainer` / `is_sensitive_workspace`
+
+- `src/apple_container/` — the sandbox backend's parsers, isolation gate,
+  records, journal reconciliation, and lifecycle against a scripted runtime.
+  The module compiles only with its feature on macOS, so sweep it separately:
+
+  ```bash
+  cargo mutants --features apple-container -f 'src/apple_container/*.rs'
+  ```
 
 **Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`,
 `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY

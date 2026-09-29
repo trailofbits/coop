@@ -56,8 +56,8 @@ Install the hooks once, then let them run on every commit:
 prek install
 ```
 
-The hooks run `cargo fmt -- --check`, `cargo clippy --all-targets --all-features
--- -D warnings`, `cargo test`, `taplo format --check` (TOML formatting, also
+The hooks run `cargo fmt -- --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo test`, `taplo format --check` (TOML formatting, also
 enforced by CI), and a set of file checks (trailing whitespace, end-of-file,
 YAML, large files, merge conflicts). Run them by hand at any time with:
 
@@ -66,8 +66,10 @@ prek run --all-files
 ```
 
 The local clippy and test hooks cover only `coop`. Before submitting, also
-run `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
-`cargo test --workspace` to cover `coop-proxy`, as CI does.
+run `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` to cover `coop-proxy`, as CI does. On macOS, also
+run `cargo clippy --all-targets --features apple-container -- -D warnings`
+for the opt-in Apple sandbox backend (the feature does not build elsewhere).
 
 Fix every warning before committing. coop has a zero-warnings policy — clippy
 runs with `-D warnings`, so a warning fails the build.
@@ -118,7 +120,7 @@ parsing, the JSONC reader, the arithmetic kernels — see
 ## Code style
 
 - Format with `cargo fmt`; lint with `cargo clippy --workspace --all-targets
-  --all-features -- -D warnings`. Both are enforced in CI.
+  -- -D warnings`. Both are enforced in CI.
 - Lean on the type system to make illegal states unrepresentable rather than
   validating at runtime: parse untrusted input into strong types at the
   boundary, use newtypes over bare primitives that carry an invariant, and use
@@ -153,7 +155,8 @@ CI must pass before a pull request can merge. The
 [CI workflow](.github/workflows/ci.yml) runs:
 
 - **`cargo fmt -- --check`** — formatting.
-- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — lints.
+- **`cargo clippy --workspace --all-targets -- -D warnings`** — lints; a macOS
+  job also lints and tests `--features apple-container`.
 - **`cargo test --workspace`** — tests for both crates.
 - **`./tests/integration-install.sh`**, **`./tests/integration-update.sh`**,
   and **`./tests/integration-uninstall.sh`** — installer provenance, update,

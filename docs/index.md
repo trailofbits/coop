@@ -5,7 +5,7 @@ short navigational entrypoint; durable detail lives here.
 
 ## For contributors (engineering)
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, the two-backend design,
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, the backend design,
   host→guest data flow, architectural invariants.
 - [`trust-model.md`](trust-model.md) — trust boundaries, taint sources, secret
   handling, `coop update` verification. The authoritative security spec the
@@ -16,13 +16,19 @@ short navigational entrypoint; durable detail lives here.
   `.cargo/mutants.toml` scoping and baselines), fuzzing, kani.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
+- [`design/`](design/) — decision records:
+  - [`apple-sandbox-runtime.md`](design/apple-sandbox-runtime.md): why the
+    Apple backend runs its own runtime;
+  - [`apple-sandbox-transactions.md`](design/apple-sandbox-transactions.md):
+    its mutation invariants, disk-update recovery, per-sandbox locking, and
+    maintenance image.
 
 ## For users
 
 - [`getting-started.md`](getting-started.md) — install and first VM.
 - [`commands.md`](commands.md) — every `coop` subcommand.
 - [`configuration.md`](configuration.md) — `config.toml` reference.
-- [`backends.md`](backends.md) — Lima (macOS) and Firecracker (Linux) setup.
+- [`backends.md`](backends.md) — Lima (macOS), Firecracker (Linux), and the opt-in Apple sandbox backend (`coop-sandbox` on `apple/containerization`).
 - [`images-and-profiles.md`](images-and-profiles.md),
   [`workspaces.md`](workspaces.md), [`multi-instance.md`](multi-instance.md),
   [`devcontainer.md`](devcontainer.md), [`editor.md`](editor.md),

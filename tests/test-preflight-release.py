@@ -69,7 +69,7 @@ if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('Version sources agree; tag v9.8.7 is free.', result.stdout)
         calls = self.log.read_text().splitlines()
-        for call in ('cargo clippy --workspace --all-targets --all-features -- -D warnings',
+        for call in ('cargo clippy --workspace --all-targets -- -D warnings',
                      'cargo test --workspace', 'cargo deny --workspace check',
                      'cargo build --release --workspace --target aarch64-unknown-linux-musl',
                      'taplo format --check', 'test-integration-probes.py',

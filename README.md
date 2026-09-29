@@ -27,7 +27,7 @@ Then build the VM template image:
 coop setup
 ```
 
-On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
+On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. A macOS build with the opt-in `apple-container` feature uses coop-sandbox VMs instead of Lima; see [backends](docs/backends.md#macos--apple-sandbox-opt-in). coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
 
 Keep coop updated:
 

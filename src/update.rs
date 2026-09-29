@@ -665,7 +665,22 @@ fn replace_sibling_proxy_at(extract_dir: &Path, current_exe: &Path) -> Result<()
 
 // ── Main update flow ─────────────────────────────────────────────────────────
 
+/// Whether this binary is a variant the release artifacts cannot replace.
+/// Published releases carry only the default backend, so updating an
+/// `apple-container` build would silently swap it for a Lima build.
+const fn is_unreleased_variant() -> bool {
+    cfg!(feature = "apple-container")
+}
+
 pub fn run(opts: &UpdateOpts) -> Result<()> {
+    if is_unreleased_variant() {
+        bail!(
+            "APPLE_UPDATE_VARIANT_UNSUPPORTED: this is an apple-container build, and \
+             release artifacts contain only the default (Lima) backend. Updating would \
+             replace this backend, so `coop update` is disabled; rebuild from source \
+             with `--features apple-container` instead. Nothing was changed."
+        );
+    }
     if is_dev_build() {
         bail!(
             "This is a dev build ({}); `coop update` only replaces release binaries.\n\
@@ -796,6 +811,11 @@ fn state_path() -> Option<PathBuf> {
 ///
 /// Best-effort — used by `coop uninstall`. Returns `Ok` even if nothing exists.
 pub fn remove_state() -> Result<()> {
+    // The state file belongs to the default build (this variant never writes
+    // it), so an apple-container uninstall leaves it alone.
+    if is_unreleased_variant() {
+        return Ok(());
+    }
     let Some(path) = state_path() else {
         return Ok(());
     };
@@ -849,7 +869,7 @@ fn persist_state(tag: Option<&str>) {
 // ── Disable sources (env + TTY + dev) ────────────────────────────────────────
 
 fn background_check_disabled() -> bool {
-    if is_dev_build() {
+    if is_dev_build() || is_unreleased_variant() {
         return true;
     }
     if env::var("COOP_NO_UPDATE_CHECK")

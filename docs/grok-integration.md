@@ -171,7 +171,8 @@ guest first.
 These are baked into the golden image during `coop setup` (on the Lima/macOS
 backend) and recorded in the image's template config. On a VM's first boot
 coop installs only the delta not already baked in; on the Firecracker/Linux
-backend, where nothing is baked, the full set installs on first boot.
+and Apple sandbox backends, where nothing is baked, the full set installs on
+first boot.
 
 ## Bootstrap sequence
 

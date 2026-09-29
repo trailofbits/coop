@@ -41,11 +41,22 @@ jobs:
 
       # `--workspace` so coop-proxy is linted/tested too (it is not a default
       # member, to keep plain `cargo build` and the integration scripts light).
+      # No `--all-features`: the only feature, `apple-container`, is macOS-only
+      # and is a deliberate compile error here (checked below, and linted in
+      # the `apple-container` job).
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
         run: cargo test --workspace
+
+      - name: apple-container feature is rejected off macOS
+        run: |
+          if cargo check --features apple-container 2> apple-feature.log; then
+            echo "apple-container unexpectedly built on Linux" >&2
+            exit 1
+          fi
+          grep -q "exists only on" apple-feature.log
 
       - name: Install network test tools
         run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server
@@ -73,6 +84,37 @@ jobs:
 
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
+
+  # The opt-in Apple sandbox backend compiles only on macOS. Unit tests use a
+  # scripted runtime, and the coop-sandbox tests boot no VM; nothing here needs
+  # Apple Container or virtualization. The default (Lima) build is checked here
+  # too, since shared backend, SSH, and lifecycle code compiles differently on
+  # macOS than on the Linux jobs.
+  apple-container:
+    # Pinned: macos/coop-sandbox needs Swift 6.2+ and the macOS 26 SDK
+    # (vmnet networks); this image's default Xcode is 26.x.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Clippy (macOS default / Lima)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests (macOS default / Lima)
+        run: cargo test
+
+      - name: Clippy (apple-container)
+        run: cargo clippy --all-targets --features apple-container -- -D warnings
+
+      - name: Unit tests (apple-container)
+        run: cargo test --features apple-container
+
+      - name: coop-sandbox build and unit tests
+        run: |
+          swift --version
+          swift test --package-path macos/coop-sandbox --force-resolved-versions --no-parallel
 
   deny:
     runs-on: ubuntu-latest

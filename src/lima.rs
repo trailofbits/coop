@@ -286,9 +286,10 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
 /// Resize the disk of a stopped Lima instance.
 ///
-/// Truncates the disk to the new size and updates `lima.yaml` `disk:`
-/// to match, so the next start sees the grown size. Cloud-init's
-/// `growpart` expands the partition and filesystem on next boot.
+/// Records the new size as `disk:` in lima.yaml, then truncates the disk to
+/// it. Cloud-init's `growpart` expands the partition and filesystem on next
+/// boot. Re-running at the current size re-records `disk:`, which repairs an
+/// instance whose lima.yaml lags its disk.
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let disk = disk_path(inst)?;
 
@@ -304,7 +305,8 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
     let current_bytes = std::fs::metadata(&disk)
         .with_context(|| format!("Failed to stat {}", disk.display()))?
         .len();
-    let current_gib = current_bytes / (1024 * 1024 * 1024);
+    // Round up so a re-run never records a `disk:` below the image's size.
+    let current_gib = current_bytes.div_ceil(1024 * 1024 * 1024);
     let new_gib = u64::from(new_size.as_u32());
 
     if new_gib < current_gib {
@@ -313,6 +315,12 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
              requested: {new_gib} GiB)"
         );
     }
+    // Lima 2.x compares `disk:` in lima.yaml with the disk image on every
+    // start and refuses to boot ("disk shrinking is not supported") when the
+    // image is larger than `disk:`. Record the size first: if the truncate
+    // below then fails, `disk:` is the larger one, which Lima grows into.
+    // A re-run at the current size repairs a lima.yaml left behind.
+    record_disk_size(inst, new_gib)?;
     if new_gib == current_gib {
         tracing::info!("Disk is already {current_gib} GiB — nothing to do");
         return Ok(());
@@ -322,43 +330,15 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
         inst.name,
     );
-
-    // Lima re-reads `disk:` from lima.yaml on start. Growing the file
-    // without updating that field makes the next start look like a
-    // shrink, which Lima rejects.
-    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
-    let original = fs::read_to_string(&yaml_path)
-        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
-    let disk_value = format!("\"{}GiB\"", new_size.as_u32());
-    let edited = set_yaml_scalar(&original, "disk", &disk_value)
-        .with_context(|| format!("No top-level 'disk' key in {}", yaml_path.display()))?;
-    crate::fs_util::atomic_write_with_mode(&yaml_path, &edited, 0o644)?;
-
-    let restore_yaml = || {
-        if let Err(restore) = crate::fs_util::atomic_write_with_mode(&yaml_path, &original, 0o644) {
-            tracing::error!(
-                "Failed to restore {} after a failed truncate: {restore}",
-                yaml_path.display()
-            );
-        }
-    };
-
-    match Command::new("truncate")
+    let status = Command::new("truncate")
         .arg("-s")
         .arg(format!("{new_size}G"))
         .arg(&disk)
         .status()
-        .context("Failed to run truncate")
-    {
-        Ok(status) if status.success() => {}
-        Ok(_) => {
-            restore_yaml();
-            bail!("truncate failed for {}", disk.display());
-        }
-        Err(e) => {
-            restore_yaml();
-            return Err(e);
-        }
+        .context("Failed to run truncate")?;
+
+    if !status.success() {
+        bail!("truncate failed for {}", disk.display());
     }
 
     tracing::info!(
@@ -366,6 +346,30 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
          (cloud-init growpart)."
     );
     Ok(())
+}
+
+/// Set `disk:` in the instance's lima.yaml to `gib` GiB.
+fn record_disk_size(inst: &Instance, gib: u64) -> Result<()> {
+    let yaml_path = lima_home()?.join(lima_name(inst)).join("lima.yaml");
+    let yaml = fs::read_to_string(&yaml_path)
+        .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
+    crate::fs_util::atomic_write_with_mode(&yaml_path, &with_disk_size(&yaml, gib), 0o644)
+}
+
+/// `yaml` with its top-level `disk:` set to `gib` GiB, appending the key
+/// when the file has none.
+fn with_disk_size(yaml: &str, gib: u64) -> String {
+    let value = format!("\"{gib}GiB\"");
+    set_yaml_scalar(yaml, "disk", &value).unwrap_or_else(|| {
+        let mut out = yaml.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("disk: ");
+        out.push_str(&value);
+        out.push('\n');
+        out
+    })
 }
 
 /// Change a stopped Lima instance's cpus/memory by editing its
@@ -562,6 +566,29 @@ pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
     lima_state(&inst.name)
 }
 
+/// Like [`is_running`], but a failed `limactl` query is an error rather
+/// than "not running". A VM that a successful listing does not contain is
+/// confirmed not running; a `Broken` or unrecognized status is an error,
+/// since it confirms neither.
+pub fn probe_running(inst: &Instance) -> Result<bool> {
+    match lima_state(&inst.name)? {
+        Some(state) => running_from_state(&state),
+        None => Ok(false),
+    }
+}
+
+/// Whether a Lima status confirms the VM running (`Ok(true)`) or stopped
+/// (`Ok(false)`); any other status is an error.
+fn running_from_state(state: &LimaState) -> Result<bool> {
+    match state {
+        LimaState::Running => Ok(true),
+        LimaState::Stopped => Ok(false),
+        LimaState::Broken | LimaState::Unknown(_) => {
+            bail!("Lima reports the VM as {state}; its running state is unknown")
+        }
+    }
+}
+
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let info = limactl_info(&inst.name)?;
@@ -664,6 +691,7 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -1024,6 +1052,7 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         port,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     })
 }
 
@@ -1471,7 +1500,7 @@ provision:
     )
 }
 
-fn compose_provision_script(
+pub(crate) fn compose_provision_script(
     ssh_pubkey: &str,
     profiles: &[ProfileDef],
     oci_features: &[ResolvedFeature],
@@ -1741,6 +1770,7 @@ fn wait_for_lima_ssh(
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
         user: SshUser::new(guest_user.as_str())?,
         key_path: cfg.ssh_key_path(),
+        host_keys: crate::backend::HostKeyPolicy::Unverified,
     };
     let mut delay = Duration::from_millis(500);
 
@@ -2022,9 +2052,12 @@ mod tests {
         if mode == "Stopped" {
             let stopped = stopped.unwrap();
             backend
-                .resize_disk(&cfg, &stopped, crate::config::GiB::new(1).unwrap())
+                .resize_disk(&cfg, &stopped, crate::config::GiB::new(2).unwrap())
                 .unwrap();
-            assert_eq!(std::fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+            assert_eq!(
+                std::fs::metadata(&disk).unwrap().len(),
+                2 * 1024 * 1024 * 1024
+            );
         } else {
             assert!(stopped.is_err(), "{mode} minted StoppedInstance");
             assert_eq!(std::fs::read_to_string(&disk).unwrap(), "disk sentinel");
@@ -2061,28 +2094,6 @@ mod tests {
         }
     }
 
-    struct RestoreEnv {
-        lima_home: Option<std::ffi::OsString>,
-        path: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            // SAFETY: the resize spawn-failure test holds ENV_LOCK and is
-            // the only lima test that mutates these variables.
-            unsafe {
-                match &self.lima_home {
-                    Some(v) => std::env::set_var("LIMA_HOME", v),
-                    None => std::env::remove_var("LIMA_HOME"),
-                }
-                match &self.path {
-                    Some(v) => std::env::set_var("PATH", v),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
     #[test]
     fn cloud_init_exit0_done_succeeds() {
         let result = check_cloud_init_output(Some(0), "status: done\n");
@@ -2103,6 +2114,16 @@ mod tests {
             edited.contains("disk: \"20GiB\"\n"),
             "unrelated key changed: {edited}"
         );
+    }
+
+    #[test]
+    fn with_disk_size_updates_or_appends_the_disk_key() {
+        let yaml = "cpus: 2\ndisk: \"20GiB\"\nmounts: []\n";
+        assert_eq!(
+            with_disk_size(yaml, 40),
+            "cpus: 2\ndisk: \"40GiB\"\nmounts: []\n"
+        );
+        assert_eq!(with_disk_size("cpus: 2", 40), "cpus: 2\ndisk: \"40GiB\"\n");
     }
 
     #[test]
@@ -2137,67 +2158,6 @@ mod tests {
         assert!(
             edited.contains("cpus: 8\n"),
             "top-level key not edited: {edited}"
-        );
-    }
-
-    #[test]
-    fn resize_disk_restores_yaml_when_truncate_cannot_spawn() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let lima_root = tempfile::TempDir::new().unwrap();
-        let shadow = tempfile::TempDir::new().unwrap();
-        // A self-symlink makes the first PATH hit fail with ELOOP.
-        // A directory or a file without +x returns EACCES, and
-        // posix_spawnp then continues to a later real `truncate`.
-        std::os::unix::fs::symlink("truncate", shadow.path().join("truncate")).unwrap();
-
-        let inst = Instance {
-            name: InstanceName::new("test").unwrap(),
-            index: crate::config::InstanceIndex::new(0).unwrap(),
-            dir: lima_root.path().to_path_buf(),
-            image: ImageName::new("test.img").unwrap(),
-        };
-        let inst_dir = lima_root.path().join(lima_name(&inst));
-        fs::create_dir_all(&inst_dir).unwrap();
-        let yaml_path = inst_dir.join("lima.yaml");
-        let original_yaml = "cpus: 2\ndisk: \"1GiB\"\nmemory: \"4GiB\"\n";
-        fs::write(&yaml_path, original_yaml).unwrap();
-        fs::write(inst_dir.join("disk"), b"").unwrap();
-
-        let cfg = CoopConfig::default();
-        let new_size = GiB::new(2).unwrap();
-
-        let prior_lima_home = std::env::var_os("LIMA_HOME");
-        let prior_path = std::env::var_os("PATH");
-        let _restore = RestoreEnv {
-            lima_home: prior_lima_home,
-            path: prior_path.clone(),
-        };
-
-        let mut path_dirs = vec![shadow.path().to_path_buf()];
-        if let Some(rest) = &prior_path {
-            path_dirs.extend(std::env::split_paths(rest));
-        }
-        let shadowed_path = std::env::join_paths(&path_dirs).unwrap();
-        // SAFETY: ENV_LOCK held; RestoreEnv drop restores both.
-        unsafe {
-            std::env::set_var("LIMA_HOME", lima_root.path());
-            std::env::set_var("PATH", shadowed_path);
-        }
-
-        let result = resize_disk(&cfg, &inst, new_size);
-
-        assert!(
-            result.is_err(),
-            "resize must fail when truncate cannot spawn: {result:?}"
-        );
-        let yaml = fs::read_to_string(&yaml_path).unwrap();
-        assert!(
-            yaml.contains("disk: \"1GiB\"\n"),
-            "lima.yaml must keep the original disk: after spawn failure: {yaml}"
         );
     }
 
@@ -2677,6 +2637,14 @@ Host h
             LimaState::from_status_str("Restarting"),
             LimaState::Unknown("Restarting".to_string()),
         );
+    }
+
+    #[test]
+    fn only_running_or_stopped_is_a_confirmed_state() {
+        assert!(running_from_state(&LimaState::Running).unwrap());
+        assert!(!running_from_state(&LimaState::Stopped).unwrap());
+        assert!(running_from_state(&LimaState::Broken).is_err());
+        assert!(running_from_state(&LimaState::Unknown("Restarting".into())).is_err());
     }
 
     #[test]

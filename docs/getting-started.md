@@ -1,6 +1,6 @@
 # Getting Started
 
-coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework, or coop-sandbox VMs on Apple's `containerization` package in a build with the opt-in `apple-container` feature (see [backends](backends.md#macos--apple-sandbox-opt-in)). Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
 
 ## Prerequisites
 
@@ -148,7 +148,7 @@ reference](commands.md#quickstart) for details.
 
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
+`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, Codex, and Grok Build.
 
 ```
 coop setup
