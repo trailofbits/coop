@@ -14,6 +14,10 @@ translate macOS-specific commands.
 
 ## Launching Codex
 
+If a [creation hook](configuration.md#creation-hooks) has failed, `coop codex`
+reports unfinished setup. Use `coop shell` or `coop exec` to debug and repeat
+`coop up` before launching Codex.
+
 ```bash
 coop codex [instance-name] [-- extra-args...]
 ```

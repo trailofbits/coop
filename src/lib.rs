@@ -10,6 +10,7 @@ mod cmd;
 mod commands;
 mod completions;
 pub mod config;
+mod creation_hooks;
 mod devcontainer;
 mod devcontainer_oci;
 mod fs_util;
@@ -80,7 +81,7 @@ use commands::{
     cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
     cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
     cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
-    open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
+    open_agent_session, preflight_start_target, prepend_binary, resolve_devcontainer,
     resolve_devcontainer_collect, resolve_running,
 };
 
@@ -1360,7 +1361,7 @@ pub fn run() -> Result<()> {
             ask,
             mut args,
         } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -1371,13 +1372,13 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1395,7 +1396,7 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
         }
         Commands::Grok { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             let args = grok_launch_args(ask, args);
             let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
             ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))

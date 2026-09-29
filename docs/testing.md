@@ -140,6 +140,15 @@ VM suite checks initial copies, restart refresh, retained guest-only content,
 writable neighboring configuration directories, bootstrap ordering, and restart
 rejection of persisted live host mounts.
 
+Creation-hook tests cover shell and argv forms, invalid commands, private recipe
+storage, stage progress, legacy instances, restore invalidation, startup-hook
+precedence, and shell quoting. Full VM tests cover global/project failure,
+debugging access, agent gating, retries without repeating successful stages,
+workspace availability, environment forwarding, failed-hook descendant cleanup,
+cancellation, and retries during paused or failed restart file copying.
+Hook counters live in the guest home so boot-time cleanup
+of `/tmp` does not invalidate restart assertions.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

@@ -6,6 +6,9 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
+# post_create = "sudo apt-get update && sudo apt-get install -y htop"
+# Creation commands run once per VM creation, before project setup.
+# post_start = "echo guest ready"         # Every boot, after creation/workspace setup
 # GitHub auth strategy. Pick ONE of the two forms below — `github` cannot
 # be both a string and a table at the same time.
 #

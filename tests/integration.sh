@@ -6768,6 +6768,345 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# ── Creation hooks (--full only) ───────────────────────────────
+
+prepare_creation_hooks_fixture() {
+    local source=$1 cfg=$2
+    mkdir -p "$source/.devcontainer"
+    cat > "$cfg" <<'TOML'
+github = "off"
+post_create = '''
+printf 'global:%s:%s\n' "$PWD" "$CREATION_TEST" >> /home/ubuntu/.creation-log
+test -f "$HOME/global-ready"
+'''
+post_start = "echo config-post-start >> /home/ubuntu/.creation-log"
+TOML
+    cat > "$source/.devcontainer/devcontainer.json" <<'JSON'
+{
+  "containerEnv": {"CREATION_TEST": "from-project"},
+  "postCreateCommand": ["bash", "setup.sh", "literal && $(ignored)"],
+  "postStartCommand": "echo post-start >> /home/ubuntu/.creation-log"
+}
+JSON
+    cat > "$source/setup.sh" <<'SH'
+set -euo pipefail
+test "$1" = 'literal && $(ignored)'
+printf 'project:%s:%s\n' "$PWD" "$CREATION_TEST" >> /home/ubuntu/.creation-log
+test -f "$HOME/project-ready"
+SH
+}
+
+# shellcheck disable=SC2016 # Guest shells must expand these expressions, not the host.
+test_creation_hooks() {
+    echo ""
+    echo "=== Phase: creation hook failure and retry ==="
+    local inst_name="${INSTANCE}-creation"
+    local source="$tmpdir/creation-workspace" cfg="$tmpdir/creation.toml"
+    prepare_creation_hooks_fixture "$source" "$cfg"
+    STARTED_INSTANCES+=("$inst_name")
+    if coop_fails --config "$cfg" up "$source" --name "$inst_name" --no-agents \
+        --devcontainer "$source/.devcontainer/devcontainer.json" &&
+        [[ "$HARNESS_ERR" == *"global post_create failed"* ]]; then
+        pass "global creation failure retains the VM"
+    else
+        fail "global creation failure retains the VM" "$HARNESS_ERR"
+        return
+    fi
+    GUEST_INSTANCE="$inst_name"
+    if guest_exec bash -c 'test "$(cat /home/ubuntu/.creation-log)" = global:/home/ubuntu:from-project' &&
+        coop_fails --config "$cfg" codex "$inst_name" -- --version &&
+        [[ "$HARNESS_ERR" == *"Creation setup is unfinished"* ]]; then
+        pass "global failure blocks project/startup hooks and agent launch but allows debugging"
+    else
+        fail "global failure blocks project/startup hooks and agent launch but allows debugging"
+    fi
+    guest_exec touch /home/ubuntu/global-ready
+    if coop_fails --config "$cfg" up "$source" &&
+        [[ "$HARNESS_ERR" == *"project postCreateCommand failed"* ]]; then
+        pass "running up resumes setup and reports project failure"
+    else
+        fail "running up resumes setup and reports project failure" "$HARNESS_ERR"
+    fi
+    finish_creation_hooks_retry "$inst_name" "$source" "$cfg"
+    test_creation_hooks_restore "$inst_name" "$source" "$cfg"
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
+# shellcheck disable=SC2016 # Guest shells must expand these expressions, not the host.
+finish_creation_hooks_retry() {
+    local inst_name=$1 source=$2 cfg=$3
+    guest_exec touch /home/ubuntu/project-ready
+    cat > "$cfg" <<'TOML'
+github = "off"
+post_create = "exit 99"
+post_start = "echo changed-post-start >> /home/ubuntu/.creation-log"
+TOML
+    if coop --config "$cfg" up "$source" &&
+        guest_exec bash -c 'test "$(grep -c "^global:" /home/ubuntu/.creation-log)" = 2 &&
+            test "$(grep -c "^project:/workspace:from-project$" /home/ubuntu/.creation-log)" = 2 &&
+            test "$(tail -n 1 /home/ubuntu/.creation-log)" = post-start &&
+            test "$(wc -l < /home/ubuntu/.creation-log)" = 5'; then
+        pass "retry keeps the recipe, argv, environment, and successful stages and runs saved post_start"
+    else
+        fail "retry keeps the recipe, argv, environment, and successful stages and runs saved post_start" "$HARNESS_ERR"
+    fi
+    coop --config "$cfg" up "$source"
+    if guest_exec bash -c 'test "$(wc -l < /home/ubuntu/.creation-log)" = 5' &&
+        coop --config "$cfg" codex "$inst_name" -- --version; then
+        pass "completed setup permits agents and reconnect does not rerun hooks"
+    else
+        fail "completed setup permits agents and reconnect does not rerun hooks" "$HARNESS_ERR"
+    fi
+    coop stop "$inst_name"
+    if coop --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        guest_exec bash -c 'test "$(wc -l < /home/ubuntu/.creation-log)" = 6 &&
+            test "$(tail -n 1 /home/ubuntu/.creation-log)" = changed-post-start'; then
+        pass "normal restart skips completed creation stages and runs current post_start"
+    else
+        fail "normal restart skips completed creation stages and runs current post_start" "$HARNESS_ERR"
+    fi
+}
+
+test_creation_hooks_restore() {
+    local inst_name=$1 source=$2 cfg=$3
+    if coop_fails --config "$cfg" restore "$inst_name" --reprovision --no-agents -y &&
+        [[ "$HARNESS_ERR" == *"global post_create failed"* ]] &&
+        guest_exec test -f /workspace/setup.sh; then
+        pass "reprovision resets creation progress and copies workspace before retrying saved hooks"
+    else
+        fail "reprovision resets creation progress and copies workspace before retrying saved hooks" "$HARNESS_ERR"
+    fi
+    guest_exec touch /home/ubuntu/global-ready /home/ubuntu/project-ready
+    coop --config "$cfg" up "$source"
+    coop stop "$inst_name"
+    coop --config "$cfg" restore "$inst_name" --image default
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        [[ "$HARNESS_ERR" == *"global post_create failed"* ]]; then
+        pass "plain restore invalidates completed creation stages"
+    else
+        fail "plain restore invalidates completed creation stages" "$HARNESS_ERR"
+    fi
+}
+
+prepare_creation_restart_fixture() {
+    local source=$1 cfg=$2
+    mkdir -p "$source"
+    echo old > "$source/payload"
+    cat > "$cfg" <<TOML
+github = "off"
+post_create = '''
+cat "\$HOME/.creation-payload" >> "\$HOME/.creation-attempts"
+test -f "\$HOME/.creation-repaired"
+'''
+[[guest_files]]
+source = "$source/payload"
+destination = "~/.creation-payload"
+TOML
+}
+
+# shellcheck disable=SC2016 # The wrapper and guest assertions expand inside the VM.
+test_creation_restart_serialization() {
+    echo ""
+    echo "=== Phase: creation retry during restart provisioning ==="
+    local inst_name="${INSTANCE}-restart-hooks"
+    local source="$tmpdir/creation-restart" cfg="$tmpdir/creation-restart.toml"
+    prepare_creation_restart_fixture "$source" "$cfg"
+    STARTED_INSTANCES+=("$inst_name")
+    GUEST_INSTANCE="$inst_name"
+    if ! coop_fails --config "$cfg" up "$source" --name "$inst_name" \
+        --no-agents --no-devcontainer; then
+        fail "restart serialization fixture starts with a failed creation command"
+        return
+    fi
+    guest_exec bash -c 'cat > /tmp/rsync-wrapper <<'"'"'SCRIPT'"'"'
+#!/bin/bash
+set -euo pipefail
+if [[ $* == *coop-guest-files-* ]]; then
+    test ! -e "$HOME/.creation-copy-fail" || exit 1
+    touch "$HOME/.creation-copy-began"
+    until test -e "$HOME/.creation-copy-release"; do sleep 0.1; done
+fi
+exec /usr/bin/rsync "$@"
+SCRIPT
+sudo install -m 755 /tmp/rsync-wrapper /usr/local/bin/rsync
+touch "$HOME/.creation-copy-fail" "$HOME/.creation-repaired"'
+    echo refreshed > "$source/payload"
+    coop stop "$inst_name"
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        coop_fails --config "$cfg" up "$source" &&
+        [[ "$HARNESS_ERR" == *"Boot prerequisites are unfinished"* ]]; then
+        pass "running retries cannot bypass failed boot prerequisites"
+    else
+        fail "running retries cannot bypass failed boot prerequisites" "$HARNESS_ERR"
+    fi
+    guest_exec rm /home/ubuntu/.creation-copy-fail
+    coop stop "$inst_name"
+    check_creation_restart_serialization "$inst_name" "$source" "$cfg"
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
+# shellcheck disable=SC2016 # Guest shells must expand these expressions, not the host.
+check_creation_restart_serialization() {
+    local inst_name=$1 source=$2 cfg=$3
+    "$BINARY" --config "$cfg" start "$inst_name" --no-agents --no-prompt \
+        > "$tmpdir/creation-restart.log" 2>&1 &
+    local first=$!
+    local attempt
+    for ((attempt = 0; attempt < 90; attempt++)); do
+        if guest_exec test -f /home/ubuntu/.creation-copy-began; then break; fi
+        kill -0 "$first" 2>/dev/null || break
+        sleep 1
+    done
+    "$BINARY" --config "$cfg" up "$source" > "$tmpdir/creation-retry.log" 2>&1 &
+    local second=$!
+    sleep 2
+    if guest_exec bash -c 'test -f ~/.creation-copy-began &&
+        test "$(cat ~/.creation-attempts)" = old'; then
+        pass "running retry waits while restart copies guest files"
+    else
+        fail "running retry waits while restart copies guest files"
+    fi
+    guest_exec touch /home/ubuntu/.creation-copy-release
+    wait_for_creation_launcher "$first"
+    wait_for_creation_launcher "$second"
+    if wait "$first" && wait "$second" &&
+        guest_exec bash -c 'test "$(cat ~/.creation-attempts)" = "$(printf "old\nrefreshed")"'; then
+        pass "creation runs once after restart prerequisites finish"
+    else
+        fail "creation runs once after restart prerequisites finish"
+        cat "$tmpdir/creation-restart.log" "$tmpdir/creation-retry.log"
+    fi
+}
+
+# shellcheck disable=SC2016 # Guest shells must expand these expressions, not the host.
+test_creation_failed_descendants() {
+    echo ""
+    echo "=== Phase: failed creation hook descendants ==="
+    local inst_name="${INSTANCE}-descendants"
+    local source="$tmpdir/creation-descendants" cfg="$tmpdir/creation-descendants.toml"
+    mkdir -p "$source"
+    cat > "$cfg" <<'TOML'
+github = "off"
+post_create = '''
+sleep 600 >/dev/null 2>&1 &
+echo $! >> "$HOME/.creation-descendants"
+exit 1
+'''
+TOML
+    STARTED_INSTANCES+=("$inst_name")
+    GUEST_INSTANCE="$inst_name"
+    local attempt
+    for attempt in 1 2; do
+        local args=()
+        if [[ $attempt == 1 ]]; then args=(--name "$inst_name" --no-agents --no-devcontainer); fi
+        if coop_fails --config "$cfg" up "$source" "${args[@]+"${args[@]}"}" &&
+            [[ "$HARNESS_ERR" == *"global post_create failed"* ]] &&
+            guest_exec bash -c 'test "$(wc -l < ~/.creation-descendants)" = "$1" &&
+                while read -r pid; do
+                    if kill -0 "$pid" 2>/dev/null; then exit 1; fi
+                done < ~/.creation-descendants' _ "$attempt"; then
+            pass "failed creation attempt $attempt terminates its background descendants"
+        else
+            fail "failed creation attempt $attempt terminates its background descendants" "$HARNESS_ERR"
+        fi
+    done
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
+test_creation_hook_cancellation() {
+    echo ""
+    echo "=== Phase: creation hook cancellation and serialization ==="
+    local inst_name="${INSTANCE}-cancel"
+    local source="$tmpdir/creation-cancel-workspace" cfg="$tmpdir/creation-cancel.toml"
+    mkdir -p "$source"
+    cat > "$cfg" <<'TOML'
+github = "off"
+post_create = '''
+echo attempt >> "$HOME/.creation-attempts"
+if [ ! -f "$HOME/.creation-repaired" ]; then
+    echo $$ > "$HOME/.creation-child"
+    sleep 600 &
+    echo $! > "$HOME/.creation-descendant"
+    touch "$HOME/.creation-began"
+    wait
+fi
+'''
+TOML
+    STARTED_INSTANCES+=("$inst_name")
+    GUEST_INSTANCE="$inst_name"
+    "$BINARY" --config "$cfg" up "$source" --name "$inst_name" --no-agents \
+        --no-devcontainer > "$tmpdir/creation-launch.log" 2>&1 &
+    local first=$!
+    if ! wait_for_creation_marker "$first"; then
+        fail "creation cancellation fixture reaches the running command"
+        kill -TERM "$first" 2>/dev/null || true
+        wait "$first" || true
+        unset GUEST_INSTANCE
+        return
+    fi
+    check_creation_cancellation "$first" "$source" "$cfg"
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
+wait_for_creation_marker() {
+    local launcher=$1
+    for ((attempt = 0; attempt < 90; attempt++)); do
+        if guest_exec test -f /home/ubuntu/.creation-began; then return 0; fi
+        kill -0 "$launcher" 2>/dev/null || return 1
+        sleep 1
+    done
+    return 1
+}
+
+# shellcheck disable=SC2016 # Guest shells must expand these expressions, not the host.
+check_creation_cancellation() {
+    local first=$1 source=$2 cfg=$3
+    local child descendant
+    child=$(guest_exec cat /home/ubuntu/.creation-child)
+    descendant=$(guest_exec cat /home/ubuntu/.creation-descendant)
+    guest_exec touch /home/ubuntu/.creation-repaired
+    "$BINARY" --config "$cfg" up "$source" > "$tmpdir/creation-retry.log" 2>&1 &
+    local second=$!
+    sleep 2
+    if guest_exec bash -c 'test "$(wc -l < ~/.creation-attempts)" = 1'; then
+        pass "concurrent up waits for the active creation attempt"
+    else
+        fail "concurrent up waits for the active creation attempt"
+    fi
+    kill -INT "$first"
+    wait_for_creation_launcher "$first"
+    local first_rc=0 second_rc=0
+    wait "$first" || first_rc=$?
+    wait_for_creation_launcher "$second"
+    wait "$second" || second_rc=$?
+    if [[ $first_rc != 0 && $second_rc == 0 ]] &&
+        guest_exec bash -c '! kill -0 "$1" 2>/dev/null && ! kill -0 "$2" 2>/dev/null &&
+            test "$(wc -l < ~/.creation-attempts)" = 2' _ "$child" "$descendant"; then
+        pass "cancellation reaps the guest command and a serialized retry completes"
+    else
+        fail "cancellation reaps the guest command and a serialized retry completes"
+        cat "$tmpdir/creation-launch.log" "$tmpdir/creation-retry.log"
+    fi
+}
+
+wait_for_creation_launcher() {
+    local launcher=$1
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        kill -0 "$launcher" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    fail "creation launcher exits within the cancellation/retry bound"
+    kill -KILL "$launcher" 2>/dev/null || true
+}
+
 # ── Explicit guest files (--full only) ─────────────────────────
 
 test_guest_files() {
@@ -7316,6 +7655,10 @@ EOF
         test_builtin_profile_plugins
         test_post_start
         test_guest_files
+        test_creation_hooks
+        test_creation_hook_cancellation
+        test_creation_failed_descendants
+        test_creation_restart_serialization
         test_devcontainer_apply
         test_devcontainer_oci_feature
 

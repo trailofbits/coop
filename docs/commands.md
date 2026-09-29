@@ -6,6 +6,13 @@ Configured [`guest_files`](configuration.md#guest-files) are copied before agent
 bootstrap when you create or restart a VM, including `restore --reprovision` and
 `--no-agents`. Reconnecting to an already-running VM does not refresh them.
 
+[Creation hooks](configuration.md#creation-hooks) run after the workspace is
+ready. A failed hook retains the VM and blocks agent launch. Use `shell` or
+`exec` to debug, then retry `up` on the running VM or `start` after stopping it.
+Completed creation stages are skipped on ordinary restarts. `restore` resets
+progress; `restore --reprovision` also copies the workspace before rerunning the
+saved recipe.
+
 ## Global Flags
 
 | Flag | Description |
@@ -878,6 +885,7 @@ Kept across the wipe, because coop persists them host-side:
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards, including a devcontainer's `forwardPorts` | `forwards.json` |
 | Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
+| Creation commands and their deferred startup command | `creation.json`; creation progress is reset before the disk replacement |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
 
@@ -885,7 +893,7 @@ Kept across the wipe, because coop persists them host-side:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
-- A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
+- A devcontainer's `postStartCommand` when no creation commands were selected. With a saved creation recipe, completing its reset stages also runs the saved startup command. Devcontainer `features` are baked into the image and survive the wipe.
 
 Before replacing the disk, coop checks that the image exists, the state files
 parse, the recorded workspace directory is still there, and host ports for
