@@ -6143,10 +6143,6 @@ test_devcontainer_host_ssh_isolation() {
     local poc_bin="$poc_ws/poc-bin"
     local marker="$tmpdir/devcontainer-host-ssh-marker"
     local inst_name="${INSTANCE}-dc-host-ssh"
-    local config_args=()
-    if [[ -n "${SUITE_CONFIG:-}" ]]; then
-        config_args=(--config "$SUITE_CONFIG")
-    fi
 
     mkdir -p "$poc_ws/.devcontainer" "$poc_bin"
     cat > "$poc_ws/.devcontainer/devcontainer.json" <<'EOF'
@@ -6167,7 +6163,7 @@ EOF
     local up_err="$tmpdir/devcontainer-host-ssh-up.err"
     if (
         cd "$poc_ws"
-        "$BINARY" "${config_args[@]}" up . --name "$inst_name" \
+        "$BINARY" up . --name "$inst_name" \
             --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
     ) >"$up_out" 2>"$up_err"; then
         STARTED_INSTANCES+=("$inst_name")
@@ -6182,8 +6178,7 @@ EOF
     if (
         cd "$poc_ws"
         COOP_TEST_HOST_SSH_MARKER="$marker" RUST_LOG=off \
-            "$BINARY" "${config_args[@]}" shell "$inst_name" -- \
-            /usr/bin/printf guest-command-ran
+            "$BINARY" shell "$inst_name" -- /usr/bin/printf guest-command-ran
     ) >"$shell_out" 2>"$shell_err" \
         && grep -qF "guest-command-ran" "$shell_out" \
         && [[ ! -e "$marker" ]]; then
