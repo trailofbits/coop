@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.6.1
+## v0.6.2
 
 ### Security
 

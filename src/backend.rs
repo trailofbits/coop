@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::num::{NonZeroU8, NonZeroU16};
 use std::path::{Path, PathBuf};
