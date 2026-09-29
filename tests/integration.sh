@@ -6132,7 +6132,7 @@ EOF
     untrack_instance "$inst_name"
 }
 
-# Reproduce GHSA-rjgv-3r4c-mmcw with a project-controlled PATH and fake ssh.
+# Exercise host SSH isolation with a project-controlled PATH and fake ssh.
 # The payload must remain inert on the host while the real SSH client reaches
 # the guest with the translated PATH.
 test_devcontainer_host_ssh_isolation() {
@@ -6167,9 +6167,9 @@ EOF
             --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
     ) >"$up_out" 2>"$up_err"; then
         STARTED_INSTANCES+=("$inst_name")
-        pass "advisory fixture up exits 0"
+        pass "host SSH isolation fixture up exits 0"
     else
-        fail "advisory fixture up exits 0" "stderr: $(cat "$up_err")"
+        fail "host SSH isolation fixture up exits 0" "stderr: $(cat "$up_err")"
         return
     fi
 
