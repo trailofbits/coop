@@ -1,7 +1,7 @@
 # Architecture
 
 `coop` is a Rust CLI that orchestrates isolated VM environments for running AI
-coding agents (Claude Code, Codex). It manages the full VM lifecycle — setup,
+coding agents (Claude Code, Codex, Grok Build). It manages the full VM lifecycle — setup,
 start, shell, stop, destroy, status, logs — behind two platform backends:
 
 - **Linux** — Firecracker microVMs on KVM.
@@ -87,7 +87,7 @@ backends.)
 
 Everything above the trait is **backend-shared**: the entire "shared guest
 operations" surface in `backend.rs` (env/secret forwarding, agent bootstrap,
-Claude/Codex config injection, git-repo cloning), plus `workspace.rs`,
+Claude/Codex/Grok config injection, git-repo cloning), plus `workspace.rs`,
 `ssh.rs`, `config.rs`, and the `commands/` handlers. When you touch shared
 code, it must hold for **both** backends. Known intentional divergences:
 
@@ -104,15 +104,22 @@ Two lifecycle machines are encoded in the type system rather than in runtime
 flags — this is a load-bearing design choice (see
 [`code-style.md`](code-style.md#type-state-for-lifecycles)):
 
-- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) are unforgeable
-  liveness proofs with private fields, minted only by the probes `as_running`
-  / `as_stopped`. Operations that require a live (or stopped) VM take the proof
-  by value, so the precondition is checked once and then witnessed by the type.
+- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields
+  and are minted by `as_running` / `as_stopped` after a state probe. They record
+  a point-in-time observation. `StoppedInstance` also holds the per-instance
+  operation lock through stopped-only disk mutations. Lima only mints it for
+  confirmed `Stopped`; absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
   path calls first; it runs `cfg.validate()` so no VM starts on an invalid
   config.
+
+An instance operation lock is held from the stopped-state probe through disk
+resize, commit, or restore. Start, stop, and destroy acquire the same bounded
+lock. Its file is a sibling of the instance directory, so directory removal
+does not replace the lock inode. Allocation releases its directory lock before
+any instance operation lock is acquired.
 
 ## Command dispatch
 
@@ -178,6 +185,9 @@ Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
 `guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files.
+Allocation refuses an occupied instance path. If any instance directory has
+unreadable metadata, allocation stops because its network index cannot be
+trusted; existing healthy instances remain available through normal lookup.
 
 ## `coop update`
 
@@ -213,9 +223,9 @@ Hold these when changing the code; the review agents check for their violation:
    filesystem escape. See [`trust-model.md`](trust-model.md).
 2. **Backend selection is compile-time.** Don't add a runtime backend enum;
    keep shared code correct for both Firecracker and Lima.
-3. **Liveness is a type, not a flag.** Route VM operations through
-   `RunningInstance`/`StoppedInstance` and `boot_preflight`, not ad-hoc
-   `if is_running` checks.
+3. **State-gated operations use probes and locks.** Route VM operations through
+   `RunningInstance`/`StoppedInstance` and `boot_preflight`; the stopped token
+   holds the operation lock until the disk mutation is complete.
 4. **Value invariants live in constructors.** Parse into a newtype at the
    boundary; don't re-validate primitives downstream.
 5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in

@@ -38,7 +38,7 @@ attestation.
 ## Scope
 
 coop provisions isolated virtual machines — Firecracker microVMs on Linux, Lima
-VMs on macOS — to run coding agents such as Claude Code and Codex. **The
+VMs on macOS — to run coding agents such as Claude Code, Codex, and Grok Build. **The
 security boundary is the VM.** coop's job is to stand that boundary up and hand
 work to it without weakening it.
 
@@ -67,6 +67,6 @@ Out of scope:
   [`docs/platform-notes.md`](docs/platform-notes.md) and
   [`docs/trust-model.md`](docs/trust-model.md) for details.
 - Vulnerabilities in the software coop runs or orchestrates rather than ships —
-  the guest agents (Claude Code, Codex), Docker, the guest OS, Firecracker, and
+  the guest agents (Claude Code, Codex, Grok Build), Docker, the guest OS, Firecracker, and
   Lima. Report those to their respective projects.
 - Behavior that requires an attacker who already controls the host coop runs on.

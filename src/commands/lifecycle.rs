@@ -1528,6 +1528,47 @@ pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String>
     args
 }
 
+/// Grok Build flags for running unrestricted (always-approve + folder trust).
+const GROK_ALWAYS_APPROVE: &str = "--always-approve";
+const GROK_TRUST: &str = "--trust";
+const GROK_PERMISSION_MODE: &str = "--permission-mode";
+const GROK_PERMISSION_ASK: &str = "default";
+const GROK_AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
+
+/// Prepend Grok Build's always-approve and folder-trust flags, and pin
+/// `--cwd /workspace`, unless the user opted into prompts or is running an
+/// auth subcommand.
+///
+/// The VM is the isolation boundary, so Grok's own permission prompts add
+/// no protection. `--trust` records `/workspace` as trusted so project
+/// `.grok/` hooks and MCP servers load without a first-run question.
+/// Guest `~/.grok/config.toml` also sets `ui.permission_mode =
+/// "always-approve"`, so `--ask` must pass `--permission-mode default`
+/// (Grok's ask mode). Omitting `--always-approve` alone leaves the
+/// config default in force. `login` / `logout` never start a session, so
+/// always-approve is dropped there (folder trust is still harmless and
+/// kept).
+pub(crate) fn grok_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> {
+    let is_auth_subcommand = args
+        .first()
+        .is_some_and(|arg| GROK_AUTH_SUBCOMMANDS.contains(&arg.as_str()));
+    let has_cwd = args
+        .iter()
+        .any(|arg| arg == "--cwd" || arg.starts_with("--cwd="));
+    if !has_cwd && !is_auth_subcommand {
+        args.insert(0, "/workspace".to_string());
+        args.insert(0, "--cwd".to_string());
+    }
+    args.insert(0, GROK_TRUST.to_string());
+    if ask {
+        args.insert(0, GROK_PERMISSION_ASK.to_string());
+        args.insert(0, GROK_PERMISSION_MODE.to_string());
+    } else if !is_auth_subcommand {
+        args.insert(0, GROK_ALWAYS_APPROVE.to_string());
+    }
+    args
+}
+
 pub(crate) fn cmd_exec(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1763,30 +1804,36 @@ pub(crate) fn prepare_session_from_target(
 }
 
 pub(crate) fn cmd_stop(
-    be: &backend::PlatformBackend,
+    be: &impl backend::VmBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Probe live state once. The `RunningInstance` proof flows into
+    // Probe live state. The `RunningInstance` proof flows into
     // `be.stop`, so the type system witnesses that we only ask the
     // backend to stop something that was actually running.
-    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
-        // Tear down forwards before shutting down the VM so the
-        // control master can exit cleanly while SSH is still
-        // reachable.
-        port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?;
-    } else {
-        tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
-        // Stale forwards may still exist even when the VM is gone.
-        if let Ok(target) = be.ssh_target(cfg, inst) {
-            port_forward::teardown_ssh_forwards(inst, &target);
+    let stop_result = match be.as_running(cfg, inst.clone()) {
+        Ok(Some(running)) => {
+            // Tear down forwards before shutting down the VM so the
+            // control master can exit cleanly while SSH is still
+            // reachable.
+            port_forward::teardown_ssh_forwards(running.instance(), running.target());
+            be.stop(cfg, running)
         }
-    }
+        Ok(None) => {
+            tracing::debug!("Instance '{}' is not running", inst.name);
+            // Stale forwards may still exist even when the VM is gone.
+            if let Ok(target) = be.ssh_target(cfg, inst) {
+                port_forward::teardown_ssh_forwards(inst, &target);
+            }
+            be.cleanup_stopped(cfg, inst)
+        }
+        Err(error) => Err(error),
+    };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
     // proxy mode was never on.
     crate::proxy::stop(inst);
+    stop_result?;
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
@@ -1973,7 +2020,9 @@ pub(crate) fn cmd_resize(
         // instance itself (Lima must boot to validate regardless).
         be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
     } else if opts.start {
-        be.start_existing(cfg, stopped.instance())?;
+        let inst = stopped.instance().clone();
+        drop(stopped);
+        be.start_existing(cfg, &inst)?;
     }
 
     Ok(())
@@ -2282,10 +2331,11 @@ fn reprovision_instance(
     inst.set_image(image.clone()).with_context(partial)?;
 
     if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        let stopped = be.as_stopped(inst.clone()).with_context(partial)?;
         be.resize_disk(cfg, &stopped, previous_disk)
             .with_context(partial)?;
     }
+
+    drop(stopped);
 
     signal::check_shutdown().with_context(partial)?;
 
@@ -2515,6 +2565,45 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use crate::backend::VmBackend as _;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_reports_unknown_process_state_and_preserves_pid_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
+        let disk = inst.rootfs_path();
+        std::fs::write(&disk, "disk sentinel").expect("disk sentinel");
+        let cfg = cfg_with_data_dir(root.path().to_path_buf());
+        let backend = super::backend::FirecrackerBackend::new();
+
+        let error = super::cmd_stop(&backend, &cfg, &inst)
+            .expect_err("failed probe cannot report stopped")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(inst.pid_file_path()).expect("retained pid"),
+            "invalid-pid"
+        );
+        let error = backend
+            .destroy_instance(&cfg, &inst)
+            .expect_err("unknown liveness cannot authorize destroy")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&disk).expect("retained disk"),
+            "disk sentinel"
+        );
+        assert!(inst.dir.is_dir());
+    }
 
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {
@@ -2708,6 +2797,54 @@ mod tests {
     fn codex_launch_args_bypass_flag_leads_empty_args() {
         let args = super::codex_launch_args(false, Vec::new());
         assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
+    }
+
+    #[test]
+    fn grok_launch_args_always_approves_and_trusts_by_default() {
+        let args = super::grok_launch_args(false, vec!["--model".into(), "grok-4.6".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--always-approve",
+                "--trust",
+                "--cwd",
+                "/workspace",
+                "--model",
+                "grok-4.6"
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_launch_args_ask_overrides_guest_permission_mode() {
+        let args = super::grok_launch_args(true, vec!["--model".into(), "grok-4.6".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode",
+                "default",
+                "--trust",
+                "--cwd",
+                "/workspace",
+                "--model",
+                "grok-4.6"
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_launch_args_login_and_logout_keep_trust() {
+        for subcommand in ["login", "logout"] {
+            let args =
+                super::grok_launch_args(false, vec![subcommand.into(), "--device-auth".into()]);
+            assert_eq!(args, vec!["--trust", subcommand, "--device-auth"]);
+        }
+    }
+
+    #[test]
+    fn grok_launch_args_respects_user_cwd() {
+        let args = super::grok_launch_args(false, vec!["--cwd".into(), "/tmp".into()]);
+        assert_eq!(args, vec!["--always-approve", "--trust", "--cwd", "/tmp"]);
     }
 
     #[test]

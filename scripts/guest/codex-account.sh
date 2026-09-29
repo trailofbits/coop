@@ -171,6 +171,9 @@ else
     export COOP_CODEX_ACCOUNT_UNLOCKED=1
 fi
 
-exec "$CODEX_BIN" "$@"
+# Codex 0.154.0 can reuse a desktop daemon on another D-Bus session when
+# there are no explicit config overrides. Keep terminal auth on the keyring
+# we just unlocked. Prepend the default so caller overrides retain precedence.
+exec "$CODEX_BIN" -c 'cli_auth_credentials_store="keyring"' "$@"
 CODEXACCOUNTEOF
 chmod 755 /usr/local/bin/codex-account

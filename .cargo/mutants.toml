@@ -58,6 +58,9 @@ exclude_re = [
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
+  # Firecracker liveness invokes sudo and probes /proc plus a Unix socket;
+  # Linux-only process tests cover it outside the unit mutation sweep.
+  "\\bprobe_liveness\\b",
 
   # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
   "\\brun_setup_pat\\b",
@@ -153,6 +156,7 @@ exclude_re = [
 
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
+  "\\block_sibling_bounded\\b",
 
   # network.rs — the guest-to-guest isolation shell-outs. Each drives `bridge`
   # or `iptables` against a live br0, so a `--lib` test cannot observe whether

@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::num::NonZeroU16;
@@ -76,6 +77,15 @@ impl ForwardsState {
 /// Also flags duplicate host ports within `forwards` (two guests
 /// fighting for the same host port).
 pub fn check_host_port_collisions(forwards: &[PortForward]) -> Result<()> {
+    check_host_port_collisions_with_probe(forwards, |port| {
+        TcpListener::bind(("127.0.0.1", port)).map(drop)
+    })
+}
+
+fn check_host_port_collisions_with_probe(
+    forwards: &[PortForward],
+    mut probe: impl FnMut(u16) -> io::Result<()>,
+) -> Result<()> {
     let mut seen: HashSet<NonZeroU16> = HashSet::new();
     for f in forwards {
         if !seen.insert(f.host) {
@@ -88,10 +98,8 @@ pub fn check_host_port_collisions(forwards: &[PortForward]) -> Result<()> {
             );
         }
 
-        match TcpListener::bind(("127.0.0.1", f.host.get())) {
-            Ok(listener) => {
-                drop(listener);
-            }
+        match probe(f.host.get()) {
+            Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 bail!(
                     "Host port {host} is already in use — \
@@ -280,14 +288,14 @@ mod tests {
 
     #[test]
     fn collision_check_passes_when_ports_free() {
-        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let p1 = l1.local_addr().unwrap().port();
-        let p2 = l2.local_addr().unwrap().port();
-        drop(l1);
-        drop(l2);
-        let forwards = vec![pf(3000, p1), pf(4000, p2)];
-        assert!(check_host_port_collisions(&forwards).is_ok());
+        let forwards = vec![pf(3000, 10001), pf(4000, 10002)];
+        let mut probed = Vec::new();
+        let result = check_host_port_collisions_with_probe(&forwards, |port| {
+            probed.push(port);
+            Ok(())
+        });
+        assert!(result.is_ok(), "result = {result:?}");
+        assert_eq!(probed, [10001, 10002]);
     }
 
     #[test]

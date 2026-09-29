@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -147,9 +147,10 @@ deletes the shared secret nor revokes it on GitHub. Destroying the VM removes
 its association with the VM state, leaving the shared PAT intact.
 
 An active assignment rejects managed `GITHUB_TOKEN` **and** `GH_TOKEN` entries
-in `[guest_env]`, either agent's `env_forward`, or persisted `--env` /
-`containerEnv` overrides. Remove these conflicting entries, including saved
-keys in `<instance>/guest_env.json`, or unassign the PAT. This controls coop's
+in `[guest_env]`, Claude, Codex, or Grok `env_forward`, a Grok stdio MCP `env`
+value that names either variable, or persisted `--env` / `containerEnv`
+overrides. Remove these conflicting entries, including saved keys in
+`<instance>/guest_env.json`, or unassign the PAT. This controls coop's
 delivery; the guest can still change its own environment. The VM receives the
 token's actual authority over every repository it covers.
 
@@ -310,6 +311,21 @@ Codex configuration injected into the guest VM at start time. Every field is opt
 | `local_model` | table | unset | Host-side model endpoint to route Codex at when the VM is in local mode (`coop model <vm> local`). See [Local-model routing](#local-model-routing). |
 
 coop preserves any other settings already present in the staged `config.toml`, but the `mcp_servers` table is owned by coop when `codex.mcp_servers` is configured. With `auth = "chatgpt"`, coop also writes `cli_auth_credentials_store = "keyring"` so Codex caches account credentials in the guest OS credential store instead of `auth.json`.
+
+## `grok` section
+
+Grok Build configuration injected into the guest VM at start time. Every field is optional.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `api_key` | string | unset (reads `$XAI_API_KEY` from environment) | xAI API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
+| `config_dir` | string (path) or `false` | `~/.grok` | Source for `AGENTS.md`, `auth.json`, `lsp.json`, `rules/`, `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`, overlaid into guest `~/.grok/` on each start. Host `config.toml` is merged into the guest file except `[plugins]`. Directory symlinks, hidden directories (`.git`, `.venv`, caches), and bare git repos (`*.git`) stay on the host. `.grok-plugin/` and `.claude-plugin/` manifests are copied. `installed-plugins/` is a host-absolute registry and stays on the host. Supports `~` expansion; `false` stops copying while retaining prior files. Host deletions do not delete guest files. See [config directory](grok-integration.md#config-directory). |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `XAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `marketplaces` | array of strings | `[]` | Grok Build plugin marketplace sources. Each entry is a `owner/repo`[`@ref`] shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
+| `plugins` | array of strings | `[]` | Grok Build plugins to install from registered marketplaces (`grok plugin install <name> --trust`). |
+| `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.grok/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
+
+coop also writes `ui.permission_mode = "always-approve"` into the guest `~/.grok/config.toml`, drops the host `[plugins]` table (those names resolve through `installed-plugins/`), keeps the guest `[plugins]` table, and records `/workspace` in `~/.grok/trusted_folders.toml`. Other keys already on the guest, plus host keys that are not `[plugins]`, are preserved. A copied host `auth.json` is set to owner-only (`0600`) on the guest and signs the guest in; otherwise use `coop grok -- login --device-auth`.
 
 ## Local-model routing
 

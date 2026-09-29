@@ -50,7 +50,7 @@ type rather than in a field. Two flavors, pick the lightest that works:
   `start(self) -> Vm<Running>` consumes the stopped value. Illegal transitions
   become compile errors. Use when the lifecycle is the *primary* abstraction a
   type exposes. coop uses this for `FirecrackerVm<Configured|Running>` (`vm.rs`)
-  and for the `RunningInstance`/`StoppedInstance` liveness proofs (`backend.rs`)
+  and for the `RunningInstance`/`StoppedInstance` state observations (`backend.rs`)
   — don't reach for it on a type that mostly does something else.
 
 ## Newtypes that earn their keep

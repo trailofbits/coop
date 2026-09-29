@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -721,6 +720,10 @@ pub struct CoopConfig {
     /// Codex config forwarding settings
     #[serde(default)]
     pub codex: CodexConfig,
+
+    /// Grok Build config forwarding settings
+    #[serde(default)]
+    pub grok: GrokConfig,
 
     /// Host-side credential-injecting proxy (issue #411). Opt-in: when an
     /// upstream is configured, the real credential stays on the host and the
@@ -1532,6 +1535,51 @@ pub struct CodexConfig {
     pub local_model: Option<LocalModel>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrokConfig {
+    /// xAI API key (forwarded via `SendEnv`, never written to disk)
+    pub api_key: Option<Secret<String>>,
+
+    /// Additional env var names to forward from host to guest via SSH
+    #[serde(default)]
+    pub env_forward: Vec<EnvVarName>,
+
+    /// Plugin marketplace sources (URL, path, or GitHub repo)
+    #[serde(default)]
+    pub marketplaces: Vec<String>,
+
+    /// Plugins to install from marketplaces
+    #[serde(default)]
+    pub plugins: Vec<String>,
+
+    /// MCP servers to merge into the guest `~/.grok/config.toml`
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerDef>,
+
+    /// Source directory for Grok Build files (AGENTS.md, auth.json, lsp.json,
+    /// rules/, skills/, commands/, plugins/, hooks/, agents/, workflows/).
+    /// Host `config.toml` is merged into the guest file (except `[plugins]`),
+    /// not copied over it.
+    #[serde(default)]
+    pub config_dir: ConfigDir,
+}
+
+impl GrokConfig {
+    /// Host environment variable names referenced by stdio MCP `env`
+    /// mappings. Grok expands those as `${NAME}` in the guest config, so
+    /// the names must be forwarded into the guest.
+    pub(crate) fn stdio_env_host_names(&self) -> Vec<EnvVarName> {
+        self.mcp_servers
+            .values()
+            .filter_map(|def| match def {
+                McpServerDef::Stdio { env, .. } => Some(env.values().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+}
+
 /// Codex cloud authentication mode.
 ///
 /// `ApiKey` preserves the historical behavior: coop forwards
@@ -1978,6 +2026,7 @@ impl CoopConfig {
     fn expand_user_paths(&mut self) {
         expand_marketplaces(&mut self.claude.marketplaces);
         expand_marketplaces(&mut self.codex.marketplaces);
+        expand_marketplaces(&mut self.grok.marketplaces);
         for profile in self.profiles.values_mut() {
             expand_marketplaces(&mut profile.marketplaces);
         }
@@ -2074,6 +2123,15 @@ impl CoopConfig {
             ));
         }
 
+        if let ConfigDir::Custom(ref path) = self.grok.config_dir
+            && !path.is_dir()
+        {
+            errors.push(format!(
+                "grok.config_dir '{}' does not exist or is not a directory",
+                path.display()
+            ));
+        }
+
         if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
             errors.push(
                 "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
@@ -2089,6 +2147,7 @@ impl CoopConfig {
             &mut errors,
         );
         check_local_marketplaces("codex.marketplaces", &self.codex.marketplaces, &mut errors);
+        check_local_marketplaces("grok.marketplaces", &self.grok.marketplaces, &mut errors);
 
         // `[claude.local_model]` / `[codex.local_model]` invariants
         // (http(s) scheme, present host, non-empty model) are enforced by
@@ -2215,10 +2274,10 @@ impl CoopConfig {
                 Err(e) => {
                     // Instance dir exists but has missing or corrupted
                     // instance.json — leftover from a crashed start.
-                    // Log and skip so callers aren't blocked.
+                    // Keep healthy instances available for lookup.
                     tracing::warn!(
                         "Skipping corrupted instance dir {} ({}). \
-                         Remove it manually or run `destroy --all`.",
+                         Repair or remove it manually before creating another instance.",
                         entry.path().display(),
                         e,
                     );
@@ -2299,6 +2358,21 @@ impl CoopConfig {
     ) -> Result<Instance> {
         let _lock = lock_dir(&self.instances_dir())?;
 
+        // A directory with unreadable metadata may own any index. Keep it
+        // reserved until the owner repairs or removes it; guessing a free
+        // index could give two VMs the same network identity.
+        for entry in fs::read_dir(self.instances_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                Instance::load(&entry.path()).with_context(|| {
+                    format!(
+                        "Cannot allocate while instance directory {} has invalid metadata",
+                        entry.path().display()
+                    )
+                })?;
+            }
+        }
+
         let instances = self.list_instances()?;
         let used_indices: HashSet<InstanceIndex> = instances.iter().map(|i| i.index).collect();
 
@@ -2333,11 +2407,12 @@ impl CoopConfig {
             InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
         };
 
-        if instances.iter().any(|i| i.name == name) {
-            bail!("Instance '{name}' already exists");
-        }
-
         let dir = self.instances_dir().join(name.as_str());
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => bail!("Instance '{name}' already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to check instance directory"),
+        }
         let instance = Instance {
             name,
             index,
@@ -2373,6 +2448,7 @@ impl Default for CoopConfig {
             setup: SetupConfig::default(),
             claude: ClaudeConfig::default(),
             codex: CodexConfig::default(),
+            grok: GrokConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
             profiles: HashMap::new(),
@@ -2430,6 +2506,19 @@ impl Default for CodexConfig {
             mcp_servers: HashMap::new(),
             config_dir: ConfigDir::Default,
             local_model: None,
+        }
+    }
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            api_key: std::env::var("XAI_API_KEY").ok().map(Secret::new),
+            env_forward: Vec::new(),
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            mcp_servers: HashMap::new(),
+            config_dir: ConfigDir::Default,
         }
     }
 }
@@ -2591,21 +2680,42 @@ impl Instance {
     /// (guards against PID reuse). Removes stale PID files as a side
     /// effect when the process is gone or belongs to something else.
     pub fn is_running(&self) -> bool {
-        let pid_path = self.pid_file_path();
-        if !pid_path.exists() {
-            return false;
-        }
-        let Ok(pid_str) = fs::read_to_string(&pid_path) else {
-            return false;
-        };
-        let Ok(pid) = pid_str.trim().parse::<u32>() else {
-            return false;
-        };
+        self.probe_running().unwrap_or_else(|error| {
+            tracing::warn!(
+                "Could not determine whether instance '{}' is running: {error}",
+                self.name
+            );
+            false
+        })
+    }
 
-        let alive = Cmd::new("kill")
-            .args(["-0", &pid.to_string()])
-            .sudo()
-            .status_ok();
+    /// Fallible Firecracker state probe for operations that must distinguish
+    /// confirmed absence from a failed liveness or identity check.
+    pub fn probe_running(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid_str = match fs::read_to_string(&pid_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+        let pid: u32 = pid_str
+            .trim()
+            .parse()
+            .context("Invalid Firecracker PID file")?;
+        let pid_i32 = i32::try_from(pid).context("Firecracker PID is out of range")?;
+        if pid_i32 <= 0 {
+            bail!("Firecracker PID must be positive");
+        }
+        // SAFETY: signal 0 only probes liveness; it does not signal the process.
+        let alive = if unsafe { libc::kill(pid_i32, 0) } == 0 {
+            true
+        } else {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => false,
+                Some(libc::EPERM) => true,
+                _ => bail!("Failed to probe Firecracker PID {pid}"),
+            }
+        };
 
         if !alive {
             tracing::debug!(
@@ -2615,10 +2725,16 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        if !is_firecracker_process(pid) {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).with_context(|| {
+            format!("Failed to read Firecracker process identity for PID {pid}")
+        })?;
+        if !cmdline
+            .windows(b"firecracker".len())
+            .any(|w| w == b"firecracker")
+        {
             tracing::debug!(
                 "Removing stale PID file for instance '{}' \
                  (PID {pid} is not a Firecracker process)",
@@ -2627,26 +2743,71 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
-}
 
-/// Check if a PID belongs to a Firecracker process by reading
-/// `/proc/{pid}/cmdline`. Returns `false` if the file is unreadable
-/// or the command line does not contain "firecracker".
-fn is_firecracker_process(pid: u32) -> bool {
-    let Ok(cmdline) = Cmd::new("cat")
-        .arg(format!("/proc/{pid}/cmdline"))
-        .sudo()
-        .capture()
-    else {
-        return false;
-    };
-    // /proc/pid/cmdline uses NUL as separator
-    cmdline.contains("firecracker")
+    /// Probe Firecracker liveness without treating an uncertain probe
+    /// or an orphaned API socket as a confirmed exit.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid = match fs::read_to_string(&pid_path) {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<i32>()
+                    .context("Invalid Firecracker PID")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+
+        if let Some(pid) = pid {
+            if pid <= 0 {
+                bail!("Invalid Firecracker PID: {pid}");
+            }
+            // EPERM means the root-owned process exists. ESRCH confirms exit,
+            // including when /proc hides other users' processes.
+            let exists = if unsafe { libc::kill(pid, 0) } == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EPERM) => true,
+                    Some(libc::ESRCH) => false,
+                    _ => return Err(error).context("Failed to probe Firecracker PID"),
+                }
+            };
+            if exists {
+                let cmdline = Cmd::new("cat")
+                    .arg(format!("/proc/{pid}/cmdline"))
+                    .sudo()
+                    .capture()
+                    .context("Failed to inspect Firecracker PID")?;
+                if cmdline.contains("firecracker") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        match std::os::unix::net::UnixStream::connect(self.api_socket_path()) {
+            Ok(_) => {
+                bail!("Firecracker API socket is still accepting connections without a valid PID")
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("Failed to probe Firecracker API socket"),
+        }
+    }
 }
 
 // ── Defaults ──────────────────────────────────────────────────
@@ -3044,6 +3205,48 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_pidless_live_socket() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_confirms_exited_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+        assert!(!inst.probe_liveness().unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_invalid_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), "invalid").unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_recognizes_running_firecracker() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let result = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
@@ -3099,37 +3302,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_dead_pid() {
-        assert!(!is_firecracker_process(DEAD_PID));
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_live_non_firecracker_pid() {
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(!result);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_true_for_firecracker_named_pid() {
-        let mut child = spawn_firecracker_like();
-        let pid = child.id();
-        wait_for_firecracker_cmdline(pid);
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(result);
-    }
-
     // ── Allocate instance ────────────────────────────────────
 
     #[test]
@@ -3139,6 +3311,42 @@ mod tests {
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
+    }
+
+    #[test]
+    fn allocate_rejects_corrupt_instance_directory_without_touching_its_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let healthy = cfg
+            .allocate_instance(Some(&iname("healthy")), &default_img(), None)
+            .unwrap();
+        let corrupt = cfg.instances_dir().join("project");
+        fs::create_dir(&corrupt).unwrap();
+        let metadata = corrupt.join("instance.json");
+        let disk = corrupt.join("rootfs.ext4");
+        fs::write(&metadata, "{bad json").unwrap();
+        fs::write(&disk, "disk sentinel").unwrap();
+
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        for (name, workspace) in [
+            (Some(iname("project")), None),
+            (None, Some(project.as_path())),
+            (None, None),
+        ] {
+            let error = cfg
+                .allocate_instance(name.as_ref(), &default_img(), workspace)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid metadata"), "{error}");
+            assert_eq!(fs::read_to_string(&metadata).unwrap(), "{bad json");
+            assert_eq!(fs::read_to_string(&disk).unwrap(), "disk sentinel");
+            assert!(corrupt.is_dir());
+            assert_eq!(
+                cfg.resolve_instance(Some(&healthy.name)).unwrap().index,
+                healthy.index
+            );
+        }
     }
 
     #[test]
@@ -3540,6 +3748,47 @@ mod tests {
     fn codex_config_rejects_unknown_auth_mode() {
         let json = r#"{"auth": "subscription"}"#;
         assert!(serde_json::from_str::<CodexConfig>(json).is_err());
+    }
+
+    #[test]
+    fn grok_config_all_fields() {
+        let json = r#"{
+            "api_key": "xai-test",
+            "env_forward": ["MYORG_KEY"],
+            "marketplaces": ["https://github.com/example/grok-plugins"],
+            "plugins": ["my-skill@grok-plugins"],
+            "mcp_servers": {
+                "sentry": {
+                    "type": "http",
+                    "url": "https://mcp.sentry.dev/mcp"
+                }
+            }
+        }"#;
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.api_key.as_ref().map(|s| s.expose().as_str()),
+            Some("xai-test")
+        );
+        assert_eq!(cfg.env_forward, vec![EnvVarName::new("MYORG_KEY").unwrap()]);
+        assert_eq!(
+            cfg.marketplaces,
+            vec!["https://github.com/example/grok-plugins".to_string()]
+        );
+        assert_eq!(cfg.plugins, vec!["my-skill@grok-plugins".to_string()]);
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert!(cfg.mcp_servers.contains_key("sentry"));
+    }
+
+    #[test]
+    fn grok_config_all_defaults() {
+        let json = "{}";
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.env_forward.is_empty());
+        assert!(cfg.marketplaces.is_empty());
+        assert!(cfg.plugins.is_empty());
+        assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(cfg.config_dir, ConfigDir::Default);
     }
 
     // ── LocalModel ───────────────────────────────────────────
@@ -5235,19 +5484,23 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn allocate_works_alongside_corrupted_dirs() {
+    fn allocate_refuses_unknown_index_until_corrupt_dir_is_removed() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        // Create a corrupted instance dir occupying no valid index
+        // The malformed metadata may have held any valid index.
         let broken = tmp.path().join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
-        // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg
-            .allocate_instance(None, &ImageName::new(DEFAULT_IMAGE).unwrap(), None)
-            .unwrap();
+        assert!(
+            cfg.allocate_instance(None, &default_img(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid metadata")
+        );
+        fs::remove_dir_all(&broken).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
 
@@ -5448,6 +5701,16 @@ skip = ["not-a-slug"]
     }
 
     #[test]
+    fn grok_config_dir_deserializes_custom_path() {
+        let json = r#"{"grok": {"config_dir": "/custom/path"}}"#;
+        let cfg: CoopConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.grok.config_dir,
+            ConfigDir::Custom(ConfigPath::new("/custom/path"))
+        );
+    }
+
+    #[test]
     fn config_dir_deserializes_disabled() {
         let json = r#"{"claude": {"config_dir": false}}"#;
         let cfg: CoopConfig = serde_json::from_str(json).unwrap();
@@ -5520,6 +5783,17 @@ skip = ["not-a-slug"]
         assert!(
             err.to_string().contains("codex.config_dir"),
             "expected codex config_dir error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nonexistent_grok_config_dir() {
+        let mut cfg = CoopConfig::default();
+        cfg.grok.config_dir = ConfigDir::Custom(ConfigPath::new("/nonexistent/config"));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("grok.config_dir"),
+            "expected grok config_dir error, got: {err}"
         );
     }
 
@@ -5944,6 +6218,17 @@ skip = ["not-a-slug"]
         assert!(
             !debug.contains("sk-openai-real-secret"),
             "CodexConfig Debug leaked api_key: {debug}"
+        );
+    }
+
+    #[test]
+    fn grok_config_api_key_debug_redacts() {
+        let json = r#"{"api_key": "xai-real-secret"}"#;
+        let cfg: GrokConfig = serde_json::from_str(json).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("xai-real-secret"),
+            "GrokConfig Debug leaked api_key: {debug}"
         );
     }
 

@@ -13,7 +13,8 @@ use crate::config::{CoopConfig, ImageName, Instance, InstanceName};
 use crate::devcontainer_oci::{InstalledFeature, ResolvedFeature, installed_features};
 use crate::guest::{
     BASE_PACKAGES, DOCKER_PACKAGES, GH_PACKAGES, GuestUser, ProfileDef, SCRIPT_CLAUDE_CODE,
-    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, resolve_profiles,
+    SCRIPT_CODEX, SCRIPT_CODEX_ACCOUNT, SCRIPT_DOCKER_REPO, SCRIPT_GH_REPO, SCRIPT_GROK,
+    resolve_profiles,
 };
 use crate::sha256_hash::Sha256Hash;
 
@@ -63,6 +64,10 @@ pub struct TemplateConfig {
     pub codex_marketplaces: Vec<String>,
     #[serde(default)]
     pub codex_plugins: Vec<String>,
+    #[serde(default)]
+    pub grok_marketplaces: Vec<String>,
+    #[serde(default)]
+    pub grok_plugins: Vec<String>,
     #[serde(default)]
     pub guest_user: GuestUser,
     #[serde(default)]
@@ -349,20 +354,14 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
 
     let _guard = MountGuard::simple(&rootfs_str, &mount_str)?;
 
-    let network_config = format!(
-        "[Match]\nName=eth0\n\n[Network]\nAddress={}/24\nGateway=172.16.0.1\nDNS=8.8.8.8\nDNS=8.8.4.4\n",
-        inst.guest_ip()
-    );
-    let netfile = format!("{mount_str}/etc/systemd/network/10-eth0.network");
-
-    // Write via tee to handle root-owned filesystem
-    Cmd::new("tee")
-        .arg(&netfile)
+    Cmd::new(std::env::current_exe()?)
+        .arg("__patch-guest-network")
+        .arg(&mount_str)
+        .arg(&hostname)
+        .arg(inst.guest_ip().to_string())
         .sudo()
-        .stdin_write(network_config.as_bytes())
-        .context("Failed to write guest network config")?;
-
-    patch_guest_identity(&mount_str, &hostname)?;
+        .run()
+        .context("Failed to patch guest network and identity")?;
 
     // _guard dropped here → unmount + rmdir
     Ok(())
@@ -408,21 +407,65 @@ fn guest_hostname(name: &InstanceName) -> String {
 /// of each `sudo` command in the guest. The template ships `claude-vm`
 /// (`scripts/guest/guest-config.sh`) while each instance gets its own name, so
 /// the two files have to move together.
-fn patch_guest_identity(mount_str: &str, hostname: &str) -> Result<()> {
-    let hostfile = format!("{mount_str}/etc/hostname");
-    Cmd::new("tee")
-        .arg(&hostfile)
-        .sudo()
-        .stdin_write(format!("{hostname}\n").as_bytes())
-        .context("Failed to write hostname")?;
+#[cfg(target_os = "linux")]
+pub(crate) fn patch_guest_network_files(
+    mount: &Path,
+    hostname: &str,
+    ip: std::net::Ipv4Addr,
+) -> Result<()> {
+    let network_config = format!(
+        "[Match]\nName=eth0\n\n[Network]\nAddress={ip}/24\nGateway=172.16.0.1\nDNS=8.8.8.8\nDNS=8.8.4.4\n"
+    );
+    replace_guest_file(
+        mount,
+        &["etc", "systemd", "network"],
+        "10-eth0.network",
+        network_config.as_bytes(),
+    )
+    .context("Failed to write guest network config")?;
+    replace_guest_file(
+        mount,
+        &["etc"],
+        "hostname",
+        format!("{hostname}\n").as_bytes(),
+    )
+    .context("Failed to write guest hostname")?;
+    patch_guest_hosts(mount, hostname).context("Failed to patch guest hosts file")
+}
 
-    Cmd::new(std::env::current_exe()?)
-        .arg("__patch-guest-hosts")
-        .arg(mount_str)
-        .arg(hostname)
-        .sudo()
-        .run()
-        .context("Failed to patch guest hosts file")
+/// Replace a guest file without following any guest-authored path component.
+/// Each directory is opened relative to the previous pinned descriptor; the
+/// final rename replaces a symlink rather than traversing it.
+#[cfg(target_os = "linux")]
+fn replace_guest_file(mount: &Path, parents: &[&str], name: &str, content: &[u8]) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let open_directory = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
+    for component in parents {
+        directory = open_directory(&PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            directory.as_raw_fd(),
+            component
+        )))
+        .with_context(|| format!("Guest /{} must be a real directory", parents.join("/")))?;
+    }
+    let parent = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let mut replacement = tempfile::NamedTempFile::new_in(&parent)?;
+    replacement.write_all(content)?;
+    replacement
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))?;
+    replacement
+        .persist(parent.join(name))
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Privileged hosts-file update. Keep directory descriptors alive throughout:
@@ -586,6 +629,8 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         plugins: Vec::new(),
         codex_marketplaces: Vec::new(),
         codex_plugins: Vec::new(),
+        grok_marketplaces: Vec::new(),
+        grok_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
         oci_features: installed_features(&opts.oci_features),
     };
@@ -690,7 +735,7 @@ fn build_template(
         "    3. Create a {} GiB ext4 template image",
         cfg.vm.template_size_gib
     );
-    eprintln!("    4. Install Docker, Claude Code, Codex, and profile packages");
+    eprintln!("    4. Install Docker, Claude Code, Codex, Grok Build, and profile packages");
     eprintln!("  Image: {image}");
     eprintln!("  Output: {}", cfg.template_path_for(image).display());
     eprintln!();
@@ -889,6 +934,8 @@ fn compose_recipe(
     // Codex's native installer keeps the full package under the guest user's home.
     s.push_str(SCRIPT_CODEX);
     s.push_str(SCRIPT_CODEX_ACCOUNT);
+    // Grok Build installs under ~/.grok/bin for the guest user.
+    s.push_str(SCRIPT_GROK);
 
     s
 }
@@ -1446,7 +1493,7 @@ fn install_guest_packages(
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
-    eprintln!("  Installing guest packages (Docker, Claude Code, Codex)...");
+    eprintln!("  Installing guest packages (Docker, Claude Code, Codex, Grok Build)...");
     eprintln!("  This requires sudo and may take several minutes.");
 
     let template_str = image_path.display().to_string();
@@ -1789,6 +1836,14 @@ mod tests {
             "codex-yolo should route through the account wrapper so keyring \
              mode works from an in-guest shell",
         );
+        assert!(
+            script.contains("Installing Grok Build CLI"),
+            "base recipe should install Grok Build CLI",
+        );
+        assert!(
+            script.contains("https://x.ai/cli/install.sh"),
+            "base recipe should use the official Grok installer",
+        );
         no_consecutive_concat(&script);
     }
 
@@ -1799,6 +1854,19 @@ mod tests {
         assert!(
             script.contains("export GUEST_USER='vscode'"),
             "recipe must export GUEST_USER for the chroot scripts:\n{script}"
+        );
+    }
+
+    #[test]
+    fn compose_recipe_chowns_guest_home_recursively() {
+        // Image skel files arrive as root; the guest must own their home.
+        let script = compose_recipe(&[], &[], &[], &GuestUser::default());
+        assert!(
+            script.lines().any(|line| {
+                line.trim() == r#"chown -R "${GUEST_USER}:${GUEST_USER}" "${GUEST_HOME}""#
+            }),
+            "guest home must be chowned recursively so squashfs skel files \
+             are writable by the guest user:\n{script}"
         );
     }
 
@@ -1821,6 +1889,8 @@ mod tests {
         // must default to empty rather than failing to deserialize.
         assert!(tc.codex_marketplaces.is_empty());
         assert!(tc.codex_plugins.is_empty());
+        assert!(tc.grok_marketplaces.is_empty());
+        assert!(tc.grok_plugins.is_empty());
     }
 
     #[test]
@@ -2272,6 +2342,63 @@ mod tests {
             0o600
         );
         assert_eq!(fs::read_dir(&etc).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_network_files_replaces_symlinks_without_writing_outside_rootfs() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc");
+        fs::create_dir_all(etc.join("systemd/network")).unwrap();
+        fs::write(etc.join("hosts"), "127.0.0.1 localhost\n").unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "untouched").unwrap();
+        symlink(&sentinel, etc.join("hostname")).unwrap();
+        symlink(&sentinel, etc.join("systemd/network/10-eth0.network")).unwrap();
+
+        patch_guest_network_files(root.path(), "claude-a", "172.16.0.2".parse().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
+        assert_eq!(
+            fs::read_to_string(etc.join("hostname")).unwrap(),
+            "claude-a\n"
+        );
+        assert!(
+            fs::read_to_string(etc.join("systemd/network/10-eth0.network"))
+                .unwrap()
+                .contains("Address=172.16.0.2/24")
+        );
+        assert!(
+            fs::read_to_string(etc.join("hosts"))
+                .unwrap()
+                .contains("127.0.1.1 claude-a")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_network_files_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("etc/systemd")).unwrap();
+        fs::create_dir(outside.path().join("network")).unwrap();
+        let sentinel = outside.path().join("network/10-eth0.network");
+        fs::write(&sentinel, "untouched").unwrap();
+        symlink(
+            outside.path().join("network"),
+            root.path().join("etc/systemd/network"),
+        )
+        .unwrap();
+
+        assert!(
+            patch_guest_network_files(root.path(), "claude-a", "172.16.0.2".parse().unwrap())
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
     }
 
     #[cfg(target_os = "linux")]

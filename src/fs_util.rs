@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -58,10 +59,10 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
     Ok(())
 }
 
-/// RAII file lock acquired via `flock(LOCK_EX)`. Blocks until the lock
-/// is available; releases on drop.
+/// RAII file lock acquired via `flock(LOCK_EX)`. Releases on drop.
 ///
-/// Use [`lock_sibling`] to obtain a lock keyed off a target path.
+/// Use [`lock_sibling`] for an indefinite wait or [`lock_sibling_bounded`]
+/// when a lifecycle operation must time out.
 pub struct FileLock {
     _file: File,
 }
@@ -96,6 +97,37 @@ pub fn lock_sibling(target: &Path) -> Result<FileLock> {
         );
     }
     Ok(FileLock { _file: file })
+}
+
+/// Acquire a sibling lock with a bounded wait. The lock file stays outside
+/// an instance directory, so destroying that directory cannot replace the
+/// inode used by concurrent lifecycle operations.
+pub fn lock_sibling_bounded(target: &Path, timeout: Duration) -> Result<FileLock> {
+    let parent = target.parent().context("Lock target has no parent")?;
+    fs::create_dir_all(parent)?;
+    let stem = target.file_name().context("Lock target has no name")?;
+    let path = parent.join(format!(".{}.operation.lock", stem.to_string_lossy()));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("Failed to open operation lock {}", path.display()))?;
+    let start = Instant::now();
+    loop {
+        // SAFETY: file owns a valid descriptor throughout the flock call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(FileLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error).with_context(|| format!("Failed to lock {}", path.display()));
+        }
+        if start.elapsed() >= timeout {
+            bail!("Timed out waiting for operation lock {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Write `content` to `path` atomically with permissions `mode`.
@@ -169,6 +201,19 @@ pub fn atomic_write_ssh(path: &Path, content: &str) -> Result<()> {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_sibling_lock_times_out_and_can_be_reacquired() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("instance");
+        let first = lock_sibling_bounded(&target, Duration::from_millis(100)).unwrap();
+        let error = lock_sibling_bounded(&target, Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Timed out"));
+        drop(first);
+        assert!(lock_sibling_bounded(&target, Duration::from_millis(100)).is_ok());
+    }
 
     #[test]
     fn atomic_write_json_creates_file() {

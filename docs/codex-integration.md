@@ -16,6 +16,15 @@ unlocks GNOME Keyring, and then runs the real Codex binary. In keyring mode
 each launch gets a fresh private D-Bus session, so the wrapper asks for the
 guest keyring password every time before Codex starts.
 
+The wrapper also supplies `-c 'cli_auth_credentials_store="keyring"'`.
+In Codex 0.153.0 and 0.154.0, this override prevents implicit reuse of a desktop
+app-server whose D-Bus session may have an unusable keyring. Terminal sign-in
+then uses the session unlocked by the wrapper, including through `codex-yolo`.
+Caller arguments follow this default and retain their precedence; explicitly
+selecting a remote app-server still selects that server and its auth session.
+API-key mode remains a passthrough. This daemon-selection behavior is
+version-dependent and should be rechecked when updating Codex.
+
 The in-guest `codex-yolo` shortcut routes through the same wrapper, so it works
 in either auth mode. Running the bare `codex` binary from `coop shell` does
 not: it has no D-Bus session, and `keyring` credential storage has no
