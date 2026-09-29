@@ -3144,7 +3144,7 @@ mod tests {
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir() {
         use std::os::unix::ffi::OsStrExt as _;
