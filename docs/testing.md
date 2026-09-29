@@ -37,6 +37,9 @@ The test exercises the full VM lifecycle (setup → start → status → shell �
 guest environment → docker → stop → destroy). CI additionally runs the fast,
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
+The full VM suite rebuilds the image and requires the Grok CLI to report a
+version. The shorter suite may reuse an older image and reports that check as
+skipped when Grok is absent.
 
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
