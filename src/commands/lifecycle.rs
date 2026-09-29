@@ -2717,7 +2717,22 @@ mod tests {
             super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
             "saved-value".to_string(),
         );
+        let project_config = tmp.path().join("devcontainer.json");
+        std::fs::write(
+            &project_config,
+            r#"{"containerEnv":{"PATH":"./project-bin"}}"#,
+        )
+        .unwrap();
+        let parsed = crate::devcontainer::ParsedDevcontainer::load(&project_config).unwrap();
+        let translated = crate::devcontainer::translate(
+            &parsed,
+            &crate::devcontainer::TranslatorInputs::default(),
+            crate::devcontainer::Stage::Start,
+        );
+        state.entries.extend(translated.guest_env);
         state.save(&inst).expect("save snapshot");
+        // A later shell loads only saved state, even if the project file is gone.
+        std::fs::remove_file(project_config).unwrap();
 
         let mut cfg = super::config::CoopConfig::default();
         // Sanity: an entry in cfg without a CLI override should still
@@ -2737,7 +2752,24 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let ssh = session
+            .command(&[], "/usr/bin/printenv PATH")
+            .expect("SSH command");
+        assert!(!ssh.get_envs().any(|(name, _)| name == "PATH"));
+        assert!(
+            ssh.get_envs()
+                .any(|(_, value)| value == Some(std::ffi::OsStr::new("./project-bin")))
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(ssh.get_args().last().unwrap())
+            .env_clear()
+            .envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"./project-bin\n");
+        let envs = session.env.guest_values();
         assert_eq!(
             envs.get("FROM_CLI").map(String::as_str),
             Some("saved-value"),
@@ -2793,7 +2825,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("ANTHROPIC_API_KEY"),
             "proxy mode re-injected the raw key from the persisted --env overlay",
@@ -2841,7 +2873,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth re-injected the raw key from the persisted --env overlay",
@@ -2888,7 +2920,7 @@ mod tests {
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
-            !session.env.as_envs().contains_key("OPENAI_API_KEY"),
+            !session.env.guest_values().contains_key("OPENAI_API_KEY"),
             "proxy mode must keep the raw key on the host",
         );
     }
@@ -2930,7 +2962,7 @@ mod tests {
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth must not forward an OpenAI API key",

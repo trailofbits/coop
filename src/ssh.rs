@@ -50,11 +50,10 @@ fn escape_opts() -> [String; 2] {
     ["-e".into(), "~".into()]
 }
 
-fn interactive_ssh_args(session: &SshSession, remote_cmd: String) -> Vec<String> {
-    let mut args = session.ssh_opts();
-    args.extend(escape_opts());
-    args.extend(["-t".to_string(), session.target.addr(), remote_cmd]);
-    args
+fn interactive_ssh_command(session: &SshSession, remote_cmd: &str) -> Result<Command> {
+    let mut options = escape_opts().to_vec();
+    options.push("-t".to_string());
+    session.command(&options, remote_cmd)
 }
 
 /// Restore the local terminal after an SSH failure.
@@ -91,11 +90,7 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
         "If the remote session stops responding, type Enter, then ~. to disconnect; run `stty sane` if your terminal remains broken.",
     );
 
-    let args = interactive_ssh_args(session, remote_cmd);
-
-    let status = Command::new("ssh")
-        .args(&args)
-        .envs(session.env.as_envs())
+    let status = interactive_ssh_command(session, &remote_cmd)?
         .env("TERM", guest_term())
         .status()
         .context("Failed to launch SSH — is the ssh client installed?")?;
@@ -116,13 +111,8 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     tracing::info!("Running (non-interactive): {remote_cmd}");
 
-    let mut args = session.ssh_opts();
-    args.push(session.target.addr());
-    args.push(remote_cmd);
-
-    let status = Command::new("ssh")
-        .args(&args)
-        .envs(session.env.as_envs())
+    let status = session
+        .command(&[], &remote_cmd)?
         .status()
         .context("Failed to launch SSH")?;
 
@@ -143,13 +133,8 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     tracing::debug!("exec: {remote_cmd}");
 
-    let mut args = session.ssh_opts();
-    args.push(session.target.addr());
-    args.push(remote_cmd);
-
-    let output = Command::new("ssh")
-        .args(&args)
-        .envs(session.env.as_envs())
+    let output = session
+        .command(&[], &remote_cmd)?
         .output()
         .context("Failed to launch SSH")?;
 
@@ -206,7 +191,10 @@ mod tests {
         // every transport shares; this session must not add a second one, since
         // OpenSSH honors the first value of a repeated `-o`.
         assert_eq!(
-            interactive_ssh_args(&session, "cd /workspace && 'claude' 'agents'".into()),
+            interactive_ssh_command(&session, "cd /workspace && 'claude' 'agents'")
+                .expect("interactive SSH command")
+                .get_args()
+                .collect::<Vec<_>>(),
             [
                 "-o",
                 "BatchMode=yes",
@@ -234,6 +222,77 @@ mod tests {
                 "ubuntu@127.0.0.1",
                 "cd /workspace && 'claude' 'agents'",
             ],
+        );
+    }
+
+    #[test]
+    fn all_launch_paths_keep_guest_environment_off_host() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var_os("COOP_FORWARDING_FIXTURE").is_some() {
+            let mut env = crate::backend::EnvForward::default();
+            env.set("PATH", "./project-bin");
+            env.set("LD_LIBRARY_PATH", "./project-libs");
+            env.set("SECRET", "guest-only-sentinel");
+            let session = SshSession {
+                target: crate::backend::SshTarget {
+                    host: crate::backend::Hostname::new("127.0.0.1").expect("host"),
+                    port: std::num::NonZeroU16::MIN,
+                    user: crate::backend::SshUser::new("ubuntu").expect("user"),
+                    key_path: "/unused-key".into(),
+                },
+                env,
+            };
+            let check = "test \"$PATH\" = ./project-bin && test \"$LD_LIBRARY_PATH\" = ./project-libs && test \"$SECRET\" = guest-only-sentinel";
+            let args = ["/bin/sh".into(), "-c".into(), check.into()];
+            session
+                .exec(crate::remote_command::RemoteCommand::new().literal(check))
+                .expect("session exec");
+            run_command(&session, &args).expect("noninteractive");
+            exec_command(&session, &args).expect("captured");
+            run_interactive(&session, &args).expect("interactive");
+            return;
+        }
+        let fixture = tempfile::tempdir().expect("fixture");
+        let marker = fixture.path().join("launched");
+        let ssh = fixture.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+set -eu
+test "$PATH" = "$COOP_FORWARDING_FIXTURE"
+test "${LD_LIBRARY_PATH-unset}" = unset
+test "${SECRET-unset}" = unset
+for arg do remote=$arg; done
+# Map the guest workspace to this fixture without requiring /workspace on macOS.
+remote=$(printf '%s' "$remote" | /usr/bin/sed 's@cd /workspace && @@g')
+# Simulate sshd running the remote command, after checking host isolation.
+SHELL=/bin/bash /bin/sh -c "$remote"
+printf x >> "$COOP_FORWARDING_MARKER"
+"#,
+        )
+        .expect("SSH fixture");
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).expect("executable");
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "ssh::tests::all_launch_paths_keep_guest_environment_off_host",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", fixture.path())
+            .env("COOP_FORWARDING_FIXTURE", fixture.path())
+            .env("COOP_FORWARDING_MARKER", &marker)
+            .output()
+            .expect("child test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(marker).expect("all launches reached fixture"),
+            b"xxxx"
         );
     }
 

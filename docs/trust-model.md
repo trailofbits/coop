@@ -98,6 +98,19 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   `<state_dir>/github-pat/<account>.txt` (`secret_store.rs:store_file`); all
   managed writes go through `fs_util::atomic_write_with_mode` / `atomic_write_ssh`,
   which never relax permissions.
+- **Guest environment names never configure host tools.** `EnvForward` sends
+  values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
+  all aliases, removes them, and exports the original names before executing
+  the requested command. This covers config literals, devcontainer entries,
+  CLI overrides, and saved `guest_env.json` equally. Never pass the guest map
+  to a host `Command::envs`, even with an absolute executable path: guest
+  loader and SSH settings must also remain guest-only. Values stay out of
+  command arguments, stdin, and temporary files; existing images' `AcceptEnv *`
+  supports the transport. Missing forwarded aliases fail before the command.
+  Assignment failures also stop the command; shell diagnostics that could
+  contain values are replaced with a message containing only the variable name.
+  The `COOP_SSH_ENV_` namespace is reserved for transport: trusted host SSH
+  wrappers and configuration must not interpret these values as instructions.
 - **Secrets stay out of logs.** `Cmd::redacted_arg` redacts argv in traces;
   `EnvForward`/`Secret<T>` custom `Debug` impls keep values out of debug output.
   Do not log a resolved secret.

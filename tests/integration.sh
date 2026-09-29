@@ -5102,16 +5102,18 @@ test_guest_env_config() {
     # forwarded host value (and a WARN must be emitted on the collision).
     # `post_start` forces the up-time SSH session (and thus
     # `prepare_env_forwarding`, which emits the precedence WARN) to run even
-    # under `--no-agents`, which otherwise skips all session work. `true` is
-    # a no-op. Without it the WARN is never produced during `up`.
+    # under `--no-agents`, which otherwise skips all session work. Bash syntax
+    # verifies that forwarding preserves the account's command interpreter.
     cat > "$cfg_file" <<CFGEOF
-post_start = "true"
+post_start = "[[ 1 == 1 ]] && printf coop-bash-hook-ok"
 
 [claude]
 github = "off"
 env_forward = ["COOP_TEST_GUEST_ENV_PRECEDENCE"]
 
 [guest_env]
+PATH = "/coop-guest-only:/usr/local/bin:/usr/bin:/bin"
+COOP_SSH_ENV_0 = "guest-alias-value"
 COOP_TEST_GUEST_ENV_CONFIG = "from-config-file"
 COOP_TEST_GUEST_ENV_PRECEDENCE = "literal-wins"
 CFGEOF
@@ -5149,6 +5151,12 @@ CFGEOF
         return
     fi
 
+    if [[ "$HARNESS_OUT" == *coop-bash-hook-ok* ]]; then
+        pass "forwarded post_start retains the guest login shell"
+    else
+        fail "forwarded post_start retains the guest login shell" "stderr: $HARNESS_ERR"
+    fi
+
     # The override WARN is emitted during `up` (stderr, INFO default level).
     if echo "$HARNESS_ERR" | grep -q "COOP_TEST_GUEST_ENV_PRECEDENCE.*overrides"; then
         pass "guest_env literal override logs a WARN"
@@ -5180,6 +5188,20 @@ CFGEOF
     else
         fail "guest_env literal overrides forwarded value" \
             "printenv failed; stderr: $(guest_stderr)"
+    fi
+
+    local path_val alias_val
+    if path_val=$(ge_exec /usr/bin/printenv PATH) \
+        && [[ "$path_val" == "/coop-guest-only:/usr/local/bin:/usr/bin:/bin" ]]; then
+        pass "guest PATH survives transport"
+    else
+        fail "guest PATH survives transport" "stderr: $(guest_stderr)"
+    fi
+    if alias_val=$(ge_exec /usr/bin/printenv COOP_SSH_ENV_0) \
+        && [[ "$alias_val" == "guest-alias-value" ]]; then
+        pass "guest transport-name collision is preserved"
+    else
+        fail "guest transport-name collision is preserved" "stderr: $(guest_stderr)"
     fi
 
     ge stop "$inst_name" 2>/dev/null || true

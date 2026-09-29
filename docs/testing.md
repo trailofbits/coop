@@ -94,6 +94,21 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+The same fixture exercises guest environment forwarding through real OpenSSH:
+literal values, empty values, transport-name collisions, PTYs, stdin, exit
+status, missing forwarding, and redacted assignment failures. Its sshd accepts
+only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
+bypassing the transport. The ordinary unit suite separately checks host
+environment isolation on all four SSH launch paths and the complete path from
+devcontainer parsing through saved instance state to a later session.
+
+The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
+normal scope. When changing it, deliberately restore direct guest-map
+`Command::envs` use and separately remove guest restoration: the launch-path
+and round-trip regressions must fail, respectively. Removing export diagnostic
+redaction must fail the assignment-error regression. Restore the code and
+rerun the tests after each check.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
