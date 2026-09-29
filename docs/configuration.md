@@ -174,7 +174,7 @@ RUST_LOG = "info"
 MY_FLAG = "1"
 ```
 
-Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. SSH carries values under internal transport aliases, so saved instance values also remain isolated from the host SSH environment. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
+Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. The values transit the host SSH process under inert internal aliases, so their original guest-controlled names—including names loaded from saved instance state—cannot configure that process. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
 
 **Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
 

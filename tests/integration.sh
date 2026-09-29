@@ -6132,6 +6132,71 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# Reproduce GHSA-rjgv-3r4c-mmcw with a project-controlled PATH and fake ssh.
+# The payload must remain inert on the host while the real SSH client reaches
+# the guest with the translated PATH.
+test_devcontainer_host_ssh_isolation() {
+    echo ""
+    echo "=== Phase: devcontainer host SSH isolation (--full) ==="
+
+    local poc_ws="$tmpdir/devcontainer-host-ssh-poc"
+    local poc_bin="$poc_ws/poc-bin"
+    local marker="$tmpdir/devcontainer-host-ssh-marker"
+    local inst_name="${INSTANCE}-dc-host-ssh"
+    local config_args=()
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        config_args=(--config "$SUITE_CONFIG")
+    fi
+
+    mkdir -p "$poc_ws/.devcontainer" "$poc_bin"
+    cat > "$poc_ws/.devcontainer/devcontainer.json" <<'EOF'
+{
+    "containerEnv": {
+        "PATH": "./poc-bin:/usr/local/bin:/usr/bin:/bin"
+    }
+}
+EOF
+    cat > "$poc_bin/ssh" <<'EOF'
+#!/bin/sh
+printf 'project-controlled host ssh executed\n' > "$COOP_TEST_HOST_SSH_MARKER"
+exit 73
+EOF
+    chmod 700 "$poc_bin/ssh"
+
+    local up_out="$tmpdir/devcontainer-host-ssh-up.out"
+    local up_err="$tmpdir/devcontainer-host-ssh-up.err"
+    if (
+        cd "$poc_ws"
+        "$BINARY" "${config_args[@]}" up . --name "$inst_name" \
+            --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
+    ) >"$up_out" 2>"$up_err"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "advisory fixture up exits 0"
+    else
+        fail "advisory fixture up exits 0" "stderr: $(cat "$up_err")"
+        return
+    fi
+
+    local shell_out="$tmpdir/devcontainer-host-ssh-shell.out"
+    local shell_err="$tmpdir/devcontainer-host-ssh-shell.err"
+    if (
+        cd "$poc_ws"
+        COOP_TEST_HOST_SSH_MARKER="$marker" RUST_LOG=off \
+            "$BINARY" "${config_args[@]}" shell "$inst_name" -- \
+            /usr/bin/printf guest-command-ran
+    ) >"$shell_out" 2>"$shell_err" \
+        && grep -qF "guest-command-ran" "$shell_out" \
+        && [[ ! -e "$marker" ]]; then
+        pass "project PATH cannot replace the host SSH client"
+    else
+        fail "project PATH cannot replace the host SSH client" \
+            "marker: $(test -e "$marker" && echo created || echo absent); stdout: $(cat "$shell_out"); stderr: $(cat "$shell_err")"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── OCI devcontainer feature install (--full only) ────────────
 
 # Resolve a real public GHCR devcontainer Feature, bake it into the image,
@@ -6575,6 +6640,7 @@ main() {
         test_builtin_profiles
         test_post_start
         test_devcontainer_apply
+        test_devcontainer_host_ssh_isolation
         test_devcontainer_oci_feature
 
         # Local marketplace directory copy

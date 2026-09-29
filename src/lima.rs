@@ -1030,7 +1030,7 @@ fn install_builder_plugins(
     // Minimal env forwarding: GITHUB_TOKEN for private repo access
     let mut env = crate::backend::EnvForward::default();
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        env.set("GITHUB_TOKEN", token);
+        env.set("GITHUB_TOKEN", token)?;
     }
 
     let session = crate::backend::SshSession { target, env };

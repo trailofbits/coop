@@ -230,9 +230,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         if std::env::var_os("COOP_FORWARDING_FIXTURE").is_some() {
             let mut env = crate::backend::EnvForward::default();
-            env.set("PATH", "./project-bin");
-            env.set("LD_LIBRARY_PATH", "./project-libs");
-            env.set("SECRET", "guest-only-sentinel");
+            env.set("PATH", "./project-bin").expect("PATH");
+            env.set("LD_LIBRARY_PATH", "./project-libs")
+                .expect("LD_LIBRARY_PATH");
+            env.set("SECRET", "guest-only-sentinel").expect("SECRET");
             let session = SshSession {
                 target: crate::backend::SshTarget {
                     host: crate::backend::Hostname::new("127.0.0.1").expect("host"),
