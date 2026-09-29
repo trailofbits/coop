@@ -46,7 +46,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 # native musl compiler; the release workflow builds every target on a
 # matching-arch runner (no cross-compilation), so `musl-gcc` compiles it
 # cleanly for both musl targets.
-rustls = { version = "0.23", default-features = false, features = [
+rustls = { version = "0.23.45", default-features = false, features = [
   "std",
   "tls12",
   "aws_lc_rs",

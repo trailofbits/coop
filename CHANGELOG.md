@@ -9,6 +9,8 @@
 - Isolate guest environment forwarding from host SSH process configuration.
   Guest-selected names such as `PATH`, loader settings, and SSH settings are
   now restored only inside the VM through inert transport aliases.
+- Update rustls to 0.23.45 to reject TLS 1.3 handshake messages received at
+  an invalid encryption level (RUSTSEC-2026-0285).
 
 ## v0.6.0
 
