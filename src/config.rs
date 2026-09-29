@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_os = "macos"))]
+use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
