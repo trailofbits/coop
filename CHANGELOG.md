@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.6.1
+
+### Security
+
+- Isolate guest environment forwarding from host SSH process configuration.
+  Guest-selected names such as `PATH`, loader settings, and SSH settings are
+  now restored only inside the VM through inert transport aliases.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4
