@@ -741,6 +741,10 @@ pub struct CoopConfig {
     #[serde(default)]
     pub guest_env: BTreeMap<crate::guest_env_state::EnvVarName, String>,
 
+    /// Explicit host files and directories copied into the guest at every boot.
+    #[serde(default)]
+    pub guest_files: Vec<crate::guest_files::GuestFile>,
+
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
@@ -2452,6 +2456,7 @@ impl Default for CoopConfig {
             grok: GrokConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
+            guest_files: Vec::new(),
             profiles: HashMap::new(),
             post_start: None,
             forward_ports: Vec::new(),

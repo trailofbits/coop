@@ -80,6 +80,18 @@ user launched it.
 
 ## Secrets and how they cross into the guest
 
+`[[guest_files]]` explicitly authorizes copying complete host source trees into
+the guest, including any credentials in those trees. Each boot stages private
+copies before VM startup. Source links are materialized only within declared
+source roots; cycles, dangling links, and special files fail staging. Source
+components are opened relative to pinned directory descriptors without following
+symlinks; copying reads the validated file descriptor. Sources containing the
+staging directory are rejected. Destinations
+are guest paths, never inputs to host filesystem writes. Guest copying rejects
+symlinks and live-mount overlaps and does not delete unmatched guest files.
+These opt-in copies are separate from the agent allowlists and proxy filtering;
+users must select sources that contain only data they intend to expose.
+
 coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
 user `env_forward` entries, and the VM SSH key. The invariants:

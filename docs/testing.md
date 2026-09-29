@@ -132,6 +132,14 @@ rejects the fixture filename. The Lima resize spawn-failure test runs in an
 isolated child process with an empty executable search directory, so it cannot
 find a host `truncate` or change another test's environment.
 
+Guest-file unit tests cover multiple mappings, guest-home expansion, destination
+validation, source snapshots, private writable modes, symlink materialization,
+cycles, missing sources, special files, concurrent source-path replacement, staging
+directory overlap, and mount/destination overlaps. The full
+VM suite checks initial copies, restart refresh, retained guest-only content,
+writable neighboring configuration directories, bootstrap ordering, and restart
+rejection of persisted live host mounts.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

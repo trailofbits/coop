@@ -6768,6 +6768,144 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# ── Explicit guest files (--full only) ─────────────────────────
+
+test_guest_files() {
+    echo ""
+    echo "=== Phase: guest_files copies ==="
+    local inst_name="${INSTANCE}-files"
+    local source="$tmpdir/guest-files-source"
+    local cfg="$tmpdir/guest-files.toml"
+    prepare_guest_files_fixture "$source" "$cfg"
+    if coop --config "$cfg" up "$source/workspace" --name "$inst_name" \
+        --no-agents --no-devcontainer \
+        --post-start 'test -f "$HOME/.config/coop-test-hooks/.input" && touch /tmp/files-ready'; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "guest_files copies with --no-agents before post_start"
+    else
+        fail "guest_files copies with --no-agents before post_start" "$HARNESS_ERR"
+        return
+    fi
+    GUEST_INSTANCE="$inst_name"
+    check_guest_files_initial_copy
+    printf '%s\n' 'second' > "$source/hooks/.input"
+    coop stop "$inst_name"
+    if coop --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        guest_exec bash -c 'test "$(cat ~/.config/coop-test-hooks/.input)" = second &&
+            test "$(cat ~/.config/coop-test-hooks/retained)" = guest-only'; then
+        pass "guest_files refreshes on restart and retains guest-only files"
+    else
+        fail "guest_files refreshes on restart and retains guest-only files" "$HARNESS_ERR"
+    fi
+    coop stop "$inst_name"
+    if coop --config "$cfg" start "$inst_name" --no-prompt &&
+        guest_exec bash -c 'test "$(cat ~/.claude/CLAUDE.md)" = agent-bootstrap'; then
+        pass "agent bootstrap runs after guest_files copies"
+    else
+        fail "agent bootstrap runs after guest_files copies" "$HARNESS_ERR"
+    fi
+    test_guest_files_symlink "$inst_name" "$cfg"
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+    test_guest_files_live_mount
+}
+
+prepare_guest_files_fixture() {
+    local source=$1 cfg=$2
+    mkdir -p "$source/hooks" "$source/workspace" "$source/claude"
+    printf '%s\n' 'first' > "$source/hooks/.input"
+    printf '%s\n' 'executable' > "$source/hooks/run"
+    chmod 555 "$source/hooks/run"
+    ln -s .input "$source/hooks/link"
+    printf '%s\n' 'single' > "$source/single"
+    printf '%s\n' 'agent-bootstrap' > "$source/claude/CLAUDE.md"
+    cat > "$cfg" <<TOML
+ github = "off"
+ [[guest_files]]
+ source = "$source/hooks"
+ destination = "~/.config/coop-test-hooks"
+ [[guest_files]]
+ source = "$source/single"
+ destination = "~/.coop-test-file"
+ [[guest_files]]
+ source = "$source/single"
+ destination = "~/.claude/CLAUDE.md"
+ [claude]
+ config_dir = "$source/claude"
+ [codex]
+ config_dir = false
+ [grok]
+ config_dir = false
+TOML
+}
+
+check_guest_files_initial_copy() {
+    if guest_exec bash -c 'test -f /tmp/files-ready &&
+        test "$(cat ~/.config/coop-test-hooks/.input)" = first &&
+        test "$(cat ~/.config/coop-test-hooks/link)" = first &&
+        test ! -L ~/.config/coop-test-hooks/link &&
+        test "$(cat ~/.coop-test-file)" = single &&
+        test "$(cat ~/.claude/CLAUDE.md)" = single &&
+        test "$(stat -c %a ~/.config/coop-test-hooks/run)" = 700 &&
+        test "$(stat -c %a ~/.coop-test-file)" = 600 &&
+        mkdir -p ~/.config/coop-test-neighbor && touch ~/.config/coop-test-neighbor/settings &&
+        echo guest-only > ~/.config/coop-test-hooks/retained'; then
+        pass "guest_files preserves contents and modes and leaves neighboring config writable"
+    else
+        fail "guest_files preserves contents and modes and leaves neighboring config writable"
+    fi
+}
+
+test_guest_files_symlink() {
+    local inst_name=$1 cfg=$2
+    guest_exec bash -c 'mkdir -p ~/coop-test-elsewhere &&
+        ln -s ~/coop-test-elsewhere ~/.config/coop-test-hooks/unsafe'
+    coop stop "$inst_name"
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        [[ "$HARNESS_ERR" == *"destination contains a symlink"* ]]; then
+        pass "guest_files refuses existing destination symlinks on restart"
+    else
+        fail "guest_files refuses existing destination symlinks on restart" "$HARNESS_ERR"
+    fi
+}
+
+test_guest_files_live_mount() {
+    if [[ $(uname -s) != Darwin ]]; then
+        skip "guest_files live-mount guard (Lima only)"
+        return
+    fi
+    local inst_name="${INSTANCE}-files-mount"
+    local source="$tmpdir/guest-files-mounted"
+    local cfg="$tmpdir/guest-files-mount.toml"
+    mkdir -p "$source/workspace" "$source/shared" "$source/copy"
+    printf '%s\n' 'host-original' > "$source/shared/sentinel"
+    printf '%s\n' 'must-not-copy' > "$source/copy/sentinel"
+    if coop up "$source/workspace" --name "$inst_name" --no-agents --no-devcontainer \
+        --extra-mount "$source/shared:/files-shared"; then
+        STARTED_INSTANCES+=("$inst_name")
+    else
+        fail "guest_files live-mount fixture starts" "$HARNESS_ERR"
+        return
+    fi
+    coop stop "$inst_name"
+    cat > "$cfg" <<TOML
+ github = "off"
+ [[guest_files]]
+ source = "$source/copy"
+ destination = "/files-shared"
+TOML
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        [[ "$HARNESS_ERR" == *"destination overlaps a live host mount"* ]] &&
+        [[ $(cat "$source/shared/sentinel") == host-original ]]; then
+        pass "guest_files restart rejects persisted live mounts without changing host files"
+    else
+        fail "guest_files restart rejects persisted live mounts without changing host files" "$HARNESS_ERR"
+    fi
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -7177,6 +7315,7 @@ EOF
         test_builtin_profiles
         test_builtin_profile_plugins
         test_post_start
+        test_guest_files
         test_devcontainer_apply
         test_devcontainer_oci_feature
 

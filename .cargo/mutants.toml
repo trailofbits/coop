@@ -52,6 +52,11 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # guest_files.rs: SSH transfer and cleanup; staging and path checks remain scoped.
+  "guest_files.rs:.*StagedFiles::install",
+  # Lifecycle staging resolves image metadata and backend mount behavior.
+  "BootPayload::prepare",
+
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
   # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
