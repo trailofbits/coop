@@ -2761,7 +2761,7 @@ impl Instance {
                 value
                     .trim()
                     .parse::<i32>()
-                    .context("Invalid Firecracker PID")?,
+                    .context("Invalid Firecracker PID file")?,
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
@@ -2769,7 +2769,7 @@ impl Instance {
 
         if let Some(pid) = pid {
             if pid <= 0 {
-                bail!("Invalid Firecracker PID: {pid}");
+                bail!("Invalid Firecracker PID file: {pid}");
             }
             // EPERM means the root-owned process exists. ESRCH confirms exit,
             // including when /proc hides other users' processes.
