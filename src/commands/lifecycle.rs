@@ -2488,6 +2488,7 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {
             data_dir: super::config::ConfigPath::new(dir),
