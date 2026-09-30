@@ -2112,28 +2112,6 @@ mod tests {
         }
     }
 
-    struct RestoreEnv {
-        lima_home: Option<std::ffi::OsString>,
-        path: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            // SAFETY: the resize spawn-failure test holds ENV_LOCK and is
-            // the only lima test that mutates these variables.
-            unsafe {
-                match &self.lima_home {
-                    Some(v) => std::env::set_var("LIMA_HOME", v),
-                    None => std::env::remove_var("LIMA_HOME"),
-                }
-                match &self.path {
-                    Some(v) => std::env::set_var("PATH", v),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn completion_instance_names_selects_exact_lima_states() {
@@ -2216,63 +2194,43 @@ mod tests {
 
     #[test]
     fn resize_disk_restores_yaml_when_truncate_cannot_spawn() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let lima_root = tempfile::TempDir::new().unwrap();
-        let shadow = tempfile::TempDir::new().unwrap();
-        // A self-symlink makes the first PATH hit fail with ELOOP.
-        // A directory or a file without +x returns EACCES, and
-        // posix_spawnp then continues to a later real `truncate`.
-        std::os::unix::fs::symlink("truncate", shadow.path().join("truncate")).unwrap();
-
+        let Ok(root) = std::env::var("COOP_TEST_TRUNCATE_FAILURE") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::resize_disk_restores_yaml_when_truncate_cannot_spawn",
+                    "--nocapture",
+                ])
+                .env("COOP_TEST_TRUNCATE_FAILURE", root.path())
+                .env("LIMA_HOME", root.path())
+                .env("PATH", root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
-            dir: lima_root.path().to_path_buf(),
+            dir: PathBuf::from(&root),
             image: ImageName::new("test.img").unwrap(),
         };
-        let inst_dir = lima_root.path().join(lima_name(&inst));
+        let inst_dir = Path::new(&root).join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
         let yaml_path = inst_dir.join("lima.yaml");
         let original_yaml = "cpus: 2\ndisk: \"1GiB\"\nmemory: \"4GiB\"\n";
         fs::write(&yaml_path, original_yaml).unwrap();
-        fs::write(inst_dir.join("disk"), b"").unwrap();
+        let disk_path = inst_dir.join("disk");
+        fs::write(&disk_path, b"").unwrap();
 
-        let cfg = CoopConfig::default();
-        let new_size = GiB::new(2).unwrap();
-
-        let prior_lima_home = std::env::var_os("LIMA_HOME");
-        let prior_path = std::env::var_os("PATH");
-        let _restore = RestoreEnv {
-            lima_home: prior_lima_home,
-            path: prior_path.clone(),
-        };
-
-        let mut path_dirs = vec![shadow.path().to_path_buf()];
-        if let Some(rest) = &prior_path {
-            path_dirs.extend(std::env::split_paths(rest));
-        }
-        let shadowed_path = std::env::join_paths(&path_dirs).unwrap();
-        // SAFETY: ENV_LOCK held; RestoreEnv drop restores both.
-        unsafe {
-            std::env::set_var("LIMA_HOME", lima_root.path());
-            std::env::set_var("PATH", shadowed_path);
-        }
-
-        let result = resize_disk(&cfg, &inst, new_size);
-
+        let error = resize_disk(&CoopConfig::default(), &inst, GiB::new(2).unwrap()).unwrap_err();
         assert!(
-            result.is_err(),
-            "resize must fail when truncate cannot spawn: {result:?}"
+            error.to_string().contains("Failed to run truncate"),
+            "{error:#}"
         );
-        let yaml = fs::read_to_string(&yaml_path).unwrap();
-        assert!(
-            yaml.contains("disk: \"1GiB\"\n"),
-            "lima.yaml must keep the original disk: after spawn failure: {yaml}"
-        );
+        assert_eq!(fs::read_to_string(&yaml_path).unwrap(), original_yaml);
+        assert_eq!(fs::metadata(&disk_path).unwrap().len(), 0);
     }
 
     #[test]

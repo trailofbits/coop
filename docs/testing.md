@@ -139,6 +139,11 @@ and round-trip regressions must fail, respectively. Removing export diagnostic
 redaction must fail the assignment-error regression. Restore the code and
 rerun the tests after each check.
 
+The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
+rejects the fixture filename. The Lima resize spawn-failure test runs in an
+isolated child process with an empty executable search directory, so it cannot
+find a host `truncate` or change another test's environment.
+
 ## Host subprocess boundary tests
 
 Changes that route project or guest configuration into host launchers need both
