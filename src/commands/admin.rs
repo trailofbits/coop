@@ -113,6 +113,21 @@ pub(crate) fn cmd_uninstall(
     // surface the resolved path so the user knows what's actually about to go.
     tracing::debug!("Resolved binary path: {}", binary_path.display());
 
+    // Check ownership before prompting or purging: Nix owns the immutable
+    // executable, including the wrapped binary used on macOS.
+    if is_nix_store_path(&binary_path) {
+        bail!(
+            "Cannot uninstall a Nix-managed binary with `coop uninstall`. \
+             No data has been removed.\n\
+             To remove the package from a Nix profile, use `nix profile remove coop` \
+             (check the entry name with `nix profile list`). For NixOS or Home Manager, \
+             remove coop from your configuration and rebuild.\n\
+             Package removal preserves coop data. To delete it, first run \
+             `coop destroy --all` with your usual --config, then follow the \
+             data-cleanup steps in docs/getting-started.md#removing-a-nix-installation."
+        );
+    }
+
     if !opts.yes && !std::io::stdin().is_terminal() {
         bail!(
             "stdin is not a TTY; pass --yes (and optionally --keep-data or --purge) \
@@ -248,6 +263,12 @@ fn is_dev_target_path(path: &Path) -> bool {
     })
 }
 
+/// `current_exe` resolves profile symlinks to the executable in the Nix store.
+/// Component matching avoids treating `/nix/store-backup` as managed by Nix.
+fn is_nix_store_path(path: &Path) -> bool {
+    path.starts_with("/nix/store")
+}
+
 fn remove_self_binary(binary_path: &Path) -> Result<()> {
     if is_dev_target_path(binary_path) {
         tracing::warn!(
@@ -275,6 +296,28 @@ fn remove_self_binary(binary_path: &Path) -> Result<()> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
+
+    #[test]
+    fn nix_store_path_matches_binaries_and_wrappers_only_under_store() {
+        use std::path::Path;
+
+        for path in [
+            "/nix/store/abc-coop-0.6.0/bin/coop",
+            "/nix/store/abc-coop-0.6.0/bin/.coop-wrapped",
+        ] {
+            assert!(super::is_nix_store_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/nix/store-backup/bin/coop",
+            "/home/u/nix/store/coop",
+            "nix/store/coop",
+            "/home/u/.local/bin/coop",
+            "/usr/local/bin/coop",
+            "/home/u/repo/target/debug/coop",
+        ] {
+            assert!(!super::is_nix_store_path(Path::new(path)), "{path}");
+        }
+    }
 
     fn opts(yes: bool, keep_data: bool, purge: bool) -> super::UninstallOpts {
         super::UninstallOpts {

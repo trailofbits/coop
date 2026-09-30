@@ -250,7 +250,8 @@ exclude_re = [
 
   # admin.rs — uninstall/init IO: terminal summary, recursive data-dir wipe,
   # self-binary removal. The decide_remove_data / config_path_is_under_data_dir
-  # / is_dev_target_path predicates are pure and stay in scope (unit-tested).
+  # / is_dev_target_path / is_nix_store_path predicates are pure and stay in
+  # scope (unit-tested). The Nix install check exercises the early refusal.
   "\\bprint_uninstall_summary\\b",
   "\\bwipe_data_dir\\b",
   "\\bremove_self_binary\\b",

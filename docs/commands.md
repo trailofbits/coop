@@ -967,7 +967,16 @@ coop uninstall [FLAGS]
 
 Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
 
-If the binary lives in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. A config file outside the data directory is left in place and a note is printed.
+Nix-store binaries are refused before any data or SSH configuration is changed,
+including with `--yes` or `--purge`. Use `nix profile remove coop` for a profile
+installation, or remove the package from your NixOS/Home Manager configuration
+and rebuild. Package removal preserves data; follow the explicit
+[Nix data-cleanup procedure](getting-started.md#removing-a-nix-installation)
+before removing the package if you want to delete that data too.
+
+For a non-Nix binary in a protected directory (e.g. `/usr/local/bin`), run with
+`sudo`. A config file outside the data directory is left in place and a note is
+printed.
 
 ```
 coop uninstall                       # interactive: prompts for binary and data

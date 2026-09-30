@@ -48,6 +48,32 @@ credential proxy. To build both release binaries, install CMake and run
 `cargo build --workspace --release`; keep `coop-proxy` next to `coop` when
 installing them.
 
+### Nix
+
+`nix develop` provides the toolchain from `rust-toolchain.toml` (including
+rustfmt and clippy), CMake, Git, OpenSSH, and Python 3. Install the pinned development
+tools with the existing script, then run the workspace checks:
+
+```sh
+nix develop
+./scripts/install-dev-tools.sh
+cargo fmt -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+On macOS, the shell also provides Lima and the host tools included in the
+packaged CLI. Add Cargo's install directory (normally `~/.cargo/bin`) to
+`PATH` if needed to run the installed tools. The development shell does not
+install hooks or initialize a VM automatically.
+
+`nix build` packages both release binaries, and `nix flake check` builds the
+package and runs its workspace unit tests and installation checks for the
+current platform. VM integration tests still need the host prerequisites
+and must be run separately. The Nix package skips the invalid UTF-8 filename
+test on macOS because APFS rejects its fixture; it remains enabled on Linux.
+Format the flake with `nix fmt`.
+
 ## Pre-commit hooks
 
 Install the hooks once, then let them run on every commit:
