@@ -587,9 +587,6 @@ fn parse_completion_instance_names(output: &str) -> Result<CompletionInstanceNam
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let entry: serde_json::Value = serde_json::from_str(line)
             .context("Failed to parse limactl JSON output for completion")?;
-        if entry["name"].as_str() == Some(BUILDER_NAME) {
-            continue;
-        }
         if let Some(name) = entry["name"]
             .as_str()
             .and_then(|name| name.strip_prefix(LIMA_PREFIX))
@@ -2127,11 +2124,22 @@ mod tests {
         let names = parse_completion_instance_names(output).unwrap();
         assert_eq!(
             names.running,
-            HashSet::from([InstanceName::new("alpha").unwrap()])
+            HashSet::from([
+                InstanceName::new("alpha").unwrap(),
+                InstanceName::new("builder").unwrap(),
+            ])
         );
         assert_eq!(
             names.stopped,
             HashSet::from([InstanceName::new("beta").unwrap()])
+        );
+
+        let stopped_builder =
+            parse_completion_instance_names("{\"name\":\"coop-builder\",\"status\":\"Stopped\"}\n")
+                .unwrap();
+        assert_eq!(
+            stopped_builder.stopped,
+            HashSet::from([InstanceName::new("builder").unwrap()])
         );
     }
 
