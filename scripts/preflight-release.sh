@@ -303,6 +303,7 @@ step "Workflow audit (zizmor)" run_zizmor
 step "TOML formatting" run_taplo
 step "Integration probe regression tests" python3 tests/test-integration-probes.py
 step "Release preflight regression tests" python3 tests/test-preflight-release.py
+step "Integration runner regression tests" python3 tests/test-run-integration.py
 step "Integration — bridge isolation" run_bridge_isolation
 step "Integration — proxy reverse forwarding" run_proxy_forward
 step "Integration — installer provenance" ./tests/integration-install.sh
@@ -325,6 +326,11 @@ fi
 if [[ "$QUICK" == 1 ]]; then
   warn "--quick: full cross-platform integration suite skipped"
 else
+  # Deliberately no --full here: --full makes the runner re-run the two
+  # host-only Linux gates (bridge isolation, proxy reverse forwarding) on the
+  # host it targets, and the two dedicated steps above already covered the
+  # local one. Run ./tests/run-integration.sh --remote <host> --full yourself
+  # when you want the remote host's copy of those gates as well.
   prompt_for_remote
   step "Full integration (local host)" ./tests/run-integration.sh
   if [[ -n "$REMOTE" ]]; then

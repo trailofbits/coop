@@ -11,7 +11,10 @@ set -euo pipefail
 # Remote mode detects the remote host's architecture, cross-compiles
 # the matching musl binary, copies it and the test script, and runs tests there.
 #
-# --full also runs integration-network.sh on the test host before the VM suite.
+# --full also runs the two host-only Linux gates (integration-network.sh and
+# integration-proxy-forward.sh) on the test host before the VM suite. Each gate
+# skips itself with an explicit message off Linux, so a macOS --full run reports
+# what it did not cover instead of passing silently.
 # All flags other than --remote are forwarded to integration.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,12 +33,42 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Host-only gates, named so a failure names its own phase. They run outside any
+# VM, so a broken gate can never be mistaken for a passing full integration run.
+run_local_gate() {
+    local label="$1" script="$2"
+    echo "Running $label integration test..."
+    if ! "$SCRIPT_DIR/$script"; then
+        echo "error: $label integration test failed" >&2
+        exit 1
+    fi
+    echo "PASS: $label integration test"
+}
+
+# The same gates on the remote host, run from the source tree already unpacked
+# there: both build a library test binary and need it in the tree they run from.
+run_remote_gate() {
+    local label="$1" script="$2"
+    echo "Running $label integration test on $REMOTE_HOST..."
+    # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
+    if ! ssh "$REMOTE_HOST" "
+        set -e
+        . \"\$HOME/.cargo/env\" 2>/dev/null || true
+        cd '$REMOTE_DIR/src'
+        ./tests/$script
+    "; then
+        echo "error: $label integration test failed on $REMOTE_HOST" >&2
+        exit 1
+    fi
+    echo "PASS: $label integration test on $REMOTE_HOST"
+}
+
 # ── Local mode ───────────────────────────────────────────────────
 
 if [[ -z "$REMOTE_HOST" ]]; then
     if [[ "$FULL" == "1" ]]; then
-        echo "Running bridge isolation integration test..."
-        "$SCRIPT_DIR/integration-network.sh"
+        run_local_gate "bridge isolation" integration-network.sh
+        run_local_gate "proxy reverse forwarding" integration-proxy-forward.sh
     fi
 
     echo "Building coop (release)..."
@@ -111,14 +144,8 @@ if [[ "$FULL" == "1" || "$build_proxy_on_remote" == "1" ]]; then
 fi
 
 if [[ "$FULL" == "1" ]]; then
-    echo "Running bridge isolation integration test on $REMOTE_HOST..."
-    # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
-    ssh "$REMOTE_HOST" "
-        set -e
-        . \"\$HOME/.cargo/env\" 2>/dev/null || true
-        cd '$REMOTE_DIR/src'
-        ./tests/integration-network.sh
-    "
+    run_remote_gate "bridge isolation" integration-network.sh
+    run_remote_gate "proxy reverse forwarding" integration-proxy-forward.sh
 fi
 
 if [[ "$build_proxy_on_remote" == "0" ]]; then
