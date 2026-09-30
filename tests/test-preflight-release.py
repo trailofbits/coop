@@ -42,7 +42,8 @@ if [[ "$1" == rev-parse ]]; then exit 1; fi
 printf '%s\n' "${0##*/}" >> "$PREFLIGHT_CALLS"
 if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
 ''')
-        for name in ('test-integration-probes.py', 'test-preflight-release.py'):
+        for name in ('test-integration-probes.py', 'test-preflight-release.py',
+                     'test-run-integration.py'):
             (self.root / 'tests' / name).write_text(
                 'import os\nwith open(os.environ["PREFLIGHT_CALLS"], "a") as f:\n'
                 f'    f.write("{name}\\n")\n')
@@ -73,7 +74,8 @@ if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
                      'cargo test --workspace', 'cargo deny --workspace check',
                      'cargo build --release --workspace --target aarch64-unknown-linux-musl',
                      'taplo format --check', 'test-integration-probes.py',
-                     'test-preflight-release.py', 'integration-network.sh',
+                     'test-preflight-release.py', 'test-run-integration.py',
+                     'integration-network.sh',
                      'integration-proxy-forward.sh'):
             self.assertIn(call, calls)
         self.assertNotIn('Next: tag', result.stdout)

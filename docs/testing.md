@@ -27,6 +27,10 @@ Run on **both platforms** before every commit:
 ./tests/run-integration.sh --profile python,node --name my-test
 ```
 
+`--full` also runs the two host-only Linux gates described below on the host it
+targets — locally, or on the remote when `--remote` is given.
+`tests/test-run-integration.py` covers which gates that dispatches to.
+
 You can also run the suite directly if you already have a binary:
 
 ```bash
@@ -78,9 +82,10 @@ completeness remain the native installer's responsibility.
 
 ## Host-only bridge isolation test
 
-`./tests/run-integration.sh --full` runs the bridge isolation gate before
-the VM suite, on the selected local or remote host. A failure stops the full
-run; macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables
+`./tests/run-integration.sh --full` runs this gate and the proxy
+reverse-forward gate below before the VM suite, on the selected local or remote
+host. A failure stops the full run and names the gate that failed; macOS
+explicitly skips both, because each is Linux-only. `TEST_FULL=1` also enables
 both gates. Remote full runs copy the tracked working-tree source and require
 the build and namespace prerequisites below on the remote host.
 
@@ -106,7 +111,9 @@ host-only gate does not replace Firecracker or Lima VM integration.
 
 ## Host-only proxy reverse-forward test
 
-Run `./tests/integration-proxy-forward.sh` on Linux to exercise the production
+`./tests/run-integration.sh --full` runs this gate on the selected local or
+remote host, from the source tree that a remote full run already copies there.
+Run `./tests/integration-proxy-forward.sh` directly on Linux to exercise the production
 reverse-tunnel startup against real OpenSSH. It authenticates with throwaway
 keys, witnesses traffic through an accepted forward, then occupies the guest
 loopback port and requires startup to return an error without publishing a PID
@@ -118,9 +125,9 @@ util-linux, coreutils, hostname, and OpenSSH client/server tools. It builds
 unprivileged, then confines the fixture to disposable mount, network, UTS, and
 PID namespaces. No user SSH configuration or keys are used. Namespace teardown
 removes all children and temporary files on success, failure, or timeout.
-Linux CI and release preflight run this gate explicitly; ordinary unit tests
-mark it ignored, and macOS preflight reports it as unrun. This host test does
-not replace the Firecracker and Lima VM integration gates.
+Linux CI, release preflight, and `--full` runs run this gate explicitly;
+ordinary unit tests mark it ignored, and macOS preflight reports it as unrun.
+This host test does not replace the Firecracker and Lima VM integration gates.
 
 ## Mutation testing
 

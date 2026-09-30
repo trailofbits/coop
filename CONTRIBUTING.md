@@ -164,6 +164,8 @@ CI must pass before a pull request can merge. The
 - **`python3 tests/test-preflight-release.py`** — release gate regression checks.
 - **`python3 tests/test-integration-probes.py`** — regression checks for
   integration probes.
+- **`python3 tests/test-run-integration.py`** — regression checks for the
+  integration runner's host-only gate dispatch.
 - **`cargo deny --workspace check`** — advisories, licenses, bans, and sources.
 - **[zizmor](https://github.com/zizmorcore/zizmor)** — GitHub Actions security
   audit.
