@@ -331,6 +331,62 @@ test_completions() {
     fi
 }
 
+test_running_vm_completions() {
+    echo ""
+    echo "=== Phase: running VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "shell completion offers running instance"
+        else
+            fail "shell completion offers running instance" "got: $candidates"
+        fi
+    else
+        fail "shell completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "start completion excludes running instance" "got: $candidates"
+        else
+            pass "start completion excludes running instance"
+        fi
+    else
+        fail "start completion exits 0" "exit code: $?, output: $candidates"
+    fi
+}
+
+test_stopped_vm_completions() {
+    echo ""
+    echo "=== Phase: stopped VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "start completion offers stopped instance"
+        else
+            fail "start completion offers stopped instance" "got: $candidates"
+        fi
+    else
+        fail "start completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "shell completion excludes stopped instance" "got: $candidates"
+        else
+            pass "shell completion excludes stopped instance"
+        fi
+    else
+        fail "shell completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+}
+
 test_invalid_names() {
     echo ""
     echo "=== Phase: invalid instance names ==="
@@ -7213,6 +7269,7 @@ EOF
     test_duplicate_name
     test_status_running
     test_list_running
+    test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
@@ -7246,6 +7303,7 @@ EOF
     test_status_stopped
     test_agent_update_stopped
     test_list_stopped
+    test_stopped_vm_completions
     test_resize_status
     test_reconfigure
     test_commit_restore

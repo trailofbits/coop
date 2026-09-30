@@ -292,7 +292,10 @@ enum Commands {
     /// Restart a stopped VM
     Start {
         /// Stopped instance name (optional only when exactly one stopped instance exists)
-        #[arg(value_parser = config::InstanceName::new)]
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::stopped_instance_candidates),
+        )]
         name: Option<config::InstanceName>,
         /// Project directory used to select an associated stopped instance
         #[arg(long)]
@@ -346,7 +349,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Command to run (non-interactive, no PTY)
@@ -358,7 +361,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Prompt for permissions instead of skipping them
@@ -377,7 +380,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Extra arguments passed to `claude agents`
@@ -389,7 +392,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Keep Codex's sandbox and approval prompts instead of bypassing them
@@ -489,7 +492,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Local directory to push (defaults to `workspace.json` `host_path`)
@@ -507,7 +510,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
@@ -529,7 +532,7 @@ enum Commands {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Command and arguments to run (after `--`)
@@ -752,7 +755,7 @@ enum AgentAction {
         /// Instance name (required if multiple instances exist)
         #[arg(
             value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::instance_candidates),
+            add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
         /// Update Claude Code (default: update every agent)

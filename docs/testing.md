@@ -204,7 +204,7 @@ parsing, or state composition:
   `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
   `discovered_local_devcontainer` / `is_sensitive_workspace`
 
-**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`,
+**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`, `update.rs`,
 `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY
 prompts), `main.rs`, and — inside `src/commands/` — the `cmd_*` dispatch
 entrypoints and the handlers that take a `&PlatformBackend`, write stdout, or

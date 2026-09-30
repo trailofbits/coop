@@ -28,6 +28,9 @@
 # (CLAUDE.md "Don't bother with" list.) Unit tests cannot observe their effects.
 exclude_globs = [
   "src/backend.rs",
+  # Completion callbacks read host state and probe VM liveness on every TAB;
+  # their behavior is exercised through the CLI integration suite.
+  "src/completions.rs",
   "src/lima.rs",
   "src/setup.rs",
   "src/update.rs",

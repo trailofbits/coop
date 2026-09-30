@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::num::NonZeroU8;
@@ -560,6 +561,48 @@ pub fn is_running(inst: &Instance) -> bool {
 
 pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
     lima_state(&inst.name)
+}
+
+/// Query Lima once for the names of running and stopped coop instances.
+///
+/// Shell completion uses this instead of calling `is_running` for every
+/// registered instance, which would spawn `limactl list` for each name.
+pub(crate) fn completion_instance_names() -> Result<CompletionInstanceNames> {
+    let output = limactl_list_output()?;
+    parse_completion_instance_names(&output)
+}
+
+#[derive(Default)]
+pub(crate) struct CompletionInstanceNames {
+    pub running: HashSet<InstanceName>,
+    pub stopped: HashSet<InstanceName>,
+}
+
+fn parse_completion_instance_names(output: &str) -> Result<CompletionInstanceNames> {
+    let mut names = CompletionInstanceNames::default();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: serde_json::Value = serde_json::from_str(line)
+            .context("Failed to parse limactl JSON output for completion")?;
+        if entry["name"].as_str() == Some(BUILDER_NAME) {
+            continue;
+        }
+        if let Some(name) = entry["name"]
+            .as_str()
+            .and_then(|name| name.strip_prefix(LIMA_PREFIX))
+            .and_then(|name| InstanceName::new(name).ok())
+        {
+            match entry["status"].as_str() {
+                Some("Running") => {
+                    names.running.insert(name);
+                }
+                Some("Stopped") => {
+                    names.stopped.insert(name);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Get a human-readable status string.
@@ -1911,20 +1954,8 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
 }
 
 fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
-    let output = Command::new("limactl")
-        .args(["list", "--json"])
-        .output()
-        .context("Failed to run limactl list")?;
-
-    if !output.status.success() {
-        bail!(
-            "limactl list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
+    let stdout = limactl_list_output()?;
     // limactl list --json outputs one JSON object per line (NDJSON)
-    let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1942,6 +1973,22 @@ fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Val
     }
 
     Ok(None)
+}
+
+fn limactl_list_output() -> Result<String> {
+    let output = Command::new("limactl")
+        .args(["list", "--json"])
+        .output()
+        .context("Failed to run limactl list")?;
+
+    if !output.status.success() {
+        bail!(
+            "limactl list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -2081,6 +2128,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn completion_instance_names_selects_exact_lima_states() {
+        let output = concat!(
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+            "{\"name\":\"coop-broken\",\"status\":\"Broken\"}\n",
+            "{\"name\":\"coop-starting\",\"status\":\"Restarting\"}\n",
+            "{\"name\":\"other-vm\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-builder\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-invalid name\",\"status\":\"Running\"}\n",
+        );
+        let names = parse_completion_instance_names(output).unwrap();
+        assert_eq!(
+            names.running,
+            HashSet::from([InstanceName::new("alpha").unwrap()])
+        );
+        assert_eq!(
+            names.stopped,
+            HashSet::from([InstanceName::new("beta").unwrap()])
+        );
     }
 
     #[test]
