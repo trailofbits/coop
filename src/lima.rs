@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
@@ -567,17 +568,20 @@ pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
 ///
 /// Shell completion uses this instead of calling `is_running` for every
 /// registered instance, which would spawn `limactl list` for each name.
+#[cfg(target_os = "macos")]
 pub(crate) fn completion_instance_names() -> Result<CompletionInstanceNames> {
     let output = limactl_list_output()?;
     parse_completion_instance_names(&output)
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 pub(crate) struct CompletionInstanceNames {
     pub running: HashSet<InstanceName>,
     pub stopped: HashSet<InstanceName>,
 }
 
+#[cfg(target_os = "macos")]
 fn parse_completion_instance_names(output: &str) -> Result<CompletionInstanceNames> {
     let mut names = CompletionInstanceNames::default();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -2130,6 +2134,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn completion_instance_names_selects_exact_lima_states() {
         let output = concat!(
