@@ -231,9 +231,11 @@ RUST_LOG = "info"
 MY_FLAG = "1"
 ```
 
-Keys are env var names; values are the literals to inject. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
+Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. The values transit the host SSH process under inert internal aliases, so their original guest-controlled names—including names loaded from saved instance state—cannot configure that process. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
 
 **Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
+
+Variables with special meaning to the guest shell still follow that shell's rules. If its environment-restoration shell rejects an assignment, Coop stops the command and reports the variable name without its value.
 
 Override or extend per-invocation with `coop up --env KEY=VALUE` or `coop start --env KEY=VALUE` (repeatable).
 

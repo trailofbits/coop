@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::num::NonZeroU8;
@@ -562,6 +564,48 @@ pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
     lima_state(&inst.name)
 }
 
+/// Query Lima once for the names of running and stopped coop instances.
+///
+/// Shell completion uses this instead of calling `is_running` for every
+/// registered instance, which would spawn `limactl list` for each name.
+#[cfg(target_os = "macos")]
+pub(crate) fn completion_instance_names() -> Result<CompletionInstanceNames> {
+    let output = limactl_list_output()?;
+    parse_completion_instance_names(&output)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+pub(crate) struct CompletionInstanceNames {
+    pub running: HashSet<InstanceName>,
+    pub stopped: HashSet<InstanceName>,
+}
+
+#[cfg(target_os = "macos")]
+fn parse_completion_instance_names(output: &str) -> Result<CompletionInstanceNames> {
+    let mut names = CompletionInstanceNames::default();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: serde_json::Value = serde_json::from_str(line)
+            .context("Failed to parse limactl JSON output for completion")?;
+        if let Some(name) = entry["name"]
+            .as_str()
+            .and_then(|name| name.strip_prefix(LIMA_PREFIX))
+            .and_then(|name| InstanceName::new(name).ok())
+        {
+            match entry["status"].as_str() {
+                Some("Running") => {
+                    names.running.insert(name);
+                }
+                Some("Stopped") => {
+                    names.stopped.insert(name);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// Get a human-readable status string.
 pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let info = limactl_info(&inst.name)?;
@@ -1079,7 +1123,7 @@ fn install_builder_plugins(
     // Minimal env forwarding: GITHUB_TOKEN for private repo access
     let mut env = crate::backend::EnvForward::default();
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        env.set("GITHUB_TOKEN", token);
+        env.set("GITHUB_TOKEN", token)?;
     }
 
     let session = crate::backend::SshSession { target, env };
@@ -1911,20 +1955,8 @@ fn limactl_list_entry(lima_name: &str) -> Result<serde_json::Value> {
 }
 
 fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Value>> {
-    let output = Command::new("limactl")
-        .args(["list", "--json"])
-        .output()
-        .context("Failed to run limactl list")?;
-
-    if !output.status.success() {
-        bail!(
-            "limactl list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
+    let stdout = limactl_list_output()?;
     // limactl list --json outputs one JSON object per line (NDJSON)
-    let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1942,6 +1974,22 @@ fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Val
     }
 
     Ok(None)
+}
+
+fn limactl_list_output() -> Result<String> {
+    let output = Command::new("limactl")
+        .args(["list", "--json"])
+        .output()
+        .context("Failed to run limactl list")?;
+
+    if !output.status.success() {
+        bail!(
+            "limactl list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -2061,26 +2109,38 @@ mod tests {
         }
     }
 
-    struct RestoreEnv {
-        lima_home: Option<std::ffi::OsString>,
-        path: Option<std::ffi::OsString>,
-    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn completion_instance_names_selects_exact_lima_states() {
+        let output = concat!(
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+            "{\"name\":\"coop-broken\",\"status\":\"Broken\"}\n",
+            "{\"name\":\"coop-starting\",\"status\":\"Restarting\"}\n",
+            "{\"name\":\"other-vm\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-builder\",\"status\":\"Running\"}\n",
+            "{\"name\":\"coop-invalid name\",\"status\":\"Running\"}\n",
+        );
+        let names = parse_completion_instance_names(output).unwrap();
+        assert_eq!(
+            names.running,
+            HashSet::from([
+                InstanceName::new("alpha").unwrap(),
+                InstanceName::new("builder").unwrap(),
+            ])
+        );
+        assert_eq!(
+            names.stopped,
+            HashSet::from([InstanceName::new("beta").unwrap()])
+        );
 
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            // SAFETY: the resize spawn-failure test holds ENV_LOCK and is
-            // the only lima test that mutates these variables.
-            unsafe {
-                match &self.lima_home {
-                    Some(v) => std::env::set_var("LIMA_HOME", v),
-                    None => std::env::remove_var("LIMA_HOME"),
-                }
-                match &self.path {
-                    Some(v) => std::env::set_var("PATH", v),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
+        let stopped_builder =
+            parse_completion_instance_names("{\"name\":\"coop-builder\",\"status\":\"Stopped\"}\n")
+                .unwrap();
+        assert_eq!(
+            stopped_builder.stopped,
+            HashSet::from([InstanceName::new("builder").unwrap()])
+        );
     }
 
     #[test]
@@ -2142,63 +2202,43 @@ mod tests {
 
     #[test]
     fn resize_disk_restores_yaml_when_truncate_cannot_spawn() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let lima_root = tempfile::TempDir::new().unwrap();
-        let shadow = tempfile::TempDir::new().unwrap();
-        // A self-symlink makes the first PATH hit fail with ELOOP.
-        // A directory or a file without +x returns EACCES, and
-        // posix_spawnp then continues to a later real `truncate`.
-        std::os::unix::fs::symlink("truncate", shadow.path().join("truncate")).unwrap();
-
+        let Ok(root) = std::env::var("COOP_TEST_TRUNCATE_FAILURE") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::resize_disk_restores_yaml_when_truncate_cannot_spawn",
+                    "--nocapture",
+                ])
+                .env("COOP_TEST_TRUNCATE_FAILURE", root.path())
+                .env("LIMA_HOME", root.path())
+                .env("PATH", root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
-            dir: lima_root.path().to_path_buf(),
+            dir: PathBuf::from(&root),
             image: ImageName::new("test.img").unwrap(),
         };
-        let inst_dir = lima_root.path().join(lima_name(&inst));
+        let inst_dir = Path::new(&root).join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
         let yaml_path = inst_dir.join("lima.yaml");
         let original_yaml = "cpus: 2\ndisk: \"1GiB\"\nmemory: \"4GiB\"\n";
         fs::write(&yaml_path, original_yaml).unwrap();
-        fs::write(inst_dir.join("disk"), b"").unwrap();
+        let disk_path = inst_dir.join("disk");
+        fs::write(&disk_path, b"").unwrap();
 
-        let cfg = CoopConfig::default();
-        let new_size = GiB::new(2).unwrap();
-
-        let prior_lima_home = std::env::var_os("LIMA_HOME");
-        let prior_path = std::env::var_os("PATH");
-        let _restore = RestoreEnv {
-            lima_home: prior_lima_home,
-            path: prior_path.clone(),
-        };
-
-        let mut path_dirs = vec![shadow.path().to_path_buf()];
-        if let Some(rest) = &prior_path {
-            path_dirs.extend(std::env::split_paths(rest));
-        }
-        let shadowed_path = std::env::join_paths(&path_dirs).unwrap();
-        // SAFETY: ENV_LOCK held; RestoreEnv drop restores both.
-        unsafe {
-            std::env::set_var("LIMA_HOME", lima_root.path());
-            std::env::set_var("PATH", shadowed_path);
-        }
-
-        let result = resize_disk(&cfg, &inst, new_size);
-
+        let error = resize_disk(&CoopConfig::default(), &inst, GiB::new(2).unwrap()).unwrap_err();
         assert!(
-            result.is_err(),
-            "resize must fail when truncate cannot spawn: {result:?}"
+            error.to_string().contains("Failed to run truncate"),
+            "{error:#}"
         );
-        let yaml = fs::read_to_string(&yaml_path).unwrap();
-        assert!(
-            yaml.contains("disk: \"1GiB\"\n"),
-            "lima.yaml must keep the original disk: after spawn failure: {yaml}"
-        );
+        assert_eq!(fs::read_to_string(&yaml_path).unwrap(), original_yaml);
+        assert_eq!(fs::metadata(&disk_path).unwrap().len(), 0);
     }
 
     #[test]

@@ -331,6 +331,62 @@ test_completions() {
     fi
 }
 
+test_running_vm_completions() {
+    echo ""
+    echo "=== Phase: running VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "shell completion offers running instance"
+        else
+            fail "shell completion offers running instance" "got: $candidates"
+        fi
+    else
+        fail "shell completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "start completion excludes running instance" "got: $candidates"
+        else
+            pass "start completion excludes running instance"
+        fi
+    else
+        fail "start completion exits 0" "exit code: $?, output: $candidates"
+    fi
+}
+
+test_stopped_vm_completions() {
+    echo ""
+    echo "=== Phase: stopped VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "start completion offers stopped instance"
+        else
+            fail "start completion offers stopped instance" "got: $candidates"
+        fi
+    else
+        fail "start completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "shell completion excludes stopped instance" "got: $candidates"
+        else
+            pass "shell completion excludes stopped instance"
+        fi
+    else
+        fail "shell completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+}
+
 test_invalid_names() {
     echo ""
     echo "=== Phase: invalid instance names ==="
@@ -1339,18 +1395,22 @@ test_claude_onboarding_seed() {
 }
 
 check_native_codex() {
-    local guest_home launcher version
+    local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
     launcher="$guest_home/.local/bin/codex"
+    native_host="$guest_home/.codex/packages/standalone/current/bin/codex-code-mode-host"
 
     if guest_exec test -x "$launcher" \
         && guest_exec test -L /usr/local/bin/codex \
         && guest_exec test /usr/local/bin/codex -ef "$launcher" \
+        && guest_exec test -x "$native_host" \
+        && guest_exec test -L /usr/local/bin/codex-code-mode-host \
+        && guest_exec test /usr/local/bin/codex-code-mode-host -ef "$native_host" \
         && [[ "$(guest_exec sh -c 'command -v codex')" == "$launcher" ]]; then
-        pass "Codex resolves through the guest's native launcher and compatibility link"
+        pass "Codex and its Code Mode host resolve through native-package compatibility links"
     else
-        fail "Codex resolves through the guest's native launcher and compatibility link" \
-            "expected launcher: $launcher; stderr: $(guest_stderr)"
+        fail "Codex and its Code Mode host resolve through native-package compatibility links" \
+            "expected launcher: $launcher; host: $native_host; stderr: $(guest_stderr)"
     fi
 
     if version=$(guest_exec /usr/local/bin/codex --version) \
@@ -1359,6 +1419,29 @@ check_native_codex() {
     else
         fail "Codex is executable through the compatibility link" \
             "output: $version; stderr: $(guest_stderr)"
+    fi
+
+    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
+    # A successful hello must return connection/ready; an exit-zero stub cannot.
+    if coop_exec bash -o pipefail -c '
+        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
+        printf "\147\000\000\000%s" "$hello" |
+            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
+            dd bs=1 skip=4 status=none |
+            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
+    '; then
+        pass "Codex Code Mode host responds to stdio hello"
+    else
+        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
+    fi
+
+    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
+    host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+    if [[ "$(dirname "$codex_path")" == "$(dirname "$host_path")" ]]; then
+        pass "Codex and its Code Mode host come from the same native release"
+    else
+        fail "Codex and its Code Mode host come from the same native release" \
+            "codex=$codex_path host=$host_path"
     fi
 }
 
@@ -4614,6 +4697,8 @@ post_install = '''
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/codex-code-mode-host
+chmod 0755 /usr/local/bin/codex-code-mode-host
 '''
 CFGEOF
 
@@ -4647,9 +4732,9 @@ CFGEOF
     local marker
     marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
     if [[ "$(guest_exec /usr/local/bin/codex --version)" == "codex-cli 9.9.9-profile" ]]; then
-        pass "custom profile's Codex is not replaced by the native installer"
+        pass "custom profile's complete Codex pair is not replaced by the native installer"
     else
-        fail "custom profile's Codex is not replaced by the native installer" \
+        fail "custom profile's complete Codex pair is not replaced by the native installer" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -5712,16 +5797,18 @@ test_guest_env_config() {
     # forwarded host value (and a WARN must be emitted on the collision).
     # `post_start` forces the up-time SSH session (and thus
     # `prepare_env_forwarding`, which emits the precedence WARN) to run even
-    # under `--no-agents`, which otherwise skips all session work. `true` is
-    # a no-op. Without it the WARN is never produced during `up`.
+    # under `--no-agents`, which otherwise skips all session work. Bash syntax
+    # verifies that forwarding preserves the account's command interpreter.
     cat > "$cfg_file" <<CFGEOF
-post_start = "true"
+post_start = "[[ 1 == 1 ]] && printf coop-bash-hook-ok"
 
 [claude]
 github = "off"
 env_forward = ["COOP_TEST_GUEST_ENV_PRECEDENCE"]
 
 [guest_env]
+PATH = "/coop-guest-only:/usr/local/bin:/usr/bin:/bin"
+COOP_SSH_ENV_0 = "guest-alias-value"
 COOP_TEST_GUEST_ENV_CONFIG = "from-config-file"
 COOP_TEST_GUEST_ENV_PRECEDENCE = "literal-wins"
 CFGEOF
@@ -5759,6 +5846,12 @@ CFGEOF
         return
     fi
 
+    if [[ "$HARNESS_OUT" == *coop-bash-hook-ok* ]]; then
+        pass "forwarded post_start retains the guest login shell"
+    else
+        fail "forwarded post_start retains the guest login shell" "stderr: $HARNESS_ERR"
+    fi
+
     # The override WARN is emitted during `up` (stderr, INFO default level).
     if echo "$HARNESS_ERR" | grep -q "COOP_TEST_GUEST_ENV_PRECEDENCE.*overrides"; then
         pass "guest_env literal override logs a WARN"
@@ -5790,6 +5883,20 @@ CFGEOF
     else
         fail "guest_env literal overrides forwarded value" \
             "printenv failed; stderr: $(guest_stderr)"
+    fi
+
+    local path_val alias_val
+    if path_val=$(ge_exec /usr/bin/printenv PATH) \
+        && [[ "$path_val" == "/coop-guest-only:/usr/local/bin:/usr/bin:/bin" ]]; then
+        pass "guest PATH survives transport"
+    else
+        fail "guest PATH survives transport" "stderr: $(guest_stderr)"
+    fi
+    if alias_val=$(ge_exec /usr/bin/printenv COOP_SSH_ENV_0) \
+        && [[ "$alias_val" == "guest-alias-value" ]]; then
+        pass "guest transport-name collision is preserved"
+    else
+        fail "guest transport-name collision is preserved" "stderr: $(guest_stderr)"
     fi
 
     ge stop "$inst_name" 2>/dev/null || true
@@ -6720,6 +6827,71 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# Exercise host SSH isolation with a project-controlled PATH and fake ssh.
+# The payload must remain inert on the host while the real SSH client reaches
+# the guest with the translated PATH.
+test_devcontainer_host_ssh_isolation() {
+    echo ""
+    echo "=== Phase: devcontainer host SSH isolation (--full) ==="
+
+    local poc_ws="$tmpdir/devcontainer-host-ssh-poc"
+    local poc_bin="$poc_ws/poc-bin"
+    local marker="$tmpdir/devcontainer-host-ssh-marker"
+    local inst_name="${INSTANCE}-dc-host-ssh"
+    local config_args=()
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        config_args=(--config "$SUITE_CONFIG")
+    fi
+
+    mkdir -p "$poc_ws/.devcontainer" "$poc_bin"
+    cat > "$poc_ws/.devcontainer/devcontainer.json" <<'EOF'
+{
+    "containerEnv": {
+        "PATH": "./poc-bin:/usr/local/bin:/usr/bin:/bin"
+    }
+}
+EOF
+    cat > "$poc_bin/ssh" <<'EOF'
+#!/bin/sh
+printf 'project-controlled host ssh executed\n' > "$COOP_TEST_HOST_SSH_MARKER"
+exit 73
+EOF
+    chmod 700 "$poc_bin/ssh"
+
+    local up_out="$tmpdir/devcontainer-host-ssh-up.out"
+    local up_err="$tmpdir/devcontainer-host-ssh-up.err"
+    if (
+        cd "$poc_ws"
+        "$BINARY" "${config_args[@]}" up . --name "$inst_name" \
+            --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
+    ) >"$up_out" 2>"$up_err"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "host SSH isolation fixture up exits 0"
+    else
+        fail "host SSH isolation fixture up exits 0" "stderr: $(cat "$up_err")"
+        return
+    fi
+
+    local shell_out="$tmpdir/devcontainer-host-ssh-shell.out"
+    local shell_err="$tmpdir/devcontainer-host-ssh-shell.err"
+    if (
+        cd "$poc_ws"
+        COOP_TEST_HOST_SSH_MARKER="$marker" RUST_LOG=off \
+            "$BINARY" "${config_args[@]}" shell "$inst_name" -- \
+            /usr/bin/printf guest-command-ran
+    ) >"$shell_out" 2>"$shell_err" \
+        && grep -qF "guest-command-ran" "$shell_out" \
+        && [[ ! -e "$marker" ]]; then
+        pass "project PATH cannot replace the host SSH client"
+    else
+        fail "project PATH cannot replace the host SSH client" \
+            "marker: $(test -e "$marker" && echo created || echo absent); stdout: $(cat "$shell_out"); stderr: $(cat "$shell_err")"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── OCI devcontainer feature install (--full only) ────────────
 
 # Resolve a real public GHCR devcontainer Feature, bake it into the image,
@@ -7120,6 +7292,7 @@ EOF
     test_duplicate_name
     test_status_running
     test_list_running
+    test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
@@ -7153,6 +7326,7 @@ EOF
     test_status_stopped
     test_agent_update_stopped
     test_list_stopped
+    test_stopped_vm_completions
     test_resize_status
     test_reconfigure
     test_commit_restore
@@ -7184,6 +7358,7 @@ EOF
         test_builtin_profile_plugins
         test_post_start
         test_devcontainer_apply
+        test_devcontainer_host_ssh_isolation
         test_devcontainer_oci_feature
 
         # Local marketplace directory copy

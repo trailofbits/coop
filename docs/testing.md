@@ -73,8 +73,10 @@ version-dependent. This opt-in test does not replace either VM backend gate.
 The full Codex update tests install native release `0.153.0` before running
 `codex update` as the guest user, and require the installed version to change.
 They compare the actual `config.toml` contents across host updates, self-updates,
-and migration from a profile-provided system command. Package layout and
-completeness remain the native installer's responsibility.
+and migration from a profile-provided system command. The native installer owns
+package validation; coop additionally verifies that the CLI and Code Mode host
+are executable, exposed through stable system links, and resolve to the same
+native release.
 
 ## Host-only bridge isolation test
 
@@ -122,6 +124,60 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+The same fixture exercises guest environment forwarding through real OpenSSH:
+literal values, empty values, transport-name collisions, PTYs, stdin, exit
+status, missing forwarding, and redacted assignment failures. Its sshd accepts
+only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
+bypassing the transport. The ordinary unit suite separately checks host
+environment isolation on all four SSH launch paths and the complete path from
+devcontainer parsing through saved instance state to a later session.
+
+The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
+normal scope. When changing it, deliberately restore direct guest-map
+`Command::envs` use and separately remove guest restoration: the launch-path
+and round-trip regressions must fail, respectively. Removing export diagnostic
+redaction must fail the assignment-error regression. Restore the code and
+rerun the tests after each check.
+
+The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
+rejects the fixture filename. The Lima resize spawn-failure test runs in an
+isolated child process with an empty executable search directory, so it cannot
+find a host `truncate` or change another test's environment.
+
+## Host subprocess boundary tests
+
+Changes that route project or guest configuration into host launchers need both
+an intended guest result and evidence that the host launch context is unaffected.
+A successful guest `printenv` or an assertion on the forwarding map alone does
+not establish isolation. Trace the input from local/fetched project parsing
+through config merging and saved-state replay to all applicable launch variants
+(interactive, non-interactive, stdin, and output capture).
+
+Use disposable fixtures with no real credentials or user configuration. For
+executable lookup, put a marker-writing replacement tool in a project-controlled
+directory and verify it never runs on the host. Pair that negative check with a
+positive witness that the intended launcher ran and the guest received the
+value. Inspect the child environment for loader and tool-control names too;
+using an absolute executable does not cover those controls. A fake launcher can
+observe host isolation, while a real transport fixture must verify guest
+restoration. Keep platform-specific controls tied to the platform that consumes
+them and report missing platform coverage.
+
+Deliberately reintroduce the unsafe source-to-sink connection and require the
+host-isolation assertion to fail; separately break guest delivery and require
+the positive witness to fail. Do this even when the launch code is excluded
+from cargo-mutants. Run such checks only in an authorized test environment;
+read-only CI review must report them as unrun when contributor execution is
+forbidden. The concrete forwarding checks above implement this pattern for SSH.
+
+For file-transfer changes, extend the fixture through the later host operation
+that consumes the transferred data. Use the relevant real tool to exercise
+implicit file discovery, with a disposable destination and no real credentials
+or user configuration. Pair an assertion on unintended host effects with a
+positive witness that the intended transfer or rejection and consumer check
+occurred. Separately break the boundary guard and the intended outcome to prove
+both assertions work. Apply the execution restrictions above.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
@@ -153,7 +209,7 @@ parsing, or state composition:
   `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
   `discovered_local_devcontainer` / `is_sensitive_workspace`
 
-**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`,
+**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`, `update.rs`,
 `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY
 prompts), `main.rs`, and — inside `src/commands/` — the `cmd_*` dispatch
 entrypoints and the handlers that take a `&PlatformBackend`, write stdout, or

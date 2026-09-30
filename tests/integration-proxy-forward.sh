@@ -28,10 +28,12 @@ print(tests[0])
 PY
 )
 test_name=proxy::tests::reverse_forward_requires_authenticated_bind_acknowledgment
+env_test_name=backend::tests::forwarding_over_openssh_preserves_session_behavior
 "$binary" --list --ignored --exact "$test_name" | grep -Fx "$test_name: test"
+"$binary" --list --ignored --exact "$env_test_name" | grep -Fx "$env_test_name: test"
 sudo -n timeout --kill-after=5s 60s \
     unshare --mount --net --uts --pid --fork --mount-proc --kill-child \
-    bash -s -- "$binary" "$test_name" "$(command -v ssh)" "$(command -v sshd)" <<'INNER'
+    bash -s -- "$binary" "$test_name" "$(command -v ssh)" "$(command -v sshd)" "$env_test_name" <<'INNER'
 set -euo pipefail
 mount --make-rprivate /
 hostname localhost
@@ -65,6 +67,7 @@ PermitRootLogin prohibit-password
 UsePAM yes
 AllowUsers root
 AllowTcpForwarding remote
+AcceptEnv COOP_SSH_ENV_*
 PidFile $COOP_FORWARD_TEST_DIR/sshd.pid
 LogLevel ERROR
 CONFIG
@@ -94,4 +97,5 @@ while True:
 PY
 # Namespace init exit kills every descendant, including on test panic/timeout.
 /run/coop-test --ignored --exact "$2" --nocapture
+/run/coop-test --ignored --exact "$5" --nocapture
 INNER

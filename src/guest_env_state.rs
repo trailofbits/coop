@@ -25,6 +25,7 @@
 //! Empty snapshots are not written; an empty file would be ambiguous
 //! with "no snapshot," and the missing-file branch already means
 //! "nothing extra to overlay."
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -82,6 +83,12 @@ impl fmt::Display for EnvVarName {
 impl AsRef<str> for EnvVarName {
     #[mutants::skip] // equivalent: trivial forwarder; a test would duplicate the as_str() coverage above
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for EnvVarName {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }

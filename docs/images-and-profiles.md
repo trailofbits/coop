@@ -29,8 +29,10 @@ Every template installs these packages regardless of profile selection.
 **Codex CLI:** installed with OpenAI's native installer as the guest user during
 the template build. The full package, including bundled tools, stays under the
 user's home directory. `~/.local/bin/codex` is the native launcher;
-`/usr/local/bin/codex` is a compatibility link. The guest user can run
-`codex update` directly without sudo.
+`/usr/local/bin/codex` is a compatibility link. The same-release Code Mode
+host is exposed at `/usr/local/bin/codex-code-mode-host`; both system links
+track native package updates. The guest user can run `codex update` directly
+without sudo.
 The image also installs `/usr/local/bin/codex-account`, a wrapper used by
 `[codex] auth = "chatgpt"` to run Codex with a D-Bus session and guest Linux
 Secret Service storage. The wrapper and its three supporting packages

@@ -42,6 +42,7 @@ user launched it.
 | Zone | Trust | Notes |
 |------|-------|-------|
 | Host user + `config.toml` | Trusted | `config.toml` `cmd:` values run arbitrary `sh -c` on the host (`config.rs:resolve_cmd_value`). The config file is a host code-execution surface; only the owner should write it. |
+| Project files (local or fetched) | **Untrusted** | Opting into project configuration authorizes guest configuration, not host code execution. |
 | coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs `iptables`/`firecracker` via `sudo`. |
 | The guest VM | **Untrusted** | Agent-controlled. Anything it emits — file contents, paths, archive members, command output — is a taint source once it crosses back to the host. |
 | GitHub API / model endpoints / DNS | External | `api.github.com` (PAT probe, release metadata), the model endpoint, `8.8.8.8`. Reached over the network; authenticated where applicable. |
@@ -52,6 +53,8 @@ user launched it.
   `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
+  Files retain their untrusted origin after transfer, including when a host tool
+  discovers them implicitly or consumes them during a later operation.
 - **Rootfs files touched while loop-mounted during setup.** `setup.rs`
   `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
   commit` turns a guest-mutated rootfs into an image template — so the guest
@@ -69,14 +72,41 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
-- **A fetched `devcontainer.json`.** `git_repo_devcontainer.rs` /
-  `devcontainer.rs` parse devcontainer JSON that may originate from a remote
-  repo. Its values configure the guest; they must never reach a host `cmd:`
-  evaluation or host shell.
+- **Project configuration, local or fetched.** `git_repo_devcontainer.rs` /
+  `devcontainer.rs` parse repository-controlled devcontainer JSON. Its values
+  configure the guest; they must never select host executables, configure host
+  process environments, or reach host `cmd:` evaluation or a host shell.
+  Parsing, merging into `CoopConfig`, and saving/reloading instance state do
+  not make these values trusted. Choosing to use a project's devcontainer
+  configuration does not authorize that project to execute code on the host.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
 - **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*
   from GHCR; the install snippet runs **in the guest**, not the host.
+
+## Host subprocess boundary
+
+For every tainted input that reaches a host subprocess, trace its origin through
+translation, merging, persistence, and reload to the actual launch. Include
+unchanged consumers when a change adds a less-trusted producer. Inspect the
+executable and its lookup path, arguments and option parsing, environment,
+working directory, and configuration files or wrappers the tool consumes.
+
+Argv APIs prevent shell interpolation; they do not prevent executable lookup
+through a tainted `PATH`, loader controls such as `LD_PRELOAD` or
+`DYLD_INSERT_LIBRARIES`, or tool-specific configuration from changing host
+behavior. An absolute executable path addresses lookup only. Guest-bound data
+must remain inert to the host transport and gain its intended meaning only in
+the guest; see the `EnvForward` invariant below. Review the complete launch
+context, including credentials inherited by a substituted process.
+
+Transferred files also form part of a host tool's execution context. Trace
+implicitly discovered configuration and metadata through later coop commands
+and ordinary host-tool use, even when coop never parses the files itself. Path
+containment and successful transfer establish neither safe interpretation nor
+host execution authority. Record which consumer interprets each file and what
+authority that interpretation grants; explicit transfer opt-in does not by
+itself authorize host execution.
 
 ## Secrets and how they cross into the guest
 
@@ -110,6 +140,19 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   managed writes go through `fs_util::atomic_write_with_mode` / `atomic_write_ssh`,
   which never relax permissions. A host `~/.grok/auth.json` copied into the
   guest is `chmod 0600` after `scp` (`backend.rs:restrict_guest_grok_auth`).
+- **Guest environment names never configure host tools.** `EnvForward` sends
+  values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
+  all aliases, removes them, and exports the original names before executing
+  the requested command. This covers config literals, devcontainer entries,
+  CLI overrides, and saved `guest_env.json` equally. Never pass the guest map
+  to a host `Command::envs`, even with an absolute executable path: guest
+  loader and SSH settings must also remain guest-only. Values stay out of
+  command arguments, stdin, and temporary files; existing images' `AcceptEnv *`
+  supports the transport. Missing forwarded aliases fail before the command.
+  Assignment failures also stop the command; shell diagnostics that could
+  contain values are replaced with a message containing only the variable name.
+  The `COOP_SSH_ENV_` namespace is reserved for transport: trusted host SSH
+  wrappers and configuration must not interpret these values as instructions.
 - **Secrets stay out of logs.** `Cmd::redacted_arg` redacts argv in traces;
   `EnvForward`/`Secret<T>` custom `Debug` impls keep values out of debug output.
   Do not log a resolved secret.
@@ -414,8 +457,9 @@ Stop and get explicit human confirmation before merging a change that:
   name the boundary it crosses and what authenticates it;
 - forwards a new secret into the guest, or makes an existing one persistent
   inside the guest;
-- runs a host subprocess on tainted (guest- or fetch-derived) bytes — no shell
-  strings; use `Cmd::arg`/`RemoteCommand::arg`;
+- runs a host subprocess on tainted (guest-, project-, or fetch-derived)
+  bytes — inspect the full launch context above, including executable lookup,
+  environment, cwd, and tool configuration, as well as shell/argv handling;
 - writes a **host** filesystem path derived from tainted data — validate against
   traversal first;
 - logs or traces tainted or secret content — that channel becomes an

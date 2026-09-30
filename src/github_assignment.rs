@@ -160,7 +160,7 @@ mod tests {
             key_path: inst.dir.join("unused"),
         };
         let session = crate::commands::prepare_session_from_target(cfg, Some(inst), target, repo)?;
-        Ok(session.env.as_envs().get("GITHUB_TOKEN").cloned())
+        Ok(session.env.guest_values().get("GITHUB_TOKEN").cloned())
     }
 
     #[test]
