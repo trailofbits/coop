@@ -5,6 +5,8 @@ use std::fs::{self, File};
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2795,20 +2797,61 @@ impl Instance {
             }
         }
 
-        match std::os::unix::net::UnixStream::connect(self.api_socket_path()) {
-            Ok(_) => {
-                bail!("Firecracker API socket is still accepting connections without a valid PID")
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error).context("Failed to probe Firecracker API socket"),
-        }
+        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        Ok(false)
+    }
+}
+
+/// Confirm that the root-owned Firecracker API socket is no longer accepting
+/// connections. An unprivileged connect sees `EACCES` for both live and stale
+/// mode-0755 sockets, so it cannot safely distinguish those states.
+#[cfg(not(target_os = "macos"))]
+fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => bail!(
+            "Firecracker API socket path is not a Unix socket: {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+    }
+
+    let output = Cmd::new("curl")
+        .args([
+            // Must be the first argument so curl does not load root's .curlrc.
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--output",
+            "/dev/null",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "2",
+            "--noproxy",
+            "*",
+            "--unix-socket",
+        ])
+        .arg(socket_path)
+        .arg("http://localhost/")
+        .sudo()
+        .output()
+        .context("Failed to run privileged Firecracker API socket probe")?;
+
+    classify_firecracker_socket_probe(output.status.code())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn classify_firecracker_socket_probe(exit_code: Option<i32>) -> Result<()> {
+    match exit_code {
+        Some(0) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        // curl exit 7 means it could not connect. With the probe running as
+        // root, this covers a missing listener without conflating it with the
+        // ordinary user's lack of write permission on the socket.
+        Some(7) => Ok(()),
+        Some(code) => bail!("Privileged Firecracker API socket probe exited with code {code}"),
+        None => bail!("Privileged Firecracker API socket probe terminated by signal"),
     }
 }
 
@@ -3211,6 +3254,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn firecracker_socket_probe_classifies_curl_outcomes() {
+        assert!(classify_firecracker_socket_probe(Some(0)).is_err());
+        classify_firecracker_socket_probe(Some(7)).unwrap();
+        assert!(classify_firecracker_socket_probe(Some(1)).is_err());
+        assert!(classify_firecracker_socket_probe(None).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_api_path() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+
         assert!(inst.probe_liveness().is_err());
     }
 

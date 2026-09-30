@@ -2627,7 +2627,7 @@ test_stop() {
     echo ""
     echo "=== Phase: stop ==="
 
-    local ip tap=""
+    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0
     if [[ "$(uname -s)" == Linux ]]; then
         ip=$(guest_ip_of "$INSTANCE") || ip=""
         if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
@@ -2640,6 +2640,36 @@ test_stop() {
             fi
         else
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
+        fi
+
+        # Firecracker and its socket run as root. Kill the VMM without its
+        # graceful cleanup so `coop stop` must recognize the abandoned
+        # root-owned socket and still remove the TAP.
+        fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
+        socket_metadata=$(stat -c '%U:%a' "$socket_path" 2>/dev/null || true)
+        if [[ -n "$fc_pid" && -S "$socket_path" \
+            && "$socket_metadata" == "root:755" ]]; then
+            if sudo -n kill -9 "$fc_pid"; then
+                for _ in {1..50}; do
+                    if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
+                        exited=1
+                        break
+                    fi
+                    sleep 0.1
+                done
+                if [[ "$exited" -eq 1 && -S "$socket_path" ]]; then
+                    pass "unexpected Firecracker exit leaves a root-owned API socket"
+                else
+                    fail "unexpected Firecracker exit leaves a root-owned API socket" \
+                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$socket_path" ]] && echo yes || echo no )"
+                fi
+            else
+                fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
+            fi
+        else
+            fail "Firecracker stop fixture has a root-owned mode-0755 socket" \
+                "pid=${fc_pid:-<missing>} socket=$socket_path metadata=${socket_metadata:-missing}"
         fi
     fi
 

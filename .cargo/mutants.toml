@@ -64,6 +64,9 @@ exclude_re = [
   # Firecracker liveness invokes sudo and probes /proc plus a Unix socket;
   # Linux-only process tests cover it outside the unit mutation sweep.
   "\\bprobe_liveness\\b",
+  # Privileged curl wrapper; its exit-code classifier remains in scope and the
+  # root-owned stale-socket behavior is covered by the integration suite.
+  "\\bensure_firecracker_api_socket_stopped\\b",
 
   # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
   "\\brun_setup_pat\\b",
