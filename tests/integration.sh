@@ -76,6 +76,8 @@ exec </dev/null
 pass_count=0
 fail_count=0
 skip_count=0
+SKIPPED=()
+proxy_phase_ran=0
 
 pass() {
     pass_count=$((pass_count + 1))
@@ -92,6 +94,7 @@ fail() {
 
 skip() {
     skip_count=$((skip_count + 1))
+    SKIPPED+=("$1${2:+ ($2)}")
     echo "  SKIP  $1${2:+ ($2)}"
 }
 
@@ -100,6 +103,10 @@ summary() {
     echo "────────────────────────────────────────"
     echo "  $pass_count passed, $fail_count failed, $skip_count skipped"
     echo "────────────────────────────────────────"
+    if [[ $skip_count -gt 0 ]]; then
+        printf '  Skipped phases/checks:\n'
+        printf '    - %s\n' "${SKIPPED[@]}"
+    fi
     if [[ $fail_count -gt 0 ]]; then
         exit 1
     fi
@@ -6113,20 +6120,45 @@ CFGEOF
 #     Codex's `auth.json` is not staged;
 #   - the proxy is reachable on host loopback and enforces the capability gate;
 #   - `stop` tears the proxy down (the host port stops answering).
+seatbelt_profile_path() {
+    local script_dir="$1" binary="$2"
+    if [[ -f "$script_dir/src/Cargo.toml" && -f "$script_dir/src/src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/src/src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$script_dir/../Cargo.toml" && -f "$script_dir/../src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/../src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$(dirname "$binary")/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$(dirname "$binary")/seatbelt-proxy.sb"
+        return 0
+    fi
+    return 1
+}
+
 test_proxy() {
     echo ""
     echo "=== Phase: credential-injecting proxy (--full) ==="
 
     if ! command -v curl >/dev/null 2>&1; then
-        skip "credential-proxy test (curl not available on host)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "curl not available on host"
+        else
+            skip "credential-proxy test (curl not available on host)"
+        fi
         return
     fi
     # The proxy needs the `coop-proxy` binary next to `coop`. It is not a
     # default workspace member (it needs cmake for aws-lc-rs), so a plain
-    # `cargo build` / older deploy may not have it; skip rather than fail the
-    # fail-closed `up` when it's absent.
+    # `cargo build` / older deploy may not have it. Developer runs may skip;
+    # required release runs fail before attempting `up`.
     if [[ ! -x "$(dirname "$BINARY")/coop-proxy" ]]; then
-        skip "credential-proxy test (coop-proxy not built alongside coop)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "coop-proxy not built alongside coop"
+        else
+            skip "credential-proxy test (coop-proxy not built alongside coop)"
+        fi
         return
     fi
 
@@ -6388,8 +6420,7 @@ STATEEOF
     proxy_bin="$(dirname "$BINARY")/coop-proxy"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local sb_profile
-        sb_profile="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/seatbelt-proxy.sb"
-        if [[ -f "$sb_profile" ]]; then
+        if sb_profile=$(seatbelt_profile_path "$(dirname "${BASH_SOURCE[0]}")" "$BINARY"); then
             # Pass the profile inline with -p (as coop's launcher does), not -f,
             # and bind PROXY_BIN to the proxy's absolute path (as the launcher
             # does), so the smoke test exercises the same code path production
@@ -6405,7 +6436,11 @@ STATEEOF
                 fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
             fi
         else
-            skip "proxy jail self-test (Seatbelt profile not found at $sb_profile)"
+            if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+                fail "proxy jail self-test" "Seatbelt profile not found beside source or binary"
+            else
+                skip "proxy jail self-test (Seatbelt profile not found beside source or binary)"
+            fi
         fi
     else
         selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
@@ -6429,6 +6464,7 @@ STATEEOF
     px destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
     rm -r "$px_dir"
+    proxy_phase_ran=1
 }
 
 # ── Interrupted setup test (--full only) ──────────────────────
@@ -7434,6 +7470,9 @@ EOF
         fi
     fi
 
+    if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$proxy_phase_ran" != 1 ]]; then
+        fail "credential-proxy phase ran" "required release phase did not complete"
+    fi
     summary
 }
 

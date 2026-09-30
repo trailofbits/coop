@@ -27,6 +27,18 @@ Run on **both platforms** before every commit:
 ./tests/run-integration.sh --profile python,node --name my-test
 ```
 
+Release preflight runs `--full --require-proxy` on each selected host. Use the
+same flags to require the proxy build, host curl, the macOS Seatbelt profile,
+and completion of the credential-proxy phase:
+
+```bash
+./tests/run-integration.sh --full --require-proxy
+./tests/run-integration.sh --remote user@remote-host --full --require-proxy
+```
+
+Developer runs without `--require-proxy` may skip missing proxy prerequisites.
+The runner consumes `--require-proxy`; it requires `--full` or `TEST_FULL=1`.
+
 You can also run the suite directly if you already have a binary:
 
 ```bash
