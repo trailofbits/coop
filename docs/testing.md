@@ -50,6 +50,14 @@ guest environment → docker → stop → destroy). CI additionally runs the fas
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
 
+The stop phase writes, overwrites, and deletes guest files immediately before
+stopping, then verifies those changes after restart without syncing them in
+the test. The `vm::tests::stop_bounds_guest_shutdown_and_reaps_ssh` unit test
+uses real child processes and fake SSH/sudo boundaries to cover graceful exit,
+SSH refusal, a hung client, a missing client, and liveness-probe failure. It
+checks forced-signal fallback, bounded waits, and SSH client reaping. The
+existing stop failure test checks PID retention after failed forced signals.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
@@ -212,6 +220,12 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It also corrupts an ext4 inode reference count, checks that read-only verification
+rejects it, and repairs the filesystem before resizing. The repair operation
+accepts exit code 1 (errors corrected), as defined by
+[e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
+Nonzero results from other disk tools, reboot-required results, error combinations,
+and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.

@@ -31,7 +31,7 @@ sudo -n chown root:root "$stage"
 sudo -n chmod 0666 "$stage"
 # A normal CLI call must reach the sudo wrapper and execute the same running
 # coop inode through /proc, then repair this root-owned managed disk.
-printf 'data_dir = "%s"\n' "$data_dir" > "$data_dir/config.toml"
+printf 'data_dir = "%s"\n' "$data_dir" >"$data_dir/config.toml"
 "$coop_bin" --config "$data_dir/config.toml" list >/dev/null
 [[ $(stat -c %a "$stage") == 600 ]]
 mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
@@ -115,7 +115,18 @@ if sudo -n "$coop_bin" __disk-op truncate "$data_dir" "$instance" 0 2>/dev/null;
     exit 1
 fi
 [[ $(stat -c %s "$instance") == 1073741824 ]]
+# An inconsistent inode reference count requires an actual repair, whose e2fsck
+# status is 1. A read-only check must reject it before repair and pass afterward.
+sudo -n debugfs -w -R 'set_inode_field <2> links_count 99' "$instance" >/dev/null 2>&1
+# shellcheck disable=SC2024 # Capture root tool output in a caller-owned private log.
+if sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" \
+    >"$data_dir/fsck-read-error" 2>&1; then
+    echo 'read-only check accepted an inconsistent filesystem' >&2
+    exit 1
+fi
+grep -Fq '/usr/sbin/e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
 sudo -n "$coop_bin" __disk-op fsck-fix "$data_dir" "$instance" >/dev/null
+sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" >/dev/null
 sudo -n "$coop_bin" __disk-op resize "$data_dir" "$instance" >/dev/null
 sudo -n "$coop_bin" __disk-op swap "$data_dir" "$stage"
 sudo -n "$coop_bin" __disk-op remove "$data_dir" "$instance"
