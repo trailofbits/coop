@@ -46,7 +46,8 @@ coop/
 │   ├── port_forward.rs     # ssh -L port forwards + state
 │   ├── signal.rs           # SIGINT/SIGTERM cooperative cancellation
 │   ├── paths.rs            # GuestPath / HostPath type split
-│   ├── fs_util.rs          # atomic file writes, file locks
+│   ├── fs_util.rs          # private directories/ACLs, atomic file writes, file locks
+│   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
 │   ├── jsonc.rs            # JSONC → JSON (for devcontainer.json)
 │   ├── naming.rs           # safe-name character class

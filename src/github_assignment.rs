@@ -1,6 +1,7 @@
 //! A VM stores an entry key, never a resolved PAT or a duplicate secret.
-use std::fs;
+use std::ffi::OsStr;
 use std::io::ErrorKind;
+use std::io::Read as _;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -17,16 +18,19 @@ pub struct Assignment {
 
 impl Assignment {
     pub fn load(inst: &Instance) -> Result<Option<Self>> {
-        let path = inst.dir.join("github_pat.json");
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => bail!(
-                "github_pat.json must be a regular file; use coop github unassign-pat --vm <name> to remove it"
-            ),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).context("Cannot inspect github_pat.json"),
-        }
-        let bytes = fs::read(path).context("Cannot read github_pat.json")?;
+        let bytes = (|| {
+            let directory = crate::fs_util::PrivateDir::open_existing(&inst.dir)?;
+            let mut bytes = Vec::new();
+            directory
+                .open_regular(OsStr::new("github_pat.json"))?
+                .read_to_end(&mut bytes)?;
+            Ok::<_, anyhow::Error>(bytes)
+        })();
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) if is_missing(&error) => return Ok(None),
+            Err(error) => return Err(error).context("Cannot read github_pat.json"),
+        };
         serde_json::from_slice::<Self>(&bytes).map(Some).context(
             "Invalid github_pat.json; use coop github unassign-pat --vm <name> to remove it",
         )
@@ -34,18 +38,23 @@ impl Assignment {
 
     pub fn save(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         self.validate(cfg)?;
-        crate::fs_util::atomic_write_with_mode(
-            &inst.dir.join("github_pat.json"),
-            &serde_json::to_string(self)?,
+        crate::fs_util::PrivateDir::create(&inst.dir)?.write_atomic_private(
+            OsStr::new("github_pat.json"),
+            serde_json::to_string(self)?.as_bytes(),
             0o600,
         )
     }
 
     pub fn remove(inst: &Instance) -> Result<()> {
-        match fs::remove_file(inst.dir.join("github_pat.json")) {
+        let directory = match crate::fs_util::PrivateDir::open_existing(&inst.dir) {
+            Ok(directory) => directory,
+            Err(error) if is_missing(&error) => return Ok(()),
+            Err(error) => return Err(error).context("Cannot open PAT assignment directory"),
+        };
+        match directory.unlink_non_directory(OsStr::new("github_pat.json")) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context("Cannot remove github_pat.json"),
+            Err(error) if is_missing(&error) => Ok(()),
+            Err(error) => Err(error).context("Cannot remove github_pat.json"),
         }
     }
 
@@ -66,6 +75,13 @@ impl Assignment {
             .and_then(|auth| auth.pat_entry(&self.repo))
             .is_some()
     }
+}
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == ErrorKind::NotFound)
 }
 
 /// Opt-out precedes even reading the sidecar. A bad reference never falls back.

@@ -18,6 +18,31 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
+### Private host storage
+
+coop keeps `data_dir`, its image/instance/state directories, and each managed
+image or instance directory at `0700`. Environment snapshots, JSON state, file
+backend tokens, SSH private keys, and VM disks use `0600`. Atomic writes create
+private temporary files before writing their contents. Lima runs with a `077`
+child umask, reapplies disk modes after startup, and protects its coop instance directories under `LIMA_HOME` (or
+`~/.lima`).
+
+Commands seal shared storage roots and migrate existing entries without walking
+mounted guest filesystems or workspaces. Entries removed during migration are
+ignored; unsafe instance or image entries are reported without blocking unrelated
+commands. Loading a selected instance or image strictly checks its directory and
+managed files. Shared credential storage and the common SSH key remain strict. Repairing a
+root-owned Firecracker disk may request sudo. Private storage must be owned by
+the invoking user; Firecracker disks may also be root-owned. Symlinked managed
+paths, hardlinked sensitive files, and ancestors owned by another user are
+rejected. Lima’s same-directory `disk` → `diffdisk` compatibility alias is
+accepted. Root-owned OS directory aliases are allowed as ancestors. Writable
+ancestors must be sticky, as with `/tmp`; use a dedicated user-owned directory
+for custom storage. Extended ACL grants and directory inheritance are removed
+from private directories and user-owned sensitive files. On macOS, ancestor
+ACLs granting write or ownership/control access are rejected. Config edits
+preserve the permissions and ACLs of the directory containing `config.toml`.
+
 ## GitHub auth
 
 The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:

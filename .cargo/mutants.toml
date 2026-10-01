@@ -33,6 +33,9 @@ exclude_globs = [
   "src/completions.rs",
   "src/lima.rs",
   "src/setup.rs",
+  # Root-only disk, filesystem, and mount syscalls are exercised by the
+  # passwordless-sudo host probe rather than the ordinary unit sweep.
+  "src/privileged_disk.rs",
   "src/update.rs",
   "src/shell.rs",
   "src/port_forward.rs",
@@ -55,6 +58,9 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # MigrationOutcome::report only emits a warning for an already classified
+  # failure; policy decisions remain in scope and are unit-tested.
+  "src/private_storage\\.rs:.*MigrationOutcome::report",
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
   # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
@@ -159,6 +165,23 @@ exclude_re = [
   "\\btool_on_path\\b",
   "\\bstore_keychain\\b",
   "find-generic-password",
+
+  # private_storage.rs — root-owned disk repair invokes sudo; host integration
+  # covers that branch. The user-owned mode and ACL paths have unit regressions.
+  "src/private_storage\\.rs:.*\\bprivate_file\\b",
+  # Migration diagnostics write tracing output; the missing-error decision stays tested.
+  "\\breport_migration_result\\b",
+
+  # Darwin ACL functions are compiled out on the Linux mutation host; native
+  # macOS unit tests exercise allow/deny ACLs and ACL removal.
+  "mac_acl::",
+
+  # Descriptor/creation syscall adapters; pure alias, errno, and creation
+  # decisions remain in scope. Closed-fd, strict-umask, and root-alias probes
+  # cover the adapters, including the privileged ownership fixture.
+  "\\bopen_directory_at\\b",
+  "\\broot_owned_symlink_at\\b",
+  "\\bcreate_private_directory_at\\b",
 
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",

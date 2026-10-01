@@ -22,8 +22,6 @@
 //!    interactively when no config existed).
 //! 3. Else none — the tool stays on the cloud default.
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::ErrorKind;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,9 +109,7 @@ impl ModelState {
         if self.is_default() {
             // A missing file already encodes the default; don't leave a
             // stale snapshot behind.
-            if path.exists()
-                && let Err(e) = fs::remove_file(&path)
-            {
+            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
                 tracing::debug!(
                     "Failed to remove default model state {} (non-fatal): {e}",
                     path.display()
@@ -131,15 +127,13 @@ impl ModelState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.model_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state = serde_json::from_str(&content).context("Failed to parse model.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 
@@ -508,7 +502,7 @@ mod tests {
     fn try_load_surfaces_non_not_found_read_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let inst = fake_instance(tmp.path().to_path_buf());
-        fs::create_dir_all(inst.model_state_path()).unwrap();
+        std::fs::create_dir_all(inst.model_state_path()).unwrap();
         assert!(ModelState::try_load(&inst).is_err());
     }
 

@@ -532,6 +532,49 @@ test_profiles_cli() {
 
 # ── Setup ─────────────────────────────────────────────────────
 
+test_private_storage() {
+    echo ""
+    echo "=== Phase: private host storage ==="
+    local result
+    if result=$(python3 - "$INSTANCE" <<'PYMODE'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path.home() / ".coop"
+instance = root / "instances" / sys.argv[1]
+for directory in (root, root / "images", root / "instances", root / "state", instance):
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+state = instance / "instance.json"
+assert state.is_file(), state
+assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+for state in instance.glob("*.json"):
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+if sys.platform == "darwin":
+    directory = pathlib.Path(os.environ.get("LIMA_HOME", str(pathlib.Path.home() / ".lima"))) / ("coop-" + sys.argv[1])
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    disk = next((directory / name for name in ("disk", "diffdisk") if (directory / name).exists()), None)
+else:
+    config = instance / "vm_config.json"
+    assert config.is_file(), config
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600, config
+    disk = instance / "rootfs.ext4"
+assert disk is not None and disk.is_file(), disk
+assert stat.S_IMODE(disk.stat().st_mode) == 0o600, disk
+images = list((root / "images").glob("*/*.ext4")) + list((root / "images").glob("*/*.img"))
+assert images, "no template disk found"
+for image in images:
+    assert stat.S_IMODE(image.parent.stat().st_mode) == 0o700, image.parent
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600, image
+PYMODE
+    ); then
+        pass "managed directories, state, and VM disks have private modes"
+    else
+        fail "managed directories, state, and VM disks have private modes" "$result"
+    fi
+}
+
 test_setup() {
     echo ""
     echo "=== Phase: setup ==="
@@ -7354,6 +7397,7 @@ EOF
     # Setup + primary instance
     test_setup
     test_up_creates_primary_instance
+    test_private_storage
     test_start_rejects_missing_instance
     test_duplicate_name
     test_status_running
@@ -7396,6 +7440,7 @@ EOF
     test_resize_status
     test_reconfigure
     test_commit_restore
+    test_private_storage
     test_restart_stopped
     test_restart_rejects_ignored_flags
     test_restore_reprovision

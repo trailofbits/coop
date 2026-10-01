@@ -153,6 +153,21 @@ apply across all lenses:
   When the review harness forbids executing contributor code, inspect the test
   and report the reproduction/mutation as unrun; do not relax that restriction.
 
+### Trace filesystem identity through use
+
+- For each changed file or mount operation, list the validation step, later
+  consumer, privilege boundary, and each path resolution between them. An
+  `open` descriptor pins an inode; a checked path string or parent descriptor
+  alone does not pin a later child lookup. Include subprocesses, sudo, and
+  tools that reopen `/proc/self/fd` paths or their original path arguments.
+- For rename, unlink, mount, and unmount, check the final component separately.
+  Determine whether an untrusted writer can replace it after validation and
+  whether the kernel operation follows that replacement. Reproduce relevant
+  flags and descriptor behavior on the target OS when practical.
+- Follow interrupted writes and copies through retry and cleanup. Verify
+  staging files cannot accumulate without bound and that locks serialize the
+  actual mutation, including after a process dies.
+
 ### Audit the whole lifecycle and contract
 
 - Trace success, failure after partial setup, timeout, cancellation, retry,

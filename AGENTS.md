@@ -128,6 +128,10 @@ workflow. In addition to lens-specific checks, every review must:
 - Audit lifecycle symmetry: success, partial failure, timeout, retry, cleanup,
   concurrency, stale state, and mode transitions. A spawned process, secret,
   lock, PID file, or cache must remain bounded on every path.
+- For filesystem and mount changes, trace object identity from validation to
+  use, including subprocesses and sudo. Check every path reopening, mutable
+  final component, interrupted operation, and retry against the guest/host
+  trust boundary; a checked parent descriptor alone does not pin its children.
 - Search every representation of a changed contract, including source, tests,
   examples, exhaustive docs, workflow/install scripts, comments, and PR text.
   Re-check the full branch after rebases and review-fix commits.

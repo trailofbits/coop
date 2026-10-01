@@ -190,6 +190,29 @@ positive witness that the intended transfer or rejection and consumer check
 occurred. Separately break the boundary guard and the intended outcome to prove
 both assertions work. Apply the execution restrictions above.
 
+## Private storage checks
+
+Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
+legacy state repair, concurrent instance removal, unsafe links and parents,
+Firecracker config creation/replacement, and Linux POSIX ACL removal.
+The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux unit probes require passwordless sudo:
+
+```bash
+cargo test --lib rejects_files_and_directories_owned_by_another_user -- --ignored
+cargo test --lib unmount_rejects_name_swapped_to_outside_mount -- --ignored
+```
+
+The VM integration suite checks host directory, JSON state, template disk, and
+instance disk modes after creation and after commit/restore on both backends.
+
+On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
+run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
+the privileged disk helper with real formatting, loop mounts, cleanup, symlink
+rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
+symlink between validation and `umount2`; it also checks a normal unmount.
+This host probe does not replace either VM integration gate.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real
