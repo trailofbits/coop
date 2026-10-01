@@ -28,8 +28,14 @@
 # (CLAUDE.md "Don't bother with" list.) Unit tests cannot observe their effects.
 exclude_globs = [
   "src/backend.rs",
+  # Completion callbacks read host state and probe VM liveness on every TAB;
+  # their behavior is exercised through the CLI integration suite.
+  "src/completions.rs",
   "src/lima.rs",
   "src/setup.rs",
+  # Root-only disk, filesystem, and mount syscalls are exercised by the
+  # passwordless-sudo host probe rather than the ordinary unit sweep.
+  "src/privileged_disk.rs",
   "src/update.rs",
   "src/shell.rs",
   "src/port_forward.rs",
@@ -57,6 +63,9 @@ exclude_re = [
   # Lifecycle staging resolves image metadata and backend mount behavior.
   "BootPayload::prepare",
 
+  # MigrationOutcome::report only emits a warning for an already classified
+  # failure; policy decisions remain in scope and are unit-tested.
+  "src/private_storage\\.rs:.*MigrationOutcome::report",
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
   # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
@@ -156,6 +165,23 @@ exclude_re = [
   "\\bstore_keychain\\b",
   "find-generic-password",
 
+  # private_storage.rs — root-owned disk repair invokes sudo; host integration
+  # covers that branch. The user-owned mode and ACL paths have unit regressions.
+  "src/private_storage\\.rs:.*\\bprivate_file\\b",
+  # Migration diagnostics write tracing output; the missing-error decision stays tested.
+  "\\breport_migration_result\\b",
+
+  # Darwin ACL functions are compiled out on the Linux mutation host; native
+  # macOS unit tests exercise allow/deny ACLs and ACL removal.
+  "mac_acl::",
+
+  # Descriptor/creation syscall adapters; pure alias, errno, and creation
+  # decisions remain in scope. Closed-fd, strict-umask, and root-alias probes
+  # cover the adapters, including the privileged ownership fixture.
+  "\\bopen_directory_at\\b",
+  "\\broot_owned_symlink_at\\b",
+  "\\bcreate_private_directory_at\\b",
+
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
   "\\block_sibling_bounded\\b",
@@ -252,7 +278,8 @@ exclude_re = [
 
   # admin.rs — uninstall/init IO: terminal summary, recursive data-dir wipe,
   # self-binary removal. The decide_remove_data / config_path_is_under_data_dir
-  # / is_dev_target_path predicates are pure and stay in scope (unit-tested).
+  # / is_dev_target_path / is_nix_store_path predicates are pure and stay in
+  # scope (unit-tested). The Nix install check exercises the early refusal.
   "\\bprint_uninstall_summary\\b",
   "\\bwipe_data_dir\\b",
   "\\bremove_self_binary\\b",

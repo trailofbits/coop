@@ -12,8 +12,6 @@
 //! resolved on the host at VM start (never written to the guest); a
 //! configured-but-unresolvable credential fails the VM start closed rather
 //! than falling back to forwarding a raw key.
-use std::fs;
-use std::io::ErrorKind;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,9 +74,7 @@ impl ProxyState {
         if self.is_default() {
             // A missing file already encodes "no override"; don't leave a
             // stale snapshot behind.
-            if path.exists()
-                && let Err(e) = fs::remove_file(&path)
-            {
+            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
                 tracing::debug!(
                     "Failed to remove default proxy state {} (non-fatal): {e}",
                     path.display()
@@ -98,15 +94,13 @@ impl ProxyState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.proxy_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state = serde_json::from_str(&content).context("Failed to parse proxy.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 
@@ -175,7 +169,7 @@ mod tests {
     fn unreadable_state_does_not_fall_back_to_config_defaults() {
         let tmp = tempfile::TempDir::new().unwrap();
         let inst = inst(tmp.path().to_path_buf());
-        fs::create_dir(inst.proxy_state_path()).unwrap();
+        std::fs::create_dir(inst.proxy_state_path()).unwrap();
         let error = ProxyState::try_load(&inst).unwrap_err();
         assert!(error.to_string().contains("Failed to read"));
 

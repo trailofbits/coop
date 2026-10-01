@@ -49,22 +49,18 @@ pub struct DevcontainerPreferences {
 
 impl DevcontainerPreferences {
     pub fn load(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content)
+        match crate::fs_util::read_optional_private(path) {
+            Ok(Some(content)) => serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse {}", path.display())),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(Self::default()),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if self.projects.is_empty() {
-            if path.exists() {
-                fs::remove_file(path)
-                    .with_context(|| format!("Failed to remove {}", path.display()))?;
-            }
+            crate::fs_util::remove_private_if_exists(path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
             return Ok(());
         }
         let json = serde_json::to_string_pretty(self)
@@ -278,16 +274,14 @@ impl DevcontainerState {
 
     pub fn try_load(inst: &config::Instance) -> Result<Option<Self>> {
         let path = inst.devcontainer_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state = serde_json::from_str(&content)
                     .context("Failed to parse devcontainer_state.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 

@@ -206,7 +206,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
     /// global default. A fresh instance (no config yet) seeds them from
     /// the global config.
     pub fn configure(&self) -> Result<()> {
-        fs::create_dir_all(&self.inst.dir).context("Failed to create instance directory")?;
+        crate::fs_util::private_dir(&self.inst.dir)
+            .context("Failed to create instance directory")?;
 
         let config_path = self.inst.vm_config_path();
         let mut fc_config = build_config(self.cfg, self.inst);
@@ -215,7 +216,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
         }
         let config_json = serde_json::to_string_pretty(&fc_config)
             .context("Failed to serialize Firecracker config")?;
-        fs::write(&config_path, config_json).context("Failed to write Firecracker config")?;
+        crate::fs_util::atomic_write_json(&config_path, &config_json)
+            .context("Failed to write Firecracker config")?;
 
         tracing::debug!("Wrote VM config to {}", config_path.display());
         Ok(())
@@ -639,6 +641,65 @@ mod tests {
         read_machine_config, wait_for_exit, wait_for_pid_file,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    fn configure_creates_and_replaces_private_config_under_permissive_umask() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        const CHILD: &str = "COOP_VM_CONFIG_PRIVATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "vm::tests::configure_creates_and_replaces_private_config_under_permissive_umask"])
+                .env(CHILD, "1").status().unwrap().success());
+            return;
+        }
+        // SAFETY: the fixture runs in a separate process with no other tests.
+        unsafe {
+            libc::umask(0);
+        }
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig::default();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        let vm = FirecrackerVm::new(&cfg, &inst);
+        vm.configure().unwrap();
+        let path = inst.vm_config_path();
+        assert_eq!(
+            fs::metadata(&inst.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            read_machine_config(&path).unwrap().vcpu_count,
+            cfg.vm.vcpu_count.get()
+        );
+        fs::write(&path, SAMPLE_CONFIG_JSON).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        vm.configure().unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let resources = read_machine_config(&path).unwrap();
+        assert_eq!(resources.vcpu_count, 6);
+        assert_eq!(resources.mem_size_mib, 5120);
+        let outside = root.path().join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(vm.configure().is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
+    }
 
     #[test]
     #[expect(

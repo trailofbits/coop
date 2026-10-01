@@ -19,6 +19,31 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
+### Private host storage
+
+coop keeps `data_dir`, its image/instance/state directories, and each managed
+image or instance directory at `0700`. Environment snapshots, JSON state, file
+backend tokens, SSH private keys, and VM disks use `0600`. Atomic writes create
+private temporary files before writing their contents. Lima runs with a `077`
+child umask, reapplies disk modes after startup, and protects its coop instance directories under `LIMA_HOME` (or
+`~/.lima`).
+
+Commands seal shared storage roots and migrate existing entries without walking
+mounted guest filesystems or workspaces. Entries removed during migration are
+ignored; unsafe instance or image entries are reported without blocking unrelated
+commands. Loading a selected instance or image strictly checks its directory and
+managed files. Shared credential storage and the common SSH key remain strict. Repairing a
+root-owned Firecracker disk may request sudo. Private storage must be owned by
+the invoking user; Firecracker disks may also be root-owned. Symlinked managed
+paths, hardlinked sensitive files, and ancestors owned by another user are
+rejected. Lima’s same-directory `disk` → `diffdisk` compatibility alias is
+accepted. Root-owned OS directory aliases are allowed as ancestors. Writable
+ancestors must be sticky, as with `/tmp`; use a dedicated user-owned directory
+for custom storage. Extended ACL grants and directory inheritance are removed
+from private directories and user-owned sensitive files. On macOS, ancestor
+ACLs granting write or ownership/control access are rejected. Config edits
+preserve the permissions and ACLs of the directory containing `config.toml`.
+
 ## Guest files
 
 Use one `[[guest_files]]` entry per host file or directory that you want to copy
@@ -278,9 +303,11 @@ RUST_LOG = "info"
 MY_FLAG = "1"
 ```
 
-Keys are env var names; values are the literals to inject. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
+Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. The values transit the host SSH process under inert internal aliases, so their original guest-controlled names—including names loaded from saved instance state—cannot configure that process. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
 
 **Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
+
+Variables with special meaning to the guest shell still follow that shell's rules. If its environment-restoration shell rejects an assignment, Coop stops the command and reports the variable name without its value.
 
 Override or extend per-invocation with `coop up --env KEY=VALUE` or `coop start --env KEY=VALUE` (repeatable).
 

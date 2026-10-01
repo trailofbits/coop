@@ -98,13 +98,11 @@ impl WorkspaceState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        let content = match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => content,
+            Ok(None) => return Ok(None),
             Err(e) => {
-                return Err(
-                    anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))
-                );
+                return Err(e.context(format!("Failed to read {}", path.display())));
             }
         };
         serde_json::from_str(&content)

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
+use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
@@ -1910,18 +1911,18 @@ impl<'de> Deserialize<'de> for ImageName {
 ///
 /// Returns the open file handle — the lock is held until dropped.
 fn lock_dir(dir: &Path) -> Result<File> {
-    fs::create_dir_all(dir)
+    let directory = crate::fs_util::PrivateDir::create(dir)
         .with_context(|| format!("Failed to create directory {}", dir.display()))?;
-    let lock_path = dir.join(".lock");
-    let file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+    let file = directory
+        .open_or_create_lock(OsStr::new(".lock"))
+        .with_context(|| format!("Failed to open lock file in {}", dir.display()))?;
     // SAFETY: flock is safe to call on a valid fd. The File owns the fd
     // and outlives this call. LOCK_EX blocks until the lock is acquired.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
         bail!(
             "Failed to acquire lock on {}: {}",
-            lock_path.display(),
+            dir.join(".lock").display(),
             std::io::Error::last_os_error()
         );
     }
@@ -2229,13 +2230,32 @@ impl CoopConfig {
                     continue;
                 }
             };
-            let config_path = self.template_config_path_for(&name);
-            let config = if config_path.exists() {
-                let content = fs::read_to_string(&config_path).ok();
-                content.and_then(|c| serde_json::from_str(&c).ok())
-            } else {
-                None
+            if let Err(error) = crate::private_storage::prepare_directory(&entry.path()) {
+                tracing::warn!(
+                    "Skipping image directory {}: {error:#}",
+                    entry.path().display()
+                );
+                continue;
+            }
+            let image_dir = match crate::fs_util::PrivateDir::open_existing(&entry.path()) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    tracing::warn!(
+                        "Skipping image directory {}: {error:#}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
             };
+            let config = image_dir
+                .open_regular(OsStr::new("template-config.json"))
+                .and_then(|mut file| {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    Ok(content)
+                })
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok());
             images.push(ImageInfo {
                 name,
                 dir: entry.path(),
@@ -2667,11 +2687,19 @@ impl Instance {
     }
 
     fn load(dir: &Path) -> Result<Self> {
+        crate::private_storage::prepare_directory(dir)?;
+        let directory = crate::fs_util::PrivateDir::open_existing(dir)?;
         let meta_path = dir.join("instance.json");
-        let content = fs::read_to_string(&meta_path)
+        let mut content = String::new();
+        directory
+            .open_regular(OsStr::new("instance.json"))?
+            .read_to_string(&mut content)
             .with_context(|| format!("Failed to read {}", meta_path.display()))?;
         let meta: InstanceMeta =
             serde_json::from_str(&content).context("Failed to parse instance.json")?;
+        if dir.file_name() != Some(OsStr::new(meta.name.as_str())) {
+            bail!("Instance metadata name does not match its directory");
+        }
         Ok(Instance {
             name: meta.name,
             index: meta.index,
@@ -3442,6 +3470,18 @@ mod tests {
         assert_eq!(indices, vec![2, 5, 10]);
     }
 
+    #[test]
+    fn list_rejects_metadata_for_a_different_instance_directory() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let mut instance = make_instance(tmp.path(), "alias", idx(1));
+        instance.name = iname("other");
+        instance.save().unwrap();
+
+        assert!(cfg.list_instances().unwrap().is_empty());
+        assert!(cfg.resolve_instance(Some(&iname("alias"))).is_err());
+    }
+
     // ── Resolve instance ─────────────────────────────────────
 
     #[test]
@@ -3518,11 +3558,8 @@ mod tests {
 
     #[test]
     fn resolve_ignores_stale_fast_path_dir() {
-        // The fast path reads `instances_dir/<name>/instance.json` and only
-        // returns it when the stored name matches the requested name. Here the
-        // directory `wanted` holds an instance whose stored name is `decoy`, so
-        // the fast path must reject it and the slow path must find the real
-        // `wanted` instance living under a differently-named directory.
+        // A mismatched metadata name must be rejected by both the fast path
+        // and the fallback directory listing.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let instances = tmp.path().join("instances");
@@ -3535,17 +3572,8 @@ mod tests {
         };
         stale.save().unwrap();
 
-        let real = Instance {
-            name: iname("wanted"),
-            index: idx(1),
-            dir: instances.join("elsewhere"),
-            image: default_img(),
-        };
-        real.save().unwrap();
-
-        let inst = cfg.resolve_instance(Some(&iname("wanted"))).unwrap();
-        assert_eq!(inst.name, *"wanted");
-        assert_eq!(inst.index.as_u16(), 1);
+        assert!(cfg.resolve_instance(Some(&iname("wanted"))).is_err());
+        assert!(cfg.list_instances().unwrap().is_empty());
     }
 
     #[test]
@@ -5289,7 +5317,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("inst");
         let inst = Instance {
-            name: InstanceName::new("test").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("python-dev").unwrap(),
@@ -5305,7 +5333,7 @@ skip = ["not-a-slug"]
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         // Write old-format instance.json without image field
-        fs::write(dir.join("instance.json"), r#"{"name": "test", "index": 0}"#).unwrap();
+        fs::write(dir.join("instance.json"), r#"{"name": "inst", "index": 0}"#).unwrap();
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
     }
@@ -5415,7 +5443,7 @@ skip = ["not-a-slug"]
 
         // Save initial state
         let inst = Instance {
-            name: InstanceName::new("v1").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
@@ -5424,7 +5452,7 @@ skip = ["not-a-slug"]
 
         // Overwrite with different content
         let inst2 = Instance {
-            name: InstanceName::new("v2").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("custom").unwrap(),
@@ -5433,7 +5461,7 @@ skip = ["not-a-slug"]
 
         // Load should see the new content, not a mix
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.name, *"v2");
+        assert_eq!(loaded.name, *"inst");
         assert_eq!(loaded.index.as_u16(), 5);
         assert_eq!(loaded.image.as_str(), "custom");
 

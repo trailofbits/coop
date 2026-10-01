@@ -27,6 +27,18 @@ Run on **both platforms** before every commit:
 ./tests/run-integration.sh --profile python,node --name my-test
 ```
 
+Release preflight runs `--full --require-proxy` on each selected host. Use the
+same flags to require the proxy build, host curl, the macOS Seatbelt profile,
+and completion of the credential-proxy phase:
+
+```bash
+./tests/run-integration.sh --full --require-proxy
+./tests/run-integration.sh --remote user@remote-host --full --require-proxy
+```
+
+Developer runs without `--require-proxy` may skip missing proxy prerequisites.
+The runner consumes `--require-proxy`; it requires `--full` or `TEST_FULL=1`.
+
 You can also run the suite directly if you already have a binary:
 
 ```bash
@@ -78,8 +90,10 @@ version-dependent. This opt-in test does not replace either VM backend gate.
 The full Codex update tests install native release `0.153.0` before running
 `codex update` as the guest user, and require the installed version to change.
 They compare the actual `config.toml` contents across host updates, self-updates,
-and migration from a profile-provided system command. Package layout and
-completeness remain the native installer's responsibility.
+and migration from a profile-provided system command. The native installer owns
+package validation; coop additionally verifies that the CLI and Code Mode host
+are executable, exposed through stable system links, and resolve to the same
+native release.
 
 ## Host-only bridge isolation test
 
@@ -127,13 +141,84 @@ Linux CI and release preflight run this gate explicitly; ordinary unit tests
 mark it ignored, and macOS preflight reports it as unrun. This host test does
 not replace the Firecracker and Lima VM integration gates.
 
+The same fixture exercises guest environment forwarding through real OpenSSH:
+literal values, empty values, transport-name collisions, PTYs, stdin, exit
+status, missing forwarding, and redacted assignment failures. Its sshd accepts
+only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
+bypassing the transport. The ordinary unit suite separately checks host
+environment isolation on all four SSH launch paths and the complete path from
+devcontainer parsing through saved instance state to a later session.
+
+The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
+normal scope. When changing it, deliberately restore direct guest-map
+`Command::envs` use and separately remove guest restoration: the launch-path
+and round-trip regressions must fail, respectively. Removing export diagnostic
+redaction must fail the assignment-error regression. Restore the code and
+rerun the tests after each check.
+
 The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
-rejects the fixture filename. The Lima resize spawn-failure test runs in an
-isolated child process with an empty executable search directory, so it cannot
-find a host `truncate` or change another test's environment.
+rejects the fixture filename.
+
+## Host subprocess boundary tests
+
+Changes that route project or guest configuration into host launchers need both
+an intended guest result and evidence that the host launch context is unaffected.
+A successful guest `printenv` or an assertion on the forwarding map alone does
+not establish isolation. Trace the input from local/fetched project parsing
+through config merging and saved-state replay to all applicable launch variants
+(interactive, non-interactive, stdin, and output capture).
+
+Use disposable fixtures with no real credentials or user configuration. For
+executable lookup, put a marker-writing replacement tool in a project-controlled
+directory and verify it never runs on the host. Pair that negative check with a
+positive witness that the intended launcher ran and the guest received the
+value. Inspect the child environment for loader and tool-control names too;
+using an absolute executable does not cover those controls. A fake launcher can
+observe host isolation, while a real transport fixture must verify guest
+restoration. Keep platform-specific controls tied to the platform that consumes
+them and report missing platform coverage.
+
+Deliberately reintroduce the unsafe source-to-sink connection and require the
+host-isolation assertion to fail; separately break guest delivery and require
+the positive witness to fail. Do this even when the launch code is excluded
+from cargo-mutants. Run such checks only in an authorized test environment;
+read-only CI review must report them as unrun when contributor execution is
+forbidden. The concrete forwarding checks above implement this pattern for SSH.
+
+For file-transfer changes, extend the fixture through the later host operation
+that consumes the transferred data. Use the relevant real tool to exercise
+implicit file discovery, with a disposable destination and no real credentials
+or user configuration. Pair an assertion on unintended host effects with a
+positive witness that the intended transfer or rejection and consumer check
+occurred. Separately break the boundary guard and the intended outcome to prove
+both assertions work. Apply the execution restrictions above.
+
+## Private storage checks
+
+Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
+legacy state repair, concurrent instance removal, unsafe links and parents,
+Firecracker config creation/replacement, and Linux POSIX ACL removal.
+The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux unit probes require passwordless sudo:
+
+```bash
+cargo test --lib rejects_files_and_directories_owned_by_another_user -- --ignored
+cargo test --lib unmount_rejects_name_swapped_to_outside_mount -- --ignored
+```
+
+The VM integration suite checks host directory, JSON state, template disk, and
+instance disk modes after creation and after commit/restore on both backends.
+
+On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
+run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
+the privileged disk helper with real formatting, loop mounts, cleanup, symlink
+rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
+symlink between validation and `umount2`; it also checks a normal unmount.
+This host probe does not replace either VM integration gate.
 
 Guest-file unit tests cover multiple mappings, guest-home expansion, destination
-validation, source snapshots, private writable modes, symlink materialization,
+validation, source snapshots, private writable modes, macOS staging ACL inheritance,
+symlink materialization,
 cycles, missing sources, special files, concurrent source-path replacement, staging
 directory overlap, and mount/destination overlaps. The full
 VM suite checks initial copies, restart refresh, retained guest-only content,
@@ -171,7 +256,7 @@ parsing, or state composition:
   `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
   `discovered_local_devcontainer` / `is_sensitive_workspace`
 
-**Don't bother with:** `backend.rs`, `lima.rs`, `setup.rs`, `update.rs`,
+**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`, `update.rs`,
 `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY
 prompts), `main.rs`, and — inside `src/commands/` — the `cmd_*` dispatch
 entrypoints and the handlers that take a `&PlatformBackend`, write stdout, or
