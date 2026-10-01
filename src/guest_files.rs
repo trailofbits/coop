@@ -79,6 +79,8 @@ impl StagedFiles {
         let directory = tempfile::Builder::new()
             .prefix("coop-guest-files-")
             .tempdir()?;
+        crate::fs_util::private_dir(directory.path())
+            .context("Cannot secure guest_files staging directory")?;
         let mut roots = Vec::new();
         let mut destinations = Vec::new();
         for file in files {
@@ -484,6 +486,19 @@ mod tests {
     }
 
     #[test]
+    fn staging_root_is_private() {
+        let staged = StagedFiles::prepare(&[], &GuestUser::default(), &[]).unwrap();
+        assert_eq!(
+            fs::metadata(staged.directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn source_containing_tmpdir_fails_without_recursing() {
         const MARKER: &str = "COOP_TEST_STAGING_ROOT";
         if let Some(root) = std::env::var_os(MARKER) {
@@ -503,6 +518,53 @@ mod tests {
             ])
             .env("TMPDIR", root.path())
             .env(MARKER, root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staging_removes_inherited_read_acls() {
+        use std::process::Command;
+        const MARKER: &str = "COOP_TEST_STAGING_ACL";
+        if std::env::var_os(MARKER).is_some() {
+            let source = tempfile::tempdir().unwrap();
+            fs::write(source.path().join("canary"), "private snapshot").unwrap();
+            let staged = StagedFiles::prepare(
+                &[mapping(source.path(), "~/copy")],
+                &GuestUser::default(),
+                &[],
+            )
+            .unwrap();
+            let listing = Command::new("ls")
+                .arg("-lde")
+                .arg(staged.directory.path())
+                .output()
+                .unwrap();
+            assert!(listing.status.success());
+            assert!(!String::from_utf8_lossy(&listing.stdout).contains("allow"));
+            assert_eq!(
+                fs::read_to_string(staged.directory.path().join("0/payload/canary")).unwrap(),
+                "private snapshot"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("chmod")
+                .arg("+a")
+                .arg("everyone allow read,search,file_inherit,directory_inherit")
+                .arg(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("guest_files::tests::staging_removes_inherited_read_acls")
+            .env("TMPDIR", root.path())
+            .env(MARKER, "1")
             .status()
             .unwrap();
         assert!(status.success());

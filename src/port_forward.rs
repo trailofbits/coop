@@ -38,9 +38,7 @@ impl ForwardsState {
         let path = inst.forwards_state_path();
         if self.forwards.is_empty() {
             // Don't litter the instance dir with empty state.
-            if path.exists()
-                && let Err(e) = fs::remove_file(&path)
-            {
+            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
                 tracing::debug!(
                     "Failed to remove empty forwards state {} (non-fatal): {e}",
                     path.display()
@@ -57,16 +55,14 @@ impl ForwardsState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.forwards_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state =
                     serde_json::from_str(&content).context("Failed to parse forwards.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 }

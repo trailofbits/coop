@@ -76,6 +76,8 @@ exec </dev/null
 pass_count=0
 fail_count=0
 skip_count=0
+SKIPPED=()
+proxy_phase_ran=0
 
 pass() {
     pass_count=$((pass_count + 1))
@@ -92,6 +94,7 @@ fail() {
 
 skip() {
     skip_count=$((skip_count + 1))
+    SKIPPED+=("$1${2:+ ($2)}")
     echo "  SKIP  $1${2:+ ($2)}"
 }
 
@@ -100,6 +103,10 @@ summary() {
     echo "────────────────────────────────────────"
     echo "  $pass_count passed, $fail_count failed, $skip_count skipped"
     echo "────────────────────────────────────────"
+    if [[ $skip_count -gt 0 ]]; then
+        printf '  Skipped phases/checks:\n'
+        printf '    - %s\n' "${SKIPPED[@]}"
+    fi
     if [[ $fail_count -gt 0 ]]; then
         exit 1
     fi
@@ -331,6 +338,62 @@ test_completions() {
     fi
 }
 
+test_running_vm_completions() {
+    echo ""
+    echo "=== Phase: running VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "shell completion offers running instance"
+        else
+            fail "shell completion offers running instance" "got: $candidates"
+        fi
+    else
+        fail "shell completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "start completion excludes running instance" "got: $candidates"
+        else
+            pass "start completion excludes running instance"
+        fi
+    else
+        fail "start completion exits 0" "exit code: $?, output: $candidates"
+    fi
+}
+
+test_stopped_vm_completions() {
+    echo ""
+    echo "=== Phase: stopped VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "start completion offers stopped instance"
+        else
+            fail "start completion offers stopped instance" "got: $candidates"
+        fi
+    else
+        fail "start completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "shell completion excludes stopped instance" "got: $candidates"
+        else
+            pass "shell completion excludes stopped instance"
+        fi
+    else
+        fail "shell completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+}
+
 test_invalid_names() {
     echo ""
     echo "=== Phase: invalid instance names ==="
@@ -468,6 +531,49 @@ test_profiles_cli() {
 }
 
 # ── Setup ─────────────────────────────────────────────────────
+
+test_private_storage() {
+    echo ""
+    echo "=== Phase: private host storage ==="
+    local result
+    if result=$(python3 - "$INSTANCE" <<'PYMODE'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path.home() / ".coop"
+instance = root / "instances" / sys.argv[1]
+for directory in (root, root / "images", root / "instances", root / "state", instance):
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+state = instance / "instance.json"
+assert state.is_file(), state
+assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+for state in instance.glob("*.json"):
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+if sys.platform == "darwin":
+    directory = pathlib.Path(os.environ.get("LIMA_HOME", str(pathlib.Path.home() / ".lima"))) / ("coop-" + sys.argv[1])
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    disk = next((directory / name for name in ("disk", "diffdisk") if (directory / name).exists()), None)
+else:
+    config = instance / "vm_config.json"
+    assert config.is_file(), config
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600, config
+    disk = instance / "rootfs.ext4"
+assert disk is not None and disk.is_file(), disk
+assert stat.S_IMODE(disk.stat().st_mode) == 0o600, disk
+images = list((root / "images").glob("*/*.ext4")) + list((root / "images").glob("*/*.img"))
+assert images, "no template disk found"
+for image in images:
+    assert stat.S_IMODE(image.parent.stat().st_mode) == 0o700, image.parent
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600, image
+PYMODE
+    ); then
+        pass "managed directories, state, and VM disks have private modes"
+    else
+        fail "managed directories, state, and VM disks have private modes" "$result"
+    fi
+}
 
 test_setup() {
     echo ""
@@ -1339,18 +1445,22 @@ test_claude_onboarding_seed() {
 }
 
 check_native_codex() {
-    local guest_home launcher version
+    local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
     launcher="$guest_home/.local/bin/codex"
+    native_host="$guest_home/.codex/packages/standalone/current/bin/codex-code-mode-host"
 
     if guest_exec test -x "$launcher" \
         && guest_exec test -L /usr/local/bin/codex \
         && guest_exec test /usr/local/bin/codex -ef "$launcher" \
+        && guest_exec test -x "$native_host" \
+        && guest_exec test -L /usr/local/bin/codex-code-mode-host \
+        && guest_exec test /usr/local/bin/codex-code-mode-host -ef "$native_host" \
         && [[ "$(guest_exec sh -c 'command -v codex')" == "$launcher" ]]; then
-        pass "Codex resolves through the guest's native launcher and compatibility link"
+        pass "Codex and its Code Mode host resolve through native-package compatibility links"
     else
-        fail "Codex resolves through the guest's native launcher and compatibility link" \
-            "expected launcher: $launcher; stderr: $(guest_stderr)"
+        fail "Codex and its Code Mode host resolve through native-package compatibility links" \
+            "expected launcher: $launcher; host: $native_host; stderr: $(guest_stderr)"
     fi
 
     if version=$(guest_exec /usr/local/bin/codex --version) \
@@ -1359,6 +1469,29 @@ check_native_codex() {
     else
         fail "Codex is executable through the compatibility link" \
             "output: $version; stderr: $(guest_stderr)"
+    fi
+
+    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
+    # A successful hello must return connection/ready; an exit-zero stub cannot.
+    if coop_exec bash -o pipefail -c '
+        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
+        printf "\147\000\000\000%s" "$hello" |
+            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
+            dd bs=1 skip=4 status=none |
+            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
+    '; then
+        pass "Codex Code Mode host responds to stdio hello"
+    else
+        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
+    fi
+
+    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
+    host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+    if [[ "$(dirname "$codex_path")" == "$(dirname "$host_path")" ]]; then
+        pass "Codex and its Code Mode host come from the same native release"
+    else
+        fail "Codex and its Code Mode host come from the same native release" \
+            "codex=$codex_path host=$host_path"
     fi
 }
 
@@ -4600,6 +4733,8 @@ post_install = '''
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/codex-code-mode-host
+chmod 0755 /usr/local/bin/codex-code-mode-host
 '''
 CFGEOF
 
@@ -4633,9 +4768,9 @@ CFGEOF
     local marker
     marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
     if [[ "$(guest_exec /usr/local/bin/codex --version)" == "codex-cli 9.9.9-profile" ]]; then
-        pass "custom profile's Codex is not replaced by the native installer"
+        pass "custom profile's complete Codex pair is not replaced by the native installer"
     else
-        fail "custom profile's Codex is not replaced by the native installer" \
+        fail "custom profile's complete Codex pair is not replaced by the native installer" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -5698,16 +5833,18 @@ test_guest_env_config() {
     # forwarded host value (and a WARN must be emitted on the collision).
     # `post_start` forces the up-time SSH session (and thus
     # `prepare_env_forwarding`, which emits the precedence WARN) to run even
-    # under `--no-agents`, which otherwise skips all session work. `true` is
-    # a no-op. Without it the WARN is never produced during `up`.
+    # under `--no-agents`, which otherwise skips all session work. Bash syntax
+    # verifies that forwarding preserves the account's command interpreter.
     cat > "$cfg_file" <<CFGEOF
-post_start = "true"
+post_start = "[[ 1 == 1 ]] && printf coop-bash-hook-ok"
 
 [claude]
 github = "off"
 env_forward = ["COOP_TEST_GUEST_ENV_PRECEDENCE"]
 
 [guest_env]
+PATH = "/coop-guest-only:/usr/local/bin:/usr/bin:/bin"
+COOP_SSH_ENV_0 = "guest-alias-value"
 COOP_TEST_GUEST_ENV_CONFIG = "from-config-file"
 COOP_TEST_GUEST_ENV_PRECEDENCE = "literal-wins"
 CFGEOF
@@ -5745,6 +5882,12 @@ CFGEOF
         return
     fi
 
+    if [[ "$HARNESS_OUT" == *coop-bash-hook-ok* ]]; then
+        pass "forwarded post_start retains the guest login shell"
+    else
+        fail "forwarded post_start retains the guest login shell" "stderr: $HARNESS_ERR"
+    fi
+
     # The override WARN is emitted during `up` (stderr, INFO default level).
     if echo "$HARNESS_ERR" | grep -q "COOP_TEST_GUEST_ENV_PRECEDENCE.*overrides"; then
         pass "guest_env literal override logs a WARN"
@@ -5776,6 +5919,20 @@ CFGEOF
     else
         fail "guest_env literal overrides forwarded value" \
             "printenv failed; stderr: $(guest_stderr)"
+    fi
+
+    local path_val alias_val
+    if path_val=$(ge_exec /usr/bin/printenv PATH) \
+        && [[ "$path_val" == "/coop-guest-only:/usr/local/bin:/usr/bin:/bin" ]]; then
+        pass "guest PATH survives transport"
+    else
+        fail "guest PATH survives transport" "stderr: $(guest_stderr)"
+    fi
+    if alias_val=$(ge_exec /usr/bin/printenv COOP_SSH_ENV_0) \
+        && [[ "$alias_val" == "guest-alias-value" ]]; then
+        pass "guest transport-name collision is preserved"
+    else
+        fail "guest transport-name collision is preserved" "stderr: $(guest_stderr)"
     fi
 
     ge stop "$inst_name" 2>/dev/null || true
@@ -5962,20 +6119,45 @@ CFGEOF
 #     Codex's `auth.json` is not staged;
 #   - the proxy is reachable on host loopback and enforces the capability gate;
 #   - `stop` tears the proxy down (the host port stops answering).
+seatbelt_profile_path() {
+    local script_dir="$1" binary="$2"
+    if [[ -f "$script_dir/src/Cargo.toml" && -f "$script_dir/src/src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/src/src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$script_dir/../Cargo.toml" && -f "$script_dir/../src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/../src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$(dirname "$binary")/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$(dirname "$binary")/seatbelt-proxy.sb"
+        return 0
+    fi
+    return 1
+}
+
 test_proxy() {
     echo ""
     echo "=== Phase: credential-injecting proxy (--full) ==="
 
     if ! command -v curl >/dev/null 2>&1; then
-        skip "credential-proxy test (curl not available on host)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "curl not available on host"
+        else
+            skip "credential-proxy test (curl not available on host)"
+        fi
         return
     fi
     # The proxy needs the `coop-proxy` binary next to `coop`. It is not a
     # default workspace member (it needs cmake for aws-lc-rs), so a plain
-    # `cargo build` / older deploy may not have it; skip rather than fail the
-    # fail-closed `up` when it's absent.
+    # `cargo build` / older deploy may not have it. Developer runs may skip;
+    # required release runs fail before attempting `up`.
     if [[ ! -x "$(dirname "$BINARY")/coop-proxy" ]]; then
-        skip "credential-proxy test (coop-proxy not built alongside coop)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "coop-proxy not built alongside coop"
+        else
+            skip "credential-proxy test (coop-proxy not built alongside coop)"
+        fi
         return
     fi
 
@@ -6237,8 +6419,7 @@ STATEEOF
     proxy_bin="$(dirname "$BINARY")/coop-proxy"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local sb_profile
-        sb_profile="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/seatbelt-proxy.sb"
-        if [[ -f "$sb_profile" ]]; then
+        if sb_profile=$(seatbelt_profile_path "$(dirname "${BASH_SOURCE[0]}")" "$BINARY"); then
             # Pass the profile inline with -p (as coop's launcher does), not -f,
             # and bind PROXY_BIN to the proxy's absolute path (as the launcher
             # does), so the smoke test exercises the same code path production
@@ -6254,7 +6435,11 @@ STATEEOF
                 fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
             fi
         else
-            skip "proxy jail self-test (Seatbelt profile not found at $sb_profile)"
+            if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+                fail "proxy jail self-test" "Seatbelt profile not found beside source or binary"
+            else
+                skip "proxy jail self-test (Seatbelt profile not found beside source or binary)"
+            fi
         fi
     else
         selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
@@ -6278,6 +6463,7 @@ STATEEOF
     px destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
     rm -r "$px_dir"
+    proxy_phase_ran=1
 }
 
 # ── Interrupted setup test (--full only) ──────────────────────
@@ -6706,6 +6892,71 @@ EOF
     untrack_instance "$inst_name"
 }
 
+# Exercise host SSH isolation with a project-controlled PATH and fake ssh.
+# The payload must remain inert on the host while the real SSH client reaches
+# the guest with the translated PATH.
+test_devcontainer_host_ssh_isolation() {
+    echo ""
+    echo "=== Phase: devcontainer host SSH isolation (--full) ==="
+
+    local poc_ws="$tmpdir/devcontainer-host-ssh-poc"
+    local poc_bin="$poc_ws/poc-bin"
+    local marker="$tmpdir/devcontainer-host-ssh-marker"
+    local inst_name="${INSTANCE}-dc-host-ssh"
+    local config_args=()
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        config_args=(--config "$SUITE_CONFIG")
+    fi
+
+    mkdir -p "$poc_ws/.devcontainer" "$poc_bin"
+    cat > "$poc_ws/.devcontainer/devcontainer.json" <<'EOF'
+{
+    "containerEnv": {
+        "PATH": "./poc-bin:/usr/local/bin:/usr/bin:/bin"
+    }
+}
+EOF
+    cat > "$poc_bin/ssh" <<'EOF'
+#!/bin/sh
+printf 'project-controlled host ssh executed\n' > "$COOP_TEST_HOST_SSH_MARKER"
+exit 73
+EOF
+    chmod 700 "$poc_bin/ssh"
+
+    local up_out="$tmpdir/devcontainer-host-ssh-up.out"
+    local up_err="$tmpdir/devcontainer-host-ssh-up.err"
+    if (
+        cd "$poc_ws"
+        "$BINARY" "${config_args[@]}" up . --name "$inst_name" \
+            --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
+    ) >"$up_out" 2>"$up_err"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "host SSH isolation fixture up exits 0"
+    else
+        fail "host SSH isolation fixture up exits 0" "stderr: $(cat "$up_err")"
+        return
+    fi
+
+    local shell_out="$tmpdir/devcontainer-host-ssh-shell.out"
+    local shell_err="$tmpdir/devcontainer-host-ssh-shell.err"
+    if (
+        cd "$poc_ws"
+        COOP_TEST_HOST_SSH_MARKER="$marker" RUST_LOG=off \
+            "$BINARY" "${config_args[@]}" shell "$inst_name" -- \
+            /usr/bin/printf guest-command-ran
+    ) >"$shell_out" 2>"$shell_err" \
+        && grep -qF "guest-command-ran" "$shell_out" \
+        && [[ ! -e "$marker" ]]; then
+        pass "project PATH cannot replace the host SSH client"
+    else
+        fail "project PATH cannot replace the host SSH client" \
+            "marker: $(test -e "$marker" && echo created || echo absent); stdout: $(cat "$shell_out"); stderr: $(cat "$shell_err")"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # ── OCI devcontainer feature install (--full only) ────────────
 
 # Resolve a real public GHCR devcontainer Feature, bake it into the image,
@@ -6776,6 +7027,8 @@ prepare_creation_hooks_fixture() {
     cat > "$cfg" <<'TOML'
 github = "off"
 post_create = '''
+test "$PATH" = /coop-creation-guest-only:/usr/local/bin:/usr/bin:/bin
+test "$COOP_SSH_ENV_0" = creation-alias
 printf 'global:%s:%s\n' "$PWD" "$CREATION_TEST" >> /home/ubuntu/.creation-log
 test -f "$HOME/global-ready"
 '''
@@ -6783,7 +7036,11 @@ post_start = "echo config-post-start >> /home/ubuntu/.creation-log"
 TOML
     cat > "$source/.devcontainer/devcontainer.json" <<'JSON'
 {
-  "containerEnv": {"CREATION_TEST": "from-project"},
+  "containerEnv": {
+    "CREATION_TEST": "from-project",
+    "COOP_SSH_ENV_0": "creation-alias",
+    "PATH": "/coop-creation-guest-only:/usr/local/bin:/usr/bin:/bin"
+  },
   "postCreateCommand": ["bash", "setup.sh", "literal && $(ignored)"],
   "postStartCommand": "echo post-start >> /home/ubuntu/.creation-log"
 }
@@ -6791,6 +7048,8 @@ JSON
     cat > "$source/setup.sh" <<'SH'
 set -euo pipefail
 test "$1" = 'literal && $(ignored)'
+test "$PATH" = /coop-creation-guest-only:/usr/local/bin:/usr/bin:/bin
+test "$COOP_SSH_ENV_0" = creation-alias
 printf 'project:%s:%s\n' "$PWD" "$CREATION_TEST" >> /home/ubuntu/.creation-log
 test -f "$HOME/project-ready"
 SH
@@ -7587,10 +7846,12 @@ EOF
     # Setup + primary instance
     test_setup
     test_up_creates_primary_instance
+    test_private_storage
     test_start_rejects_missing_instance
     test_duplicate_name
     test_status_running
     test_list_running
+    test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
@@ -7624,9 +7885,11 @@ EOF
     test_status_stopped
     test_agent_update_stopped
     test_list_stopped
+    test_stopped_vm_completions
     test_resize_status
     test_reconfigure
     test_commit_restore
+    test_private_storage
     test_restart_stopped
     test_restart_rejects_ignored_flags
     test_restore_reprovision
@@ -7660,6 +7923,7 @@ EOF
         test_creation_failed_descendants
         test_creation_restart_serialization
         test_devcontainer_apply
+        test_devcontainer_host_ssh_isolation
         test_devcontainer_oci_feature
 
         # Local marketplace directory copy
@@ -7705,6 +7969,9 @@ EOF
         fi
     fi
 
+    if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$proxy_phase_ran" != 1 ]]; then
+        fail "credential-proxy phase ran" "required release phase did not complete"
+    fi
     summary
 }
 

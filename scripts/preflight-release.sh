@@ -326,9 +326,9 @@ if [[ "$QUICK" == 1 ]]; then
   warn "--quick: full cross-platform integration suite skipped"
 else
   prompt_for_remote
-  step "Full integration (local host)" ./tests/run-integration.sh
+  step "Full integration (local host)" ./tests/run-integration.sh --full --require-proxy
   if [[ -n "$REMOTE" ]]; then
-    step "Full integration ($REMOTE)" ./tests/run-integration.sh --remote "$REMOTE"
+    step "Full integration ($REMOTE)" ./tests/run-integration.sh --remote "$REMOTE" --full --require-proxy
   else
     warn "No remote host given — only the local platform's integration suite ran; the other platform was not covered."
   fi

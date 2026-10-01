@@ -18,7 +18,7 @@ use clap::CommandFactory as _;
 use clap_complete::engine::CompletionCandidate;
 use clap_complete::{Shell, generate};
 
-use crate::config::CoopConfig;
+use crate::config::{CoopConfig, Instance};
 use crate::guest::BUILTIN_PROFILES;
 
 /// Write a static completion script for `shell` to stdout.
@@ -39,16 +39,65 @@ pub fn emit_static(shell: Shell) {
 /// If tracing is ever wired up earlier, those warnings would surface here.
 #[must_use]
 pub fn instance_candidates() -> Vec<CompletionCandidate> {
+    instance_candidates_for(InstanceFilter::All)
+}
+
+#[derive(Clone, Copy)]
+enum InstanceFilter {
+    All,
+    Running,
+    Stopped,
+}
+
+fn instance_candidates_for(filter: InstanceFilter) -> Vec<CompletionCandidate> {
     let Ok(cfg) = CoopConfig::load(&CoopConfig::default_path()) else {
         return Vec::new();
     };
     let Ok(instances) = cfg.list_instances() else {
         return Vec::new();
     };
+    #[cfg(target_os = "macos")]
+    let state_names = if matches!(filter, InstanceFilter::All) {
+        None
+    } else {
+        match crate::lima::completion_instance_names() {
+            Ok(names) => Some(names),
+            Err(_) => return Vec::new(),
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let matches_filter = |instance: &Instance| match filter {
+        InstanceFilter::All => true,
+        InstanceFilter::Running => state_names
+            .as_ref()
+            .is_some_and(|names| names.running.contains(&instance.name)),
+        InstanceFilter::Stopped => state_names
+            .as_ref()
+            .is_some_and(|names| names.stopped.contains(&instance.name)),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let matches_filter = |instance: &Instance| match filter {
+        InstanceFilter::All => true,
+        InstanceFilter::Running => matches!(instance.probe_running(), Ok(true)),
+        InstanceFilter::Stopped => matches!(instance.probe_running(), Ok(false)),
+    };
     instances
         .into_iter()
+        .filter(matches_filter)
         .map(|i| CompletionCandidate::new(i.name.as_str()))
         .collect()
+}
+
+/// Candidate list for commands that need a running instance.
+#[must_use]
+pub fn running_instance_candidates() -> Vec<CompletionCandidate> {
+    instance_candidates_for(InstanceFilter::Running)
+}
+
+/// Candidate list for `start`, which accepts only stopped instances.
+#[must_use]
+pub fn stopped_instance_candidates() -> Vec<CompletionCandidate> {
+    instance_candidates_for(InstanceFilter::Stopped)
 }
 
 /// Candidate list for `--image` arguments.

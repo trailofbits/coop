@@ -25,10 +25,9 @@
 //! Empty snapshots are not written; an empty file would be ambiguous
 //! with "no snapshot," and the missing-file branch already means
 //! "nothing extra to overlay."
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
@@ -86,6 +85,12 @@ impl AsRef<str> for EnvVarName {
     }
 }
 
+impl Borrow<str> for EnvVarName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl FromStr for EnvVarName {
     type Err = anyhow::Error;
 
@@ -125,9 +130,7 @@ impl GuestEnvState {
         if self.entries.is_empty() {
             // Don't leave a stale or empty snapshot behind — the
             // missing-file branch already encodes "nothing to overlay."
-            if path.exists()
-                && let Err(e) = fs::remove_file(&path)
-            {
+            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
                 tracing::debug!(
                     "Failed to remove empty guest_env state {} (non-fatal): {e}",
                     path.display()
@@ -145,16 +148,14 @@ impl GuestEnvState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.guest_env_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state =
                     serde_json::from_str(&content).context("Failed to parse guest_env.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
 }
@@ -277,7 +278,7 @@ mod tests {
         // Put a directory where the JSON file is expected: reading it fails
         // with a non-NotFound error kind, which must surface as Err rather
         // than being swallowed as Ok(None).
-        fs::create_dir_all(inst.guest_env_state_path()).unwrap();
+        std::fs::create_dir_all(inst.guest_env_state_path()).unwrap();
         assert!(GuestEnvState::try_load(&inst).is_err());
     }
 

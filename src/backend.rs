@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 #[cfg(any(target_os = "macos", test))]
 use std::fs;
 use std::num::{NonZeroU8, NonZeroU16};
@@ -45,9 +46,9 @@ pub enum LogMode {
 
 /// Environment variables to forward to guest VMs via SSH `SendEnv`.
 ///
-/// Carries both variable names (for `-o SendEnv=`) and their values
-/// (for `Command::env()` on SSH child processes), avoiding unsafe
-/// mutation of the process-global environment.
+/// Guest names never become host process environment names. Values travel
+/// under fixed transport aliases and are restored only by a guest shell.
+/// This keeps guest PATH, loader settings, and SSH settings off the host.
 ///
 /// The whole struct is secret-bearing by construction (entries are
 /// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`, plus any
@@ -56,7 +57,7 @@ pub enum LogMode {
 /// diagnostics and are not themselves secret.
 #[derive(Clone, Default)]
 pub struct EnvForward {
-    vars: IndexMap<String, String>,
+    vars: IndexMap<crate::guest_env_state::EnvVarName, String>,
 }
 
 impl std::fmt::Debug for EnvForward {
@@ -79,8 +80,10 @@ impl std::fmt::Debug for EnvForward {
 
 impl EnvForward {
     /// Insert or overwrite an env var.
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.vars.insert(name.into(), value.into());
+    pub fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) -> Result<()> {
+        let name = crate::guest_env_state::EnvVarName::new(name.as_ref())?;
+        self.vars.insert(name, value.into());
+        Ok(())
     }
 
     /// Check whether a variable is present.
@@ -88,19 +91,58 @@ impl EnvForward {
         self.vars.contains_key(name)
     }
 
-    /// SSH `-o SendEnv=` args for all contained variables.
-    fn send_env_opts(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(self.vars.len() * 2);
-        for name in self.vars.keys() {
-            opts.push("-o".into());
-            opts.push(format!("SendEnv={name}"));
-        }
-        opts
+    /// Inspect guest values in composition tests without exposing a production
+    /// map that could accidentally be passed to `Command::envs`.
+    #[cfg(test)]
+    pub fn guest_values(&self) -> &IndexMap<crate::guest_env_state::EnvVarName, String> {
+        &self.vars
     }
 
-    /// Key-value pairs for `Command::envs()`.
-    pub fn as_envs(&self) -> &IndexMap<String, String> {
-        &self.vars
+    /// Configure the transport and wrap the command without placing guest
+    /// names in the host environment or values in either host or guest argv.
+    fn wrap_command(&self, ssh: &mut Command, remote: &str) -> Result<String> {
+        if self.vars.is_empty() {
+            return Ok(remote.to_owned());
+        }
+        let mut capture = String::from("set --");
+        let mut cleanup = String::from("unset");
+        let mut restore = String::new();
+        for (index, (name, value)) in self.vars.iter().enumerate() {
+            if value.contains('\0') {
+                bail!("Guest environment variable '{name}' contains a NUL byte");
+            }
+            let alias = format!("COOP_SSH_ENV_{index}");
+            ssh.arg("-o").arg(format!("SendEnv={alias}"));
+            ssh.env(&alias, value);
+            // Snapshot every value before unsetting aliases or exporting names:
+            // a legitimate guest name can itself equal another transport alias.
+            write!(
+                capture,
+                " \"${{{alias}?coop: missing forwarded environment}}\""
+            )?;
+            cleanup.push(' ');
+            cleanup.push_str(&alias);
+            // Shell-special variables can reject assignments and print the
+            // value. `command` makes export failures catchable in dash; suppress
+            // its diagnostic and report only the variable's validated name.
+            write!(
+                restore,
+                "command export {name}=\"$1\" 2>/dev/null || {{ printf '%s\\n' 'coop: could not restore guest variable {name}' >&2; exit 1; }}; shift; "
+            )?;
+        }
+        // sshd sets SHELL to the account's login shell. Preserve it before a
+        // guest SHELL override, so raw post-start commands retain bash syntax.
+        capture.push_str(" \"${SHELL:-/bin/sh}\"");
+        let script = format!(
+            "{capture}; {cleanup}; {restore}exec \"$1\" -c {}",
+            crate::shell::shell_escape(remote),
+        );
+        // Existing images already have /bin/sh and AcceptEnv *. No installed
+        // decoder, persistent secret file, or stdin framing is needed.
+        Ok(format!(
+            "/bin/sh -c {}",
+            crate::shell::shell_escape(&script)
+        ))
     }
 }
 
@@ -605,23 +647,20 @@ impl SshTarget {
 }
 
 impl SshSession {
-    /// SSH options with environment variable forwarding.
-    pub fn ssh_opts(&self) -> Vec<String> {
-        let mut opts = self.target.ssh_opts();
-        opts.extend(self.env.send_env_opts());
-        opts
+    /// Build every environment-bearing SSH launch through the same boundary.
+    pub fn command(&self, options: &[String], remote: &str) -> Result<Command> {
+        let mut ssh = Command::new("ssh");
+        ssh.args(self.target.ssh_opts());
+        let remote = self.env.wrap_command(&mut ssh, remote)?;
+        ssh.args(options).arg(self.target.addr()).arg(remote);
+        Ok(ssh)
     }
 
     /// Run a command on the guest via SSH with env forwarding.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.target.addr());
-        args.push(cmd.clone());
-
-        let status = Command::new("ssh")
-            .args(&args)
-            .envs(self.env.as_envs())
+        let status = self
+            .command(&[], &cmd)?
             .status()
             .context("Failed to run SSH command")?;
 
@@ -1429,9 +1468,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve claude.api_key")?;
-        env.set("ANTHROPIC_API_KEY", resolved);
+        env.set("ANTHROPIC_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        env.set("ANTHROPIC_API_KEY", key);
+        env.set("ANTHROPIC_API_KEY", key)?;
     }
 
     // OPENAI_API_KEY: prefer config, fall back to process env. In proxy mode
@@ -1446,9 +1485,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
-        env.set("OPENAI_API_KEY", resolved);
+        env.set("OPENAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        env.set("OPENAI_API_KEY", key);
+        env.set("OPENAI_API_KEY", key)?;
     }
 
     // XAI_API_KEY: prefer config, fall back to process env. Never written
@@ -1456,14 +1495,14 @@ pub fn prepare_env_forwarding(
     if let Some(key) = &grok.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve grok.api_key")?;
-        env.set("XAI_API_KEY", resolved);
+        env.set("XAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        env.set("XAI_API_KEY", key);
+        env.set("XAI_API_KEY", key)?;
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
     if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
-        env.set("GITHUB_TOKEN", token);
+        env.set("GITHUB_TOKEN", token)?;
     } else {
         tracing::debug!("no GITHUB_TOKEN forwarded to guest");
     }
@@ -1506,7 +1545,7 @@ pub fn prepare_env_forwarding(
         if !env.contains(name.as_str())
             && let Ok(val) = std::env::var(name.as_str())
         {
-            env.set(name.as_str(), val);
+            env.set(name.as_str(), val)?;
         }
     }
 
@@ -1523,7 +1562,7 @@ pub fn prepare_env_forwarding(
         if env.contains(name.as_str()) {
             tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
         }
-        env.set(name.as_str(), value.as_str());
+        env.set(name.as_str(), value.as_str())?;
     }
 
     Ok(env)
@@ -6764,14 +6803,265 @@ url = "https://example.com/m"
         assert!(resolve_clone_token(Some(&failed), url, Some(&assigned)).is_err());
     }
 
+    fn forwarding_session(entries: &[(&str, &str)]) -> SshSession {
+        let mut env = EnvForward::default();
+        for (name, value) in entries {
+            env.set(*name, *value).unwrap();
+        }
+        SshSession {
+            target: SshTarget {
+                host: Hostname::new("127.0.0.1").unwrap(),
+                port: NonZeroU16::new(22).unwrap(),
+                user: SshUser::new("ubuntu").unwrap(),
+                key_path: "/unused-test-key".into(),
+            },
+            env,
+        }
+    }
+
+    // Execute the actual guest wrapper with precisely the transport environment
+    // built for SSH. This needs neither a VM nor a host-wide environment change.
+    fn forwarding_guest(ssh: &Command) -> Command {
+        let mut guest = Command::new("/bin/sh");
+        guest.env_clear();
+        for (name, value) in ssh.get_envs() {
+            guest.env(name, value.unwrap());
+        }
+        guest.arg("-c").arg(ssh.get_args().last().unwrap());
+        guest
+    }
+
+    #[test]
+    fn forwarding_isolates_host_and_round_trips_guest_values() {
+        let entries = [
+            ("PATH", "./project-bin"),
+            ("LD_LIBRARY_PATH", "./project-libs"),
+            ("SSH_AUTH_SOCK", "./project-socket"),
+            ("SECRET", "sentinel-secret-'\"$()`\n雪"),
+            ("EMPTY", ""),
+            ("COOP_SSH_ENV_0", "guest-alias-collision"),
+        ];
+        let session = forwarding_session(&entries);
+        let ssh = session.command(&[], "/usr/bin/env -0").unwrap();
+        let host_env: Vec<_> = ssh.get_envs().collect();
+        assert_eq!(host_env.len(), entries.len());
+        for (index, (_, value)) in entries.iter().enumerate() {
+            let alias = format!("COOP_SSH_ENV_{index}");
+            assert!(
+                host_env
+                    .iter()
+                    .any(|(k, v)| *k == alias.as_str() && *v == Some(std::ffi::OsStr::new(value)))
+            );
+        }
+        for name in ["PATH", "LD_LIBRARY_PATH", "SSH_AUTH_SOCK", "SECRET"] {
+            assert!(!host_env.iter().any(|(k, _)| *k == name));
+        }
+        for arg in ssh.get_args() {
+            assert!(!arg.to_string_lossy().contains(entries[3].1));
+        }
+        let output = forwarding_guest(&ssh).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = String::from_utf8(output.stdout).unwrap();
+        let actual: BTreeMap<_, _> = bytes
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+        for (name, value) in entries {
+            if name == "PATH" {
+                assert_eq!(
+                    actual
+                        .get(name)
+                        .and_then(|path| path.split(':').next_back()),
+                    Some(value),
+                );
+            } else {
+                assert_eq!(actual.get(name), Some(&value));
+            }
+        }
+        assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+    }
+
+    #[test]
+    fn forwarding_preserves_login_shell_before_guest_shell_override() {
+        let session = forwarding_session(&[("SHELL", "/guest/custom-shell")]);
+        let ssh = session
+            .command(&[], "[[ $SHELL == /guest/custom-shell ]] && printf bash-ok")
+            .unwrap();
+        let output = forwarding_guest(&ssh)
+            .env("SHELL", "/bin/bash")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"bash-ok");
+    }
+
+    #[test]
+    fn forwarding_preserves_stdin_and_exit_status() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let session = forwarding_session(&[("SECRET", "not-in-argv")]);
+        let ssh = session.command(&[], "/bin/cat; exit 37").unwrap();
+        let mut child = forwarding_guest(&ssh)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"stdin payload\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.stdout, b"stdin payload\n");
+        assert_eq!(output.status.code(), Some(37));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires tests/integration-proxy-forward.sh isolated OpenSSH fixture"]
+    fn forwarding_over_openssh_preserves_session_behavior() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let fixture = PathBuf::from(std::env::var("COOP_FORWARD_TEST_DIR").unwrap());
+        let entries = [
+            ("PATH", "/guest-only:/usr/bin:/bin"),
+            ("LD_LIBRARY_PATH", "/guest-library-only"),
+            ("SECRET", "dummy-'\"$()`\n雪"),
+            ("EMPTY", ""),
+            ("COOP_SSH_ENV_0", "guest-alias-collision"),
+        ];
+        let mut session = forwarding_session(&entries);
+        session.target = SshTarget {
+            host: Hostname::new("192.0.2.2").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("root").unwrap(),
+            key_path: fixture.join("client"),
+        };
+        let output = session
+            .command(&[], "/usr/bin/env -0")
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let actual: BTreeMap<_, _> = text
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+        for (name, value) in entries {
+            assert_eq!(actual.get(name), Some(&value));
+        }
+        assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+
+        // Force a PTY even when the CI runner has no local terminal. The bash
+        // expression also checks preservation of the fixture account's shell.
+        let output = session
+            .command(
+                &["-tt".into()],
+                "test -t 0 && [[ 1 == 1 ]] && printf pty-ok",
+            )
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"pty-ok");
+
+        let mut child = session
+            .command(&[], "/bin/cat; exit 37")
+            .unwrap()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"stdin preserved\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.stdout, b"stdin preserved\n");
+        assert_eq!(output.status.code(), Some(37));
+
+        let output = session
+            .command(&[], "printf command-ran")
+            .unwrap()
+            .env_remove("COOP_SSH_ENV_0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing forwarded environment"));
+
+        session.env = EnvForward::default();
+        session.env.set("OPTIND", "private-test-value").unwrap();
+        let output = session
+            .command(&[], "printf command-ran")
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            b"coop: could not restore guest variable OPTIND\n"
+        );
+    }
+
+    #[test]
+    fn forwarding_missing_transport_fails_before_command() {
+        let session = forwarding_session(&[("EMPTY", "")]);
+        let ssh = session.command(&[], "printf command-ran").unwrap();
+        let output = forwarding_guest(&ssh)
+            .env_remove("COOP_SSH_ENV_0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing forwarded environment"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_assignment_failure_redacts_values_and_stops_command() {
+        // The guest's dash shell treats OPTIND as numeric. This is a rejected
+        // assignment, not malformed transport; no value may reach diagnostics.
+        let session = forwarding_session(&[("OPTIND", "private-test-value")]);
+        let ssh = session.command(&[], "printf command-ran").unwrap();
+        let output = forwarding_guest(&ssh).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            b"coop: could not restore guest variable OPTIND\n"
+        );
+    }
+
+    #[test]
+    fn forwarding_rejects_invalid_names_and_nul_without_values_in_errors() {
+        let mut env = EnvForward::default();
+        let invalid_name = env.set("BAD-NAME", "secret-value").unwrap_err().to_string();
+        assert!(!invalid_name.contains("secret"));
+
+        let session = forwarding_session(&[("VALID", "secret\0value")]);
+        let invalid_value = session.command(&[], "true").unwrap_err().to_string();
+        assert!(!invalid_value.contains("secret"));
+    }
+
     // ── EnvForward Debug redaction ──────────────────────────
 
     #[test]
     fn env_forward_debug_redacts_all_values() {
         let mut env = EnvForward::default();
-        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value");
-        env.set("GITHUB_TOKEN", "ghp_secret_value");
-        env.set("MYORG_INTERNAL", "internal-secret-blob");
+        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value").unwrap();
+        env.set("GITHUB_TOKEN", "ghp_secret_value").unwrap();
+        env.set("MYORG_INTERNAL", "internal-secret-blob").unwrap();
         let debug = format!("{env:?}");
         for secret in [
             "sk-ant-secret-value",
@@ -6898,7 +7188,7 @@ url = "https://example.com/m"
         }
 
         assert_eq!(
-            env.as_envs().get("XAI_API_KEY").map(String::as_str),
+            env.guest_values().get("XAI_API_KEY").map(String::as_str),
             Some("xai-from-host-env"),
             "process XAI_API_KEY must be forwarded when grok.api_key is unset"
         );
@@ -6941,7 +7231,10 @@ url = "https://example.com/m"
         }
 
         assert_eq!(
-            forwarded.as_envs().get("MY_HOST_TOKEN").map(String::as_str),
+            forwarded
+                .guest_values()
+                .get("MY_HOST_TOKEN")
+                .map(String::as_str),
             Some("token-from-host"),
             "Grok MCP env mappings must forward the referenced host variable"
         );
@@ -7096,10 +7389,13 @@ url = "https://example.com/m"
         let cfg = cfg_with_guest_env(&[("RUST_LOG", "info"), ("MY_FLAG", "1")]);
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
-            env.as_envs().get("RUST_LOG").map(String::as_str),
+            env.guest_values().get("RUST_LOG").map(String::as_str),
             Some("info")
         );
-        assert_eq!(env.as_envs().get("MY_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.guest_values().get("MY_FLAG").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -7111,7 +7407,9 @@ url = "https://example.com/m"
 
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
-            env.as_envs().get("ANTHROPIC_API_KEY").map(String::as_str),
+            env.guest_values()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
             Some("guest-env-wins"),
         );
     }
@@ -7122,7 +7420,10 @@ url = "https://example.com/m"
         // "set to empty" so users can intentionally clear inherited vars.
         let cfg = cfg_with_guest_env(&[("EMPTY", "")]);
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
-        assert_eq!(env.as_envs().get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(
+            env.guest_values().get("EMPTY").map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]
@@ -7141,7 +7442,7 @@ url = "https://example.com/m"
         let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("ANTHROPIC_API_KEY")
                 .map(String::as_str),
             Some("sk-ant-realkey")
@@ -7159,7 +7460,7 @@ url = "https://example.com/m"
         let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("sk-openai-realkey")
@@ -7219,7 +7520,7 @@ url = "https://example.com/m"
         );
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("ANTHROPIC_API_KEY")
                 .map(String::as_str),
             Some("sk-ant-from-host-env"),

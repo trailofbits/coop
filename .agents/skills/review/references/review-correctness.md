@@ -25,6 +25,7 @@ Only flag issues **introduced or materially changed by the diff**. The one excep
   preserve that distinction in fallback and diagnostics.
 - **Concurrency / signals:** shared state without synchronization, a signal handler racing teardown, a lock held across a blocking call. Only if the diff touches these.
 - Resource lifecycle: file handles, sockets, child processes, and VM state cleaned up on every path.
+- For atomic file or disk operations, include process death between staging and rename. Confirm retries reuse or remove stale staging safely, and that any lock covers the mutation it is meant to serialize.
 - **Cross-backend correctness:** a change to `backend.rs`-shared code (SSH, workspace sync, config injection) that only holds for one of Firecracker/Lima. Confirm the abstraction still holds for both.
 
 ## Output

@@ -42,6 +42,9 @@ if [[ "$1" == rev-parse ]]; then exit 1; fi
 printf '%s\n' "${0##*/}" >> "$PREFLIGHT_CALLS"
 if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
 ''')
+        self.executable('tests/run-integration.sh', '''#!/bin/bash
+printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
+''')
         for name in ('test-integration-probes.py', 'test-preflight-release.py'):
             (self.root / 'tests' / name).write_text(
                 'import os\nwith open(os.environ["PREFLIGHT_CALLS"], "a") as f:\n'
@@ -57,9 +60,14 @@ if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
             '[[package]]\nname = "coop"\nversion = "9.8.7"\n'
             f'[[package]]\nname = "coop-proxy"\nversion = "{proxy}"\n')
 
-    def run_preflight(self, fail=''):
+    def run_preflight(self, fail='', quick=True, remote=None):
+        args = ['bash', str(self.root / 'scripts/preflight-release.sh')]
+        if quick:
+            args.append('--quick')
+        if remote:
+            args.extend(['--remote', remote])
         return subprocess.run(
-            ['bash', str(self.root / 'scripts/preflight-release.sh'), '--quick'],
+            args,
             env={**os.environ, 'PATH': str(self.root / 'bin') + ':' + os.environ['PATH'],
                  'PREFLIGHT_CALLS': str(self.log), 'PREFLIGHT_FAIL': fail},
             capture_output=True, text=True, timeout=20)
@@ -105,6 +113,14 @@ if [[ "${0##*/}" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('FAIL: Unit tests', result.stdout)
 
+    def test_nonquick_runs_full_required_proxy_suite_on_both_platforms(self):
+        result = self.run_preflight(quick=False, remote='tester@other')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertIn('run-integration.sh --full --require-proxy', calls)
+        self.assertIn(
+            'run-integration.sh --remote tester@other --full --require-proxy', calls)
+
 
 class ReleaseBinaryTests(unittest.TestCase):
     def test_packaging_requires_release_identity_and_companion(self):
@@ -140,6 +156,68 @@ class ReleaseBinaryTests(unittest.TestCase):
                              'TAG': 'v9.8.7', 'TARGET': 'test-target'},
                         capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, expected, result.stderr)
+
+
+class RequiredProxyPhaseTests(unittest.TestCase):
+    def test_seatbelt_selftest_prefers_current_source_profile(self):
+        integration = (ROOT / 'tests/integration.sh').read_text()
+        selection = ('seatbelt_profile_path() {'
+                     + integration.split('seatbelt_profile_path() {', 1)[1]
+                     .split('test_proxy() {', 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / 'tests'
+            source = root / 'src' / 'seatbelt-proxy.sb'
+            binary = root / 'target' / 'release' / 'coop'
+            neighbor = binary.parent / 'seatbelt-proxy.sb'
+            scripts.mkdir()
+            source.parent.mkdir()
+            (root / 'Cargo.toml').write_text('[package]\nname = "fixture"\n')
+            neighbor.parent.mkdir(parents=True)
+            source.write_text('current')
+            neighbor.write_text('stale')
+            result = subprocess.run(
+                ['bash', '-c', selection + '\nseatbelt_profile_path "$1" "$2"',
+                 'bash', str(scripts), str(binary)],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()).resolve(), source)
+
+            remote = root / 'remote'
+            remote_source = remote / 'src' / 'src' / 'seatbelt-proxy.sb'
+            remote_source.parent.mkdir(parents=True)
+            (remote / 'src' / 'Cargo.toml').write_text('[package]\nname = "fixture"\n')
+            remote_source.write_text('current remote')
+            (remote / 'seatbelt-proxy.sb').write_text('stale remote')
+            result = subprocess.run(
+                ['bash', '-c', selection + '\nseatbelt_profile_path "$1" "$2"',
+                 'bash', str(remote), str(remote / 'coop')],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(result.stdout.strip()).resolve(), remote_source)
+
+    def test_missing_curl_or_proxy_is_failure_in_required_mode(self):
+        integration = (ROOT / 'tests/integration.sh').read_text()
+        proxy_function = ('test_proxy() {' + integration.split('test_proxy() {', 1)[1]
+                          .split('# ── Interrupted setup test', 1)[0])
+        for missing in ('curl', 'proxy'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                script = proxy_function + '''
+fail() { printf 'FAIL %s\\n' "$1"; fail_count=$((fail_count + 1)); }
+skip() { printf 'SKIP %s\\n' "$1"; skip_count=$((skip_count + 1)); }
+fail_count=0; skip_count=0
+test_proxy
+[[ "$fail_count" == 1 && "$skip_count" == 0 ]]
+'''
+                if missing == 'curl':
+                    script = 'command() { return 1; }\n' + script
+                result = subprocess.run(
+                    ['bash', '-c', script],
+                    env={**os.environ, 'BINARY': str(Path(directory) / 'coop'),
+                         'COOP_TEST_REQUIRE_PROXY': '1'},
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('FAIL credential-proxy prerequisites', result.stdout)
 
 
 if __name__ == '__main__':

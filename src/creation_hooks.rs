@@ -1,9 +1,7 @@
 //! Persisted, resumable creation commands executed only inside the guest.
 
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -167,22 +165,21 @@ impl CreationState {
     }
 
     pub(crate) fn save(&self, inst: &Instance) -> Result<()> {
-        crate::fs_util::atomic_write_with_mode(
+        crate::fs_util::atomic_write_json(
             &inst.dir.join("creation.json"),
             &serde_json::to_string_pretty(self)?,
-            0o600,
         )
         .context("Cannot save creation-hook progress")
     }
 
     pub(crate) fn load(inst: &Instance) -> Result<Option<Self>> {
-        match fs::read_to_string(inst.dir.join("creation.json")) {
-            Ok(contents) => Ok(Some(serde_json::from_str(&contents).context(
-                "Invalid creation.json; restore its saved recipe before retrying",
-            )?)),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("Cannot read creation-hook progress"),
-        }
+        crate::fs_util::read_optional_private(&inst.dir.join("creation.json"))
+            .context("Cannot read creation-hook progress")?
+            .map(|contents| {
+                serde_json::from_str(&contents)
+                    .context("Invalid creation.json; restore its saved recipe before retrying")
+            })
+            .transpose()
     }
 
     fn pending(&self) -> bool {
@@ -360,12 +357,8 @@ fn execute_staged(session: &SshSession, remote: &str) -> Result<()> {
         .literal("bash ")
         .arg(remote)
         .literal("/hook.sh");
-    let mut child = Command::new("ssh")
-        .args(session.ssh_opts())
-        .arg("-tt")
-        .arg(session.target.addr())
-        .arg(command.into_string())
-        .envs(session.env.as_envs())
+    let mut child = session
+        .command(&["-tt".into()], &command.into_string())?
         .stdin(Stdio::null())
         .spawn()
         .context("Cannot launch creation-hook SSH session")?;
@@ -399,10 +392,11 @@ mod tests {
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
     use crate::creation_hooks::{
         Completion, CreationCommand, CreationProgress, CreationState, Preparation, ensure_complete,
-        ensure_prepared, invalidate, pending, script, set_preparation, wait_for_hook,
+        ensure_prepared, execute_staged, invalidate, pending, script, set_preparation,
+        wait_for_hook,
     };
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
     use std::process::Command;
 
@@ -613,6 +607,193 @@ mod tests {
         assert!(CreationState::load(&inst).is_err());
         assert!(ensure_complete(&inst).is_err());
         assert!(invalidate(&inst).is_err());
+    }
+
+    #[test]
+    fn recipe_reads_and_replacements_tighten_private_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = instance(&root.path().join("instance"));
+        let cfg = CoopConfig {
+            post_create: Some("saved command".into()),
+            ..CoopConfig::default()
+        };
+        let state = CreationState::select(&cfg, None).unwrap();
+        state.save(&inst).unwrap();
+        let recipe = inst.dir.join("creation.json");
+        for read in [true, false] {
+            fs::set_permissions(&inst.dir, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&recipe, fs::Permissions::from_mode(0o644)).unwrap();
+            if read {
+                let saved = CreationState::load(&inst).unwrap().unwrap();
+                assert_eq!(saved.global.unwrap().command.0[2], "saved command");
+            } else {
+                state.save(&inst).unwrap();
+            }
+            assert_eq!(
+                fs::metadata(&inst.dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&recipe).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn recipe_links_cannot_bypass_completion_or_overwrite_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = instance(&root.path().join("instance"));
+        let state = CreationState::select(&CoopConfig::default(), None).unwrap();
+        state.save(&inst).unwrap();
+        let recipe = inst.dir.join("creation.json");
+        let target = root.path().join("outside.json");
+        let contents = fs::read_to_string(&recipe).unwrap();
+        fs::write(&target, &contents).unwrap();
+        for hard_link in [false, true] {
+            fs::remove_file(&recipe).unwrap();
+            if hard_link {
+                fs::hard_link(&target, &recipe).unwrap();
+            } else {
+                symlink(&target, &recipe).unwrap();
+            }
+            assert!(CreationState::load(&inst).is_err());
+            assert!(ensure_complete(&inst).is_err());
+            assert!(state.save(&inst).is_err());
+            assert_eq!(fs::read_to_string(&target).unwrap(), contents);
+        }
+        fs::remove_file(&recipe).unwrap();
+        symlink(root.path().join("missing"), &recipe).unwrap();
+        assert!(CreationState::load(&inst).is_err());
+        assert!(state.save(&inst).is_err());
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[test]
+    fn recipes_reject_symlinked_and_writable_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("shared");
+        let inst = instance(&parent.join("instance"));
+        let state = CreationState::select(&CoopConfig::default(), None).unwrap();
+        state.save(&inst).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&parent, &alias).unwrap();
+        let linked = instance(&alias.join("instance"));
+        assert!(CreationState::load(&linked).is_err());
+        assert!(state.save(&linked).is_err());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(CreationState::load(&inst).is_err());
+        assert!(state.save(&inst).is_err());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[test]
+    fn missing_instance_recipe_does_not_create_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = instance(&root.path().join("missing/instance"));
+        assert!(CreationState::load(&inst).unwrap().is_none());
+        assert!(!root.path().join("missing").exists());
+    }
+
+    fn run_creation_transport_fixture(root: &Path) {
+        let mut env = crate::backend::EnvForward::default();
+        env.set(
+            "PATH",
+            format!("{}/guest-bin:/usr/bin:/bin", root.display()),
+        )
+        .unwrap();
+        env.set("LD_LIBRARY_PATH", "/creation-guest-libraries")
+            .unwrap();
+        env.set("SECRET", "creation-guest-only").unwrap();
+        env.set("COOP_SSH_ENV_0", "creation-alias").unwrap();
+        let session = crate::backend::SshSession {
+            target: crate::backend::SshTarget {
+                host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
+                port: std::num::NonZeroU16::MIN,
+                user: crate::backend::SshUser::new("ubuntu").unwrap(),
+                key_path: root.join("unused-key"),
+            },
+            env,
+        };
+        execute_staged(&session, root.to_str().unwrap()).unwrap();
+    }
+
+    fn prepare_creation_transport_fixture(root: &Path) {
+        fs::create_dir(root.join("host-bin")).unwrap();
+        fs::create_dir(root.join("guest-bin")).unwrap();
+        let ssh = root.join("host-bin/ssh");
+        fs::write(
+            &ssh,
+            r#"#!/bin/sh
+set -eu
+test "$PATH" = "$COOP_CREATION_FIXTURE/host-bin"
+test "${LD_LIBRARY_PATH-unset}" = unset
+test "${SECRET-unset}" = unset
+printf host > "$COOP_CREATION_FIXTURE/host-launched"
+for arg do remote=$arg; done
+SHELL=/bin/bash /bin/sh -c "$remote"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let injected = root.join("guest-bin/ssh");
+        fs::write(
+            &injected,
+            "#!/bin/sh\nprintf injected > \"$COOP_CREATION_FIXTURE/host-injected\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(injected, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            root.join("hook.sh"),
+            r#"#!/bin/bash
+set -euo pipefail
+test "$PATH" = "$COOP_CREATION_FIXTURE/guest-bin:/usr/bin:/bin"
+test "$LD_LIBRARY_PATH" = /creation-guest-libraries
+test "$SECRET" = creation-guest-only
+test "$COOP_SSH_ENV_0" = creation-alias
+printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn creation_transport_keeps_guest_environment_off_host() {
+        if let Some(root) = std::env::var_os("COOP_CREATION_FIXTURE") {
+            run_creation_transport_fixture(Path::new(&root));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        prepare_creation_transport_fixture(root.path());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "creation_hooks::tests::creation_transport_keeps_guest_environment_off_host",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", root.path().join("host-bin"))
+            .env("COOP_CREATION_FIXTURE", root.path())
+            .output()
+            .unwrap();
+        assert!(!root.path().join("host-injected").exists());
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(root.path().join("host-launched")).unwrap(),
+            b"host"
+        );
+        assert_eq!(
+            fs::read(root.path().join("guest-restored")).unwrap(),
+            b"guest"
+        );
     }
 
     #[test]

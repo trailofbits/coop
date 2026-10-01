@@ -31,10 +31,15 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
-      # `--workspace` clippy/test below build it. Preinstalled on ubuntu-latest,
-      # installed explicitly so the job doesn't depend on the image contents.
-      - name: Install cmake
-        run: sudo apt-get update && sudo apt-get install -y cmake
+      # `--workspace` clippy/test below build it. The musl compile catches
+      # target-specific libc API differences before the release workflow.
+      - name: Install cmake and musl tools
+        run: sudo apt-get update && sudo apt-get install -y cmake musl-tools
+
+      - name: Check musl portability
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo check --target x86_64-unknown-linux-musl
 
       - name: Format check
         run: cargo fmt -- --check
