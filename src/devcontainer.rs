@@ -25,6 +25,7 @@ use crate::devcontainer_oci::{FeatureRequest, ResolvedFeature};
 use crate::guest::{BuiltinProfile, GuestUser, builtin_for_feature};
 use crate::guest_env_state::EnvVarName;
 use crate::jsonc::jsonc_to_json;
+use crate::remote_command::RemoteCommand;
 use crate::sha256_hash::Sha256Hash;
 
 /// Default relative path coop looks for inside a workspace or mount root.
@@ -623,7 +624,7 @@ pub fn translate(
                 ReportStatus::Invalid,
                 ReportSource::Devcontainer,
                 render_value(cmd),
-                "expected string or [string,...]; array form joined with ' && '",
+                "expected string or [string,...]; array form is one executable plus its arguments",
             );
         }
     }
@@ -1238,10 +1239,23 @@ fn render_value_opt(v: Option<&serde_json::Value>) -> String {
 
 fn post_start_to_string(v: &serde_json::Value) -> Option<String> {
     match v {
+        // String form is authored as shell text, so it runs as written.
         serde_json::Value::String(s) => Some(s.clone()),
+        // Array form is an executable plus its arguments, never a shell
+        // command list. Joining with ` && ` would turn arguments into
+        // separate commands and give shell metacharacters inside them live
+        // meaning, so each element becomes one escaped argv word instead.
         serde_json::Value::Array(items) => {
             let strs: Option<Vec<&str>> = items.iter().map(serde_json::Value::as_str).collect();
-            strs.map(|ss| ss.join(" && "))
+            let strs = strs?;
+            let mut cmd = RemoteCommand::new();
+            for (i, s) in strs.iter().enumerate() {
+                if i > 0 {
+                    cmd = cmd.literal(" ");
+                }
+                cmd = cmd.arg(s);
+            }
+            Some(cmd.into_string())
         }
         _ => None,
     }
@@ -1832,8 +1846,40 @@ mod tests {
     }
 
     #[test]
-    fn translate_post_start_array_joins() {
-        let f = parse(r#"{ "postStartCommand": ["echo a", "echo b"] }"#);
+    fn translate_post_start_array_preserves_argv() {
+        // Array form is argv, not a command list: `echo a` and `echo b` are two
+        // arguments to one executable, and must not become `a && echo b`.
+        let f = parse(r#"{ "postStartCommand": ["echo", "a", "b"] }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert_eq!(t.post_start.as_deref(), Some("'echo' 'a' 'b'"));
+    }
+
+    #[test]
+    fn translate_post_start_array_keeps_spaces_in_one_argument() {
+        // The regression this fixes: `&&`-joining split this into four commands.
+        let f = parse(r#"{ "postStartCommand": ["printf", "%s\n", "hello world"] }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert_eq!(
+            t.post_start.as_deref(),
+            Some("'printf' '%s\n' 'hello world'")
+        );
+    }
+
+    #[test]
+    fn translate_post_start_array_neutralizes_shell_metacharacters() {
+        // Metacharacters inside an argument stay inside that argument.
+        let f = parse(r#"{ "postStartCommand": ["echo", "a && b", "$(id)", "it's"] }"#);
+        let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
+        assert_eq!(
+            t.post_start.as_deref(),
+            Some("'echo' 'a && b' '$(id)' 'it'\\''s'")
+        );
+    }
+
+    #[test]
+    fn translate_post_start_string_form_is_untouched() {
+        // String form is authored shell text and must still interpret `&&`.
+        let f = parse(r#"{ "postStartCommand": "echo a && echo b" }"#);
         let t = translate(&f, &TranslatorInputs::default(), Stage::Start);
         assert_eq!(t.post_start.as_deref(), Some("echo a && echo b"));
     }
