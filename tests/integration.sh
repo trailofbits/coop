@@ -2734,6 +2734,11 @@ test_stop() {
         else
             pass "stop removes instance TAP"
         fi
+        if [[ -e "$HOME/.coop/instances/$INSTANCE/firecracker.pid" ]]; then
+            fail "stop removes stale Firecracker PID file" "PID file still exists"
+        else
+            pass "stop removes stale Firecracker PID file"
+        fi
     fi
 }
 

@@ -224,6 +224,9 @@ exclude_re = [
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
   "\\bstart_instance\\b",
+  # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
+  # the ordering is covered by a filesystem-backed lifecycle unit test.
+  "\\bcleanup_confirmed_stop\\b",
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
   # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.

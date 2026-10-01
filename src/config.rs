@@ -2826,6 +2826,15 @@ impl Instance {
         }
 
         ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        if pid.is_some()
+            && let Err(error) = fs::remove_file(&pid_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove stale Firecracker PID file {} (non-fatal): {error}",
+                pid_path.display()
+            );
+        }
         Ok(false)
     }
 }
@@ -3311,6 +3320,7 @@ mod tests {
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
         assert!(!inst.probe_liveness().unwrap());
+        assert!(!inst.pid_file_path().exists());
     }
 
     #[test]
