@@ -14,13 +14,41 @@ Use devcontainer.json at <path>? [Y/n]
 
 After your reply (or non-interactive escape hatches, below), coop prints a per-key report showing exactly which devcontainer.json keys took effect, which were overridden by CLI flags, and which are unsupported.
 
-When a local `devcontainer.json` is applied while creating a VM, coop records the file path and SHA-256 content hash in the instance state. Later `coop up` reconnects and `coop start` restarts compare the current file at that path with the recorded hash. If it changed or disappeared, coop prints an informational warning and leaves the existing VM unchanged. Destroy and recreate the VM to apply creation-time changes such as `features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`. Start-time values from the old file, including `containerEnv`, `forwardPorts`, and `postStartCommand`, are not re-applied automatically on restart.
+When a local `devcontainer.json` is applied while creating a VM, coop records the file path and SHA-256 content hash in the instance state. Later `coop up` reconnects and `coop start` restarts compare the current file at that path with the recorded hash. If it changed or disappeared, coop prints an informational warning and leaves the existing VM unchanged. Destroy and recreate the VM to apply creation-time changes such as `features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`. Restarts reuse saved `containerEnv` and `forwardPorts` values without re-reading them from the file. A `postStartCommand` deferred by unfinished creation commands stays in the saved recipe and runs when those stages finish; ordinary later boots do not reapply the old file's `postStartCommand`.
 
 `postStartCommand` runs after agent bootstrap, workspace copying or cloning, and
 additional mount synchronization. Repository scripts can use `/workspace` and
 mounted data. The command runs from the guest user's home directory; use
 `cd /workspace && ...` for relative project paths. A command failure produces a
 warning and does not fail startup.
+
+## Creation commands
+
+Use `postCreateCommand` for project tools and setup after the workspace has been
+copied, cloned, or mounted:
+
+```json
+{
+  "postCreateCommand": ["bash", "scripts/setup.sh", "development mode"]
+}
+```
+
+The array is an executable followed by literal arguments. To use pipes,
+conditionals, or redirects, supply a shell string instead:
+
+```json
+{
+  "postCreateCommand": "./scripts/setup.sh && ./scripts/check_setup.sh"
+}
+```
+
+The global [`post_create`](configuration.md#creation-hooks) command runs first
+in the guest home; the project command then runs in `/workspace`. Both use the
+configured guest user and forwarded environment. Parallel command objects are
+rejected. Setup failures retain the VM, block agent launch, and retry from the
+unfinished stage on `up` or restart. Successful stages are recorded. The recipe
+is selected at VM creation and replayed on reprovision; editing the devcontainer
+file does not change an existing VM's selected command.
 
 ## Non-interactive escape hatches
 
@@ -61,6 +89,7 @@ CLI flags > `devcontainer.json` > defaults. The reporting table marks overrides 
 | devcontainer.json | coop equivalent | Notes |
 |---|---|---|
 | `postStartCommand` | `post_start` | String or `[string,...]`; arrays are joined with ` && ` |
+| `postCreateCommand` | Project creation hook | String or nonempty argv array; runs after global `post_create`. Parallel command objects are unsupported. |
 | `containerEnv` | `guest_env` (`--env KEY=VALUE`) | CLI `--env` wins on conflict |
 | `forwardPorts` | `--forward-port` | Items may be integers or `"GUEST[:HOST]"` strings |
 | `features` (`rust`, `node`, `python`, `go`, `c`, `fuzz`) | built-in `--profile` | Only at `coop setup`; ignored during VM start/restart |

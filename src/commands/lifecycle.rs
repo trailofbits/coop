@@ -153,6 +153,7 @@ pub(crate) fn cmd_up(
         if be.is_running(&inst) {
             devcontainer::warn_if_applied_devcontainer_changed(&inst);
             reject_running_up_restart_inputs(&inst, opts)?;
+            resume_running_creation(be, cfg, &inst)?;
             tracing::info!(
                 "Instance '{}' is already running for {}",
                 inst.name,
@@ -210,6 +211,7 @@ fn cmd_up_git_repo(
         ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, opts)?;
         if be.is_running(&inst) {
             reject_running_up_restart_inputs(&inst, opts)?;
+            resume_running_creation(be, cfg, &inst)?;
             tracing::info!("Instance '{}' is already running for {repo_url}", inst.name);
             return Ok(());
         }
@@ -953,6 +955,11 @@ pub(super) fn allocate_and_start(
     let _guard = signal::install_handlers();
     let result = start_instance(be, &mut *cfg, &inst, opts);
 
+    if let Err(error) = &result
+        && error.is::<crate::creation_hooks::CreationIncomplete>()
+    {
+        return result.map(|()| inst);
+    }
     if let Err(e) = &result {
         tracing::error!("Failed to start instance '{}': {e}", inst.name);
         if let Ok(target) = be.ssh_target(cfg, &inst) {
@@ -1083,6 +1090,8 @@ fn restart_instance(
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
+    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
+    drop(be.as_stopped(inst.clone())?);
     devcontainer::warn_if_applied_devcontainer_changed(inst);
 
     let _guard = signal::install_handlers();
@@ -1124,6 +1133,7 @@ fn restart_instance(
         &[],
     )?;
     crate::github_assignment::active(cfg, inst)?;
+    crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Waiting)?;
     be.start_existing(cfg, inst)?;
 
     signal::check_shutdown()?;
@@ -1163,7 +1173,8 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
-    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
+    let command = creation_post_start(be, cfg, inst, opts)?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1226,6 +1237,8 @@ fn start_instance(
     port_forward::check_host_port_collisions(&forwards)?;
 
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
+    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
+    crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
     provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
@@ -1402,7 +1415,8 @@ fn provision_first_boot(
         }
     }
 
-    run_configured_post_start(cfg, inst, &target, repo, opts)?;
+    let command = creation_post_start(be, cfg, inst, opts)?;
+    run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1630,6 +1644,63 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
+pub(crate) fn open_agent_session(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+) -> Result<backend::SshSession> {
+    let running = resolve_running(be, cfg, name)?;
+    crate::creation_hooks::ensure_complete(running.instance())?;
+    let repo = backend::detect_instance_repo(running.instance());
+    let (inst, target) = running.into_parts();
+    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+}
+
+fn creation_post_start(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    opts: &StartOpts<'_>,
+) -> Result<Option<String>> {
+    crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Ready)?;
+    Ok(resume_creation(be, cfg, inst)?
+        .post_start(opts.post_start_override, cfg.post_start.as_deref()))
+}
+
+pub(super) fn resume_running_creation(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+) -> Result<()> {
+    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
+    if let crate::creation_hooks::CreationProgress::Finished(command) =
+        resume_creation(be, cfg, inst)?
+    {
+        let target = be.ssh_target(cfg, inst)?;
+        let repo = backend::detect_instance_repo(inst);
+        run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
+    }
+    Ok(())
+}
+
+fn resume_creation(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+) -> Result<crate::creation_hooks::CreationProgress> {
+    (|| {
+        if !crate::creation_hooks::pending(inst)? {
+            return Ok(crate::creation_hooks::CreationProgress::Unchanged);
+        }
+        let _guard = signal::install_handlers();
+        let repo = backend::detect_instance_repo(inst);
+        let target = be.ssh_target(cfg, inst)?;
+        let session = prepare_session_from_target(cfg, Some(inst), target, repo.as_ref())?;
+        crate::creation_hooks::run_pending(inst, &session)
+    })()
+    .map_err(|source| crate::creation_hooks::CreationIncomplete::new(inst, source).into())
+}
+
 /// Bootstrap guest agents after boot, before workspace provisioning.
 fn bootstrap_on_boot(
     be: &backend::PlatformBackend,
@@ -1688,9 +1759,9 @@ fn run_configured_post_start(
     inst: &config::Instance,
     target: &backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
-    opts: &StartOpts<'_>,
+    command: Option<&str>,
 ) -> Result<()> {
-    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+    let Some(command) = command else {
         return Ok(());
     };
     // Bootstrap may mint a proxy capability token; construct this session afterward.
@@ -2158,6 +2229,7 @@ pub(crate) fn cmd_restore(
     }
 
     let stopped = be.as_stopped(inst)?;
+    crate::creation_hooks::invalidate(stopped.instance())?;
     be.restore_disk(cfg, &stopped, image)?;
 
     // Persist the new lineage after the disk swap: if `restore_disk` fails,
@@ -2190,14 +2262,10 @@ pub(crate) fn cmd_restore(
 ///
 /// Only what coop persists can be replayed. A devcontainer's `containerEnv`
 /// and `forwardPorts` survive (they live in `guest_env.json` /
-/// `forwards.json`) and its features are baked into the image, but its
-/// `postStartCommand` reaches the guest only as an in-memory
-/// `post_start_override` during `coop up` and is **not** re-run here.
-/// (`postCreateCommand` is not the affected key: coop parses
-/// `postStartCommand` and reports `postCreateCommand` as an unrecognised
-/// `devcontainer.json` key, so it never reaches the guest on `coop up`
-/// either.)
-/// Likewise extra `--extra-mount` directories and `--exclude-git`.
+/// `forwards.json`) and its features are baked into the image. The saved
+/// creation recipe is reset and runs again after workspace provisioning,
+/// followed by its deferred startup command when it contains creation stages.
+/// Extra `--extra-mount` directories and `--exclude-git` are not replayed.
 ///
 /// The plain [`cmd_restore`] path replaces the disk but leaves the follow-up
 /// `coop start` on the [`backend::BootMode::Restart`] path, which skips
@@ -2209,6 +2277,7 @@ fn reprovision_instance(
     opts: &ReprovisionOpts<'_>,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
+    let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
     let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
     if !be.image_is_built(cfg, &image) {
@@ -2323,6 +2392,7 @@ fn reprovision_instance(
     // the swap. This is the longest window before the point of no return.
     signal::check_shutdown()?;
 
+    crate::creation_hooks::invalidate(stopped.instance())?;
     be.restore_disk(cfg, &stopped, &image)?;
 
     // Past this point the old disk is gone and there is nothing to roll back
@@ -2573,8 +2643,77 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
-    #[cfg(target_os = "linux")]
     use crate::backend::VmBackend as _;
+
+    fn check_stale_restart_preserves_creation_progress(root: &std::path::Path) {
+        let mut cfg = cfg_with_data_dir(root.join("data"));
+        cfg.post_create = Some("true".into());
+        let inst = crate::config::Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: crate::config::ImageName::new("default").unwrap(),
+        };
+        crate::creation_hooks::CreationState::select(&cfg, None)
+            .unwrap()
+            .save(&inst)
+            .unwrap();
+        crate::creation_hooks::set_preparation(&inst, crate::creation_hooks::Preparation::Ready)
+            .unwrap();
+        let recipe = inst.dir.join("creation.json");
+        let before = std::fs::read(&recipe).unwrap();
+        std::fs::write(inst.pid_file_path(), std::process::id().to_string()).unwrap();
+        let backend = crate::backend::PlatformBackend::new();
+        assert!(backend.is_running(&inst));
+        let config_path = root.join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+        let error = crate::commands::lifecycle::restart_instance(&backend, &mut cfg, &inst, &opts)
+            .expect_err("stale stopped observation must be rechecked");
+        assert!(
+            error.to_string().to_lowercase().contains("running"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(recipe).unwrap(), before);
+    }
+
+    #[test]
+    fn stale_restart_preserves_ready_creation_progress() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::CommandExt as _;
+
+        if let Some(root) = std::env::var_os("COOP_RESTART_FIXTURE") {
+            check_stale_restart_preserves_creation_progress(std::path::Path::new(&root));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let controller = root.path().join("limactl");
+        std::fs::write(
+            &controller,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' '{\"name\":\"coop-test\",\"status\":\"Running\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(controller, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg0("firecracker-restart-fixture")
+            .args([
+                "--exact",
+                "commands::lifecycle::tests::stale_restart_preserves_ready_creation_progress",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", root.path())
+            .env("LIMA_HOME", root.path().join("lima"))
+            .env("PATH", root.path())
+            .env("COOP_RESTART_FIXTURE", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

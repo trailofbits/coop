@@ -162,6 +162,12 @@ To share hook scripts or dotfiles with every VM, add
 files into writable guest locations on each boot, so tools can create their own
 configuration alongside them.
 
+For tools you want in every new VM, set a top-level
+[`post_create`](configuration.md#creation-hooks) command. Put project setup in
+`postCreateCommand` in `.devcontainer/devcontainer.json`. coop runs global setup
+first, then project setup, after the workspace is ready. Failed setup keeps the
+VM available for debugging and resumes when you repeat `coop up`.
+
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 
 A minimal config (an empty file is valid; all fields have defaults):

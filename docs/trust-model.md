@@ -79,6 +79,12 @@ user launched it.
   Parsing, merging into `CoopConfig`, and saving/reloading instance state do
   not make these values trusted. Choosing to use a project's devcontainer
   configuration does not authorize that project to execute code on the host.
+  This includes `postCreateCommand`: strings and argv arrays become a private
+  guest script sent over SSH stdin. They never become host shell source. Global
+  `post_create` uses the same guest execution path. Selected recipes may contain
+  secrets, so `creation.json` is owner-only and debug output redacts commands.
+  Creation commands have the guest user's existing environment and sudo access;
+  failure gates agent launch, not shell/exec access for debugging.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
 - **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*

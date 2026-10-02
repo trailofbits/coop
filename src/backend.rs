@@ -214,7 +214,7 @@ impl StoppedInstance {
 
 const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+pub(crate) fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
     lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 

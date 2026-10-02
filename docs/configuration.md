@@ -17,6 +17,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
+| `post_create` | string | unset | Global shell command run during VM creation, after workspace provisioning and before the project's `postCreateCommand`. Successful stages are recorded; failures retain the VM and block agent launch. See [Creation hooks](#creation-hooks). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ### Private host storage
@@ -43,6 +44,67 @@ for custom storage. Extended ACL grants and directory inheritance are removed
 from private directories and user-owned sensitive files. On macOS, ancestor
 ACLs granting write or ownership/control access are rejected. Config edits
 preserve the permissions and ACLs of the directory containing `config.toml`.
+
+## Creation hooks
+
+Set a global `post_create` command in `~/.coop/config.toml` to install tools or
+apply guest configuration to every new VM. This is a top-level field; place it
+before table headers such as `[claude]` or `[[guest_files]]`:
+
+```toml
+post_create = '''
+set -eu
+sudo apt-get update
+sudo apt-get install -y htop
+'''
+```
+
+For project setup, use `postCreateCommand` in
+[`.devcontainer/devcontainer.json`](devcontainer.md#creation-commands). Both hooks
+run inside the VM as the configured guest user, with the same forwarded
+environment as other guest commands and access to passwordless `sudo`. Global
+commands start in the guest user's home; project commands start in `/workspace`.
+String commands use `sh -c`; project argv arrays preserve each argument without
+joining them into a shell script.
+
+Creation runs in this order:
+
+1. Boot, copy `guest_files`, and bootstrap agents.
+2. Copy or clone the workspace and prepare additional mounts.
+3. Run global `post_create`, then project `postCreateCommand`.
+4. Run `post_start` and allow agent launch.
+
+`--no-agents` skips agent bootstrap but still runs file copies and creation
+commands. Creation hooks do not run while building a golden image with `setup`;
+use image profiles for that purpose.
+
+If a creation command fails or is interrupted, coop returns an error and retains
+the VM. Later creation stages and `post_start` wait. `coop claude`, `coop codex`,
+`coop grok`, and `quickstart` do not launch an agent until setup completes.
+Use `coop shell <name>` or `coop exec <name> -- <command>` to investigate and fix
+guest state. Then repeat `coop up <project>` for a running VM, or stop it and run
+`coop start <name>`. Successful stages are skipped; unfinished stages retry.
+Concurrent attempts for the same VM are serialized, including file copying and
+bootstrap before the hooks. If those boot prerequisites fail, stop the VM and
+run `coop start` to finish provisioning before retrying creation commands.
+Failed or interrupted commands have their process groups terminated. Successful
+commands can leave background services running.
+
+The selected commands and progress are saved in the instance's private
+`creation.json`. Changes to the host config or devcontainer file do not replace
+that recipe; recreate the VM to select a new recipe. A deferred `post_start` also
+keeps its original selection until creation finishes; an explicit `--post-start`
+on a restart still overrides it. Ordinary later boots use the existing
+`post_start` selection rules. An already-running VM with completed setup does not
+rerun hooks when you reconnect.
+
+Commands must tolerate retries: interruption after a command succeeds but before
+its success is recorded can cause it to run again. Host-side progress is reset
+before a disk restore. `restore --reprovision` copies the workspace before rerunning
+the saved recipe. Plain `restore` does not copy the workspace; use reprovisioning
+when the restored image does not contain the project files that setup needs.
+Older instances without `creation.json` remain unchanged and do not automatically
+pick up new creation hooks.
 
 ## Guest files
 

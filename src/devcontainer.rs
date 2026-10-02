@@ -167,6 +167,8 @@ struct RawDevcontainer {
     #[serde(default)]
     post_start_command: Option<serde_json::Value>,
     #[serde(default)]
+    post_create_command: Option<serde_json::Value>,
+    #[serde(default)]
     mounts: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     host_requirements: Option<RawHostRequirements>,
@@ -539,6 +541,7 @@ pub struct Translation {
     pub mem_mib: Option<MiB>,
     pub disk_gib: Option<GiB>,
     pub post_start: Option<String>,
+    pub post_create: Option<crate::creation_hooks::CreationCommand>,
     pub guest_env: BTreeMap<EnvVarName, String>,
     pub forward_ports: Vec<PortForward>,
     pub mounts: Vec<Mount>,
@@ -581,6 +584,8 @@ pub fn translate(
     if let Some(reqs) = &file.raw.host_requirements {
         translate_host_requirements(reqs, inputs, stage, &mut t);
     }
+
+    translate_post_create(file, stage, &mut t);
 
     if let Some(cmd) = &file.raw.post_start_command {
         let key = "postStartCommand";
@@ -1230,6 +1235,33 @@ fn render_value_opt(v: Option<&serde_json::Value>) -> String {
     v.map(render_value).unwrap_or_default()
 }
 
+fn translate_post_create(file: &ParsedDevcontainer, stage: Stage, t: &mut Translation) {
+    let Some(value) = &file.raw.post_create_command else {
+        return;
+    };
+    match crate::creation_hooks::CreationCommand::from_devcontainer(value) {
+        Ok(command) => {
+            if stage == Stage::Start {
+                t.post_create = Some(command);
+            }
+            t.report.push(
+                "postCreateCommand",
+                ReportStatus::Applied,
+                ReportSource::Devcontainer,
+                "configured",
+                "runs after global post_create",
+            );
+        }
+        Err(error) => t.report.push(
+            "postCreateCommand",
+            ReportStatus::Invalid,
+            ReportSource::Devcontainer,
+            "invalid",
+            error.to_string(),
+        ),
+    }
+}
+
 fn post_start_to_string(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -1572,6 +1604,7 @@ pub fn apply_to_config(cfg: &mut CoopConfig, t: &Translation) -> Result<()> {
     if let Some(p) = &t.post_start {
         cfg.post_start = Some(p.clone());
     }
+    cfg.project_post_create.clone_from(&t.post_create);
     for (k, v) in &t.guest_env {
         cfg.guest_env.insert(k.clone(), v.clone());
     }
@@ -1606,6 +1639,62 @@ mod tests {
 
     fn parse(text: &str) -> ParsedDevcontainer {
         ParsedDevcontainer::from_str(PathBuf::from("test.json"), text).unwrap()
+    }
+
+    #[test]
+    fn creation_command_translates_only_for_vm_start() {
+        let file = parse(r#"{"postCreateCommand":["echo","a && b"]}"#);
+        let start = translate(&file, &TranslatorInputs::default(), Stage::Start);
+        assert!(start.post_create.is_some());
+        let row = start
+            .report
+            .entries
+            .iter()
+            .find(|row| row.key == "postCreateCommand")
+            .unwrap();
+        assert_eq!(row.status, ReportStatus::Applied);
+        let mut cfg = CoopConfig::default();
+        apply_to_config(&mut cfg, &start).unwrap();
+        assert_eq!(
+            serde_json::to_value(cfg.project_post_create.unwrap()).unwrap(),
+            serde_json::json!(["echo", "a && b"])
+        );
+        let setup = translate(&file, &TranslatorInputs::default(), Stage::Setup);
+        assert!(setup.post_create.is_none());
+        assert_eq!(
+            setup
+                .report
+                .entries
+                .iter()
+                .find(|row| row.key == "postCreateCommand")
+                .unwrap()
+                .status,
+            ReportStatus::Applied
+        );
+    }
+
+    #[test]
+    fn creation_command_rejects_parallel_objects_and_empty_argv() {
+        for json in [
+            r#"{"postCreateCommand": {"parallel": "x"}}"#,
+            r#"{"postCreateCommand": []}"#,
+        ] {
+            let file = parse(json);
+            for stage in [Stage::Setup, Stage::Start] {
+                let translation = translate(&file, &TranslatorInputs::default(), stage);
+                assert!(translation.post_create.is_none());
+                assert_eq!(
+                    translation
+                        .report
+                        .entries
+                        .iter()
+                        .find(|row| row.key == "postCreateCommand")
+                        .unwrap()
+                        .status,
+                    ReportStatus::Invalid
+                );
+            }
+        }
     }
 
     #[test]

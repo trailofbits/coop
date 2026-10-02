@@ -752,7 +752,7 @@ pub struct CoopConfig {
 
     /// Shell command to run inside the guest after every successful boot.
     ///
-    /// Executed after SSH, agent bootstrap, and workspace/mount provisioning,
+    /// Executed after SSH, agent bootstrap, workspace/mount provisioning, and creation hooks,
     /// before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
@@ -760,6 +760,14 @@ pub struct CoopConfig {
     /// Maps to `postStartCommand` from `devcontainer.json`.
     #[serde(default)]
     pub post_start: Option<String>,
+
+    /// Global guest command run once per newly provisioned VM, before project setup.
+    #[serde(default)]
+    pub post_create: Option<String>,
+
+    /// Invocation-only project command translated from devcontainer.json.
+    #[serde(skip)]
+    pub project_post_create: Option<crate::creation_hooks::CreationCommand>,
 
     /// Default host:guest port forwards applied to every VM startup.
     ///
@@ -2479,6 +2487,8 @@ impl Default for CoopConfig {
             guest_files: Vec::new(),
             profiles: HashMap::new(),
             post_start: None,
+            post_create: None,
+            project_post_create: None,
             forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
         }

@@ -6,6 +6,11 @@ Isolated VM environments for running Claude Code, Codex, and Grok Build.
 
 coop is a Rust CLI that manages disposable virtual machines where Claude Code, Codex, and Grok Build have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
 
+You can copy shared dotfiles with
+[`guest_files`](docs/configuration.md#guest-files) and install tools for each new
+VM with global [`post_create`](docs/configuration.md#creation-hooks) commands or
+project `postCreateCommand` entries in `.devcontainer/devcontainer.json`.
+
 ## Setup
 
 Install the latest release:

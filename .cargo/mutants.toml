@@ -58,6 +58,10 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # Creation-hook SSH execution and lifecycle orchestration require a guest.
+  "creation_hooks.rs:.*(run_pending|execute|execute_staged|wait_for_hook|lock_provisioning)\\b",
+  "\\b(creation_post_start|resume_creation|resume_running_creation|open_agent_session)\\b",
+
   # guest_files.rs: SSH transfer and cleanup; staging and path checks remain scoped.
   "guest_files.rs:.*StagedFiles::install",
   # Lifecycle staging resolves image metadata and backend mount behavior.
