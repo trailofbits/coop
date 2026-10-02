@@ -230,6 +230,15 @@ The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
 
+Guest-file unit tests cover multiple mappings, guest-home expansion, destination
+validation, source snapshots, private writable modes, macOS staging ACL inheritance,
+symlink materialization,
+cycles, missing sources, special files, concurrent source-path replacement, staging
+directory overlap, and mount/destination overlaps. The full
+VM suite checks initial copies, restart refresh, retained guest-only content,
+writable neighboring configuration directories, bootstrap ordering, and restart
+rejection of persisted live host mounts.
+
 ## Mutation testing
 
 Mutation testing finds unit tests that pass even when the code is broken — real

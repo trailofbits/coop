@@ -153,12 +153,18 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 1. **Resolve** the target repo/workspace and optionally prompt for a GitHub PAT
    (`pat_prompt::maybe_prompt`).
 2. **Ports** — merge forward-port specs and fail fast on host-port collisions
-   (`port_forward::check_host_port_collisions`).
+   (`port_forward::check_host_port_collisions`). Stage explicit `guest_files`
+   sources in private host temporary directories, resolving permitted symlinks
+   and rejecting invalid source trees before boot or disk replacement.
 3. **Boot** the VM (`be.create_and_start`), then `wait_until_ready` (SSH probe
    with backoff).
 4. **Forwards + state** — spawn `ssh -L` forwards, persist `ForwardsState`,
    `GuestEnvState`, `DevcontainerState` as JSON sidecars in the instance dir.
-5. **Bootstrap** (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
+5. **Guest files and bootstrap** — `guest_files.rs` uploads the staged copies;
+   `scripts/guest/copy-files.sh` rejects destination symlinks and live-mount
+   overlaps, then merges private, writable files without deletion. Host staging
+   drops at the end of the operation; guest staging is cleaned after each copy.
+   Then (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
    `gh auth setup-git`; then `bootstrap_claude` / `bootstrap_codex` inject the
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked

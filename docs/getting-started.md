@@ -157,6 +157,11 @@ steps.
 
 ## Configuration
 
+To share hook scripts or dotfiles with every VM, add
+[`[[guest_files]]`](configuration.md#guest-files) mappings. coop copies those
+files into writable guest locations on each boot, so tools can create their own
+configuration alongside them.
+
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 
 A minimal config (an empty file is valid; all fields have defaults):
