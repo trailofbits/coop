@@ -26,9 +26,6 @@ coop/
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
 │   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
-│   ├── devcontainer.rs     # devcontainer.json parse + translate to coop config
-│   ├── devcontainer_oci.rs # devcontainer Features from the GHCR OCI registry
-│   ├── git_repo_devcontainer.rs # fetch devcontainer.json from a remote repo
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
@@ -49,7 +46,6 @@ coop/
 │   ├── fs_util.rs          # private directories/ACLs, atomic file writes, file locks
 │   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
-│   ├── jsonc.rs            # JSONC → JSON (for devcontainer.json)
 │   ├── naming.rs           # safe-name character class
 │   ├── completions.rs      # shell completion (static + dynamic candidates)
 │   ├── prompt.rs           # TTY prompts
@@ -129,7 +125,7 @@ any instance operation lock is acquired.
 1. Emit dynamic shell completions (before arg parsing) if requested.
 2. Parse `Cli` (clap derive), init tracing (→ **stderr**).
 3. Handle commands that must work **without** a loaded config —
-   `Completions`, `Init`, `Update`, `Uninstall`, `Devcontainer check` — first.
+   `Completions`, `Init`, `Update`, `Uninstall` — first.
 4. `config::CoopConfig::load`, then fire the update-notifier check.
 5. Construct `backend::PlatformBackend::new()`.
 6. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
@@ -138,10 +134,9 @@ any instance operation lock is acquired.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
-`devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
+`profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
-`admin.rs` (init/validate/uninstall),
-and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
+`admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
 (`merge_runtime_guest_env`, `purge_all_data`).
 
@@ -157,7 +152,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 3. **Boot** the VM (`be.create_and_start`), then `wait_until_ready` (SSH probe
    with backoff).
 4. **Forwards + state** — spawn `ssh -L` forwards, persist `ForwardsState`,
-   `GuestEnvState`, `DevcontainerState` as JSON sidecars in the instance dir.
+   `GuestEnvState` as JSON sidecars in the instance dir.
 5. **Bootstrap** (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
    `gh auth setup-git`; then `bootstrap_claude` / `bootstrap_codex` inject the
    allowlisted config files and a managed `settings.json`, and on first boot
@@ -166,7 +161,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
-7. **`postStartCommand`** hook (warned, not fatal).
+7. **`post_start`** hook (warned, not fatal).
 
 Config, secrets, and workspace all cross the host→guest boundary here; the
 security-relevant details of each crossing are in
@@ -184,7 +179,7 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
-`guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
+`guest_env.json`, `model.json`, `proxy.json`, plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files.
 Allocation refuses an occupied instance path. If any instance directory has
 unreadable metadata, allocation stops because its network index cannot be

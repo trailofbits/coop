@@ -236,8 +236,8 @@ pub const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
 /// `MiB` is a generic byte quantity whose only invariant is non-zero;
 /// the 128 MiB floor is domain-specific to *VM memory*, so it lives here
 /// rather than on `MiB`. Every entry point that sets guest memory — the
-/// `--mem` CLI flag, `config.toml`, `coop resize`, and the devcontainer
-/// translator — constructs through [`Self::new`], so no path can hold an
+/// `--mem` CLI flag, `config.toml`, and `coop resize` — constructs through
+/// [`Self::new`], so no path can hold an
 /// unbootable value. This is parse-don't-validate: the floor is a
 /// property of the type, not a check a caller must remember to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -416,8 +416,7 @@ impl Mount {
     /// Single source of truth for the canonicalize / is-dir
     /// invariants; the absolute-guest invariant is carried by
     /// `GuestPath::absolute` at the type boundary. Callers that build
-    /// the spec from typed fields (devcontainer JSON, Docker
-    /// `type=bind` form) skip the string round-trip by calling this
+    /// the spec from typed fields skip the string round-trip by calling this
     /// directly.
     pub fn from_parts(host: &str, guest_path: GuestPath) -> Result<Self> {
         let host_path = Path::new(host)
@@ -751,8 +750,6 @@ pub struct CoopConfig {
     /// Executed after the VM is up and SSH is ready, before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
-    ///
-    /// Maps to `postStartCommand` from `devcontainer.json`.
     #[serde(default)]
     pub post_start: Option<String>,
 
@@ -2271,12 +2268,6 @@ impl CoopConfig {
         self.data_dir.join("instances")
     }
 
-    /// Path to per-project devcontainer discovery preferences.
-    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
-    pub fn devcontainer_preferences_path(&self) -> PathBuf {
-        self.data_dir.join("devcontainer_preferences.json")
-    }
-
     /// List all existing instances, sorted by index.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let dir = self.instances_dir();
@@ -2623,11 +2614,6 @@ impl Instance {
     /// means "no override — use the `[proxy.<provider>]` defaults."
     pub fn proxy_state_path(&self) -> PathBuf {
         self.dir.join("proxy.json")
-    }
-
-    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
-    pub fn devcontainer_state_path(&self) -> PathBuf {
-        self.dir.join("devcontainer_state.json")
     }
 
     pub fn tap_device(&self) -> String {
@@ -6348,15 +6334,7 @@ skip = ["not-a-slug"]
 
     // ── Property tests ───────────────────────────────────────
     //
-    // A standing `cargo-fuzz` target for the config loader (the parser
-    // class #278 reserves fuzzing for) isn't practical here: `CoopConfig`
-    // transitively embeds `update`, `setup`, and `shell` types, so the
-    // `#[path]`-include trick used by the self-contained `jsonc` /
-    // `parse_repo_slug` targets would have to pull in most of the crate
-    // (including its network and process-spawning modules). The
-    // `config_load_never_panics` property below covers the same
-    // "never panics, only returns Err" guarantee as a CI gate; unblocking
-    // a true fuzz target would mean giving the crate a `lib` target.
+    // Property tests complement the config_load fuzz target.
 
     fn arb_subnet_mask() -> impl Strategy<Value = SubnetMask> {
         (0u8..=32).prop_map(|b| SubnetMask::new(b).unwrap())

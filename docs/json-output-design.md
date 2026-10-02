@@ -2,17 +2,14 @@
 
 Tracking issue: [#385](https://github.com/trailofbits/coop/issues/385).
 
-This document is an implementation guide. It specifies a `--json` output mode
-for coop's read/query commands, the shared infrastructure that keeps human and
-JSON output from drifting, and the exact view models (typed against coop's
-existing newtypes) for every command in scope.
+This document records the original design of `--json` output for read/query
+commands. The implemented command surface is documented in
+[`commands.md`](commands.md).
 
 ## Goal
 
-coop has no machine-readable output. Every command prints human text; automation
-must scrape fixed-width tables or free-form strings. Add an opt-in `--json` flag
-so command output can be parsed reliably, starting with the highest-value read
-commands. The human output stays the default and is unchanged.
+The design adds opt-in machine-readable output to read/query commands while
+keeping human output as the default.
 
 `serde_json` (with `preserve_order`) is already a dependency; `serde::Serialize`
 is derived widely across `config.rs`. No new dependency is needed.
@@ -57,12 +54,12 @@ models carry the newtype, **borrowed** from the data already in hand (`serde`
 implements `Serialize` for `&T`), so there is no clone and no downgrade.
 
 Only use `String` where the domain genuinely has no newtype (see per-command
-notes: profile names, `Report` free-text, timestamps, `ResourceUsage`
+notes: profile names, timestamps, `ResourceUsage`
 primitives).
 
 ### 3. Enums for every closed set, never a free string
 
-State, backend kind, report status/source, PAT storage, probe result — each is a
+State, backend kind, PAT storage, probe result — each is a
 fixed set of values. Model each as an enum with `#[serde(rename_all = "…")]` so
 serialization is **total** (no typo'd literal can escape) and the compiler forces
 exhaustive handling. Where the human path already has a `label()` method that
@@ -77,12 +74,7 @@ all `Option`.
 
 ### 5. JSON goes to stdout; tracing/human decoration stays on stderr
 
-Per `AGENTS.md`, tracing already goes to stderr, so `coop … --json | jq` stays
-clean. **Two commands (`devcontainer check`, `up/start --dry-run`) currently
-write their report to stderr** via `eprintln!` / `Report::render()`. For those,
-`--json` must move the payload to **stdout** — the flag selects
-`(stderr, human)` vs `(stdout, json)`, not just the format. The human path stays
-on stderr, unchanged.
+Per `AGENTS.md`, tracing goes to stderr, so `coop … --json | jq` stays clean.
 
 ## The flag: per-command `--json`, not global
 
@@ -147,19 +139,15 @@ pub(crate) fn render_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
 | `status` | yes | **P0** | Instance state — highest automation value. |
 | `list` / `ls` | yes | **P0** | Trivial subset of status; nearly free once the enum exists. |
 | `images` | yes | **P1** | Machine-readable image inventory; already structured. |
-| `devcontainer check` | yes | **P1** | `Report` already structured; CI branches on translation. |
 | `github status` | yes | **P1** | PAT entries + validation state; secrets excluded. |
-| `up --dry-run` / `start --dry-run` | yes | **P2** | Resolved plan/translation. Heaviest shape. |
 | `profiles list` | yes | **P2** | Profile inventory; low automation demand. |
 | `model` (no action) | status-only | **P3** | Only the readout; `local`/`remote` mutate and prompt. |
-| `devcontainer status` | yes | **P3** | Lists opt-outs; minor query. |
 | `validate` | maybe | **P3** | Its value *is* the human warnings; wrap only on demand. |
 | `logs` | no | — | A stream; NDJSON adds ~nothing over raw text. |
 | `profiles show`, `github show` | no | — | Single-item detail dumps; wrap only if a consumer appears. |
 | `up`/`start`/`setup`/`quickstart`/`resize`/`commit`/`restore`/`stop`/`destroy`/`push`/`pull` | no | — | Mutations. Output is side effect + tracing (stderr). |
 | `shell`/`claude`/`claude-agents`/`codex`/`exec`/`editor` | no | — | Interactive / passthrough; stdout is the guest's. |
 | `ssh-config` | no | — | Emits SSH config text, not data. |
-| `model local`/`remote`, `github setup-pat`/`rotate-pat`/`forget-pat`, `devcontainer ignore`/`clear` | no | — | Mutations; several prompt on a TTY. |
 | `init`/`update`/`uninstall`/`completions` | no | — | Installer/meta actions. |
 
 **Rule for the "no" set:** everything ruled out is a mutation (its output is a
@@ -291,45 +279,6 @@ stays `Vec<String>` because profile names have no newtype (`config.rs:678`:
     "created": "2026-06-01T12:00:00Z", "size_bytes": 8589934592 } ]
 ```
 
-### P1 — `devcontainer check`
-
-- **Handler:** report rendered at `src/commands/devcontainer.rs:230` (and the
-  both-stage path at `:309`); subcommand at `src/lib.rs:699`.
-- **Clap:** add `json: bool` to the `Check` variant.
-- **stderr → stdout:** the human report currently goes to **stderr**
-  (`eprintln!`, behind `#[expect(clippy::print_stderr)]`). With `--json`, write
-  to **stdout** via `render_json`. Human path unchanged.
-
-The `Report` types (`src/devcontainer.rs:349–427`) are already structured — add
-`Serialize` derives. Their existing `label()` methods already return exactly the
-strings `rename_all = "lowercase"` produces (`"applied"`, `"cli"`, …), so human
-and JSON labels cannot diverge:
-
-```rust
-#[derive(Serialize, /* existing derives */)]
-#[serde(rename_all = "lowercase")]
-pub enum ReportStatus { Applied, Overridden, Unsupported, Invalid }
-
-#[derive(Serialize, /* existing derives */)]
-#[serde(rename_all = "lowercase")]
-pub enum ReportSource { Cli, Devcontainer }
-
-#[derive(Serialize, /* existing derives */)]
-pub struct ReportEntry { pub key: String, pub status: ReportStatus,
-                         pub source: ReportSource, pub value: String, pub note: String }
-
-#[derive(Serialize, /* existing derives */)]
-pub struct Report { pub entries: Vec<ReportEntry>, pub source_path: Option<PathBuf>,
-                    pub ignored_paths: Vec<PathBuf> }
-```
-
-`key` / `value` / `note` stay `String` — they are free-form (a dotted
-devcontainer path, a rendered value, a human note), not a closed set. Keep the
-`label()` methods for the human table; the derive is purely additive.
-
-- **`--stage both`** emits `{ "setup": <Report>, "start": <Report> }`; a single
-  stage emits one `Report`. `PathBuf` serializes as a string via serde.
-
 ### P1 — `github status`
 
 - **Handler:** `render_status`, `src/github_pat.rs:115` (already split from
@@ -407,37 +356,6 @@ resolved under `--probe`.
   "skip": [] }
 ```
 
-### P2 — `up --dry-run` / `start --dry-run`
-
-- **Handlers:** dry-run early-returns in the `Up` and `Start` arms
-  (`src/lib.rs:970` and `:1032`). Today the dry-run runs `resolve_devcontainer`
-  (which renders the `Report` to stderr) and returns; there is no collected plan
-  object.
-- **Clap:** `--dry-run` already exists; add `json: bool` to `Up` and `Start`.
-- This is the **heaviest** shape — the plan's pieces (translation report,
-  resolved profiles, VM overrides, guest user) are computed but never assembled
-  into one struct. That assembly is the bulk of the work.
-
-```rust
-#[derive(Serialize)]
-pub(crate) struct DryRunPlan {
-    pub report: Option<devcontainer::Report>,   // reuse P1 Serialize derives
-    pub profiles: Vec<String>,                   // resolved profile names
-    pub guest_user: guest::GuestUser,            // newtype, serializes as string
-    pub vm: VmOverrides,
-}
-
-#[derive(Serialize)]
-pub(crate) struct VmOverrides {
-    pub vcpus: Option<u32>,
-    pub mem_mib: Option<u32>,
-    pub disk: Option<String>,   // or the DiskSize newtype if it implements Serialize
-}
-```
-
-Same stderr → stdout move as `devcontainer check`. Do this **after** P1 so the
-`Report` derives already exist.
-
 ### P2 — `profiles list`
 
 - **Handler:** `cmd_profiles`, `src/commands/profiles.rs:10`; subcommand
@@ -457,18 +375,10 @@ pub(crate) struct ProfileEntry {
 }
 ```
 
-### P3 — `model` (readout only), `devcontainer status`, `validate`
+### P3 — `model` readout and `validate`
 
-Lower demand; wrap only when reached. Shapes:
-
-- **`model`** (no action, `render_status` at `src/commands/model.rs:33`): only
-  the `None` action gets `--json` — `local`/`remote` mutate and prompt on a TTY.
-  Carry `&InstanceName` and `&GuestUser`; `mode` reuses/mirrors the `ModelMode`
-  enum (already `ValueEnum`); per-tool endpoints as `{ claude: …, codex: … }`.
-- **`devcontainer status`** (`src/lib.rs:712`): `[{ "project": …, "ignored_path":
-  … }]` — paths serialize as strings.
-- **`validate`** (`src/lib.rs:1184`): only if a consumer appears; its value is the
-  human warning text.
+These query commands can gain JSON output when a consumer needs it. Keep
+mutations and interactive commands on the human path.
 
 ---
 
@@ -520,14 +430,8 @@ real stdout/stderr split on both backends.
 
 ## Suggested phasing
 
-1. **P0 (this issue #385):** `status` + `list/ls` together — they share
-   `InstanceState` and get the shared `json` module + `render_json` helper in
-   place. Barely more than `status` alone.
-2. **P1:** `images`, `devcontainer check`, `github status` — mostly
-   derive-and-branch on already-structured data; `check` also does the
-   stderr → stdout move.
-3. **P2:** `up/start --dry-run`, `profiles list` — real assembly / lower demand.
-4. **P3 (on demand only):** `model` readout, `devcontainer status`, `validate`.
+Add JSON output to remaining query commands when needed, using the shared
+view models and tests above.
 
 ## Per-command implementation checklist
 
@@ -539,8 +443,6 @@ For each command you add:
       where the domain has no newtype.
 - [ ] Extract a pure builder from the handler's IO so the assembly is unit-testable.
 - [ ] Branch the handler: `render_json(&view)?` vs the existing human formatter.
-- [ ] For `check` / `--dry-run`: move the JSON payload to stdout (human stays on
-      stderr).
 - [ ] Add shape tests (edges: `null`, `[]`, array vs object, enum tokens).
 - [ ] Update `.cargo/mutants.toml` (exclude IO/stdout writers; keep pure builders
       in scope) **in the same PR**.

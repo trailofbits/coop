@@ -24,13 +24,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "jsonc_to_json"
-path = "fuzz_targets/jsonc_to_json.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "config_load"
 path = "fuzz_targets/config_load.rs"
 test = false

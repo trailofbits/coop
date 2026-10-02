@@ -63,9 +63,7 @@ if [[ -z "$BINARY" ]]; then
 fi
 
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
-# (e.g. the discovered-devcontainer confirmation) on stdin being a TTY, falling
-# back to a non-TTY error that the suite asserts on. Under CI stdin is already
-# not a TTY, but when the suite runs from an interactive shell (the release
+# on stdin being a TTY. Under CI stdin is already not a TTY, but when the suite runs from an interactive shell (the release
 # preflight) those prompts would read real keystrokes and block. Redirecting the
 # whole script makes every coop subprocess see a non-TTY stdin regardless of how
 # the suite is invoked. The script itself never reads stdin.
@@ -454,16 +452,17 @@ test_mem_floor() {
             "failed for the wrong reason: $(cat "$tmpdir/mem_floor_cfg_stderr")"
     fi
 
-    # The floor is a floor, not a ban: the boundary value is accepted by the
-    # parser (this still fails later for other reasons, so only assert the
-    # error is not the floor message).
-    if coop up --mem 128 --dry-run "$tmpdir" 2>"$tmpdir/mem_floor_stderr"; then
-        pass "up accepts --mem at the 128 MiB boundary (dry-run)"
-    elif ! grep -q "is too low" "$tmpdir/mem_floor_stderr"; then
-        pass "up accepts --mem at the 128 MiB boundary (no floor error)"
+    # A valid boundary value reaches profile resolution before any VM work.
+    if coop_fails up --mem 128 --profile invalid-profile "$tmpdir"; then
+        if grep -q "Unknown profile" <<<"$HARNESS_ERR"; then
+            pass "up accepts --mem at the 128 MiB boundary"
+        else
+            fail "up accepts --mem at the 128 MiB boundary" \
+                "failed before profile resolution: $HARNESS_ERR"
+        fi
     else
         fail "up accepts --mem at the 128 MiB boundary" \
-            "128 MiB was rejected as too low"
+            "unexpectedly accepted invalid profile"
     fi
 }
 
@@ -608,9 +607,13 @@ test_up_creates_primary_instance() {
     # `--env` exercises the guest_env CLI -> config -> SendEnv path
     # end-to-end. `test_guest_environment` verifies the value is
     # visible inside the guest via `printenv`.
-    mkdir -p "$tmpdir/primary-ws"
+    local ignored_marker="/tmp/coop-devcontainer-ignored-$$"
+    mkdir -p "$tmpdir/primary-ws/.devcontainer"
+    cat > "$tmpdir/primary-ws/.devcontainer/devcontainer.json" <<EOF
+{"containerEnv":{"COOP_TEST_DEVCONTAINER_IGNORED":"should-not-appear"},"postStartCommand":"touch $ignored_marker"}
+EOF
     local args=(
-        up "$tmpdir/primary-ws" --name "$INSTANCE" --no-agents --no-devcontainer
+        up "$tmpdir/primary-ws" --name "$INSTANCE" --no-agents
         --env "COOP_TEST_GUEST_ENV=hello-from-cli"
     )
     if coop "${args[@]}"; then
@@ -621,6 +624,28 @@ test_up_creates_primary_instance() {
         echo "stderr: $HARNESS_ERR"
         echo "FATAL: primary instance creation failed, cannot continue"
         exit 1
+    fi
+
+    local copied_file="" env_value=""
+    if copied_file=$(guest_exec cat /workspace/.devcontainer/devcontainer.json) \
+        && [[ "$copied_file" == *COOP_TEST_DEVCONTAINER_IGNORED* ]]; then
+        pass "project devcontainer file reaches the guest as ordinary workspace data"
+    else
+        fail "project devcontainer file reaches the guest as ordinary workspace data" \
+            "content: $copied_file; stderr: $(guest_stderr)"
+    fi
+    if env_value=$(guest_exec /bin/sh -c 'printf "%s" "${COOP_TEST_DEVCONTAINER_IGNORED-unset}"') \
+        && [[ "$env_value" == "unset" ]]; then
+        pass "up ignores discovered devcontainer containerEnv"
+    else
+        fail "up ignores discovered devcontainer containerEnv" \
+            "value: $env_value; stderr: $(guest_stderr)"
+    fi
+    if guest_exec /usr/bin/test ! -e "$ignored_marker"; then
+        pass "up ignores discovered devcontainer postStartCommand"
+    else
+        fail "up ignores discovered devcontainer postStartCommand" \
+            "marker exists or guest check failed: $(guest_stderr)"
     fi
 }
 
@@ -643,7 +668,7 @@ test_duplicate_name() {
 
     local other_ws="$tmpdir/duplicate-ws"
     mkdir -p "$other_ws"
-    if coop_fails up "$other_ws" --name "$INSTANCE" --no-agents --no-devcontainer; then
+    if coop_fails up "$other_ws" --name "$INSTANCE" --no-agents; then
         pass "rejects duplicate instance name"
     else
         fail "rejects duplicate instance name" "should have failed"
@@ -651,7 +676,7 @@ test_duplicate_name() {
         coop destroy "$INSTANCE" 2>/dev/null || true
     fi
 
-    if coop_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents --no-devcontainer; then
+    if coop_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents; then
         pass "rejects mismatched name for existing project"
     else
         fail "rejects mismatched name for existing project" "should have failed"
@@ -2042,7 +2067,6 @@ CFGEOF
             "$ws_dir" \
             --name "$pat_instance" \
             --no-agents \
-            --no-devcontainer \
             --no-prompt \
             >"$tmpdir/pat-start.out" 2>&1; then
         STARTED_INSTANCES+=("$pat_instance")
@@ -2194,7 +2218,7 @@ CFGEOF
         expected=absent
         case "$stage" in
             fresh-up)
-                boot_args=(up "$ws_dir" --name "$inst_name" --no-devcontainer --no-github)
+                boot_args=(up "$ws_dir" --name "$inst_name" --no-github)
                 ;;
             plain-start)
                 boot_args=(start "$inst_name")
@@ -2978,7 +3002,7 @@ test_commit_restore() {
     local commit_inst="${INSTANCE}-from-commit"
     local commit_ws="$tmpdir/${commit_inst}-ws"
     mkdir -p "$commit_ws"
-    if coop up "$commit_ws" --name "$commit_inst" --no-agents --no-devcontainer --image "$snap"; then
+    if coop up "$commit_ws" --name "$commit_inst" --no-agents --image "$snap"; then
         STARTED_INSTANCES+=("$commit_inst")
         pass "up --image (committed snapshot) exits 0"
 
@@ -3709,7 +3733,7 @@ test_quickstart() {
     # First invocation: image is already built (from test_setup) and no
     # instance for this workspace exists, so quickstart must allocate fresh.
     local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3748,7 +3772,7 @@ test_quickstart() {
     pre_list=$("$BINARY" list 2>/dev/null | sort)
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3779,7 +3803,7 @@ test_quickstart() {
     fi
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3820,7 +3844,7 @@ test_up_project_workflow() {
     up_inst_name=${up_ws##*/}
     up_inst_name=${up_inst_name//[!a-zA-Z0-9_-]/-}
 
-    if coop up "$up_ws" --no-agents --no-devcontainer; then
+    if coop up "$up_ws" --no-agents; then
         STARTED_INSTANCES+=("$up_inst_name")
         pass "up copy creates project instance"
     else
@@ -3844,7 +3868,7 @@ test_up_project_workflow() {
 
     local pre_list post_list
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up "$up_ws" --no-devcontainer; then
+    if coop up "$up_ws"; then
         pass "up copy re-run exits 0 while running"
     else
         fail "up copy re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -3857,7 +3881,7 @@ test_up_project_workflow() {
             "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
     fi
 
-    if coop stop "$up_inst_name" && coop up "$up_ws" --no-agents --no-devcontainer; then
+    if coop stop "$up_inst_name" && coop up "$up_ws" --no-agents; then
         pass "up copy restarts stopped project instance"
     else
         fail "up copy restarts stopped project instance" "stderr: $HARNESS_ERR"
@@ -3866,7 +3890,7 @@ test_up_project_workflow() {
     local reject_ws data_dir
     reject_ws=$(mktemp -d "$tmpdir/up-reject-XXXXXX")
     data_dir=$(mktemp -d "$tmpdir/up-data-XXXXXX")
-    if coop_fails up "$reject_ws" --extra-mount "$data_dir" --no-devcontainer; then
+    if coop_fails up "$reject_ws" --extra-mount "$data_dir"; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up copy rejects host-only extra mount at /workspace"
         else
@@ -3888,7 +3912,7 @@ test_up_project_workflow() {
     mount_inst_name=${mount_ws##*/}
     mount_inst_name=${mount_inst_name//[!a-zA-Z0-9_-]/-}
 
-    if coop up "$mount_ws" --mount --no-agents --no-devcontainer; then
+    if coop up "$mount_ws" --mount --no-agents; then
         STARTED_INSTANCES+=("$mount_inst_name")
         pass "up mount creates project instance"
     else
@@ -3925,7 +3949,7 @@ test_up_project_workflow() {
     unset GUEST_INSTANCE
 
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up "$mount_ws" --mount --no-devcontainer; then
+    if coop up "$mount_ws" --mount; then
         pass "up mount re-run exits 0 while running"
     else
         fail "up mount re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -3950,7 +3974,7 @@ test_new_instance_sibling() {
     shift 3
 
     STARTED_INSTANCES+=("$sibling")
-    if coop up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer; then
+    if coop up "$@" --new-instance --name "$sibling" --no-agents; then
         pass "--new-instance creates sibling $sibling"
     else
         fail "--new-instance creates sibling $sibling" "$HARNESS_ERR"
@@ -3969,14 +3993,14 @@ test_new_instance_sibling() {
         fail "$original and $sibling have independent guest state" "$(guest_stderr)"
     fi
 
-    if coop_fails up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer &&
+    if coop_fails up "$@" --new-instance --name "$sibling" --no-agents &&
             [[ "$HARNESS_ERR" == *"Instance '$sibling' already exists"* ]]; then
         pass "--new-instance rejects duplicate name $sibling"
     else
         fail "--new-instance rejects duplicate name $sibling" "$HARNESS_ERR"
     fi
 
-    if coop_fails up "$@" --no-agents --no-devcontainer &&
+    if coop_fails up "$@" --no-agents &&
             [[ "$HARNESS_ERR" == *"$ambiguity"* &&
                "$HARNESS_ERR" == *"$original"* && "$HARNESS_ERR" == *"$sibling"* ]]; then
         pass "plain up reports ambiguity between $original and $sibling"
@@ -4006,12 +4030,12 @@ test_git_repo() {
     # no VM boot).
     local some_dir
     some_dir=$(mktemp -d "$tmpdir/gitrepo-dir-XXXXXX")
-    if coop_fails up "$some_dir" --git-repo "$repo_url" --no-devcontainer; then
+    if coop_fails up "$some_dir" --git-repo "$repo_url"; then
         pass "up --git-repo conflicts with a positional directory"
     else
         fail "up --git-repo conflicts with a positional directory" "should have failed"
     fi
-    if coop_fails up --git-repo "$repo_url" --mount --no-devcontainer; then
+    if coop_fails up --git-repo "$repo_url" --mount; then
         pass "up --git-repo conflicts with --mount"
     else
         fail "up --git-repo conflicts with --mount" "should have failed"
@@ -4019,9 +4043,8 @@ test_git_repo() {
     rm -rf "$some_dir"
 
     # --extra-mount targeting /workspace collides with the clone; rejected
-    # before boot (--no-devcontainer avoids remote devcontainer discovery).
     if coop_fails up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/workspace" --no-agents --no-devcontainer; then
+            --extra-mount "$data_dir:/workspace" --no-agents; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up --git-repo rejects --extra-mount at /workspace"
         else
@@ -4036,7 +4059,7 @@ test_git_repo() {
     # git-repo + extra-mount combination is the workspace-sync path that
     # regressed on Firecracker before this change.
     if coop up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/data" --no-agents --no-devcontainer; then
+            --extra-mount "$data_dir:/data" --no-agents; then
         STARTED_INSTANCES+=("$gr_instance")
         pass "up --git-repo creates an instance"
     else
@@ -4081,7 +4104,7 @@ test_git_repo() {
     # Re-running while the instance is up reuses it: exit 0, no new instance.
     local pre_list post_list
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up --git-repo "$repo_url" --name "$gr_instance" --no-devcontainer; then
+    if coop up --git-repo "$repo_url" --name "$gr_instance"; then
         pass "up --git-repo re-run exits 0 while running"
     else
         fail "up --git-repo re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -4184,7 +4207,7 @@ test_workspace_sync() {
     ) || fail "set up git repo in workspace tmpdir" "git init/commit failed"
 
     # Create instance for the workspace.
-    local args=(up "$ws_tmpdir" --name "$ws_instance" --no-agents --no-devcontainer)
+    local args=(up "$ws_tmpdir" --name "$ws_instance" --no-agents)
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$ws_instance")
         pass "up with workspace exits 0"
@@ -4321,7 +4344,7 @@ test_appledouble_sidecars() {
     fi
 
     if coop up "$repo_dir" --name "$ad_instance" --copy \
-        --no-agents --no-prompt --no-devcontainer; then
+        --no-agents --no-prompt; then
         STARTED_INSTANCES+=("$ad_instance")
         pass "up --copy with xattr-bearing repo exits 0"
     else
@@ -4543,7 +4566,7 @@ test_multi_instance() {
     mkdir -p "$ws_a"
 
     # Create two instances from the same project directory.
-    if coop up "$ws_a" --name "$inst_a" --no-agents --no-devcontainer; then
+    if coop up "$ws_a" --name "$inst_a" --no-agents; then
         STARTED_INSTANCES+=("$inst_a")
         pass "up creates instance A ($inst_a)"
     else
@@ -4654,7 +4677,7 @@ test_named_images() {
     local inst_name="${INSTANCE}-img"
     local img_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$img_ws"
-    if coop up "$img_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
+    if coop up "$img_ws" --name "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --image $img_name exits 0"
     else
@@ -4745,7 +4768,7 @@ CFGEOF
     local inst_name="${INSTANCE}-custom"
     local custom_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$custom_ws"
-    if "$BINARY" --config "$cfg_file" up "$custom_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$custom_img" 2>"$tmpdir/stderr"; then
+    if "$BINARY" --config "$cfg_file" up "$custom_ws" --name "$inst_name" --no-agents --image "$custom_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with custom profile image exits 0"
     else
@@ -4899,7 +4922,7 @@ test_builtin_profile_plugins() {
     local inst_name="${INSTANCE}-profile-plugins"
     local prof_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$prof_ws"
-    if coop up "$prof_ws" --name "$inst_name" --image "$img_name" --no-devcontainer; then
+    if coop up "$prof_ws" --name "$inst_name" --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with c,rust profile image exits 0"
     else
@@ -4953,7 +4976,7 @@ test_host_mount() {
     echo "nested-mount" > "$mount_dir/subdir/deep.txt"
 
     # Create instance with project mount at /workspace
-    if coop up "$mount_dir" --name "$mount_instance" --no-agents --no-devcontainer --mount; then
+    if coop up "$mount_dir" --name "$mount_instance" --no-agents --mount; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "up --mount exits 0"
     else
@@ -5100,7 +5123,7 @@ test_host_mount_custom_guest_path() {
     local project_dir="$tmpdir/${mount_instance}-ws"
     mkdir -p "$project_dir"
     # Mount with explicit guest path
-    if coop up "$project_dir" --name "$mount_instance" --no-agents --no-devcontainer --extra-mount "$mount_dir:/data/project"; then
+    if coop up "$project_dir" --name "$mount_instance" --no-agents --extra-mount "$mount_dir:/data/project"; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "up with --extra-mount host:guest exits 0"
     else
@@ -5146,7 +5169,7 @@ test_port_forwards() {
     local fwd_ws="$tmpdir/${fwd_instance}-ws"
     mkdir -p "$fwd_ws"
 
-    if coop up "$fwd_ws" --name "$fwd_instance" --no-agents --no-devcontainer --forward-port "${guest_port}:${host_port}"; then
+    if coop up "$fwd_ws" --name "$fwd_instance" --no-agents --forward-port "${guest_port}:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance")
         pass "up with --forward-port exits 0"
     else
@@ -5200,7 +5223,7 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
     local fwd_instance2="${INSTANCE}-fwd2"
     local fwd_ws2="$tmpdir/${fwd_instance2}-ws"
     mkdir -p "$fwd_ws2"
-    if coop up "$fwd_ws2" --name "$fwd_instance2" --no-agents --no-devcontainer --forward-port "9999:${host_port}"; then
+    if coop up "$fwd_ws2" --name "$fwd_instance2" --no-agents --forward-port "9999:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance2")
         fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
         coop destroy "$fwd_instance2" 2>/dev/null || true
@@ -5293,13 +5316,13 @@ test_destroy_all() {
     local ws_y="$tmpdir/${inst_y}-ws"
     mkdir -p "$ws_x" "$ws_y"
 
-    if ! coop up "$ws_x" --name "$inst_x" --no-agents --no-devcontainer; then
+    if ! coop up "$ws_x" --name "$inst_x" --no-agents; then
         fail "up instance for destroy --all" "exit code: $?"
         return
     fi
     STARTED_INSTANCES+=("$inst_x")
 
-    if ! coop up "$ws_y" --name "$inst_y" --no-agents --no-devcontainer; then
+    if ! coop up "$ws_y" --name "$inst_y" --no-agents; then
         fail "up second instance for destroy --all" "exit code: $?"
         coop destroy "$inst_x" 2>/dev/null || true
         return
@@ -5397,7 +5420,7 @@ CFGEOF
 
     # Create the instance WITH bootstrap. The stub claude handles
     # `marketplace add` calls. Unset tokens to avoid auth steps.
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up "$mp_ws" --name "$mp_instance" --image "$mp_img" --no-devcontainer 2>"$tmpdir/stderr"; then
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up "$mp_ws" --name "$mp_instance" --image "$mp_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$mp_instance")
         pass "up with local marketplace exits 0"
     else
@@ -5579,7 +5602,7 @@ CFGEOF
 
     local cd_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$cd_ws"
-    if cs up "$cd_ws" --name "$inst_name" --no-devcontainer; then
+    if cs up "$cd_ws" --name "$inst_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with config_dir exits 0"
     else
@@ -5851,7 +5874,7 @@ CFGEOF
 
     # `coop shell` must run with this config file: config-block `guest_env`
     # literals are re-derived from `config.toml` on each command (only CLI
-    # `--env` and devcontainer entries are persisted to `guest_env.json`).
+    # `--env` entries are persisted to `guest_env.json`).
     # A bare `coop shell` would load the default config and never see them.
     # `RUST_LOG=off` keeps tracing out of captured stdout, mirroring
     # `guest_exec`; stderr lands in the shared guest_stderr file.
@@ -5864,7 +5887,7 @@ CFGEOF
 
     local ge_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$ge_ws"
-    if ge up "$ge_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+    if ge up "$ge_ws" --name "$inst_name" --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with [guest_env] config exits 0"
     else
@@ -5978,7 +6001,7 @@ CFGEOF
 
     local lm_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$lm_ws"
-    if lm up "$lm_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+    if lm up "$lm_ws" --name "$inst_name" --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up for model test exits 0"
     else
@@ -6198,7 +6221,7 @@ CFGEOF
     local px_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$px_ws"
     # Proxy mode is wired during AGENT bootstrap, so this must NOT be --no-agents.
-    if px up "$px_ws" --name "$inst_name" --no-devcontainer; then
+    if px up "$px_ws" --name "$inst_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up in proxy mode exits 0"
     else
@@ -6516,7 +6539,7 @@ test_interrupted_setup() {
     local inst_name="${INSTANCE}-recovery"
     local recovery_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$recovery_ws"
-    if coop up "$recovery_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img"; then
+    if coop up "$recovery_ws" --name "$inst_name" --no-agents --image "$img"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up from recovered image exits 0"
     else
@@ -6540,476 +6563,6 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
-# ── devcontainer.json translator (pre-VM + --full) ────────────
-
-# Write a sample devcontainer.json into $1/.devcontainer/devcontainer.json.
-# Exercises JSONC features (comments + trailing commas) so the integration
-# run also catches parser regressions, not just the unit tests.
-_write_devcontainer() {
-    local dir="$1"
-    mkdir -p "$dir/.devcontainer"
-    cat > "$dir/.devcontainer/devcontainer.json" <<'EOF'
-{
-    // sample devcontainer.json — coop reads a subset.
-    "name": "coop-it-demo",
-    "image": "ubuntu:22.04",
-    "hostRequirements": {
-        "cpus": 2,
-        "memory": "1GiB",
-    },
-    "containerEnv": {
-        "COOP_TEST_DEVCONTAINER": "applied",
-    },
-    "forwardPorts": [3000],
-    "postStartCommand": "echo dc-hooked > /tmp/coop-dc-marker",
-    "remoteUser": "root",
-}
-EOF
-}
-
-test_devcontainer_translator() {
-    echo ""
-    echo "=== Phase: devcontainer.json translator (dry-run) ==="
-
-    local dcdir="$tmpdir/devcontainer-ws"
-    _write_devcontainer "$dcdir"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-
-    # --dry-run with auto-discovery: report is printed to stderr, no VM work.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-dry" --dry-run --no-agents; then
-        pass "up ... --dry-run exits 0"
-    else
-        fail "up ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    # Report content lands on stderr (per the CLAUDE.md "tracing → stderr" rule).
-    if grep -q "hostRequirements.cpus" <<< "$HARNESS_ERR" \
-        && grep -q "applied" <<< "$HARNESS_ERR"; then
-        pass "dry-run report covers hostRequirements"
-    else
-        fail "dry-run report covers hostRequirements" "stderr: $HARNESS_ERR"
-    fi
-
-    # JSONC: the file uses //-comments and trailing commas; parser must accept.
-    if grep -q "containerEnv" <<< "$HARNESS_ERR"; then
-        pass "JSONC (comments + trailing commas) parses"
-    else
-        fail "JSONC (comments + trailing commas) parses" "stderr: $HARNESS_ERR"
-    fi
-
-    # `remoteUser: "root"` is rejected by the GuestUser validator
-    # (coop requires an unprivileged uid-1000 account), so the report
-    # row for `remoteUser` must specifically read "invalid" — not
-    # "unsupported" (which other rows like `image` carry, so a fuzzy
-    # whole-buffer grep would pass by coincidence).
-    if grep "remoteUser" <<< "$HARNESS_ERR" | grep -q "invalid"; then
-        pass "remoteUser=root is reported invalid"
-    else
-        fail "remoteUser=root is reported invalid" "stderr: $HARNESS_ERR"
-    fi
-
-    # Dedicated check command: validates the same file without discovery,
-    # config loading, setup, or VM work.
-    if coop devcontainer check "$dcfile" --stage both; then
-        pass "devcontainer check exits 0"
-    else
-        fail "devcontainer check exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "setup-stage translation:" <<< "$HARNESS_ERR" \
-        && grep -q "start-stage translation:" <<< "$HARNESS_ERR" \
-        && grep -q "remoteUser" <<< "$HARNESS_ERR"; then
-        pass "devcontainer check reports setup and start stages"
-    else
-        fail "devcontainer check reports setup and start stages" "stderr: $HARNESS_ERR"
-    fi
-
-    local oci_bad="$tmpdir/devcontainer-oci-bad.json"
-    cat > "$oci_bad" <<'EOF'
-{
-  "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {
-      "version": { "nested": true }
-    }
-  }
-}
-EOF
-    if coop devcontainer check "$oci_bad" --stage setup; then
-        pass "devcontainer check handles invalid OCI feature options"
-    else
-        fail "devcontainer check handles invalid OCI feature options" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "features.ghcr.io/devcontainers/features/github-cli:1" <<< "$HARNESS_ERR" \
-        && grep -q "invalid" <<< "$HARNESS_ERR" \
-        && grep -q "must be a string" <<< "$HARNESS_ERR"; then
-        pass "invalid OCI feature options are reported loudly"
-    else
-        fail "invalid OCI feature options are reported loudly" "stderr: $HARNESS_ERR"
-    fi
-
-    # --no-devcontainer silently skips the file: the report header must NOT appear.
-    # `--dry-run` lets us exercise the discovery path without any VM work.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-skip" \
-        --no-devcontainer --dry-run --no-agents; then
-        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            fail "--no-devcontainer suppresses discovery" "report header still appeared: $HARNESS_ERR"
-        else
-            pass "--no-devcontainer suppresses discovery"
-        fi
-    else
-        fail "--no-devcontainer suppresses discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    local pref_cfg="$tmpdir/devcontainer-pref-config.toml"
-    local pref_data="$tmpdir/devcontainer-pref-data"
-    mkdir -p "$pref_data"
-    cat > "$pref_cfg" <<EOF
-data_dir = "$pref_data"
-EOF
-
-    if coop --config "$pref_cfg" devcontainer ignore "$dcdir"; then
-        pass "devcontainer ignore records persistent opt-out"
-    else
-        fail "devcontainer ignore records persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" devcontainer status "$dcdir" \
-        && grep -q "disabled" <<< "$HARNESS_OUT" \
-        && grep -q "$dcdir" <<< "$HARNESS_OUT"; then
-        pass "devcontainer status reports project opt-out"
-    else
-        fail "devcontainer status reports project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref" \
-        --dry-run --no-agents; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips discovery"
-        else
-            fail "stored devcontainer opt-out skips discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" setup --workspace "$dcdir" --dry-run; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "setup-stage translation" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips setup --workspace dry-run discovery"
-        else
-            fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" start --workspace "$dcdir" --dry-run; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "start-stage translation" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips start --workspace dry-run discovery"
-        else
-            fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-explicit" \
-        --devcontainer "$dcfile" --dry-run --no-agents; then
-        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            pass "explicit --devcontainer bypasses stored opt-out"
-        else
-            fail "explicit --devcontainer bypasses stored opt-out" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "explicit --devcontainer bypasses stored opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" devcontainer clear "$dcdir"; then
-        pass "devcontainer clear removes persistent opt-out"
-    else
-        fail "devcontainer clear removes persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    local stale_ws
-    stale_ws=$(mktemp -d "$tmpdir/devcontainer-stale-XXXXXX")
-    _write_devcontainer "$stale_ws"
-    if coop --config "$pref_cfg" devcontainer ignore "$stale_ws"; then
-        rm -rf "$stale_ws"
-        if coop --config "$pref_cfg" devcontainer clear "$stale_ws" \
-            && grep -q "Cleared devcontainer opt-out" <<< "$HARNESS_OUT"; then
-            pass "devcontainer clear removes stale deleted-project opt-out"
-        else
-            fail "devcontainer clear removes stale deleted-project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "devcontainer clear removes stale deleted-project opt-out" "ignore failed: $HARNESS_ERR"
-    fi
-
-    if coop_fails --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-cleared" --no-agents; then
-        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
-            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
-            pass "cleared devcontainer opt-out restores non-TTY prompt error"
-        else
-            fail "cleared devcontainer opt-out restores non-TTY prompt error" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "cleared devcontainer opt-out restores non-TTY prompt error" "expected non-zero exit"
-    fi
-
-    # Non-interactive + discovered file + no escape hatch must error with the
-    # hint pointing at --devcontainer / --no-devcontainer.
-    if coop_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then
-        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
-            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
-            pass "non-TTY without escape hatch errors with hint"
-        else
-            fail "non-TTY without escape hatch errors with hint" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "non-TTY without escape hatch errors with hint" "expected non-zero exit"
-    fi
-
-    # CLI overrides devcontainer.json values — report should mark cpus as
-    # "overridden" with source = CLI.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-override" \
-        --vcpus 8 --dry-run --no-agents; then
-        pass "up --dry-run with overriding CLI flag exits 0"
-    else
-        fail "up --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
-        return
-    fi
-    if grep "hostRequirements.cpus" <<< "$HARNESS_ERR" | grep -q "overridden"; then
-        pass "CLI --vcpus is reported as overriding devcontainer.json"
-    else
-        fail "CLI --vcpus is reported as overriding devcontainer.json" "stderr: $HARNESS_ERR"
-    fi
-}
-
-# ── devcontainer.json apply (--full only) ─────────────────────
-
-test_devcontainer_apply() {
-    echo ""
-    echo "=== Phase: devcontainer.json apply (--full) ==="
-
-    local dcdir="$tmpdir/devcontainer-apply-ws"
-    _write_devcontainer "$dcdir"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-    local inst_name="${INSTANCE}-dc-apply"
-
-    # Use explicit --devcontainer to skip the prompt in CI.
-    if coop up "$dcdir" --name "$inst_name" \
-        --devcontainer "$dcfile" --no-agents; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up with --devcontainer exits 0"
-    else
-        fail "up with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$inst_name"
-
-    # containerEnv must reach the guest as a literal env var.
-    local seen_env
-    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
-    if [[ "$seen_env" == "applied" ]]; then
-        pass "containerEnv reached the guest"
-    else
-        fail "containerEnv reached the guest" "got: '$seen_env'"
-    fi
-
-    # postStartCommand must have written the marker.
-    local seen_marker
-    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
-    if [[ "$seen_marker" == *dc-hooked* ]]; then
-        pass "postStartCommand ran in the guest"
-    else
-        fail "postStartCommand ran in the guest" "marker contents: '$seen_marker'"
-    fi
-
-    cat > "$dcfile" <<'EOF'
-{
-    "name": "coop-it-demo-changed",
-    "hostRequirements": {
-        "cpus": 4,
-        "memory": "2GiB"
-    },
-    "containerEnv": {
-        "COOP_TEST_DEVCONTAINER": "changed"
-    },
-    "forwardPorts": [3001],
-    "postStartCommand": "echo changed > /tmp/coop-dc-marker",
-    "remoteUser": "root"
-}
-EOF
-
-    if coop stop "$inst_name"; then
-        pass "stop devcontainer apply instance exits 0"
-    else
-        fail "stop devcontainer apply instance exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop start --workspace "$dcdir" --no-agents; then
-        pass "start --workspace after devcontainer change exits 0"
-    else
-        fail "start --workspace after devcontainer change exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "devcontainer.json changed" <<< "$HARNESS_ERR" \
-        && grep -q "Destroy and recreate" <<< "$HARNESS_ERR" \
-        && grep -q "features, hostRequirements, mounts" <<< "$HARNESS_ERR" \
-        && grep -q "not re-applied automatically" <<< "$HARNESS_ERR"; then
-        pass "changed devcontainer warning is informational"
-    else
-        fail "changed devcontainer warning is informational" "stderr: $HARNESS_ERR"
-    fi
-
-    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
-    if [[ "$seen_env" == "applied" ]]; then
-        pass "changed containerEnv is not re-applied on restart"
-    else
-        fail "changed containerEnv is not re-applied on restart" "got: '$seen_env'"
-    fi
-
-    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
-    if [[ "$seen_marker" != *changed* ]]; then
-        pass "changed postStartCommand is not re-applied on restart"
-    else
-        fail "changed postStartCommand is not re-applied on restart" "marker contents: '$seen_marker'"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-}
-
-# Exercise host SSH isolation with a project-controlled PATH and fake ssh.
-# The payload must remain inert on the host while the real SSH client reaches
-# the guest with the translated PATH.
-test_devcontainer_host_ssh_isolation() {
-    echo ""
-    echo "=== Phase: devcontainer host SSH isolation (--full) ==="
-
-    local poc_ws="$tmpdir/devcontainer-host-ssh-poc"
-    local poc_bin="$poc_ws/poc-bin"
-    local marker="$tmpdir/devcontainer-host-ssh-marker"
-    local inst_name="${INSTANCE}-dc-host-ssh"
-    local config_args=()
-    if [[ -n "${SUITE_CONFIG:-}" ]]; then
-        config_args=(--config "$SUITE_CONFIG")
-    fi
-
-    mkdir -p "$poc_ws/.devcontainer" "$poc_bin"
-    cat > "$poc_ws/.devcontainer/devcontainer.json" <<'EOF'
-{
-    "containerEnv": {
-        "PATH": "./poc-bin:/usr/local/bin:/usr/bin:/bin"
-    }
-}
-EOF
-    cat > "$poc_bin/ssh" <<'EOF'
-#!/bin/sh
-printf 'project-controlled host ssh executed\n' > "$COOP_TEST_HOST_SSH_MARKER"
-exit 73
-EOF
-    chmod 700 "$poc_bin/ssh"
-
-    local up_out="$tmpdir/devcontainer-host-ssh-up.out"
-    local up_err="$tmpdir/devcontainer-host-ssh-up.err"
-    if (
-        cd "$poc_ws"
-        "$BINARY" "${config_args[@]}" up . --name "$inst_name" \
-            --devcontainer .devcontainer/devcontainer.json --no-agents --no-prompt
-    ) >"$up_out" 2>"$up_err"; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "host SSH isolation fixture up exits 0"
-    else
-        fail "host SSH isolation fixture up exits 0" "stderr: $(cat "$up_err")"
-        return
-    fi
-
-    local shell_out="$tmpdir/devcontainer-host-ssh-shell.out"
-    local shell_err="$tmpdir/devcontainer-host-ssh-shell.err"
-    if (
-        cd "$poc_ws"
-        COOP_TEST_HOST_SSH_MARKER="$marker" RUST_LOG=off \
-            "$BINARY" "${config_args[@]}" shell "$inst_name" -- \
-            /usr/bin/printf guest-command-ran
-    ) >"$shell_out" 2>"$shell_err" \
-        && grep -qF "guest-command-ran" "$shell_out" \
-        && [[ ! -e "$marker" ]]; then
-        pass "project PATH cannot replace the host SSH client"
-    else
-        fail "project PATH cannot replace the host SSH client" \
-            "marker: $(test -e "$marker" && echo created || echo absent); stdout: $(cat "$shell_out"); stderr: $(cat "$shell_err")"
-    fi
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-}
-
-# ── OCI devcontainer feature install (--full only) ────────────
-
-# Resolve a real public GHCR devcontainer Feature, bake it into the image,
-# and assert the tool it installs is present and runnable in the guest. This
-# is the end-to-end counterpart to the invalid-options error path exercised
-# in test_devcontainer_translator (which only runs `devcontainer check`).
-test_devcontainer_oci_feature() {
-    echo ""
-    echo "=== Phase: OCI devcontainer feature install (--full) ==="
-
-    local dcdir="$tmpdir/devcontainer-oci-ws"
-    mkdir -p "$dcdir/.devcontainer"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-    local inst_name="${INSTANCE}-dc-oci"
-
-    # github-cli is a small public Feature on ghcr.io that installs `gh` to
-    # /usr/local/bin. Pinning the major tag keeps the resolved digest stable.
-    cat > "$dcfile" <<'EOF'
-{
-    "name": "coop-it-oci-feature",
-    "features": {
-        "ghcr.io/devcontainers/features/github-cli:1": {}
-    }
-}
-EOF
-
-    # Use explicit --devcontainer to skip the prompt in CI. Feature resolution
-    # and bake happen during `up`; a network failure reaching ghcr.io would
-    # surface here.
-    if coop up "$dcdir" --name "$inst_name" \
-        --devcontainer "$dcfile" --no-agents; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up with OCI feature exits 0"
-    else
-        fail "up with OCI feature exits 0" "exit code: $? stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$inst_name"
-
-    # The feature's install.sh must have placed `gh` on PATH in the guest.
-    if guest_exec command -v gh >/dev/null 2>&1; then
-        pass "gh is on PATH in the guest"
-    else
-        fail "gh is on PATH in the guest" "stderr: $(guest_stderr)"
-    fi
-
-    # The installed tool must be runnable, not just present.
-    local gh_version
-    if gh_version=$(guest_exec gh --version 2>/dev/null) \
-        && [[ "$gh_version" == *"gh version"* ]]; then
-        pass "gh runs in the guest"
-    else
-        fail "gh runs in the guest" "got: '$gh_version' stderr: $(guest_stderr)"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-}
-
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -7023,7 +6576,7 @@ test_post_start() {
     # The marker file written by the hook is the assertion.
     local post_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$post_ws"
-    if coop up "$post_ws" --name "$inst_name" --no-agents --no-devcontainer \
+    if coop up "$post_ws" --name "$inst_name" --no-agents \
         --post-start "echo hooked > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
@@ -7047,7 +6600,7 @@ test_post_start() {
     local fail_inst="${INSTANCE}-poststart-fail"
     local fail_ws="$tmpdir/${fail_inst}-ws"
     mkdir -p "$fail_ws"
-    if coop up "$fail_ws" --name "$fail_inst" --no-agents --no-devcontainer \
+    if coop up "$fail_ws" --name "$fail_inst" --no-agents \
         --post-start "false; exit 1"; then
         STARTED_INSTANCES+=("$fail_inst")
         pass "up succeeds when --post-start fails (warn-and-continue)"
@@ -7103,6 +6656,23 @@ test_provision_failure() {
     fi
 }
 
+# ── Removed devcontainer CLI (pre-VM) ─────────────────────────
+
+test_removed_devcontainer_cli() {
+    echo ""
+    echo "=== Phase: removed devcontainer CLI ==="
+    if coop_fails devcontainer check missing.json; then
+        pass "devcontainer subcommand is rejected"
+    else
+        fail "devcontainer subcommand is rejected" "unexpectedly accepted"
+    fi
+    if coop_fails up --devcontainer missing.json; then
+        pass "up --devcontainer is rejected"
+    else
+        fail "up --devcontainer is rejected" "unexpectedly accepted"
+    fi
+}
+
 # ── Guest user CLI validation (pre-VM) ────────────────────────
 
 test_guest_user_validation() {
@@ -7111,14 +6681,14 @@ test_guest_user_validation() {
 
     # `root` is rejected by the GuestUser validator: coop requires an
     # unprivileged uid-1000 account.
-    if coop_fails setup -y --guest-user root --dry-run; then
+    if coop_fails setup -y --guest-user root; then
         pass "setup --guest-user root is rejected"
     else
         fail "setup --guest-user root is rejected" "should have failed"
     fi
 
     # Uppercase and other non-POSIX-portable characters are rejected.
-    if coop_fails setup -y --guest-user Vscode --dry-run; then
+    if coop_fails setup -y --guest-user Vscode; then
         pass "setup --guest-user with uppercase rejected"
     else
         fail "setup --guest-user with uppercase rejected" "should have failed"
@@ -7174,7 +6744,7 @@ test_guest_user_alt() {
     # here on purpose; coop must read the persisted value.
     local alt_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$alt_ws"
-    if coop up "$alt_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
+    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up (alt-user image) exits 0"
     else
@@ -7338,7 +6908,7 @@ EOF
     test_mem_floor
     test_profiles_cli
     test_completions
-    test_devcontainer_translator
+    test_removed_devcontainer_cli
     test_guest_user_validation
 
     # Setup + primary instance
@@ -7415,9 +6985,6 @@ EOF
         test_builtin_profiles
         test_builtin_profile_plugins
         test_post_start
-        test_devcontainer_apply
-        test_devcontainer_host_ssh_isolation
-        test_devcontainer_oci_feature
 
         # Local marketplace directory copy
         test_local_marketplace

@@ -44,8 +44,7 @@ exclude_globs = [
   "src/vm.rs",
   # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
   "src/main.rs",
-  # Interactive y/N + free-form line prompts (confirm / confirm_default_yes /
-  # read_line). Every function short-circuits to Ok(false)/Ok(None) off a TTY
+  # Interactive prompts (confirm / read_line) short-circuit off a TTY
   # and otherwise reads stdin; the trailing match on the reply is only
   # reachable behind a real terminal, so a `--lib` test cannot observe any of
   # it. Whole-module exclude (cf. read_line added for #352, issue #373).
@@ -96,8 +95,6 @@ exclude_re = [
   "\\bdiscover_from_pasted_token\\b",
   # gh_auth_token is a pure `gh auth token` shell-out that delegates trimming
   # to parse_gh_token (#322, kept). Exclude only its whole-body replacement;
-  # this module-agnostic pattern also covers the identical gh_auth_token in
-  # git_repo_devcontainer.rs (whose logic lives in normalize_token, kept).
   "replace gh_auth_token ->",
   # Thin wrappers whose logic was extracted in #322: run_status just renders
   # build_status(...) as JSON or text (kept helpers below); probe_user_login
@@ -131,10 +128,10 @@ exclude_re = [
   "\\brefresh_ssh_config_if_present\\b",
   "\\bupdate_ssh_config\\b",
   # The bare `push`/`pull` free functions live in workspace.rs; anchor on the
-  # file so Report::push in devcontainer.rs (testable report logic) is kept.
+  # file so other push/pull methods stay in scope.
   "src/workspace\\.rs:.*\\bpush\\b",
   "src/workspace\\.rs:.*\\bpull\\b",
-  # WorkspaceState persistence IO (same treatment as DevcontainerState).
+  # WorkspaceState persistence IO.
   "WorkspaceState::save",
   "WorkspaceState::try_load",
   # $HOME-resolving wrappers split out in #324; the read/clean/gated-write
@@ -142,14 +139,6 @@ exclude_re = [
   # the `_at` suffix defeating the `\b` boundary) and remove_named_marker_block.
   "\\bremove_all_ssh_config\\b",
   "\\bremove_ssh_config\\b",
-
-  # devcontainer.rs — persistence IO and NotFound guards; tracing-only warn.
-  "DevcontainerPreferences::load",
-  "ParsedDevcontainer::load",
-  "AppliedDevcontainer::current_hash",
-  "DevcontainerState::save",
-  "DevcontainerState::try_load",
-  "\\bwarn_if_applied_devcontainer_changed\\b",
 
   # secret_store.rs — $PATH probes and the macOS keychain write. The macOS
   # `find-generic-password` arm of CmdToken::from_words is compiled out on the
@@ -200,8 +189,8 @@ exclude_re = [
   # THOSE is a real coverage gap. NOT a blanket `src/commands/**` exclude.
 
   # All `coop <subcommand>` dispatch entrypoints across the command modules
-  # (lifecycle.rs, admin.rs, github.rs, profiles.rs, quickstart.rs,
-  # commands/devcontainer.rs). Every `cmd_*` only parses the dispatch and
+  # (lifecycle.rs, admin.rs, github.rs, profiles.rs, quickstart.rs).
+  # Every `cmd_*` only parses the dispatch and
   # shells out to a backend; whole-body `-> Ok(())` mutants are unobservable.
   "\\bcmd_[a-z_]+\\b",
 
@@ -238,13 +227,8 @@ exclude_re = [
   # current_disk_gib stats the disk image; its `/ 1 GiB` arithmetic kernel
   # is extracted into bytes_to_gib (kept in scope, unit-tested).
   "\\bcurrent_disk_gib\\b",
-  # instance_status (#385) runs as_running + query_resource_usage (SSH) to
-  # assemble the `status --json` shape; emit_up_dry_run (#385) drives the
-  # devcontainer collector + persisted_guest_user and renders the dry-run
-  # plan. Their pure inputs — InstanceState::from_running, BackendKind::of,
-  # up_translator_inputs — stay in scope and are unit-tested.
+  # instance_status (#385) queries usage over SSH.
   "\\binstance_status\\b",
-  "\\bemit_up_dry_run\\b",
 
   # ---- src/commands/json.rs (#385): --json output ----
   # render_json is the single stdout JSON writer; a `--lib` test cannot
@@ -289,29 +273,13 @@ exclude_re = [
   "\\bwrite_profiles_list\\b",
   "\\bwrite_profile_show\\b",
 
-  # commands/devcontainer.rs — discovery + interactive prompt + stderr report.
-  # The pure guard (discovered_local_devcontainer) and the assumed-guest-user
-  # helper stay in scope. resolve_oci_feature_requests drives the OCI feature
-  # resolver (network/registry) so its effects aren't `--lib`-observable.
-  # resolve_devcontainer (stderr wrapper) and resolve_devcontainer_collect
-  # (the quiet collector it delegates to, #385) both discover + prompt +
-  # drive the OCI resolver; \b leaves the pure discovered_local_devcontainer
-  # guard alone. check_render_json (#385) drives the collector and builds
-  # TranslatorInputs inline, so it carries an in-source `#[mutants::skip]`
-  # (see the TranslatorInputs note below), not an entry here.
-  "\\bresolve_devcontainer\\b",
-  "\\bresolve_devcontainer_collect\\b",
-  "\\bmaybe_skip_stored_devcontainer_opt_out\\b",
-  "\\bmaybe_record_devcontainer_opt_out\\b",
-  "\\bresolve_oci_feature_requests\\b",
-
   # quickstart.rs — cwd/TTY prompt resolution. is_sensitive_workspace (pure)
-  # stays in scope and is tested. quickstart_fresh_start is scoped out via an
-  # in-source `#[mutants::skip]` (see the TranslatorInputs note below).
+  # stays in scope and is tested. quickstart_fresh_start has an
+  # in-source `#[mutants::skip]` for backend orchestration.
   "\\bresolve_quickstart_workspace\\b",
 
   # lib.rs shim — tracing-subscriber install. (The `run` dispatch is scoped
-  # out via an in-source `#[mutants::skip]`; see the TranslatorInputs note.)
+  # out via an in-source `#[mutants::skip]`.)
   "\\binit_tracing\\b",
 
   # ---- coop model (#352): local/cloud model switch ----
@@ -406,18 +374,4 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
 
-  # NOTE on `delete field … from struct …` mutants: cargo-mutants (27.x) does
-  # not honour exclude_re for these — the regex never matches their name (not
-  # by function, struct path, or even file:line). They are emitted only where
-  # a struct literal uses `..Default::default()`. In this crate that is
-  # `devcontainer::TranslatorInputs`, assembled in four places:
-  #   * up_translator_inputs (lifecycle.rs) — pure builder, KEPT in scope and
-  #     unit-tested (up_translator_inputs_maps_opts), which kills its
-  #     field-deletion mutants.
-  #   * run (lib.rs), cmd_devcontainer_check, check_render_json (#385),
-  #     quickstart_fresh_start — these are dispatch/shell-out handlers whose
-  #     assembled inputs only become observable once the (excluded) translator
-  #     + a real VM consume them, so a `--lib` test cannot kill the
-  #     field-deletions. Because exclude_re is powerless here, those carry an
-  #     in-source `#[mutants::skip]` with a back-reference to this note.
 ]

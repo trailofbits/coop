@@ -10,17 +10,13 @@ mod cmd;
 mod commands;
 mod completions;
 pub mod config;
-mod devcontainer;
-mod devcontainer_oci;
 mod fs_util;
-mod git_repo_devcontainer;
 mod github_assignment;
 mod github_pat;
 pub mod github_repo;
 mod github_submodules;
 mod guest;
 mod guest_env_state;
-pub mod jsonc;
 mod model_state;
 mod naming;
 mod pat_prompt;
@@ -65,25 +61,22 @@ mod update;
 mod vm;
 mod workspace;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
-use commands::json;
 use commands::{
-    AgentUpdateOpts, DevcontainerInput, DevcontainerOpts, ProfileImageTarget, ProjectTransport,
-    QuickstartOpts, ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts,
-    UninstallOpts, UpDevcontainerOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env,
-    apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy, cmd_devcontainer,
-    cmd_devcontainer_check, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model,
-    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
-    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
-    open_ssh_session, preflight_start_target, prepend_binary, resolve_devcontainer,
-    resolve_devcontainer_collect, resolve_running,
+    AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts, ReprovisionOpts,
+    ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
+    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy,
+    cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
+    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_ssh_session,
+    preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -200,19 +193,6 @@ enum Commands {
             value_parser = guest_env_state::parse_cli_env_arg,
         )]
         guest_env: Vec<(guest_env_state::EnvVarName, String)>,
-        /// Explicit path to a `devcontainer.json` to use (skips discovery).
-        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<PathBuf>,
-        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
-        #[arg(long)]
-        no_devcontainer: bool,
-        /// Translate `devcontainer.json` and print the report, then exit
-        /// before any VM work.
-        #[arg(long)]
-        dry_run: bool,
-        /// With --dry-run, emit the resolved plan as JSON on stdout
-        #[arg(long, requires = "dry_run")]
-        json: bool,
     },
     /// One-shot: ensure default image, start an instance for cwd, launch Claude.
     ///
@@ -224,9 +204,6 @@ enum Commands {
         /// Skip mounting the current directory as the workspace.
         #[arg(long)]
         no_workspace: bool,
-        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
-        #[arg(long)]
-        no_devcontainer: bool,
     },
     /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
     Setup {
@@ -267,12 +244,7 @@ enum Commands {
         )]
         image: config::ImageName,
         /// Guest username to create in the image (default: "ubuntu").
-        /// Baked into the image at setup time and immutable for its
-        /// lifetime — `start`/`shell`/`exec` read it from the image's
-        /// `template_config.json`. Use this when a workspace's
-        /// `devcontainer.json` declares a `remoteUser` other than
-        /// `ubuntu` (e.g. `vscode` for the Microsoft devcontainer base
-        /// images).
+        /// Baked into the image at setup time and immutable for its lifetime.
         #[arg(long, value_name = "NAME", value_parser = guest::GuestUser::parse)]
         guest_user: Option<guest::GuestUser>,
         /// Duration to wait for setup image build commands before timing
@@ -280,26 +252,6 @@ enum Commands {
         /// (e.g. `90s`, `30m`, `2h`).
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         builder_timeout: Option<Duration>,
-        /// Workspace directory to scan for `.devcontainer/devcontainer.json`.
-        /// When present (and `--no-devcontainer` is not set), coop offers to
-        /// apply the file's `features` and `hostRequirements` to this setup.
-        #[arg(long)]
-        workspace: Option<String>,
-        /// Explicit path to a `devcontainer.json` to use (skips discovery).
-        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<PathBuf>,
-        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
-        #[arg(long)]
-        no_devcontainer: bool,
-        /// Translate `devcontainer.json` and print the report, then exit
-        /// before doing any setup work.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Inspect devcontainer.json support without starting setup or a VM
-    Devcontainer {
-        #[command(subcommand)]
-        command: DevcontainerCommands,
     },
     /// Restart a stopped VM
     Start {
@@ -341,19 +293,6 @@ enum Commands {
             value_parser = guest_env_state::parse_cli_env_arg,
         )]
         guest_env: Vec<(guest_env_state::EnvVarName, String)>,
-        /// Explicit path to a `devcontainer.json` to use (skips discovery).
-        #[arg(long, value_name = "PATH", conflicts_with = "no_devcontainer")]
-        devcontainer: Option<PathBuf>,
-        /// Ignore any discovered `devcontainer.json` (escape hatch for CI).
-        #[arg(long)]
-        no_devcontainer: bool,
-        /// Translate `devcontainer.json` and print the report, then exit
-        /// before doing any VM work.
-        #[arg(long)]
-        dry_run: bool,
-        /// With --dry-run, emit the resolved plan as JSON on stdout
-        #[arg(long, requires = "dry_run")]
-        json: bool,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -923,46 +862,6 @@ enum ProxyAction {
     },
 }
 
-#[derive(Subcommand)]
-enum DevcontainerCommands {
-    /// Parse devcontainer.json and print coop's translation report.
-    Check {
-        /// Path to the devcontainer.json file to inspect
-        path: PathBuf,
-        /// Which lifecycle translation to report
-        #[arg(long, value_enum, default_value_t = DevcontainerCheckStage::Both)]
-        stage: DevcontainerCheckStage,
-        /// Emit machine-readable JSON on stdout instead of the text report on stderr
-        #[arg(long)]
-        json: bool,
-    },
-    /// Persistently ignore discovered devcontainer.json for a project.
-    Ignore {
-        /// Project directory whose discovered devcontainer.json should be ignored
-        project: PathBuf,
-    },
-    /// Show persistent devcontainer opt-outs.
-    Status {
-        /// Project directory to inspect; omitted lists every stored opt-out
-        project: Option<PathBuf>,
-    },
-    /// Clear a persistent devcontainer opt-out for a project.
-    Clear {
-        /// Project directory whose opt-out should be cleared
-        project: PathBuf,
-    },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum DevcontainerCheckStage {
-    /// Report setup-time keys such as features, hostRequirements, and remoteUser
-    Setup,
-    /// Report start-time keys such as postStartCommand, containerEnv, ports, and mounts
-    Start,
-    /// Report both setup and start translations
-    Both,
-}
-
 impl Commands {
     fn apply_github_override(&self, cfg: &mut config::CoopConfig) {
         if matches!(
@@ -1019,10 +918,8 @@ where
 /// failures, backend/VM operations, SSH, network, and filesystem errors all
 /// bubble up here for `main` to report.
 #[expect(clippy::too_many_lines, reason = "CLI dispatch — flat match arms")]
-// Scoped out of mutation testing: pure arg dispatch to the cmd_* handlers,
-// unobservable from a `--lib` test. exclude_re cannot suppress its
-// `delete field … from struct devcontainer::TranslatorInputs` mutants
-// (see the note in .cargo/mutants.toml), so skip the whole body here.
+// Backend dispatch and CLI output cannot be observed by library mutation tests.
+// Command tests cover argument parsing; integration tests cover execution.
 #[mutants::skip]
 pub fn run() -> Result<()> {
     // Dynamic shell completion: when invoked with COMPLETE=<shell>, compute
@@ -1111,12 +1008,6 @@ pub fn run() -> Result<()> {
         );
     }
 
-    if let Commands::Devcontainer { ref command } = cli.command
-        && matches!(command, DevcontainerCommands::Check { .. })
-    {
-        return cmd_devcontainer_check(command);
-    }
-
     let mut cfg = config::CoopConfig::load(&cli.config)?;
     private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     cli.command.apply_github_override(&mut cfg);
@@ -1151,10 +1042,6 @@ pub fn run() -> Result<()> {
             forward_port,
             post_start,
             guest_env,
-            devcontainer,
-            no_devcontainer,
-            dry_run,
-            json,
         } => {
             cfg.validate_and_warn()?;
             let transport = match (copy, mount) {
@@ -1194,26 +1081,12 @@ pub fn run() -> Result<()> {
                     post_start,
                     guest_env,
                 },
-                devcontainer: UpDevcontainerOpts {
-                    input: DevcontainerInput::from_flags(devcontainer, no_devcontainer),
-                    dry_run,
-                    json,
-                },
             };
             cmd_up(&be, &mut cfg, &cli.config, &opts)
         }
-        Commands::Quickstart {
-            no_workspace,
-            no_devcontainer,
-        } => cmd_quickstart(
-            &be,
-            &mut cfg,
-            &cli.config,
-            &QuickstartOpts {
-                no_workspace,
-                no_devcontainer,
-            },
-        ),
+        Commands::Quickstart { no_workspace } => {
+            cmd_quickstart(&be, &mut cfg, &cli.config, &QuickstartOpts { no_workspace })
+        }
         Commands::Setup {
             yes,
             vcpus,
@@ -1226,57 +1099,12 @@ pub fn run() -> Result<()> {
             image,
             guest_user,
             builder_timeout,
-            workspace,
-            devcontainer,
-            no_devcontainer,
-            dry_run,
         } => {
             cfg.validate_and_warn()?;
-            let ws_path = workspace.as_deref().map(Path::new);
-            let inputs = devcontainer::TranslatorInputs {
-                cli_vcpus: vcpus,
-                cli_mem_mib: mem,
-                cli_profiles: profile.clone(),
-                cli_guest_user: guest_user.clone(),
-                ..devcontainer::TranslatorInputs::default()
-            };
-            let dc_input = DevcontainerInput::from_flags(devcontainer, no_devcontainer);
-            let translation = resolve_devcontainer(
-                &DevcontainerOpts {
-                    input: &dc_input,
-                    dry_run,
-                    workspace: ws_path,
-                    mounts: &[],
-                    git_repo: None,
-                    github_auth: cfg.github.as_ref(),
-                    preference_path: Some(&cfg.devcontainer_preferences_path()),
-                },
-                &inputs,
-                devcontainer::Stage::Setup,
-            )?;
-            if dry_run {
-                return Ok(());
-            }
-            let mut profile = profile;
-            if let Some(t) = &translation {
-                for p in &t.profiles {
-                    if !profile.contains(p) {
-                        profile.push(p.clone());
-                    }
-                }
-            }
-            // CLI flags first; translation values then fill in any blanks.
             apply_vm_overrides(&mut cfg, vcpus, mem, template_size)?;
-            if let Some(t) = &translation {
-                devcontainer::apply_to_config(&mut cfg, t)?;
-            }
             // Resolve profile names once at the CLI boundary.
             let resolved_profiles = guest::resolve_profiles(&profile, &cfg.profiles)?;
-            // CLI wins; otherwise honour the devcontainer's `remoteUser`;
-            // otherwise default to `ubuntu`.
-            let resolved_guest_user = guest_user
-                .or_else(|| translation.as_ref().and_then(|t| t.guest_user.clone()))
-                .unwrap_or_default();
+            let resolved_guest_user = guest_user.unwrap_or_default();
             let _guard = signal::install_handlers();
             be.setup(
                 &cfg,
@@ -1284,10 +1112,6 @@ pub fn run() -> Result<()> {
                     skip_confirm: yes,
                     rebuild,
                     profiles: resolved_profiles,
-                    oci_features: translation
-                        .as_ref()
-                        .map(|t| t.oci_features.clone())
-                        .unwrap_or_default(),
                     extra_packages,
                     post_install: post_install.map(PathBuf::from),
                     image,
@@ -1296,7 +1120,6 @@ pub fn run() -> Result<()> {
                 },
             )
         }
-        Commands::Devcontainer { command } => cmd_devcontainer(&cfg, &command),
         Commands::Start {
             name,
             workspace,
@@ -1306,10 +1129,6 @@ pub fn run() -> Result<()> {
             post_start,
             guest_env,
             forward_port: forward_ports,
-            devcontainer,
-            no_devcontainer,
-            dry_run,
-            json: json_out,
         } => {
             cfg.validate_and_warn()?;
             if raw_args_use_deprecated_no_claude(&raw_args) {
@@ -1317,51 +1136,6 @@ pub fn run() -> Result<()> {
                     "--no-claude is deprecated and will be removed in a future release; use --no-agents"
                 );
             }
-            if dry_run {
-                let cli_env_keys = guest_env.iter().map(|(k, _)| k.clone()).collect();
-                let dry_run_image = config::default_image_name();
-                let dry_run_guest_user = backend::persisted_guest_user(&cfg, &dry_run_image);
-                let inputs = devcontainer::TranslatorInputs {
-                    cli_post_start: post_start.clone(),
-                    cli_guest_env_keys: cli_env_keys,
-                    cli_forward_ports: forward_ports.clone(),
-                    persisted_guest_user: Some(dry_run_guest_user.clone()),
-                    cli_workspace_or_git_repo: workspace.is_some(),
-                    ..devcontainer::TranslatorInputs::default()
-                };
-                let ws_path = workspace.as_deref().map(Path::new);
-                let dc_input = DevcontainerInput::from_flags(devcontainer.clone(), no_devcontainer);
-                let dc_opts = DevcontainerOpts {
-                    input: &dc_input,
-                    dry_run,
-                    workspace: ws_path,
-                    mounts: &[],
-                    git_repo: None,
-                    github_auth: cfg.github.as_ref(),
-                    preference_path: Some(&cfg.devcontainer_preferences_path()),
-                };
-                if json_out {
-                    let translation = resolve_devcontainer_collect(
-                        &dc_opts,
-                        &inputs,
-                        devcontainer::Stage::Start,
-                    )?;
-                    let plan = json::DryRunPlan {
-                        report: translation.as_ref().map(|t| &t.report),
-                        profiles: &[],
-                        guest_user: &dry_run_guest_user,
-                        vm: json::VmOverrides {
-                            vcpus: None,
-                            mem_mib: None,
-                            disk_gib: None,
-                        },
-                    };
-                    return json::render_json(&plan);
-                }
-                resolve_devcontainer(&dc_opts, &inputs, devcontainer::Stage::Start)?;
-                return Ok(());
-            }
-
             let mut start_opts = StartOpts {
                 name: name.as_ref(),
                 workspace_dir: workspace.as_deref(),
@@ -1375,11 +1149,9 @@ pub fn run() -> Result<()> {
                 config_path: &cli.config,
                 post_start_override: post_start.as_deref(),
                 persisted_guest_env: std::collections::BTreeMap::new(),
-                devcontainer_path: devcontainer.as_deref(),
-                applied_devcontainer: None,
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
-            apply_runtime_guest_env(&mut cfg, &guest_env, None, &mut start_opts);
+            apply_runtime_guest_env(&mut cfg, &guest_env, &mut start_opts);
             cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
@@ -2655,15 +2427,10 @@ token = "test-pat"
     #[test]
     fn quickstart_subcommand_parses_with_defaults() {
         let cli = parse(&["quickstart"]);
-        let super::Commands::Quickstart {
-            no_workspace,
-            no_devcontainer,
-        } = cli.command
-        else {
+        let super::Commands::Quickstart { no_workspace } = cli.command else {
             panic!("expected Quickstart variant");
         };
         assert!(!no_workspace);
-        assert!(!no_devcontainer);
     }
 
     #[test]
@@ -2676,118 +2443,35 @@ token = "test-pat"
     }
 
     #[test]
-    fn quickstart_no_devcontainer_flag_parses() {
-        let cli = parse(&["quickstart", "--no-devcontainer"]);
-        let super::Commands::Quickstart {
-            no_devcontainer, ..
-        } = cli.command
-        else {
-            panic!("expected Quickstart variant");
-        };
-        assert!(no_devcontainer);
-    }
-
-    #[test]
     fn quickstart_rejects_unknown_flag() {
         let err = parse_err(&["quickstart", "--name", "foo"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
-    fn devcontainer_check_subcommand_parses_with_defaults() {
-        let cli = parse(&["devcontainer", "check", ".devcontainer/devcontainer.json"]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Check { path, stage, json } = command else {
-            panic!("expected devcontainer check variant");
-        };
-        assert_eq!(
-            path,
-            std::path::PathBuf::from(".devcontainer/devcontainer.json")
-        );
-        assert!(matches!(stage, super::DevcontainerCheckStage::Both));
-        assert!(!json);
-    }
-
-    #[test]
-    fn devcontainer_check_json_flag_parses() {
-        let cli = parse(&[
-            "devcontainer",
-            "check",
-            ".devcontainer/devcontainer.json",
-            "--json",
-        ]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Check { json, .. } = command else {
-            panic!("expected devcontainer check variant");
-        };
-        assert!(json);
-    }
-
-    #[test]
-    fn devcontainer_check_stage_flag_parses() {
-        let cli = parse(&[
-            "devcontainer",
-            "check",
-            ".devcontainer/devcontainer.json",
-            "--stage",
-            "start",
-        ]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Check { stage, .. } = command else {
-            panic!("expected devcontainer check variant");
-        };
-        assert!(matches!(stage, super::DevcontainerCheckStage::Start));
-    }
-
-    #[test]
-    fn devcontainer_ignore_subcommand_parses() {
-        let cli = parse(&["devcontainer", "ignore", "."]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Ignore { project } = command else {
-            panic!("expected devcontainer ignore variant");
-        };
-        assert_eq!(project, std::path::PathBuf::from("."));
-    }
-
-    #[test]
-    fn devcontainer_status_subcommand_parses_optional_project() {
-        let cli = parse(&["devcontainer", "status"]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Status { project } = command else {
-            panic!("expected devcontainer status variant");
-        };
-        assert!(project.is_none());
-
-        let cli = parse(&["devcontainer", "status", "."]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Status { project } = command else {
-            panic!("expected devcontainer status variant");
-        };
-        assert_eq!(project, Some(std::path::PathBuf::from(".")));
-    }
-
-    #[test]
-    fn devcontainer_clear_subcommand_parses() {
-        let cli = parse(&["devcontainer", "clear", "."]);
-        let super::Commands::Devcontainer { command } = cli.command else {
-            panic!("expected Devcontainer variant");
-        };
-        let super::DevcontainerCommands::Clear { project } = command else {
-            panic!("expected devcontainer clear variant");
-        };
-        assert_eq!(project, std::path::PathBuf::from("."));
+    fn devcontainer_interface_is_removed() {
+        assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
+        for args in [
+            &["devcontainer", "check", "file.json"][..],
+            &["up", "--devcontainer", "file.json"][..],
+            &["up", "--no-devcontainer"][..],
+            &["up", "--dry-run"][..],
+            &["setup", "--workspace", "."][..],
+            &["setup", "--devcontainer", "file.json"][..],
+            &["quickstart", "--no-devcontainer"][..],
+            &["start", "--devcontainer", "file.json"][..],
+            &["start", "--dry-run"][..],
+        ] {
+            let kind = parse_err(args).kind();
+            assert!(
+                matches!(
+                    kind,
+                    clap::error::ErrorKind::UnknownArgument
+                        | clap::error::ErrorKind::InvalidSubcommand
+                ),
+                "unexpected clap error for {args:?}: {kind:?}"
+            );
+        }
     }
 
     #[test]

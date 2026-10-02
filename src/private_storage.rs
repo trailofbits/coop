@@ -1,4 +1,5 @@
 //! Permissions for managed host state. Never traverse guest filesystems.
+use std::ffi::OsStr;
 use std::path::Path;
 
 #[cfg(test)]
@@ -17,6 +18,12 @@ use crate::fs_util::{PrivateDir, PrivateEntryType};
 /// Invalid instance/image entries do not block operations on unrelated storage.
 pub fn prepare(cfg: &CoopConfig) -> Result<()> {
     let data = PrivateDir::create(&cfg.data_dir)?;
+    if let Err(error) = remove_obsolete_file(&data, OsStr::new("devcontainer_preferences.json")) {
+        tracing::warn!(
+            "Cannot remove obsolete managed state {}: {error:#}",
+            cfg.data_dir.join("devcontainer_preferences.json").display()
+        );
+    }
     repair_files(&data, &cfg.data_dir)?;
     for root in ManagedRoot::ALL {
         let directory = cfg.data_dir.join(root.name());
@@ -28,7 +35,24 @@ pub fn prepare(cfg: &CoopConfig) -> Result<()> {
             let path = directory.join(&name);
             let outcome = MigrationOutcome::from_result((|| {
                 match managed.entry_type(&name)? {
-                    PrivateEntryType::Directory => repair_files(&managed.child(&name)?, &path)?,
+                    PrivateEntryType::Directory => {
+                        let directory = managed.child(&name)?;
+                        match root {
+                            ManagedRoot::Instances => {
+                                if let Err(error) = remove_obsolete_file(
+                                    &directory,
+                                    OsStr::new("devcontainer_state.json"),
+                                ) {
+                                    tracing::warn!(
+                                        "Cannot remove obsolete managed state {}: {error:#}",
+                                        path.join("devcontainer_state.json").display()
+                                    );
+                                }
+                            }
+                            ManagedRoot::Images | ManagedRoot::State => {}
+                        }
+                        repair_files(&directory, &path)?;
+                    }
                     PrivateEntryType::Symlink => {
                         bail!(
                             "Managed storage cannot contain a symlink: {}",
@@ -46,6 +70,19 @@ pub fn prepare(cfg: &CoopConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     crate::lima::prepare_private_storage()?;
     Ok(())
+}
+
+/// Remove one metadata file owned by a deleted feature.
+///
+/// The descriptor-relative unlink does not follow symlinks. A directory at the
+/// old filename is not recursively removed: it is not state coop created, and
+/// deleting an unexpected tree would exceed migration's authority.
+fn remove_obsolete_file(directory: &PrivateDir, name: &OsStr) -> Result<()> {
+    match directory.unlink_non_directory(name) {
+        Ok(()) => Ok(()),
+        Err(error) if is_missing(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Validate and repair an existing selected instance, image, or state directory.
@@ -264,6 +301,58 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_metadata_removal_does_not_follow_symlinks() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path().join("data")),
+            ..CoopConfig::default()
+        };
+        private_dir(&cfg.data_dir).unwrap();
+        fs::write(
+            cfg.data_dir.join("devcontainer_preferences.json"),
+            "obsolete",
+        )
+        .unwrap();
+
+        let instance = cfg.instances_dir().join("test");
+        private_dir(&instance).unwrap();
+        fs::write(instance.join("devcontainer_state.json"), "obsolete").unwrap();
+
+        let outside = root.path().join("outside");
+        fs::write(&outside, "keep").unwrap();
+        let linked_instance = cfg.instances_dir().join("linked");
+        private_dir(&linked_instance).unwrap();
+        symlink(&outside, linked_instance.join("devcontainer_state.json")).unwrap();
+
+        let data = PrivateDir::open_existing(&cfg.data_dir).unwrap();
+        remove_obsolete_file(&data, OsStr::new("devcontainer_preferences.json")).unwrap();
+        let instances = PrivateDir::open_existing(&cfg.instances_dir()).unwrap();
+        let instance_dir = instances.child(OsStr::new("test")).unwrap();
+        remove_obsolete_file(&instance_dir, OsStr::new("devcontainer_state.json")).unwrap();
+        let linked_instance_dir = instances.child(OsStr::new("linked")).unwrap();
+        remove_obsolete_file(&linked_instance_dir, OsStr::new("devcontainer_state.json")).unwrap();
+
+        assert!(!cfg.data_dir.join("devcontainer_preferences.json").exists());
+        assert!(!instance.join("devcontainer_state.json").exists());
+        assert!(!linked_instance.join("devcontainer_state.json").exists());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "keep");
+
+        // Missing state is the steady state after the one-time cleanup.
+        remove_obsolete_file(&data, OsStr::new("devcontainer_preferences.json")).unwrap();
+
+        // Never recurse into an unexpected directory at the legacy filename.
+        let unexpected = instance.join("devcontainer_state.json");
+        fs::create_dir(&unexpected).unwrap();
+        assert!(
+            remove_obsolete_file(&instance_dir, OsStr::new("devcontainer_state.json")).is_err()
+        );
+        assert!(unexpected.is_dir());
+    }
+
+    #[test]
     fn private_storage_under_permissive_umask() {
         const CHILD: &str = "COOP_PRIVATE_STORAGE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -377,6 +466,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(healthy.index, InstanceIndex::new(0).unwrap());
+        let obsolete_preferences = cfg.data_dir.join("devcontainer_preferences.json");
+        let obsolete_instance_state = healthy.dir.join("devcontainer_state.json");
+        fs::write(&obsolete_preferences, "obsolete").unwrap();
+        fs::write(&obsolete_instance_state, "obsolete").unwrap();
         let outside = root.path().join("outside");
         fs::write(&outside, "untouched").unwrap();
         let stale = cfg.instances_dir().join("stale");
@@ -390,6 +483,8 @@ mod tests {
         )
         .unwrap();
         prepare(&cfg).unwrap();
+        assert!(!obsolete_preferences.exists());
+        assert!(!obsolete_instance_state.exists());
         assert_eq!(
             cfg.resolve_instance(Some(&healthy.name)).unwrap().name,
             healthy.name

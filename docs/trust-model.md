@@ -72,17 +72,8 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
-- **Project configuration, local or fetched.** `git_repo_devcontainer.rs` /
-  `devcontainer.rs` parse repository-controlled devcontainer JSON. Its values
-  configure the guest; they must never select host executables, configure host
-  process environments, or reach host `cmd:` evaluation or a host shell.
-  Parsing, merging into `CoopConfig`, and saving/reloading instance state do
-  not make these values trusted. Choosing to use a project's devcontainer
-  configuration does not authorize that project to execute code on the host.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
-- **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*
-  from GHCR; the install snippet runs **in the guest**, not the host.
 
 ## Host subprocess boundary
 
@@ -165,8 +156,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
-  the requested command. This covers config literals, devcontainer entries,
-  CLI overrides, and saved `guest_env.json` equally. Never pass the guest map
+  the requested command. This covers config literals, CLI overrides, and saved
+  `guest_env.json` equally. Never pass the guest map
   to a host `Command::envs`, even with an absolute executable path: guest
   loader and SSH settings must also remain guest-only. Values stay out of
   command arguments, stdin, and temporary files; existing images' `AcceptEnv *`

@@ -138,7 +138,7 @@ new integration test phase.
 coop also carries mutation tests (`cargo-mutants`), fuzz targets
 (`cargo-fuzz`), and formal proofs (`kani`). These are manual quality checks,
 not required for every change. If you touch a logic-dense module — config
-parsing, the JSONC reader, the arithmetic kernels — see
+parsing and the arithmetic kernels — see
 [docs/testing.md](docs/testing.md) for when and how to run them.
 
 ## Code style
