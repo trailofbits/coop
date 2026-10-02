@@ -2882,10 +2882,7 @@ mod tests {
         super::generate_start_template(&cfg, &image).unwrap();
         let generated = std::fs::read_to_string(cfg.lima_template_path(&image)).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
-        assert_eq!(
-            parsed["images"][0]["location"].as_str(),
-            disk.canonicalize().unwrap().to_str()
-        );
+        assert_eq!(parsed["images"][0]["location"].as_str(), disk.to_str());
         assert_eq!(parsed["mounts"].as_sequence().unwrap().len(), 0);
     }
 

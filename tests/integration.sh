@@ -2673,6 +2673,50 @@ test_guest_fingerprint() {
 
 # ── Stop / status-stopped / restart ───────────────────────────
 
+test_stop_preserves_recent_writes() {
+    echo ""
+    echo "=== Phase: stop preserves recent guest writes ==="
+
+    if coop_exec python3 -c '
+from pathlib import Path
+import os
+root = Path.home() / ".coop-stop-durability-test"
+root.mkdir(exist_ok=True)
+(root / "changed").write_text("before")
+(root / "deleted").write_text("before")
+os.sync()
+(root / "changed").write_text("after")
+(root / "created").write_text("new")
+(root / "deleted").unlink()
+'; then
+        pass "write guest disk changes before stop"
+    else
+        fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
+        return
+    fi
+    if ! coop stop "$INSTANCE"; then
+        fail "stop after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! coop start "$INSTANCE" --no-agents; then
+        fail "restart after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if coop_exec python3 -c '
+from pathlib import Path
+import shutil
+root = Path.home() / ".coop-stop-durability-test"
+assert (root / "changed").read_text() == "after", "overwrite lost"
+assert (root / "created").read_text() == "new", "new file lost"
+assert not (root / "deleted").exists(), "deleted file restored"
+shutil.rmtree(root)
+'; then
+        pass "recent writes and deletion survive stop/start"
+    else
+        fail "recent writes and deletion survive stop/start" "stderr: $(guest_stderr)"
+    fi
+}
+
 test_stop() {
     echo ""
     echo "=== Phase: stop ==="
@@ -4036,7 +4080,8 @@ test_git_repo() {
     # git-repo + extra-mount combination is the workspace-sync path that
     # regressed on Firecracker before this change.
     if coop up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/data" --no-agents --no-devcontainer; then
+            --extra-mount "$data_dir:/data" --no-agents --no-devcontainer \
+            --post-start 'test -d /workspace/.git && cat /data/marker.txt > /tmp/clone-post-start'; then
         STARTED_INSTANCES+=("$gr_instance")
         pass "up --git-repo creates an instance"
     else
@@ -4046,6 +4091,14 @@ test_git_repo() {
     fi
 
     GUEST_INSTANCE="$gr_instance"
+
+    local hook_marker
+    hook_marker=$(guest_exec cat /tmp/clone-post-start 2>/dev/null) || hook_marker=""
+    if [[ "$hook_marker" == "extra-mount-marker" ]]; then
+        pass "post-start runs after clone and extra mount provisioning"
+    else
+        fail "post-start runs after clone and extra mount provisioning" "got: $hook_marker"
+    fi
 
     if guest_exec test -d /workspace/.git; then
         pass "up --git-repo clones the repository into /workspace"
@@ -7019,12 +7072,16 @@ test_post_start() {
     local inst_name="${INSTANCE}-poststart"
     local marker="/tmp/coop-post-start-$$.marker"
 
-    # --post-start runs the command in the guest after SSH is ready.
-    # The marker file written by the hook is the assertion.
     local post_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$post_ws"
+    local post_data="$tmpdir/${inst_name}-data"
+    mkdir -p "$post_ws" "$post_data"
+    printf '%s\n' 'workspace-ready' > "$post_ws/input.txt"
+    printf '%s\n' 'mount-ready' > "$post_data/input.txt"
+    printf '%s\n' 'set -eu' 'cat /workspace/input.txt /post-start-data/input.txt' \
+        > "$post_ws/setup.sh"
     if coop up "$post_ws" --name "$inst_name" --no-agents --no-devcontainer \
-        --post-start "echo hooked > $marker"; then
+        --extra-mount "$post_data:/post-start-data" \
+        --post-start "bash /workspace/setup.sh > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
     else
@@ -7037,12 +7094,18 @@ test_post_start() {
     seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
     unset GUEST_INSTANCE
 
-    if [[ "$seen" == *hooked* ]]; then
-        pass "--post-start hook ran in the guest"
+    if [[ "$seen" == $'workspace-ready\nmount-ready' ]]; then
+        pass "post-start reads copied workspace and extra mount contents"
     else
-        fail "--post-start hook ran in the guest" "marker contents: '$seen'"
+        fail "post-start reads copied workspace and extra mount contents" "got: '$seen'"
     fi
 
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    test_post_start_failure
+}
+
+test_post_start_failure() {
     # Verify a failing hook does not fail `coop up` (warn-and-continue).
     local fail_inst="${INSTANCE}-poststart-fail"
     local fail_ws="$tmpdir/${fail_inst}-ws"
@@ -7055,8 +7118,6 @@ test_post_start() {
         fail "up succeeds when --post-start fails" "exit code: $?"
     fi
 
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
     coop destroy "$fail_inst" 2>/dev/null || true
     untrack_instance "$fail_inst"
 }
@@ -7377,6 +7438,7 @@ EOF
     test_guest_fingerprint
 
     # Stop + restart + stopped-state verification
+    test_stop_preserves_recent_writes
     test_stop
     test_stop_idempotency
     test_auto_resolve_stopped

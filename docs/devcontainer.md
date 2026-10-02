@@ -16,6 +16,12 @@ After your reply (or non-interactive escape hatches, below), coop prints a per-k
 
 When a local `devcontainer.json` is applied while creating a VM, coop records the file path and SHA-256 content hash in the instance state. Later `coop up` reconnects and `coop start` restarts compare the current file at that path with the recorded hash. If it changed or disappeared, coop prints an informational warning and leaves the existing VM unchanged. Destroy and recreate the VM to apply creation-time changes such as `features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`. Start-time values from the old file, including `containerEnv`, `forwardPorts`, and `postStartCommand`, are not re-applied automatically on restart.
 
+`postStartCommand` runs after agent bootstrap, workspace copying or cloning, and
+additional mount synchronization. Repository scripts can use `/workspace` and
+mounted data. The command runs from the guest user's home directory; use
+`cd /workspace && ...` for relative project paths. A command failure produces a
+warning and does not fail startup.
+
 ## Non-interactive escape hatches
 
 For CI or scripted use, pass one of:
