@@ -6,6 +6,8 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_os = "macos"))]
+use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -2776,6 +2780,116 @@ impl Instance {
 
         Ok(true)
     }
+
+    /// Probe Firecracker liveness without treating an uncertain probe
+    /// or an orphaned API socket as a confirmed exit.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid = match fs::read_to_string(&pid_path) {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<i32>()
+                    .context("Invalid Firecracker PID file")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+
+        if let Some(pid) = pid {
+            if pid <= 0 {
+                bail!("Invalid Firecracker PID file: {pid}");
+            }
+            // EPERM means the root-owned process exists. ESRCH confirms exit,
+            // including when /proc hides other users' processes.
+            let exists = if unsafe { libc::kill(pid, 0) } == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EPERM) => true,
+                    Some(libc::ESRCH) => false,
+                    _ => return Err(error).context("Failed to probe Firecracker PID"),
+                }
+            };
+            if exists {
+                let cmdline = Cmd::new("cat")
+                    .arg(format!("/proc/{pid}/cmdline"))
+                    .sudo()
+                    .capture()
+                    .context("Failed to inspect Firecracker PID")?;
+                if cmdline.contains("firecracker") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        if pid.is_some()
+            && let Err(error) = fs::remove_file(&pid_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove stale Firecracker PID file {} (non-fatal): {error}",
+                pid_path.display()
+            );
+        }
+        Ok(false)
+    }
+}
+
+/// Confirm that the root-owned Firecracker API socket is no longer accepting
+/// connections. An unprivileged connect sees `EACCES` for both live and stale
+/// mode-0755 sockets, so it cannot safely distinguish those states.
+#[cfg(not(target_os = "macos"))]
+fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => bail!(
+            "Firecracker API socket path is not a Unix socket: {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+    }
+
+    let output = Cmd::new("curl")
+        .args([
+            // Must be the first argument so curl does not load root's .curlrc.
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--output",
+            "/dev/null",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "2",
+            "--noproxy",
+            "*",
+            "--unix-socket",
+        ])
+        .arg(socket_path)
+        .arg("http://localhost/")
+        .sudo()
+        .output()
+        .context("Failed to run privileged Firecracker API socket probe")?;
+
+    classify_firecracker_socket_probe(output.status.code())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn classify_firecracker_socket_probe(exit_code: Option<i32>) -> Result<()> {
+    match exit_code {
+        Some(0) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        // curl exit 7 means it could not connect. With the probe running as
+        // root, this covers a missing listener without conflating it with the
+        // ordinary user's lack of write permission on the socket.
+        Some(7) => Ok(()),
+        Some(code) => bail!("Privileged Firecracker API socket probe exited with code {code}"),
+        None => bail!("Privileged Firecracker API socket probe terminated by signal"),
+    }
 }
 
 // ── Defaults ──────────────────────────────────────────────────
@@ -3169,6 +3283,68 @@ mod tests {
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_pidless_live_socket() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn firecracker_socket_probe_classifies_curl_outcomes() {
+        assert!(classify_firecracker_socket_probe(Some(0)).is_err());
+        classify_firecracker_socket_probe(Some(7)).unwrap();
+        assert!(classify_firecracker_socket_probe(Some(1)).is_err());
+        assert!(classify_firecracker_socket_probe(None).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_api_path() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_confirms_exited_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+        assert!(!inst.probe_liveness().unwrap());
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_invalid_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), "invalid").unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_recognizes_running_firecracker() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let result = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap());
     }
 
     #[test]

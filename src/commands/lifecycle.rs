@@ -1809,29 +1809,41 @@ pub(crate) fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Preserve probe errors: unknown state cannot be reported as stopped.
-    if let Some(running) = be.as_running(cfg, inst.clone())? {
+    // `RunningInstance` records a point-in-time observation from this probe;
+    // `be.stop` rechecks under the backend operation lock before mutating.
+    let stopped = if let Some(running) = be.as_running(cfg, inst.clone())? {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
         port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?;
+        be.stop(cfg, running)?
     } else {
-        tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
+        tracing::debug!("Instance '{}' is not running", inst.name);
         // Stale forwards may still exist even when the VM is gone.
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
-    }
+        // Reconfirm the stopped state while acquiring the operation lock.
+        be.as_stopped(inst.clone())?
+    };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
-    // proxy mode was never on.
-    crate::proxy::stop(inst);
+    // proxy mode was never on. Do this only after confirmed exit, but before
+    // backend cleanup so TAP deletion errors do not leave stale credentials.
+    cleanup_confirmed_stop(&stopped, |stopped| be.cleanup_stopped(cfg, stopped))?;
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
     // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
     Ok(())
+}
+
+fn cleanup_confirmed_stop(
+    stopped: &backend::StoppedInstance,
+    cleanup: impl FnOnce(&backend::StoppedInstance) -> Result<()>,
+) -> Result<()> {
+    crate::proxy::stop(stopped.instance());
+    cleanup(stopped)
 }
 
 pub(crate) fn cmd_destroy(
@@ -2572,6 +2584,8 @@ mod tests {
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
         let disk = inst.rootfs_path();
         std::fs::write(&disk, "disk sentinel").expect("disk sentinel");
         let cfg = cfg_with_data_dir(root.path().to_path_buf());
@@ -2585,6 +2599,10 @@ mod tests {
             std::fs::read_to_string(inst.pid_file_path()).expect("retained pid"),
             "invalid-pid"
         );
+        assert_eq!(
+            std::fs::read_to_string(&proxy_token).expect("retained proxy token"),
+            "proxy sentinel"
+        );
         let error = backend
             .destroy_instance(&cfg, &inst)
             .expect_err("unknown liveness cannot authorize destroy")
@@ -2595,6 +2613,35 @@ mod tests {
             "disk sentinel"
         );
         assert!(inst.dir.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_stop_removes_proxy_before_cleanup_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
+        let backend = super::backend::FirecrackerBackend::new();
+        let stopped = backend
+            .as_stopped(inst)
+            .expect("instance is confirmed stopped");
+
+        let error = super::cleanup_confirmed_stop(&stopped, |_| {
+            assert!(!proxy_token.exists(), "proxy token survived confirmed stop");
+            Err(anyhow::anyhow!("cleanup failed"))
+        })
+        .expect_err("cleanup failure must propagate")
+        .to_string();
+
+        assert_eq!(error, "cleanup failed");
+        assert!(!proxy_token.exists());
     }
 
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {

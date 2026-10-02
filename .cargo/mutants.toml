@@ -67,6 +67,12 @@ exclude_re = [
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
+  # Firecracker liveness invokes sudo and probes /proc plus a Unix socket;
+  # Linux-only process tests cover it outside the unit mutation sweep.
+  "\\bprobe_liveness\\b",
+  # Privileged curl wrapper; its exit-code classifier remains in scope and the
+  # root-owned stale-socket behavior is covered by the integration suite.
+  "\\bensure_firecracker_api_socket_stopped\\b",
 
   # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
   "\\brun_setup_pat\\b",
@@ -218,6 +224,9 @@ exclude_re = [
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
   "\\bstart_instance\\b",
+  # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
+  # the ordering is covered by a filesystem-backed lifecycle unit test.
+  "\\bcleanup_confirmed_stop\\b",
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
   # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.

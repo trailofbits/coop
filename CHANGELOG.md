@@ -22,6 +22,11 @@
   `coop restore <vm> --image <image> --reprovision` (or destroy/recreate)
   to pick up the new binary.
 
+### Fixed
+
+- `coop stop` now removes a Firecracker instance's TAP after the VM exits,
+  including when Firecracker exited before the stop command.
+
 ## v0.6.0
 
 ### Upgrading from v0.5.4

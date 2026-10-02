@@ -187,9 +187,9 @@ impl RunningInstance {
 // ── Stopped instance ──────────────────────────────────────────
 
 /// Observation that an instance was stopped, with an operation lock held.
-/// Construct via [`VmBackend::as_stopped`]. The constructor probes live state
-/// while holding the lock, so a concurrent lifecycle mutation waits until
-/// the token is dropped.
+/// Construct via [`VmBackend::as_stopped`] or a successful [`VmBackend::stop`].
+/// Both paths confirm the stopped state while holding the lock, so a concurrent
+/// lifecycle mutation waits until the token is dropped.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
 /// The field is private so callers cannot construct one without a backend probe.
@@ -199,10 +199,9 @@ pub struct StoppedInstance {
 }
 
 impl StoppedInstance {
-    /// Mint a `StoppedInstance` after a successful live-state probe.
+    /// Mint a `StoppedInstance` after the backend confirms the instance stopped.
     ///
-    /// Crate-private so only backend impls can construct one. Callers
-    /// use [`VmBackend::as_stopped`] (which delegates here).
+    /// Crate-private so only backend implementations can construct one.
     pub(crate) fn new(inst: Instance, lock: FileLock) -> Self {
         Self { inst, _lock: lock }
     }
@@ -827,8 +826,15 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    /// Stop an instance observed running at the preceding probe.
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop an instance observed running at the preceding probe and return it
+    /// with the operation lock held once the backend confirms it has exited.
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance>;
+    /// Finish backend cleanup for a confirmed-stopped instance.
+    /// Lima has no host TAP; Firecracker deletes it while the operation lock
+    /// carried by `stopped` prevents a concurrent restart.
+    fn cleanup_stopped(&self, _cfg: &CoopConfig, _stopped: &StoppedInstance) -> Result<()> {
+        Ok(())
+    }
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
@@ -999,14 +1005,18 @@ impl VmBackend for FirecrackerBackend {
         start_firecracker_existing(cfg, inst)
     }
 
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
-        if !inst.probe_running()? {
-            return Ok(());
+        let operation = lock_instance_operation(&inst)?;
+        if inst.probe_liveness()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
+            vm.stop()?;
         }
-        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
-        vm.stop()
+        Ok(StoppedInstance::new(inst, operation))
+    }
+
+    fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
+        crate::network::teardown_tap(&cfg.network, stopped.instance())
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1125,7 +1135,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !inst.probe_running()? {
+        if !inst.probe_liveness()? {
             return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
@@ -1134,7 +1144,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
         let lock = lock_instance_operation(&inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
                  `coop stop {}`",
@@ -1232,15 +1242,16 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
+        let operation = lock_instance_operation(&inst)?;
         match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
-            Some(crate::lima::LimaState::Stopped) => Ok(()),
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst)?,
+            Some(crate::lima::LimaState::Stopped) => {}
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
         }
+        Ok(StoppedInstance::new(inst, operation))
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {

@@ -105,11 +105,12 @@ Two lifecycle machines are encoded in the type system rather than in runtime
 flags — this is a load-bearing design choice (see
 [`code-style.md`](code-style.md#type-state-for-lifecycles)):
 
-- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields
-  and are minted by `as_running` / `as_stopped` after a state probe. They record
-  a point-in-time observation. `StoppedInstance` also holds the per-instance
-  operation lock through stopped-only disk mutations. Lima only mints it for
-  confirmed `Stopped`; absent, broken, unknown, and failed probes stay distinct.
+- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields.
+  `as_running` records a point-in-time running observation; `as_stopped` and a
+  successful `stop` mint `StoppedInstance` only after confirming exit.
+  `StoppedInstance` holds the per-instance operation lock through cleanup and
+  stopped-only disk mutations. Lima only mints it for confirmed `Stopped`;
+  absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
