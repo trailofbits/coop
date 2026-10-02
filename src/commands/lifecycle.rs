@@ -1118,6 +1118,11 @@ fn restart_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
+    let files = crate::guest_files::StagedFiles::prepare(
+        &cfg.guest_files,
+        &backend::persisted_guest_user(cfg, &inst.image),
+        &[],
+    )?;
     crate::github_assignment::active(cfg, inst)?;
     be.start_existing(cfg, inst)?;
 
@@ -1148,6 +1153,7 @@ fn restart_instance(
     }
     .save(inst)?;
 
+    files.install(&target)?;
     bootstrap_on_boot(
         be,
         cfg,
@@ -1219,9 +1225,33 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
-    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
+}
+
+struct BootPayload {
+    forwards: Vec<config::PortForward>,
+    files: crate::guest_files::StagedFiles,
+}
+
+impl BootPayload {
+    fn prepare(
+        be: &backend::PlatformBackend,
+        cfg: &config::CoopConfig,
+        image: &config::ImageName,
+        mounts: &[config::Mount],
+        forwards: Vec<config::PortForward>,
+    ) -> Result<Self> {
+        let live_mounts = if be.mounts_are_live() { mounts } else { &[] };
+        let files = crate::guest_files::StagedFiles::prepare(
+            &cfg.guest_files,
+            &backend::persisted_guest_user(cfg, image),
+            live_mounts,
+        )?;
+        Ok(Self { forwards, files })
+    }
 }
 
 /// Everything a first boot needs once the guest is up: port forwards,
@@ -1239,7 +1269,7 @@ fn start_instance(
 /// `exclude_git`, `persisted_guest_env`, `applied_devcontainer`, `post_start_override`, plus what
 /// [`bootstrap_on_boot`] consumes (`no_agents`).
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
-/// resolved forward set arrives as `forwards`, because callers merge it
+/// resolved forward set arrives in `payload`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
 /// behavior for `reprovision_instance` only, which passes placeholders for them.
 fn provision_first_boot(
@@ -1248,8 +1278,9 @@ fn provision_first_boot(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
     repo: Option<&github_repo::RepoSlug>,
-    forwards: &[config::PortForward],
+    payload: &BootPayload,
 ) -> Result<()> {
+    let forwards = payload.forwards.as_slice();
     signal::check_shutdown()?;
 
     let target = be.ssh_target(cfg, inst)?;
@@ -1290,6 +1321,7 @@ fn provision_first_boot(
         .save(inst)?;
     }
 
+    payload.files.install(&target)?;
     bootstrap_on_boot(
         be,
         cfg,
@@ -2208,6 +2240,8 @@ fn reprovision_instance(
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
+    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
+    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
@@ -2257,14 +2291,13 @@ fn reprovision_instance(
     // `check_host_port_collisions` binds each host port to probe it, so while
     // the instance is still running its *own* forwarder holds them and every
     // forward would look taken.
-    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
     // The bail names `--forward-port`, which `restore` does not expose, and
     // the instance is stopped by now — so say both. Reachable without the
     // user having asked about ports at all: a `forward_ports` entry added to
     // `config.toml` since creation whose host port is busy, or two entries
     // with distinct guest ports sharing one host port (`merge_forward_ports`
     // dedupes on the guest port only).
-    port_forward::check_host_port_collisions(&forwards).with_context(|| {
+    port_forward::check_host_port_collisions(&payload.forwards).with_context(|| {
         format!(
             "Instance '{}' is stopped and was not reprovisioned. Free the host port \
              or drop the conflicting `forward_ports` entry from config.toml, then \
@@ -2341,7 +2374,7 @@ fn reprovision_instance(
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &payload)
         .with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);

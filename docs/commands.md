@@ -2,6 +2,10 @@
 
 coop creates isolated VM environments for running Claude Code, Codex, and Grok Build. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
 
+Configured [`guest_files`](configuration.md#guest-files) are copied before agent
+bootstrap when you create or restart a VM, including `restore --reprovision` and
+`--no-agents`. Reconnecting to an already-running VM does not refresh them.
+
 ## Global Flags
 
 | Flag | Description |

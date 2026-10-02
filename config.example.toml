@@ -26,6 +26,16 @@
 # [github.pat."trailofbits/coop"]
 # token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop -w"
 
+# Optional copies into each VM, refreshed before agent bootstrap at every boot.
+# Repeat [[guest_files]] for multiple sources. ~ in destination means guest home.
+# [[guest_files]]
+# source = "~/.config/agents"
+# destination = "~/.config/agents"
+#
+# [[guest_files]]
+# source = "~/dotfiles/gitconfig"
+# destination = "~/.gitconfig"
+
 # [setup]
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 

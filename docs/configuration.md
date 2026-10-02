@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`guest_files.source`, `data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -16,6 +16,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
+| `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
 | `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ### Private host storage
@@ -42,6 +43,52 @@ for custom storage. Extended ACL grants and directory inheritance are removed
 from private directories and user-owned sensitive files. On macOS, ancestor
 ACLs granting write or ownership/control access are rejected. Config edits
 preserve the permissions and ACLs of the directory containing `config.toml`.
+
+## Guest files
+
+Use one `[[guest_files]]` entry per host file or directory that you want to copy
+into every VM. For example, shared agent hooks can live alongside writable guest
+configuration directories without a host mount:
+
+```toml
+[[guest_files]]
+source = "~/.config/agents"
+destination = "~/.config/agents"
+
+[[guest_files]]
+source = "~/dotfiles/gitconfig"
+destination = "~/.gitconfig"
+```
+
+`source` expands `~` to your **host** home. `destination` expands `~/` to the
+configured **guest** user's home, or accepts an absolute guest path. Destinations
+must name a path below `/` or `~/`, without trailing slashes, empty components,
+`.` components, `..` components, or control characters. Parent directories are
+created as the guest user; copying to a location that user cannot write fails.
+
+A directory copies its contents into the exact destination directory; a file
+copies to the exact destination filename. Copies run before agent bootstrap on
+creation, restart, and `restore --reprovision`, including with `--no-agents`.
+Reconnecting to an already-running instance does not copy again. Agent bootstrap
+can subsequently replace files that it manages, such as `~/.codex/config.toml`.
+coop does not rewrite platform-specific paths or commands inside copied files.
+
+Each boot takes a private host snapshot before starting the VM. Copies overwrite
+matching guest files, retain guest-only files, include dotfiles, and ignore no
+files based on `.gitignore`. Removing a mapping or source file does not remove its
+previous guest copy. Copied directories have mode `0700`; files have mode `0600`,
+or `0700` when the source is owner-executable. Guest edits never sync to the host.
+
+Source symlinks are materialized as copies. Their targets must stay within an
+explicitly declared source root; add another mapping when you need to include an
+external target. Missing sources, dangling or cyclic links, and special files
+fail before boot. A source that contains the host staging directory is rejected;
+set `TMPDIR` outside your source directories if needed. Destination mappings cannot overlap each other or live host
+mounts. Existing destination symlinks are rejected instead of followed.
+
+These are explicit copies of everything under each source, including any secrets
+you place there. Select narrow directories. They do not change the agent-specific
+configuration allowlists or the proxy's credential-filtering behavior.
 
 ## GitHub auth
 
