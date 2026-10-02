@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.6.3
+
+### Security
+
+- Stop invoking host Git during `coop pull`. Pull now refuses a nonempty
+  destination unless `--force` explicitly authorizes overwriting matching
+  files. Transports apply best-effort filters for common `.git` paths, and the
+  tar fallback stages guest archives before installation, but pulled content
+  remains untrusted and may be malicious. Repositories pulled by older affected
+  releases must be recreated from a trusted source before use with host Git.
+  The ineffective `coop pull --exclude-git` compatibility flag has been
+  removed; pull's best-effort filtering is unconditional.
+
 ## v0.6.2
 
 ### Security
