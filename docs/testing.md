@@ -50,10 +50,23 @@ guest environment → docker → stop → destroy). CI additionally runs the fas
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
 
+The stop phase writes, overwrites, and deletes guest files immediately before
+stopping, then verifies those changes after restart without syncing them in
+the test. The `vm::tests::stop_bounds_guest_shutdown_and_reaps_ssh` unit test
+uses real child processes and fake SSH/sudo boundaries to cover graceful exit,
+SSH refusal, a hung client, a missing client, and liveness-probe failure. It
+checks forced-signal fallback, bounded waits, and SSH client reaping. The
+existing stop failure test checks PID retention after failed forced signals.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
 forwarding on an intervening invocation without the flag.
+
+The full post-start tests run a script from the copied workspace that reads an
+additional mount. The clone phase also checks that a post-start hook can read
+both the cloned repository and its additional mount. These assertions detect
+hooks running before workspace provisioning.
 
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
@@ -152,9 +165,7 @@ redaction must fail the assignment-error regression. Restore the code and
 rerun the tests after each check.
 
 The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
-rejects the fixture filename. The Lima resize spawn-failure test runs in an
-isolated child process with an empty executable search directory, so it cannot
-find a host `truncate` or change another test's environment.
+rejects the fixture filename.
 
 ## Host subprocess boundary tests
 
@@ -209,6 +220,12 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It also corrupts an ext4 inode reference count, checks that read-only verification
+rejects it, and repairs the filesystem before resizing. The repair operation
+accepts exit code 1 (errors corrected), as defined by
+[e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
+Nonzero results from other disk tools, reboot-required results, error combinations,
+and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
@@ -333,7 +350,7 @@ unit-tested): `tools_needing_prompt`, `switch_report_lines`,
 ModelMode` in `lib.rs`. Excluded as IO/backend/TTY: `model.rs`'s `render_status`
 / `write_tool_line` / `set_local` / `set_remote` / `report_switch` /
 `apply_to_running` / `prompt_endpoint`, and `lifecycle.rs`'s
-`bootstrap_and_post_start` / `prepare_session_from_target`.
+`bootstrap_on_boot` / `run_configured_post_start` / `prepare_session_from_target`.
 
 **Keep `.cargo/mutants.toml` in sync in the same PR that adds the code** — this
 is not a follow-up chore. #352 was merged without scoping its new IO/backend/TTY

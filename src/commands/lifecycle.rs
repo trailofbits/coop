@@ -1148,7 +1148,7 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    bootstrap_and_post_start(
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1157,6 +1157,7 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1235,8 +1236,8 @@ fn start_instance(
 /// and `/workspace` survived on the guest disk.
 ///
 /// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, `applied_devcontainer`, plus what
-/// [`bootstrap_and_post_start`] consumes (`no_agents`, `post_start_override`).
+/// `exclude_git`, `persisted_guest_env`, `applied_devcontainer`, `post_start_override`, plus what
+/// [`bootstrap_on_boot`] consumes (`no_agents`).
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
 /// resolved forward set arrives as `forwards`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
@@ -1289,7 +1290,7 @@ fn provision_first_boot(
         .save(inst)?;
     }
 
-    bootstrap_and_post_start(
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1368,6 +1369,8 @@ fn provision_first_boot(
             );
         }
     }
+
+    run_configured_post_start(cfg, inst, &target, repo, opts)?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1595,25 +1598,8 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
-/// Build an `SshSession` from an already-resolved target.
-///
-/// Symmetric with `open_ssh_session`, for paths that resolve the
-/// target without going through `resolve_running` — namely the
-/// post-boot bootstrap in fresh start and restart, where the
-/// instance isn't yet registered as running.
-///
-/// When `inst` is `Some`, any persisted `--env` snapshot for that
-/// instance is overlaid onto the resolved env-forward set so values
-/// passed at `coop start --env KEY=VAL` survive across the
-/// per-invocation config reload. Bootstrap callers inside fresh
-/// `start_instance` pass `None` because the in-memory `cfg.guest_env`
-/// is already authoritative for that one process; restart and every
-/// post-start command pass `Some` because the on-disk snapshot is
-/// the only place the original `--env` set still lives.
-/// Open a session and run the post-boot agent bootstrap plus any
-/// `postStartCommand`, honoring `--no-agents`. Shared by fresh start and
-/// restart, which differ only in the [`backend::BootMode`].
-fn bootstrap_and_post_start(
+/// Bootstrap guest agents after boot, before workspace provisioning.
+fn bootstrap_on_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -1622,7 +1608,6 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1648,7 +1633,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() {
+    if opts.no_agents {
         if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
@@ -1660,27 +1645,25 @@ fn bootstrap_and_post_start(
     // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
     // defeating proxy-mode non-exposure (issue #411).
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
-    if opts.no_agents {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
-    }
-    if let Some(cmd) = post_start {
-        // Agent bootstrap may have just minted the per-instance capability
-        // token (proxy mode), which is forwarded to sessions via `SendEnv`
-        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
-        // the token existed, so re-prepare it here — otherwise a `post_start`
-        // that runs Codex in proxy mode would lack the token and fail to
-        // authenticate. Under --no-agents no proxy started, so nothing new to
-        // pick up; keep the original session.
-        let session = if opts.no_agents {
-            session
-        } else {
-            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
-        };
-        backend::run_post_start(&session, cmd);
-    }
+    let guest_host = be.guest_host_address(&cfg.network);
+    backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+    Ok(())
+}
+
+/// Run the hook after bootstrap and workspace provisioning have succeeded.
+fn run_configured_post_start(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+        return Ok(());
+    };
+    // Bootstrap may mint a proxy capability token; construct this session afterward.
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    backend::run_post_start(&session, command);
     Ok(())
 }
 

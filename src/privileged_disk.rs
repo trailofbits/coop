@@ -9,7 +9,7 @@ use std::os::unix::fs::{
     FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, bail};
 
@@ -26,6 +26,35 @@ struct DiskPath {
 enum DiskKind {
     Template,
     Instance,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DiskTool {
+    FsckFix,
+    FsckRead,
+    Resize,
+    Format,
+}
+
+impl DiskTool {
+    fn program(self) -> &'static str {
+        match self {
+            Self::FsckFix | Self::FsckRead => "/usr/sbin/e2fsck",
+            Self::Resize => "/usr/sbin/resize2fs",
+            Self::Format => "/usr/sbin/mkfs.ext4",
+        }
+    }
+
+    fn succeeded(self, status: ExitStatus) -> bool {
+        if status.success() {
+            return true;
+        }
+        match self {
+            // e2fsck(8): 1 means errors corrected; other bits still require failure.
+            Self::FsckFix => status.code() == Some(1),
+            Self::FsckRead | Self::Resize | Self::Format => false,
+        }
+    }
 }
 
 const LOOP_CTL_GET_FREE: libc::Ioctl = libc::_IO(0x4c, 0x82);
@@ -326,12 +355,12 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
             Ok(())
         }
         "fsck-fix" if argument.is_none() => {
-            disk_tool(&disk, uid, "/usr/sbin/e2fsck", &["-fy"], true)
+            disk_tool(&disk, uid, DiskTool::FsckFix, &["-fy"], true)
         }
         "fsck-read" if argument.is_none() => {
-            disk_tool(&disk, uid, "/usr/sbin/e2fsck", &["-fn"], false)
+            disk_tool(&disk, uid, DiskTool::FsckRead, &["-fn"], false)
         }
-        "resize" if argument.is_none() => disk_tool(&disk, uid, "/usr/sbin/resize2fs", &[], true),
+        "resize" if argument.is_none() => disk_tool(&disk, uid, DiskTool::Resize, &[], true),
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
@@ -619,9 +648,10 @@ fn write_resolv(disk: &DiskPath) -> Result<()> {
 /// CLOEXEC only in its child, never in coop's long-lived process. If a tool
 /// forks and closes the descriptor, its open fails rather than re-resolving
 /// the original untrusted path.
-fn run_on_descriptors(program: &str, args: &[&str], descriptors: &[&File]) -> Result<()> {
+fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let fds: Vec<_> = descriptors.iter().map(|file| file.as_raw_fd()).collect();
+    let program = tool.program();
     let mut command = Command::new(program);
     command.args(args);
     // SAFETY: pre_exec performs only async-signal-safe fcntl calls. The fd
@@ -639,18 +669,18 @@ fn run_on_descriptors(program: &str, args: &[&str], descriptors: &[&File]) -> Re
     let status = command
         .status()
         .with_context(|| format!("Failed to run {program}"))?;
-    if !status.success() {
+    if !tool.succeeded(status) {
         bail!("{program} failed with status {status}");
     }
     Ok(())
 }
 
-fn disk_tool(disk: &DiskPath, uid: u32, program: &str, flags: &[&str], write: bool) -> Result<()> {
+fn disk_tool(disk: &DiskPath, uid: u32, tool: DiskTool, flags: &[&str], write: bool) -> Result<()> {
     let file = disk.file(write, uid)?;
     let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     let mut args = flags.to_vec();
     args.push(&proc_path);
-    run_on_descriptors(program, &args, &[&file])
+    run_on_descriptors(tool, &args, &[&file])
 }
 
 fn format_disk(disk: &DiskPath, uid: u32) -> Result<()> {
@@ -670,7 +700,7 @@ fn format_disk(disk: &DiskPath, uid: u32) -> Result<()> {
     let source_path = format!("/proc/self/fd/{}", unpack.as_raw_fd());
     let disk_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     run_on_descriptors(
-        "/usr/sbin/mkfs.ext4",
+        DiskTool::Format,
         &["-d", &source_path, "-F", &disk_path],
         &[&unpack, &file],
     )
@@ -745,8 +775,56 @@ pub(crate) fn write_resolv_conf(path: &Path) -> Result<()> {
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, symlink};
+    use std::os::unix::process::ExitStatusExt as _;
 
     use super::*;
+
+    const DISK_TOOLS: [DiskTool; 4] = [
+        DiskTool::FsckFix,
+        DiskTool::FsckRead,
+        DiskTool::Resize,
+        DiskTool::Format,
+    ];
+
+    #[test]
+    fn disk_tools_accept_clean_status() {
+        for tool in DISK_TOOLS {
+            assert!(tool.succeeded(ExitStatus::from_raw(0)), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn only_fsck_fix_accepts_corrected_status() {
+        let corrected = ExitStatus::from_raw(1 << 8);
+        assert!(DiskTool::FsckFix.succeeded(corrected));
+        for tool in [DiskTool::FsckRead, DiskTool::Resize, DiskTool::Format] {
+            assert!(!tool.succeeded(corrected), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn disk_tools_reject_errors_combined_statuses_and_signals() {
+        for tool in DISK_TOOLS {
+            for code in 2..=255 {
+                assert!(
+                    !tool.succeeded(ExitStatus::from_raw(code << 8)),
+                    "{tool:?}: {code}"
+                );
+            }
+            for signal in [
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGABRT,
+                libc::SIGKILL,
+                libc::SIGTERM,
+            ] {
+                assert!(
+                    !tool.succeeded(ExitStatus::from_raw(signal)),
+                    "{tool:?}: {signal}"
+                );
+            }
+        }
+    }
 
     struct TemporaryMount(CString);
 

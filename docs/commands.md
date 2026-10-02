@@ -65,7 +65,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
-| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |
@@ -413,6 +413,13 @@ coop exec my-project -- docker ps
 ### `stop`
 
 Gracefully stop a running VM. The instance disk is preserved. Use `start` to relaunch or `destroy` to remove it.
+
+On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
+guest finishes shutting down. coop allows 10 seconds for this request and exit,
+then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
+wait. A guest that cannot shut down within the grace period can lose recent
+writes during forced termination. If termination cannot be confirmed, coop
+retains the PID file and socket so you can retry.
 
 ```
 coop stop [NAME]

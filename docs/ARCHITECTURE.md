@@ -166,7 +166,9 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
-7. **`postStartCommand`** hook (warned, not fatal).
+7. **`postStartCommand`** hook — runs after workspace and mount provisioning,
+   with an SSH session prepared after bootstrap to include newly created proxy
+   capability tokens. Hook command failures are warned, not fatal.
 
 Config, secrets, and workspace all cross the host→guest boundary here; the
 security-relevant details of each crossing are in
