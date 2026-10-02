@@ -2673,6 +2673,50 @@ test_guest_fingerprint() {
 
 # ── Stop / status-stopped / restart ───────────────────────────
 
+test_stop_preserves_recent_writes() {
+    echo ""
+    echo "=== Phase: stop preserves recent guest writes ==="
+
+    if coop_exec python3 -c '
+from pathlib import Path
+import os
+root = Path.home() / ".coop-stop-durability-test"
+root.mkdir(exist_ok=True)
+(root / "changed").write_text("before")
+(root / "deleted").write_text("before")
+os.sync()
+(root / "changed").write_text("after")
+(root / "created").write_text("new")
+(root / "deleted").unlink()
+'; then
+        pass "write guest disk changes before stop"
+    else
+        fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
+        return
+    fi
+    if ! coop stop "$INSTANCE"; then
+        fail "stop after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! coop start "$INSTANCE" --no-agents; then
+        fail "restart after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if coop_exec python3 -c '
+from pathlib import Path
+import shutil
+root = Path.home() / ".coop-stop-durability-test"
+assert (root / "changed").read_text() == "after", "overwrite lost"
+assert (root / "created").read_text() == "new", "new file lost"
+assert not (root / "deleted").exists(), "deleted file restored"
+shutil.rmtree(root)
+'; then
+        pass "recent writes and deletion survive stop/start"
+    else
+        fail "recent writes and deletion survive stop/start" "stderr: $(guest_stderr)"
+    fi
+}
+
 test_stop() {
     echo ""
     echo "=== Phase: stop ==="
@@ -7377,6 +7421,7 @@ EOF
     test_guest_fingerprint
 
     # Stop + restart + stopped-state verification
+    test_stop_preserves_recent_writes
     test_stop
     test_stop_idempotency
     test_auto_resolve_stopped

@@ -50,6 +50,14 @@ guest environment → docker → stop → destroy). CI additionally runs the fas
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
 
+The stop phase writes, overwrites, and deletes guest files immediately before
+stopping, then verifies those changes after restart without syncing them in
+the test. The `vm::tests::stop_bounds_guest_shutdown_and_reaps_ssh` unit test
+uses real child processes and fake SSH/sudo boundaries to cover graceful exit,
+SSH refusal, a hung client, a missing client, and liveness-probe failure. It
+checks forced-signal fallback, bounded waits, and SSH client reaping. The
+existing stop failure test checks PID retention after failed forced signals.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub

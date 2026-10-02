@@ -414,6 +414,13 @@ coop exec my-project -- docker ps
 
 Gracefully stop a running VM. The instance disk is preserved. Use `start` to relaunch or `destroy` to remove it.
 
+On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
+guest finishes shutting down. coop allows 10 seconds for this request and exit,
+then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
+wait. A guest that cannot shut down within the grace period can lose recent
+writes during forced termination. If termination cannot be confirmed, coop
+retains the PID file and socket so you can retry.
+
 ```
 coop stop [NAME]
 ```

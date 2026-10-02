@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::net::TcpStream;
 use std::num::NonZeroU8;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -350,18 +350,27 @@ impl<'a> FirecrackerVm<'a, Running> {
         );
     }
 
-    /// Stop the Firecracker VM by sending a shutdown request via
-    /// the API socket, falling back to SIGTERM then SIGKILL.
+    /// Request guest shutdown, then fall back to SIGTERM and SIGKILL.
     pub fn stop(self) -> Result<()> {
-        self.stop_with_timeouts(Duration::from_secs(10), Duration::from_secs(5))
+        self.stop_with_timeouts(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        )
     }
 
-    fn stop_with_timeouts(self, term_timeout: Duration, kill_timeout: Duration) -> Result<()> {
-        self.stop_with_probe(term_timeout, kill_timeout, wait_for_exit)
+    fn stop_with_timeouts(
+        self,
+        graceful_timeout: Duration,
+        term_timeout: Duration,
+        kill_timeout: Duration,
+    ) -> Result<()> {
+        self.stop_with_probe(graceful_timeout, term_timeout, kill_timeout, wait_for_exit)
     }
 
     fn stop_with_probe(
         self,
+        graceful_timeout: Duration,
         term_timeout: Duration,
         kill_timeout: Duration,
         mut wait: impl FnMut(u32, Duration) -> Result<bool>,
@@ -374,61 +383,12 @@ impl<'a> FirecrackerVm<'a, Running> {
             bail!("Firecracker PID must be positive");
         }
 
-        // Try graceful shutdown via SendCtrlAltDel action
-        let socket_path = self.inst.api_socket_path();
-        if socket_path.exists() {
-            tracing::debug!("Sending CtrlAltDel via API socket");
-            let result = Cmd::new("curl")
-                .arg("--unix-socket")
-                .arg(&socket_path)
-                .args([
-                    "-X",
-                    "PUT",
-                    "http://localhost/actions",
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    r#"{"action_type": "SendCtrlAltDel"}"#,
-                ])
-                .sudo()
-                .output();
-
-            if result.is_ok() {
-                std::thread::sleep(Duration::from_secs(3));
-            }
+        if !wait(pid, Duration::ZERO)?
+            && !self.shutdown_gracefully(pid, graceful_timeout, &mut wait)?
+        {
+            terminate_firecracker(pid, term_timeout, kill_timeout, &mut wait)?;
         }
 
-        // Send SIGTERM as fallback (process is owned by root)
-        if let Err(e) = Cmd::new("kill").arg(pid.to_string()).sudo().run() {
-            tracing::debug!(
-                "Failed to send SIGTERM to PID {pid} \
-                 (non-fatal): {e}"
-            );
-        }
-
-        // Wait for process to exit after SIGTERM
-        let exited = wait(pid, term_timeout)?;
-
-        if !exited {
-            tracing::warn!(
-                "Firecracker PID {pid} did not exit \
-                 after SIGTERM, sending SIGKILL"
-            );
-            if let Err(e) = Cmd::new("kill").args(["-9", &pid.to_string()]).sudo().run() {
-                tracing::debug!(
-                    "Failed to send SIGKILL to PID {pid} \
-                     (non-fatal): {e}"
-                );
-            }
-
-            if !wait(pid, kill_timeout)? {
-                bail!(
-                    "Firecracker PID {pid} is still alive after SIGKILL; PID file and socket retained for retry"
-                );
-            }
-        }
-
-        // Clean up PID file and socket (socket owned by root)
         if let Err(e) = fs::remove_file(&pid_path) {
             tracing::debug!("Failed to remove PID file (non-fatal): {e}");
         }
@@ -442,6 +402,48 @@ impl<'a> FirecrackerVm<'a, Running> {
         }
 
         Ok(())
+    }
+
+    fn shutdown_gracefully(
+        &self,
+        pid: u32,
+        timeout: Duration,
+        wait: &mut impl FnMut(u32, Duration) -> Result<bool>,
+    ) -> Result<bool> {
+        let request = self.shutdown_command().and_then(|mut command| {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("Cannot launch guest shutdown SSH request")
+        });
+        let mut child = match request {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!("Cannot request graceful guest shutdown: {error:#}");
+                return Ok(false);
+            }
+        };
+        // A successful reboot can disconnect SSH before it reports success.
+        let stopped = wait(pid, timeout);
+        reap_shutdown_client(&mut child);
+        stopped
+    }
+
+    fn shutdown_command(&self) -> Result<Command> {
+        let user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
+        let session = crate::backend::SshSession {
+            target: crate::backend::SshTarget {
+                host: self.inst.guest_ip().into(),
+                port: self.cfg.ssh_port,
+                user: crate::backend::SshUser::new(user.as_str())?,
+                key_path: self.cfg.ssh_key_path(),
+            },
+            env: crate::backend::EnvForward::default(),
+        };
+        // Firecracker exits on guest reboot; its CtrlAltDel API is x86-only.
+        session.command(&[], "sudo -n /sbin/reboot")
     }
 
     /// Return a human-readable status string with resource usage.
@@ -633,6 +635,39 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> Result<bool> {
     }
 }
 
+fn reap_shutdown_client(child: &mut Child) {
+    if let Err(error) = child.kill() {
+        tracing::debug!("Cannot terminate guest shutdown SSH client: {error}");
+    }
+    if let Err(error) = child.wait() {
+        tracing::warn!("Cannot reap guest shutdown SSH client: {error}");
+    }
+}
+
+fn terminate_firecracker(
+    pid: u32,
+    term_timeout: Duration,
+    kill_timeout: Duration,
+    wait: &mut impl FnMut(u32, Duration) -> Result<bool>,
+) -> Result<()> {
+    tracing::warn!("Graceful shutdown did not stop Firecracker PID {pid}; sending SIGTERM");
+    if let Err(error) = Cmd::new("kill").arg(pid.to_string()).sudo().run() {
+        tracing::debug!("Failed to send SIGTERM to PID {pid}: {error}");
+    }
+    if wait(pid, term_timeout)? {
+        return Ok(());
+    }
+    tracing::warn!("Firecracker PID {pid} did not exit after SIGTERM; sending SIGKILL");
+    if let Err(error) = Cmd::new("kill").args(["-9", &pid.to_string()]).sudo().run() {
+        tracing::debug!("Failed to send SIGKILL to PID {pid}: {error}");
+    }
+    anyhow::ensure!(
+        wait(pid, kill_timeout)?,
+        "Firecracker PID {pid} is still alive after SIGKILL; PID file and socket retained for retry"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 mod tests {
@@ -727,6 +762,9 @@ mod tests {
                 )
                 .unwrap();
                 fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+                let ssh = root.path().join("ssh");
+                fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
+                fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
                 let output = Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -751,8 +789,14 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 let calls = fs::read_to_string(root.path().join("calls")).unwrap_or_default();
-                if matches!(mode, "probe_invalid" | "probe_out_of_range") {
-                    assert!(calls.is_empty(), "invalid PID reached sudo: {calls}");
+                if matches!(
+                    mode,
+                    "probe_invalid" | "probe_out_of_range" | "probe_failure" | "already_exited"
+                ) {
+                    assert!(
+                        !calls.contains("kill"),
+                        "unconfirmed live PID reached kill: {calls}"
+                    );
                 } else {
                     assert!(calls.contains("kill"), "{mode}: {calls}");
                 }
@@ -787,11 +831,11 @@ mod tests {
         let cfg = CoopConfig::default();
         let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
         let result = if mode == "probe_failure" {
-            vm.stop_with_probe(Duration::ZERO, Duration::ZERO, |_, _| {
+            vm.stop_with_probe(Duration::ZERO, Duration::ZERO, Duration::ZERO, |_, _| {
                 Err(anyhow::anyhow!("injected liveness probe failure"))
             })
         } else {
-            vm.stop_with_timeouts(Duration::ZERO, Duration::ZERO)
+            vm.stop_with_timeouts(Duration::ZERO, Duration::ZERO, Duration::ZERO)
         };
         if mode == "already_exited" {
             assert!(result.is_ok(), "{result:?}");
@@ -812,6 +856,160 @@ mod tests {
                 fs::read_to_string(inst.pid_file_path()).unwrap(),
                 pid.to_string()
             );
+        }
+    }
+
+    #[test]
+    fn stop_bounds_guest_shutdown_and_reaps_ssh() {
+        let Ok(mode) = std::env::var("COOP_TEST_SHUTDOWN_MODE") else {
+            for mode in ["graceful", "refused", "hung", "missing", "probe_error"] {
+                run_shutdown_fixture(mode);
+            }
+            return;
+        };
+        let root = std::path::PathBuf::from(std::env::var("COOP_TEST_SHUTDOWN_ROOT").unwrap());
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let mut process = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(inst.pid_file_path(), process.id().to_string()).unwrap();
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.join("data")),
+            ..CoopConfig::default()
+        };
+        cfg.guest_env
+            .insert("PATH".parse().unwrap(), "/guest-only".into());
+        let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
+        let started = Instant::now();
+        let result = vm.stop_with_probe(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            |_, timeout| probe_shutdown_fixture(&mut process, &root, &mode, timeout),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "unbounded shutdown"
+        );
+        assert_shutdown_result(result, &inst, &mut process, &mode);
+        assert_shutdown_fixture(&root, &mode);
+    }
+
+    fn assert_shutdown_result(
+        result: anyhow::Result<()>,
+        inst: &Instance,
+        process: &mut std::process::Child,
+        mode: &str,
+    ) {
+        if mode == "probe_error" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected probe failure")
+            );
+            assert!(inst.pid_file_path().exists());
+            assert!(process.try_wait().unwrap().is_none());
+            process.kill().unwrap();
+            process.wait().unwrap();
+        } else {
+            result.unwrap();
+            assert!(!inst.pid_file_path().exists());
+            assert!(process.try_wait().unwrap().is_some());
+        }
+    }
+
+    const SHUTDOWN_SUDO: &str = concat!(
+        "#!/bin/sh\nset -eu\n",
+        "printf '%s\\n' \"$*\" >> \"$COOP_TEST_SHUTDOWN_ROOT/signals\"\n",
+        "case $1 in\n",
+        "kill) shift; kill \"$@\";;\n",
+        "rm) shift; exec /bin/rm \"$@\";;\n",
+        "*) exit 1;;\nesac\n",
+    );
+
+    const SHUTDOWN_SSH: &str = concat!(
+        "#!/bin/sh\nset -eu\n",
+        "printf '%s\\n' \"$$\" > \"$COOP_TEST_SHUTDOWN_ROOT/ssh-pid\"\n",
+        "for arg do remote=$arg; done\n",
+        "[ \"$remote\" = 'sudo -n /sbin/reboot' ] || exit 99\n",
+        "case $COOP_TEST_SHUTDOWN_MODE in\n",
+        "graceful) pid=$(/bin/cat \"$COOP_TEST_SHUTDOWN_ROOT/instance/firecracker.pid\"); ",
+        "kill \"$pid\"; exit 255;;\n",
+        "refused) exit 1;;\n",
+        "*) exec /bin/sleep 30;;\nesac\n",
+    );
+
+    fn run_shutdown_fixture(mode: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let sudo = root.path().join("sudo");
+        std::fs::write(&sudo, SHUTDOWN_SUDO).unwrap();
+        std::fs::set_permissions(sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if mode != "missing" {
+            let ssh = root.path().join("ssh");
+            std::fs::write(&ssh, SHUTDOWN_SSH).unwrap();
+            std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vm::tests::stop_bounds_guest_shutdown_and_reaps_ssh",
+            ])
+            .env("COOP_TEST_SHUTDOWN_ROOT", root.path())
+            .env("COOP_TEST_SHUTDOWN_MODE", mode)
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn probe_shutdown_fixture(
+        process: &mut std::process::Child,
+        root: &std::path::Path,
+        mode: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<bool> {
+        let started = Instant::now();
+        loop {
+            if process.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if mode == "probe_error" && !timeout.is_zero() && root.join("ssh-pid").exists() {
+                anyhow::bail!("injected probe failure");
+            }
+            if started.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_shutdown_fixture(root: &std::path::Path, mode: &str) {
+        let signals = std::fs::read_to_string(root.join("signals")).unwrap_or_default();
+        if mode == "graceful" || mode == "probe_error" {
+            assert!(!signals.contains("kill"), "{mode}: {signals}");
+        } else {
+            assert!(signals.contains("kill "), "{mode}: {signals}");
+            assert!(!signals.contains("kill -9"), "{mode}: {signals}");
+        }
+        if mode == "missing" {
+            assert!(!root.join("ssh-pid").exists());
+        } else {
+            let pid = std::fs::read_to_string(root.join("ssh-pid")).unwrap();
+            assert!(wait_for_exit(pid.trim().parse().unwrap(), Duration::ZERO).unwrap());
         }
     }
 
