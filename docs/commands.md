@@ -65,7 +65,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
-| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
 | `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
 | `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |

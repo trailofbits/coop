@@ -63,6 +63,11 @@ boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
 forwarding on an intervening invocation without the flag.
 
+The full post-start tests run a script from the copied workspace that reads an
+additional mount. The clone phase also checks that a post-start hook can read
+both the cloned repository and its additional mount. These assertions detect
+hooks running before workspace provisioning.
+
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
 
@@ -160,9 +165,7 @@ redaction must fail the assignment-error regression. Restore the code and
 rerun the tests after each check.
 
 The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
-rejects the fixture filename. The Lima resize spawn-failure test runs in an
-isolated child process with an empty executable search directory, so it cannot
-find a host `truncate` or change another test's environment.
+rejects the fixture filename.
 
 ## Host subprocess boundary tests
 
@@ -347,7 +350,7 @@ unit-tested): `tools_needing_prompt`, `switch_report_lines`,
 ModelMode` in `lib.rs`. Excluded as IO/backend/TTY: `model.rs`'s `render_status`
 / `write_tool_line` / `set_local` / `set_remote` / `report_switch` /
 `apply_to_running` / `prompt_endpoint`, and `lifecycle.rs`'s
-`bootstrap_and_post_start` / `prepare_session_from_target`.
+`bootstrap_on_boot` / `run_configured_post_start` / `prepare_session_from_target`.
 
 **Keep `.cargo/mutants.toml` in sync in the same PR that adds the code** — this
 is not a follow-up chore. #352 was merged without scoping its new IO/backend/TTY
