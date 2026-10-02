@@ -473,7 +473,10 @@ enum Commands {
         #[arg(long)]
         exclude_git: bool,
     },
-    /// Pull guest workspace to local directory
+    /// Pull the untrusted guest workspace to a local directory
+    ///
+    /// Pulled files may be malicious. Review them before executing them or
+    /// interpreting them with Git, editors, build tools, or other host apps.
     Pull {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -484,12 +487,9 @@ enum Commands {
         /// Local directory to pull into (defaults to `workspace.json` `host_path`)
         #[arg(long)]
         dir: Option<String>,
-        /// Overwrite local changes without confirmation
+        /// Allow pull into a non-empty destination, overwriting matching files
         #[arg(long)]
         force: bool,
-        /// Skip the `.git` directory in this transfer
-        #[arg(long)]
-        exclude_git: bool,
     },
     /// Run a command in the VM and return its output (non-interactive)
     ///
@@ -1354,14 +1354,9 @@ pub fn run() -> Result<()> {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::push(&running, dir.as_deref(), force, exclude_git)
         }
-        Commands::Pull {
-            name,
-            dir,
-            force,
-            exclude_git,
-        } => {
+        Commands::Pull { name, dir, force } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
-            workspace::pull(&running, dir.as_deref(), force, exclude_git)
+            workspace::pull(&running, dir.as_deref(), force)
         }
         Commands::Exec { name, command } => cmd_exec(&be, &cfg, name.as_ref(), &command),
         Commands::Editor {
@@ -2067,10 +2062,7 @@ mod tests {
     #[test]
     fn pull_positional_name_and_dir_flag_parse() {
         let cli = parse(&["pull", "myvm", "--dir", "./out", "--force"]);
-        let super::Commands::Pull {
-            name, dir, force, ..
-        } = cli.command
-        else {
+        let super::Commands::Pull { name, dir, force } = cli.command else {
             panic!("expected Pull variant");
         };
         assert_eq!(
@@ -2079,6 +2071,26 @@ mod tests {
         );
         assert_eq!(dir.as_deref(), Some("./out"));
         assert!(force);
+    }
+
+    #[test]
+    fn pull_rejects_exclude_git_flag() {
+        let result = super::Cli::try_parse_from(["coop", "pull", "--exclude-git"]);
+        assert!(result.is_err(), "pull must reject its removed no-op flag");
+    }
+
+    #[test]
+    fn pull_help_states_overwrite_and_untrusted_content_semantics() {
+        let mut command = <super::Cli as clap::CommandFactory>::command();
+        let pull = command
+            .find_subcommand_mut("pull")
+            .expect("pull subcommand");
+        let help = pull.render_long_help().to_string();
+
+        assert!(help.contains("untrusted guest"), "{help}");
+        assert!(help.contains("may be malicious"), "{help}");
+        assert!(help.contains("non-empty destination"), "{help}");
+        assert!(!help.contains("--exclude-git"), "{help}");
     }
 
     #[test]

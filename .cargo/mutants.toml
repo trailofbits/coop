@@ -114,7 +114,6 @@ exclude_re = [
   "\\brsync_push\\b",
   "\\brsync_pull\\b",
   "\\bcheck_guest_dirty\\b",
-  "\\bcheck_local_dirty\\b",
   "\\batomic_write\\b",
   "\\bwrite_ssh_config\\b",
   "\\brefresh_ssh_config_if_present\\b",

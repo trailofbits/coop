@@ -49,6 +49,15 @@ user launched it.
   `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
+  Pull never invokes host Git to inspect its destination. It refuses a nonempty
+  destination unless the user supplies `--force`, which authorizes overwriting
+  matching files but does not change their trust level. The transports attempt
+  to omit common ASCII-case `.git` paths, and tar-pipe pulls extract into an
+  empty staging directory before installation. Those filters are
+  defense-in-depth, not a guarantee across every transport, Git, and filesystem
+  naming behavior. Treat every pulled file and the resulting directory as
+  potentially malicious. In particular, coop does not make a repository
+  previously pulled by a vulnerable release safe for host Git or other tools.
 - **Rootfs files touched while loop-mounted during setup.** `setup.rs`
   `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
   commit` turns a guest-mutated rootfs into an image template — so the guest

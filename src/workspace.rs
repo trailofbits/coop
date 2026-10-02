@@ -15,9 +15,8 @@ use crate::remote_command::RemoteCommand;
 const GUEST_WORKSPACE: &str = "/workspace";
 
 /// Default exclusions for transfers — reproducible build/cache directories
-/// only. `.git/` is intentionally absent: agents inside the guest need
-/// history, branches, and the ability to make commits that survive a
-/// `coop pull`. Opt out per-transfer with `exclude_git: true`.
+/// only. Git metadata is handled separately because the safe policy depends on
+/// the transfer direction.
 const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
     "target/",
@@ -26,7 +25,19 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     ".coop/",
 ];
 
-const GIT_EXCLUDE: &str = ".git/";
+/// Best-effort match for Git administration entries in every ASCII case.
+///
+/// macOS filesystems are commonly case-insensitive, so allowing a guest `.GIT`
+/// entry through a case-sensitive filter can still overwrite the host's
+/// `.git`. The bracket form works with both rsync and tar and matches at every
+/// directory depth. This filter reduces accidental transfer; it is not a
+/// security boundary because transport and filesystem name semantics vary.
+const GIT_EXCLUDE: &str = ".[gG][iI][tT]";
+
+const PULL_UNTRUSTED_WARNING: &str = "Pull copies files controlled by the untrusted guest. \
+Treat the result as potentially malicious: review it before executing files or interpreting \
+it with Git, editors, build tools, shells, or other host applications. Git metadata filtering \
+is best effort, not a security boundary.";
 
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -504,23 +515,26 @@ pub fn push(
 ///
 /// Takes a `RunningInstance` so the caller's proof of liveness is
 /// visible in the signature — no surprise SSH failure inside.
-pub fn pull(
-    running: &RunningInstance,
-    dir: Option<&str>,
-    force: bool,
-    exclude_git: bool,
-) -> Result<()> {
+pub fn pull(running: &RunningInstance, dir: Option<&str>, force: bool) -> Result<()> {
     let inst = running.instance();
     let target = running.target();
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir(dir, &state, "pull")?;
 
-    if !force && dest_dir.exists() {
-        check_local_dirty(&dest_dir)?;
+    if !force && pull_destination_is_nonempty(&dest_dir)? {
+        bail!(
+            "Refusing to pull into non-empty destination '{}'.\n\
+             coop does not inspect the destination with Git because its files and repository \
+             metadata may be untrusted. Review the destination, then rerun with --force to \
+             authorize overwriting matching files. --force does not make pulled content trusted.",
+            dest_dir.display()
+        );
     }
 
     fs::create_dir_all(&dest_dir)
         .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+
+    tracing::warn!("{PULL_UNTRUSTED_WARNING}");
 
     tracing::info!(
         "Pulling guest:{} -> {}",
@@ -529,10 +543,10 @@ pub fn pull(
     );
 
     if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
-        rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
+        rsync_pull(target, &state.guest_path, &dest_dir)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
+        tar_pipe_pull(target, &state.guest_path, &dest_dir)?;
     }
 
     tracing::info!("Pull complete");
@@ -783,13 +797,8 @@ pub(crate) fn rsync_push(
     Ok(())
 }
 
-fn rsync_pull(
-    target: &SshTarget,
-    guest_path: &GuestPath,
-    dest: &Path,
-    exclude_git: bool,
-) -> Result<()> {
-    let mut args = rsync_base_args(target, exclude_git);
+fn rsync_pull(target: &SshTarget, guest_path: &GuestPath, dest: &Path) -> Result<()> {
+    let mut args = rsync_pull_args(target);
     args.push(format!("{}:{guest_path}/", target.addr()));
     args.push(format!("{}/", dest.display()));
 
@@ -802,6 +811,12 @@ fn rsync_pull(
         bail!("rsync pull failed");
     }
     Ok(())
+}
+
+fn rsync_pull_args(target: &SshTarget) -> Vec<String> {
+    // Guest-authored Git administration data is active configuration, not
+    // workspace content. Apply the common-name filter as defense-in-depth.
+    rsync_base_args(target, true)
 }
 
 // ── Transport: tar-pipe ───────────────────────────────────────
@@ -836,14 +851,14 @@ fn tar_command() -> Command {
 ///
 /// `guest_path` is shell-escaped (via [`RemoteCommand::arg`]); the exclude
 /// patterns are fixed constants, not user input.
-fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
+fn tar_pull_cmd(guest_path: &GuestPath) -> RemoteCommand {
     let mut excludes: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(|exc| format!("--exclude={exc}"))
         .collect();
-    if exclude_git {
-        excludes.push(format!("--exclude={GIT_EXCLUDE}"));
-    }
+    // Match rsync pull's best-effort filter for common Git administration
+    // names. The host extraction path applies the same filter independently.
+    excludes.push(format!("--exclude={GIT_EXCLUDE}"));
     let exclude_str = excludes.join(" ");
     RemoteCommand::new()
         .literal("tar cf - -C ")
@@ -851,13 +866,51 @@ fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
         .literal(format!(" {exclude_str} ."))
 }
 
-fn tar_pipe_pull(
-    target: &SshTarget,
-    guest_path: &GuestPath,
-    dest: &Path,
-    exclude_git: bool,
-) -> Result<()> {
-    let remote_cmd = tar_pull_cmd(guest_path, exclude_git).into_string();
+/// Local extraction command for a guest-created pull archive.
+///
+/// The guest is untrusted and may replace or wrap its `tar`, so the host must
+/// enforce the Git-administration exclusion independently while extracting.
+fn tar_pull_extract_cmd(dest: &Path) -> Command {
+    let mut command = tar_command();
+    command
+        .arg("xf")
+        .arg("-")
+        .arg(format!("--exclude={GIT_EXCLUDE}"))
+        .arg("-C")
+        .arg(dest);
+    command
+}
+
+fn install_staged_pull(source: &Path, dest: &Path) -> Result<()> {
+    let args = install_staged_pull_args(source, dest);
+    let status = Command::new("rsync")
+        .args(args)
+        .status()
+        .context("Failed to install staged tar-pipe pull")?;
+
+    if !status.success() {
+        bail!("Failed to install staged tar-pipe pull");
+    }
+    Ok(())
+}
+
+fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
+    vec![
+        "-a".to_string(),
+        format!("--exclude={GIT_EXCLUDE}"),
+        format!("{}/", source.display()),
+        format!("{}/", dest.display()),
+    ]
+}
+
+fn tar_pipe_pull(target: &SshTarget, guest_path: &GuestPath, dest: &Path) -> Result<()> {
+    let remote_cmd = tar_pull_cmd(guest_path).into_string();
+    // Never unpack an archive authored by the untrusted guest into an existing
+    // host workspace. In particular, a tar hard-link entry can otherwise name
+    // an allowed path while targeting an existing `.git/config`. An empty
+    // staging directory makes such cross-boundary links fail before rsync
+    // installs the ordinary workspace entries.
+    let staging = tempfile::tempdir().context("Failed to create pull staging directory")?;
 
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
@@ -879,11 +932,7 @@ fn tar_pipe_pull(
         .take()
         .context("Failed to get SSH stderr")?;
 
-    let mut tar_child = Command::new("tar")
-        .arg("xf")
-        .arg("-")
-        .arg("-C")
-        .arg(dest)
+    let mut tar_child = tar_pull_extract_cmd(staging.path())
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -951,7 +1000,7 @@ fn tar_pipe_pull(
         );
     }
 
-    Ok(())
+    install_staged_pull(staging.path(), dest)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1015,28 +1064,22 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     Ok(())
 }
 
-fn check_local_dirty(dest: &Path) -> Result<()> {
-    let git_dir = dest.join(".git");
-    if !git_dir.exists() {
-        return Ok(());
+fn pull_destination_is_nonempty(dest: &Path) -> Result<bool> {
+    let mut entries = match fs::read_dir(dest) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect pull destination {}", dest.display()));
+        }
+    };
+
+    match entries.next() {
+        None => Ok(false),
+        Some(Ok(_)) => Ok(true),
+        Some(Err(error)) => Err(error)
+            .with_context(|| format!("Failed to inspect pull destination {}", dest.display())),
     }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dest)
-        .args(["status", "--porcelain"])
-        .output()
-        .context("Failed to check local git status")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-        bail!(
-            "Local directory has uncommitted changes:\n{stdout}\n\
-             Use --force to overwrite"
-        );
-    }
-
-    Ok(())
 }
 
 // ── SSH config / VS Code ──────────────────────────────────────
@@ -2112,15 +2155,14 @@ Host coop-other\n\
 
     #[test]
     fn default_excludes_omit_git() {
-        // Issue #91: `.git/` was previously hardcoded into DEFAULT_EXCLUDES,
-        // which silently stripped git history from agents in the guest. The
-        // policy is now opt-out via --exclude-git; lock it in here so a
-        // future tidy-up doesn't accidentally re-add `.git/`.
+        // Host-to-guest transfers include Git metadata by default so agents
+        // receive repository history. Pulls enforce their stricter policy at
+        // the direction-specific call sites.
         assert!(
             !DEFAULT_EXCLUDES.iter().any(|e| e.contains(".git")),
             "DEFAULT_EXCLUDES must not contain a .git pattern; got {DEFAULT_EXCLUDES:?}"
         );
-        assert_eq!(GIT_EXCLUDE, ".git/");
+        assert_eq!(GIT_EXCLUDE, ".[gG][iI][tT]");
     }
 
     #[test]
@@ -2159,7 +2201,9 @@ Host coop-other\n\
             }
 
             let has_protect = args.iter().any(|a| a == "--filter=+ /.git/***");
-            let has_exclude_git = args.iter().any(|a| a == "--exclude=.git/");
+            let has_exclude_git = args
+                .iter()
+                .any(|a| a == "--exclude=.[gG][iI][tT]");
             // Exactly one git rule, selected by the flag.
             prop_assert_eq!(has_protect, !exclude_git);
             prop_assert_eq!(has_exclude_git, exclude_git);
@@ -2170,7 +2214,9 @@ Host coop-other\n\
                 .expect("expected .gitignore merge filter");
             let git_rule_idx = args
                 .iter()
-                .position(|a| a == "--filter=+ /.git/***" || a == "--exclude=.git/")
+                .position(|a| {
+                    a == "--filter=+ /.git/***" || a == "--exclude=.[gG][iI][tT]"
+                })
                 .expect("expected a git rule");
             prop_assert!(
                 git_rule_idx < gitignore_idx,
@@ -2178,6 +2224,156 @@ Host coop-other\n\
                 args
             );
         }
+    }
+
+    #[test]
+    fn pull_transports_apply_best_effort_git_exclusions() {
+        let target = fake_ssh_target();
+        let rsync_args = rsync_pull_args(&target);
+        assert!(
+            rsync_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]")
+        );
+        assert!(!rsync_args.iter().any(|arg| arg == "--filter=+ /.git/***"));
+
+        let tar = tar_pull_cmd(&GuestPath::absolute("/workspace").unwrap()).into_string();
+        assert!(tar.contains("--exclude=.[gG][iI][tT]"), "{tar}");
+
+        let extract = tar_pull_extract_cmd(Path::new("/host/workspace"));
+        let extract_args: Vec<_> = extract
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            extract_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
+            "{extract_args:?}"
+        );
+
+        let staged_args =
+            install_staged_pull_args(Path::new("/pull-staging"), Path::new("/host/workspace"));
+        assert!(
+            staged_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
+            "{staged_args:?}"
+        );
+    }
+
+    #[test]
+    fn tar_pull_extractor_omits_common_guest_git_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(source.join("nested/.GiT")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("workspace-file"), "worktree\n").unwrap();
+        fs::write(source.join("nested/.GiT/config"), "guest-controlled\n").unwrap();
+
+        let archive = temp.path().join("guest.tar");
+        let packed = tar_command()
+            .args(["cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(packed.success());
+
+        let archive_input = fs::File::open(&archive).unwrap();
+        let extracted = tar_pull_extract_cmd(&dest)
+            .stdin(Stdio::from(archive_input))
+            .status()
+            .unwrap();
+        assert!(extracted.success());
+        assert_eq!(
+            fs::read_to_string(dest.join("workspace-file")).unwrap(),
+            "worktree\n"
+        );
+        assert!(!dest.join("nested/.GiT").exists());
+    }
+
+    #[test]
+    fn tar_pull_staging_rejects_hard_links_into_git_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(source.join(".git/config"), "guest-controlled\n").unwrap();
+        fs::hard_link(source.join(".git/config"), source.join("alias")).unwrap();
+
+        let archive = temp.path().join("guest-hard-link.tar");
+        let packed = tar_command()
+            .args(["cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .args([".git/config", "alias"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+
+        let archive_input = fs::File::open(&archive).unwrap();
+        let extracted = tar_pull_extract_cmd(&staging)
+            .stdin(Stdio::from(archive_input))
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!extracted.success());
+        assert!(!staging.join("alias").exists());
+    }
+
+    #[test]
+    fn staged_pull_best_effort_filter_leaves_common_host_git_path_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(staging.join(".GiT")).unwrap();
+        fs::create_dir_all(dest.join(".git")).unwrap();
+        fs::write(staging.join("workspace-file"), "worktree\n").unwrap();
+        fs::write(staging.join(".GiT/config"), "guest-controlled\n").unwrap();
+        fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
+
+        install_staged_pull(&staging, &dest).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.join("workspace-file")).unwrap(),
+            "worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".git/config")).unwrap(),
+            "host-owned\n"
+        );
+    }
+
+    #[test]
+    fn pull_destination_requires_force_based_only_on_directory_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let empty = temp.path().join("empty");
+        let nonempty = temp.path().join("nonempty");
+        let not_directory = temp.path().join("not-directory");
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("guest-controlled"), "data").unwrap();
+        fs::write(&not_directory, "data").unwrap();
+
+        assert!(!pull_destination_is_nonempty(&missing).unwrap());
+        assert!(!pull_destination_is_nonempty(&empty).unwrap());
+        assert!(pull_destination_is_nonempty(&nonempty).unwrap());
+        assert!(pull_destination_is_nonempty(&not_directory).is_err());
+    }
+
+    #[test]
+    fn pull_warning_states_the_actual_trust_boundary() {
+        assert!(PULL_UNTRUSTED_WARNING.contains("untrusted guest"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("potentially malicious"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("best effort"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("not a security boundary"));
     }
 
     // ── WorkspaceState serialization ──────────────────────────
@@ -2219,7 +2415,7 @@ Host coop-other\n\
             "extract command must single-quote the guest path"
         );
 
-        let pull = tar_pull_cmd(&evil, false).into_string();
+        let pull = tar_pull_cmd(&evil).into_string();
         assert!(
             pull.starts_with("tar cf - -C '/work; rm -rf / $(touch pwned)' "),
             "pull command must single-quote the guest path: {pull}"
