@@ -23,16 +23,17 @@ first to change creation-time choices such as transport, image, disk size, or
 extra mounts.
 
 `coop up` in copy mode tar-pipes the project into `/workspace` inside the
-guest over SSH. Both sides independently SHA-256-hash the tar stream. If the
-checksums diverge, the transfer aborts. coop persists the host-to-guest path
-mapping in `workspace.json` so that later `push` and `pull` calls resolve paths
-automatically.
+guest over SSH. coop checks the local tar and guest SSH exit statuses, then
+persists the host-to-guest path mapping in `workspace.json` so that later
+`push` and `pull` calls resolve paths automatically.
 
 `coop up --mount` mounts the project directory into the guest. Behavior differs
 by backend:
 
 - **Lima (macOS)**: Live virtiofs mount. Changes on host are visible in guest immediately and vice versa.
-- **Firecracker (Linux)**: One-time rsync sync at boot. Not a live mount. Use `coop push` / `coop pull` to sync changes afterward.
+- **Firecracker (Linux)**: One-time rsync sync at boot. Not a live mount. Use
+  `coop push` to update the guest, or `coop pull --dir <new-directory>` to
+  retrieve guest changes for review.
 
 Additional host data can be mounted at creation time with
 `coop up --extra-mount HOST_PATH:GUEST_PATH`. In copy mode, extra mounts must
@@ -54,10 +55,10 @@ Because the mount is live, those entries appear on the host as well. After the V
 
 coop prints a warning at start time when a live-mount source is a git repo. To avoid the issue, do not run commands inside the guest that record absolute paths in `.git/config` — in particular, `git worktree add` and `prek install` (or any other tool that calls `git config core.hooksPath`).
 
-Switching from mount mode to copy mode does not on its own fix this: copy mode
-includes `.git/` by default and `coop pull` can bring corrupted config entries
-written inside the guest back to the host. Either avoid the offending commands
-or pass `--exclude-git` on `coop pull`.
+Copy mode does not create a live filesystem share. Host-to-guest transfers
+include `.git/`; guest-to-host pulls attempt to omit common `.git` paths but do
+not promise to identify every filesystem alias. Treat the pulled directory as
+untrusted even when the ordinary `.git` entry was not copied back.
 
 ### Manual via SSH
 
@@ -75,7 +76,7 @@ Creating a project VM with `coop up` writes a `workspace.json` in the instance d
 | Field        | Description                                                    |
 |-------------|----------------------------------------------------------------|
 | `host_path`  | Absolute path on the host for local workspace and mount sources |
-| `guest_path` | Path inside the guest VM (always `/workspace`)                 |
+| `guest_path` | Path inside the guest VM (`/workspace` by default; the first mount's path for mount-only VMs) |
 | `source`     | How the workspace was created: `workspace`, `mount`, or `git_repo` |
 
 `push` and `pull` read this file to resolve default paths.
@@ -100,21 +101,38 @@ If either signal finds anything, push prints it and exits. `--force` overrides b
 Transfer method selection is automatic:
 
 1. **rsync** if the guest has it. Uses `--delete` to mirror the host directory exactly. Reads `.gitignore` files via `--filter=':- .gitignore'`.
-2. **tar-pipe** otherwise. Streams a tar archive over SSH with end-to-end SHA-256 verification.
+2. **tar-pipe** otherwise. Streams a tar archive over SSH to the recorded guest path. On Lima, `push` refuses this fallback for a live mount because extraction could write into its own host source. Lima mounts normally expose host changes directly in the guest.
 
 ## Pulling: guest to host
 
 ```bash
-coop pull                                       # uses host_path from workspace.json
+coop pull                                       # uses host_path; must be empty unless --force
 coop pull --dir ./local-copy                    # pull into a specific directory
-coop pull --force                               # skip local dirty check
+coop pull --force                               # allow a nonempty destination
 coop pull my-instance                           # target a specific instance
 coop pull my-instance --dir ./local-copy        # combined
 ```
 
-Before overwriting the local destination, `pull` runs `git status --porcelain` against it. If the directory has a `.git` and any uncommitted changes (tracked or untracked), pull refuses unless you pass `--force`. Unlike push's guest-side check, the local check does not inspect unpushed commits — committing your local work first is enough to satisfy it.
+Pull never invokes Git on the host. It cannot safely use `git status` to inspect
+a directory that may contain files or repository metadata from an untrusted
+guest. Pull therefore accepts a missing or empty destination by default and
+refuses a nonempty destination unless `--force` is supplied. `--force`
+authorizes overwriting matching destination files; it does not disable transfer
+checks or make the received files trusted.
 
-The destination directory is created if absent. Transport selection follows the same rsync-then-tar-pipe order. The tar-pipe fallback verifies SHA-256 checksums end-to-end.
+Everything returned by pull is controlled by the guest and may be malicious.
+Review the result before executing it or interpreting it with Git, an editor, a
+build tool, a shell, or another host application. Upgrading coop does not repair
+repositories pulled by an affected older release; recreate their Git metadata
+from a trusted source before using host Git on them.
+
+The transports attempt to exclude common `.git` names, including nested ASCII
+case variants. Both pull paths receive into an empty staging directory and then
+apply the filter again during a trusted host-side installation; the tar path
+also filters during host extraction. This is useful defense-in-depth, not a
+guarantee that every Git-administration alias will be recognized across all
+transport and filesystem implementations. Pull has no `--exclude-git` option;
+the filtering behavior is unconditional and best effort.
 
 ## Default exclusions
 
@@ -133,7 +151,10 @@ effect on extraction). Without it, those metadata entries can land in a Linux
 guest as ordinary files, including inside `.git/`, where they can break Git's
 pack/ref discovery.
 
-`.git/` is **included** by default so agents in the guest get full history, branches, and the ability to make commits that survive a `coop pull`. Pass `--exclude-git` to `coop up`, `coop push`, or `coop pull` to skip it on a per-transfer basis (useful for very large repos where transfer time dominates).
+Host-to-guest transfers (`coop up` and `coop push`) include `.git/` by default
+so agents receive full history and branches. Pass `--exclude-git` to skip it.
+Guest-to-host pulls attempt to exclude common `.git` paths as defense-in-depth.
+Do not rely on pull to sanitize guest content or make it safe for host Git.
 
 ## .gitignore integration
 
@@ -143,14 +164,19 @@ The tar-pipe fallback on Linux uses GNU tar's `--exclude-vcs-ignores` for the sa
 
 ### `.git/` and .gitignore
 
-A repo whose `.gitignore` lists `.git/` (rare, but legal — sometimes seen in dotfile repos or repos vendoring other repos) gets special handling so the new include-by-default behaviour is not silently undone:
+A repo whose `.gitignore` lists `.git/` (rare, but legal — sometimes seen in dotfile repos or repos vendoring other repos) gets special handling on host-to-guest transfers so the include-by-default behaviour is not silently undone:
 
-- **rsync**: a protective `--filter=+ /.git/***` is prepended before the per-directory `.gitignore` merge, so `.git/` and its contents are always transferred unless `--exclude-git` is passed.
-- **GNU tar (Linux)**: `--exclude-vcs-ignores` is all-or-nothing. If your `.gitignore` lists `.git/`, the tar-pipe transport will skip it. Pass `--exclude-git` explicitly if that is what you want, or remove the entry from `.gitignore`.
+- **rsync push**: a protective `--filter=+ /.git/***` is prepended before the per-directory `.gitignore` merge, so `.git/` and its contents are transferred unless `--exclude-git` is passed.
+- **GNU tar push (Linux)**: `--exclude-vcs-ignores` is all-or-nothing. If your `.gitignore` lists `.git/`, the tar-pipe transport will skip it. Pass `--exclude-git` explicitly if that is what you want, or remove the entry from `.gitignore`.
 - **BSD tar (macOS)**: not affected — it doesn't read `.gitignore` at all.
+- **Pulls**: transports attempt to exclude common `.git` entries independently
+  of `.gitignore`; this is not a security guarantee.
 
-## Checksum verification
+## Transfer integrity
 
-Every tar-pipe transfer hashes the archive with SHA-256 on both the sending and receiving sides. A mismatch fails the transfer and reports both hash values. This detects truncated streams, network corruption, and disk errors.
+Tar-pipe transfers rely on SSH transport integrity and check both the sending
+and receiving process statuses. They do not add an application-level checksum.
+A checksum supplied by the untrusted guest would not make guest-authored pull
+content trustworthy.
 
 Rsync handles integrity internally. No additional checksumming is layered on top.

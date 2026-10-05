@@ -30,6 +30,12 @@ unreachable?*
   wrap the type in a module-private struct and expose `fn new(...) -> Result<Self, Error>`.
   The invariant then holds by construction everywhere the type appears
   (`Hostname`, `SshUser`, `RepoSlug`, `EnvVarName`, `InstanceIndex`).
+  State exactly what the constructor proves: `EnvVarName` proves name syntax,
+  not safety in a host process environment. Keep origin and execution domain
+  distinct when merging trusted settings with project/guest data; a shared
+  config type does not confer trust. Prefer APIs that expose only the inert
+  transport representation to host launchers, with guest interpretation kept
+  behind the guest boundary.
 - **Make illegal states unrepresentable.** Two `Option<T>` fields that are
   always both-`Some`/both-`None` should be one `Option<(T, T)>`. A `bool` plus a
   payload meaningful only when the bool is true should be an `Option`. A
@@ -50,7 +56,7 @@ type rather than in a field. Two flavors, pick the lightest that works:
   `start(self) -> Vm<Running>` consumes the stopped value. Illegal transitions
   become compile errors. Use when the lifecycle is the *primary* abstraction a
   type exposes. coop uses this for `FirecrackerVm<Configured|Running>` (`vm.rs`)
-  and for the `RunningInstance`/`StoppedInstance` liveness proofs (`backend.rs`)
+  and for the `RunningInstance`/`StoppedInstance` state observations (`backend.rs`)
   — don't reach for it on a type that mostly does something else.
 
 ## Newtypes that earn their keep

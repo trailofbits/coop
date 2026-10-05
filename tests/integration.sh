@@ -63,9 +63,7 @@ if [[ -z "$BINARY" ]]; then
 fi
 
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
-# (e.g. the discovered-devcontainer confirmation) on stdin being a TTY, falling
-# back to a non-TTY error that the suite asserts on. Under CI stdin is already
-# not a TTY, but when the suite runs from an interactive shell (the release
+# on stdin being a TTY. Under CI stdin is already not a TTY, but when the suite runs from an interactive shell (the release
 # preflight) those prompts would read real keystrokes and block. Redirecting the
 # whole script makes every coop subprocess see a non-TTY stdin regardless of how
 # the suite is invoked. The script itself never reads stdin.
@@ -76,6 +74,8 @@ exec </dev/null
 pass_count=0
 fail_count=0
 skip_count=0
+SKIPPED=()
+proxy_phase_ran=0
 
 pass() {
     pass_count=$((pass_count + 1))
@@ -92,6 +92,7 @@ fail() {
 
 skip() {
     skip_count=$((skip_count + 1))
+    SKIPPED+=("$1${2:+ ($2)}")
     echo "  SKIP  $1${2:+ ($2)}"
 }
 
@@ -100,6 +101,10 @@ summary() {
     echo "────────────────────────────────────────"
     echo "  $pass_count passed, $fail_count failed, $skip_count skipped"
     echo "────────────────────────────────────────"
+    if [[ $skip_count -gt 0 ]]; then
+        printf '  Skipped phases/checks:\n'
+        printf '    - %s\n' "${SKIPPED[@]}"
+    fi
     if [[ $fail_count -gt 0 ]]; then
         exit 1
     fi
@@ -331,6 +336,62 @@ test_completions() {
     fi
 }
 
+test_running_vm_completions() {
+    echo ""
+    echo "=== Phase: running VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "shell completion offers running instance"
+        else
+            fail "shell completion offers running instance" "got: $candidates"
+        fi
+    else
+        fail "shell completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "start completion excludes running instance" "got: $candidates"
+        else
+            pass "start completion excludes running instance"
+        fi
+    else
+        fail "start completion exits 0" "exit code: $?, output: $candidates"
+    fi
+}
+
+test_stopped_vm_completions() {
+    echo ""
+    echo "=== Phase: stopped VM completions ==="
+
+    local candidates
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop start "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "start completion offers stopped instance"
+        else
+            fail "start completion offers stopped instance" "got: $candidates"
+        fi
+    else
+        fail "start completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop shell "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            fail "shell completion excludes stopped instance" "got: $candidates"
+        else
+            pass "shell completion excludes stopped instance"
+        fi
+    else
+        fail "shell completion exits 0 for stopped instance" "exit code: $?, output: $candidates"
+    fi
+}
+
 test_invalid_names() {
     echo ""
     echo "=== Phase: invalid instance names ==="
@@ -391,16 +452,17 @@ test_mem_floor() {
             "failed for the wrong reason: $(cat "$tmpdir/mem_floor_cfg_stderr")"
     fi
 
-    # The floor is a floor, not a ban: the boundary value is accepted by the
-    # parser (this still fails later for other reasons, so only assert the
-    # error is not the floor message).
-    if coop up --mem 128 --dry-run "$tmpdir" 2>"$tmpdir/mem_floor_stderr"; then
-        pass "up accepts --mem at the 128 MiB boundary (dry-run)"
-    elif ! grep -q "is too low" "$tmpdir/mem_floor_stderr"; then
-        pass "up accepts --mem at the 128 MiB boundary (no floor error)"
+    # A valid boundary value reaches profile resolution before any VM work.
+    if coop_fails up --mem 128 --profile invalid-profile "$tmpdir"; then
+        if grep -q "Unknown profile" <<<"$HARNESS_ERR"; then
+            pass "up accepts --mem at the 128 MiB boundary"
+        else
+            fail "up accepts --mem at the 128 MiB boundary" \
+                "failed before profile resolution: $HARNESS_ERR"
+        fi
     else
         fail "up accepts --mem at the 128 MiB boundary" \
-            "128 MiB was rejected as too low"
+            "unexpectedly accepted invalid profile"
     fi
 }
 
@@ -469,6 +531,49 @@ test_profiles_cli() {
 
 # ── Setup ─────────────────────────────────────────────────────
 
+test_private_storage() {
+    echo ""
+    echo "=== Phase: private host storage ==="
+    local result
+    if result=$(python3 - "$INSTANCE" <<'PYMODE'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path.home() / ".coop"
+instance = root / "instances" / sys.argv[1]
+for directory in (root, root / "images", root / "instances", root / "state", instance):
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+state = instance / "instance.json"
+assert state.is_file(), state
+assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+for state in instance.glob("*.json"):
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600, state
+if sys.platform == "darwin":
+    directory = pathlib.Path(os.environ.get("LIMA_HOME", str(pathlib.Path.home() / ".lima"))) / ("coop-" + sys.argv[1])
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    disk = next((directory / name for name in ("disk", "diffdisk") if (directory / name).exists()), None)
+else:
+    config = instance / "vm_config.json"
+    assert config.is_file(), config
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600, config
+    disk = instance / "rootfs.ext4"
+assert disk is not None and disk.is_file(), disk
+assert stat.S_IMODE(disk.stat().st_mode) == 0o600, disk
+images = list((root / "images").glob("*/*.ext4")) + list((root / "images").glob("*/*.img"))
+assert images, "no template disk found"
+for image in images:
+    assert stat.S_IMODE(image.parent.stat().st_mode) == 0o700, image.parent
+    assert stat.S_IMODE(image.stat().st_mode) == 0o600, image
+PYMODE
+    ); then
+        pass "managed directories, state, and VM disks have private modes"
+    else
+        fail "managed directories, state, and VM disks have private modes" "$result"
+    fi
+}
+
 test_setup() {
     echo ""
     echo "=== Phase: setup ==="
@@ -502,9 +607,13 @@ test_up_creates_primary_instance() {
     # `--env` exercises the guest_env CLI -> config -> SendEnv path
     # end-to-end. `test_guest_environment` verifies the value is
     # visible inside the guest via `printenv`.
-    mkdir -p "$tmpdir/primary-ws"
+    local ignored_marker="/tmp/coop-devcontainer-ignored-$$"
+    mkdir -p "$tmpdir/primary-ws/.devcontainer"
+    cat > "$tmpdir/primary-ws/.devcontainer/devcontainer.json" <<EOF
+{"containerEnv":{"COOP_TEST_DEVCONTAINER_IGNORED":"should-not-appear"},"postStartCommand":"touch $ignored_marker"}
+EOF
     local args=(
-        up "$tmpdir/primary-ws" --name "$INSTANCE" --no-agents --no-devcontainer
+        up "$tmpdir/primary-ws" --name "$INSTANCE" --no-agents
         --env "COOP_TEST_GUEST_ENV=hello-from-cli"
     )
     if coop "${args[@]}"; then
@@ -515,6 +624,28 @@ test_up_creates_primary_instance() {
         echo "stderr: $HARNESS_ERR"
         echo "FATAL: primary instance creation failed, cannot continue"
         exit 1
+    fi
+
+    local copied_file="" env_value=""
+    if copied_file=$(guest_exec cat /workspace/.devcontainer/devcontainer.json) \
+        && [[ "$copied_file" == *COOP_TEST_DEVCONTAINER_IGNORED* ]]; then
+        pass "project devcontainer file reaches the guest as ordinary workspace data"
+    else
+        fail "project devcontainer file reaches the guest as ordinary workspace data" \
+            "content: $copied_file; stderr: $(guest_stderr)"
+    fi
+    if env_value=$(guest_exec /bin/sh -c 'printf "%s" "${COOP_TEST_DEVCONTAINER_IGNORED-unset}"') \
+        && [[ "$env_value" == "unset" ]]; then
+        pass "up ignores discovered devcontainer containerEnv"
+    else
+        fail "up ignores discovered devcontainer containerEnv" \
+            "value: $env_value; stderr: $(guest_stderr)"
+    fi
+    if guest_exec /usr/bin/test ! -e "$ignored_marker"; then
+        pass "up ignores discovered devcontainer postStartCommand"
+    else
+        fail "up ignores discovered devcontainer postStartCommand" \
+            "marker exists or guest check failed: $(guest_stderr)"
     fi
 }
 
@@ -537,7 +668,7 @@ test_duplicate_name() {
 
     local other_ws="$tmpdir/duplicate-ws"
     mkdir -p "$other_ws"
-    if coop_fails up "$other_ws" --name "$INSTANCE" --no-agents --no-devcontainer; then
+    if coop_fails up "$other_ws" --name "$INSTANCE" --no-agents; then
         pass "rejects duplicate instance name"
     else
         fail "rejects duplicate instance name" "should have failed"
@@ -545,7 +676,7 @@ test_duplicate_name() {
         coop destroy "$INSTANCE" 2>/dev/null || true
     fi
 
-    if coop_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents --no-devcontainer; then
+    if coop_fails up "$tmpdir/primary-ws" --name "${INSTANCE}-other" --no-agents; then
         pass "rejects mismatched name for existing project"
     else
         fail "rejects mismatched name for existing project" "should have failed"
@@ -1339,18 +1470,22 @@ test_claude_onboarding_seed() {
 }
 
 check_native_codex() {
-    local guest_home launcher version
+    local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
     launcher="$guest_home/.local/bin/codex"
+    native_host="$guest_home/.codex/packages/standalone/current/bin/codex-code-mode-host"
 
     if guest_exec test -x "$launcher" \
         && guest_exec test -L /usr/local/bin/codex \
         && guest_exec test /usr/local/bin/codex -ef "$launcher" \
+        && guest_exec test -x "$native_host" \
+        && guest_exec test -L /usr/local/bin/codex-code-mode-host \
+        && guest_exec test /usr/local/bin/codex-code-mode-host -ef "$native_host" \
         && [[ "$(guest_exec sh -c 'command -v codex')" == "$launcher" ]]; then
-        pass "Codex resolves through the guest's native launcher and compatibility link"
+        pass "Codex and its Code Mode host resolve through native-package compatibility links"
     else
-        fail "Codex resolves through the guest's native launcher and compatibility link" \
-            "expected launcher: $launcher; stderr: $(guest_stderr)"
+        fail "Codex and its Code Mode host resolve through native-package compatibility links" \
+            "expected launcher: $launcher; host: $native_host; stderr: $(guest_stderr)"
     fi
 
     if version=$(guest_exec /usr/local/bin/codex --version) \
@@ -1359,6 +1494,29 @@ check_native_codex() {
     else
         fail "Codex is executable through the compatibility link" \
             "output: $version; stderr: $(guest_stderr)"
+    fi
+
+    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
+    # A successful hello must return connection/ready; an exit-zero stub cannot.
+    if coop_exec bash -o pipefail -c '
+        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
+        printf "\147\000\000\000%s" "$hello" |
+            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
+            dd bs=1 skip=4 status=none |
+            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
+    '; then
+        pass "Codex Code Mode host responds to stdio hello"
+    else
+        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
+    fi
+
+    codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
+    host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
+    if [[ "$(dirname "$codex_path")" == "$(dirname "$host_path")" ]]; then
+        pass "Codex and its Code Mode host come from the same native release"
+    else
+        fail "Codex and its Code Mode host come from the same native release" \
+            "codex=$codex_path host=$host_path"
     fi
 }
 
@@ -1909,7 +2067,6 @@ CFGEOF
             "$ws_dir" \
             --name "$pat_instance" \
             --no-agents \
-            --no-devcontainer \
             --no-prompt \
             >"$tmpdir/pat-start.out" 2>&1; then
         STARTED_INSTANCES+=("$pat_instance")
@@ -2061,7 +2218,7 @@ CFGEOF
         expected=absent
         case "$stage" in
             fresh-up)
-                boot_args=(up "$ws_dir" --name "$inst_name" --no-devcontainer --no-github)
+                boot_args=(up "$ws_dir" --name "$inst_name" --no-github)
                 ;;
             plain-start)
                 boot_args=(start "$inst_name")
@@ -2845,7 +3002,7 @@ test_commit_restore() {
     local commit_inst="${INSTANCE}-from-commit"
     local commit_ws="$tmpdir/${commit_inst}-ws"
     mkdir -p "$commit_ws"
-    if coop up "$commit_ws" --name "$commit_inst" --no-agents --no-devcontainer --image "$snap"; then
+    if coop up "$commit_ws" --name "$commit_inst" --no-agents --image "$snap"; then
         STARTED_INSTANCES+=("$commit_inst")
         pass "up --image (committed snapshot) exits 0"
 
@@ -3576,7 +3733,7 @@ test_quickstart() {
     # First invocation: image is already built (from test_setup) and no
     # instance for this workspace exists, so quickstart must allocate fresh.
     local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3615,7 +3772,7 @@ test_quickstart() {
     pre_list=$("$BINARY" list 2>/dev/null | sort)
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3646,7 +3803,7 @@ test_quickstart() {
     fi
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart --no-devcontainer \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -3687,7 +3844,7 @@ test_up_project_workflow() {
     up_inst_name=${up_ws##*/}
     up_inst_name=${up_inst_name//[!a-zA-Z0-9_-]/-}
 
-    if coop up "$up_ws" --no-agents --no-devcontainer; then
+    if coop up "$up_ws" --no-agents; then
         STARTED_INSTANCES+=("$up_inst_name")
         pass "up copy creates project instance"
     else
@@ -3711,7 +3868,7 @@ test_up_project_workflow() {
 
     local pre_list post_list
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up "$up_ws" --no-devcontainer; then
+    if coop up "$up_ws"; then
         pass "up copy re-run exits 0 while running"
     else
         fail "up copy re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -3724,7 +3881,7 @@ test_up_project_workflow() {
             "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
     fi
 
-    if coop stop "$up_inst_name" && coop up "$up_ws" --no-agents --no-devcontainer; then
+    if coop stop "$up_inst_name" && coop up "$up_ws" --no-agents; then
         pass "up copy restarts stopped project instance"
     else
         fail "up copy restarts stopped project instance" "stderr: $HARNESS_ERR"
@@ -3733,7 +3890,7 @@ test_up_project_workflow() {
     local reject_ws data_dir
     reject_ws=$(mktemp -d "$tmpdir/up-reject-XXXXXX")
     data_dir=$(mktemp -d "$tmpdir/up-data-XXXXXX")
-    if coop_fails up "$reject_ws" --extra-mount "$data_dir" --no-devcontainer; then
+    if coop_fails up "$reject_ws" --extra-mount "$data_dir"; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up copy rejects host-only extra mount at /workspace"
         else
@@ -3755,7 +3912,7 @@ test_up_project_workflow() {
     mount_inst_name=${mount_ws##*/}
     mount_inst_name=${mount_inst_name//[!a-zA-Z0-9_-]/-}
 
-    if coop up "$mount_ws" --mount --no-agents --no-devcontainer; then
+    if coop up "$mount_ws" --mount --no-agents; then
         STARTED_INSTANCES+=("$mount_inst_name")
         pass "up mount creates project instance"
     else
@@ -3792,7 +3949,7 @@ test_up_project_workflow() {
     unset GUEST_INSTANCE
 
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up "$mount_ws" --mount --no-devcontainer; then
+    if coop up "$mount_ws" --mount; then
         pass "up mount re-run exits 0 while running"
     else
         fail "up mount re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -3817,7 +3974,7 @@ test_new_instance_sibling() {
     shift 3
 
     STARTED_INSTANCES+=("$sibling")
-    if coop up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer; then
+    if coop up "$@" --new-instance --name "$sibling" --no-agents; then
         pass "--new-instance creates sibling $sibling"
     else
         fail "--new-instance creates sibling $sibling" "$HARNESS_ERR"
@@ -3836,14 +3993,14 @@ test_new_instance_sibling() {
         fail "$original and $sibling have independent guest state" "$(guest_stderr)"
     fi
 
-    if coop_fails up "$@" --new-instance --name "$sibling" --no-agents --no-devcontainer &&
+    if coop_fails up "$@" --new-instance --name "$sibling" --no-agents &&
             [[ "$HARNESS_ERR" == *"Instance '$sibling' already exists"* ]]; then
         pass "--new-instance rejects duplicate name $sibling"
     else
         fail "--new-instance rejects duplicate name $sibling" "$HARNESS_ERR"
     fi
 
-    if coop_fails up "$@" --no-agents --no-devcontainer &&
+    if coop_fails up "$@" --no-agents &&
             [[ "$HARNESS_ERR" == *"$ambiguity"* &&
                "$HARNESS_ERR" == *"$original"* && "$HARNESS_ERR" == *"$sibling"* ]]; then
         pass "plain up reports ambiguity between $original and $sibling"
@@ -3873,12 +4030,12 @@ test_git_repo() {
     # no VM boot).
     local some_dir
     some_dir=$(mktemp -d "$tmpdir/gitrepo-dir-XXXXXX")
-    if coop_fails up "$some_dir" --git-repo "$repo_url" --no-devcontainer; then
+    if coop_fails up "$some_dir" --git-repo "$repo_url"; then
         pass "up --git-repo conflicts with a positional directory"
     else
         fail "up --git-repo conflicts with a positional directory" "should have failed"
     fi
-    if coop_fails up --git-repo "$repo_url" --mount --no-devcontainer; then
+    if coop_fails up --git-repo "$repo_url" --mount; then
         pass "up --git-repo conflicts with --mount"
     else
         fail "up --git-repo conflicts with --mount" "should have failed"
@@ -3886,9 +4043,8 @@ test_git_repo() {
     rm -rf "$some_dir"
 
     # --extra-mount targeting /workspace collides with the clone; rejected
-    # before boot (--no-devcontainer avoids remote devcontainer discovery).
     if coop_fails up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/workspace" --no-agents --no-devcontainer; then
+            --extra-mount "$data_dir:/workspace" --no-agents; then
         if echo "$HARNESS_ERR" | grep -q "/workspace"; then
             pass "up --git-repo rejects --extra-mount at /workspace"
         else
@@ -3903,7 +4059,7 @@ test_git_repo() {
     # git-repo + extra-mount combination is the workspace-sync path that
     # regressed on Firecracker before this change.
     if coop up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/data" --no-agents --no-devcontainer; then
+            --extra-mount "$data_dir:/data" --no-agents; then
         STARTED_INSTANCES+=("$gr_instance")
         pass "up --git-repo creates an instance"
     else
@@ -3948,7 +4104,7 @@ test_git_repo() {
     # Re-running while the instance is up reuses it: exit 0, no new instance.
     local pre_list post_list
     pre_list=$("$BINARY" list 2>/dev/null | sort)
-    if coop up --git-repo "$repo_url" --name "$gr_instance" --no-devcontainer; then
+    if coop up --git-repo "$repo_url" --name "$gr_instance"; then
         pass "up --git-repo re-run exits 0 while running"
     else
         fail "up --git-repo re-run exits 0 while running" "exit code: $? stderr: $HARNESS_ERR"
@@ -4051,7 +4207,7 @@ test_workspace_sync() {
     ) || fail "set up git repo in workspace tmpdir" "git init/commit failed"
 
     # Create instance for the workspace.
-    local args=(up "$ws_tmpdir" --name "$ws_instance" --no-agents --no-devcontainer)
+    local args=(up "$ws_tmpdir" --name "$ws_instance" --no-agents)
     if coop "${args[@]}"; then
         STARTED_INSTANCES+=("$ws_instance")
         pass "up with workspace exits 0"
@@ -4101,13 +4257,17 @@ test_workspace_sync() {
             "git rev-parse HEAD failed: $(guest_stderr)"
     fi
 
-    # Modify file in guest, then pull
-    coop_exec sh -c 'echo modified-in-guest > /workspace/hello.txt' || true
+    # Modify a worktree file and both spellings of Git administration data in
+    # the guest. Pull must retrieve only the worktree change. The mixed-case
+    # alias matters on case-insensitive macOS filesystems, where it resolves to
+    # the same destination entry as `.git`.
+    coop_exec sh -c \
+        'echo modified-in-guest > /workspace/hello.txt && git -C /workspace config core.fsmonitor ./guest-payload && mkdir -p /workspace/.GIT && echo guest-alias > /workspace/.GIT/config' || true
 
     local pull_dir
     pull_dir=$(mktemp -d)
-    if coop pull "$ws_instance" --force --dir "$pull_dir"; then
-        pass "pull exits 0"
+    if coop pull "$ws_instance" --dir "$pull_dir"; then
+        pass "pull into empty destination exits 0 without --force"
 
         local pulled
         pulled=$(cat "$pull_dir/hello.txt" 2>/dev/null)
@@ -4116,10 +4276,95 @@ test_workspace_sync() {
         else
             fail "pull retrieves guest changes" "got: $pulled"
         fi
+        if [[ ! -e "$pull_dir/.git" && ! -e "$pull_dir/.GIT" ]]; then
+            pass "pull best-effort filter omits common guest Git paths"
+        else
+            fail "pull best-effort filter omits common guest Git paths" \
+                "guest .git or case alias reached the host"
+        fi
+        if echo "$HARNESS_ERR" | grep -q "potentially malicious"; then
+            pass "pull warns that guest-controlled files may be malicious"
+        else
+            fail "pull warns that guest-controlled files may be malicious" \
+                "stderr: $HARNESS_ERR"
+        fi
     else
         fail "pull exits 0" "exit code: $?"
     fi
     rm -rf "$pull_dir"
+
+    # A destination populated by an affected older release may contain active
+    # Git configuration. Pull must reject a nonempty destination without
+    # invoking host Git. The clean-filter fixture models a legacy destination,
+    # while the PATH probe records any host Git invocation directly.
+    local legacy_root legacy_repo legacy_marker legacy_git_probe legacy_git_bin
+    legacy_root=$(mktemp -d)
+    legacy_repo="$legacy_root/repo"
+    legacy_marker="$legacy_root/HOST_GIT_EXECUTED"
+    legacy_git_probe="$legacy_root/HOST_GIT_INVOKED"
+    legacy_git_bin="$legacy_root/bin"
+    git init -q "$legacy_repo"
+    git -C "$legacy_repo" config user.name "coop integration"
+    git -C "$legacy_repo" config user.email "coop@example.invalid"
+    printf 'original\n' > "$legacy_repo/tracked"
+    printf 'tracked filter=coop-host-marker\n' > "$legacy_repo/.gitattributes"
+    git -C "$legacy_repo" add tracked .gitattributes
+    git -C "$legacy_repo" commit -qm baseline
+    git -C "$legacy_repo" config filter.coop-host-marker.clean \
+        "sh -c 'touch \"$legacy_marker\"; cat'"
+    printf 'changed!\n' > "$legacy_repo/tracked"
+    mkdir "$legacy_git_bin"
+    cat > "$legacy_git_bin/git" <<EOF
+#!/bin/sh
+touch "$legacy_git_probe"
+exit 99
+EOF
+    chmod +x "$legacy_git_bin/git"
+
+    if PATH="$legacy_git_bin:$PATH" coop pull "$ws_instance" --dir "$legacy_repo"; then
+        fail "pull refuses nonempty destination without --force" \
+            "pull unexpectedly succeeded"
+    elif echo "$HARNESS_ERR" | grep -q "non-empty destination" &&
+            echo "$HARNESS_ERR" | grep -q -- "--force"; then
+        pass "pull refuses nonempty destination without --force"
+    else
+        fail "pull refusal explains --force" "stderr: $HARNESS_ERR"
+    fi
+    if [[ ! -e "$legacy_marker" && ! -e "$legacy_git_probe" ]]; then
+        pass "pull refusal does not invoke host Git on legacy destination"
+    else
+        fail "pull refusal does not invoke host Git on legacy destination" \
+            "host Git was invoked or the guest-authored clean filter executed"
+    fi
+
+    if PATH="$legacy_git_bin:$PATH" coop pull "$ws_instance" --force --dir "$legacy_repo"; then
+        pass "pull --force authorizes nonempty destination"
+    else
+        fail "pull --force authorizes nonempty destination" \
+            "exit code: $?; stderr: $HARNESS_ERR"
+    fi
+    if [[ ! -e "$legacy_marker" && ! -e "$legacy_git_probe" ]]; then
+        pass "pull --force does not invoke host Git"
+    else
+        fail "pull --force does not invoke host Git" \
+            "host Git was invoked or the guest-authored clean filter executed"
+    fi
+    rm -rf "$legacy_root"
+
+    local host_git_before host_git_after
+    host_git_before=$(cksum "$ws_tmpdir/.git/config")
+    if coop pull "$ws_instance" --force --dir "$ws_tmpdir"; then
+        host_git_after=$(cksum "$ws_tmpdir/.git/config")
+        if [[ "$host_git_after" == "$host_git_before" ]] &&
+                ! grep -q core.fsmonitor "$ws_tmpdir/.git/config"; then
+            pass "pull best-effort filter leaves common host Git path untouched"
+        else
+            fail "pull best-effort filter leaves common host Git path untouched" \
+                "host .git config changed"
+        fi
+    else
+        fail "pull into existing host repository exits 0" "exit code: $?"
+    fi
 
     # Push: modify locally, push to guest, verify
     echo "pushed-from-host" > "$ws_tmpdir/hello.txt"
@@ -4149,10 +4394,11 @@ test_workspace_sync() {
 
 # macOS hosts: `coop up --copy` streams the workspace through host tar, whose
 # default copyfile(3) metadata path emits AppleDouble `._*` sidecar entries
-# for xattrs/resource forks. Those land in the Linux guest as ordinary files
-# (they can break Git's pack/ref discovery inside .git/) and get pulled back
-# to the host. coop sets COPYFILE_DISABLE=1 on host-side tar creation to
-# suppress them; this phase reproduces the round-trip and pins the fix.
+# for xattrs/resource forks. Those land in the Linux guest as ordinary files;
+# entries inside .git can break Git's pack/ref discovery, while worktree
+# sidecars can be pulled back to the host. coop sets COPYFILE_DISABLE=1 on
+# host-side tar creation to suppress them; this phase reproduces the round-trip
+# and pins the fix.
 # Skipped off macOS, where tar has no copyfile path.
 test_appledouble_sidecars() {
     echo ""
@@ -4188,7 +4434,7 @@ test_appledouble_sidecars() {
     fi
 
     if coop up "$repo_dir" --name "$ad_instance" --copy \
-        --no-agents --no-prompt --no-devcontainer; then
+        --no-agents --no-prompt; then
         STARTED_INSTANCES+=("$ad_instance")
         pass "up --copy with xattr-bearing repo exits 0"
     else
@@ -4410,7 +4656,7 @@ test_multi_instance() {
     mkdir -p "$ws_a"
 
     # Create two instances from the same project directory.
-    if coop up "$ws_a" --name "$inst_a" --no-agents --no-devcontainer; then
+    if coop up "$ws_a" --name "$inst_a" --no-agents; then
         STARTED_INSTANCES+=("$inst_a")
         pass "up creates instance A ($inst_a)"
     else
@@ -4521,7 +4767,7 @@ test_named_images() {
     local inst_name="${INSTANCE}-img"
     local img_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$img_ws"
-    if coop up "$img_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
+    if coop up "$img_ws" --name "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --image $img_name exits 0"
     else
@@ -4591,6 +4837,8 @@ post_install = '''
 echo 'custom-profile-marker' > /etc/custom-profile-installed
 printf '#!/bin/sh\necho codex-cli 9.9.9-profile\n' > /usr/local/bin/codex
 chmod 0755 /usr/local/bin/codex
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/codex-code-mode-host
+chmod 0755 /usr/local/bin/codex-code-mode-host
 '''
 CFGEOF
 
@@ -4610,7 +4858,7 @@ CFGEOF
     local inst_name="${INSTANCE}-custom"
     local custom_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$custom_ws"
-    if "$BINARY" --config "$cfg_file" up "$custom_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$custom_img" 2>"$tmpdir/stderr"; then
+    if "$BINARY" --config "$cfg_file" up "$custom_ws" --name "$inst_name" --no-agents --image "$custom_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with custom profile image exits 0"
     else
@@ -4624,9 +4872,9 @@ CFGEOF
     local marker
     marker=$(guest_exec cat /etc/custom-profile-installed) || marker=""
     if [[ "$(guest_exec /usr/local/bin/codex --version)" == "codex-cli 9.9.9-profile" ]]; then
-        pass "custom profile's Codex is not replaced by the native installer"
+        pass "custom profile's complete Codex pair is not replaced by the native installer"
     else
-        fail "custom profile's Codex is not replaced by the native installer" \
+        fail "custom profile's complete Codex pair is not replaced by the native installer" \
             "stderr: $(guest_stderr)"
     fi
 
@@ -4764,7 +5012,7 @@ test_builtin_profile_plugins() {
     local inst_name="${INSTANCE}-profile-plugins"
     local prof_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$prof_ws"
-    if coop up "$prof_ws" --name "$inst_name" --image "$img_name" --no-devcontainer; then
+    if coop up "$prof_ws" --name "$inst_name" --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with c,rust profile image exits 0"
     else
@@ -4818,7 +5066,7 @@ test_host_mount() {
     echo "nested-mount" > "$mount_dir/subdir/deep.txt"
 
     # Create instance with project mount at /workspace
-    if coop up "$mount_dir" --name "$mount_instance" --no-agents --no-devcontainer --mount; then
+    if coop up "$mount_dir" --name "$mount_instance" --no-agents --mount; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "up --mount exits 0"
     else
@@ -4965,7 +5213,7 @@ test_host_mount_custom_guest_path() {
     local project_dir="$tmpdir/${mount_instance}-ws"
     mkdir -p "$project_dir"
     # Mount with explicit guest path
-    if coop up "$project_dir" --name "$mount_instance" --no-agents --no-devcontainer --extra-mount "$mount_dir:/data/project"; then
+    if coop up "$project_dir" --name "$mount_instance" --no-agents --extra-mount "$mount_dir:/data/project"; then
         STARTED_INSTANCES+=("$mount_instance")
         pass "up with --extra-mount host:guest exits 0"
     else
@@ -5011,7 +5259,7 @@ test_port_forwards() {
     local fwd_ws="$tmpdir/${fwd_instance}-ws"
     mkdir -p "$fwd_ws"
 
-    if coop up "$fwd_ws" --name "$fwd_instance" --no-agents --no-devcontainer --forward-port "${guest_port}:${host_port}"; then
+    if coop up "$fwd_ws" --name "$fwd_instance" --no-agents --forward-port "${guest_port}:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance")
         pass "up with --forward-port exits 0"
     else
@@ -5065,7 +5313,7 @@ nohup python3 /tmp/fwd.py ${guest_port} ${payload} > /tmp/fwd.log 2>&1 &" || tru
     local fwd_instance2="${INSTANCE}-fwd2"
     local fwd_ws2="$tmpdir/${fwd_instance2}-ws"
     mkdir -p "$fwd_ws2"
-    if coop up "$fwd_ws2" --name "$fwd_instance2" --no-agents --no-devcontainer --forward-port "9999:${host_port}"; then
+    if coop up "$fwd_ws2" --name "$fwd_instance2" --no-agents --forward-port "9999:${host_port}"; then
         STARTED_INSTANCES+=("$fwd_instance2")
         fail "collision detection rejects in-use host port" "start unexpectedly succeeded"
         coop destroy "$fwd_instance2" 2>/dev/null || true
@@ -5158,13 +5406,13 @@ test_destroy_all() {
     local ws_y="$tmpdir/${inst_y}-ws"
     mkdir -p "$ws_x" "$ws_y"
 
-    if ! coop up "$ws_x" --name "$inst_x" --no-agents --no-devcontainer; then
+    if ! coop up "$ws_x" --name "$inst_x" --no-agents; then
         fail "up instance for destroy --all" "exit code: $?"
         return
     fi
     STARTED_INSTANCES+=("$inst_x")
 
-    if ! coop up "$ws_y" --name "$inst_y" --no-agents --no-devcontainer; then
+    if ! coop up "$ws_y" --name "$inst_y" --no-agents; then
         fail "up second instance for destroy --all" "exit code: $?"
         coop destroy "$inst_x" 2>/dev/null || true
         return
@@ -5262,7 +5510,7 @@ CFGEOF
 
     # Create the instance WITH bootstrap. The stub claude handles
     # `marketplace add` calls. Unset tokens to avoid auth steps.
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up "$mp_ws" --name "$mp_instance" --image "$mp_img" --no-devcontainer 2>"$tmpdir/stderr"; then
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up "$mp_ws" --name "$mp_instance" --image "$mp_img" 2>"$tmpdir/stderr"; then
         STARTED_INSTANCES+=("$mp_instance")
         pass "up with local marketplace exits 0"
     else
@@ -5444,7 +5692,7 @@ CFGEOF
 
     local cd_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$cd_ws"
-    if cs up "$cd_ws" --name "$inst_name" --no-devcontainer; then
+    if cs up "$cd_ws" --name "$inst_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with config_dir exits 0"
     else
@@ -5689,16 +5937,18 @@ test_guest_env_config() {
     # forwarded host value (and a WARN must be emitted on the collision).
     # `post_start` forces the up-time SSH session (and thus
     # `prepare_env_forwarding`, which emits the precedence WARN) to run even
-    # under `--no-agents`, which otherwise skips all session work. `true` is
-    # a no-op. Without it the WARN is never produced during `up`.
+    # under `--no-agents`, which otherwise skips all session work. Bash syntax
+    # verifies that forwarding preserves the account's command interpreter.
     cat > "$cfg_file" <<CFGEOF
-post_start = "true"
+post_start = "[[ 1 == 1 ]] && printf coop-bash-hook-ok"
 
 [claude]
 github = "off"
 env_forward = ["COOP_TEST_GUEST_ENV_PRECEDENCE"]
 
 [guest_env]
+PATH = "/coop-guest-only:/usr/local/bin:/usr/bin:/bin"
+COOP_SSH_ENV_0 = "guest-alias-value"
 COOP_TEST_GUEST_ENV_CONFIG = "from-config-file"
 COOP_TEST_GUEST_ENV_PRECEDENCE = "literal-wins"
 CFGEOF
@@ -5714,7 +5964,7 @@ CFGEOF
 
     # `coop shell` must run with this config file: config-block `guest_env`
     # literals are re-derived from `config.toml` on each command (only CLI
-    # `--env` and devcontainer entries are persisted to `guest_env.json`).
+    # `--env` entries are persisted to `guest_env.json`).
     # A bare `coop shell` would load the default config and never see them.
     # `RUST_LOG=off` keeps tracing out of captured stdout, mirroring
     # `guest_exec`; stderr lands in the shared guest_stderr file.
@@ -5727,13 +5977,19 @@ CFGEOF
 
     local ge_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$ge_ws"
-    if ge up "$ge_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+    if ge up "$ge_ws" --name "$inst_name" --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up with [guest_env] config exits 0"
     else
         fail "up with [guest_env] config exits 0" "exit code: $? stderr: $HARNESS_ERR"
         rm -r "$ge_dir"
         return
+    fi
+
+    if [[ "$HARNESS_OUT" == *coop-bash-hook-ok* ]]; then
+        pass "forwarded post_start retains the guest login shell"
+    else
+        fail "forwarded post_start retains the guest login shell" "stderr: $HARNESS_ERR"
     fi
 
     # The override WARN is emitted during `up` (stderr, INFO default level).
@@ -5767,6 +6023,20 @@ CFGEOF
     else
         fail "guest_env literal overrides forwarded value" \
             "printenv failed; stderr: $(guest_stderr)"
+    fi
+
+    local path_val alias_val
+    if path_val=$(ge_exec /usr/bin/printenv PATH) \
+        && [[ "$path_val" == "/coop-guest-only:/usr/local/bin:/usr/bin:/bin" ]]; then
+        pass "guest PATH survives transport"
+    else
+        fail "guest PATH survives transport" "stderr: $(guest_stderr)"
+    fi
+    if alias_val=$(ge_exec /usr/bin/printenv COOP_SSH_ENV_0) \
+        && [[ "$alias_val" == "guest-alias-value" ]]; then
+        pass "guest transport-name collision is preserved"
+    else
+        fail "guest transport-name collision is preserved" "stderr: $(guest_stderr)"
     fi
 
     ge stop "$inst_name" 2>/dev/null || true
@@ -5821,7 +6091,7 @@ CFGEOF
 
     local lm_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$lm_ws"
-    if lm up "$lm_ws" --name "$inst_name" --no-agents --no-devcontainer; then
+    if lm up "$lm_ws" --name "$inst_name" --no-agents; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up for model test exits 0"
     else
@@ -5953,20 +6223,45 @@ CFGEOF
 #     Codex's `auth.json` is not staged;
 #   - the proxy is reachable on host loopback and enforces the capability gate;
 #   - `stop` tears the proxy down (the host port stops answering).
+seatbelt_profile_path() {
+    local script_dir="$1" binary="$2"
+    if [[ -f "$script_dir/src/Cargo.toml" && -f "$script_dir/src/src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/src/src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$script_dir/../Cargo.toml" && -f "$script_dir/../src/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$script_dir/../src/seatbelt-proxy.sb"
+        return 0
+    fi
+    if [[ -f "$(dirname "$binary")/seatbelt-proxy.sb" ]]; then
+        printf '%s\n' "$(dirname "$binary")/seatbelt-proxy.sb"
+        return 0
+    fi
+    return 1
+}
+
 test_proxy() {
     echo ""
     echo "=== Phase: credential-injecting proxy (--full) ==="
 
     if ! command -v curl >/dev/null 2>&1; then
-        skip "credential-proxy test (curl not available on host)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "curl not available on host"
+        else
+            skip "credential-proxy test (curl not available on host)"
+        fi
         return
     fi
     # The proxy needs the `coop-proxy` binary next to `coop`. It is not a
     # default workspace member (it needs cmake for aws-lc-rs), so a plain
-    # `cargo build` / older deploy may not have it; skip rather than fail the
-    # fail-closed `up` when it's absent.
+    # `cargo build` / older deploy may not have it. Developer runs may skip;
+    # required release runs fail before attempting `up`.
     if [[ ! -x "$(dirname "$BINARY")/coop-proxy" ]]; then
-        skip "credential-proxy test (coop-proxy not built alongside coop)"
+        if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "credential-proxy prerequisites" "coop-proxy not built alongside coop"
+        else
+            skip "credential-proxy test (coop-proxy not built alongside coop)"
+        fi
         return
     fi
 
@@ -6016,7 +6311,7 @@ CFGEOF
     local px_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$px_ws"
     # Proxy mode is wired during AGENT bootstrap, so this must NOT be --no-agents.
-    if px up "$px_ws" --name "$inst_name" --no-devcontainer; then
+    if px up "$px_ws" --name "$inst_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up in proxy mode exits 0"
     else
@@ -6228,8 +6523,7 @@ STATEEOF
     proxy_bin="$(dirname "$BINARY")/coop-proxy"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local sb_profile
-        sb_profile="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/seatbelt-proxy.sb"
-        if [[ -f "$sb_profile" ]]; then
+        if sb_profile=$(seatbelt_profile_path "$(dirname "${BASH_SOURCE[0]}")" "$BINARY"); then
             # Pass the profile inline with -p (as coop's launcher does), not -f,
             # and bind PROXY_BIN to the proxy's absolute path (as the launcher
             # does), so the smoke test exercises the same code path production
@@ -6245,7 +6539,11 @@ STATEEOF
                 fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
             fi
         else
-            skip "proxy jail self-test (Seatbelt profile not found at $sb_profile)"
+            if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+                fail "proxy jail self-test" "Seatbelt profile not found beside source or binary"
+            else
+                skip "proxy jail self-test (Seatbelt profile not found beside source or binary)"
+            fi
         fi
     else
         selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
@@ -6269,6 +6567,7 @@ STATEEOF
     px destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
     rm -r "$px_dir"
+    proxy_phase_ran=1
 }
 
 # ── Interrupted setup test (--full only) ──────────────────────
@@ -6330,7 +6629,7 @@ test_interrupted_setup() {
     local inst_name="${INSTANCE}-recovery"
     local recovery_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$recovery_ws"
-    if coop up "$recovery_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img"; then
+    if coop up "$recovery_ws" --name "$inst_name" --no-agents --image "$img"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up from recovered image exits 0"
     else
@@ -6354,411 +6653,6 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
-# ── devcontainer.json translator (pre-VM + --full) ────────────
-
-# Write a sample devcontainer.json into $1/.devcontainer/devcontainer.json.
-# Exercises JSONC features (comments + trailing commas) so the integration
-# run also catches parser regressions, not just the unit tests.
-_write_devcontainer() {
-    local dir="$1"
-    mkdir -p "$dir/.devcontainer"
-    cat > "$dir/.devcontainer/devcontainer.json" <<'EOF'
-{
-    // sample devcontainer.json — coop reads a subset.
-    "name": "coop-it-demo",
-    "image": "ubuntu:22.04",
-    "hostRequirements": {
-        "cpus": 2,
-        "memory": "1GiB",
-    },
-    "containerEnv": {
-        "COOP_TEST_DEVCONTAINER": "applied",
-    },
-    "forwardPorts": [3000],
-    "postStartCommand": "echo dc-hooked > /tmp/coop-dc-marker",
-    "remoteUser": "root",
-}
-EOF
-}
-
-test_devcontainer_translator() {
-    echo ""
-    echo "=== Phase: devcontainer.json translator (dry-run) ==="
-
-    local dcdir="$tmpdir/devcontainer-ws"
-    _write_devcontainer "$dcdir"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-
-    # --dry-run with auto-discovery: report is printed to stderr, no VM work.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-dry" --dry-run --no-agents; then
-        pass "up ... --dry-run exits 0"
-    else
-        fail "up ... --dry-run exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    # Report content lands on stderr (per the CLAUDE.md "tracing → stderr" rule).
-    if grep -q "hostRequirements.cpus" <<< "$HARNESS_ERR" \
-        && grep -q "applied" <<< "$HARNESS_ERR"; then
-        pass "dry-run report covers hostRequirements"
-    else
-        fail "dry-run report covers hostRequirements" "stderr: $HARNESS_ERR"
-    fi
-
-    # JSONC: the file uses //-comments and trailing commas; parser must accept.
-    if grep -q "containerEnv" <<< "$HARNESS_ERR"; then
-        pass "JSONC (comments + trailing commas) parses"
-    else
-        fail "JSONC (comments + trailing commas) parses" "stderr: $HARNESS_ERR"
-    fi
-
-    # `remoteUser: "root"` is rejected by the GuestUser validator
-    # (coop requires an unprivileged uid-1000 account), so the report
-    # row for `remoteUser` must specifically read "invalid" — not
-    # "unsupported" (which other rows like `image` carry, so a fuzzy
-    # whole-buffer grep would pass by coincidence).
-    if grep "remoteUser" <<< "$HARNESS_ERR" | grep -q "invalid"; then
-        pass "remoteUser=root is reported invalid"
-    else
-        fail "remoteUser=root is reported invalid" "stderr: $HARNESS_ERR"
-    fi
-
-    # Dedicated check command: validates the same file without discovery,
-    # config loading, setup, or VM work.
-    if coop devcontainer check "$dcfile" --stage both; then
-        pass "devcontainer check exits 0"
-    else
-        fail "devcontainer check exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "setup-stage translation:" <<< "$HARNESS_ERR" \
-        && grep -q "start-stage translation:" <<< "$HARNESS_ERR" \
-        && grep -q "remoteUser" <<< "$HARNESS_ERR"; then
-        pass "devcontainer check reports setup and start stages"
-    else
-        fail "devcontainer check reports setup and start stages" "stderr: $HARNESS_ERR"
-    fi
-
-    local oci_bad="$tmpdir/devcontainer-oci-bad.json"
-    cat > "$oci_bad" <<'EOF'
-{
-  "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {
-      "version": { "nested": true }
-    }
-  }
-}
-EOF
-    if coop devcontainer check "$oci_bad" --stage setup; then
-        pass "devcontainer check handles invalid OCI feature options"
-    else
-        fail "devcontainer check handles invalid OCI feature options" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "features.ghcr.io/devcontainers/features/github-cli:1" <<< "$HARNESS_ERR" \
-        && grep -q "invalid" <<< "$HARNESS_ERR" \
-        && grep -q "must be a string" <<< "$HARNESS_ERR"; then
-        pass "invalid OCI feature options are reported loudly"
-    else
-        fail "invalid OCI feature options are reported loudly" "stderr: $HARNESS_ERR"
-    fi
-
-    # --no-devcontainer silently skips the file: the report header must NOT appear.
-    # `--dry-run` lets us exercise the discovery path without any VM work.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-skip" \
-        --no-devcontainer --dry-run --no-agents; then
-        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            fail "--no-devcontainer suppresses discovery" "report header still appeared: $HARNESS_ERR"
-        else
-            pass "--no-devcontainer suppresses discovery"
-        fi
-    else
-        fail "--no-devcontainer suppresses discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    local pref_cfg="$tmpdir/devcontainer-pref-config.toml"
-    local pref_data="$tmpdir/devcontainer-pref-data"
-    mkdir -p "$pref_data"
-    cat > "$pref_cfg" <<EOF
-data_dir = "$pref_data"
-EOF
-
-    if coop --config "$pref_cfg" devcontainer ignore "$dcdir"; then
-        pass "devcontainer ignore records persistent opt-out"
-    else
-        fail "devcontainer ignore records persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" devcontainer status "$dcdir" \
-        && grep -q "disabled" <<< "$HARNESS_OUT" \
-        && grep -q "$dcdir" <<< "$HARNESS_OUT"; then
-        pass "devcontainer status reports project opt-out"
-    else
-        fail "devcontainer status reports project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref" \
-        --dry-run --no-agents; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips discovery"
-        else
-            fail "stored devcontainer opt-out skips discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" setup --workspace "$dcdir" --dry-run; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "setup-stage translation" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips setup --workspace dry-run discovery"
-        else
-            fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips setup --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" start --workspace "$dcdir" --dry-run; then
-        if grep -q "stored devcontainer opt-out" <<< "$HARNESS_ERR" \
-            && ! grep -q "start-stage translation" <<< "$HARNESS_ERR"; then
-            pass "stored devcontainer opt-out skips start --workspace dry-run discovery"
-        else
-            fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "stored devcontainer opt-out skips start --workspace dry-run discovery" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-explicit" \
-        --devcontainer "$dcfile" --dry-run --no-agents; then
-        if grep -q "devcontainer.json:" <<< "$HARNESS_ERR"; then
-            pass "explicit --devcontainer bypasses stored opt-out"
-        else
-            fail "explicit --devcontainer bypasses stored opt-out" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "explicit --devcontainer bypasses stored opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop --config "$pref_cfg" devcontainer clear "$dcdir"; then
-        pass "devcontainer clear removes persistent opt-out"
-    else
-        fail "devcontainer clear removes persistent opt-out" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    local stale_ws
-    stale_ws=$(mktemp -d "$tmpdir/devcontainer-stale-XXXXXX")
-    _write_devcontainer "$stale_ws"
-    if coop --config "$pref_cfg" devcontainer ignore "$stale_ws"; then
-        rm -rf "$stale_ws"
-        if coop --config "$pref_cfg" devcontainer clear "$stale_ws" \
-            && grep -q "Cleared devcontainer opt-out" <<< "$HARNESS_OUT"; then
-            pass "devcontainer clear removes stale deleted-project opt-out"
-        else
-            fail "devcontainer clear removes stale deleted-project opt-out" "stdout: $HARNESS_OUT stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "devcontainer clear removes stale deleted-project opt-out" "ignore failed: $HARNESS_ERR"
-    fi
-
-    if coop_fails --config "$pref_cfg" up "$dcdir" --name "${INSTANCE}-dc-pref-cleared" --no-agents; then
-        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
-            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
-            pass "cleared devcontainer opt-out restores non-TTY prompt error"
-        else
-            fail "cleared devcontainer opt-out restores non-TTY prompt error" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "cleared devcontainer opt-out restores non-TTY prompt error" "expected non-zero exit"
-    fi
-
-    # Non-interactive + discovered file + no escape hatch must error with the
-    # hint pointing at --devcontainer / --no-devcontainer.
-    if coop_fails up "$dcdir" --name "${INSTANCE}-dc-noopt" --no-agents; then
-        if grep -qi "devcontainer" <<< "$HARNESS_ERR" \
-            && grep -q -- "--no-devcontainer" <<< "$HARNESS_ERR"; then
-            pass "non-TTY without escape hatch errors with hint"
-        else
-            fail "non-TTY without escape hatch errors with hint" "stderr: $HARNESS_ERR"
-        fi
-    else
-        fail "non-TTY without escape hatch errors with hint" "expected non-zero exit"
-    fi
-
-    # CLI overrides devcontainer.json values — report should mark cpus as
-    # "overridden" with source = CLI.
-    if coop up "$dcdir" --name "${INSTANCE}-dc-override" \
-        --vcpus 8 --dry-run --no-agents; then
-        pass "up --dry-run with overriding CLI flag exits 0"
-    else
-        fail "up --dry-run with overriding CLI flag exits 0" "stderr: $HARNESS_ERR"
-        return
-    fi
-    if grep "hostRequirements.cpus" <<< "$HARNESS_ERR" | grep -q "overridden"; then
-        pass "CLI --vcpus is reported as overriding devcontainer.json"
-    else
-        fail "CLI --vcpus is reported as overriding devcontainer.json" "stderr: $HARNESS_ERR"
-    fi
-}
-
-# ── devcontainer.json apply (--full only) ─────────────────────
-
-test_devcontainer_apply() {
-    echo ""
-    echo "=== Phase: devcontainer.json apply (--full) ==="
-
-    local dcdir="$tmpdir/devcontainer-apply-ws"
-    _write_devcontainer "$dcdir"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-    local inst_name="${INSTANCE}-dc-apply"
-
-    # Use explicit --devcontainer to skip the prompt in CI.
-    if coop up "$dcdir" --name "$inst_name" \
-        --devcontainer "$dcfile" --no-agents; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up with --devcontainer exits 0"
-    else
-        fail "up with --devcontainer exits 0" "exit code: $? stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$inst_name"
-
-    # containerEnv must reach the guest as a literal env var.
-    local seen_env
-    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
-    if [[ "$seen_env" == "applied" ]]; then
-        pass "containerEnv reached the guest"
-    else
-        fail "containerEnv reached the guest" "got: '$seen_env'"
-    fi
-
-    # postStartCommand must have written the marker.
-    local seen_marker
-    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
-    if [[ "$seen_marker" == *dc-hooked* ]]; then
-        pass "postStartCommand ran in the guest"
-    else
-        fail "postStartCommand ran in the guest" "marker contents: '$seen_marker'"
-    fi
-
-    cat > "$dcfile" <<'EOF'
-{
-    "name": "coop-it-demo-changed",
-    "hostRequirements": {
-        "cpus": 4,
-        "memory": "2GiB"
-    },
-    "containerEnv": {
-        "COOP_TEST_DEVCONTAINER": "changed"
-    },
-    "forwardPorts": [3001],
-    "postStartCommand": "echo changed > /tmp/coop-dc-marker",
-    "remoteUser": "root"
-}
-EOF
-
-    if coop stop "$inst_name"; then
-        pass "stop devcontainer apply instance exits 0"
-    else
-        fail "stop devcontainer apply instance exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-
-    if coop start --workspace "$dcdir" --no-agents; then
-        pass "start --workspace after devcontainer change exits 0"
-    else
-        fail "start --workspace after devcontainer change exits 0" "exit code: $? stderr: $HARNESS_ERR"
-    fi
-    if grep -q "devcontainer.json changed" <<< "$HARNESS_ERR" \
-        && grep -q "Destroy and recreate" <<< "$HARNESS_ERR" \
-        && grep -q "features, hostRequirements, mounts" <<< "$HARNESS_ERR" \
-        && grep -q "not re-applied automatically" <<< "$HARNESS_ERR"; then
-        pass "changed devcontainer warning is informational"
-    else
-        fail "changed devcontainer warning is informational" "stderr: $HARNESS_ERR"
-    fi
-
-    seen_env=$(guest_exec printenv COOP_TEST_DEVCONTAINER 2>/dev/null) || seen_env=""
-    if [[ "$seen_env" == "applied" ]]; then
-        pass "changed containerEnv is not re-applied on restart"
-    else
-        fail "changed containerEnv is not re-applied on restart" "got: '$seen_env'"
-    fi
-
-    seen_marker=$(guest_exec cat /tmp/coop-dc-marker 2>/dev/null) || seen_marker=""
-    if [[ "$seen_marker" != *changed* ]]; then
-        pass "changed postStartCommand is not re-applied on restart"
-    else
-        fail "changed postStartCommand is not re-applied on restart" "marker contents: '$seen_marker'"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-}
-
-# ── OCI devcontainer feature install (--full only) ────────────
-
-# Resolve a real public GHCR devcontainer Feature, bake it into the image,
-# and assert the tool it installs is present and runnable in the guest. This
-# is the end-to-end counterpart to the invalid-options error path exercised
-# in test_devcontainer_translator (which only runs `devcontainer check`).
-test_devcontainer_oci_feature() {
-    echo ""
-    echo "=== Phase: OCI devcontainer feature install (--full) ==="
-
-    local dcdir="$tmpdir/devcontainer-oci-ws"
-    mkdir -p "$dcdir/.devcontainer"
-    local dcfile="$dcdir/.devcontainer/devcontainer.json"
-    local inst_name="${INSTANCE}-dc-oci"
-
-    # github-cli is a small public Feature on ghcr.io that installs `gh` to
-    # /usr/local/bin. Pinning the major tag keeps the resolved digest stable.
-    cat > "$dcfile" <<'EOF'
-{
-    "name": "coop-it-oci-feature",
-    "features": {
-        "ghcr.io/devcontainers/features/github-cli:1": {}
-    }
-}
-EOF
-
-    # Use explicit --devcontainer to skip the prompt in CI. Feature resolution
-    # and bake happen during `up`; a network failure reaching ghcr.io would
-    # surface here.
-    if coop up "$dcdir" --name "$inst_name" \
-        --devcontainer "$dcfile" --no-agents; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up with OCI feature exits 0"
-    else
-        fail "up with OCI feature exits 0" "exit code: $? stderr: $HARNESS_ERR"
-        return
-    fi
-
-    GUEST_INSTANCE="$inst_name"
-
-    # The feature's install.sh must have placed `gh` on PATH in the guest.
-    if guest_exec command -v gh >/dev/null 2>&1; then
-        pass "gh is on PATH in the guest"
-    else
-        fail "gh is on PATH in the guest" "stderr: $(guest_stderr)"
-    fi
-
-    # The installed tool must be runnable, not just present.
-    local gh_version
-    if gh_version=$(guest_exec gh --version 2>/dev/null) \
-        && [[ "$gh_version" == *"gh version"* ]]; then
-        pass "gh runs in the guest"
-    else
-        fail "gh runs in the guest" "got: '$gh_version' stderr: $(guest_stderr)"
-    fi
-
-    unset GUEST_INSTANCE
-
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-}
-
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -6772,7 +6666,7 @@ test_post_start() {
     # The marker file written by the hook is the assertion.
     local post_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$post_ws"
-    if coop up "$post_ws" --name "$inst_name" --no-agents --no-devcontainer \
+    if coop up "$post_ws" --name "$inst_name" --no-agents \
         --post-start "echo hooked > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
@@ -6796,7 +6690,7 @@ test_post_start() {
     local fail_inst="${INSTANCE}-poststart-fail"
     local fail_ws="$tmpdir/${fail_inst}-ws"
     mkdir -p "$fail_ws"
-    if coop up "$fail_ws" --name "$fail_inst" --no-agents --no-devcontainer \
+    if coop up "$fail_ws" --name "$fail_inst" --no-agents \
         --post-start "false; exit 1"; then
         STARTED_INSTANCES+=("$fail_inst")
         pass "up succeeds when --post-start fails (warn-and-continue)"
@@ -6852,6 +6746,25 @@ test_provision_failure() {
     fi
 }
 
+# ── Removed devcontainer CLI (pre-VM) ─────────────────────────
+
+test_removed_devcontainer_cli() {
+    echo ""
+    echo "=== Phase: removed devcontainer CLI ==="
+    if coop_fails devcontainer check missing.json \
+        && [[ "$HARNESS_ERR" == *"unrecognized subcommand 'devcontainer'"* ]]; then
+        pass "devcontainer subcommand is rejected"
+    else
+        fail "devcontainer subcommand is rejected" "stderr: $HARNESS_ERR"
+    fi
+    if coop_fails up --devcontainer missing.json \
+        && [[ "$HARNESS_ERR" == *"unexpected argument '--devcontainer'"* ]]; then
+        pass "up --devcontainer is rejected"
+    else
+        fail "up --devcontainer is rejected" "stderr: $HARNESS_ERR"
+    fi
+}
+
 # ── Guest user CLI validation (pre-VM) ────────────────────────
 
 test_guest_user_validation() {
@@ -6860,14 +6773,14 @@ test_guest_user_validation() {
 
     # `root` is rejected by the GuestUser validator: coop requires an
     # unprivileged uid-1000 account.
-    if coop_fails setup -y --guest-user root --dry-run; then
+    if coop_fails setup -y --guest-user root; then
         pass "setup --guest-user root is rejected"
     else
         fail "setup --guest-user root is rejected" "should have failed"
     fi
 
     # Uppercase and other non-POSIX-portable characters are rejected.
-    if coop_fails setup -y --guest-user Vscode --dry-run; then
+    if coop_fails setup -y --guest-user Vscode; then
         pass "setup --guest-user with uppercase rejected"
     else
         fail "setup --guest-user with uppercase rejected" "should have failed"
@@ -6883,6 +6796,23 @@ test_guest_user_validation() {
         fi
     else
         fail "start --guest-user is rejected as unknown flag" "should have failed"
+    fi
+}
+
+test_pull_cli_validation() {
+    echo ""
+    echo "=== Phase: pull CLI validation ==="
+
+    if coop_fails pull --exclude-git; then
+        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
+            pass "pull --exclude-git is rejected as an unknown flag"
+        else
+            fail "pull --exclude-git is rejected as an unknown flag" \
+                "unexpected error: $HARNESS_ERR"
+        fi
+    else
+        fail "pull --exclude-git is rejected as an unknown flag" \
+            "pull unexpectedly accepted a no-op flag"
     fi
 }
 
@@ -6923,7 +6853,7 @@ test_guest_user_alt() {
     # here on purpose; coop must read the persisted value.
     local alt_ws="$tmpdir/${inst_name}-ws"
     mkdir -p "$alt_ws"
-    if coop up "$alt_ws" --name "$inst_name" --no-agents --no-devcontainer --image "$img_name"; then
+    if coop up "$alt_ws" --name "$inst_name" --no-agents --image "$img_name"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up (alt-user image) exits 0"
     else
@@ -7087,16 +7017,19 @@ EOF
     test_mem_floor
     test_profiles_cli
     test_completions
-    test_devcontainer_translator
+    test_removed_devcontainer_cli
     test_guest_user_validation
+    test_pull_cli_validation
 
     # Setup + primary instance
     test_setup
     test_up_creates_primary_instance
+    test_private_storage
     test_start_rejects_missing_instance
     test_duplicate_name
     test_status_running
     test_list_running
+    test_running_vm_completions
     test_auto_resolve_running
     test_shell_connectivity
     test_ssh_alias
@@ -7130,9 +7063,11 @@ EOF
     test_status_stopped
     test_agent_update_stopped
     test_list_stopped
+    test_stopped_vm_completions
     test_resize_status
     test_reconfigure
     test_commit_restore
+    test_private_storage
     test_restart_stopped
     test_restart_rejects_ignored_flags
     test_restore_reprovision
@@ -7160,8 +7095,6 @@ EOF
         test_builtin_profiles
         test_builtin_profile_plugins
         test_post_start
-        test_devcontainer_apply
-        test_devcontainer_oci_feature
 
         # Local marketplace directory copy
         test_local_marketplace
@@ -7206,6 +7139,9 @@ EOF
         fi
     fi
 
+    if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$proxy_phase_ran" != 1 ]]; then
+        fail "credential-proxy phase ran" "required release phase did not complete"
+    fi
     summary
 }
 

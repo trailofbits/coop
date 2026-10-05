@@ -225,7 +225,6 @@ Local directories are first copied into the guest at `~/.coop/marketplaces/<dirn
 [claude]
 plugins = [
   "rust-analyzer-lsp@claude-plugins-official",
-  "devcontainer-setup@trailofbits",
 ]
 ```
 

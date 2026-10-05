@@ -9,7 +9,7 @@ members = ["coop-proxy"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/trailofbits/coop"
@@ -48,6 +48,7 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
+serde_yaml = "0.9"
 
 [lints]
 workspace = true

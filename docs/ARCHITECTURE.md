@@ -26,9 +26,6 @@ coop/
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
 │   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
-│   ├── devcontainer.rs     # devcontainer.json parse + translate to coop config
-│   ├── devcontainer_oci.rs # devcontainer Features from the GHCR OCI registry
-│   ├── git_repo_devcontainer.rs # fetch devcontainer.json from a remote repo
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
@@ -46,9 +43,9 @@ coop/
 │   ├── port_forward.rs     # ssh -L port forwards + state
 │   ├── signal.rs           # SIGINT/SIGTERM cooperative cancellation
 │   ├── paths.rs            # GuestPath / HostPath type split
-│   ├── fs_util.rs          # atomic file writes, file locks
+│   ├── fs_util.rs          # private directories/ACLs, atomic file writes, file locks
+│   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
-│   ├── jsonc.rs            # JSONC → JSON (for devcontainer.json)
 │   ├── naming.rs           # safe-name character class
 │   ├── completions.rs      # shell completion (static + dynamic candidates)
 │   ├── prompt.rs           # TTY prompts
@@ -104,15 +101,22 @@ Two lifecycle machines are encoded in the type system rather than in runtime
 flags — this is a load-bearing design choice (see
 [`code-style.md`](code-style.md#type-state-for-lifecycles)):
 
-- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) are unforgeable
-  liveness proofs with private fields, minted only by the probes `as_running`
-  / `as_stopped`. Operations that require a live (or stopped) VM take the proof
-  by value, so the precondition is checked once and then witnessed by the type.
+- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields
+  and are minted by `as_running` / `as_stopped` after a state probe. They record
+  a point-in-time observation. `StoppedInstance` also holds the per-instance
+  operation lock through stopped-only disk mutations. Lima only mints it for
+  confirmed `Stopped`; absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
   path calls first; it runs `cfg.validate()` so no VM starts on an invalid
   config.
+
+An instance operation lock is held from the stopped-state probe through disk
+resize, commit, or restore. Start, stop, and destroy acquire the same bounded
+lock. Its file is a sibling of the instance directory, so directory removal
+does not replace the lock inode. Allocation releases its directory lock before
+any instance operation lock is acquired.
 
 ## Command dispatch
 
@@ -121,7 +125,7 @@ flags — this is a load-bearing design choice (see
 1. Emit dynamic shell completions (before arg parsing) if requested.
 2. Parse `Cli` (clap derive), init tracing (→ **stderr**).
 3. Handle commands that must work **without** a loaded config —
-   `Completions`, `Init`, `Update`, `Uninstall`, `Devcontainer check` — first.
+   `Completions`, `Init`, `Update`, `Uninstall` — first.
 4. `config::CoopConfig::load`, then fire the update-notifier check.
 5. Construct `backend::PlatformBackend::new()`.
 6. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
@@ -130,10 +134,9 @@ flags — this is a load-bearing design choice (see
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
-`devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
+`profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
-`admin.rs` (init/validate/uninstall),
-and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
+`admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
 (`merge_runtime_guest_env`, `purge_all_data`).
 
@@ -149,7 +152,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 3. **Boot** the VM (`be.create_and_start`), then `wait_until_ready` (SSH probe
    with backoff).
 4. **Forwards + state** — spawn `ssh -L` forwards, persist `ForwardsState`,
-   `GuestEnvState`, `DevcontainerState` as JSON sidecars in the instance dir.
+   `GuestEnvState` as JSON sidecars in the instance dir.
 5. **Bootstrap** (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
    `gh auth setup-git`; then `bootstrap_claude` / `bootstrap_codex` inject the
    allowlisted config files and a managed `settings.json`, and on first boot
@@ -158,7 +161,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
-7. **`postStartCommand`** hook (warned, not fatal).
+7. **`post_start`** hook (warned, not fatal).
 
 Config, secrets, and workspace all cross the host→guest boundary here; the
 security-relevant details of each crossing are in
@@ -176,8 +179,11 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
-`guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
+`guest_env.json`, `model.json`, `proxy.json`, plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files.
+Allocation refuses an occupied instance path. If any instance directory has
+unreadable metadata, allocation stops because its network index cannot be
+trusted; existing healthy instances remain available through normal lookup.
 
 ## `coop update`
 
@@ -213,9 +219,9 @@ Hold these when changing the code; the review agents check for their violation:
    filesystem escape. See [`trust-model.md`](trust-model.md).
 2. **Backend selection is compile-time.** Don't add a runtime backend enum;
    keep shared code correct for both Firecracker and Lima.
-3. **Liveness is a type, not a flag.** Route VM operations through
-   `RunningInstance`/`StoppedInstance` and `boot_preflight`, not ad-hoc
-   `if is_running` checks.
+3. **State-gated operations use probes and locks.** Route VM operations through
+   `RunningInstance`/`StoppedInstance` and `boot_preflight`; the stopped token
+   holds the operation lock until the disk mutation is complete.
 4. **Value invariants live in constructors.** Parse into a newtype at the
    boundary; don't re-validate primitives downstream.
 5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in

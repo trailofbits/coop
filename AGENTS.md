@@ -119,9 +119,19 @@ workflow. In addition to lens-specific checks, every review must:
 - Distinguish observed facts from inferred causes in errors, docs, and review
   comments. Preserve distinct failure states when later messaging depends on
   them; prefer an enum over discarding the reason and reconstructing it.
+- Trace project/guest configuration through translation, merging, and saved-state
+  replay to unchanged host consumers. Audit executable lookup, environment, cwd,
+  tool configuration, and argv; syntax validation and guest opt-in do not grant
+  host execution authority. Include transferred files, implicit tool discovery,
+  and later host operations; containment does not establish safe interpretation.
+  See [`docs/trust-model.md`](docs/trust-model.md).
 - Audit lifecycle symmetry: success, partial failure, timeout, retry, cleanup,
   concurrency, stale state, and mode transitions. A spawned process, secret,
   lock, PID file, or cache must remain bounded on every path.
+- For filesystem and mount changes, trace object identity from validation to
+  use, including subprocesses and sudo. Check every path reopening, mutable
+  final component, interrupted operation, and retry against the guest/host
+  trust boundary; a checked parent descriptor alone does not pin its children.
 - Search every representation of a changed contract, including source, tests,
   examples, exhaustive docs, workflow/install scripts, comments, and PR text.
   Re-check the full branch after rebases and review-fix commits.

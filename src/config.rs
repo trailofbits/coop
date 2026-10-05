@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
+use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
@@ -13,7 +14,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -236,8 +236,8 @@ pub const MIN_MEM_MIB: MiB = MiB::from_nonzero(NonZeroU32::new(128).unwrap());
 /// `MiB` is a generic byte quantity whose only invariant is non-zero;
 /// the 128 MiB floor is domain-specific to *VM memory*, so it lives here
 /// rather than on `MiB`. Every entry point that sets guest memory — the
-/// `--mem` CLI flag, `config.toml`, `coop resize`, and the devcontainer
-/// translator — constructs through [`Self::new`], so no path can hold an
+/// `--mem` CLI flag, `config.toml`, and `coop resize` — constructs through
+/// [`Self::new`], so no path can hold an
 /// unbootable value. This is parse-don't-validate: the floor is a
 /// property of the type, not a check a caller must remember to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -416,8 +416,7 @@ impl Mount {
     /// Single source of truth for the canonicalize / is-dir
     /// invariants; the absolute-guest invariant is carried by
     /// `GuestPath::absolute` at the type boundary. Callers that build
-    /// the spec from typed fields (devcontainer JSON, Docker
-    /// `type=bind` form) skip the string round-trip by calling this
+    /// the spec from typed fields skip the string round-trip by calling this
     /// directly.
     pub fn from_parts(host: &str, guest_path: GuestPath) -> Result<Self> {
         let host_path = Path::new(host)
@@ -751,8 +750,6 @@ pub struct CoopConfig {
     /// Executed after the VM is up and SSH is ready, before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
-    ///
-    /// Maps to `postStartCommand` from `devcontainer.json`.
     #[serde(default)]
     pub post_start: Option<String>,
 
@@ -1906,18 +1903,18 @@ impl<'de> Deserialize<'de> for ImageName {
 ///
 /// Returns the open file handle — the lock is held until dropped.
 fn lock_dir(dir: &Path) -> Result<File> {
-    fs::create_dir_all(dir)
+    let directory = crate::fs_util::PrivateDir::create(dir)
         .with_context(|| format!("Failed to create directory {}", dir.display()))?;
-    let lock_path = dir.join(".lock");
-    let file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+    let file = directory
+        .open_or_create_lock(OsStr::new(".lock"))
+        .with_context(|| format!("Failed to open lock file in {}", dir.display()))?;
     // SAFETY: flock is safe to call on a valid fd. The File owns the fd
     // and outlives this call. LOCK_EX blocks until the lock is acquired.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
         bail!(
             "Failed to acquire lock on {}: {}",
-            lock_path.display(),
+            dir.join(".lock").display(),
             std::io::Error::last_os_error()
         );
     }
@@ -2225,13 +2222,32 @@ impl CoopConfig {
                     continue;
                 }
             };
-            let config_path = self.template_config_path_for(&name);
-            let config = if config_path.exists() {
-                let content = fs::read_to_string(&config_path).ok();
-                content.and_then(|c| serde_json::from_str(&c).ok())
-            } else {
-                None
+            if let Err(error) = crate::private_storage::prepare_directory(&entry.path()) {
+                tracing::warn!(
+                    "Skipping image directory {}: {error:#}",
+                    entry.path().display()
+                );
+                continue;
+            }
+            let image_dir = match crate::fs_util::PrivateDir::open_existing(&entry.path()) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    tracing::warn!(
+                        "Skipping image directory {}: {error:#}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
             };
+            let config = image_dir
+                .open_regular(OsStr::new("template-config.json"))
+                .and_then(|mut file| {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    Ok(content)
+                })
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok());
             images.push(ImageInfo {
                 name,
                 dir: entry.path(),
@@ -2252,12 +2268,6 @@ impl CoopConfig {
         self.data_dir.join("instances")
     }
 
-    /// Path to per-project devcontainer discovery preferences.
-    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
-    pub fn devcontainer_preferences_path(&self) -> PathBuf {
-        self.data_dir.join("devcontainer_preferences.json")
-    }
-
     /// List all existing instances, sorted by index.
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let dir = self.instances_dir();
@@ -2275,10 +2285,10 @@ impl CoopConfig {
                 Err(e) => {
                     // Instance dir exists but has missing or corrupted
                     // instance.json — leftover from a crashed start.
-                    // Log and skip so callers aren't blocked.
+                    // Keep healthy instances available for lookup.
                     tracing::warn!(
                         "Skipping corrupted instance dir {} ({}). \
-                         Remove it manually or run `destroy --all`.",
+                         Repair or remove it manually before creating another instance.",
                         entry.path().display(),
                         e,
                     );
@@ -2359,6 +2369,21 @@ impl CoopConfig {
     ) -> Result<Instance> {
         let _lock = lock_dir(&self.instances_dir())?;
 
+        // A directory with unreadable metadata may own any index. Keep it
+        // reserved until the owner repairs or removes it; guessing a free
+        // index could give two VMs the same network identity.
+        for entry in fs::read_dir(self.instances_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                Instance::load(&entry.path()).with_context(|| {
+                    format!(
+                        "Cannot allocate while instance directory {} has invalid metadata",
+                        entry.path().display()
+                    )
+                })?;
+            }
+        }
+
         let instances = self.list_instances()?;
         let used_indices: HashSet<InstanceIndex> = instances.iter().map(|i| i.index).collect();
 
@@ -2393,11 +2418,12 @@ impl CoopConfig {
             InstanceName::new(&s).context("BUG: InstanceIndex produced invalid name")?
         };
 
-        if instances.iter().any(|i| i.name == name) {
-            bail!("Instance '{name}' already exists");
-        }
-
         let dir = self.instances_dir().join(name.as_str());
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => bail!("Instance '{name}' already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to check instance directory"),
+        }
         let instance = Instance {
             name,
             index,
@@ -2590,11 +2616,6 @@ impl Instance {
         self.dir.join("proxy.json")
     }
 
-    #[mutants::skip] // equivalent: default-path getter; no caller asserts the returned PathBuf
-    pub fn devcontainer_state_path(&self) -> PathBuf {
-        self.dir.join("devcontainer_state.json")
-    }
-
     pub fn tap_device(&self) -> String {
         format!("tap{}", self.index)
     }
@@ -2646,11 +2667,19 @@ impl Instance {
     }
 
     fn load(dir: &Path) -> Result<Self> {
+        crate::private_storage::prepare_directory(dir)?;
+        let directory = crate::fs_util::PrivateDir::open_existing(dir)?;
         let meta_path = dir.join("instance.json");
-        let content = fs::read_to_string(&meta_path)
+        let mut content = String::new();
+        directory
+            .open_regular(OsStr::new("instance.json"))?
+            .read_to_string(&mut content)
             .with_context(|| format!("Failed to read {}", meta_path.display()))?;
         let meta: InstanceMeta =
             serde_json::from_str(&content).context("Failed to parse instance.json")?;
+        if dir.file_name() != Some(OsStr::new(meta.name.as_str())) {
+            bail!("Instance metadata name does not match its directory");
+        }
         Ok(Instance {
             name: meta.name,
             index: meta.index,
@@ -2665,21 +2694,42 @@ impl Instance {
     /// (guards against PID reuse). Removes stale PID files as a side
     /// effect when the process is gone or belongs to something else.
     pub fn is_running(&self) -> bool {
-        let pid_path = self.pid_file_path();
-        if !pid_path.exists() {
-            return false;
-        }
-        let Ok(pid_str) = fs::read_to_string(&pid_path) else {
-            return false;
-        };
-        let Ok(pid) = pid_str.trim().parse::<u32>() else {
-            return false;
-        };
+        self.probe_running().unwrap_or_else(|error| {
+            tracing::warn!(
+                "Could not determine whether instance '{}' is running: {error}",
+                self.name
+            );
+            false
+        })
+    }
 
-        let alive = Cmd::new("kill")
-            .args(["-0", &pid.to_string()])
-            .sudo()
-            .status_ok();
+    /// Fallible Firecracker state probe for operations that must distinguish
+    /// confirmed absence from a failed liveness or identity check.
+    pub fn probe_running(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid_str = match fs::read_to_string(&pid_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+        let pid: u32 = pid_str
+            .trim()
+            .parse()
+            .context("Invalid Firecracker PID file")?;
+        let pid_i32 = i32::try_from(pid).context("Firecracker PID is out of range")?;
+        if pid_i32 <= 0 {
+            bail!("Firecracker PID must be positive");
+        }
+        // SAFETY: signal 0 only probes liveness; it does not signal the process.
+        let alive = if unsafe { libc::kill(pid_i32, 0) } == 0 {
+            true
+        } else {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => false,
+                Some(libc::EPERM) => true,
+                _ => bail!("Failed to probe Firecracker PID {pid}"),
+            }
+        };
 
         if !alive {
             tracing::debug!(
@@ -2689,10 +2739,16 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        if !is_firecracker_process(pid) {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).with_context(|| {
+            format!("Failed to read Firecracker process identity for PID {pid}")
+        })?;
+        if !cmdline
+            .windows(b"firecracker".len())
+            .any(|w| w == b"firecracker")
+        {
             tracing::debug!(
                 "Removing stale PID file for instance '{}' \
                  (PID {pid} is not a Firecracker process)",
@@ -2701,26 +2757,11 @@ impl Instance {
             if let Err(e) = fs::remove_file(&pid_path) {
                 tracing::debug!("Failed to remove stale PID file (non-fatal): {e}");
             }
-            return false;
+            return Ok(false);
         }
 
-        true
+        Ok(true)
     }
-}
-
-/// Check if a PID belongs to a Firecracker process by reading
-/// `/proc/{pid}/cmdline`. Returns `false` if the file is unreadable
-/// or the command line does not contain "firecracker".
-fn is_firecracker_process(pid: u32) -> bool {
-    let Ok(cmdline) = Cmd::new("cat")
-        .arg(format!("/proc/{pid}/cmdline"))
-        .sudo()
-        .capture()
-    else {
-        return false;
-    };
-    // /proc/pid/cmdline uses NUL as separator
-    cmdline.contains("firecracker")
 }
 
 // ── Defaults ──────────────────────────────────────────────────
@@ -3173,37 +3214,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_dead_pid() {
-        assert!(!is_firecracker_process(DEAD_PID));
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_false_for_live_non_firecracker_pid() {
-        let mut child = spawn_sleep();
-        let pid = child.id();
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(!result);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn is_firecracker_process_true_for_firecracker_named_pid() {
-        let mut child = spawn_firecracker_like();
-        let pid = child.id();
-        wait_for_firecracker_cmdline(pid);
-        let result = is_firecracker_process(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(result);
-    }
-
     // ── Allocate instance ────────────────────────────────────
 
     #[test]
@@ -3213,6 +3223,42 @@ mod tests {
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
+    }
+
+    #[test]
+    fn allocate_rejects_corrupt_instance_directory_without_touching_its_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let healthy = cfg
+            .allocate_instance(Some(&iname("healthy")), &default_img(), None)
+            .unwrap();
+        let corrupt = cfg.instances_dir().join("project");
+        fs::create_dir(&corrupt).unwrap();
+        let metadata = corrupt.join("instance.json");
+        let disk = corrupt.join("rootfs.ext4");
+        fs::write(&metadata, "{bad json").unwrap();
+        fs::write(&disk, "disk sentinel").unwrap();
+
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        for (name, workspace) in [
+            (Some(iname("project")), None),
+            (None, Some(project.as_path())),
+            (None, None),
+        ] {
+            let error = cfg
+                .allocate_instance(name.as_ref(), &default_img(), workspace)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid metadata"), "{error}");
+            assert_eq!(fs::read_to_string(&metadata).unwrap(), "{bad json");
+            assert_eq!(fs::read_to_string(&disk).unwrap(), "disk sentinel");
+            assert!(corrupt.is_dir());
+            assert_eq!(
+                cfg.resolve_instance(Some(&healthy.name)).unwrap().index,
+                healthy.index
+            );
+        }
     }
 
     #[test]
@@ -3404,6 +3450,18 @@ mod tests {
         assert_eq!(indices, vec![2, 5, 10]);
     }
 
+    #[test]
+    fn list_rejects_metadata_for_a_different_instance_directory() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let mut instance = make_instance(tmp.path(), "alias", idx(1));
+        instance.name = iname("other");
+        instance.save().unwrap();
+
+        assert!(cfg.list_instances().unwrap().is_empty());
+        assert!(cfg.resolve_instance(Some(&iname("alias"))).is_err());
+    }
+
     // ── Resolve instance ─────────────────────────────────────
 
     #[test]
@@ -3480,11 +3538,8 @@ mod tests {
 
     #[test]
     fn resolve_ignores_stale_fast_path_dir() {
-        // The fast path reads `instances_dir/<name>/instance.json` and only
-        // returns it when the stored name matches the requested name. Here the
-        // directory `wanted` holds an instance whose stored name is `decoy`, so
-        // the fast path must reject it and the slow path must find the real
-        // `wanted` instance living under a differently-named directory.
+        // A mismatched metadata name must be rejected by both the fast path
+        // and the fallback directory listing.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let instances = tmp.path().join("instances");
@@ -3497,17 +3552,8 @@ mod tests {
         };
         stale.save().unwrap();
 
-        let real = Instance {
-            name: iname("wanted"),
-            index: idx(1),
-            dir: instances.join("elsewhere"),
-            image: default_img(),
-        };
-        real.save().unwrap();
-
-        let inst = cfg.resolve_instance(Some(&iname("wanted"))).unwrap();
-        assert_eq!(inst.name, *"wanted");
-        assert_eq!(inst.index.as_u16(), 1);
+        assert!(cfg.resolve_instance(Some(&iname("wanted"))).is_err());
+        assert!(cfg.list_instances().unwrap().is_empty());
     }
 
     #[test]
@@ -5251,7 +5297,7 @@ skip = ["not-a-slug"]
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("inst");
         let inst = Instance {
-            name: InstanceName::new("test").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("python-dev").unwrap(),
@@ -5267,7 +5313,7 @@ skip = ["not-a-slug"]
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         // Write old-format instance.json without image field
-        fs::write(dir.join("instance.json"), r#"{"name": "test", "index": 0}"#).unwrap();
+        fs::write(dir.join("instance.json"), r#"{"name": "inst", "index": 0}"#).unwrap();
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
     }
@@ -5350,19 +5396,23 @@ skip = ["not-a-slug"]
     }
 
     #[test]
-    fn allocate_works_alongside_corrupted_dirs() {
+    fn allocate_refuses_unknown_index_until_corrupt_dir_is_removed() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
 
-        // Create a corrupted instance dir occupying no valid index
+        // The malformed metadata may have held any valid index.
         let broken = tmp.path().join("instances").join("broken");
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("instance.json"), "not json").unwrap();
 
-        // Allocation should succeed — corrupted dirs are skipped
-        let inst = cfg
-            .allocate_instance(None, &ImageName::new(DEFAULT_IMAGE).unwrap(), None)
-            .unwrap();
+        assert!(
+            cfg.allocate_instance(None, &default_img(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid metadata")
+        );
+        fs::remove_dir_all(&broken).unwrap();
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
     }
 
@@ -5373,7 +5423,7 @@ skip = ["not-a-slug"]
 
         // Save initial state
         let inst = Instance {
-            name: InstanceName::new("v1").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
@@ -5382,7 +5432,7 @@ skip = ["not-a-slug"]
 
         // Overwrite with different content
         let inst2 = Instance {
-            name: InstanceName::new("v2").unwrap(),
+            name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("custom").unwrap(),
@@ -5391,7 +5441,7 @@ skip = ["not-a-slug"]
 
         // Load should see the new content, not a mix
         let loaded = Instance::load(&dir).unwrap();
-        assert_eq!(loaded.name, *"v2");
+        assert_eq!(loaded.name, *"inst");
         assert_eq!(loaded.index.as_u16(), 5);
         assert_eq!(loaded.image.as_str(), "custom");
 
@@ -6284,15 +6334,7 @@ skip = ["not-a-slug"]
 
     // ── Property tests ───────────────────────────────────────
     //
-    // A standing `cargo-fuzz` target for the config loader (the parser
-    // class #278 reserves fuzzing for) isn't practical here: `CoopConfig`
-    // transitively embeds `update`, `setup`, and `shell` types, so the
-    // `#[path]`-include trick used by the self-contained `jsonc` /
-    // `parse_repo_slug` targets would have to pull in most of the crate
-    // (including its network and process-spawning modules). The
-    // `config_load_never_panics` property below covers the same
-    // "never panics, only returns Err" guarantee as a CI gate; unblocking
-    // a true fuzz target would mean giving the crate a `lib` target.
+    // Property tests complement the config_load fuzz target.
 
     fn arb_subnet_mask() -> impl Strategy<Value = SubnetMask> {
         (0u8..=32).prop_map(|b| SubnetMask::new(b).unwrap())

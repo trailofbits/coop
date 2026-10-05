@@ -38,7 +38,7 @@ Each instance is a Lima VM created with `limactl start` using the fast-start tem
 The Lima template configures:
 - `vmType: "vz"` (Virtualization.framework, not QEMU)
 - Rosetta enabled for x86_64 binary translation on Apple Silicon
-- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides.
+- `mountType: "virtiofs"` with no host mounts (empty `mounts: []`). When `coop up --mount` is used, Lima adds virtiofs mount entries for the specified host directories, providing live mounts where changes are visible immediately on both sides. Host and guest paths are serialized as YAML scalars so special characters remain part of the path.
 - Lima's built-in containerd disabled (Docker is installed in the guest instead)
 
 ### Resize (disk, memory, vCPUs)
@@ -83,7 +83,9 @@ Creating an instance (`coop up`) follows this sequence:
 5. Creates and attaches a TAP device to the bridge (see TAP networking below).
 6. Starts the Firecracker process with `sudo`. Firecracker requires root for KVM and TAP access.
 7. Records the Firecracker PID and waits for SSH to become reachable.
-8. If `--mount` was specified, rsyncs the host directory into the guest. This is a one-time copy, not a live mount. Use `coop push` and `coop pull` to re-sync.
+8. If `--mount` was specified, rsyncs the host directory into the guest. This
+   is a one-time copy, not a live mount. Use `coop push` to update the guest;
+   use `coop pull --dir <new-directory>` to retrieve guest changes for review.
 
 The code uses a typestate pattern (`Configured` then `Running`) to enforce valid lifecycle transitions at compile time.
 

@@ -9,7 +9,7 @@ use std::io::Write as _;
 
 use serde::Serialize;
 
-use crate::{backend, config, devcontainer, guest};
+use crate::{backend, config};
 
 /// Serialize `value` as pretty JSON to stdout, with a trailing newline.
 ///
@@ -131,27 +131,6 @@ pub(crate) struct ProfileEntry {
     pub summary: String,
 }
 
-// ── up / start --dry-run ─────────────────────────────────────
-
-/// VM resource overrides resolved for a dry-run. Each is `None` when the
-/// flag was not given. The `MiB`/`GiB` newtypes serialize as bare numbers.
-#[derive(Serialize)]
-pub(crate) struct VmOverrides {
-    pub vcpus: Option<u8>,
-    pub mem_mib: Option<config::MiB>,
-    pub disk_gib: Option<config::GiB>,
-}
-
-/// `coop up --dry-run --json` / `coop start --dry-run --json`. `report`
-/// is `None` when no devcontainer.json applied.
-#[derive(Serialize)]
-pub(crate) struct DryRunPlan<'a> {
-    pub report: Option<&'a devcontainer::Report>,
-    pub profiles: &'a [String],
-    pub guest_user: &'a guest::GuestUser,
-    pub vm: VmOverrides,
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -160,10 +139,10 @@ pub(crate) struct DryRunPlan<'a> {
 )]
 mod tests {
     use super::{
-        BackendKind, DryRunPlan, ImageInfo, InstanceState, InstanceStatus, InstanceSummary,
-        ProfileEntry, ProfilesList, VmOverrides,
+        BackendKind, ImageInfo, InstanceState, InstanceStatus, InstanceSummary, ProfileEntry,
+        ProfilesList,
     };
-    use crate::{backend, config, devcontainer, guest};
+    use crate::{backend, config};
     use serde_json::{Value, json};
 
     fn to_value<T: serde::Serialize>(v: &T) -> Value {
@@ -314,62 +293,5 @@ mod tests {
                 "custom": []
             })
         );
-    }
-
-    #[test]
-    fn dry_run_plan_null_report_and_number_overrides() {
-        let user = guest::GuestUser::default();
-        let profiles = vec!["node".to_string()];
-        let view = DryRunPlan {
-            report: None,
-            profiles: &profiles,
-            guest_user: &user,
-            vm: VmOverrides {
-                vcpus: Some(4),
-                mem_mib: config::MiB::new(2048),
-                disk_gib: config::GiB::new(50),
-            },
-        };
-        assert_eq!(
-            to_value(&view),
-            json!({
-                "report": Value::Null,
-                "profiles": ["node"],
-                "guest_user": "ubuntu",
-                "vm": { "vcpus": 4, "mem_mib": 2048, "disk_gib": 50 }
-            })
-        );
-    }
-
-    #[test]
-    fn dry_run_plan_with_report() {
-        use devcontainer::{Report, ReportSource, ReportStatus};
-        let mut report = Report::default();
-        report.push(
-            "hostRequirements.cpus",
-            ReportStatus::Applied,
-            ReportSource::Devcontainer,
-            "4",
-            "",
-        );
-        let user = guest::GuestUser::default();
-        let view = DryRunPlan {
-            report: Some(&report),
-            profiles: &[],
-            guest_user: &user,
-            vm: VmOverrides {
-                vcpus: None,
-                mem_mib: None,
-                disk_gib: None,
-            },
-        };
-        let v = to_value(&view);
-        assert_eq!(v["report"]["entries"][0]["status"], json!("applied"));
-        assert_eq!(v["report"]["entries"][0]["source"], json!("devcontainer"));
-        assert_eq!(
-            v["report"]["entries"][0]["key"],
-            json!("hostRequirements.cpus")
-        );
-        assert_eq!(v["vm"]["vcpus"], Value::Null);
     }
 }

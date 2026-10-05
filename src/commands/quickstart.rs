@@ -5,17 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::lifecycle::{allocate_and_start, find_workspace_instance};
-use super::merge_runtime_guest_env;
-use super::{
-    DevcontainerInput, DevcontainerOpts, StartOpts, cmd_start, open_ssh_session, prepend_binary,
-    resolve_devcontainer,
-};
+use super::{StartOpts, cmd_start, open_ssh_session, prepend_binary};
 use crate::backend::VmBackend as _;
-use crate::{backend, config, devcontainer, guest, prompt, setup, signal, ssh};
+use crate::{backend, config, guest, prompt, setup, signal, ssh};
 
 pub(crate) struct QuickstartOpts {
     pub(crate) no_workspace: bool,
-    pub(crate) no_devcontainer: bool,
 }
 
 /// One-shot `setup → start → claude`. See `Commands::Quickstart`.
@@ -47,7 +42,6 @@ pub(crate) fn cmd_quickstart(
                 skip_confirm: true,
                 rebuild: false,
                 profiles: Vec::new(),
-                oci_features: Vec::new(),
                 extra_packages: Vec::new(),
                 post_install: None,
                 image: image.clone(),
@@ -90,19 +84,10 @@ pub(crate) fn cmd_quickstart(
                     config_path,
                     post_start_override: None,
                     persisted_guest_env: std::collections::BTreeMap::new(),
-                    devcontainer_path: None,
-                    applied_devcontainer: None,
                 },
             )?
         }
-        None => quickstart_fresh_start(
-            be,
-            cfg,
-            config_path,
-            &image,
-            workspace_dir.as_deref(),
-            opts.no_devcontainer,
-        )?,
+        None => quickstart_fresh_start(be, cfg, config_path, &image, workspace_dir.as_deref())?,
     };
 
     let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
@@ -110,71 +95,15 @@ pub(crate) fn cmd_quickstart(
     ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
 }
 
-/// Drives a fresh start with `--workspace <ws>` defaults (no mounts, no
-/// `--env`, no forwards, no `--post-start`), folding any discovered
-/// `devcontainer.json` into the start. Returns the started instance.
-///
-/// This allocates directly rather than going through `cmd_start`; quickstart
-/// creates project environments while `start` only restarts stopped instances.
-// Shell-out orchestration (devcontainer resolve + allocate_and_start). exclude_re
-// cannot suppress its `delete field … from struct devcontainer::TranslatorInputs`
-// mutant (see the note in .cargo/mutants.toml), so skip the whole body here.
-#[mutants::skip]
+/// Allocate and start a fresh instance for the current workspace.
+#[mutants::skip] // backend and SSH effects require integration tests
 fn quickstart_fresh_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     config_path: &Path,
     image: &config::ImageName,
     workspace_dir: Option<&Path>,
-    no_devcontainer: bool,
 ) -> Result<config::Instance> {
-    let inputs = devcontainer::TranslatorInputs {
-        cli_workspace_or_git_repo: workspace_dir.is_some(),
-        ..devcontainer::TranslatorInputs::default()
-    };
-    let dc_input = DevcontainerInput::from_flags(None, no_devcontainer);
-    let translation = resolve_devcontainer(
-        &DevcontainerOpts {
-            input: &dc_input,
-            dry_run: false,
-            workspace: workspace_dir,
-            mounts: &[],
-            git_repo: None,
-            github_auth: cfg.github.as_ref(),
-            preference_path: Some(&cfg.devcontainer_preferences_path()),
-        },
-        &inputs,
-        devcontainer::Stage::Start,
-    )?;
-
-    if let Some(t) = &translation {
-        devcontainer::apply_to_config(cfg, t)?;
-    }
-
-    // `cfg.forward_ports` is folded in by `start_instance` itself, so it
-    // doesn't need to be merged in here.
-    let forward_ports = translation
-        .as_ref()
-        .map(|t| devcontainer::merge_into_forward_ports(&t.forward_ports, &[]))
-        .unwrap_or_default();
-
-    let persisted_guest_env =
-        merge_runtime_guest_env(cfg, &[], translation.as_ref().map(|t| &t.guest_env));
-
-    let default_translation = devcontainer::Translation::default();
-    let effective_disk =
-        devcontainer::effective_disk(None, translation.as_ref().unwrap_or(&default_translation));
-    let post_start_override = translation.as_ref().and_then(|t| t.post_start.clone());
-
-    let final_mounts = crate::workspace::ValidatedMounts::assemble(
-        crate::workspace::WorkspaceMountRule::ProjectMountedOrNone,
-        translation
-            .as_ref()
-            .map(|t| t.mounts.clone())
-            .unwrap_or_default(),
-    )?
-    .into_vec();
-
     let workspace_str = workspace_dir
         .map(|p| {
             p.to_str()
@@ -188,15 +117,13 @@ fn quickstart_fresh_start(
         git_repo: None,
         no_agents: false,
         no_prompt: false,
-        disk: effective_disk,
-        mounts: final_mounts,
+        disk: None,
+        mounts: Vec::new(),
         exclude_git: false,
-        forward_ports,
+        forward_ports: Vec::new(),
         config_path,
-        post_start_override: post_start_override.as_deref(),
-        persisted_guest_env,
-        devcontainer_path: None,
-        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
+        post_start_override: None,
+        persisted_guest_env: std::collections::BTreeMap::new(),
     };
 
     allocate_and_start(be, cfg, None, image, workspace_dir, &start_opts)

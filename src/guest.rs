@@ -9,23 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{CoopConfig, CustomProfile};
 use crate::paths::GuestPath;
 
-/// Devcontainer feature ids (bare names) that map to builtin profiles.
-/// The id is the same string as the builtin name; this slice acts as the
-/// allow-list so an unknown feature returns `None` rather than silently
-/// resolving against an unrelated builtin added later.
-const FEATURE_IDS: &[&str] = &["python", "node", "c", "fuzz", "rust", "go"];
-
-/// Look up a builtin profile by its devcontainer feature id (a bare
-/// name such as `rust`, after stripping any `ghcr.io/...:tag` prefix).
-pub fn builtin_for_feature(id: &str) -> Option<&'static BuiltinProfile> {
-    if FEATURE_IDS.contains(&id) {
-        lookup_builtin(id)
-    } else {
-        None
-    }
-}
-
-/// Default username when neither the CLI nor a devcontainer pins one.
+/// Default guest username.
 /// Matches the user that Firecracker's CI rootfs already ships with and
 /// that Lima's `useradd` block creates at uid 1000.
 pub const DEFAULT_GUEST_USER: &str = "ubuntu";
@@ -128,6 +112,11 @@ pub fn codex_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex")
 }
 
+/// Stable system path linking to Codex's same-release Code Mode host.
+pub fn codex_code_mode_host_bin() -> GuestPath {
+    GuestPath::new("/usr/local/bin/codex-code-mode-host")
+}
+
 /// Wrapper that runs Codex with a guest Linux Secret Service session.
 pub fn codex_account_bin() -> GuestPath {
     GuestPath::new("/usr/local/bin/codex-account")
@@ -171,20 +160,21 @@ impl From<GuestUser> for String {
 /// Binaries that must exist in the guest image after provisioning.
 /// Absolute paths are checked directly; bare names are looked up via
 /// `command -v` (i.e. must be in the default system PATH).
-/// Codex's native installer owns package validation; coop checks its public
-/// compatibility link without depending on the package's internal layout.
+/// Codex's native installer owns package validation; coop checks the public
+/// CLI and Code Mode host links that form its supported guest contract.
 ///
 /// Returns `GuestPath`s rather than raw strings so call sites that
 /// build shell commands or inspect the chroot get path semantics for
 /// free (and the `/usr/bin/docker`/`/usr/bin/gh` entries can't be
 /// mistaken for host paths).
-pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 9] {
+pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
     [
         GuestPath::new("/usr/bin/docker"),
         GuestPath::new("/usr/bin/gh"),
         user.claude_bin(),
         user.grok_bin(),
         codex_bin(),
+        codex_code_mode_host_bin(),
         codex_account_bin(),
         // The Secret Service stack `codex-account` drives. Checking the
         // wrapper alone proves nothing — the provision script always writes
@@ -510,6 +500,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_script_publishes_cli_and_code_mode_host() {
+        for expected in [
+            "CODEX_NATIVE_BIN=\"/home/${GUEST_USER}/.local/bin/codex\"",
+            "CODEX_NATIVE_CODE_MODE_HOST=\"/home/${GUEST_USER}/.codex/packages/standalone/current/bin/codex-code-mode-host\"",
+            "mv -Tf \"$CODEX_CODE_MODE_HOST_LINK_TMP\" /usr/local/bin/codex-code-mode-host",
+        ] {
+            assert!(
+                SCRIPT_CODEX.contains(expected),
+                "Codex installer is missing {expected:?}",
+            );
+        }
+    }
+
+    #[test]
     fn codex_account_script_uses_secret_service() {
         assert!(
             SCRIPT_CODEX_ACCOUNT.contains("cat >/usr/local/bin/codex-account"),
@@ -807,16 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_for_feature_matches_known_ids() {
-        for id in FEATURE_IDS {
-            let bp = builtin_for_feature(id)
-                .unwrap_or_else(|| panic!("feature '{id}' should resolve to a builtin"));
-            assert_eq!(bp.name, *id);
-        }
-        assert!(builtin_for_feature("nonexistent").is_none());
-    }
-
-    #[test]
     fn guest_user_default_is_ubuntu() {
         assert_eq!(GuestUser::default().as_str(), DEFAULT_GUEST_USER);
         assert_eq!(GuestUser::default().home().to_string(), "/home/ubuntu");
@@ -911,6 +905,11 @@ mod tests {
         );
         assert!(
             bins.iter()
+                .any(|b| b.to_string() == "/usr/local/bin/codex-code-mode-host"),
+            "guest image should include the Code Mode execution host",
+        );
+        assert!(
+            bins.iter()
                 .any(|b| b.to_string() == "/usr/local/bin/codex-account"),
             "guest image should include the Codex account-auth wrapper",
         );
@@ -1001,6 +1000,7 @@ mod tests {
             "/usr/bin/docker",
             "/usr/bin/gh",
             "/usr/local/bin/codex",
+            "/usr/local/bin/codex-code-mode-host",
             "/usr/local/bin/codex-account",
         ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");

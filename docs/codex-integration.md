@@ -169,9 +169,10 @@ IP, and workspace association, accepts a running instance, and leaves it
 running. It provisions the replaced disk as a first boot, so `/workspace` is
 restored and the agent plugins are reinstalled — a plain `restore` here would
 leave both empty, because the base image carries neither. Both reprovisioning
-and destroying/recreating replace the guest disk. Save
-guest-only work first (for example with `coop pull`); the replacement also
-discards any guest keyring and cached account login.
+and destroying/recreating replace the guest disk. Save guest-only work first
+(for example with `coop pull --dir ../guest-work-backup`, using a missing or
+empty destination); the replacement also discards any guest keyring and cached
+account login.
 
 ### GitHub auth
 
@@ -278,7 +279,8 @@ This skips the guest bootstrap sequence entirely. The VM still includes both CLI
 to install the full Codex package, including bundled tools, as the configured
 guest user. The installer manages its package under the user's home directory
 and exposes `~/.local/bin/codex`. coop retains `/usr/local/bin/codex` as a
-compatibility link for existing wrappers and scripts.
+compatibility link for existing wrappers and scripts, and exposes the
+same-release Code Mode host as `/usr/local/bin/codex-code-mode-host`.
 
 To update directly inside the VM, run `codex update` as the guest user; sudo
 is not required. To update from the host:
@@ -289,10 +291,12 @@ coop agent update --check          # report installed vs. latest, change nothing
 ```
 
 `coop agent update --codex` re-runs the native installer as the guest user and
-refreshes the compatibility link. It also migrates older direct-binary
+refreshes both compatibility links. It also migrates older direct-binary
 installations without rebuilding the VM or replacing the user's Codex config.
-A profile-provided `/usr/local/bin/codex` is preserved during image setup;
-an explicit update replaces it with the native installation.
+A profile-provided Codex pair is preserved during image setup when both
+`/usr/local/bin/codex` and `/usr/local/bin/codex-code-mode-host` are
+executable; an incomplete pair or an explicit update is replaced with the
+native installation.
 
 Updates affect that VM. To refresh the golden image for new VMs, run
 `coop setup --rebuild`. See [`agent update`](commands.md#agent-update).
