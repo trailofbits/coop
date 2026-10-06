@@ -243,7 +243,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 ## SSH boundary
 
 - coop connects to the guest with `StrictHostKeyChecking=no`,
-  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`
+  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
+  `ForwardAgent=no`, and `IdentityAgent=none`
   (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
   rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
@@ -252,7 +253,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   deliberate: guest keys are ephemeral and regenerated per VM, so there is no
   stable host key to pin. The trade-off is that a MITM on the path to the guest
   is not detected — acceptable because that path is loopback / a local TAP link
-  to a VM the host itself owns.
+  to a VM the host itself owns. Coop-owned transports disable host agent use
+  and forwarding; generated SSH config blocks set the same options for aliases,
+  subject to OpenSSH configuration precedence for the user-owned file.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

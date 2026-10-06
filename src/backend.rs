@@ -411,6 +411,10 @@ impl SshTarget {
             "-o".into(),
             "UserKnownHostsFile=/dev/null".into(),
             "-o".into(),
+            "ForwardAgent=no".into(),
+            "-o".into(),
+            "IdentityAgent=none".into(),
+            "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-o".into(),
             "LogLevel=ERROR".into(),
@@ -4385,6 +4389,27 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
         }
+    }
+
+    #[test]
+    fn every_transport_disables_host_agent() {
+        let target = ssh_test_target();
+        for (name, opts) in [
+            ("ssh", target.ssh_opts()),
+            ("scp", target.scp_opts()),
+            ("mux", target.ssh_opts_mux()),
+        ] {
+            for option in ["IdentityAgent=none", "ForwardAgent=no"] {
+                assert_eq!(
+                    opts.iter().filter(|opt| opt.as_str() == option).count(),
+                    1,
+                    "{name} must disable the host agent exactly once: {option}"
+                );
+            }
+        }
+        let rsync = target.rsync_ssh_cmd();
+        assert!(rsync.contains("-o IdentityAgent=none"));
+        assert!(rsync.contains("-o ForwardAgent=no"));
     }
 
     #[test]
