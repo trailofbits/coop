@@ -83,11 +83,15 @@ Creating an instance (`coop up`) follows this sequence:
 5. Creates and attaches a TAP device to the bridge (see TAP networking below).
 6. Starts the Firecracker process with `sudo`. Firecracker requires root for KVM and TAP access.
 7. Records the Firecracker PID and waits for SSH to become reachable.
-8. If `--mount` was specified, rsyncs the host directory into the guest. This is a one-time copy, not a live mount. Use `coop push` and `coop pull` to re-sync.
+8. If `--mount` was specified, rsyncs the host directory into the guest. This
+   is a one-time copy, not a live mount. Use `coop push` to update the guest;
+   use `coop pull --dir <new-directory>` to retrieve guest changes for review.
 
 The code uses a typestate pattern (`Configured` then `Running`) to enforce valid lifecycle transitions at compile time.
 
-Stopping a VM sends `SendCtrlAltDel` via the Firecracker API socket for graceful shutdown, falls back to `SIGTERM`, then `SIGKILL` if the process does not exit.
+Stopping a VM requests a guest reboot over SSH and waits up to ten seconds for
+Firecracker to exit. If the process does not exit, coop falls back to `SIGTERM`,
+then `SIGKILL`.
 
 ### TAP networking
 
@@ -154,7 +158,7 @@ Both backends support the same CLI commands and guest capabilities:
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
 | `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
-| `coop stop` | `limactl stop` | API socket shutdown, SIGTERM/SIGKILL fallback, remove TAP |
+| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM/SIGKILL fallback, remove TAP |
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |

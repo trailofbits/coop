@@ -135,6 +135,11 @@ VS Code's Remote SSH extension exposes a Ports panel that handles forwarding onc
 
 ## Interaction with push and pull
 
-`coop push` and `coop pull` sync files between host and guest. Both work while an editor is connected; there is no need to disconnect.
+`coop push` copies host files into the guest, and `coop pull` retrieves guest
+files. Both work while an editor is connected; there is no need to disconnect.
 
-Watch for conflicts. `coop push` overwrites guest files, and `coop pull` overwrites local files. Both commands check for uncommitted git changes and refuse to proceed unless you pass `--force`.
+Watch for conflicts. `coop push` checks the guest repository for uncommitted
+tracked changes before overwriting them. `coop pull` deliberately does not run
+Git on the host: it requires `--force` for any nonempty destination. Pulled
+files are controlled by the untrusted guest and may be malicious, so review
+them before opening the result in an editor or another host tool.

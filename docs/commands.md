@@ -29,7 +29,7 @@ coop up [DIR] [FLAGS]
 ```
 
 `DIR` defaults to the current directory. coop canonicalizes it and uses it as
-the project identity for instance naming, devcontainer discovery, GitHub PAT
+the project identity for instance naming, GitHub PAT
 lookup, and future `coop up DIR` affinity. If a matching instance is already
 running, `up` reports success without creating another VM. If a matching
 instance is stopped, `up` restarts it. If no matching instance exists, `up`
@@ -67,10 +67,6 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
-| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt) |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation |
-| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work |
-| `--json` | With `--dry-run`, emit the resolved plan as JSON on stdout (`{ report, profiles, guest_user, vm }`) instead of the text report on stderr |
 
 ```
 coop up .
@@ -82,9 +78,8 @@ coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
-`--profile`, `--extra-mount`, `--git-repo`, `--exclude-git`, and
-`--devcontainer` are applied only when `up` creates a new instance. `coop up
---profile <list>`
+`--profile`, `--extra-mount`, `--git-repo`, and `--exclude-git` apply only
+when `up` creates a new instance. `coop up --profile <list>`
 derives an image name from the sorted profile list, runs the same stale-image
 check as `coop setup`, and builds or rebuilds that image if needed. Explicit
 named images are unchanged: use `coop setup --image <name> --profile ...`
@@ -95,11 +90,22 @@ recreate it with different creation options. Runtime startup options such as
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.
 
-When a local `devcontainer.json` was applied while creating the instance, coop stores
-its path and content hash. Later `coop up` reconnects or restarts warn if that
-file changed, but the existing VM is not mutated automatically. Destroy and
-recreate the instance to apply creation-time devcontainer changes such as
-`features`, `hostRequirements`, `mounts`, `image`/`build`, or `remoteUser`.
+Devcontainer files are ordinary workspace data; coop does not discover,
+translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
+mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
+agent bootstrap but before a copied workspace or Firecracker mount is synced;
+commands that require project files must run after `coop up` completes.
+
+Upgrading does not rewrite existing images or VMs. Delete affected images with
+`coop images --delete <image>`, then recreate them with `coop setup --image
+<image>` and only the profiles, packages, and guest-user options you intend to
+retain. This removes previously installed OCI Features and unwanted profile or
+guest-user choices. Destroy and recreate existing instances to remove saved
+guest environment and port-forward state, devcontainer-derived CPU, memory,
+disk settings, and old mounts. This is especially important on macOS, where a
+mount already recorded in a Lima VM remains a live writable host share when
+that VM restarts. Reprovisioning replaces the guest disk but does not remove
+the Lima VM's persisted mount configuration.
 
 ### `quickstart`
 
@@ -120,8 +126,8 @@ workspace:
   no setup, restart, or recreation.
 - **A stopped instance exists.** coop restarts it (reusing the instance's own
   image, not necessarily `default`) and launches Claude Code.
-- **No instance exists.** coop creates one for the workspace, folding in any
-  discovered `devcontainer.json`, then launches Claude Code.
+- **No instance exists.** coop creates one for the workspace, then launches
+  Claude Code.
 
 Image setup runs only when the `default` template image is missing; otherwise it
 is skipped. Setup runs non-interactively (no confirmation prompts).
@@ -129,11 +135,9 @@ is skipped. Setup runs non-interactively (no confirmation prompts).
 | Flag | Description |
 |------|-------------|
 | `--no-workspace` | Skip mounting the current directory as the workspace. Without a workspace there is no instance to match, so quickstart always creates a fresh instance rather than reusing an existing one. |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` (escape hatch for CI). |
 
 ```
 coop quickstart
-coop quickstart --no-devcontainer
 coop quickstart --no-workspace
 ```
 
@@ -171,61 +175,12 @@ coop setup [FLAGS]
 | `--post-install <path>` | Path to a post-install script to run in the chroot |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
-| `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). Use this for devcontainers that declare another `remoteUser`, such as `vscode`. |
+| `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
 | `--builder-timeout <duration>` | Duration to wait for setup image build commands before timing out. Accepts seconds by default, or `s`, `m`, and `h` suffixes. |
-| `--workspace <dir>` | Scan for `.devcontainer/devcontainer.json` and offer to apply its `features` / `hostRequirements` to this setup. Supported public `ghcr.io/devcontainers/features/*` entries are resolved and baked into the image. |
-| `--devcontainer <path>` | Explicit path to a `devcontainer.json` to use (skips discovery and prompt). |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation. |
-| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any setup work. |
 
 ```
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
-coop setup -y --workspace . --devcontainer .devcontainer/devcontainer.json
-```
-
-See [docs/devcontainer.md](devcontainer.md) for the subset of `devcontainer.json` coop reads.
-
-### `devcontainer check`
-
-Parse a `devcontainer.json` file and print the same translation report that `setup --dry-run` and `start --dry-run` use, without loading coop config, checking for updates, setting up an image, or starting a VM. Setup-stage checks resolve supported public GHCR OCI Features so the report can show the digest and `install.sh` hash that would run.
-
-```
-coop devcontainer check <path> [--stage setup|start|both]
-```
-
-| Flag | Description |
-|------|-------------|
-| `<path>` | Path to the `devcontainer.json` file to inspect |
-| `--stage <stage>` | Which lifecycle translation to report: `setup`, `start`, or `both` (default: `both`) |
-| `--json` | Emit the report as JSON on stdout instead of the text table on stderr |
-
-Use `--stage setup` to inspect setup-time keys such as `features`, `hostRequirements.cpus`, `hostRequirements.memory`, and `remoteUser`. Use `--stage start` to inspect start-time keys such as `postStartCommand`, `containerEnv`, `forwardPorts`, `mounts`, and `hostRequirements.storage`.
-
-With `--json`, a single stage emits one report object (`{ entries, source_path, ignored_paths }`, or `null` when no file applied); `--stage both` emits `{ "setup": <report>, "start": <report> }`. Each entry is `{ key, status, source, value, note }`, with `status` one of `applied`/`overridden`/`unsupported`/`invalid` and `source` one of `cli`/`devcontainer`. CI can branch on the translation without scraping the table.
-
-### `devcontainer ignore`
-
-Record a persistent opt-out for a project directory. Future automatic discovery for that project skips `.devcontainer/devcontainer.json` and reports that the stored preference was used. Explicit `--devcontainer <path>` still applies a file for that run.
-
-```
-coop devcontainer ignore <project-dir>
-```
-
-### `devcontainer status`
-
-Inspect persistent devcontainer opt-outs. With no project argument, this lists all stored opt-outs.
-
-```
-coop devcontainer status [project-dir]
-```
-
-### `devcontainer clear`
-
-Remove a persistent devcontainer opt-out for a project. If the project directory was moved or deleted, use the absolute path shown by `coop devcontainer status`.
-
-```
-coop devcontainer clear <project-dir>
 ```
 
 ### `start`
@@ -251,16 +206,6 @@ instances, pass the instance name.
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
-| `--devcontainer <path>` | Dry-run translation aid; normal restarts reject devcontainer creation options. |
-| `--no-devcontainer` | Ignore any discovered `devcontainer.json` for this invocation (escape hatch for CI). |
-| `--dry-run` | Translate `devcontainer.json` and print the report, then exit before any VM work. |
-| `--json` | With `--dry-run`, emit the resolved plan as JSON on stdout instead of the text report on stderr. |
-
-Normal `start` restarts an existing VM without re-reading or re-applying
-`devcontainer.json`. If the instance was created with a devcontainer file, coop
-warns when the recorded file path now has different contents. See
-[docs/devcontainer.md](devcontainer.md) for the supported keys, discovery
-rules, and recreate guidance.
 
 ```
 coop start
@@ -413,6 +358,13 @@ coop exec my-project -- docker ps
 ### `stop`
 
 Gracefully stop a running VM. The instance disk is preserved. Use `start` to relaunch or `destroy` to remove it.
+
+On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
+guest finishes shutting down. coop allows 10 seconds for this request and exit,
+then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
+wait. A guest that cannot shut down within the grace period can lose recent
+writes during forced termination. If termination cannot be confirmed, coop
+retains the PID file and socket so you can retry.
 
 ```
 coop stop [NAME]
@@ -642,7 +594,7 @@ coop push [NAME] [FLAGS]
 | `--exclude-git` | Skip the `.git/` directory in this transfer |
 
 Without `--force`, push refuses to transfer if the guest Git status check fails
-or reports changes. Pull does the same for a failing or dirty local Git status.
+or reports changes.
 
 ```
 coop push
@@ -652,7 +604,10 @@ coop push my-project --dir ./src --force
 ### `pull`
 
 Copy the VM's `/workspace` to a local directory. Defaults to the host path
-recorded when the instance was created with `coop up`.
+recorded when the instance was created with `coop up`. Pulled files are
+controlled by the untrusted guest and may be malicious. Review them before
+executing them or interpreting them with Git, editors, build tools, shells, or
+other host applications.
 
 ```
 coop pull [NAME] [FLAGS]
@@ -662,13 +617,18 @@ coop pull [NAME] [FLAGS]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--dir <dir>` | Local directory to pull into (defaults to the workspace host path) |
-| `--force` | Overwrite local changes without confirmation |
-| `--exclude-git` | Skip the `.git/` directory in this transfer |
+| `--force` | Allow a nonempty destination and overwrite matching files; does not make pulled content trusted |
 
 ```
-coop pull
-coop pull my-project --dir ./local-copy --force
+coop pull --dir ./local-copy
+coop pull my-project --dir ./other-review-copy
 ```
+
+Without `--force`, pull accepts only a missing or empty destination. coop does
+not run host Git to decide whether an existing destination is clean. The
+best-effort `.git` filters are not a guarantee that the result contains no Git
+administration aliases, and pull does not sanitize repositories created by an
+older vulnerable release.
 
 ### `editor`
 
@@ -873,8 +833,8 @@ Kept across the wipe, because coop persists them host-side:
 | Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
 | vCPUs and memory | backend VM config, which the swap does not touch |
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
-| Port forwards, including a devcontainer's `forwardPorts` | `forwards.json` |
-| Guest env, including a devcontainer's `containerEnv` | `guest_env.json` |
+| Port forwards | `forwards.json` |
+| Guest env | `guest_env.json` |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
 
@@ -882,7 +842,8 @@ Kept across the wipe, because coop persists them host-side:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
-- A devcontainer's `postStartCommand`, which reaches the guest only during `coop up`. Its `features` are baked into the image and so do survive. (`postCreateCommand` is unaffected because coop does not implement it — it is reported as an unrecognised `devcontainer.json` key.)
+- An invocation-level `--post-start` command. The override is not persisted;
+  reprovisioning runs the current `post_start` value from `config.toml`, if set.
 
 Before replacing the disk, coop checks that the image exists, the state files
 parse, the recorded workspace directory is still there, and host ports for

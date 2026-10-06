@@ -445,17 +445,21 @@ Push local changes into a running VM:
 coop push
 ```
 
-Pull guest changes back to the host:
+Pull guest changes into a new review directory on the host:
 
 ```
-coop pull
+coop pull --dir ../my-project-from-vm
 ```
 
-Both commands default to the workspace path recorded by `coop up`. Override with `--dir`:
+Both commands default to the workspace path recorded by `coop up`, but pull
+refuses that normally nonempty directory unless `--force` is supplied. Prefer
+pulling into a missing or empty directory, reviewing the untrusted guest files,
+and only then copying back what you want. Override the push source or pull
+destination with `--dir`:
 
 ```
 coop push --dir ~/other-dir
-coop pull --dir ~/other-dir
+coop pull --dir ~/new-review-dir
 ```
 
 ### 7. Tear down

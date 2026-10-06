@@ -6,6 +6,7 @@ use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -797,7 +798,51 @@ pub fn atomic_write_json(path: &Path, json: &str) -> Result<()> {
 /// Use [`lock_sibling`] for an indefinite wait or [`lock_sibling_bounded`]
 /// when a lifecycle operation must time out.
 pub struct FileLock {
-    _file: File,
+    file: File,
+}
+
+fn fcntl_result(result: libc::c_int) -> std::io::Result<libc::c_int> {
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
+fn normalize_lock_file(file: File) -> Result<File> {
+    if file.as_raw_fd() >= 3 {
+        return Ok(file);
+    }
+
+    // Keep lock descriptors away from stdin/stdout/stderr. Command configures
+    // those descriptors before `pre_exec`, which could otherwise replace a
+    // lock opened while one of the standard descriptors was closed.
+    // SAFETY: file owns a live descriptor for the duration of the call.
+    let fd = fcntl_result(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) })
+        .context("Failed to duplicate lock descriptor")?;
+    // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+impl FileLock {
+    /// Keep this lock held by `command` if the parent process exits while the
+    /// child is still running.
+    ///
+    /// Rust opens files close-on-exec. Clear that flag in the post-fork child
+    /// only, so the executed writer retains the same flock without changing
+    /// descriptor inheritance in the multi-threaded parent.
+    pub fn inherit_in(&self, command: &mut std::process::Command) {
+        let fd = self.file.as_raw_fd();
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure uses
+        // only async-signal-safe `fcntl` calls on the live lock descriptor.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = fcntl_result(libc::fcntl(fd, libc::F_GETFD))?;
+                fcntl_result(libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC))?;
+                Ok(())
+            });
+        }
+    }
 }
 
 /// Acquire an exclusive flock on a sibling `.lock` file next to `target`.
@@ -817,8 +862,10 @@ pub fn lock_sibling(target: &Path) -> Result<FileLock> {
         .file_name()
         .map_or_else(|| "coop".to_string(), |n| n.to_string_lossy().into_owned());
     let lock_path = parent.join(format!(".{stem}.lock"));
-    let file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+    let file = normalize_lock_file(
+        File::create(&lock_path)
+            .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?,
+    )?;
     // SAFETY: flock is safe on a valid fd. The File owns the fd and
     // outlives this call.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -829,7 +876,7 @@ pub fn lock_sibling(target: &Path) -> Result<FileLock> {
             std::io::Error::last_os_error()
         );
     }
-    Ok(FileLock { _file: file })
+    Ok(FileLock { file })
 }
 
 /// Acquire a sibling lock with a bounded wait. The lock file stays outside
@@ -840,17 +887,19 @@ pub fn lock_sibling_bounded(target: &Path, timeout: Duration) -> Result<FileLock
     fs::create_dir_all(parent)?;
     let stem = target.file_name().context("Lock target has no name")?;
     let path = parent.join(format!(".{}.operation.lock", stem.to_string_lossy()));
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("Failed to open operation lock {}", path.display()))?;
+    let file = normalize_lock_file(
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open operation lock {}", path.display()))?,
+    )?;
     let start = Instant::now();
     loop {
         // SAFETY: file owns a valid descriptor throughout the flock call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(FileLock { _file: file });
+            return Ok(FileLock { file });
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::WouldBlock {
@@ -1132,6 +1181,84 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EBADF)
         );
+    }
+
+    #[test]
+    fn file_lock_normalizes_away_from_closed_standard_descriptors() {
+        const CHILD: &str = "COOP_FILE_LOCK_FD_TEST";
+        const HOLDER: &str = "COOP_FILE_LOCK_FD_HOLDER";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "fs_util::tests::file_lock_normalizes_away_from_closed_standard_descriptors",
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        if std::env::var_os(HOLDER).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        // The child runs only this test. Make fd 0 the next available slot;
+        // lock acquisition must duplicate it above the standard descriptors.
+        unsafe {
+            libc::close(0);
+            libc::close(1);
+            libc::close(2);
+        }
+        let target = root.path().join("target");
+        let lock = lock_sibling(&target).unwrap();
+        assert!(lock.file.as_raw_fd() >= 3);
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "fs_util::tests::file_lock_normalizes_away_from_closed_standard_descriptors",
+            ])
+            .env(CHILD, "1")
+            .env(HOLDER, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        lock.inherit_in(&mut command);
+        let mut child = command.spawn().unwrap();
+        drop(lock);
+
+        let probe = File::create(root.path().join(".target.lock")).unwrap();
+        // SAFETY: probe owns a valid descriptor for the duration of the call.
+        let result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let error = std::io::Error::last_os_error();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(result, -1);
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn fcntl_result_preserves_the_error_sentinel_contract() {
+        // Set a deterministic errno so the error assertion is independent of
+        // whatever syscall happened to run immediately before this test.
+        let missing = CString::new("/definitely/not/a/real/coop/path").unwrap();
+        // SAFETY: missing is a live, NUL-terminated C string.
+        assert_eq!(unsafe { libc::open(missing.as_ptr(), libc::O_RDONLY) }, -1);
+        assert_eq!(
+            fcntl_result(-1).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(fcntl_result(0).unwrap(), 0);
+        assert_eq!(fcntl_result(1).unwrap(), 1);
     }
 
     #[test]

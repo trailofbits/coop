@@ -55,6 +55,23 @@ user launched it.
   channel** and the primary place a path-traversal or symlink escape could land.
   Files retain their untrusted origin after transfer, including when a host tool
   discovers them implicitly or consumes them during a later operation.
+  Pull never invokes host Git to inspect its destination. It refuses a nonempty
+  destination unless the user supplies `--force`, which authorizes overwriting
+  matching files but does not change their trust level. The transports attempt
+  to omit common ASCII-case `.git` paths, and both pull transports write into
+  an empty staging directory before a trusted host-side filtered installation.
+  The staging boundary is a host-owned `0700` outer directory under private
+  coop storage; transfer tools write only into its child. Pulls sharing a coop
+  data directory are serialized across destination authorization, transfer,
+  installation, and cleanup. All such pulls reuse one fixed staging tree, so
+  interrupted transfers cannot accumulate additional staging trees. Writer
+  subprocesses inherit the operation lock; a retry times out rather than
+  removing staging that an orphaned writer may still be using.
+  Those filters are
+  defense-in-depth, not a guarantee across every transport, Git, and filesystem
+  naming behavior. Treat every pulled file and the resulting directory as
+  potentially malicious. In particular, coop does not make a repository
+  previously pulled by a vulnerable release safe for host Git or other tools.
 - **Rootfs files touched while loop-mounted during setup.** `setup.rs`
   `patch_guest_network` reads and rewrites the guest's `/etc/hosts`, and `coop
   commit` turns a guest-mutated rootfs into an image template — so the guest
@@ -72,17 +89,8 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
-- **Project configuration, local or fetched.** `git_repo_devcontainer.rs` /
-  `devcontainer.rs` parse repository-controlled devcontainer JSON. Its values
-  configure the guest; they must never select host executables, configure host
-  process environments, or reach host `cmd:` evaluation or a host shell.
-  Parsing, merging into `CoopConfig`, and saving/reloading instance state do
-  not make these values trusted. Choosing to use a project's devcontainer
-  configuration does not authorize that project to execute code on the host.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
-- **OCI feature blobs.** `devcontainer_oci.rs` pulls devcontainer *Features*
-  from GHCR; the install snippet runs **in the guest**, not the host.
 
 ## Host subprocess boundary
 
@@ -165,8 +173,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
-  the requested command. This covers config literals, devcontainer entries,
-  CLI overrides, and saved `guest_env.json` equally. Never pass the guest map
+  the requested command. This covers config literals, CLI overrides, and saved
+  `guest_env.json` equally. Never pass the guest map
   to a host `Command::envs`, even with an absolute executable path: guest
   loader and SSH settings must also remain guest-only. Values stay out of
   command arguments, stdin, and temporary files; existing images' `AcceptEnv *`

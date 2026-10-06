@@ -200,7 +200,6 @@ run_mutants() {
     cargo mutants \
       -f src/config.rs \
       -f src/workspace.rs \
-      -f src/devcontainer.rs \
       -f src/guest_env_state.rs \
       -f src/github_repo.rs \
       -f src/github_pat.rs \
@@ -217,7 +216,7 @@ run_fuzz() {
   fi
   cargo +nightly fuzz build
   local target
-  for target in parse_repo_slug jsonc_to_json config_load; do
+  for target in parse_repo_slug config_load; do
     cargo +nightly fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-30}"
   done
 }

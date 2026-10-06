@@ -50,6 +50,14 @@ guest environment → docker → stop → destroy). CI additionally runs the fas
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
 
+The stop phase writes, overwrites, and deletes guest files immediately before
+stopping, then verifies those changes after restart without syncing them in
+the test. The `vm::tests::stop_bounds_guest_shutdown_and_reaps_ssh` unit test
+uses real child processes and fake SSH/sudo boundaries to cover graceful exit,
+SSH refusal, a hung client, a missing client, and liveness-probe failure. It
+checks forced-signal fallback, bounded waits, and SSH client reaping. The
+existing stop failure test checks PID retention after failed forced signals.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
@@ -141,8 +149,7 @@ literal values, empty values, transport-name collisions, PTYs, stdin, exit
 status, missing forwarding, and redacted assignment failures. Its sshd accepts
 only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
 bypassing the transport. The ordinary unit suite separately checks host
-environment isolation on all four SSH launch paths and the complete path from
-devcontainer parsing through saved instance state to a later session.
+environment isolation on all four SSH launch paths and saved CLI guest environment values through a later session.
 
 The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
 normal scope. When changing it, deliberately restore direct guest-map
@@ -209,6 +216,12 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It also corrupts an ext4 inode reference count, checks that read-only verification
+rejects it, and repairs the filesystem before resizing. The repair operation
+accepts exit code 1 (errors corrected), as defined by
+[e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
+Nonzero results from other disk tools, reboot-required results, error combinations,
+and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
@@ -234,118 +247,68 @@ parsing, or state composition:
 
 - `src/config.rs` — parsing, validation, defaults, env composition
 - `src/workspace.rs` — rsync arg construction, mount-state record/remove
-- `src/devcontainer.rs`, `src/guest_env_state.rs` — env merging and persistence
+- `src/guest_env_state.rs` — env merging and persistence
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
-  parsing, secret routing
+  parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
-- `src/commands/` (`lifecycle.rs`, `profiles.rs`, `commands/devcontainer.rs`,
-  `quickstart.rs`, `admin.rs`) — the pure helpers the command handlers were
-  carved into: input-compatibility guards, summary/message builders, the
-  `TranslatorInputs` builder, byte→GiB arithmetic kernels, and predicates like
-  `discovered_local_devcontainer` / `is_sensitive_workspace`
+- `src/commands/` — pure input-compatibility guards, summary/message builders,
+  byte-to-GiB arithmetic kernels, and predicates such as
+  `is_sensitive_workspace`
 
-**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`, `update.rs`,
-`shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`, `prompt.rs` (TTY
-prompts), `main.rs`, and — inside `src/commands/` — the `cmd_*` dispatch
-entrypoints and the handlers that take a `&PlatformBackend`, write stdout, or
-open a TTY prompt (e.g. `create_up_instance`, `restart_instance`,
-`find_stopped_instance`, `resolve_running`, `resolve_devcontainer`,
-`purge_all_data`, and `model.rs`'s `render_status`/`set_local`/`set_remote`/
-`report_switch`/`apply_to_running`/`prompt_endpoint`), plus the `lib.rs`
-`run`/`init_tracing` shims. These mostly shell out, run SSH, or talk to external
-services — unit tests can't catch behavioral changes there. `tests/integration.sh`
-does that job. This list is enforced (not just advised) by `.cargo/mutants.toml`
-— see **Scoping** below.
+**Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
+`update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
+`prompt.rs` (TTY prompts), `main.rs`, and — inside `src/commands/` — the
+`cmd_*` dispatch entrypoints and handlers that take a `&PlatformBackend`, write
+stdout, or open a TTY prompt. These mostly shell out, run SSH, or talk to
+external services, so unit tests cannot observe their effects. The integration
+suite covers those paths. This inventory is enforced by
+`.cargo/mutants.toml`, not merely advisory.
 
 ### Scoping (`.cargo/mutants.toml`)
 
 The mutation surface is curated in `.cargo/mutants.toml` so the `missed` list
 means "real unit-test gap," not "code a `--lib` test structurally cannot reach."
-cargo-mutants reads this file automatically on every run (`--list` included). It
-scopes out three things:
+cargo-mutants reads this file automatically on every run (`--list` included).
+It scopes out:
 
-- **The whole-module "Don't bother with" files above** (`main.rs`, and
-  `prompt.rs` — every function short-circuits off a TTY and otherwise reads
-  stdin, with no pure logic a `--lib` test can reach), via `exclude_globs`.
-- **`cfg(kani)` proofs** (`config.rs mod proofs`), via `exclude_re = ["proofs::"]`
-  — never compiled in a normal build, so every mutation is a silent no-op that
-  always reports `missed`. They are exercised by `cargo kani`.
-- **Individual shell-out / IO / terminal functions inside otherwise-logic-bearing
-  modules** (`github_pat.rs`, `workspace.rs`, `devcontainer.rs`,
-  `secret_store.rs`, `fs_util.rs`, `commands/model.rs`'s stdout/backend/TTY
-  functions), via `exclude_re`. Each pattern is `\b`-anchored to a function name
-  (or qualified `Type::method`) so it scopes the whole function without catching
-  longer names that share a prefix. The module-agnostic `replace gh_auth_token ->`
-  pattern also covers the identical `gh_auth_token` shell-out in
-  `git_repo_devcontainer.rs`.
-- **The `src/commands/` dispatch entrypoints and backend-driving / TTY handlers**,
-  via `exclude_re`: a single `\bcmd_[a-z_]+\b` covers every `coop <subcommand>`
-  entrypoint, plus `\b`-anchored names for the `&PlatformBackend` handlers
-  (`create_*`, `restart_instance`, `start_instance`, `find_stopped_instance`,
-  `resolve_running`, `preflight_start_target`, `current_disk_gib`, …), the IO
-  handlers in `admin.rs`/`profiles.rs`/`commands/devcontainer.rs`/`quickstart.rs`,
-  and the `lib.rs` `run`/`init_tracing` shims.
+- Whole IO/backend modules through `exclude_globs`, including `main.rs` and
+  `prompt.rs`.
+- `cfg(kani)` proofs through `exclude_re = ["proofs::"]`; normal builds never
+  compile them, and `cargo kani` exercises them separately.
+- Shell-out, filesystem, network, stdout, backend, and terminal functions in
+  otherwise logic-bearing modules through `\b`-anchored `exclude_re` entries.
+- The `src/commands/` dispatch entrypoints and backend-driving or TTY handlers,
+  while leaving their extracted pure helpers in scope.
 
-A cargo-mutants quirk to know about: `exclude_re` does **not** match `delete
-field … from struct …` mutants — emitted for every struct literal that uses
-`..Default::default()`, and no pattern filters them. In this crate they all
-target `devcontainer::TranslatorInputs`, assembled in four places. The one pure
-builder (`up_translator_inputs`) stays in scope and is unit-tested, which kills
-its field-deletion mutants; the three shell-out handlers that build it inline
-(`run`, `cmd_devcontainer_check`, `quickstart_fresh_start`) carry an in-source
-`#[mutants::skip]` with a back-reference to `.cargo/mutants.toml`.
+What is deliberately *kept* (a survivor here is a genuine coverage
+regression) includes `parse_curl_status_body`, `parse_user_login`,
+`parse_gh_token`, `pick_backend`, `doc_contains_literal_token`, the SSH-config
+marker-block helpers, `CmdToken::from_words`, `atomic_write_with_mode`, and the
+editor strategy helpers. The thin IO wrappers around them are excluded because
+a `--lib` test cannot reach the real host filesystem, network, or launcher.
 
-What is deliberately *kept* (a survivor here is a genuine coverage regression):
-the pure-logic helpers the #321–#327 fixes carved the shell-out/IO functions
-down to — `parse_curl_status_body`, `parse_user_login`, `github_pat.rs`'s
-`render_status` (note `commands/model.rs` has a *different*, excluded
-`render_status`, so its exclude is file-anchored), `parse_gh_token` /
-`normalize_token`, `pick_backend`, `doc_contains_literal_token`, the SSH-config
-marker-block helpers (`remove_marker_blocks` / `remove_named_marker_block` /
-`remove_all_ssh_config_at` / `remove_ssh_config_at`), `CmdToken::from_words`'s
-Linux/`op`/`cat` arms (only the macOS keychain arm is scoped, pinned on macOS by
-`parse_recognises_macos_keychain`), `Report::push`, `atomic_write_with_mode`,
-and the editor strategy helpers (`vscode_strategies` / `zed_strategies` /
-`editor_strategies` / `install_hints` / `may_try_after_nonzero_exit`). The thin
-wrappers those were split out of
-(`probe_user_login`, `run_status`, `remove_*_ssh_config`, `gh_auth_token`) are
-excluded — a `--lib` test can't reach them without a real `$HOME` or network.
-When adding a new shell-out or IO function to one of these modules, add a
-matching `exclude_re` line; when adding logic, leave it in scope.
-
-The same split applies in `src/commands/`. Kept in scope: the
-input-compatibility guards (`ensure_up_existing_inputs_are_compatible[_for_git_repo]`,
+The same split applies in `src/commands/`. Kept helpers include
+`ensure_up_existing_inputs_are_compatible[_for_git_repo]`,
 `up_has_restart_only_inputs`, `restart_has_ignored_creation_flags`,
-`validate_copy_workspace_mounts`), the config-IO lookups
-(`find_workspace_instance`, `find_git_repo_instance`), the message/summary
-builders (`no_stopped_instance_message`, `creation_options_rejected_message`,
-`builtin_summary`, `format_custom_summary`, `script_summary`), the
-`up_translator_inputs` builder, the arithmetic kernels `bytes_to_gib` and
-`format_dir_size`, `project_dir_to_str`, and the predicates
-`discovered_local_devcontainer` / `is_sensitive_workspace`. The backend-driving
-wrappers those kernels were carved out of (`current_disk_gib`,
-`dir_size_display`) are excluded.
+`find_workspace_instance`, `find_git_repo_instance`,
+`no_stopped_instance_message`, `creation_options_rejected_message`, profile
+summary builders, `bytes_to_gib`, `format_dir_size`, `project_dir_to_str`, and
+`is_sensitive_workspace`. Their backend-driving wrappers remain excluded.
 
-The `coop model` feature (#352) follows the same split. Kept in scope (and
-unit-tested): `tools_needing_prompt`, `switch_report_lines`,
-`ModelState::resolved_claude` / `resolved_codex` / `is_default` /
-`load_or_default`, and `ModelMode::as_str`; plus `From<ModelAction> for
-ModelMode` in `lib.rs`. Excluded as IO/backend/TTY: `model.rs`'s `render_status`
-/ `write_tool_line` / `set_local` / `set_remote` / `report_switch` /
-`apply_to_running` / `prompt_endpoint`, and `lifecycle.rs`'s
-`bootstrap_and_post_start` / `prepare_session_from_target`.
+The `coop model` feature follows the same split. `tools_needing_prompt`,
+`switch_report_lines`, `ModelState` resolution/default logic, and
+`ModelMode::as_str` stay in scope and are unit-tested. The stdout, backend, and
+TTY operations in `commands/model.rs` and lifecycle bootstrap remain excluded.
 
-**Keep `.cargo/mutants.toml` in sync in the same PR that adds the code** — this
-is not a follow-up chore. #352 was merged without scoping its new IO/backend/TTY
-functions, which silently broke the documented baseline and surfaced 22
-survivors only at the next release preflight (#373). When a change adds a
-function that shells out, drives a `&PlatformBackend`, reads a TTY, or writes
-stdout, add its `exclude_re`/`exclude_globs` entry (and extract any pure logic
-into a kept, tested helper) before merging. Verify with `cargo mutants -f
-<touched files> -- --lib` — not just the `--in-diff` sweep, which only mutates
-changed lines and so misses pre-existing same-class survivors in a touched file.
-The [`mutation-check`](../.agents/skills/mutation-check/SKILL.md) skill walks
-this workflow.
+**Keep `.cargo/mutants.toml` in sync in the same PR that adds or removes the
+code.** This is not a follow-up chore. Issue #373 showed that missing exclusions
+for new IO/backend/TTY functions can silently turn the documented zero-missed
+baseline into a list of non-actionable survivors. Add anchored exclusions for
+IO, leave pure logic in scope, and cover it with discriminating assertions.
+Verify with `cargo mutants -f <touched files> -- --lib`; an `--in-diff` sweep
+only mutates changed lines and can miss pre-existing same-class survivors in a
+touched file. The [`mutation-check`](../.agents/skills/mutation-check/SKILL.md)
+skill walks this workflow.
 
 ### Running it
 
@@ -358,7 +321,7 @@ and reports every mutant as missed.)
 cargo mutants -f src/config.rs -- --lib
 
 # Several logic modules at once
-cargo mutants -f src/config.rs -f src/workspace.rs -f src/devcontainer.rs -- --lib
+cargo mutants -f src/config.rs -f src/workspace.rs -f src/guest_env_state.rs -- --lib
 
 # PR-scoped: mutate only lines changed vs main
 cargo mutants --in-diff <(git diff origin/main -- 'src/*.rs') -- --lib
@@ -397,24 +360,22 @@ For each line in `missed.txt`:
 
 ### Baselines
 
-- **2026-06-17 (after #329 scoping, #321–#330 fixes).** A sweep of the eight
-  logic modules (`config.rs`, `workspace.rs`, `devcontainer.rs`,
-  `guest_env_state.rs`, `github_repo.rs`, `github_pat.rs`, `secret_store.rs`,
-  `fs_util.rs`) reports **0 missed**. Treat any *new* survivor as a coverage
-  regression — first confirm it isn't a shell-out/IO function that belongs in
-  `.cargo/mutants.toml`, then add a test.
-- **2026-06-24 (issue #344).** A sweep of `lifecycle.rs`, `profiles.rs`,
-  `commands/devcontainer.rs`, `quickstart.rs`, `admin.rs`, `commands/mod.rs`,
-  `lib.rs`, and `jsonc.rs` reports **0 missed** out of 229 mutants. The
-  non-caught results are `unviable` (~18) and `timeout` (~16–17, all `jsonc.rs`
-  scanner-index increment mutants where mutating the step makes the loop never
-  terminate).
-- **2026-06-26 (issue #373).** After scoping the #352 local-model IO/backend/TTY
-  functions and adding the `mode_as_str_round_trips`, `model_action_maps_to_mode`,
-  and `load_or_default_returns_saved_state` tests, a sweep of
-  `src/commands/model.rs`, `src/model_state.rs`, and `src/prompt.rs` reports
-  **0 missed** (32 caught, 3 unviable), and a full `src/lib.rs` sweep reports
-  **0 missed** (11 caught).
+Historical mutation results are snapshots of the code at the time. Re-run a
+touched-file sweep before relying on one:
+
+- **2026-06-17 (after #329 scoping, #321–#330 fixes).** The then-current logic
+  module sweep reported zero missed mutants. For the surviving modules
+  (`config.rs`, `workspace.rs`, `guest_env_state.rs`, `github_repo.rs`,
+  `github_pat.rs`, `secret_store.rs`, and `fs_util.rs`), a new survivor remains
+  a coverage regression unless it belongs to an IO function that should be
+  scoped out.
+- **2026-06-24 (issue #344).** The then-current commands and parser sweep
+  reported zero missed mutants. Removed modules no longer apply; surviving
+  pure command helpers retain the zero-missed expectation.
+- **2026-06-26 (issue #373).** After scoping the local-model IO/backend/TTY
+  functions and adding the missing model-state tests, the model sweep reported
+  zero missed mutants (32 caught, 3 unviable), and a full `src/lib.rs` sweep
+  reported zero missed mutants (11 caught).
 
 ## Fuzzing
 
@@ -445,8 +406,6 @@ fuzz run <target> <artifact-path>`.
 
 - `parse_repo_slug` — `coop::github_repo::parse_repo_slug_from_url`, fed `git
   remote get-url` output and `--git-repo` CLI args. Property: never panics.
-- `jsonc_to_json` — `coop::jsonc::jsonc_to_json`, fed hand-authored
-  `devcontainer.json` text. Property: never panics.
 - `config_load` — `toml::from_str` into `coop::config::CoopConfig` then
   `validate`, fed `config.toml` text. Exercises the custom `Deserialize`/
   `visit_map` impls (`SubnetMask`, `HostInterface`, `PortForward`). Property:

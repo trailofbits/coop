@@ -169,9 +169,10 @@ IP, and workspace association, accepts a running instance, and leaves it
 running. It provisions the replaced disk as a first boot, so `/workspace` is
 restored and the agent plugins are reinstalled — a plain `restore` here would
 leave both empty, because the base image carries neither. Both reprovisioning
-and destroying/recreating replace the guest disk. Save
-guest-only work first (for example with `coop pull`); the replacement also
-discards any guest keyring and cached account login.
+and destroying/recreating replace the guest disk. Save guest-only work first
+(for example with `coop pull --dir ../guest-work-backup`, using a missing or
+empty destination); the replacement also discards any guest keyring and cached
+account login.
 
 ### GitHub auth
 

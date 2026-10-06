@@ -17,7 +17,7 @@ Only flag issues **introduced or materially changed by the diff**. Cross-referen
 
 ## What to flag
 
-- **Changed behavior without test updates.** New/changed pure logic in a module AGENTS.md lists as mutation-tested (`config.rs`, `workspace.rs`, `devcontainer.rs`, `github_repo.rs`, `github_pat.rs`, `secret_store.rs`, `fs_util.rs`, `src/commands/*`, `model_state.rs`, `jsonc.rs`, …) that ships with no unit test — this is a coverage regression, not a nit.
+- **Changed behavior without test updates.** New/changed pure logic in a module listed in `docs/testing.md` as mutation-tested (`config.rs`, `workspace.rs`, `guest_env_state.rs`, `github_repo.rs`, `github_pat.rs`, `secret_store.rs`, `fs_util.rs`, `src/commands/*`, `model_state.rs`, …) that ships with no unit test — this is a coverage regression, not a nit.
 - **New code paths without coverage; untested error paths and edges.** coop's guidance is to test edges and errors, not just the happy path — empty inputs, boundaries, malformed data, missing files. Every error variant the code returns should have a test that triggers it.
 - **Race boundary witnesses:** for a descriptor or no-follow claim, test the operation that uses the checked object, not only the earlier validator. Include a replaceable path, an outside sentinel, and a positive intended operation where the platform fixture permits it. For sudo helpers, exercise the ordinary caller that launches the helper as well as direct helper dispatch.
 - **A new guest-visible command, flag, or lifecycle behavior with no integration-test phase.** New `coop` subcommands or guest environment changes are candidates for a new `tests/integration.sh` phase; flag the gap.

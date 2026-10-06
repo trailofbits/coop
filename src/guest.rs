@@ -9,23 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{CoopConfig, CustomProfile};
 use crate::paths::GuestPath;
 
-/// Devcontainer feature ids (bare names) that map to builtin profiles.
-/// The id is the same string as the builtin name; this slice acts as the
-/// allow-list so an unknown feature returns `None` rather than silently
-/// resolving against an unrelated builtin added later.
-const FEATURE_IDS: &[&str] = &["python", "node", "c", "fuzz", "rust", "go"];
-
-/// Look up a builtin profile by its devcontainer feature id (a bare
-/// name such as `rust`, after stripping any `ghcr.io/...:tag` prefix).
-pub fn builtin_for_feature(id: &str) -> Option<&'static BuiltinProfile> {
-    if FEATURE_IDS.contains(&id) {
-        lookup_builtin(id)
-    } else {
-        None
-    }
-}
-
-/// Default username when neither the CLI nor a devcontainer pins one.
+/// Default guest username.
 /// Matches the user that Firecracker's CI rootfs already ships with and
 /// that Lima's `useradd` block creates at uid 1000.
 pub const DEFAULT_GUEST_USER: &str = "ubuntu";
@@ -824,16 +808,6 @@ mod tests {
         let defs = resolve_profiles(&names, &custom).unwrap();
         let resolved_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(resolved_names, vec!["rust", "data", "node"]);
-    }
-
-    #[test]
-    fn builtin_for_feature_matches_known_ids() {
-        for id in FEATURE_IDS {
-            let bp = builtin_for_feature(id)
-                .unwrap_or_else(|| panic!("feature '{id}' should resolve to a builtin"));
-            assert_eq!(bp.name, *id);
-        }
-        assert!(builtin_for_feature("nonexistent").is_none());
     }
 
     #[test]

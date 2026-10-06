@@ -181,7 +181,7 @@ class RequiredProxyPhaseTests(unittest.TestCase):
                  'bash', str(scripts), str(binary)],
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(Path(result.stdout.strip()).resolve(), source)
+            self.assertEqual(Path(result.stdout.strip()).resolve(), source.resolve())
 
             remote = root / 'remote'
             remote_source = remote / 'src' / 'src' / 'seatbelt-proxy.sb'
@@ -194,7 +194,7 @@ class RequiredProxyPhaseTests(unittest.TestCase):
                  'bash', str(remote), str(remote / 'coop')],
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(Path(result.stdout.strip()).resolve(), remote_source)
+            self.assertEqual(Path(result.stdout.strip()).resolve(), remote_source.resolve())
 
     def test_missing_curl_or_proxy_is_failure_in_required_mode(self):
         integration = (ROOT / 'tests/integration.sh').read_text()
