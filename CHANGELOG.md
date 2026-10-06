@@ -7,6 +7,22 @@
 - `coop stop` now removes a Firecracker instance's TAP after the VM exits,
   including when Firecracker exited before the stop command.
 
+## v0.7.1
+
+### Fixes
+
+- Accept `e2fsck`'s successful-repair status when resizing a Firecracker disk,
+  so coop continues after filesystem errors are corrected while still rejecting
+  read-only check failures, reboot-required results, combined errors, and
+  signals.
+- Gracefully shut down Firecracker guests over SSH before falling back to
+  `SIGTERM` and `SIGKILL`. This flushes recent filesystem changes on ARM64,
+  where Firecracker does not support the Ctrl-Alt-Delete API action.
+- Restore `nix build .#coop` on macOS and Linux after the private-storage
+  hardening changes.
+- Reject `coop setup --extra-packages` and `--post-install` on Lima instead of
+  silently ignoring them. These options remain supported on Linux/Firecracker.
+
 ## v0.7.0
 
 ### Security
