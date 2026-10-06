@@ -151,11 +151,13 @@ The integration test runner (`tests/run-integration.sh --remote`) automates this
 
 ## Feature parity
 
-Both backends support the same CLI commands and guest capabilities:
+Both backends support the same core CLI commands and guest capabilities, with
+the intentional setup and mount differences listed below:
 
 | Capability | Lima (macOS) | Firecracker (Linux) |
 |---|---|---|
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
+| Explicit `setup --extra-packages` / `--post-install` | Refused | Consumed by provisioning and image staleness checks |
 | `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
 | `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM/SIGKILL fallback, remove TAP |

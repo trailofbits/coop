@@ -109,9 +109,11 @@ flags — this is a load-bearing design choice (see
   absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
-- **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
-  path calls first; it runs `cfg.validate()` so no VM starts on an invalid
-  config.
+- **Setup preflight** rejects explicit inputs unsupported by the selected
+  backend before config loading at the CLI boundary and repeats that capability
+  check at the backend boundary. `boot_preflight(cfg)` then runs
+  `cfg.validate()` before backend setup or boot work, so no VM starts on an
+  invalid config.
 
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
@@ -124,12 +126,14 @@ any instance operation lock is acquired.
 `lib.rs:run()` is the entrypoint. Order matters:
 
 1. Emit dynamic shell completions (before arg parsing) if requested.
-2. Parse `Cli` (clap derive), init tracing (→ **stderr**).
-3. Handle commands that must work **without** a loaded config —
-   `Completions`, `Init`, `Update`, `Uninstall` — first.
-4. `config::CoopConfig::load`, then fire the update-notifier check.
-5. Construct `backend::PlatformBackend::new()`.
-6. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
+2. Parse `Cli` (clap derive).
+3. Reject backend-unsupported explicit `setup` inputs before tracing, config
+   loading, or other setup side effects.
+4. Init tracing (→ **stderr**) and handle commands that must work **without** a
+   loaded config — `Completions`, `Init`, `Update`, `Uninstall` — first.
+5. `config::CoopConfig::load`, then fire the update-notifier check.
+6. Construct `backend::PlatformBackend::new()`.
+7. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
    handlers call `cfg.validate_and_warn()?` before VM work; query commands
    (`list`/`status`/`logs`) skip it.
 

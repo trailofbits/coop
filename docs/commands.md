@@ -171,8 +171,8 @@ coop setup [FLAGS]
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
-| `--extra-packages <list>` | Comma-separated extra apt packages to install |
-| `--post-install <path>` | Path to a post-install script to run in the chroot |
+| `--extra-packages <list>` | Comma-separated extra apt packages to install (Linux/Firecracker only; Lima refuses this option) |
+| `--post-install <path>` | Path to a post-install script to run in the chroot (Linux/Firecracker only; Lima refuses this option) |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
@@ -182,6 +182,8 @@ coop setup [FLAGS]
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
 ```
+
+The second example is Linux/Firecracker only.
 
 ### `start`
 

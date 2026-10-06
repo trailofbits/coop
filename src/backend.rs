@@ -20,7 +20,7 @@ use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
-use crate::setup::SetupOptions;
+use crate::setup::{ExplicitSetupInputSupport, SetupOptions};
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -802,13 +802,26 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// filesystem state.
 ///
 /// Every backend boot entry (`setup`, `create_and_start`, `start_existing`)
-/// calls this first, so the check is unforgettable — a new lifecycle path
-/// that reaches boot cannot skip it, and it sees the world as it is at boot
-/// time rather than trusting a witness minted earlier. Warnings are dropped
-/// here; they are surfaced once at the handler via
+/// calls this before backend setup or boot work, so the check is unforgettable
+/// and sees the world as it is at boot time rather than trusting a witness
+/// minted earlier. Setup first rejects backend-unsupported explicit inputs.
+/// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
     cfg.validate().map(drop)
+}
+
+fn setup_preflight(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+    explicit_inputs: ExplicitSetupInputSupport,
+) -> Result<()> {
+    crate::setup::validate_explicit_setup_inputs(
+        explicit_inputs,
+        &opts.extra_packages,
+        opts.post_install.as_ref(),
+    )?;
+    boot_preflight(cfg)
 }
 
 /// VM backend for managing guest lifecycle.
@@ -973,7 +986,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
     }
 
@@ -1220,7 +1233,7 @@ impl std::fmt::Display for LimaBackend {
 #[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::UnsupportedByLima)?;
         crate::lima::setup(cfg, opts)
     }
 
@@ -4434,6 +4447,44 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&data_dir),
+            ..Default::default()
+        };
+        cfg.claude.config_dir =
+            ConfigDir::Custom(crate::config::ConfigPath::new(root.path().join("missing")));
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: vec!["ripgrep".to_string()],
+            post_install: Some(root.path().join("setup.sh")),
+            image: ImageName::new("default").unwrap(),
+            guest_user: crate::guest::GuestUser::default(),
+            builder_timeout: None,
+        };
+
+        let error = LimaBackend::new()
+            .setup(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("claude.config_dir"), "{error}");
+        assert!(
+            !data_dir.exists(),
+            "setup must not create the data directory"
+        );
     }
 
     #[test]

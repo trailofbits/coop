@@ -533,9 +533,9 @@
   `tmux` package is also dropped from the guest base image. Claude
   Code's `claude agents` daemon (`coop claude-agents`) already
   provides session persistence without a terminal multiplexer; users
-  who still want detachable terminals can install tmux themselves via
-  `coop setup --extra-packages tmux` and start it manually inside
-  `coop shell`.
+  who still want detachable terminals can, on Linux/Firecracker, install tmux
+  themselves via `coop setup --extra-packages tmux` and start it manually
+  inside `coop shell`.
 
 - **Devcontainer auto-discovery prompts on `up` / `setup --workspace`**
   (#129, #130, #242) — When the workspace contains

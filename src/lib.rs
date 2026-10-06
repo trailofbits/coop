@@ -230,10 +230,10 @@ enum Commands {
             add = ArgValueCandidates::new(completions::profile_candidates),
         )]
         profile: Vec<String>,
-        /// Extra apt packages to install (comma-separated)
+        /// Extra apt packages to install (comma-separated; Linux/Firecracker only)
         #[arg(long, value_delimiter = ',')]
         extra_packages: Vec<String>,
-        /// Path to a post-install script to run in the chroot
+        /// Path to a post-install script to run in the chroot (Linux/Firecracker only)
         #[arg(long)]
         post_install: Option<String>,
         /// Template rootfs size in GiB (default: 8)
@@ -932,6 +932,7 @@ pub fn run() -> Result<()> {
     clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command).complete();
 
     let cli = Cli::parse();
+    validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
     #[cfg(target_os = "linux")]
@@ -1364,6 +1365,26 @@ pub fn run() -> Result<()> {
     }
 }
 
+fn validate_pre_config_command_inputs(
+    command: &Commands,
+    explicit_setup_inputs: setup::ExplicitSetupInputSupport,
+) -> Result<()> {
+    let Commands::Setup {
+        extra_packages,
+        post_install,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+
+    setup::validate_explicit_setup_inputs(
+        explicit_setup_inputs,
+        extra_packages,
+        post_install.as_ref(),
+    )
+}
+
 fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1553,6 +1574,39 @@ token = "test-pat"
             panic!("expected Setup variant");
         };
         assert_eq!(builder_timeout, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn setup_cli_rejects_unsupported_inputs_at_pre_config_boundary() {
+        let cli = parse(&[
+            "setup",
+            "--extra-packages",
+            "ripgrep",
+            "--post-install",
+            "setup.sh",
+        ]);
+        let error = super::validate_pre_config_command_inputs(
+            &cli.command,
+            crate::setup::ExplicitSetupInputSupport::UnsupportedByLima,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+    }
+
+    #[test]
+    fn setup_cli_accepts_normal_inputs_at_pre_config_boundary() {
+        let cli = parse(&["setup", "--profile", "python", "--rebuild"]);
+        super::validate_pre_config_command_inputs(
+            &cli.command,
+            crate::setup::ExplicitSetupInputSupport::UnsupportedByLima,
+        )
+        .unwrap();
     }
 
     #[test]
