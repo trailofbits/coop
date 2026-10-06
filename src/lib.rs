@@ -97,6 +97,10 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal privileged Firecracker API socket liveness probe.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__probe-firecracker-socket", hide = true)]
+    ProbeFirecrackerSocket { path: PathBuf },
     /// Internal descriptor-bound operations on Firecracker disk images.
     #[cfg(target_os = "linux")]
     #[command(name = "__disk-op", hide = true)]
@@ -931,6 +935,11 @@ pub fn run() -> Result<()> {
     init_tracing(cli.verbose);
 
     #[cfg(target_os = "linux")]
+    if let Commands::ProbeFirecrackerSocket { ref path } = cli.command {
+        return config::probe_firecracker_api_socket(path);
+    }
+
+    #[cfg(target_os = "linux")]
     if let Commands::DiskOp {
         ref operation,
         ref root,
@@ -1018,6 +1027,8 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Commands::ProbeFirecrackerSocket { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]

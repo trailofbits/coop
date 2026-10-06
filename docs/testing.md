@@ -58,6 +58,11 @@ SSH refusal, a hung client, a missing client, and liveness-probe failure. It
 checks forced-signal fallback, bounded waits, and SSH client reaping. The
 existing stop failure test checks PID retention after failed forced signals.
 
+`cargo test --test firecracker_socket` exercises the Linux socket helper and
+`coop stop` with a full Unix listener accept queue. It checks proxy-token
+retention and TAP cleanup through a fake `ip` boundary, then closes the listener
+and requires cleanup to succeed. It does not replace either VM integration gate.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub

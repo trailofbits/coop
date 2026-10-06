@@ -2840,41 +2840,98 @@ fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
         Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
     }
 
-    let output = Cmd::new("curl")
-        .args([
-            // Must be the first argument so curl does not load root's .curlrc.
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--output",
-            "/dev/null",
-            "--connect-timeout",
-            "1",
-            "--max-time",
-            "2",
-            "--noproxy",
-            "*",
-            "--unix-socket",
-        ])
+    let output = Cmd::new(crate::privileged_disk::running_executable_path())
+        .arg("__probe-firecracker-socket")
         .arg(socket_path)
-        .arg("http://localhost/")
         .sudo()
         .output()
         .context("Failed to run privileged Firecracker API socket probe")?;
-
-    classify_firecracker_socket_probe(output.status.code())
+    if !output.status.success() {
+        bail!(
+            "Privileged Firecracker API socket probe failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn classify_firecracker_socket_probe(exit_code: Option<i32>) -> Result<()> {
-    match exit_code {
-        Some(0) => bail!("Firecracker API socket is accepting connections without a valid PID"),
-        // curl exit 7 means it could not connect. With the probe running as
-        // root, this covers a missing listener without conflating it with the
-        // ordinary user's lack of write permission on the socket.
-        Some(7) => Ok(()),
-        Some(code) => bail!("Privileged Firecracker API socket probe exited with code {code}"),
-        None => bail!("Privileged Firecracker API socket probe terminated by signal"),
+/// Run in the privileged helper so permission denial cannot mask a listener.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_firecracker_api_socket(socket_path: &Path) -> Result<()> {
+    classify_firecracker_socket_probe(connect_firecracker_api_socket(socket_path))
+}
+
+#[cfg(target_os = "linux")]
+fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(socket_path.as_os_str().as_bytes())?;
+    // SAFETY: sockaddr_un is a plain C struct; zeroing terminates sun_path.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family =
+        libc::sa_family_t::try_from(libc::AF_UNIX).map_err(std::io::Error::other)?;
+    if path.as_bytes_with_nul().len() > address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Firecracker API socket path is too long",
+        ));
+    }
+    // SAFETY: the checked destination holds the entire NUL-terminated path.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path.as_ptr().cast::<u8>(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path.as_bytes_with_nul().len(),
+        );
+    }
+    // Nonblocking connect returns EAGAIN for a full accept queue rather than
+    // waiting indefinitely. Only ENOENT/ECONNREFUSED can authorize cleanup.
+    // SAFETY: socket creates a new descriptor with these Linux flags.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful socket call returns a newly owned descriptor.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let address_len = libc::socklen_t::try_from(std::mem::size_of_val(&address))
+        .map_err(std::io::Error::other)?;
+    // SAFETY: the initialized sockaddr_un and its length are valid; socket
+    // owns the descriptor until after connect returns, including on error.
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            address_len,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
+    match connection {
+        Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
     }
 }
 
@@ -3273,20 +3330,32 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_rejects_pidless_live_socket() {
+    fn firecracker_socket_probe_rejects_live_socket() {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
-        assert!(inst.probe_liveness().is_err());
+        assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn firecracker_socket_probe_classifies_curl_outcomes() {
-        assert!(classify_firecracker_socket_probe(Some(0)).is_err());
-        classify_firecracker_socket_probe(Some(7)).unwrap();
-        assert!(classify_firecracker_socket_probe(Some(1)).is_err());
-        assert!(classify_firecracker_socket_probe(None).is_err());
+    fn firecracker_socket_probe_classifies_connect_errors() {
+        assert!(classify_firecracker_socket_probe(Ok(())).is_err());
+        for errno in [libc::ECONNREFUSED, libc::ENOENT] {
+            classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                .unwrap();
+        }
+        for errno in [
+            libc::EAGAIN,
+            libc::ETIMEDOUT,
+            libc::EACCES,
+            libc::EINPROGRESS,
+        ] {
+            assert!(
+                classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
