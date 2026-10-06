@@ -298,13 +298,34 @@ pub enum CmdToken {
     #[cfg(target_os = "linux")]
     SecretService { service: String, account: String },
     /// 1Password item read via `op item get`.
-    OnePassword { title: String },
+    OnePassword {
+        title: String,
+        field: OnePasswordField,
+    },
     /// Plain-file read via `cat`. `dir` is the per-service secret directory
     /// (see [`secret_subdir`]) and `account` names the `<account>.txt` file
     /// inside it, so the `<dir>/<account>.txt` layout holds by construction
     /// and every value round-trips through [`Display`](fmt::Display) /
     /// [`parse`](Self::parse).
     File { dir: PathBuf, account: AccountName },
+}
+
+/// Secret field selected by a saved 1Password retrieval command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnePasswordField {
+    /// Login items created by older coop versions.
+    Password,
+    /// API Credential items created by the current wizard.
+    Credential,
+}
+
+impl fmt::Display for OnePasswordField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Password => "password",
+            Self::Credential => "credential",
+        })
+    }
 }
 
 impl CmdToken {
@@ -368,17 +389,16 @@ impl CmdToken {
                 service: (*service).to_string(),
                 account: (*account).to_string(),
             }),
-            [
-                "op",
-                "item",
-                "get",
-                title,
-                "--fields",
-                "password",
-                "--reveal",
-            ] => Some(Self::OnePassword {
-                title: (*title).to_string(),
-            }),
+            ["op", "item", "get", title, "--fields", field, "--reveal"] => {
+                Some(Self::OnePassword {
+                    title: (*title).to_string(),
+                    field: match *field {
+                        "password" => OnePasswordField::Password,
+                        "credential" => OnePasswordField::Credential,
+                        _ => return None,
+                    },
+                })
+            }
             ["cat", path] => {
                 parse_file(Path::new(path)).map(|(dir, account)| Self::File { dir, account })
             }
@@ -404,9 +424,9 @@ impl fmt::Display for CmdToken {
                 shell_quote(service),
                 shell_quote(account),
             ),
-            Self::OnePassword { title } => write!(
+            Self::OnePassword { title, field } => write!(
                 f,
-                "cmd:op item get {} --fields password --reveal",
+                "cmd:op item get {} --fields {field} --reveal",
                 shell_quote(title),
             ),
             Self::File { dir, account } => {
@@ -533,9 +553,8 @@ fn store_secret_service(service: &str, account: &AccountName, token: &str) -> Re
 fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Result<CmdToken> {
     // `op item create` reads field values from argv. The token is briefly
     // visible to local observers via /proc; redacted from coop's own
-    // debug log via `redacted_arg`. 1Password rejects duplicate titles, so
-    // soft-delete any existing item with the same title first (rotate-pat
-    // calls store_onepassword on an existing entry).
+    // debug log via `redacted_arg`. Archive any existing item with the same
+    // title first so retrieval by title stays unambiguous after rotation.
     let title = format!("{service} ({account})");
     let _ = Cmd::new("op")
         .arg("item")
@@ -543,16 +562,19 @@ fn store_onepassword(service: &str, account: &AccountName, token: &str) -> Resul
         .arg("--archive")
         .arg(&title)
         .output();
-    let password_field = format!("password={token}");
+    let credential_field = format!("credential={token}");
     Cmd::new("op")
         .arg("item")
         .arg("create")
-        .arg("--category=login")
+        .arg("--category=API Credential")
         .arg(format!("--title={title}"))
-        .redacted_arg(password_field)
+        .redacted_arg(credential_field)
         .run()
         .context("Failed to create 1Password item")?;
-    Ok(CmdToken::OnePassword { title })
+    Ok(CmdToken::OnePassword {
+        title,
+        field: OnePasswordField::Credential,
+    })
 }
 
 fn store_file(
@@ -848,6 +870,10 @@ mod tests {
             Some(Backend::OnePassword)
         );
         assert_eq!(
+            backend_of("cmd:op item get 'foo' --fields credential --reveal"),
+            Some(Backend::OnePassword)
+        );
+        assert_eq!(
             backend_of("cmd:cat ~/.coop/state/github-pat/x.txt"),
             Some(Backend::File)
         );
@@ -856,10 +882,111 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_canonical_onepassword() {
-        // coop only ever writes `op item get … --fields password --reveal`.
+        // coop writes `op item get … --fields <secret field> --reveal`.
         // A hand-written `op read` reference is not a form coop can read back
         // by title, so it is treated as opaque rather than misattributed.
         assert_eq!(backend_of("cmd:op read op://Private/coop/token"), None);
+        assert_eq!(
+            backend_of("cmd:op item get foo --fields username --reveal"),
+            None
+        );
+    }
+
+    #[test]
+    fn onepassword_commands_preserve_legacy_and_api_credential_fields() {
+        for (name, field) in [
+            ("password", OnePasswordField::Password),
+            ("credential", OnePasswordField::Credential),
+        ] {
+            let cmd =
+                format!("cmd:op item get 'coop-github-pat (owner-repo)' --fields {name} --reveal");
+            let parsed = CmdToken::parse(&cmd).unwrap();
+            assert_eq!(
+                parsed,
+                CmdToken::OnePassword {
+                    title: "coop-github-pat (owner-repo)".to_string(),
+                    field,
+                }
+            );
+            assert_eq!(parsed.to_string(), cmd);
+            assert_eq!(parsed.backend(), Backend::OnePassword);
+        }
+    }
+
+    #[test]
+    fn onepassword_stores_and_reads_api_credentials() {
+        const CHILD_ROOT: &str = "COOP_TEST_ONEPASSWORD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            for (service, name) in [
+                (SERVICE, "owner-repo"),
+                (ANTHROPIC_SERVICE, "anthropic"),
+                (OPENAI_SERVICE, "openai"),
+            ] {
+                let stored = store_secret(
+                    Backend::OnePassword,
+                    service,
+                    &AccountName::new(name).unwrap(),
+                    "test-api-token",
+                    Path::new(&root),
+                )
+                .unwrap();
+                assert_eq!(CmdToken::parse(&stored.to_string()), Some(stored.clone()));
+                assert_eq!(
+                    crate::config::resolve_cmd_value(&stored.to_string()).unwrap(),
+                    "test-api-token"
+                );
+            }
+            return;
+        }
+
+        // Change PATH only in a child so parallel tests keep their real tools.
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/bin/sh", root.path().join("sh")).unwrap();
+        let op = root.path().join("op");
+        std::fs::write(
+            &op,
+            r#"#!/bin/sh
+[ "$1" = item ] || exit 1
+case "$2" in
+    delete) exit 0 ;;
+    create)
+        [ "$#" = 5 ] || exit 2
+        [ "$3" = '--category=API Credential' ] || exit 3
+        [ "$5" = 'credential=test-api-token' ] || exit 4
+        printf '%s\n' "$4" >> "$COOP_TEST_ONEPASSWORD_ROOT/created"
+        ;;
+    get)
+        [ "$#" = 6 ] || exit 5
+        [ "$4" = --fields ] && [ "$5" = credential ] && [ "$6" = --reveal ] || exit 6
+        printf '%s\n' test-api-token
+        ;;
+    *) exit 7 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "secret_store::tests::onepassword_stores_and_reads_api_credentials",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("created")).unwrap(),
+            "--title=coop-github-pat (owner-repo)\n\
+             --title=coop-anthropic (anthropic)\n\
+             --title=coop-openai (openai)\n"
+        );
     }
 
     #[test]
@@ -962,6 +1089,7 @@ mod tests {
                 "-w".to_string(),
                 "--fields".to_string(),
                 "password".to_string(),
+                "credential".to_string(),
                 "--reveal".to_string(),
                 "cat".to_string(),
                 "lookup".to_string(),
@@ -986,7 +1114,14 @@ mod tests {
     fn arb_cmd_token() -> impl Strategy<Value = CmdToken> {
         prop_oneof![
             arb_system_token(),
-            arb_field().prop_map(|title| CmdToken::OnePassword { title }),
+            (
+                arb_field(),
+                prop::sample::select(vec![
+                    OnePasswordField::Password,
+                    OnePasswordField::Credential
+                ]),
+            )
+                .prop_map(|(title, field)| CmdToken::OnePassword { title, field }),
             (arb_dir(), arb_account_name())
                 .prop_map(|(dir, account)| CmdToken::File { dir, account }),
         ]
