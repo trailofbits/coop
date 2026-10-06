@@ -197,7 +197,9 @@ trusted; existing healthy instances remain available through normal lookup.
 from the pinned `trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
 `attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
-when the release publishes no usable one (best-effort),
+when the release publishes no usable one (best-effort). Both paths pin the
+signer to `.github/workflows/release.yml` at the selected tag, require that
+source ref, and reject attestations generated on self-hosted runners. Then
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
 `coop-proxy` beside the CLI before replacing `coop`. Each replacement is
 atomic; the pair is not a single transaction. A background notifier checks for

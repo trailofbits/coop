@@ -888,6 +888,9 @@ coop profiles show rust
 ### `update`
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Attestation verification requires `.github/workflows/release.yml` at the selected
+release tag and rejects attestations generated on self-hosted runners. The same
+policy applies to the release bundle and GitHub API fallback.
 
 No authentication is required. When [`gh`](https://cli.github.com/) is authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update` uses it, which helps avoid GitHub API rate limits.
 
