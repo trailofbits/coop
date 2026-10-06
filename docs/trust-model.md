@@ -447,13 +447,15 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode), unless
+   the updater integration suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1`
+   to exercise verification against a local fixture. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin **and** disables
+`COOP_UPDATE_API_BASE_URL` redirects the update origin and normally disables
 attestation; the checksum then only proves integrity against *that* server's own
 `SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
 attestation provide provenance. Flag any change that widens where that override

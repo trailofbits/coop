@@ -121,11 +121,20 @@ fn api_base_overridden() -> bool {
     env::var("COOP_UPDATE_API_BASE_URL").is_ok()
 }
 
+fn skip_attestation_for_fixture() -> bool {
+    api_base_overridden() && env::var("COOP_UPDATE_TEST_VERIFY_ATTESTATION").as_deref() != Ok("1")
+}
+
 fn warn_if_api_base_overridden() {
-    if api_base_overridden() {
+    if skip_attestation_for_fixture() {
         tracing::warn!(
             "COOP_UPDATE_API_BASE_URL is set — attestation verification is DISABLED. \
              This is a test-only mode; do not use with untrusted URLs."
+        );
+    } else if api_base_overridden() {
+        tracing::warn!(
+            "COOP_UPDATE_API_BASE_URL is set — verifying a test-only release source. \
+             Do not use with untrusted URLs."
         );
     }
 }
@@ -419,7 +428,8 @@ fn attestation_verify_args(tarball: &Path, tag: &str, bundle: Option<&Path>) -> 
 /// performs the download this describes.
 #[derive(Debug)]
 enum BundleDecision<'a> {
-    /// `COOP_UPDATE_API_BASE_URL` is set. The local fixture serves synthetic
+    /// `COOP_UPDATE_API_BASE_URL` is set without the verification test switch.
+    /// The local fixture serves synthetic
     /// artifacts that have no provenance in GitHub's attestation API, so
     /// verification is skipped; `warn_if_api_base_overridden` has already
     /// surfaced the override on stderr.
@@ -523,7 +533,11 @@ impl Provenance {
 /// Never fails the update: every problem with the bundle falls back to the
 /// attestations API or skips verification outright.
 fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
-    let asset = match bundle_decision(release, api_base_overridden(), command_exists("gh")) {
+    let asset = match bundle_decision(
+        release,
+        skip_attestation_for_fixture(),
+        command_exists("gh"),
+    ) {
         BundleDecision::TestMode => return Provenance::TestMode,
         BundleDecision::NoGh => return Provenance::NoGh,
         BundleDecision::NoAsset => {
