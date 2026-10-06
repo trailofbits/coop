@@ -914,7 +914,7 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    bootstrap_and_post_start(
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -923,6 +923,7 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1001,8 +1002,8 @@ fn start_instance(
 /// and `/workspace` survived on the guest disk.
 ///
 /// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, plus what
-/// [`bootstrap_and_post_start`] consumes (`no_agents`, `post_start_override`).
+/// `exclude_git`, `persisted_guest_env`, `post_start_override`, plus what
+/// [`bootstrap_on_boot`] consumes (`no_agents`).
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
 /// resolved forward set arrives as `forwards`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
@@ -1043,7 +1044,7 @@ fn provision_first_boot(
         entries: opts.persisted_guest_env.clone(),
     }
     .save(inst)?;
-    bootstrap_and_post_start(
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1123,6 +1124,8 @@ fn provision_first_boot(
             );
         }
     }
+
+    run_configured_post_start(cfg, inst, &target, repo, opts)?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1350,10 +1353,8 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
-/// Open a session and run the post-boot agent bootstrap plus any
-/// `post_start` hook, honoring `--no-agents`. Shared by fresh start and
-/// restart, which differ only in the [`backend::BootMode`].
-fn bootstrap_and_post_start(
+/// Bootstrap guest agents after boot, before workspace provisioning.
+fn bootstrap_on_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -1362,7 +1363,6 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1388,7 +1388,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() {
+    if opts.no_agents {
         if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
@@ -1400,27 +1400,26 @@ fn bootstrap_and_post_start(
     // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
     // defeating proxy-mode non-exposure (issue #411).
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
-    if opts.no_agents {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
-    }
-    if let Some(cmd) = post_start {
-        // Agent bootstrap may have just minted the per-instance capability
-        // token (proxy mode), which is forwarded to sessions via `SendEnv`
-        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
-        // the token existed, so re-prepare it here — otherwise a `post_start`
-        // that runs Codex in proxy mode would lack the token and fail to
-        // authenticate. Under --no-agents no proxy started, so nothing new to
-        // pick up; keep the original session.
-        let session = if opts.no_agents {
-            session
-        } else {
-            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
-        };
-        backend::run_post_start(&session, cmd);
-    }
+    let guest_host = be.guest_host_address(&cfg.network);
+    backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+    Ok(())
+}
+
+/// Run the hook after bootstrap and workspace provisioning have succeeded.
+fn run_configured_post_start(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+        return Ok(());
+    };
+    signal::check_shutdown()?;
+    // Bootstrap may mint a proxy capability token; construct this session afterward.
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    backend::run_post_start(&session, command);
     Ok(())
 }
 
@@ -2386,6 +2385,64 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn post_start_stops_before_session_preparation_when_interrupted() {
+        const CHILD: &str = "COOP_POST_START_INTERRUPTED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "commands::lifecycle::tests::",
+                        "post_start_stops_before_session_preparation_when_interrupted",
+                    ),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        assert_interrupted_post_start();
+    }
+
+    fn assert_interrupted_post_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = instance_named("test", tmp.path());
+        std::fs::create_dir(inst.model_state_path()).unwrap();
+        let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        cfg.post_start = Some("true".to_string());
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: super::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("id_test"),
+        };
+        let opts = start_opts(Vec::new(), tmp.path());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert!(format!("{error:#}").contains("model.json"), "{error:#}");
+        let _signals = super::signal::install_handlers();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(super::signal::shutdown_requested());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert_eq!(error.to_string(), "Interrupted by signal — cleaning up");
+        cfg.post_start = None;
+        super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap();
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {

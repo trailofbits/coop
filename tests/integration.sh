@@ -4161,7 +4161,8 @@ test_git_repo() {
     # git-repo + extra-mount combination is the workspace-sync path that
     # regressed on Firecracker before this change.
     if coop up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/data" --no-agents; then
+            --extra-mount "$data_dir:/data" --no-agents \
+            --post-start 'test -d /workspace/.git && cat /data/marker.txt > /tmp/clone-post-start'; then
         STARTED_INSTANCES+=("$gr_instance")
         pass "up --git-repo creates an instance"
     else
@@ -4171,6 +4172,14 @@ test_git_repo() {
     fi
 
     GUEST_INSTANCE="$gr_instance"
+
+    local hook_marker
+    hook_marker=$(guest_exec cat /tmp/clone-post-start 2>/dev/null) || hook_marker=""
+    if [[ "$hook_marker" == "extra-mount-marker" ]]; then
+        pass "post-start runs after clone and extra mount provisioning"
+    else
+        fail "post-start runs after clone and extra mount provisioning" "got: $hook_marker"
+    fi
 
     if guest_exec test -d /workspace/.git; then
         pass "up --git-repo clones the repository into /workspace"
@@ -6764,12 +6773,16 @@ test_post_start() {
     local inst_name="${INSTANCE}-poststart"
     local marker="/tmp/coop-post-start-$$.marker"
 
-    # --post-start runs the command in the guest after SSH is ready.
-    # The marker file written by the hook is the assertion.
     local post_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$post_ws"
+    local post_data="$tmpdir/${inst_name}-data"
+    mkdir -p "$post_ws" "$post_data"
+    printf '%s\n' 'workspace-ready' > "$post_ws/input.txt"
+    printf '%s\n' 'mount-ready' > "$post_data/input.txt"
+    printf '%s\n' 'set -eu' 'cat /workspace/input.txt /post-start-data/input.txt' \
+        > "$post_ws/setup.sh"
     if coop up "$post_ws" --name "$inst_name" --no-agents \
-        --post-start "echo hooked > $marker"; then
+        --extra-mount "$post_data:/post-start-data" \
+        --post-start "bash /workspace/setup.sh > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
     else
@@ -6782,12 +6795,50 @@ test_post_start() {
     seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
     unset GUEST_INSTANCE
 
-    if [[ "$seen" == *hooked* ]]; then
-        pass "--post-start hook ran in the guest"
+    if [[ "$seen" == $'workspace-ready\nmount-ready' ]]; then
+        pass "post-start reads copied workspace and extra mount contents"
     else
-        fail "--post-start hook ran in the guest" "marker contents: '$seen'"
+        fail "post-start reads copied workspace and extra mount contents" "got: '$seen'"
     fi
 
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    test_post_start_mount
+    test_post_start_failure
+}
+
+test_post_start_mount() {
+    local inst_name="${INSTANCE}-poststart-mount"
+    local marker="/tmp/coop-mount-post-start-$$.marker"
+    local mount_dir="$tmpdir/${inst_name}-data"
+    mkdir -p "$mount_dir"
+    printf '%s\n' 'mount-only-ready' > "$mount_dir/input.txt"
+
+    if coop up "$mount_dir" --name "$inst_name" --no-agents --mount \
+        --post-start "cat /workspace/input.txt > $marker"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up with mount-only post-start exits 0"
+    else
+        fail "up with mount-only post-start exits 0" "exit code: $?"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+    local seen
+    seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
+    unset GUEST_INSTANCE
+
+    if [[ "$seen" == "mount-only-ready" ]]; then
+        pass "post-start reads mount-only contents during startup"
+    else
+        fail "post-start reads mount-only contents during startup" "got: '$seen'"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
+test_post_start_failure() {
     # Verify a failing hook does not fail `coop up` (warn-and-continue).
     local fail_inst="${INSTANCE}-poststart-fail"
     local fail_ws="$tmpdir/${fail_inst}-ws"
@@ -6800,8 +6851,6 @@ test_post_start() {
         fail "up succeeds when --post-start fails" "exit code: $?"
     fi
 
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
     coop destroy "$fail_inst" 2>/dev/null || true
     untrack_instance "$fail_inst"
 }

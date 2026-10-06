@@ -38,6 +38,8 @@ not publish it):
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --cert-identity https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<version> \
+  --source-ref refs/tags/<version> --deny-self-hosted-runners \
   --bundle attestations.jsonl
 ```
 
@@ -45,6 +47,10 @@ Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
 instead, which it will only do when `gh` is logged in. `install.sh` and `coop
 update` use that API path themselves for releases published without a usable
 bundle.
+Both paths require the release workflow at the selected tag (including its
+`v` prefix), with attestation generated on a GitHub-hosted runner. An older
+`gh` that does not support these flags fails verification; upgrade it before
+retrying.
 
 ## Upgrading from v0.5.4
 

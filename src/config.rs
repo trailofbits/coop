@@ -751,7 +751,8 @@ pub struct CoopConfig {
 
     /// Shell command to run inside the guest after every successful boot.
     ///
-    /// Executed after the VM is up and SSH is ready, before any interactive
+    /// Executed after SSH, agent bootstrap, and workspace/mount provisioning,
+    /// before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
     #[serde(default)]

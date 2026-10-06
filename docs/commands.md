@@ -65,7 +65,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
-| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
 
 ```
@@ -93,8 +93,8 @@ first so those options can take effect.
 Devcontainer files are ordinary workspace data; coop does not discover,
 translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
 mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
-agent bootstrap but before a copied workspace or Firecracker mount is synced;
-commands that require project files must run after `coop up` completes.
+agent bootstrap and workspace/mount provisioning, so commands can use copied,
+cloned, and mounted project files.
 
 Upgrading does not rewrite existing images or VMs. Delete affected images with
 `coop images --delete <image>`, then recreate them with `coop setup --image
@@ -888,6 +888,9 @@ coop profiles show rust
 ### `update`
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Attestation verification requires `.github/workflows/release.yml` at the selected
+release tag and rejects attestations generated on self-hosted runners. The same
+policy applies to the release bundle and GitHub API fallback.
 
 No authentication is required. When [`gh`](https://cli.github.com/) is authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update` uses it, which helps avoid GitHub API rate limits.
 

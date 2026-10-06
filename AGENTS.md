@@ -64,6 +64,11 @@ Workspace builds include `coop-proxy` and require CMake. Plain `cargo build`
 and the local clippy/test hooks cover only `coop`; run the workspace commands
 above before submitting.
 
+`--all-targets` covers Cargo target kinds for the current Rust target, not
+other operating systems. Changes to `#[cfg]` gates, platform aliases, or
+platform-only types must also compile and pass clippy for every affected OS;
+see [`docs/testing.md`](docs/testing.md#cross-platform-compile-and-lint-checks).
+
 Install pinned local dev tools (prek, taplo, cargo-deny, cargo-mutants,
 cargo-fuzz, kani) with `./scripts/install-dev-tools.sh --all`, then `prek
 install`. CI pins its own taplo/cargo-deny versions in

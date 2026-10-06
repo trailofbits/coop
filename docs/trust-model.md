@@ -392,7 +392,12 @@ Self-update (`update.rs`) must preserve, in order:
    (`verify_sha256`, constant-size `Sha256Hash` compare).
 4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
    --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
-   downloaded from the same release.
+   downloaded from the same release. Both `update.rs` and `install.sh` also
+   require `--cert-identity
+   https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<tag>`,
+   `--source-ref refs/tags/<tag>`, and `--deny-self-hosted-runners` on both the
+   bundle and API paths. The signer must be the release workflow at the exact
+   selected tag, attesting on a GitHub-hosted runner.
 
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
@@ -413,8 +418,8 @@ Self-update (`update.rs`) must preserve, in order:
    - **The bundle path accepts a superset.** The API path only returns
      attestations registered in the repo's attestation store, so minting one
      requires `attestations: write`. The `--bundle` path accepts any
-     correctly-signed bundle sitting in a release, which requires only
-     `contents: write`.
+     correctly-signed bundle satisfying the signer/ref/runner policy sitting
+     in a release, whose publication requires only `contents: write`.
    - **The bundle path is unrevocable.** `DELETE
      /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
      carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
@@ -422,14 +427,12 @@ Self-update (`update.rs`) must preserve, in order:
      indefinitely after the attestation is deleted.
 
    What still defeats a substituted bundle is the **subject-digest binding** —
-   `gh` digests the artifact and requires a matching subject. `--repo
-   trailofbits/coop` pins the source repository and constrains the signer SAN
-   to that repo, but not to a specific workflow file or ref: any workflow on
-   any ref in `trailofbits/coop` holding `id-token: write` +
-   `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
-   / `--cert-identity` are the tighter pin and neither client passes one — the
-   API path is keyed by digest against the same repo-scoped store and is
-   equally unpinned there.
+   `gh` digests the artifact and requires a matching subject. Repository-only
+   verification could accept another workflow or ref in the same repository;
+   the exact certificate identity and source-ref checks reject those on both
+   verification paths. These checks pin a tag name, not an immutable commit
+   digest: moving a tag and rerunning the release workflow is not prevented
+   by this policy.
 
    A release that publishes no bundle asset — or one whose download fails, or
    whose bundle is empty — falls back to the API path, where `gh` requires a
@@ -444,13 +447,15 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode), unless
+   the updater integration suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1`
+   to exercise verification against a local fixture. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin **and** disables
+`COOP_UPDATE_API_BASE_URL` redirects the update origin and normally disables
 attestation; the checksum then only proves integrity against *that* server's own
 `SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
 attestation provide provenance. Flag any change that widens where that override

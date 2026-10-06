@@ -326,11 +326,13 @@ exclude_re = [
   # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
   # via exclude_globs above.)
 
-  # lifecycle.rs — backend-driving session/bootstrap helpers. Both open an SSH
-  # session and bootstrap guest agents (prepare_session_from_target also reads
-  # persisted guest-env / model state from disk); their effects are observable
-  # only against a real VM.
-  "\\bbootstrap_and_post_start\\b",
+  # lifecycle.rs — backend-driving helpers: bootstrap_on_boot installs guest
+  # agents, run_configured_post_start executes the configured guest hook, and
+  # prepare_session_from_target reads persisted state and prepares SSH/env.
+  # VM tests cover their guest effects; an isolated unit test covers the
+  # post-start cancellation check before session preparation.
+  "\\bbootstrap_on_boot\\b",
+  "\\brun_configured_post_start\\b",
   "\\bprepare_session_from_target\\b",
 
   # ---- coop agent update (#402): in-guest agent refresh ----

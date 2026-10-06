@@ -217,6 +217,12 @@ else
     fail "update --yes returned non-zero" "$(tail -5 "$TMPDIR/t1.log")"
 fi
 
+if grep -q 'attestation verification is DISABLED' "$TMPDIR/t1.log"; then
+    pass "fixture mode warns that attestation is disabled"
+else
+    fail "fixture mode must warn when attestation is disabled"
+fi
+
 if [[ -x "$TMPDIR/bin/coop-proxy" ]] \
     && [[ "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
     pass "update installs the missing proxy companion"
@@ -330,6 +336,90 @@ if "$COOP_BIN" update --yes > "$TMPDIR/t6.log" 2>&1 \
     pass "legacy update replaces coop and preserves the existing companion"
 else
     fail "legacy update replaces coop and preserves the existing companion" "$(tail -5 "$TMPDIR/t6.log")"
+fi
+
+# ── Test 7: attestation policy and refusal preserve installed binaries ────────
+
+echo "==> Test 7: attestation verification gates replacement"
+cp "$RELEASE_BIN" "$COOP_BIN"
+cat > "$TMPDIR/build/${FAKE_DIR}/coop-proxy" << 'EOF'
+#!/bin/sh
+echo "MARKER: fake-proxy-binary"
+EOF
+chmod +x "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
+(cd "$TMPDIR/build" && tar -czf "$FIXTURE/${FAKE_TARBALL}" "$FAKE_DIR")
+(cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
+printf '%s\n' 'keep-existing-proxy' > "$TMPDIR/bin/coop-proxy"
+ORIG_SHA="$(sha_of "$COOP_BIN")"
+ORIG_PROXY_SHA="$(sha_of "$TMPDIR/bin/coop-proxy")"
+printf '%s\n' 'synthetic bundle' > "$FIXTURE/attestations.jsonl"
+write_release_json \
+    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FAKE_TAG" \
+    "$(cat << JSON
+[
+  {"name": "${FAKE_TARBALL}", "browser_download_url": "${BASE_URL}/${FAKE_TARBALL}"},
+  {"name": "SHA256SUMS", "browser_download_url": "${BASE_URL}/SHA256SUMS"},
+  {"name": "attestations.jsonl", "browser_download_url": "${BASE_URL}/attestations.jsonl"}
+]
+JSON
+)"
+
+mkdir -p "$TMPDIR/mock-bin"
+cat > "$TMPDIR/mock-bin/gh" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$GH_MOCK_ARGS"
+previous=''
+for arg do
+    if [ "$previous" = '--bundle' ] && [ -s "$arg" ]; then
+        printf '%s\n' 'nonempty bundle' > "$GH_MOCK_BUNDLE_PROOF"
+    fi
+    previous="$arg"
+done
+exit "$GH_MOCK_EXIT"
+EOF
+chmod +x "$TMPDIR/mock-bin/gh"
+export PATH="$TMPDIR/mock-bin:$PATH"
+export COOP_UPDATE_TEST_VERIFY_ATTESTATION=1
+export GH_MOCK_ARGS="$TMPDIR/gh-args"
+export GH_MOCK_BUNDLE_PROOF="$TMPDIR/gh-bundle-proof"
+
+GH_MOCK_EXIT=1 "$COOP_BIN" update --yes > "$TMPDIR/t7-fail.log" 2>&1 && result=0 || result=$?
+if [[ "$result" -ne 0 \
+    && -f "$GH_MOCK_ARGS" \
+    && "$(head -n 2 "$GH_MOCK_ARGS" | tr '\n' ' ')" == "attestation verify " \
+    && "$(sha_of "$COOP_BIN")" == "$ORIG_SHA" \
+    && "$(sha_of "$TMPDIR/bin/coop-proxy")" == "$ORIG_PROXY_SHA" ]] \
+    && grep -q 'Attestation verification failed' "$TMPDIR/t7-fail.log" \
+    && grep -q 'verifying a test-only release source' "$TMPDIR/t7-fail.log"; then
+    pass "rejected attestation leaves both binaries unchanged"
+else
+    fail "rejected attestation must preserve both binaries" "$(tail -5 "$TMPDIR/t7-fail.log")"
+fi
+
+if grep -Fxq -- '--repo' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'trailofbits/coop' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--cert-identity' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- \
+        'https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/v9.9.9' \
+        "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--source-ref' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'refs/tags/v9.9.9' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--deny-self-hosted-runners' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--bundle' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'nonempty bundle' "$GH_MOCK_BUNDLE_PROOF"; then
+    pass "updater passes the release signer policy to gh"
+else
+    fail "updater omitted a release signer policy argument" "$(cat "$GH_MOCK_ARGS")"
+fi
+
+GH_MOCK_EXIT=0 "$COOP_BIN" update --yes > "$TMPDIR/t7-pass.log" 2>&1 && result=0 || result=$?
+if [[ "$result" -eq 0 \
+    && "$("$COOP_BIN")" == "MARKER: fake-replacement-binary" \
+    && "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
+    pass "accepted attestation permits replacement"
+else
+    fail "accepted attestation must permit replacement" "$(tail -5 "$TMPDIR/t7-pass.log")"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
