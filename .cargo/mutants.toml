@@ -201,6 +201,12 @@ exclude_re = [
   # GUEST_ISOLATION_SPEC is a shared six-argument constant.
   "\\bisolate_tap_port\\b",
   "\\bensure_guest_isolation_rule\\b",
+  # Trusted network setup/cleanup orchestration shells out through resolved
+  # tools. The resolver, candidate policy, command construction, and setup
+  # pre-resolution decision remain in unit/mutation scope; real effects are
+  # covered by the isolated Linux network gate and full Firecracker suite.
+  "\\bsetup_tap_with_tools\\b",
+  "\\bteardown_bridge_device\\b",
 
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into

@@ -1,9 +1,13 @@
-use std::process::Command;
+use std::fmt;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
 use crate::config::{HostInterface, Instance, NetworkConfig};
+use crate::host_tool::{
+    ResolvedHostTool, TrustedLaunchContext, TrustedToolPolicy, resolve_host_tool,
+};
 
 const BRIDGE_NAME: &str = "br0";
 
@@ -11,6 +15,239 @@ const BRIDGE_NAME: &str = "br0";
 /// the `-C` probe, the `-I` insert, and the `-D` teardown so the three cannot
 /// drift — a teardown that misses by one argument leaks the rule.
 const GUEST_ISOLATION_SPEC: [&str; 6] = ["-i", BRIDGE_NAME, "-o", BRIDGE_NAME, "-j", "DROP"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NetworkTool {
+    Sudo,
+    Ip,
+    Bridge,
+    Iptables,
+    Sysctl,
+}
+
+impl NetworkTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sudo => "sudo",
+            Self::Ip => "ip",
+            Self::Bridge => "bridge",
+            Self::Iptables => "iptables",
+            Self::Sysctl => "sysctl",
+        }
+    }
+
+    fn production_candidates(self) -> &'static [&'static str] {
+        match self {
+            Self::Sudo => &["/usr/bin/sudo", "/bin/sudo"],
+            Self::Ip => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"],
+            Self::Bridge => &[
+                "/usr/sbin/bridge",
+                "/sbin/bridge",
+                "/usr/bin/bridge",
+                "/bin/bridge",
+            ],
+            Self::Iptables => &[
+                "/usr/sbin/iptables",
+                "/sbin/iptables",
+                "/usr/bin/iptables",
+                "/bin/iptables",
+            ],
+            Self::Sysctl => &[
+                "/usr/sbin/sysctl",
+                "/sbin/sysctl",
+                "/usr/bin/sysctl",
+                "/bin/sysctl",
+            ],
+        }
+    }
+}
+
+impl fmt::Display for NetworkTool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+fn production_network_policy() -> Result<TrustedToolPolicy> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(TrustedToolPolicy::new(
+            "/",
+            ["/usr/bin", "/usr/sbin", "/bin", "/sbin"].map(PathBuf::from),
+            0,
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!("Linux network control-plane tools are unavailable on this platform")
+    }
+}
+
+fn resolve_network_tool(
+    tool: NetworkTool,
+    policy: &TrustedToolPolicy,
+) -> Result<ResolvedHostTool<NetworkTool>> {
+    let candidates = tool
+        .production_candidates()
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    resolve_network_tool_from_candidates(tool, &candidates, policy)
+}
+
+fn resolve_network_tool_from_candidates(
+    tool: NetworkTool,
+    candidates: &[PathBuf],
+    policy: &TrustedToolPolicy,
+) -> Result<ResolvedHostTool<NetworkTool>> {
+    resolve_host_tool(tool, candidates, policy).map_err(Into::into)
+}
+
+struct SetupNetworkTools {
+    sudo: ResolvedHostTool<NetworkTool>,
+    ip: ResolvedHostTool<NetworkTool>,
+    bridge: ResolvedHostTool<NetworkTool>,
+    iptables: ResolvedHostTool<NetworkTool>,
+    sysctl: ResolvedHostTool<NetworkTool>,
+    launch: TrustedLaunchContext,
+}
+
+impl SetupNetworkTools {
+    fn resolve(policy: &TrustedToolPolicy) -> Result<Self> {
+        Self::resolve_with(policy, |tool| {
+            tool.production_candidates()
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+    }
+
+    fn resolve_with(
+        policy: &TrustedToolPolicy,
+        candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            sudo: resolve_network_tool_from_candidates(
+                NetworkTool::Sudo,
+                &candidates(NetworkTool::Sudo),
+                policy,
+            )?,
+            ip: resolve_network_tool_from_candidates(
+                NetworkTool::Ip,
+                &candidates(NetworkTool::Ip),
+                policy,
+            )?,
+            bridge: resolve_network_tool_from_candidates(
+                NetworkTool::Bridge,
+                &candidates(NetworkTool::Bridge),
+                policy,
+            )?,
+            iptables: resolve_network_tool_from_candidates(
+                NetworkTool::Iptables,
+                &candidates(NetworkTool::Iptables),
+                policy,
+            )?,
+            sysctl: resolve_network_tool_from_candidates(
+                NetworkTool::Sysctl,
+                &candidates(NetworkTool::Sysctl),
+                policy,
+            )?,
+            launch: TrustedLaunchContext::system(),
+        })
+    }
+
+    fn ip(&self) -> Cmd {
+        self.launch.elevated(&self.sudo, &self.ip)
+    }
+
+    fn ip_probe(&self) -> Cmd {
+        self.launch.command(&self.ip)
+    }
+
+    fn iptables(&self) -> Cmd {
+        self.launch.elevated(&self.sudo, &self.iptables)
+    }
+
+    fn sysctl(&self) -> Cmd {
+        self.launch.elevated(&self.sudo, &self.sysctl)
+    }
+}
+
+trait BridgeToolset {
+    fn bridge(&self) -> Cmd;
+}
+
+impl BridgeToolset for SetupNetworkTools {
+    fn bridge(&self) -> Cmd {
+        self.launch.elevated(&self.sudo, &self.bridge)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct IsolationNetworkTools {
+    sudo: ResolvedHostTool<NetworkTool>,
+    bridge: ResolvedHostTool<NetworkTool>,
+    launch: TrustedLaunchContext,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl IsolationNetworkTools {
+    fn resolve_production() -> Result<Self> {
+        let policy = production_network_policy()?;
+        Ok(Self {
+            sudo: resolve_network_tool(NetworkTool::Sudo, &policy)?,
+            bridge: resolve_network_tool(NetworkTool::Bridge, &policy)?,
+            launch: TrustedLaunchContext::system(),
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl BridgeToolset for IsolationNetworkTools {
+    fn bridge(&self) -> Cmd {
+        self.launch.elevated(&self.sudo, &self.bridge)
+    }
+}
+
+struct CleanupNetworkTools {
+    sudo: ResolvedHostTool<NetworkTool>,
+    launch: TrustedLaunchContext,
+}
+
+impl CleanupNetworkTools {
+    fn resolve(policy: &TrustedToolPolicy) -> Result<Self> {
+        Ok(Self {
+            sudo: resolve_network_tool(NetworkTool::Sudo, policy)?,
+            launch: TrustedLaunchContext::system(),
+        })
+    }
+
+    fn resolve_with(
+        policy: &TrustedToolPolicy,
+        candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            sudo: resolve_network_tool_from_candidates(
+                NetworkTool::Sudo,
+                &candidates(NetworkTool::Sudo),
+                policy,
+            )?,
+            launch: TrustedLaunchContext::system(),
+        })
+    }
+
+    fn ip(&self, ip: &ResolvedHostTool<NetworkTool>) -> Cmd {
+        self.launch.elevated(&self.sudo, ip)
+    }
+
+    fn ip_probe(&self, ip: &ResolvedHostTool<NetworkTool>) -> Cmd {
+        self.launch.command(ip)
+    }
+
+    fn iptables(&self, iptables: &ResolvedHostTool<NetworkTool>) -> Cmd {
+        self.launch.elevated(&self.sudo, iptables)
+    }
+}
 
 /// Rewrite a host-visible endpoint URL into one reachable from inside the
 /// guest.
@@ -50,41 +287,62 @@ fn host_is_loopback(host: Option<&url::Host<&str>>) -> bool {
 /// Ensure the bridge exists with the host IP, then create and attach the
 /// instance's tap device. Sets up NAT rules if this is the first instance.
 pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
-    let host_iface = resolve_host_iface(&cfg.host_iface)?;
+    let policy = production_network_policy()?;
+    let tools = SetupNetworkTools::resolve(&policy)?;
+    setup_tap_with_tools(cfg, inst, &tools)
+}
+
+#[cfg(test)]
+fn setup_tap_with_policy(
+    cfg: &NetworkConfig,
+    inst: &Instance,
+    policy: &TrustedToolPolicy,
+    candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
+) -> Result<()> {
+    let tools = SetupNetworkTools::resolve_with(policy, candidates)?;
+    setup_tap_with_tools(cfg, inst, &tools)
+}
+
+fn setup_tap_with_tools(
+    cfg: &NetworkConfig,
+    inst: &Instance,
+    tools: &SetupNetworkTools,
+) -> Result<()> {
+    let host_iface = resolve_host_iface(&cfg.host_iface, tools.ip_probe())?;
     let tap = inst.tap_device();
 
-    ensure_bridge(cfg, &host_iface)?;
+    ensure_bridge(cfg, &host_iface, tools)?;
     // Outside ensure_bridge, which returns early on a pre-existing bridge —
     // one left by a crashed teardown must still get the rule.
-    ensure_guest_isolation_rule()?;
+    ensure_guest_isolation_rule(tools)?;
 
     tracing::info!("Setting up TAP device {tap} on bridge {BRIDGE_NAME}");
 
     // Remove existing TAP device if present (leftover from previous run)
-    if tap_exists(&tap) {
+    if tap_exists(&tap, tools.ip_probe()) {
         tracing::debug!("TAP device {tap} already exists, removing");
-        if let Err(e) = Cmd::new("ip").args(["link", "del", &tap]).sudo().run() {
+        if let Err(e) = tools.ip().args(["link", "del", &tap]).run() {
             tracing::debug!("Failed to remove stale TAP {tap} (non-fatal): {e}");
         }
     }
 
-    Cmd::new("ip")
+    tools
+        .ip()
         .args(["tuntap", "add", &tap, "mode", "tap"])
-        .sudo()
         .run()
         .context("Failed to create TAP device")?;
-    Cmd::new("ip")
+    tools
+        .ip()
         .args(["link", "set", &tap, "master", BRIDGE_NAME])
-        .sudo()
         .run()
         .context("Failed to add TAP to bridge")?;
     // The L2 half: the bridge never forwards between two isolated ports. Set
     // before the TAP goes up, so the port is never live and unisolated. The
     // routed path is closed separately, in ensure_guest_isolation_rule.
-    isolate_tap_port(&tap)?;
-    Cmd::new("ip")
+    isolate_tap_port(&tap, tools)?;
+    tools
+        .ip()
         .args(["link", "set", &tap, "up"])
-        .sudo()
         .run()
         .context("Failed to bring up TAP device")?;
 
@@ -95,21 +353,29 @@ pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
 
 /// Remove the instance's tap device. Tears down the bridge if no taps remain.
 pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
+    let policy = production_network_policy()?;
+    let tools = CleanupNetworkTools::resolve(&policy)?;
+    let ip = resolve_network_tool(NetworkTool::Ip, &policy)?;
     let tap = inst.tap_device();
     tracing::info!("Tearing down TAP device {tap}");
 
-    if tap_exists(&tap) {
-        Cmd::new("ip")
+    if tap_exists(&tap, tools.ip_probe(&ip)) {
+        tools
+            .ip(&ip)
             .args(["link", "del", &tap])
-            .sudo()
             .run()
             .context("Failed to delete TAP device")?;
     }
 
     // If no tap devices remain on the bridge, tear it down
-    if bridge_exists() && bridge_is_empty() {
-        let host_iface = resolve_host_iface(&cfg.host_iface).unwrap_or_else(|_| "eth0".into());
-        teardown_bridge(&host_iface);
+    if bridge_exists(tools.ip_probe(&ip)) && bridge_is_empty(tools.ip_probe(&ip)) {
+        let host_iface = resolve_host_iface(&cfg.host_iface, tools.ip_probe(&ip))
+            .unwrap_or_else(|_| "eth0".into());
+        let iptables = resolve_network_tool(NetworkTool::Iptables, &policy);
+        if let Err(error) = &iptables {
+            tracing::debug!("Cannot resolve trusted iptables for cleanup (non-fatal): {error}");
+        }
+        teardown_bridge(&host_iface, &tools, Some(&ip), iptables.as_ref().ok());
     }
 
     tracing::info!("Network teardown complete");
@@ -118,22 +384,73 @@ pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
 
 /// Tear down the bridge and all NAT rules unconditionally.
 pub fn teardown_all(cfg: &NetworkConfig) {
-    let host_iface = resolve_host_iface(&cfg.host_iface).unwrap_or_else(|_| "eth0".into());
-    teardown_bridge(&host_iface);
+    let policy = match production_network_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::debug!("Cannot resolve trusted network cleanup policy (non-fatal): {error}");
+            return;
+        }
+    };
+    teardown_all_with_policy(cfg, &policy, |tool| {
+        tool.production_candidates()
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    });
+}
+
+fn teardown_all_with_policy(
+    cfg: &NetworkConfig,
+    policy: &TrustedToolPolicy,
+    candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
+) {
+    let tools = match CleanupNetworkTools::resolve_with(policy, &candidates) {
+        Ok(tools) => tools,
+        Err(error) => {
+            tracing::debug!("Cannot resolve trusted network cleanup tools (non-fatal): {error}");
+            return;
+        }
+    };
+    let ip =
+        resolve_network_tool_from_candidates(NetworkTool::Ip, &candidates(NetworkTool::Ip), policy);
+    if let Err(error) = &ip {
+        tracing::debug!("Cannot resolve trusted ip for cleanup (non-fatal): {error}");
+    }
+    let host_iface = match (&cfg.host_iface, ip.as_ref().ok()) {
+        (HostInterface::Named(name), _) => name.as_str().to_string(),
+        (HostInterface::Auto, Some(ip)) => {
+            detect_default_iface(tools.ip_probe(ip)).unwrap_or_else(|_| "eth0".into())
+        }
+        (HostInterface::Auto, None) => "eth0".to_string(),
+    };
+    let iptables = resolve_network_tool_from_candidates(
+        NetworkTool::Iptables,
+        &candidates(NetworkTool::Iptables),
+        policy,
+    );
+    if let Err(error) = &iptables {
+        tracing::debug!("Cannot resolve trusted iptables for cleanup (non-fatal): {error}");
+    }
+    teardown_bridge(
+        &host_iface,
+        &tools,
+        ip.as_ref().ok(),
+        iptables.as_ref().ok(),
+    );
 }
 
 // ── Guest-to-guest isolation ──────────────────────────────────
 
 /// Apply the L2 half to one TAP and confirm it took effect.
-fn isolate_tap_port(tap: &str) -> Result<()> {
-    Cmd::new("bridge")
+fn isolate_tap_port(tap: &str, tools: &impl BridgeToolset) -> Result<()> {
+    tools
+        .bridge()
         .args(["link", "set", "dev", tap, "isolated", "on"])
-        .sudo()
         .run()
         .context("Failed to isolate TAP from peer guest ports")?;
-    let flags = Cmd::new("bridge")
+    let flags = tools
+        .bridge()
         .args(["-d", "link", "show", "dev", tap])
-        .sudo()
         .capture()
         .with_context(|| format!("Failed to read back bridge port flags for {tap}"))?;
     if !port_is_isolated(&flags) {
@@ -169,24 +486,24 @@ fn port_is_isolated(flags: &str) -> bool {
 /// Inserted at the head so it cannot lose to a pre-existing permissive
 /// `-A FORWARD -j ACCEPT` from libvirt or another tool. Existing rules are
 /// checked for precedence too; refuse startup if the firewall has shadowed it.
-fn ensure_guest_isolation_rule() -> Result<()> {
-    let present = Cmd::new("iptables")
+fn ensure_guest_isolation_rule(tools: &SetupNetworkTools) -> Result<()> {
+    let present = tools
+        .iptables()
         .args(["-C", "FORWARD"])
         .args(GUEST_ISOLATION_SPEC)
-        .sudo()
         .capture()
         .is_ok();
     if !present {
-        Cmd::new("iptables")
+        tools
+            .iptables()
             .args(["-I", "FORWARD", "1"])
             .args(GUEST_ISOLATION_SPEC)
-            .sudo()
             .run()
             .context("Failed to deny inter-guest routing across the bridge")?;
     }
-    let rules = Cmd::new("iptables")
+    let rules = tools
+        .iptables()
         .args(["-S", "FORWARD"])
-        .sudo()
         .capture()
         .context("Failed to verify guest isolation rule precedence")?;
     if !guest_isolation_rule_is_first(&rules) {
@@ -211,39 +528,40 @@ fn guest_isolation_rule_is_first(rules: &str) -> bool {
 
 // ── Bridge management ─────────────────────────────────────────
 
-fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str) -> Result<()> {
-    if bridge_exists() {
+fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str, tools: &SetupNetworkTools) -> Result<()> {
+    if bridge_exists(tools.ip_probe()) {
         tracing::debug!("Bridge {BRIDGE_NAME} already exists");
         return Ok(());
     }
 
     tracing::info!("Creating bridge {BRIDGE_NAME}");
-    Cmd::new("ip")
+    tools
+        .ip()
         .args(["link", "add", BRIDGE_NAME, "type", "bridge"])
-        .sudo()
         .run()
         .context("Failed to create bridge")?;
 
     let host_cidr = format!("{}{}", cfg.host_ip, cfg.subnet_mask);
-    Cmd::new("ip")
+    tools
+        .ip()
         .args(["addr", "add", &host_cidr, "dev", BRIDGE_NAME])
-        .sudo()
         .run()
         .context("Failed to assign IP to bridge")?;
 
-    Cmd::new("ip")
+    tools
+        .ip()
         .args(["link", "set", BRIDGE_NAME, "up"])
-        .sudo()
         .run()
         .context("Failed to bring up bridge")?;
 
-    Cmd::new("sysctl")
+    tools
+        .sysctl()
         .args(["-w", "net.ipv4.ip_forward=1"])
-        .sudo()
         .run()
         .context("Failed to enable IP forwarding")?;
 
-    Cmd::new("iptables")
+    tools
+        .iptables()
         .args([
             "-t",
             "nat",
@@ -254,11 +572,11 @@ fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str) -> Result<()> {
             "-j",
             "MASQUERADE",
         ])
-        .sudo()
         .run()
         .context("Failed to add NAT masquerade rule")?;
 
-    Cmd::new("iptables")
+    tools
+        .iptables()
         .args([
             "-A",
             "FORWARD",
@@ -269,11 +587,11 @@ fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str) -> Result<()> {
             "-j",
             "ACCEPT",
         ])
-        .sudo()
         .run()
         .context("Failed to add forward rule")?;
 
-    Cmd::new("iptables")
+    tools
+        .iptables()
         .args([
             "-A",
             "FORWARD",
@@ -288,25 +606,35 @@ fn ensure_bridge(cfg: &NetworkConfig, host_iface: &str) -> Result<()> {
             "-j",
             "ACCEPT",
         ])
-        .sudo()
         .run()
         .context("Failed to add return traffic rule")?;
 
     Ok(())
 }
 
-fn teardown_bridge(host_iface: &str) {
+fn teardown_bridge(
+    host_iface: &str,
+    tools: &CleanupNetworkTools,
+    ip: Option<&ResolvedHostTool<NetworkTool>>,
+    iptables: Option<&ResolvedHostTool<NetworkTool>>,
+) {
     tracing::info!("Tearing down bridge {BRIDGE_NAME}");
 
-    if let Err(e) = Cmd::new("iptables")
+    let Some(iptables) = iptables else {
+        teardown_bridge_device(tools, ip);
+        return;
+    };
+
+    if let Err(e) = tools
+        .iptables(iptables)
         .args(["-D", "FORWARD"])
         .args(GUEST_ISOLATION_SPEC)
-        .sudo()
         .run()
     {
         tracing::debug!("Failed to remove guest isolation rule (non-fatal): {e}");
     }
-    if let Err(e) = Cmd::new("iptables")
+    if let Err(e) = tools
+        .iptables(iptables)
         .args([
             "-t",
             "nat",
@@ -317,12 +645,12 @@ fn teardown_bridge(host_iface: &str) {
             "-j",
             "MASQUERADE",
         ])
-        .sudo()
         .run()
     {
         tracing::debug!("Failed to remove NAT rule (non-fatal): {e}");
     }
-    if let Err(e) = Cmd::new("iptables")
+    if let Err(e) = tools
+        .iptables(iptables)
         .args([
             "-D",
             "FORWARD",
@@ -333,12 +661,12 @@ fn teardown_bridge(host_iface: &str) {
             "-j",
             "ACCEPT",
         ])
-        .sudo()
         .run()
     {
         tracing::debug!("Failed to remove forward rule (non-fatal): {e}");
     }
-    if let Err(e) = Cmd::new("iptables")
+    if let Err(e) = tools
+        .iptables(iptables)
         .args([
             "-D",
             "FORWARD",
@@ -353,43 +681,38 @@ fn teardown_bridge(host_iface: &str) {
             "-j",
             "ACCEPT",
         ])
-        .sudo()
         .run()
     {
         tracing::debug!("Failed to remove return traffic rule (non-fatal): {e}");
     }
 
-    if bridge_exists() {
-        if let Err(e) = Cmd::new("ip")
+    teardown_bridge_device(tools, ip);
+}
+
+fn teardown_bridge_device(tools: &CleanupNetworkTools, ip: Option<&ResolvedHostTool<NetworkTool>>) {
+    let Some(ip) = ip else {
+        return;
+    };
+    if bridge_exists(tools.ip_probe(ip)) {
+        if let Err(e) = tools
+            .ip(ip)
             .args(["link", "set", BRIDGE_NAME, "down"])
-            .sudo()
             .run()
         {
             tracing::debug!("Failed to bring down bridge (non-fatal): {e}");
         }
-        if let Err(e) = Cmd::new("ip")
-            .args(["link", "del", BRIDGE_NAME])
-            .sudo()
-            .run()
-        {
+        if let Err(e) = tools.ip(ip).args(["link", "del", BRIDGE_NAME]).run() {
             tracing::debug!("Failed to delete bridge (non-fatal): {e}");
         }
     }
 }
 
-fn bridge_exists() -> bool {
-    Command::new("ip")
-        .args(["link", "show", BRIDGE_NAME])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn bridge_exists(ip: Cmd) -> bool {
+    ip.args(["link", "show", BRIDGE_NAME]).status_ok()
 }
 
-fn bridge_is_empty() -> bool {
-    let output = Command::new("ip")
-        .args(["link", "show", "master", BRIDGE_NAME])
-        .output();
+fn bridge_is_empty(ip: Cmd) -> bool {
+    let output = ip.args(["link", "show", "master", BRIDGE_NAME]).output();
     match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
         Err(_) => true,
@@ -398,15 +721,15 @@ fn bridge_is_empty() -> bool {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-fn resolve_host_iface(configured: &HostInterface) -> Result<String> {
+fn resolve_host_iface(configured: &HostInterface, ip: Cmd) -> Result<String> {
     match configured {
-        HostInterface::Auto => detect_default_iface(),
+        HostInterface::Auto => detect_default_iface(ip),
         HostInterface::Named(name) => Ok(name.as_str().to_string()),
     }
 }
 
-fn detect_default_iface() -> Result<String> {
-    let output = Command::new("ip")
+fn detect_default_iface(ip: Cmd) -> Result<String> {
+    let output = ip
         .args(["route", "show", "default"])
         .output()
         .context("Failed to detect default network interface")?;
@@ -422,19 +745,19 @@ fn detect_default_iface() -> Result<String> {
     Ok(iface)
 }
 
-fn tap_exists(name: &str) -> bool {
-    Command::new("ip")
-        .args(["link", "show", name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn tap_exists(name: &str, ip: Cmd) -> bool {
+    ip.args(["link", "show", name]).status_ok()
 }
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::path::Path;
+
     use super::*;
+    use crate::config::{InstanceIndex, InstanceName, default_image_name};
 
     fn rewrite(url: &str, host: &str) -> String {
         rewrite_host_url(&url::Url::parse(url).unwrap(), host)
@@ -541,6 +864,97 @@ mod tests {
         assert!(!loopback("192.168.0.1"));
         assert!(!loopback("example.com"));
         assert!(!host_is_loopback(None));
+    }
+
+    #[test]
+    fn network_tool_identities_have_only_fixed_absolute_candidates() {
+        assert_eq!(
+            NetworkTool::Sudo.production_candidates(),
+            ["/usr/bin/sudo", "/bin/sudo"]
+        );
+        for (tool, name) in [
+            (NetworkTool::Ip, "ip"),
+            (NetworkTool::Bridge, "bridge"),
+            (NetworkTool::Iptables, "iptables"),
+            (NetworkTool::Sysctl, "sysctl"),
+        ] {
+            assert_eq!(
+                tool.production_candidates(),
+                [
+                    format!("/usr/sbin/{name}"),
+                    format!("/sbin/{name}"),
+                    format!("/usr/bin/{name}"),
+                    format!("/bin/{name}"),
+                ]
+            );
+            assert!(
+                tool.production_candidates()
+                    .iter()
+                    .all(|candidate| Path::new(candidate).is_absolute())
+            );
+        }
+    }
+
+    #[test]
+    fn setup_resolves_every_tool_before_running_the_first_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        let markers = temp.path().join("markers");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir(&markers).unwrap();
+        for name in ["sudo", "ip", "bridge", "iptables"] {
+            let executable = bin.join(name);
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nexit 0\n",
+                    markers.join(name).display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+        let cfg = NetworkConfig::default();
+        let inst = Instance {
+            name: InstanceName::new("resolution-order").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: temp.path().join("instance"),
+            image: default_image_name(),
+        };
+        let error = setup_tap_with_policy(&cfg, &inst, &policy, |tool| vec![bin.join(tool.name())])
+            .unwrap_err();
+        assert!(error.to_string().contains("trusted host tool 'sysctl'"));
+        assert_eq!(fs::read_dir(markers).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn teardown_all_keeps_firewall_cleanup_when_ip_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let marker = temp.path().join("iptables-runs");
+
+        let sudo = bin.join("sudo");
+        fs::write(&sudo, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
+        fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+        let iptables = bin.join("iptables");
+        fs::write(
+            &iptables,
+            format!("#!/bin/sh\nprintf 'run\\n' >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&iptables, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+        teardown_all_with_policy(&NetworkConfig::default(), &policy, |tool| {
+            vec![bin.join(tool.name())]
+        });
+        assert_eq!(fs::read_to_string(marker).unwrap(), "run\n".repeat(4));
     }
 }
 

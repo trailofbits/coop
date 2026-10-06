@@ -234,6 +234,16 @@ from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
 
+The trusted-host-tool unit fixtures use a private synthetic filesystem root so
+they do not depend on tools installed on the development host. They cover fixed
+candidate mapping, missing/relative/writable rejection, trusted symlink hops,
+ambient-`PATH` exclusion, explicit cwd/environment, absolute elevated argv, and
+complete `setup_tap` resolution before the first probe. The ignored Linux
+network namespace test additionally resolves the production `sudo` and
+`bridge` policy before exercising bridge-port isolation; ordinary unit tests do
+not require the production tools because CI installs those prerequisites only
+for the later isolated network gate.
+
 For file-transfer changes, extend the fixture through the later host operation
 that consumes the transferred data. Use the relevant real tool to exercise
 implicit file discovery, with a disposable destination and no real credentials

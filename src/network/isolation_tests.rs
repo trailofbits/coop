@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::Command;
 
-use crate::network::isolate_tap_port;
+use crate::network::{IsolationNetworkTools, isolate_tap_port};
 
 fn ping(namespace: &str, address: &str) -> i32 {
     let output = Command::new("ip")
@@ -55,10 +55,11 @@ fn bridge_port_isolation_blocks_peers_without_firewall() {
 
     assert_peers_reachable();
     assert_gateway_reachable();
-    isolate_tap_port("port-a").unwrap();
+    let tools = IsolationNetworkTools::resolve_production().unwrap();
+    isolate_tap_port("port-a", &tools).unwrap();
     // Isolation is pairwise: marking just one port must leave peers reachable.
     assert_peers_reachable();
-    isolate_tap_port("port-b").unwrap();
+    isolate_tap_port("port-b", &tools).unwrap();
     assert_eq!(ping("guest-a", "192.0.2.3"), 1, "A must not reach B");
     assert_eq!(ping("guest-b", "192.0.2.2"), 1, "B must not reach A");
     assert_gateway_reachable();

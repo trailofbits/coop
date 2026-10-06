@@ -19,6 +19,7 @@ mod github_submodules;
 mod guest;
 mod guest_env_state;
 pub mod guest_files;
+mod host_tool;
 mod model_state;
 mod naming;
 mod pat_prompt;

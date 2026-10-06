@@ -121,6 +121,25 @@ host execution authority. Record which consumer interprets each file and what
 authority that interpretation grants; explicit transfer opt-in does not by
 itself authorize host execution.
 
+The Linux network control-plane family is one narrow implementation of this
+contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
+only from exact candidates under `/usr/bin`, `/usr/sbin`, `/bin`, or `/sbin`.
+It validates every controlling path component and symlink hop, requires the
+canonical target to remain under those roots, and requires root ownership, a
+regular executable target, and no group/other write bits. It executes the
+selected absolute candidate (preserving alternatives/multi-call argv[0]),
+clears the launcher environment, supplies only `LANG=C` and `LC_ALL=C`, and
+sets cwd to `/`. Elevated commands use both the resolved absolute `sudo` and
+resolved absolute target. `sudo` may rebuild the elevated command's environment
+or cwd according to trusted sudoers/plugins; the guarantee here is the bounded
+context supplied to `sudo`, not an exact post-policy root environment.
+
+This remains pathname-based validation followed by pathname-based execution;
+it does not pin an inode, validate an executable's loader/library closure, or
+close inherited file descriptors. It also does not cover other host subprocess
+families. Non-FHS layouts such as NixOS/Guix require a separate reviewed policy
+instead of trusting broad `/run`, store, or user-profile roots.
+
 ## Secrets and how they cross into the guest
 
 `[[guest_files]]` explicitly authorizes copying complete host source trees into
@@ -278,6 +297,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   TAP, enables `ip_forward`, and adds a `MASQUERADE` + `FORWARD` ruleset so the
   guest reaches the internet through the host's default interface. A change
   that widens guest egress or adds inbound reachability is a finding.
+- Firecracker setup resolves all five required network-tool identities before
+  default-interface discovery or the first network mutation. Teardown resolves
+  only the tools needed for each cleanup category, logs unavailable best-effort
+  categories, and never falls back to ambient `PATH`.
 - **Guest VMs cannot reach each other by IP.** All Firecracker guests share
   `br0` and a single subnet, so this is enforced, not structural, and it takes
   **two** complementary controls — removing either one re-opens the path:
