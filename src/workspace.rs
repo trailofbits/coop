@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -15,9 +17,8 @@ use crate::remote_command::RemoteCommand;
 const GUEST_WORKSPACE: &str = "/workspace";
 
 /// Default exclusions for transfers — reproducible build/cache directories
-/// only. `.git/` is intentionally absent: agents inside the guest need
-/// history, branches, and the ability to make commits that survive a
-/// `coop pull`. Opt out per-transfer with `exclude_git: true`.
+/// only. Git metadata is handled separately because the safe policy depends on
+/// the transfer direction.
 const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules/",
     "target/",
@@ -26,7 +27,19 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     ".coop/",
 ];
 
-const GIT_EXCLUDE: &str = ".git/";
+/// Best-effort match for Git administration entries in every ASCII case.
+///
+/// macOS filesystems are commonly case-insensitive, so allowing a guest `.GIT`
+/// entry through a case-sensitive filter can still overwrite the host's
+/// `.git`. The bracket form works with both rsync and tar and matches at every
+/// directory depth. This filter reduces accidental transfer; it is not a
+/// security boundary because transport and filesystem name semantics vary.
+const GIT_EXCLUDE: &str = ".[gG][iI][tT]";
+
+const PULL_UNTRUSTED_WARNING: &str = "Pull copies files controlled by the untrusted guest. \
+Treat the result as potentially malicious: review it before executing files or interpreting \
+it with Git, editors, build tools, shells, or other host applications. Git metadata filtering \
+is best effort, not a security boundary.";
 
 /// Persisted workspace metadata written during `start`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,13 +111,11 @@ impl WorkspaceState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.workspace_state_path();
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        let content = match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => content,
+            Ok(None) => return Ok(None),
             Err(e) => {
-                return Err(
-                    anyhow::anyhow!(e).context(format!("Failed to read {}", path.display()))
-                );
+                return Err(e.context(format!("Failed to read {}", path.display())));
             }
         };
         serde_json::from_str(&content)
@@ -149,8 +160,8 @@ pub fn try_load_or_warn(inst: &Instance, consequence: &str) -> Option<WorkspaceS
 ///
 /// Streams `tar cf -` straight into a guest-side `tar xf - -C /workspace`.
 /// No staging file on either side, so peak disk usage on the guest is
-/// just the extracted tree. Integrity relies on SSH's MAC over the
-/// localhost transport plus tar's per-header checksums.
+/// just the extracted tree. SSH protects the stream in transit; tar checks
+/// archive headers. There is no application-level checksum.
 pub fn tar_pipe_transfer(target: &SshTarget, source_dir: &Path, exclude_git: bool) -> Result<()> {
     let workspace = GuestPath::absolute(GUEST_WORKSPACE)?;
     tar_pipe_transfer_to(target, source_dir, &workspace, exclude_git)
@@ -460,10 +471,11 @@ fn load_or_default(inst: &Instance, dir: Option<&str>, cmd: &str) -> Result<Work
     )
 }
 
-/// Push local directory to guest. Uses rsync if available, falls back to tar-pipe.
+/// Push local directory to guest. Uses rsync if available, falls back to tar-pipe
+/// except for live Lima mounts, where tar would write into its own source tree.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — no surprise SSH failure inside.
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature. The guest can still stop before SSH connects.
 pub fn push(
     running: &RunningInstance,
     dir: Option<&str>,
@@ -492,35 +504,67 @@ pub fn push(
     if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
-        tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_transfer(target, &source_dir, exclude_git)?;
+        tar_push_fallback(
+            target,
+            &source_dir,
+            &state,
+            exclude_git,
+            cfg!(target_os = "macos"),
+        )?;
     }
 
     tracing::info!("Push complete");
     Ok(())
 }
 
+fn tar_fallback_targets_live_mount(source: &WorkspaceSource, mounts_are_live: bool) -> bool {
+    mounts_are_live && matches!(source, WorkspaceSource::Mount { .. })
+}
+
+fn tar_push_fallback(
+    target: &SshTarget,
+    source_dir: &Path,
+    state: &WorkspaceState,
+    exclude_git: bool,
+    mounts_are_live: bool,
+) -> Result<()> {
+    if tar_fallback_targets_live_mount(&state.source, mounts_are_live) {
+        target.exec(RemoteCommand::new().literal("true"))?;
+        bail!(
+            "Cannot tar-push into a live Lima mount: extraction could overwrite its own \
+             host source. Lima mounts normally expose host changes directly; install guest rsync \
+             to push a different --dir."
+        );
+    }
+    tracing::info!("rsync not available on guest, using tar-pipe");
+    tar_pipe_transfer_to(target, source_dir, &state.guest_path, exclude_git)
+}
+
 /// Pull guest workspace to local directory. Uses rsync if available, falls back to tar-pipe.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — no surprise SSH failure inside.
-pub fn pull(
-    running: &RunningInstance,
-    dir: Option<&str>,
-    force: bool,
-    exclude_git: bool,
-) -> Result<()> {
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature. The guest can still stop before SSH connects.
+pub fn pull(running: &RunningInstance, dir: Option<&str>, force: bool) -> Result<()> {
     let inst = running.instance();
     let target = running.target();
     let state = load_or_default(inst, dir, "pull")?;
     let dest_dir = resolve_host_dir(dir, &state, "pull")?;
+    let operation = PullOperation::new(pull_staging_path(inst)?)?;
 
-    if !force && dest_dir.exists() {
-        check_local_dirty(&dest_dir)?;
+    if !force && pull_destination_is_nonempty(&dest_dir)? {
+        bail!(
+            "Refusing to pull into non-empty destination '{}'.\n\
+             coop does not inspect the destination with Git because its files and repository \
+             metadata may be untrusted. Review the destination, then rerun with --force to \
+             authorize overwriting matching files. --force does not make pulled content trusted.",
+            dest_dir.display()
+        );
     }
 
     fs::create_dir_all(&dest_dir)
         .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+
+    tracing::warn!("{PULL_UNTRUSTED_WARNING}");
 
     tracing::info!(
         "Pulling guest:{} -> {}",
@@ -529,10 +573,10 @@ pub fn pull(
     );
 
     if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
-        rsync_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
+        rsync_pull(target, &state.guest_path, &dest_dir, &operation)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
-        tar_pipe_pull(target, &state.guest_path, &dest_dir, exclude_git)?;
+        tar_pipe_pull(target, &state.guest_path, &dest_dir, &operation)?;
     }
 
     tracing::info!("Pull complete");
@@ -611,8 +655,8 @@ pub enum EditorKind {
 
 /// Generate SSH config and launch an editor connected over SSH.
 ///
-/// Takes a `RunningInstance` so the caller's proof of liveness is
-/// visible in the signature — the editor needs a live SSH target.
+/// Takes a `RunningInstance` so the caller's recent live-state observation is
+/// visible in the signature — the editor needs an SSH target.
 pub fn open_editor(
     running: &RunningInstance,
     project: Option<&str>,
@@ -787,21 +831,39 @@ fn rsync_pull(
     target: &SshTarget,
     guest_path: &GuestPath,
     dest: &Path,
-    exclude_git: bool,
+    operation: &PullOperation,
 ) -> Result<()> {
-    let mut args = rsync_base_args(target, exclude_git);
+    let mut args = rsync_pull_args(target);
     args.push(format!("{}:{guest_path}/", target.addr()));
-    args.push(format!("{}/", dest.display()));
+    // A compromised guest controls the remote rsync sender. Stage its file
+    // list away from the destination, then apply the Git-metadata exclusion
+    // again with the trusted host rsync during installation.
+    let mut staging = operation.staging()?;
+    args.push(format!("{}/", staging.path()?.display()));
 
-    let status = Command::new("rsync")
-        .args(&args)
-        .status()
-        .context("Failed to run rsync")?;
+    let result = (|| {
+        let mut command = locked_rsync_command(&args, operation);
+        let status = command.status().context("Failed to run rsync")?;
 
-    if !status.success() {
-        bail!("rsync pull failed");
-    }
-    Ok(())
+        if !status.success() {
+            bail!("rsync pull failed");
+        }
+        install_staged_pull(staging.path()?, dest, operation)
+    })();
+    staging.finish(result)
+}
+
+fn rsync_pull_args(target: &SshTarget) -> Vec<String> {
+    // Guest-authored Git administration data is active configuration, not
+    // workspace content. Apply the common-name filter as defense-in-depth.
+    rsync_base_args(target, true)
+}
+
+fn locked_rsync_command(args: &[String], operation: &PullOperation) -> Command {
+    let mut command = Command::new("rsync");
+    command.args(args);
+    operation.inherit_lock_in(&mut command);
+    command
 }
 
 // ── Transport: tar-pipe ───────────────────────────────────────
@@ -831,19 +893,18 @@ fn tar_command() -> Command {
     cmd
 }
 
-/// Remote command that streams a tar archive of `guest_path` to stdout,
-/// applying the same exclusions as a push.
+/// Remote command that streams a filtered pull archive of `guest_path` to stdout.
 ///
 /// `guest_path` is shell-escaped (via [`RemoteCommand::arg`]); the exclude
 /// patterns are fixed constants, not user input.
-fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
+fn tar_pull_cmd(guest_path: &GuestPath) -> RemoteCommand {
     let mut excludes: Vec<String> = DEFAULT_EXCLUDES
         .iter()
         .map(|exc| format!("--exclude={exc}"))
         .collect();
-    if exclude_git {
-        excludes.push(format!("--exclude={GIT_EXCLUDE}"));
-    }
+    // Match rsync pull's best-effort filter for common Git administration
+    // names. The host extraction path applies the same filter independently.
+    excludes.push(format!("--exclude={GIT_EXCLUDE}"));
     let exclude_str = excludes.join(" ");
     RemoteCommand::new()
         .literal("tar cf - -C ")
@@ -851,22 +912,82 @@ fn tar_pull_cmd(guest_path: &GuestPath, exclude_git: bool) -> RemoteCommand {
         .literal(format!(" {exclude_str} ."))
 }
 
+/// Local extraction command for a guest-created pull archive.
+///
+/// The guest is untrusted and may replace or wrap its `tar`, so the host must
+/// enforce the Git-administration exclusion independently while extracting.
+fn tar_pull_extract_cmd(dest: &Path) -> Command {
+    let mut command = tar_command();
+    command
+        .arg("xf")
+        .arg("-")
+        .arg(format!("--exclude={GIT_EXCLUDE}"))
+        .arg("-C")
+        .arg(dest);
+    command
+}
+
+fn locked_tar_pull_extract_cmd(dest: &Path, operation: &PullOperation) -> Command {
+    let mut command = tar_pull_extract_cmd(dest);
+    operation.inherit_lock_in(&mut command);
+    command
+}
+
+fn install_staged_pull(source: &Path, dest: &Path, operation: &PullOperation) -> Result<()> {
+    let args = install_staged_pull_args(source, dest);
+    let mut command = locked_rsync_command(&args, operation);
+    let status = command.status().context("Failed to install staged pull")?;
+
+    if !status.success() {
+        bail!("Failed to install staged pull");
+    }
+    Ok(())
+}
+
+fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
+    vec![
+        "-a".to_string(),
+        format!("--exclude={GIT_EXCLUDE}"),
+        format!("{}/", source.display()),
+        format!("{}/", dest.display()),
+    ]
+}
+
 fn tar_pipe_pull(
     target: &SshTarget,
     guest_path: &GuestPath,
     dest: &Path,
-    exclude_git: bool,
+    operation: &PullOperation,
 ) -> Result<()> {
-    let remote_cmd = tar_pull_cmd(guest_path, exclude_git).into_string();
+    let remote_cmd = tar_pull_cmd(guest_path).into_string();
+    // Never unpack an archive authored by the untrusted guest into an existing
+    // host workspace. In particular, a tar hard-link entry can otherwise name
+    // an allowed path while targeting an existing `.git/config`. An empty
+    // staging directory makes such cross-boundary links fail before rsync
+    // installs the ordinary workspace entries.
+    let mut staging = operation.staging()?;
 
+    let result = tar_pipe_pull_staged(target, &remote_cmd, staging.path()?, dest, operation);
+    staging.finish(result)
+}
+
+fn tar_pipe_pull_staged(
+    target: &SshTarget,
+    remote_cmd: &str,
+    staging: &Path,
+    dest: &Path,
+    operation: &PullOperation,
+) -> Result<()> {
     let mut ssh_args = target.ssh_opts();
     ssh_args.push(target.addr());
-    ssh_args.push(remote_cmd);
+    ssh_args.push(remote_cmd.to_string());
 
-    let mut ssh_child = Command::new("ssh")
+    let mut ssh_command = Command::new("ssh");
+    ssh_command
         .args(&ssh_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut ssh_child = ssh_command
         .spawn()
         .context("Failed to start SSH for tar-pipe pull")?;
 
@@ -879,13 +1000,9 @@ fn tar_pipe_pull(
         .take()
         .context("Failed to get SSH stderr")?;
 
-    let mut tar_child = Command::new("tar")
-        .arg("xf")
-        .arg("-")
-        .arg("-C")
-        .arg(dest)
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut tar_command = locked_tar_pull_extract_cmd(staging, operation);
+    tar_command.stdin(Stdio::piped()).stderr(Stdio::piped());
+    let mut tar_child = tar_command
         .spawn()
         .context("Failed to start local tar extraction")?;
 
@@ -951,10 +1068,208 @@ fn tar_pipe_pull(
         );
     }
 
-    Ok(())
+    install_staged_pull(staging, dest, operation)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+fn pull_staging_path(inst: &Instance) -> Result<PathBuf> {
+    let instances_dir = inst
+        .dir
+        .parent()
+        .context("Instance directory has no parent for pull staging")?;
+    let data_dir = instances_dir
+        .parent()
+        .context("Instances directory has no parent for pull staging")?;
+    Ok(data_dir.join("pull-staging/work"))
+}
+
+/// Host-owned staging directory for data received from an untrusted guest.
+///
+/// The stable outer directory is private and never exposed to the transfer
+/// tools. They receive into its `contents` child, whose mode the guest may
+/// replace. A global lock serializes pulls sharing the coop data directory. If the process
+/// dies before cleanup, the next pull removes the same bounded staging tree
+/// before recreating it. Cleanup restores owner traversal permissions without
+/// following symlinks. `Drop` is only a panic fallback; normal paths report a
+/// cleanup failure to the caller.
+struct PullOperation {
+    staging_root: PathBuf,
+    lock: crate::fs_util::FileLock,
+}
+
+impl PullOperation {
+    fn new(staging_root: PathBuf) -> Result<Self> {
+        let parent = staging_root
+            .parent()
+            .context("Pull staging path has no parent")?;
+        let _parent = crate::fs_util::PrivateDir::create(parent)
+            .context("Failed to prepare private pull staging storage")?;
+        // Serialize every pull that shares this private coop data directory,
+        // not just pulls from one instance. Otherwise two instances could
+        // both authorize the same empty destination before either installs.
+        let lock = crate::fs_util::lock_sibling_bounded(
+            &parent.join("pull"),
+            std::time::Duration::from_secs(30),
+        )
+        .context("Failed to lock pull staging directory")?;
+        Ok(Self { staging_root, lock })
+    }
+
+    fn staging(&self) -> Result<PullStaging> {
+        PullStaging::new(&self.staging_root)
+    }
+
+    fn inherit_lock_in(&self, command: &mut Command) {
+        self.lock.inherit_in(command);
+    }
+}
+
+struct PullStaging {
+    root: Option<PathBuf>,
+    contents: PathBuf,
+}
+
+impl PullStaging {
+    fn new(root: &Path) -> Result<Self> {
+        remove_staging_directory(root).context("Failed to remove stale pull staging directory")?;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(root).with_context(|| {
+            format!("Failed to create pull staging directory {}", root.display())
+        })?;
+
+        let contents = root.join("contents");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        if let Err(error) = builder.create(&contents) {
+            let cleanup = fs::remove_dir(root);
+            return match cleanup {
+                Ok(()) => Err(error).with_context(|| {
+                    format!(
+                        "Failed to create pull staging contents directory {}",
+                        contents.display()
+                    )
+                }),
+                Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                    "Failed to create pull staging contents directory {}; additionally failed to remove {}: {cleanup_error}",
+                    contents.display(),
+                    root.display()
+                ))),
+            };
+        }
+
+        Ok(Self {
+            root: Some(root.to_path_buf()),
+            contents,
+        })
+    }
+
+    fn path(&self) -> Result<&Path> {
+        self.root
+            .as_ref()
+            .map(|_| self.contents.as_path())
+            .context("Pull staging directory is no longer available")
+    }
+
+    fn finish(&mut self, operation: Result<()>) -> Result<()> {
+        let cleanup = self.cleanup();
+        match (operation, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+                "Additionally failed to remove pull staging directory: {cleanup_error:#}"
+            ))),
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let root = self
+            .root
+            .take()
+            .context("Pull staging directory was already cleaned")?;
+        remove_staging_directory(&root).context("Failed to remove pull staging directory")
+    }
+}
+
+impl Drop for PullStaging {
+    fn drop(&mut self) {
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        let _ = remove_staging_directory(&root);
+    }
+}
+
+fn remove_staging_directory(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect staging path {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_dir() {
+        let permissions = make_staging_directories_traversable(path);
+        let removal = fs::remove_dir_all(path)
+            .with_context(|| format!("Failed to remove staging path {}", path.display()));
+        match (permissions, removal) {
+            (_, Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(permission_error), Err(removal_error)) => Err(removal_error.context(format!(
+                "Failed to restore staged directory permissions before removal: \
+                 {permission_error:#}"
+            ))),
+        }
+    } else {
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "Failed to remove non-directory staging path {}",
+                path.display()
+            )
+        })
+    }
+}
+
+fn make_staging_directories_traversable(path: &Path) -> Result<()> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let metadata = fs::symlink_metadata(&directory)
+            .with_context(|| format!("Failed to inspect staged path {}", directory.display()))?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+
+        let mode = metadata.permissions().mode();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(mode | 0o700)).with_context(
+            || {
+                format!(
+                    "Failed to restore owner permissions on staged directory {}",
+                    directory.display()
+                )
+            },
+        )?;
+        for entry in fs::read_dir(&directory).with_context(|| {
+            format!(
+                "Failed to traverse staged directory {}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "Failed to inspect entry in staged directory {}",
+                    directory.display()
+                )
+            })?;
+            pending.push(entry.path());
+        }
+    }
+    Ok(())
+}
 
 fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState, cmd: &str) -> Result<PathBuf> {
     if let Some(d) = explicit {
@@ -979,15 +1294,15 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
     // commits are the real signal that an agent has done work the host
     // doesn't yet know about.
     let check_cmd = RemoteCommand::new()
-        .literal("if [ -d ")
+        .literal("if [ -e ")
         .arg(guest_path)
         .literal("/.git ]; then cd ")
         .arg(guest_path)
         .literal(
-            " && \
-             git status --porcelain --untracked-files=no && \
+            " || exit 20; \
+             git status --porcelain --untracked-files=no || exit 21; \
              if git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
-                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null); \
+                 ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null) || exit 22; \
                  if [ \"${ahead:-0}\" -gt 0 ]; then \
                      echo \"AHEAD $ahead\"; \
                  fi; \
@@ -1004,39 +1319,47 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
         .output()
         .context("Failed to check guest workspace status")?;
 
+    if !output.status.success() {
+        let reason = match output.status.code() {
+            Some(20) => "guest workspace directory could not be opened",
+            Some(21) => "guest git status failed",
+            Some(22) => "guest git rev-list failed",
+            _ => "SSH or guest workspace status probe failed",
+        };
+        bail!(
+            "Cannot determine guest workspace cleanliness: {reason}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
         bail!(
             "Guest workspace has changes the host does not know about:\n{stdout}\n\
-             Pull them with `coop pull`, or overwrite with `coop push --force`."
+             Pull them into a missing or empty review directory with \
+             `coop pull --dir <new-directory>`, or overwrite with `coop push --force`."
         );
     }
 
     Ok(())
 }
 
-fn check_local_dirty(dest: &Path) -> Result<()> {
-    let git_dir = dest.join(".git");
-    if !git_dir.exists() {
-        return Ok(());
+fn pull_destination_is_nonempty(dest: &Path) -> Result<bool> {
+    let mut entries = match fs::read_dir(dest) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect pull destination {}", dest.display()));
+        }
+    };
+
+    match entries.next() {
+        None => Ok(false),
+        Some(Ok(_)) => Ok(true),
+        Some(Err(error)) => Err(error)
+            .with_context(|| format!("Failed to inspect pull destination {}", dest.display())),
     }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dest)
-        .args(["status", "--porcelain"])
-        .output()
-        .context("Failed to check local git status")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-        bail!(
-            "Local directory has uncommitted changes:\n{stdout}\n\
-             Use --force to overwrite"
-        );
-    }
-
-    Ok(())
 }
 
 // ── SSH config / VS Code ──────────────────────────────────────
@@ -1072,6 +1395,8 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
+         \x20   IdentityAgent none\n\
+         \x20   ForwardAgent no\n\
          \x20   StrictHostKeyChecking no\n\
          \x20   UserKnownHostsFile /dev/null\n\
          \x20   LogLevel ERROR\n\
@@ -1346,7 +1671,10 @@ fn launch_editor(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::num::NonZeroU16;
+
     use super::*;
+    use crate::backend::{Hostname, SshTarget, SshUser};
     use crate::config::{ImageName, InstanceIndex, InstanceName};
     use proptest::prelude::*;
 
@@ -1357,6 +1685,271 @@ mod tests {
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
         }
+    }
+
+    fn test_pull_operation(parent: &Path) -> PullOperation {
+        PullOperation::new(parent.join("pull-staging/work")).unwrap()
+    }
+
+    fn assert_writer_child_holds_pull_lock(
+        operation: PullOperation,
+        child: &mut std::process::Child,
+        lock_path: &Path,
+    ) {
+        use std::os::fd::AsRawFd as _;
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "writer exited too early"
+        );
+        drop(operation);
+
+        let probe = fs::OpenOptions::new().write(true).open(lock_path).unwrap();
+        // SAFETY: probe owns a valid descriptor for the duration of the call.
+        let lock_result = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let lock_error = std::io::Error::last_os_error();
+        let process_group = i32::try_from(child.id()).unwrap();
+        // SAFETY: both fixtures put the writer in a process group whose ID is
+        // the child's PID. Killing the group also terminates rsync helpers that
+        // inherited the lock descriptor.
+        assert_eq!(unsafe { libc::kill(-process_group, libc::SIGKILL) }, 0);
+        child.wait().unwrap();
+        assert_eq!(
+            lock_result, -1,
+            "writer child did not retain the pull operation lock"
+        );
+        assert_eq!(lock_error.kind(), std::io::ErrorKind::WouldBlock);
+
+        let mut released = false;
+        for _ in 0..50 {
+            // SAFETY: probe owns a valid descriptor for every attempt.
+            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            released,
+            "writer process group did not release the pull lock"
+        );
+    }
+
+    #[test]
+    fn failed_or_dirty_status_prevents_transfer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(mode) = std::env::var("COOP_TEST_CLEANLINESS_MODE") else {
+            for mode in [
+                "guest_git_failure",
+                "guest_git_file_failure",
+                "ssh_failure",
+                "guest_dirty",
+                "clean",
+                "force",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let ssh = temp.path().join("ssh");
+                fs::write(&ssh, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_CAPTURE\"\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) for last; do :; done; exec sh -c \"$last\";;\n ssh_failure) exit 255;;\n guest_dirty) echo ' M guest-file'; exit 0;;\n clean|force) case \"$*\" in *'which rsync'*) exit 1;; esac; cat >/dev/null; exit 0;;\nesac\n").unwrap();
+                fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+                let git = temp.path().join("git");
+                fs::write(&git, "#!/bin/sh\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) exit 42;;\nesac\n").unwrap();
+                fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+                let path = format!(
+                    "{}:{}",
+                    temp.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "workspace::tests::failed_or_dirty_status_prevents_transfer",
+                    ])
+                    .env("COOP_TEST_CLEANLINESS_MODE", mode)
+                    .env("COOP_TEST_CLEANLINESS_ROOT", temp.path())
+                    .env("COOP_TEST_CAPTURE", temp.path().join("ssh-calls"))
+                    .env("PATH", path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let calls = fs::read_to_string(temp.path().join("ssh-calls")).unwrap_or_default();
+                if mode == "clean" || mode == "force" {
+                    assert!(calls.contains("tar xf - -C"), "{calls}");
+                    if mode == "force" {
+                        assert!(!calls.contains("git status"), "{calls}");
+                    }
+                } else {
+                    assert!(!calls.contains("tar xf - -C"), "{mode}: {calls}");
+                    assert!(!calls.contains("which rsync"), "{mode}: {calls}");
+                }
+            }
+            return;
+        };
+
+        let root = PathBuf::from(std::env::var("COOP_TEST_CLEANLINESS_ROOT").unwrap());
+        run_cleanliness_case(&root, &mode);
+    }
+
+    fn run_cleanliness_case(root: &Path, mode: &str) {
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "content").unwrap();
+        let guest = root.join("guest");
+        fs::create_dir(&guest).unwrap();
+        if mode == "guest_git_file_failure" {
+            fs::write(guest.join(".git"), "gitdir: /tmp/worktree\n").unwrap();
+        } else {
+            fs::create_dir_all(guest.join(".git")).unwrap();
+        }
+        let inst = temp_instance(&root.join("instance"));
+        WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: source.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        let running = RunningInstance::new(inst, target);
+        let result = push(&running, None, mode == "force", false);
+        match mode {
+            "clean" | "force" => assert!(result.is_ok(), "{result:?}"),
+            "guest_git_failure" | "guest_git_file_failure" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("guest git status failed")
+            ),
+            "ssh_failure" => assert!(result.unwrap_err().to_string().contains("SSH or guest")),
+            "guest_dirty" => {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("Guest workspace has changes"), "{message}");
+                assert!(
+                    message.contains("coop pull --dir <new-directory>"),
+                    "{message}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn push_fallback_uses_recorded_guest_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(root) = std::env::var("COOP_TEST_PUSH_FALLBACK_ROOT") else {
+            let temp = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let fake_ssh = temp.path().join("ssh");
+            fs::write(
+                &fake_ssh,
+                "#!/bin/sh\ncase \"$*\" in *'which rsync'*) exit 1;; esac\nfor last; do :; done\nif [ \"$last\" = \"tar xf - -C '/workspace'\" ]; then exit 1; fi\nexec sh -c \"$last\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::push_fallback_uses_recorded_guest_path",
+                ])
+                .env("COOP_TEST_PUSH_FALLBACK_ROOT", temp.path())
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let root = Path::new(&root);
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("witness"), "content").unwrap();
+        let guest = root.join("custom 'mount;$(false)");
+        fs::create_dir(&guest).unwrap();
+        let inst = temp_instance(&root.join("instance"));
+        WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: source.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        let running = RunningInstance::new(inst, target);
+        push(&running, None, true, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(guest.join("witness")).unwrap(),
+            "content"
+        );
+
+        fs::remove_file(guest.join("witness")).unwrap();
+        let mount_state = WorkspaceState {
+            guest_path: GuestPath::absolute(guest.to_string_lossy().into_owned()).unwrap(),
+            source: WorkspaceSource::Mount {
+                host_path: source.clone(),
+            },
+        };
+        let error = tar_push_fallback(running.target(), &source, &mount_state, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Cannot tar-push into a live Lima mount"),
+            "{error}"
+        );
+        assert!(!guest.join("witness").exists());
+
+        fs::write(root.join("ssh"), "#!/bin/sh\nexit 255\n").unwrap();
+        let error = tar_push_fallback(running.target(), &source, &mount_state, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SSH command failed"), "{error}");
+    }
+
+    #[test]
+    fn tar_fallback_rejects_only_live_mount_sources() {
+        let mount = WorkspaceSource::Mount {
+            host_path: PathBuf::from("/host"),
+        };
+        let workspace = WorkspaceSource::Workspace {
+            host_path: PathBuf::from("/host"),
+        };
+        let git_repo = WorkspaceSource::GitRepo {
+            url: crate::github_repo::GitRepoUrl::new("https://github.com/x/y.git"),
+        };
+
+        assert!(tar_fallback_targets_live_mount(&mount, true));
+        assert!(!tar_fallback_targets_live_mount(&mount, false));
+        assert!(!tar_fallback_targets_live_mount(&workspace, true));
+        assert!(!tar_fallback_targets_live_mount(&git_repo, true));
     }
 
     #[test]
@@ -1951,6 +2544,8 @@ Host coop-app\n\
         assert!(block.contains("Port 2222"));
         assert!(block.contains("User ubuntu"));
         assert!(block.contains("IdentityFile /tmp/key"));
+        assert!(block.contains("    IdentityAgent none\n"));
+        assert!(block.contains("    ForwardAgent no\n"));
         assert!(block.contains("StrictHostKeyChecking no"));
         assert!(block.contains("UserKnownHostsFile /dev/null"));
     }
@@ -2112,15 +2707,14 @@ Host coop-other\n\
 
     #[test]
     fn default_excludes_omit_git() {
-        // Issue #91: `.git/` was previously hardcoded into DEFAULT_EXCLUDES,
-        // which silently stripped git history from agents in the guest. The
-        // policy is now opt-out via --exclude-git; lock it in here so a
-        // future tidy-up doesn't accidentally re-add `.git/`.
+        // Host-to-guest transfers include Git metadata by default so agents
+        // receive repository history. Pulls enforce their stricter policy at
+        // the direction-specific call sites.
         assert!(
             !DEFAULT_EXCLUDES.iter().any(|e| e.contains(".git")),
             "DEFAULT_EXCLUDES must not contain a .git pattern; got {DEFAULT_EXCLUDES:?}"
         );
-        assert_eq!(GIT_EXCLUDE, ".git/");
+        assert_eq!(GIT_EXCLUDE, ".[gG][iI][tT]");
     }
 
     #[test]
@@ -2159,7 +2753,9 @@ Host coop-other\n\
             }
 
             let has_protect = args.iter().any(|a| a == "--filter=+ /.git/***");
-            let has_exclude_git = args.iter().any(|a| a == "--exclude=.git/");
+            let has_exclude_git = args
+                .iter()
+                .any(|a| a == "--exclude=.[gG][iI][tT]");
             // Exactly one git rule, selected by the flag.
             prop_assert_eq!(has_protect, !exclude_git);
             prop_assert_eq!(has_exclude_git, exclude_git);
@@ -2170,7 +2766,9 @@ Host coop-other\n\
                 .expect("expected .gitignore merge filter");
             let git_rule_idx = args
                 .iter()
-                .position(|a| a == "--filter=+ /.git/***" || a == "--exclude=.git/")
+                .position(|a| {
+                    a == "--filter=+ /.git/***" || a == "--exclude=.[gG][iI][tT]"
+                })
                 .expect("expected a git rule");
             prop_assert!(
                 git_rule_idx < gitignore_idx,
@@ -2178,6 +2776,532 @@ Host coop-other\n\
                 args
             );
         }
+    }
+
+    #[test]
+    fn pull_transports_apply_best_effort_git_exclusions() {
+        let target = fake_ssh_target();
+        let rsync_args = rsync_pull_args(&target);
+        assert!(
+            rsync_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]")
+        );
+        assert!(!rsync_args.iter().any(|arg| arg == "--filter=+ /.git/***"));
+
+        let tar = tar_pull_cmd(&GuestPath::absolute("/workspace").unwrap()).into_string();
+        assert!(tar.contains("--exclude=.[gG][iI][tT]"), "{tar}");
+
+        let extract = tar_pull_extract_cmd(Path::new("/host/workspace"));
+        let extract_args: Vec<_> = extract
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            extract_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
+            "{extract_args:?}"
+        );
+
+        let staged_args =
+            install_staged_pull_args(Path::new("/pull-staging"), Path::new("/host/workspace"));
+        assert!(
+            staged_args
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
+            "{staged_args:?}"
+        );
+    }
+
+    #[test]
+    fn pull_staging_cleanup_repairs_guest_directory_modes_without_following_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
+        let staging_path = staging.path().unwrap().to_path_buf();
+        let locked = staging.path().unwrap().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("guest-file"), "untrusted").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        symlink(outside.path(), staging.path().unwrap().join("outside-link")).unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = staging.finish(Err(anyhow::anyhow!("receive failed")));
+
+        assert_eq!(result.unwrap_err().to_string(), "receive failed");
+        assert!(!staging_path.exists());
+        assert_eq!(
+            fs::symlink_metadata(outside.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o000,
+            "cleanup must not follow a staged symlink"
+        );
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn pull_staging_path_is_a_stable_private_storage_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let instances = temp.path().join("instances");
+        let inst = temp_instance(&instances.join("test"));
+
+        assert_eq!(
+            pull_staging_path(&inst).unwrap(),
+            temp.path().join("pull-staging/work")
+        );
+    }
+
+    #[test]
+    fn pull_staging_outer_directory_stays_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "COOP_PULL_STAGING_PRIVATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::pull_staging_outer_directory_stays_private_under_permissive_umask",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        // SAFETY: only this isolated child test changes the process umask.
+        unsafe {
+            libc::umask(0);
+        }
+        let parent = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
+        fs::set_permissions(staging.path().unwrap(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let outer = parent.path().join("pull-staging/work");
+        assert_eq!(
+            fs::metadata(&outer).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "guest-controlled modes below staging must not expose its outer boundary"
+        );
+        staging.finish(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn pull_staging_replaces_the_bounded_tree_left_by_an_interrupted_pull() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("pull-staging/work");
+        let stale = root.join("contents/locked");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("guest-file"), "stale").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let mut staging = operation.staging().unwrap();
+
+        assert_eq!(staging.path().unwrap(), root.join("contents"));
+        assert_eq!(fs::read_dir(staging.path().unwrap()).unwrap().count(), 0);
+        staging.finish(Ok(())).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn pull_staging_cleanup_propagates_inspection_errors_other_than_missing() {
+        let parent = tempfile::tempdir().unwrap();
+        let non_directory = parent.path().join("file");
+        fs::write(&non_directory, "not a directory").unwrap();
+
+        let error = remove_staging_directory(&non_directory.join("child")).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Failed to inspect staging path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn pull_rsync_writer_keeps_operation_lock_after_parent_guard_drops() {
+        use std::os::unix::process::CommandExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        let dest = parent.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("large"), vec![0; 1024 * 1024]).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let args = vec![
+            "-a".to_string(),
+            "--bwlimit=1".to_string(),
+            format!("{}/", source.display()),
+            format!("{}/", dest.display()),
+        ];
+        let mut command = locked_rsync_command(&args, &operation);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+
+        assert_writer_child_holds_pull_lock(
+            operation,
+            &mut child,
+            &parent.path().join("pull-staging/.pull.operation.lock"),
+        );
+    }
+
+    #[test]
+    fn pull_tar_writer_keeps_operation_lock_after_parent_guard_drops() {
+        use std::os::unix::process::CommandExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let operation = test_pull_operation(parent.path());
+        let mut command = locked_tar_pull_extract_cmd(&dest, &operation);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let _stdin = child.stdin.take().unwrap();
+
+        assert_writer_child_holds_pull_lock(
+            operation,
+            &mut child,
+            &parent.path().join("pull-staging/.pull.operation.lock"),
+        );
+    }
+
+    #[test]
+    fn pull_staging_drop_is_a_cleanup_fallback() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let operation = test_pull_operation(parent.path());
+        let staging_path = {
+            let staging = operation.staging().unwrap();
+            let staging_path = staging.path().unwrap().to_path_buf();
+            let locked = staging.path().unwrap().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::write(locked.join("guest-file"), "untrusted").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            symlink(outside.path(), staging.path().unwrap().join("outside-link")).unwrap();
+            fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o000)).unwrap();
+            staging_path
+        };
+
+        assert!(!staging_path.exists());
+        assert_eq!(
+            fs::symlink_metadata(outside.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o000,
+            "drop cleanup must not follow a staged symlink"
+        );
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn rsync_pull_stages_a_malicious_sender_before_installation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const ROOT_ENV: &str = "COOP_TEST_RSYNC_PULL_STAGING_ROOT";
+        const REAL_RSYNC_ENV: &str = "COOP_TEST_RSYNC_PULL_REAL_RSYNC";
+
+        let Ok(root) = std::env::var(ROOT_ENV) else {
+            let temp = tempfile::tempdir().unwrap();
+            let dest = temp.path().join("dest");
+            let bin = temp.path().join("bin");
+            let staging_parent = temp.path().join("pull-tmp");
+            fs::create_dir_all(dest.join(".git")).unwrap();
+            fs::create_dir(&bin).unwrap();
+            fs::create_dir(&staging_parent).unwrap();
+            fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
+
+            let real_rsync = Command::new("sh")
+                .args(["-c", "command -v rsync"])
+                .output()
+                .unwrap();
+            assert!(real_rsync.status.success());
+            let real_rsync = String::from_utf8(real_rsync.stdout).unwrap();
+
+            let rsync = bin.join("rsync");
+            fs::write(
+                &rsync,
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *:/workspace/*)\n\
+                     for last do :; done\n\
+                     mkdir -p \"$last/.git\"\n\
+                     printf 'guest-controlled\\n' > \"$last/.git/config\"\n\
+                     printf 'worktree\\n' > \"$last/workspace-file\"\n\
+                     ;;\n\
+                   *) exec \"$COOP_TEST_RSYNC_PULL_REAL_RSYNC\" \"$@\" ;;\n\
+                 esac\n",
+            )
+            .unwrap();
+            fs::set_permissions(&rsync, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::rsync_pull_stages_a_malicious_sender_before_installation",
+                ])
+                .env(ROOT_ENV, temp.path())
+                .env(REAL_RSYNC_ENV, real_rsync.trim())
+                .env("TMPDIR", &staging_parent)
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let root = PathBuf::from(root);
+        let dest = root.join("dest");
+        let staging = root.join("pull-tmp/staging");
+        let operation = PullOperation::new(staging.clone()).unwrap();
+        rsync_pull(
+            &fake_ssh_target(),
+            &GuestPath::absolute("/workspace").unwrap(),
+            &dest,
+            &operation,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("workspace-file")).unwrap(),
+            "worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".git/config")).unwrap(),
+            "host-owned\n"
+        );
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn tar_pull_extractor_omits_common_guest_git_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(source.join("nested/.GiT")).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("workspace-file"), "worktree\n").unwrap();
+        fs::write(source.join("nested/.GiT/config"), "guest-controlled\n").unwrap();
+
+        let archive = temp.path().join("guest.tar");
+        let packed = tar_command()
+            .args(["cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(packed.success());
+
+        let archive_input = fs::File::open(&archive).unwrap();
+        let extracted = tar_pull_extract_cmd(&dest)
+            .stdin(Stdio::from(archive_input))
+            .status()
+            .unwrap();
+        assert!(extracted.success());
+        assert_eq!(
+            fs::read_to_string(dest.join("workspace-file")).unwrap(),
+            "worktree\n"
+        );
+        assert!(!dest.join("nested/.GiT").exists());
+    }
+
+    #[test]
+    fn tar_pull_staging_rejects_hard_links_into_git_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(source.join(".git/config"), "guest-controlled\n").unwrap();
+        fs::hard_link(source.join(".git/config"), source.join("alias")).unwrap();
+
+        let archive = temp.path().join("guest-hard-link.tar");
+        let packed = tar_command()
+            .args(["cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .args([".git/config", "alias"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+
+        let archive_input = fs::File::open(&archive).unwrap();
+        let extracted = tar_pull_extract_cmd(&staging)
+            .stdin(Stdio::from(archive_input))
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!extracted.success());
+        assert!(!staging.join("alias").exists());
+    }
+
+    #[test]
+    fn tar_pipe_pull_stages_before_touching_an_existing_destination() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const ROOT_ENV: &str = "COOP_TEST_TAR_PULL_STAGING_ROOT";
+        const ARCHIVE_ENV: &str = "COOP_TEST_TAR_PULL_STAGING_ARCHIVE";
+
+        let Ok(root) = std::env::var(ROOT_ENV) else {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let dest = temp.path().join("dest");
+            let bin = temp.path().join("bin");
+            let staging_parent = temp.path().join("pull-tmp");
+            fs::create_dir_all(source.join(".git")).unwrap();
+            fs::create_dir_all(dest.join(".git")).unwrap();
+            fs::create_dir(&bin).unwrap();
+            fs::create_dir(&staging_parent).unwrap();
+            fs::write(source.join(".git/config"), "guest-controlled\n").unwrap();
+            fs::hard_link(source.join(".git/config"), source.join("alias")).unwrap();
+            fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
+
+            let archive = temp.path().join("guest-hard-link.tar");
+            let packed = tar_command()
+                .args(["cf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(&source)
+                .args([".git/config", "alias"])
+                .status()
+                .unwrap();
+            assert!(packed.success());
+
+            let ssh = bin.join("ssh");
+            fs::write(
+                &ssh,
+                "#!/bin/sh\ncat \"$COOP_TEST_TAR_PULL_STAGING_ARCHIVE\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace::tests::tar_pipe_pull_stages_before_touching_an_existing_destination",
+                ])
+                .env(ROOT_ENV, temp.path())
+                .env(ARCHIVE_ENV, &archive)
+                .env("TMPDIR", &staging_parent)
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let root = PathBuf::from(root);
+        let dest = root.join("dest");
+        let staging = root.join("pull-tmp/staging");
+        let operation = PullOperation::new(staging.clone()).unwrap();
+        let result = tar_pipe_pull(
+            &fake_ssh_target(),
+            &GuestPath::absolute("/workspace").unwrap(),
+            &dest,
+            &operation,
+        );
+        assert!(
+            result.is_err(),
+            "excluded hard-link target must fail extraction"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".git/config")).unwrap(),
+            "host-owned\n"
+        );
+        assert!(!staging.exists());
+        assert!(!dest.join("alias").exists());
+    }
+
+    #[test]
+    fn staged_pull_best_effort_filter_leaves_common_host_git_path_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(staging.join(".GiT")).unwrap();
+        fs::create_dir_all(dest.join(".git")).unwrap();
+        fs::write(staging.join("workspace-file"), "worktree\n").unwrap();
+        fs::write(staging.join(".GiT/config"), "guest-controlled\n").unwrap();
+        fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
+
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&staging, &dest, &operation).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.join("workspace-file")).unwrap(),
+            "worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".git/config")).unwrap(),
+            "host-owned\n"
+        );
+    }
+
+    #[test]
+    fn pull_destination_requires_force_based_only_on_directory_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let empty = temp.path().join("empty");
+        let nonempty = temp.path().join("nonempty");
+        let not_directory = temp.path().join("not-directory");
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("guest-controlled"), "data").unwrap();
+        fs::write(&not_directory, "data").unwrap();
+
+        assert!(!pull_destination_is_nonempty(&missing).unwrap());
+        assert!(!pull_destination_is_nonempty(&empty).unwrap());
+        assert!(pull_destination_is_nonempty(&nonempty).unwrap());
+        assert!(pull_destination_is_nonempty(&not_directory).is_err());
+    }
+
+    #[test]
+    fn pull_warning_states_the_actual_trust_boundary() {
+        assert!(PULL_UNTRUSTED_WARNING.contains("untrusted guest"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("potentially malicious"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("best effort"));
+        assert!(PULL_UNTRUSTED_WARNING.contains("not a security boundary"));
     }
 
     // ── WorkspaceState serialization ──────────────────────────
@@ -2219,7 +3343,7 @@ Host coop-other\n\
             "extract command must single-quote the guest path"
         );
 
-        let pull = tar_pull_cmd(&evil, false).into_string();
+        let pull = tar_pull_cmd(&evil).into_string();
         assert!(
             pull.starts_with("tar cf - -C '/work; rm -rf / $(touch pwned)' "),
             "pull command must single-quote the guest path: {pull}"

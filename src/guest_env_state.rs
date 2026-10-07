@@ -1,34 +1,24 @@
 //! Per-instance snapshot of start-time guest env overrides.
 //!
-//! Mirrors [`crate::port_forward::ForwardsState`]. Two sources contribute
-//! entries that live only in the `coop start` process's memory and would
-//! otherwise be lost to subsequent `coop shell`/`exec` invocations
-//! (which reload `config.toml` from scratch):
-//!
-//! - `--env KEY=VALUE` from the CLI
-//! - `containerEnv` translated from a `--devcontainer` JSON file
-//!
-//! Both are passed at start time and never re-derived by later commands,
-//! so we persist them here and overlay them onto the resolved env-forward
-//! set in [`crate::prepare_session_from_target`].
+//! Mirrors [`crate::port_forward::ForwardsState`]. Current versions save CLI
+//! `--env` entries so later shell and exec invocations can reapply them. A
+//! snapshot created before devcontainer support was removed can also contain
+//! translated `containerEnv` entries; those remain readable so existing
+//! instances keep their established environment until they are recreated.
 //!
 //! `[guest_env]` from `config.toml` is deliberately *not* in the snapshot:
 //! it is re-read on every invocation, so persisting it would freeze edits
 //! the user made between `start` and `shell`.
 //!
-//! Restart can extend or override the snapshot — passing `--env
-//! KEY=newvalue` (or a `--devcontainer` whose `containerEnv` carries a
-//! new value) on `coop start <stopped>` wins over the saved value for
-//! that key and replaces it in the saved set.
+//! Restart can extend or override the snapshot with new `--env` values.
 //!
 //! Persistence layout: one JSON file at `<inst.dir>/guest_env.json`.
 //! Empty snapshots are not written; an empty file would be ambiguous
 //! with "no snapshot," and the missing-file branch already means
 //! "nothing extra to overlay."
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
@@ -40,8 +30,8 @@ use crate::config::Instance;
 ///
 /// Construction guarantees the name matches `[a-zA-Z_][a-zA-Z0-9_]*`, so
 /// downstream code (SSH `SendEnv`, JSON snapshots, shell env exports)
-/// can use it without re-checking. The CLI parser and the devcontainer
-/// translator are the two validating boundaries.
+/// can use it without re-checking. CLI parsing and snapshot deserialization
+/// validate this boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EnvVarName(String);
 
@@ -86,6 +76,12 @@ impl AsRef<str> for EnvVarName {
     }
 }
 
+impl Borrow<str> for EnvVarName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl FromStr for EnvVarName {
     type Err = anyhow::Error;
 
@@ -107,9 +103,7 @@ impl<'de> Deserialize<'de> for EnvVarName {
     }
 }
 
-/// Persisted start-time guest-env snapshot (CLI `--env` plus
-/// devcontainer `containerEnv`), applied on every later `coop`
-/// invocation that targets the same instance.
+/// Persisted start-time guest environment, applied on later invocations.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GuestEnvState {
     /// Entries to overlay onto the resolved env-forward set. `BTreeMap`
@@ -125,9 +119,7 @@ impl GuestEnvState {
         if self.entries.is_empty() {
             // Don't leave a stale or empty snapshot behind — the
             // missing-file branch already encodes "nothing to overlay."
-            if path.exists()
-                && let Err(e) = fs::remove_file(&path)
-            {
+            if let Err(e) = crate::fs_util::remove_private_if_exists(&path) {
                 tracing::debug!(
                     "Failed to remove empty guest_env state {} (non-fatal): {e}",
                     path.display()
@@ -145,37 +137,16 @@ impl GuestEnvState {
 
     pub fn try_load(inst: &Instance) -> Result<Option<Self>> {
         let path = inst.guest_env_state_path();
-        match fs::read_to_string(&path) {
-            Ok(content) => {
+        match crate::fs_util::read_optional_private(&path) {
+            Ok(Some(content)) => {
                 let state =
                     serde_json::from_str(&content).context("Failed to parse guest_env.json")?;
                 Ok(Some(state))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.context(format!("Failed to read {}", path.display()))),
         }
     }
-}
-
-/// Merge devcontainer `containerEnv` and CLI `--env` entries into the
-/// single map persisted as [`GuestEnvState`]. CLI wins on key conflict,
-/// matching the documented "CLI > devcontainer.json" precedence.
-///
-/// The translator already filters CLI keys out of its `guest_env` map
-/// (see `translate_container_env`), so in practice there is no overlap;
-/// the explicit CLI-wins insertion is defensive against future changes.
-#[must_use]
-pub fn merge_persisted_entries(
-    devcontainer_entries: &BTreeMap<EnvVarName, String>,
-    cli_entries: &BTreeMap<EnvVarName, String>,
-) -> BTreeMap<EnvVarName, String> {
-    let mut out = devcontainer_entries.clone();
-    for (key, value) in cli_entries {
-        out.insert(key.clone(), value.clone());
-    }
-    out
 }
 
 /// Parse a single `--env KEY=VALUE` entry. Suitable for clap
@@ -277,7 +248,7 @@ mod tests {
         // Put a directory where the JSON file is expected: reading it fails
         // with a non-NotFound error kind, which must surface as Err rather
         // than being swallowed as Ok(None).
-        fs::create_dir_all(inst.guest_env_state_path()).unwrap();
+        std::fs::create_dir_all(inst.guest_env_state_path()).unwrap();
         assert!(GuestEnvState::try_load(&inst).is_err());
     }
 
@@ -292,25 +263,6 @@ mod tests {
 
         GuestEnvState::default().save(&inst).unwrap();
         assert!(!inst.guest_env_state_path().exists());
-    }
-
-    // ── merge_persisted_entries ──────────────────────────────
-
-    #[test]
-    fn merge_persisted_entries_unions_disjoint_keys() {
-        let dc = BTreeMap::from([(env("DC"), "1".to_string())]);
-        let cli = BTreeMap::from([(env("CLI"), "2".to_string())]);
-        let merged = merge_persisted_entries(&dc, &cli);
-        assert_eq!(merged.get(&env("DC")).map(String::as_str), Some("1"));
-        assert_eq!(merged.get(&env("CLI")).map(String::as_str), Some("2"));
-    }
-
-    #[test]
-    fn merge_persisted_entries_cli_wins_on_conflict() {
-        let dc = BTreeMap::from([(env("K"), "from-devcontainer".to_string())]);
-        let cli = BTreeMap::from([(env("K"), "from-cli".to_string())]);
-        let merged = merge_persisted_entries(&dc, &cli);
-        assert_eq!(merged.get(&env("K")).map(String::as_str), Some("from-cli"));
     }
 
     // ── parse_cli_env_arg ────────────────────────────────────
@@ -344,9 +296,8 @@ mod tests {
 
     // ── property tests ───────────────────────────────────────
 
-    /// Keys drawn from a deliberately small space so independently generated
-    /// maps overlap often, exercising the CLI-wins-on-collision path rather
-    /// than only disjoint unions.
+    /// Keys drawn from a deliberately small space to exercise varied map
+    /// sizes and repeated generated values.
     fn small_env_map() -> impl Strategy<Value = BTreeMap<EnvVarName, String>> {
         prop::collection::btree_map(
             "[A-E]".prop_map(|s| EnvVarName::new(&s).unwrap()),
@@ -362,31 +313,6 @@ mod tests {
         fn env_var_name_accepts_all_valid_forms(s in "[a-zA-Z_][a-zA-Z0-9_]*") {
             let name = EnvVarName::new(&s).unwrap();
             prop_assert_eq!(name.as_str(), s.as_str());
-        }
-
-        /// `merge_persisted_entries` keeps every key from both tiers (totality)
-        /// and resolves collisions in the CLI's favour (precedence). It is
-        /// intentionally not idempotent or associative across overlapping
-        /// tiers, so only these two invariants are asserted.
-        #[test]
-        fn merge_persisted_entries_is_total_and_cli_wins(
-            dc in small_env_map(),
-            cli in small_env_map(),
-        ) {
-            let merged = merge_persisted_entries(&dc, &cli);
-
-            // Totality: the key set is exactly the union — nothing dropped or
-            // invented.
-            let union: std::collections::BTreeSet<_> =
-                dc.keys().chain(cli.keys()).cloned().collect();
-            let got: std::collections::BTreeSet<_> = merged.keys().cloned().collect();
-            prop_assert_eq!(got, union);
-
-            // Precedence: CLI wins on collision; devcontainer fills the rest.
-            for (k, v) in &merged {
-                let expected = cli.get(k).or_else(|| dc.get(k)).unwrap();
-                prop_assert_eq!(v, expected);
-            }
         }
 
         /// A `GuestEnvState` round-trips through disk unchanged: save → load

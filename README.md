@@ -21,6 +21,11 @@ cargo build --workspace --release
 cp target/release/coop target/release/coop-proxy /usr/local/bin/
 ```
 
+With Nix, run `nix build` to build both binaries in `result/bin`, or
+`nix run . -- --help` to run the CLI. See [Nix builds](docs/getting-started.md#nix)
+for installation and updates, and [Nix development](CONTRIBUTING.md#nix) for
+the development shell.
+
 Then build the VM template image:
 
 ```shell

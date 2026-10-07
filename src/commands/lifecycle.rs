@@ -6,14 +6,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::json;
-use super::{
-    DevcontainerInput, DevcontainerOpts, resolve_devcontainer, resolve_devcontainer_collect,
-};
 use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
-    backend, config, devcontainer, github_repo, guest, guest_env_state, model_state, pat_prompt,
-    port_forward, prompt, proxy, proxy_state, setup, signal, ssh, workspace,
+    backend, config, github_repo, guest, guest_env_state, model_state, pat_prompt, port_forward,
+    prompt, proxy, proxy_state, setup, signal, ssh, workspace,
 };
 
 pub(crate) struct UpOpts<'a> {
@@ -31,7 +28,6 @@ pub(crate) struct UpOpts<'a> {
     pub(crate) image: Option<config::ImageName>,
     pub(crate) profile_target: Option<ProfileImageTarget>,
     pub(crate) runtime: UpRuntimeOpts,
-    pub(crate) devcontainer: UpDevcontainerOpts,
 }
 
 impl UpOpts<'_> {
@@ -59,13 +55,6 @@ pub(crate) struct UpRuntimeOpts {
     pub(crate) forward_ports: Vec<config::PortForward>,
     pub(crate) post_start: Option<String>,
     pub(crate) guest_env: Vec<(guest_env_state::EnvVarName, String)>,
-}
-
-pub(crate) struct UpDevcontainerOpts {
-    pub(crate) input: DevcontainerInput,
-    pub(crate) dry_run: bool,
-    /// Emit the dry-run plan as JSON on stdout (only meaningful with `dry_run`).
-    pub(crate) json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,35 +112,12 @@ pub(crate) fn cmd_up(
         host_path: project_dir.clone(),
         guest_path: workspace::default_workspace_path(),
     };
-    let discovery_mounts = if transport == ProjectTransport::Mount {
-        std::slice::from_ref(&project_mount)
-    } else {
-        &[]
-    };
-
-    if opts.devcontainer.dry_run {
-        return emit_up_dry_run(
-            cfg,
-            opts,
-            &DevcontainerOpts {
-                input: &opts.devcontainer.input,
-                dry_run: true,
-                workspace: Some(&project_dir),
-                mounts: discovery_mounts,
-                git_repo: None,
-                github_auth: cfg.github.as_ref(),
-                preference_path: Some(&cfg.devcontainer_preferences_path()),
-            },
-        );
-    }
-
     if !opts.new_instance
         && let Some(inst) = find_workspace_instance(cfg, &project_dir)?
     {
         ensure_up_project_name_matches(&inst, &project_dir, opts)?;
         ensure_up_existing_inputs_are_compatible(&inst, transport, opts)?;
         if be.is_running(&inst) {
-            devcontainer::warn_if_applied_devcontainer_changed(&inst);
             reject_running_up_restart_inputs(&inst, opts)?;
             tracing::info!(
                 "Instance '{}' is already running for {}",
@@ -162,22 +128,14 @@ pub(crate) fn cmd_up(
         }
 
         let mut restart_opts = runtime_start_opts_from_up(opts, config_path);
-        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, None, &mut restart_opts);
+        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, &mut restart_opts);
         restart_instance(be, cfg, &inst, &restart_opts)?;
         return Ok(());
     }
 
     ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
 
-    create_up_instance(
-        be,
-        cfg,
-        config_path,
-        opts,
-        &project_dir,
-        &project_mount,
-        discovery_mounts,
-    )
+    create_up_instance(be, cfg, config_path, opts, &project_dir, &project_mount)
 }
 
 fn cmd_up_git_repo(
@@ -187,22 +145,6 @@ fn cmd_up_git_repo(
     opts: &UpOpts<'_>,
     repo_url: &str,
 ) -> Result<()> {
-    if opts.devcontainer.dry_run {
-        return emit_up_dry_run(
-            cfg,
-            opts,
-            &DevcontainerOpts {
-                input: &opts.devcontainer.input,
-                dry_run: true,
-                workspace: None,
-                mounts: &[],
-                git_repo: Some(repo_url),
-                github_auth: cfg.github.as_ref(),
-                preference_path: Some(&cfg.devcontainer_preferences_path()),
-            },
-        );
-    }
-
     if !opts.new_instance
         && let Some(inst) = find_git_repo_instance(cfg, repo_url)?
     {
@@ -215,76 +157,13 @@ fn cmd_up_git_repo(
         }
 
         let mut restart_opts = runtime_start_opts_from_up(opts, config_path);
-        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, None, &mut restart_opts);
+        apply_runtime_guest_env(cfg, &opts.runtime.guest_env, &mut restart_opts);
         restart_instance(be, cfg, &inst, &restart_opts)?;
         return Ok(());
     }
 
     ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
     create_git_repo_instance(be, cfg, config_path, opts, repo_url)
-}
-
-fn up_translator_inputs(
-    cfg: &config::CoopConfig,
-    opts: &UpOpts<'_>,
-) -> devcontainer::TranslatorInputs {
-    devcontainer::TranslatorInputs {
-        cli_vcpus: opts.vcpus,
-        cli_mem_mib: opts.mem,
-        cli_disk_gib: opts.disk,
-        cli_post_start: opts.runtime.post_start.clone(),
-        cli_guest_env_keys: opts
-            .runtime
-            .guest_env
-            .iter()
-            .map(|(k, _)| k.clone())
-            .collect(),
-        cli_forward_ports: opts.runtime.forward_ports.clone(),
-        cli_mounts: opts.extra_mount.clone(),
-        cli_profiles: opts
-            .profile_target
-            .as_ref()
-            .map(|target| target.profiles.clone())
-            .unwrap_or_default(),
-        persisted_guest_user: Some(backend::persisted_guest_user(cfg, &opts.effective_image())),
-        cli_workspace_or_git_repo: true,
-        ..devcontainer::TranslatorInputs::default()
-    }
-}
-
-/// Run the shared up dry-run: resolve the devcontainer for `Stage::Start`,
-/// then either render the human report to stderr or emit the resolved
-/// [`json::DryRunPlan`] to stdout.
-fn emit_up_dry_run(
-    cfg: &config::CoopConfig,
-    opts: &UpOpts<'_>,
-    dc_opts: &DevcontainerOpts<'_>,
-) -> Result<()> {
-    let inputs = up_translator_inputs(cfg, opts);
-    if !opts.devcontainer.json {
-        resolve_devcontainer(dc_opts, &inputs, devcontainer::Stage::Start)?;
-        return Ok(());
-    }
-    let translation = resolve_devcontainer_collect(dc_opts, &inputs, devcontainer::Stage::Start)?;
-    // Features that map to profiles are baked into the image at `coop setup`
-    // time, not selected per-start, so a Start-stage translation contributes
-    // no profiles; the effective set is exactly the CLI `--profile` list.
-    let profiles = opts
-        .profile_target
-        .as_ref()
-        .map_or(&[][..], |t| t.profiles.as_slice());
-    let guest_user = backend::persisted_guest_user(cfg, &opts.effective_image());
-    let plan = json::DryRunPlan {
-        report: translation.as_ref().map(|t| &t.report),
-        profiles,
-        guest_user: &guest_user,
-        vm: json::VmOverrides {
-            vcpus: opts.vcpus,
-            mem_mib: opts.mem.map(config::VmMemory::get),
-            disk_gib: opts.disk,
-        },
-    };
-    json::render_json(&plan)
 }
 
 fn create_up_instance(
@@ -294,55 +173,10 @@ fn create_up_instance(
     opts: &UpOpts<'_>,
     project_dir: &Path,
     project_mount: &config::Mount,
-    discovery_mounts: &[config::Mount],
 ) -> Result<()> {
-    let inputs = up_translator_inputs(cfg, opts);
-    let translation = resolve_devcontainer(
-        &DevcontainerOpts {
-            input: &opts.devcontainer.input,
-            dry_run: false,
-            workspace: Some(project_dir),
-            mounts: discovery_mounts,
-            git_repo: None,
-            github_auth: cfg.github.as_ref(),
-            preference_path: Some(&cfg.devcontainer_preferences_path()),
-        },
-        &inputs,
-        devcontainer::Stage::Start,
-    )?;
-
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
-    if let Some(t) = &translation {
-        devcontainer::apply_to_config(cfg, t)?;
-    }
-
-    let mut forward_ports = opts.runtime.forward_ports.clone();
-    if let Some(t) = &translation {
-        forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
-    }
-
-    let persisted_guest_env = merge_runtime_guest_env(
-        cfg,
-        &opts.runtime.guest_env,
-        translation.as_ref().map(|t| &t.guest_env),
-    );
-
-    let default_translation = devcontainer::Translation::default();
-    let effective_disk = devcontainer::effective_disk(
-        opts.disk,
-        translation.as_ref().unwrap_or(&default_translation),
-    );
-    let post_start_override = opts
-        .runtime
-        .post_start
-        .clone()
-        .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
-
-    let mut mounts = translation
-        .as_ref()
-        .map(|t| t.mounts.clone())
-        .unwrap_or_default();
-    mounts.extend(opts.extra_mount.clone());
+    let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
+    let mut mounts = opts.extra_mount.clone();
 
     let (workspace_dir, rule) = match opts.transport {
         ProjectTransport::Copy => (
@@ -362,15 +196,13 @@ fn create_up_instance(
         git_repo: None,
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
-        disk: effective_disk,
+        disk: opts.disk,
         mounts,
         exclude_git: opts.runtime.exclude_git,
-        forward_ports,
+        forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
-        post_start_override: post_start_override.as_deref(),
+        post_start_override: opts.runtime.post_start.as_deref(),
         persisted_guest_env,
-        devcontainer_path: None,
-        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
     };
 
     allocate_and_start(
@@ -391,53 +223,9 @@ fn create_git_repo_instance(
     opts: &UpOpts<'_>,
     repo_url: &str,
 ) -> Result<()> {
-    let inputs = up_translator_inputs(cfg, opts);
-    let translation = resolve_devcontainer(
-        &DevcontainerOpts {
-            input: &opts.devcontainer.input,
-            dry_run: false,
-            workspace: None,
-            mounts: &[],
-            git_repo: Some(repo_url),
-            github_auth: cfg.github.as_ref(),
-            preference_path: Some(&cfg.devcontainer_preferences_path()),
-        },
-        &inputs,
-        devcontainer::Stage::Start,
-    )?;
-
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
-    if let Some(t) = &translation {
-        devcontainer::apply_to_config(cfg, t)?;
-    }
-
-    let mut forward_ports = opts.runtime.forward_ports.clone();
-    if let Some(t) = &translation {
-        forward_ports = devcontainer::merge_into_forward_ports(&t.forward_ports, &forward_ports);
-    }
-
-    let persisted_guest_env = merge_runtime_guest_env(
-        cfg,
-        &opts.runtime.guest_env,
-        translation.as_ref().map(|t| &t.guest_env),
-    );
-
-    let default_translation = devcontainer::Translation::default();
-    let effective_disk = devcontainer::effective_disk(
-        opts.disk,
-        translation.as_ref().unwrap_or(&default_translation),
-    );
-    let post_start_override = opts
-        .runtime
-        .post_start
-        .clone()
-        .or_else(|| translation.as_ref().and_then(|t| t.post_start.clone()));
-
-    let mut mounts = translation
-        .as_ref()
-        .map(|t| t.mounts.clone())
-        .unwrap_or_default();
-    mounts.extend(opts.extra_mount.clone());
+    let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
+    let mounts = opts.extra_mount.clone();
     let mounts =
         workspace::ValidatedMounts::assemble(workspace::WorkspaceMountRule::GitRepoClone, mounts)?
             .into_vec();
@@ -448,15 +236,13 @@ fn create_git_repo_instance(
         git_repo: Some(repo_url),
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
-        disk: effective_disk,
+        disk: opts.disk,
         mounts,
         exclude_git: opts.runtime.exclude_git,
-        forward_ports,
+        forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
-        post_start_override: post_start_override.as_deref(),
+        post_start_override: opts.runtime.post_start.as_deref(),
         persisted_guest_env,
-        devcontainer_path: None,
-        applied_devcontainer: translation.as_ref().and_then(|t| t.applied.clone()),
     };
 
     let derived_name = opts
@@ -490,7 +276,6 @@ fn ensure_profile_image(
             skip_confirm: true,
             rebuild: false,
             profiles: resolved_profiles,
-            oci_features: Vec::new(),
             extra_packages: Vec::new(),
             post_install: None,
             image: target.image.clone(),
@@ -537,18 +322,15 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         config_path,
         post_start_override: opts.runtime.post_start.as_deref(),
         persisted_guest_env: std::collections::BTreeMap::new(),
-        devcontainer_path: None,
-        applied_devcontainer: None,
     }
 }
 
 pub(crate) fn apply_runtime_guest_env(
     cfg: &mut config::CoopConfig,
     cli_guest_env: &[(guest_env_state::EnvVarName, String)],
-    dc_guest_env: Option<&std::collections::BTreeMap<guest_env_state::EnvVarName, String>>,
     start_opts: &mut StartOpts<'_>,
 ) {
-    start_opts.persisted_guest_env = merge_runtime_guest_env(cfg, cli_guest_env, dc_guest_env);
+    start_opts.persisted_guest_env = merge_runtime_guest_env(cfg, cli_guest_env);
 }
 
 fn ensure_up_existing_inputs_are_compatible(
@@ -588,12 +370,10 @@ fn ensure_up_existing_inputs_are_compatible(
         || opts.mem.is_some()
         || !opts.extra_mount.is_empty()
         || opts.runtime.exclude_git
-        || matches!(opts.devcontainer.input, DevcontainerInput::Explicit(_))
     {
         bail!(
             "Instance '{}' already exists for this project. \
-             --vcpus, --mem, --disk, --extra-mount, --exclude-git, and \
-             --devcontainer only apply when creating a new instance.\n\
+             --vcpus, --mem, --disk, --extra-mount, and --exclude-git only apply when creating a new instance.\n\
              To change memory, vCPUs, or disk on the existing instance, \
              stop it and run `coop resize`. Otherwise `coop destroy {}` \
              first to recreate it with those options.",
@@ -667,11 +447,10 @@ fn ensure_up_existing_inputs_are_compatible_for_git_repo(
         || opts.vcpus.is_some()
         || opts.mem.is_some()
         || !opts.extra_mount.is_empty()
-        || matches!(opts.devcontainer.input, DevcontainerInput::Explicit(_))
     {
         bail!(
             "Instance '{}' already exists for this git repo. \
-             --vcpus, --mem, --disk, --extra-mount, and --devcontainer only \
+             --vcpus, --mem, --disk, and --extra-mount only \
              apply when creating a new instance.\n\
              To change memory, vCPUs, or disk on the existing instance, \
              stop it and run `coop resize`. Otherwise `coop destroy {}` \
@@ -845,18 +624,11 @@ pub(crate) struct StartOpts<'a> {
     /// "use the configured value (if any)"; `Some` always wins.
     pub(crate) post_start_override: Option<&'a str>,
     pub(crate) persisted_guest_env: std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
-    /// Explicit `--devcontainer` is creation-only. `start --dry-run` handles
-    /// translation before this struct is built; normal `start` only uses this
-    /// marker to reject silently ignored creation options on restart.
-    pub(crate) devcontainer_path: Option<&'a Path>,
-    /// Devcontainer path/hash that was applied to a newly-created instance.
-    /// Empty on restarts and when no devcontainer was used.
-    pub(crate) applied_devcontainer: Option<devcontainer::AppliedDevcontainer>,
 }
 
 fn restart_has_ignored_creation_flags(opts: &StartOpts<'_>) -> bool {
     let workspace_was_restart_key = opts.name.is_none() && opts.workspace_dir.is_some();
-    opts.devcontainer_path.is_some() || (opts.workspace_dir.is_some() && !workspace_was_restart_key)
+    opts.workspace_dir.is_some() && !workspace_was_restart_key
 }
 
 fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Path>) -> String {
@@ -870,12 +642,6 @@ fn no_stopped_instance_message(opts: &StartOpts<'_>, workspace_path: Option<&Pat
     } else {
         "No stopped instances exist.".to_string()
     };
-
-    if opts.devcontainer_path.is_some() {
-        msg.push_str(
-            "\n`coop start` only starts stopped instances; creation options belong to `coop up`.",
-        );
-    }
 
     if let Some(path) = workspace_path {
         msg.push_str("\nCreate or reconnect to this project with:\n  coop up ");
@@ -1083,7 +849,6 @@ fn restart_instance(
     opts: &StartOpts<'_>,
 ) -> Result<()> {
     tracing::info!("Restarting stopped instance '{}'", inst.name);
-    devcontainer::warn_if_applied_devcontainer_changed(inst);
 
     let _guard = signal::install_handlers();
 
@@ -1103,10 +868,11 @@ fn restart_instance(
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
-    // Re-apply the persisted guest-env set from the initial start
-    // (CLI `--env` ∪ devcontainer `containerEnv`). New start-time
-    // entries on restart override per-key; the merged result is what
-    // gets persisted (and forwarded for this restart's bootstrap).
+    // Re-apply the persisted guest-env set from the initial start. Current
+    // versions persist CLI `--env`; legacy snapshots can also contain values
+    // translated from devcontainer `containerEnv`. New start-time entries on
+    // restart override per-key; the merged result is what gets persisted (and
+    // forwarded for this restart's bootstrap).
     let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
@@ -1118,6 +884,11 @@ fn restart_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
+    let files = crate::guest_files::StagedFiles::prepare(
+        &cfg.guest_files,
+        &backend::persisted_guest_user(cfg, &inst.image),
+        &[],
+    )?;
     crate::github_assignment::active(cfg, inst)?;
     be.start_existing(cfg, inst)?;
 
@@ -1148,7 +919,8 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    bootstrap_and_post_start(
+    files.install(&target)?;
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1157,6 +929,7 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -1218,13 +991,37 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
-    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
+}
+
+struct BootPayload {
+    forwards: Vec<config::PortForward>,
+    files: crate::guest_files::StagedFiles,
+}
+
+impl BootPayload {
+    fn prepare(
+        be: &backend::PlatformBackend,
+        cfg: &config::CoopConfig,
+        image: &config::ImageName,
+        mounts: &[config::Mount],
+        forwards: Vec<config::PortForward>,
+    ) -> Result<Self> {
+        let live_mounts = if be.mounts_are_live() { mounts } else { &[] };
+        let files = crate::guest_files::StagedFiles::prepare(
+            &cfg.guest_files,
+            &backend::persisted_guest_user(cfg, image),
+            live_mounts,
+        )?;
+        Ok(Self { forwards, files })
+    }
 }
 
 /// Everything a first boot needs once the guest is up: port forwards,
-/// guest-env and devcontainer state, the `FirstBoot` agent bootstrap, and
+/// guest-env state, the `FirstBoot` agent bootstrap, and
 /// the workspace/mount sync that populates the guest filesystem.
 ///
 /// Shared by [`start_instance`] (a freshly allocated instance) and
@@ -1235,10 +1032,10 @@ fn start_instance(
 /// and `/workspace` survived on the guest disk.
 ///
 /// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, `applied_devcontainer`, plus what
-/// [`bootstrap_and_post_start`] consumes (`no_agents`, `post_start_override`).
+/// `exclude_git`, `persisted_guest_env`, `post_start_override`, plus what
+/// [`bootstrap_on_boot`] consumes (`no_agents`).
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
-/// resolved forward set arrives as `forwards`, because callers merge it
+/// resolved forward set arrives in `payload`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
 /// behavior for `reprovision_instance` only, which passes placeholders for them.
 fn provision_first_boot(
@@ -1247,8 +1044,9 @@ fn provision_first_boot(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
     repo: Option<&github_repo::RepoSlug>,
-    forwards: &[config::PortForward],
+    payload: &BootPayload,
 ) -> Result<()> {
+    let forwards = payload.forwards.as_slice();
     signal::check_shutdown()?;
 
     let target = be.ssh_target(cfg, inst)?;
@@ -1272,24 +1070,13 @@ fn provision_first_boot(
     .save(inst)?;
     port_forward::spawn_ssh_forwards(inst, &target, forwards)?;
 
-    // Persist start-time guest-env entries (CLI `--env` ∪ devcontainer
-    // `containerEnv`) so later commands targeting this instance — which
-    // reload `config.toml` from scratch and do not re-parse
-    // `--devcontainer` — still forward these values via SSH `SendEnv`.
-    // The in-memory `cfg.guest_env` already contains them for this
-    // process's bootstrap pass.
+    // Persist CLI `--env` entries for later commands that reload config.
     guest_env_state::GuestEnvState {
         entries: opts.persisted_guest_env.clone(),
     }
     .save(inst)?;
-    if let Some(applied) = &opts.applied_devcontainer {
-        devcontainer::DevcontainerState {
-            applied: applied.clone(),
-        }
-        .save(inst)?;
-    }
-
-    bootstrap_and_post_start(
+    payload.files.install(&target)?;
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1364,10 +1151,13 @@ fn provision_first_boot(
             }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
-                 Use `coop push` / `coop pull` to sync changes."
+                 Use `coop push` to update the guest, or \
+                 `coop pull --dir <new-directory>` to review guest changes."
             );
         }
     }
+
+    run_configured_post_start(cfg, inst, &target, repo, opts)?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1595,25 +1385,8 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
-/// Build an `SshSession` from an already-resolved target.
-///
-/// Symmetric with `open_ssh_session`, for paths that resolve the
-/// target without going through `resolve_running` — namely the
-/// post-boot bootstrap in fresh start and restart, where the
-/// instance isn't yet registered as running.
-///
-/// When `inst` is `Some`, any persisted `--env` snapshot for that
-/// instance is overlaid onto the resolved env-forward set so values
-/// passed at `coop start --env KEY=VAL` survive across the
-/// per-invocation config reload. Bootstrap callers inside fresh
-/// `start_instance` pass `None` because the in-memory `cfg.guest_env`
-/// is already authoritative for that one process; restart and every
-/// post-start command pass `Some` because the on-disk snapshot is
-/// the only place the original `--env` set still lives.
-/// Open a session and run the post-boot agent bootstrap plus any
-/// `postStartCommand`, honoring `--no-agents`. Shared by fresh start and
-/// restart, which differ only in the [`backend::BootMode`].
-fn bootstrap_and_post_start(
+/// Bootstrap guest agents after boot, before workspace provisioning.
+fn bootstrap_on_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -1622,7 +1395,6 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1648,7 +1420,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() {
+    if opts.no_agents {
         if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
@@ -1660,27 +1432,26 @@ fn bootstrap_and_post_start(
     // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
     // defeating proxy-mode non-exposure (issue #411).
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
-    if opts.no_agents {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
-    }
-    if let Some(cmd) = post_start {
-        // Agent bootstrap may have just minted the per-instance capability
-        // token (proxy mode), which is forwarded to sessions via `SendEnv`
-        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
-        // the token existed, so re-prepare it here — otherwise a `post_start`
-        // that runs Codex in proxy mode would lack the token and fail to
-        // authenticate. Under --no-agents no proxy started, so nothing new to
-        // pick up; keep the original session.
-        let session = if opts.no_agents {
-            session
-        } else {
-            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
-        };
-        backend::run_post_start(&session, cmd);
-    }
+    let guest_host = be.guest_host_address(&cfg.network);
+    backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+    Ok(())
+}
+
+/// Run the hook after bootstrap and workspace provisioning have succeeded.
+fn run_configured_post_start(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+        return Ok(());
+    };
+    signal::check_shutdown()?;
+    // Bootstrap may mint a proxy capability token; construct this session afterward.
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    backend::run_post_start(&session, command);
     Ok(())
 }
 
@@ -1711,6 +1482,20 @@ pub(crate) fn no_agents_skips_codex_keyring(
     no_agents && auth.uses_chatgpt_account() && !keyring_materialized()
 }
 
+/// Build an `SshSession` from an already-resolved target.
+///
+/// Symmetric with [`open_ssh_session`], for paths that resolve the target
+/// without going through `resolve_running` — namely the post-boot bootstrap in
+/// fresh start and restart, where the instance isn't yet registered as running.
+///
+/// When `inst` is `Some`, any persisted start-time guest environment for that
+/// instance is overlaid onto the resolved env-forward set. This keeps current
+/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
+/// values available across the per-invocation config reload. Bootstrap callers
+/// inside fresh `start_instance` pass `None` because the in-memory
+/// `cfg.guest_env` is already authoritative for that one process; restart and
+/// every post-start command pass `Some` because the on-disk snapshot is the
+/// only place the original persisted set still lives.
 pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: Option<&config::Instance>,
@@ -1780,7 +1565,7 @@ pub(crate) fn prepare_session_from_target(
                     tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
                     continue;
                 }
-                env.set(name.as_str(), value.as_str());
+                env.set(name.as_str(), value.as_str())?;
             }
         }
         // Codex reads its provider key from the env var named by `env_key`. In
@@ -1792,11 +1577,11 @@ pub(crate) fn prepare_session_from_target(
             if model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default());
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
             } else if proxy_openai
                 && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, token);
+                env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
             }
         }
     }
@@ -1804,36 +1589,46 @@ pub(crate) fn prepare_session_from_target(
 }
 
 pub(crate) fn cmd_stop(
-    be: &backend::PlatformBackend,
+    be: &impl backend::VmBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Probe live state once. The `RunningInstance` proof flows into
-    // `be.stop`, so the type system witnesses that we only ask the
-    // backend to stop something that was actually running.
-    if let Ok(Some(running)) = be.as_running(cfg, inst.clone()) {
+    // `RunningInstance` records a point-in-time observation from this probe;
+    // `be.stop` rechecks under the backend operation lock before mutating.
+    let stopped = if let Some(running) = be.as_running(cfg, inst.clone())? {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
         port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?;
+        be.stop(cfg, running)?
     } else {
-        tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
+        tracing::debug!("Instance '{}' is not running", inst.name);
         // Stale forwards may still exist even when the VM is gone.
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
-    }
+        // Reconfirm the stopped state while acquiring the operation lock.
+        be.as_stopped(inst.clone())?
+    };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
-    // proxy mode was never on.
-    crate::proxy::stop(inst);
+    // proxy mode was never on. Do this only after confirmed exit, but before
+    // backend cleanup so TAP deletion errors do not leave stale credentials.
+    cleanup_confirmed_stop(&stopped, |stopped| be.cleanup_stopped(cfg, stopped))?;
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
     // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
     Ok(())
+}
+
+fn cleanup_confirmed_stop(
+    stopped: &backend::StoppedInstance,
+    cleanup: impl FnOnce(&backend::StoppedInstance) -> Result<()>,
+) -> Result<()> {
+    crate::proxy::stop(stopped.instance());
+    cleanup(stopped)
 }
 
 pub(crate) fn cmd_destroy(
@@ -2014,7 +1809,9 @@ pub(crate) fn cmd_resize(
         // instance itself (Lima must boot to validate regardless).
         be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
     } else if opts.start {
-        be.start_existing(cfg, stopped.instance())?;
+        let inst = stopped.instance().clone();
+        drop(stopped);
+        be.start_existing(cfg, &inst)?;
     }
 
     Ok(())
@@ -2173,16 +1970,8 @@ pub(crate) fn cmd_restore(
 /// workspace re-synced, agents re-bootstrapped, plugins and MCP servers
 /// reinstalled.
 ///
-/// Only what coop persists can be replayed. A devcontainer's `containerEnv`
-/// and `forwardPorts` survive (they live in `guest_env.json` /
-/// `forwards.json`) and its features are baked into the image, but its
-/// `postStartCommand` reaches the guest only as an in-memory
-/// `post_start_override` during `coop up` and is **not** re-run here.
-/// (`postCreateCommand` is not the affected key: coop parses
-/// `postStartCommand` and reports `postCreateCommand` as an unrecognised
-/// `devcontainer.json` key, so it never reaches the guest on `coop up`
-/// either.)
-/// Likewise extra `--extra-mount` directories and `--exclude-git`.
+/// Only persisted settings can be replayed. Extra `--extra-mount`
+/// directories and `--exclude-git` are not persisted.
 ///
 /// The plain [`cmd_restore`] path replaces the disk but leaves the follow-up
 /// `coop start` on the [`backend::BootMode::Restart`] path, which skips
@@ -2212,19 +2001,14 @@ fn reprovision_instance(
     let saved_guest_env = guest_env_state::GuestEnvState::try_load(&inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
-    let applied_devcontainer = devcontainer::DevcontainerState::try_load(&inst)?.map(|s| s.applied);
 
     check_reprovision_workspace_source(&inst.name, workspace_state.as_ref())?;
-
-    // Same warning a restart prints: the recorded `devcontainer.json` may have
-    // changed since creation. It matters more here — the state file is
-    // re-saved with the old hash while the guest is rebuilt from the image,
-    // so nothing else would say the two have drifted apart.
-    devcontainer::warn_if_applied_devcontainer_changed(&inst);
 
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
+    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
+    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
@@ -2274,14 +2058,13 @@ fn reprovision_instance(
     // `check_host_port_collisions` binds each host port to probe it, so while
     // the instance is still running its *own* forwarder holds them and every
     // forward would look taken.
-    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
     // The bail names `--forward-port`, which `restore` does not expose, and
     // the instance is stopped by now — so say both. Reachable without the
     // user having asked about ports at all: a `forward_ports` entry added to
     // `config.toml` since creation whose host port is busy, or two entries
     // with distinct guest ports sharing one host port (`merge_forward_ports`
     // dedupes on the guest port only).
-    port_forward::check_host_port_collisions(&forwards).with_context(|| {
+    port_forward::check_host_port_collisions(&payload.forwards).with_context(|| {
         format!(
             "Instance '{}' is stopped and was not reprovisioned. Free the host port \
              or drop the conflicting `forward_ports` entry from config.toml, then \
@@ -2323,10 +2106,11 @@ fn reprovision_instance(
     inst.set_image(image.clone()).with_context(partial)?;
 
     if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        let stopped = be.as_stopped(inst.clone()).with_context(partial)?;
         be.resize_disk(cfg, &stopped, previous_disk)
             .with_context(partial)?;
     }
+
+    drop(stopped);
 
     signal::check_shutdown().with_context(partial)?;
 
@@ -2352,12 +2136,10 @@ fn reprovision_instance(
         config_path: opts.config_path,
         post_start_override: None,
         persisted_guest_env: saved_guest_env,
-        devcontainer_path: None,
-        applied_devcontainer,
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &payload)
         .with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
@@ -2556,12 +2338,144 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use crate::backend::VmBackend as _;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_reports_unknown_process_state_and_preserves_pid_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
+        let disk = inst.rootfs_path();
+        std::fs::write(&disk, "disk sentinel").expect("disk sentinel");
+        let cfg = cfg_with_data_dir(root.path().to_path_buf());
+        let backend = super::backend::FirecrackerBackend::new();
+
+        let error = super::cmd_stop(&backend, &cfg, &inst)
+            .expect_err("failed probe cannot report stopped")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(inst.pid_file_path()).expect("retained pid"),
+            "invalid-pid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&proxy_token).expect("retained proxy token"),
+            "proxy sentinel"
+        );
+        let error = backend
+            .destroy_instance(&cfg, &inst)
+            .expect_err("unknown liveness cannot authorize destroy")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&disk).expect("retained disk"),
+            "disk sentinel"
+        );
+        assert!(inst.dir.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_stop_removes_proxy_before_cleanup_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
+        let backend = super::backend::FirecrackerBackend::new();
+        let stopped = backend
+            .as_stopped(inst)
+            .expect("instance is confirmed stopped");
+
+        let error = super::cleanup_confirmed_stop(&stopped, |_| {
+            assert!(!proxy_token.exists(), "proxy token survived confirmed stop");
+            Err(anyhow::anyhow!("cleanup failed"))
+        })
+        .expect_err("cleanup failure must propagate")
+        .to_string();
+
+        assert_eq!(error, "cleanup failed");
+        assert!(!proxy_token.exists());
+    }
 
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn post_start_stops_before_session_preparation_when_interrupted() {
+        const CHILD: &str = "COOP_POST_START_INTERRUPTED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "commands::lifecycle::tests::",
+                        "post_start_stops_before_session_preparation_when_interrupted",
+                    ),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        assert_interrupted_post_start();
+    }
+
+    fn assert_interrupted_post_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = instance_named("test", tmp.path());
+        std::fs::create_dir(inst.model_state_path()).unwrap();
+        let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        cfg.post_start = Some("true".to_string());
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: super::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("id_test"),
+        };
+        let opts = start_opts(Vec::new(), tmp.path());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert!(format!("{error:#}").contains("model.json"), "{error:#}");
+        let _signals = super::signal::install_handlers();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(super::signal::shutdown_requested());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert_eq!(error.to_string(), "Interrupted by signal — cleaning up");
+        cfg.post_start = None;
+        super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap();
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
@@ -2602,8 +2516,6 @@ mod tests {
             config_path,
             post_start_override: None,
             persisted_guest_env: std::collections::BTreeMap::new(),
-            devcontainer_path: None,
-            applied_devcontainer: None,
         }
     }
 
@@ -2628,11 +2540,6 @@ mod tests {
                 forward_ports: Vec::new(),
                 post_start: None,
                 guest_env: Vec::new(),
-            },
-            devcontainer: super::UpDevcontainerOpts {
-                input: super::DevcontainerInput::Disabled,
-                dry_run: false,
-                json: false,
             },
         }
     }
@@ -2834,6 +2741,10 @@ mod tests {
             super::guest_env_state::EnvVarName::new("FROM_CLI").expect("valid env var"),
             "saved-value".to_string(),
         );
+        state.entries.insert(
+            super::guest_env_state::EnvVarName::new("PATH").expect("valid env var"),
+            "./project-bin".to_string(),
+        );
         state.save(&inst).expect("save snapshot");
 
         let mut cfg = super::config::CoopConfig::default();
@@ -2854,7 +2765,28 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let ssh = session
+            .command(&[], "/usr/bin/printenv PATH")
+            .expect("SSH command");
+        assert!(!ssh.get_envs().any(|(name, _)| name == "PATH"));
+        assert!(
+            ssh.get_envs()
+                .any(|(_, value)| value == Some(std::ffi::OsStr::new("./project-bin")))
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(ssh.get_args().last().unwrap())
+            .env_clear()
+            .envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let restored_path = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            restored_path.trim().split(':').next_back(),
+            Some("./project-bin")
+        );
+        let envs = session.env.guest_values();
         assert_eq!(
             envs.get("FROM_CLI").map(String::as_str),
             Some("saved-value"),
@@ -2910,7 +2842,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("ANTHROPIC_API_KEY"),
             "proxy mode re-injected the raw key from the persisted --env overlay",
@@ -2958,7 +2890,7 @@ mod tests {
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth re-injected the raw key from the persisted --env overlay",
@@ -3005,7 +2937,7 @@ mod tests {
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
-            !session.env.as_envs().contains_key("OPENAI_API_KEY"),
+            !session.env.guest_values().contains_key("OPENAI_API_KEY"),
             "proxy mode must keep the raw key on the host",
         );
     }
@@ -3047,7 +2979,7 @@ mod tests {
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
 
-        let envs = session.env.as_envs();
+        let envs = session.env.guest_values();
         assert!(
             !envs.contains_key("OPENAI_API_KEY"),
             "ChatGPT account auth must not forward an OpenAI API key",
@@ -3225,7 +3157,7 @@ mod tests {
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_reprovision_workspace_source_rejects_a_non_utf8_workspace_dir() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -3430,10 +3362,8 @@ mod tests {
     fn no_stopped_instance_message_points_creation_to_up() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(Vec::new(), &cfg_path);
-        opts.devcontainer_path = Some(std::path::Path::new("/tmp/devcontainer.json"));
+        let opts = start_opts(Vec::new(), &cfg_path);
         let msg = super::no_stopped_instance_message(&opts, None);
-        assert!(msg.contains("only starts stopped instances"));
         assert!(msg.contains("coop up [DIR]"));
     }
 
@@ -3630,15 +3560,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_creation_flags_detect_explicit_devcontainer() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.toml");
-        let mut opts = start_opts(Vec::new(), &cfg_path);
-        opts.devcontainer_path = Some(std::path::Path::new("/tmp/devcontainer.json"));
-        assert!(super::restart_has_ignored_creation_flags(&opts));
-    }
-
-    #[test]
     fn find_workspace_instance_returns_none_when_no_match() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
@@ -3717,55 +3638,6 @@ mod tests {
 
         let found = super::find_workspace_instance(&cfg, &ws_b).expect("ok");
         assert!(found.is_none());
-    }
-
-    #[test]
-    fn up_translator_inputs_maps_opts_to_translator_fields() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // A temp data_dir with no template_config.json makes
-        // backend::persisted_guest_user fall back to the default user, so the
-        // builder is deterministic.
-        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
-        let mount_dir = tmp.path().join("mnt");
-        std::fs::create_dir(&mount_dir).expect("mnt");
-
-        let mut opts = up_opts_for_tests(None);
-        opts.vcpus = Some(7);
-        opts.mem =
-            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap());
-        opts.disk = super::config::GiB::new(50);
-        opts.extra_mount =
-            vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
-        opts.profile_target = Some(
-            super::ProfileImageTarget::new(&["python".to_string(), "node".to_string()])
-                .expect("profile target"),
-        );
-        opts.runtime.post_start = Some("echo hi".to_string());
-        opts.runtime.forward_ports = vec![super::config::PortForward::parse("3000").expect("port")];
-        opts.runtime.guest_env = vec![(
-            super::guest_env_state::EnvVarName::new("FOO").expect("env"),
-            "bar".to_string(),
-        )];
-
-        let inputs = super::up_translator_inputs(&cfg, &opts);
-
-        assert_eq!(inputs.cli_vcpus, Some(7));
-        assert_eq!(
-            inputs.cli_mem_mib,
-            Some(super::config::VmMemory::new(super::config::MiB::new(2048).unwrap()).unwrap())
-        );
-        assert_eq!(inputs.cli_disk_gib, super::config::GiB::new(50));
-        assert_eq!(inputs.cli_post_start.as_deref(), Some("echo hi"));
-        assert_eq!(
-            inputs.cli_guest_env_keys,
-            vec![super::guest_env_state::EnvVarName::new("FOO").unwrap()]
-        );
-        assert_eq!(inputs.cli_forward_ports.len(), 1);
-        assert_eq!(inputs.cli_mounts.len(), 1);
-        // ProfileImageTarget::new sorts and dedups, so order is canonical.
-        assert_eq!(inputs.cli_profiles, vec!["node", "python"]);
-        assert!(inputs.persisted_guest_user.is_some());
-        assert!(inputs.cli_workspace_or_git_repo);
     }
 
     #[test]
@@ -3855,7 +3727,6 @@ mod tests {
             .expect("inst");
         let mount_dir = tmp.path().join("mnt");
         std::fs::create_dir(&mount_dir).expect("mnt");
-        let dc = tmp.path().join("devcontainer.json");
 
         let reject = |opts: &super::UpOpts<'_>| {
             super::ensure_up_existing_inputs_are_compatible(
@@ -3882,10 +3753,6 @@ mod tests {
         opts.extra_mount =
             vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
         reject(&opts).expect_err("--extra-mount must be rejected");
-
-        let mut opts = up_opts_for_tests(project.to_str());
-        opts.devcontainer.input = super::DevcontainerInput::Explicit(dc);
-        reject(&opts).expect_err("--devcontainer must be rejected");
     }
 
     /// When the stored transport matches the requested one, the check passes.
@@ -3951,7 +3818,6 @@ mod tests {
             .expect("inst");
         let mount_dir = tmp.path().join("mnt");
         std::fs::create_dir(&mount_dir).expect("mnt");
-        let dc = tmp.path().join("devcontainer.json");
 
         let mut opts = up_opts_for_tests(None);
         opts.mem =
@@ -3964,11 +3830,6 @@ mod tests {
             vec![super::config::Mount::parse(mount_dir.to_str().unwrap()).expect("mount")];
         super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
             .expect_err("--extra-mount must be rejected");
-
-        let mut opts = up_opts_for_tests(None);
-        opts.devcontainer.input = super::DevcontainerInput::Explicit(dc);
-        super::ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, &opts)
-            .expect_err("--devcontainer must be rejected");
     }
 
     #[test]

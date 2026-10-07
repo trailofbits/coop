@@ -200,7 +200,6 @@ run_mutants() {
     cargo mutants \
       -f src/config.rs \
       -f src/workspace.rs \
-      -f src/devcontainer.rs \
       -f src/guest_env_state.rs \
       -f src/github_repo.rs \
       -f src/github_pat.rs \
@@ -217,7 +216,7 @@ run_fuzz() {
   fi
   cargo +nightly fuzz build
   local target
-  for target in parse_repo_slug jsonc_to_json config_load; do
+  for target in parse_repo_slug config_load; do
     cargo +nightly fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-30}"
   done
 }
@@ -326,9 +325,9 @@ if [[ "$QUICK" == 1 ]]; then
   warn "--quick: full cross-platform integration suite skipped"
 else
   prompt_for_remote
-  step "Full integration (local host)" ./tests/run-integration.sh
+  step "Full integration (local host)" ./tests/run-integration.sh --full --require-proxy
   if [[ -n "$REMOTE" ]]; then
-    step "Full integration ($REMOTE)" ./tests/run-integration.sh --remote "$REMOTE"
+    step "Full integration ($REMOTE)" ./tests/run-integration.sh --remote "$REMOTE" --full --require-proxy
   else
     warn "No remote host given — only the local platform's integration suite ran; the other platform was not covered."
   fi

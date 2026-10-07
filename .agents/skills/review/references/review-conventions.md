@@ -14,6 +14,14 @@ Only flag issues **introduced or materially changed by the diff**. Cross-referen
 - **Convention violations:** naming, module organization, import patterns, and the established Rust idioms in [`docs/code-style.md`](../../../../docs/code-style.md) — newtypes over primitives that cross a boundary, enums over boolean flags, parse-don't-validate at boundaries, `&str`/`&[T]`/`&Path` parameters over owned, `let...else` early returns, `thiserror` (libraries) vs `anyhow` (application), `tracing` over `println!`/`eprintln!`. **Absolute imports only — no relative `..` paths.** Read AGENTS.md and nearby existing code; do not apply external style guides that conflict with project practice. Flag idioms with real payoff — don't demand a newtype for a primitive that crosses no boundary.
 - **Rename consistency:** if the diff renames a type, function, field, constant, file, or CLI flag, grep the diff plus touched files for the *old* name and flag every straggler — variable names, `tracing` log strings, `--help`/clap `about`/`long_about` text, doc-comments, error messages, and the docs under `docs/`. For repo-wide terminology shifts, grep the whole repo; stragglers are in-scope for the rename PR.
 - **Drift in shared constants:** literal values (guest paths, IPs/subnet octets, default sizes, filenames, marker strings) that are already defined as a constant elsewhere. Grep for the literal; if it exists as a `const`/`static` or a newtype, recommend the reference instead of the duplicate.
+- **Platform compile coverage:** when a diff changes `#[cfg]` gates, backend
+  aliases, or platform-only variants/implementations/call paths, require check
+  and clippy evidence for every affected OS. Inspect the ordinary non-test
+  library target separately from tests: `--all-targets` covers Cargo target
+  kinds for one Rust target, not other operating systems, and `cfg(test)` can
+  make an otherwise-unused production item appear covered. Prefer native
+  evidence; accept an available cross target as compile-only evidence and
+  record missing native execution explicitly.
 - **Cross-file infra sync:** if the diff touches any of these, verify the edges the change implies:
   - **A new/renamed CLI flag or config field** ↔ `config.example.toml`, the `docs/` reference (`docs/commands.md`, `docs/configuration.md`), and shell-completion output (`completions.rs`).
   - **`Cargo.toml` dependency or lint changes** ↔ `Cargo.lock` regenerated, `deny.toml` (a new dep's license/advisory), and the `[lints]` policy in AGENTS.md.

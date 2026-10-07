@@ -77,9 +77,9 @@ CI can't run the full VM integration suite or the extra-toolchain checks
 6. **Run the deep checks when the diff warrants it** (these are slow and not CI
    gates — see `AGENTS.md`):
    - `--mutants` when this release changed logic-dense modules (config,
-     workspace, devcontainer, parsing, secret routing).
+     workspace, parsing, secret routing).
    - `--fuzz` when it changed a parser of user-editable input
-     (`parse_repo_slug`, `jsonc_to_json`, `config_load`).
+     (`parse_repo_slug`, `config_load`).
 
    ```bash
    ./scripts/preflight-release.sh --remote you@other-platform-box --mutants --fuzz

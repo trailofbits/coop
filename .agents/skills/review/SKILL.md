@@ -33,6 +33,13 @@ Gather once and share with every reviewer:
 
 - PR description and linked issue, commit list, changed paths, and diff.
 - Post-change bodies of touched functions. A hunk alone is not enough.
+- For new or changed external configuration inputs or file-transfer behavior,
+  a source-to-sink trace:
+  origin/trust, translation and merging, persistence/reload, and every reachable
+  host subprocess consumer, including unchanged functions. Add those consumers
+  and their guards to the packet; touched symbols do not bound this inspection.
+  Include files discovered implicitly by host tools and consumption in later
+  commands, including ordinary host tools used outside coop.
 - Root `AGENTS.md` and relevant system-of-record docs: `ARCHITECTURE.md`,
   `trust-model.md`, `code-style.md`, `testing.md`, `.cargo/mutants.toml`,
   command/config references, and nearby platform notes.
@@ -71,7 +78,10 @@ Run when triggered:
 
 - **Security:** first read `docs/trust-model.md`; inspect tainted subprocess
   input, secret storage/logging, host paths, listeners/egress, SSH, and the
-  updater trust chain. Call out every stop-and-confirm trigger.
+  updater trust chain. Changes to project configuration, env composition,
+  persistence/reload, host launch context, or file-transfer defaults, exclusions,
+  extraction, and mirroring always trigger this lens, even when subprocess code
+  is unchanged. Call out every stop-and-confirm trigger.
 - **API usage:** verify against the version pinned in `Cargo.lock` or the exact
   installed binary. Check signatures, flags, error behavior, enabled features,
   and deprecations using primary documentation.
@@ -125,6 +135,38 @@ apply across all lenses:
   reporting often need to distinguish those cases.
 - Correct the rationale even when the code happens to be right. False comments
   and security claims become future implementation guidance.
+
+### Trace authority across boundaries
+
+- Follow untrusted configuration and transferred files to their consumers,
+  including later operations and files discovered implicitly by host tools.
+  Preserve their origin across disk writes and subsequent reads. Do not stop at a
+  parser, valid newtype, merged config, or saved state. Record what each guard
+  proves and which execution domain may interpret the value. Syntax validation
+  and user opt-in do not grant project data host execution authority.
+- At host subprocess sinks, apply the full launch-context checks in
+  `docs/trust-model.md#host-subprocess-boundary`. Shell escaping and argv APIs
+  alone do not establish safety. Check every interactive, non-interactive,
+  stdin, and output-capturing path that uses the data.
+- Require both intended guest behavior and absence of unintended host effects.
+  Prove the assertion fails when the unsafe boundary crossing is restored.
+  When the review harness forbids executing contributor code, inspect the test
+  and report the reproduction/mutation as unrun; do not relax that restriction.
+
+### Trace filesystem identity through use
+
+- For each changed file or mount operation, list the validation step, later
+  consumer, privilege boundary, and each path resolution between them. An
+  `open` descriptor pins an inode; a checked path string or parent descriptor
+  alone does not pin a later child lookup. Include subprocesses, sudo, and
+  tools that reopen `/proc/self/fd` paths or their original path arguments.
+- For rename, unlink, mount, and unmount, check the final component separately.
+  Determine whether an untrusted writer can replace it after validation and
+  whether the kernel operation follows that replacement. Reproduce relevant
+  flags and descriptor behavior on the target OS when practical.
+- Follow interrupted writes and copies through retry and cleanup. Verify
+  staging files cannot accumulate without bound and that locks serialize the
+  actual mutation, including after a process dies.
 
 ### Audit the whole lifecycle and contract
 

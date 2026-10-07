@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-#[cfg(target_os = "macos")]
+use std::fmt::Write as _;
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
 use std::num::{NonZeroU8, NonZeroU16};
 use std::path::{Path, PathBuf};
@@ -15,10 +16,11 @@ use crate::config::{
     CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
     McpServerDef, NetworkConfig, VmMemory,
 };
+use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
-use crate::setup::SetupOptions;
+use crate::setup::{ExplicitSetupInputSupport, SetupOptions};
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -44,9 +46,9 @@ pub enum LogMode {
 
 /// Environment variables to forward to guest VMs via SSH `SendEnv`.
 ///
-/// Carries both variable names (for `-o SendEnv=`) and their values
-/// (for `Command::env()` on SSH child processes), avoiding unsafe
-/// mutation of the process-global environment.
+/// Guest names never become host process environment names. Values travel
+/// under fixed transport aliases and are restored only by a guest shell.
+/// This keeps guest PATH, loader settings, and SSH settings off the host.
 ///
 /// The whole struct is secret-bearing by construction (entries are
 /// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`, plus any
@@ -55,7 +57,7 @@ pub enum LogMode {
 /// diagnostics and are not themselves secret.
 #[derive(Clone, Default)]
 pub struct EnvForward {
-    vars: IndexMap<String, String>,
+    vars: IndexMap<crate::guest_env_state::EnvVarName, String>,
 }
 
 impl std::fmt::Debug for EnvForward {
@@ -78,8 +80,10 @@ impl std::fmt::Debug for EnvForward {
 
 impl EnvForward {
     /// Insert or overwrite an env var.
-    pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.vars.insert(name.into(), value.into());
+    pub fn set(&mut self, name: impl AsRef<str>, value: impl Into<String>) -> Result<()> {
+        let name = crate::guest_env_state::EnvVarName::new(name.as_ref())?;
+        self.vars.insert(name, value.into());
+        Ok(())
     }
 
     /// Check whether a variable is present.
@@ -87,34 +91,71 @@ impl EnvForward {
         self.vars.contains_key(name)
     }
 
-    /// SSH `-o SendEnv=` args for all contained variables.
-    fn send_env_opts(&self) -> Vec<String> {
-        let mut opts = Vec::with_capacity(self.vars.len() * 2);
-        for name in self.vars.keys() {
-            opts.push("-o".into());
-            opts.push(format!("SendEnv={name}"));
-        }
-        opts
+    /// Inspect guest values in composition tests without exposing a production
+    /// map that could accidentally be passed to `Command::envs`.
+    #[cfg(test)]
+    pub fn guest_values(&self) -> &IndexMap<crate::guest_env_state::EnvVarName, String> {
+        &self.vars
     }
 
-    /// Key-value pairs for `Command::envs()`.
-    pub fn as_envs(&self) -> &IndexMap<String, String> {
-        &self.vars
+    /// Configure the transport and wrap the command without placing guest
+    /// names in the host environment or values in either host or guest argv.
+    fn wrap_command(&self, ssh: &mut Command, remote: &str) -> Result<String> {
+        if self.vars.is_empty() {
+            return Ok(remote.to_owned());
+        }
+        let mut capture = String::from("set --");
+        let mut cleanup = String::from("unset");
+        let mut restore = String::new();
+        for (index, (name, value)) in self.vars.iter().enumerate() {
+            if value.contains('\0') {
+                bail!("Guest environment variable '{name}' contains a NUL byte");
+            }
+            let alias = format!("COOP_SSH_ENV_{index}");
+            ssh.arg("-o").arg(format!("SendEnv={alias}"));
+            ssh.env(&alias, value);
+            // Snapshot every value before unsetting aliases or exporting names:
+            // a legitimate guest name can itself equal another transport alias.
+            write!(
+                capture,
+                " \"${{{alias}?coop: missing forwarded environment}}\""
+            )?;
+            cleanup.push(' ');
+            cleanup.push_str(&alias);
+            // Shell-special variables can reject assignments and print the
+            // value. `command` makes export failures catchable in dash; suppress
+            // its diagnostic and report only the variable's validated name.
+            write!(
+                restore,
+                "command export {name}=\"$1\" 2>/dev/null || {{ printf '%s\\n' 'coop: could not restore guest variable {name}' >&2; exit 1; }}; shift; "
+            )?;
+        }
+        // sshd sets SHELL to the account's login shell. Preserve it before a
+        // guest SHELL override, so raw post-start commands retain bash syntax.
+        capture.push_str(" \"${SHELL:-/bin/sh}\"");
+        let script = format!(
+            "{capture}; {cleanup}; {restore}exec \"$1\" -c {}",
+            crate::shell::shell_escape(remote),
+        );
+        // Existing images already have /bin/sh and AcceptEnv *. No installed
+        // decoder, persistent secret file, or stdin framing is needed.
+        Ok(format!(
+            "/bin/sh -c {}",
+            crate::shell::shell_escape(&script)
+        ))
     }
 }
 
 // ── Running instance ──────────────────────────────────────────
 
-/// Proof that an instance is currently running. Construct via
+/// Point-in-time observation that an instance was running. Construct via
 /// [`VmBackend::as_running`] — the constructor is the single place
-/// that probes live state, so operations taking a `RunningInstance`
-/// can rely on the precondition without re-checking. Carries the
+/// that probes live state. This token does not prevent a concurrent state
+/// transition. Carries the
 /// SSH target so connection details are always available without
 /// further fallible lookups.
 ///
-/// Fields are private so a `RunningInstance` cannot be forged; the
-/// only way to obtain one is through a backend method that verified
-/// the instance is alive.
+/// Fields are private so callers cannot construct one without a backend probe.
 pub struct RunningInstance {
     inst: Instance,
     target: SshTarget,
@@ -145,32 +186,35 @@ impl RunningInstance {
 
 // ── Stopped instance ──────────────────────────────────────────
 
-/// Proof that an instance is currently *not* running. Construct via
-/// [`VmBackend::as_stopped`] — like [`RunningInstance`], the
-/// constructor is the single place that probes live state, so
-/// operations taking a `StoppedInstance` can rely on the precondition
-/// without re-checking.
+/// Observation that an instance was stopped, with an operation lock held.
+/// Construct via [`VmBackend::as_stopped`] or a successful [`VmBackend::stop`].
+/// Both paths confirm the stopped state while holding the lock, so a concurrent
+/// lifecycle mutation waits until the token is dropped.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
-/// The field is private so a `StoppedInstance` cannot be forged; the
-/// only way to obtain one is through a backend method that verified
-/// the instance is not alive.
+/// The field is private so callers cannot construct one without a backend probe.
 pub struct StoppedInstance {
     inst: Instance,
+    _lock: FileLock,
 }
 
 impl StoppedInstance {
-    /// Mint a `StoppedInstance` after a successful live-state probe.
+    /// Mint a `StoppedInstance` after the backend confirms the instance stopped.
     ///
-    /// Crate-private so only backend impls can construct one. Callers
-    /// use [`VmBackend::as_stopped`] (which delegates here).
-    pub(crate) fn new(inst: Instance) -> Self {
-        Self { inst }
+    /// Crate-private so only backend implementations can construct one.
+    pub(crate) fn new(inst: Instance, lock: FileLock) -> Self {
+        Self { inst, _lock: lock }
     }
 
     pub fn instance(&self) -> &Instance {
         &self.inst
     }
+}
+
+const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+    lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 
 // ── SSH target ────────────────────────────────────────────────
@@ -366,6 +410,10 @@ impl SshTarget {
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
             "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "ForwardAgent=no".into(),
+            "-o".into(),
+            "IdentityAgent=none".into(),
             "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-o".into(),
@@ -602,23 +650,20 @@ impl SshTarget {
 }
 
 impl SshSession {
-    /// SSH options with environment variable forwarding.
-    pub fn ssh_opts(&self) -> Vec<String> {
-        let mut opts = self.target.ssh_opts();
-        opts.extend(self.env.send_env_opts());
-        opts
+    /// Build every environment-bearing SSH launch through the same boundary.
+    pub fn command(&self, options: &[String], remote: &str) -> Result<Command> {
+        let mut ssh = Command::new("ssh");
+        ssh.args(self.target.ssh_opts());
+        let remote = self.env.wrap_command(&mut ssh, remote)?;
+        ssh.args(options).arg(self.target.addr()).arg(remote);
+        Ok(ssh)
     }
 
     /// Run a command on the guest via SSH with env forwarding.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.target.addr());
-        args.push(cmd.clone());
-
-        let status = Command::new("ssh")
-            .args(&args)
-            .envs(self.env.as_envs())
+        let status = self
+            .command(&[], &cmd)?
             .status()
             .context("Failed to run SSH command")?;
 
@@ -761,13 +806,26 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// filesystem state.
 ///
 /// Every backend boot entry (`setup`, `create_and_start`, `start_existing`)
-/// calls this first, so the check is unforgettable — a new lifecycle path
-/// that reaches boot cannot skip it, and it sees the world as it is at boot
-/// time rather than trusting a witness minted earlier. Warnings are dropped
-/// here; they are surfaced once at the handler via
+/// calls this before backend setup or boot work, so the check is unforgettable
+/// and sees the world as it is at boot time rather than trusting a witness
+/// minted earlier. Setup first rejects backend-unsupported explicit inputs.
+/// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
     cfg.validate().map(drop)
+}
+
+fn setup_preflight(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+    explicit_inputs: ExplicitSetupInputSupport,
+) -> Result<()> {
+    crate::setup::validate_explicit_setup_inputs(
+        explicit_inputs,
+        &opts.extra_packages,
+        opts.post_install.as_ref(),
+    )?;
+    boot_preflight(cfg)
 }
 
 /// VM backend for managing guest lifecycle.
@@ -785,16 +843,20 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    /// Stop a running instance. Consumes the `RunningInstance` proof
-    /// so the type system witnesses that the precondition held when
-    /// the call was made.
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop an instance observed running at the preceding probe and return it
+    /// with the operation lock held once the backend confirms it has exited.
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance>;
+    /// Finish backend cleanup for a confirmed-stopped instance.
+    /// Lima has no host TAP; Firecracker deletes it while the operation lock
+    /// carried by `stopped` prevents a concurrent restart.
+    fn cleanup_stopped(&self, _cfg: &CoopConfig, _stopped: &StoppedInstance) -> Result<()> {
+        Ok(())
+    }
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
-    /// Resize a stopped instance's disk. Takes a [`StoppedInstance`]
-    /// proof so the "must be stopped" precondition is enforced by the
-    /// type system rather than a runtime guard.
+    /// Resize a stopped instance's disk. The [`StoppedInstance`] holds the
+    /// operation lock from the state probe through this mutation.
     fn resize_disk(
         &self,
         cfg: &CoopConfig,
@@ -824,8 +886,7 @@ pub trait VmBackend: std::fmt::Display {
     /// Save a stopped instance's filesystem as image `image` (the
     /// backend-specific disk artifacts only — the caller carries over
     /// the shared `template-config.json`). Takes a [`StoppedInstance`]
-    /// proof so the "must be stopped" precondition (filesystem
-    /// consistency) is enforced by the type system. Overwriting an
+    /// observation and lock through the filesystem copy. Overwriting an
     /// existing image is the caller's decision, gated before this call.
     fn commit_disk(
         &self,
@@ -857,9 +918,9 @@ pub trait VmBackend: std::fmt::Display {
     /// clone before calling.
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>>;
     /// Probe the live state of `inst` and return a [`StoppedInstance`]
-    /// if it is not running. The dual of [`Self::as_running`] — used
+    /// only when it is confirmed stopped. The dual of [`Self::as_running`] — used
     /// to gate operations (like `resize_disk`) that require the VM to
-    /// be stopped. Returns `Err` when the instance is running.
+    /// be stopped. Returns `Err` for running, absent, unknown, or failed probes.
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance>;
     /// Render a human-readable status report for a running instance.
     /// Takes `&RunningInstance` so the precondition is part of the
@@ -914,9 +975,22 @@ impl std::fmt::Display for FirecrackerBackend {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    if inst.probe_running()? {
+        bail!("Instance '{}' is already running", inst.name);
+    }
+    boot_preflight(cfg)?;
+    let vm = crate::vm::FirecrackerVm::new(cfg, inst);
+    vm.configure()?;
+    crate::network::setup_tap(&cfg.network, inst)?;
+    let running = vm.start()?;
+    running.wait_for_boot()
+}
+
+#[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
     }
 
@@ -927,6 +1001,10 @@ impl VmBackend for FirecrackerBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        if inst.probe_running()? {
+            bail!("Instance '{}' is already running", inst.name);
+        }
         boot_preflight(cfg)?;
         // Mounts are handled after boot via rsync (not virtiofs).
         // Validation already happened in Mount::parse().
@@ -940,22 +1018,28 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        boot_preflight(cfg)?;
-        let vm = crate::vm::FirecrackerVm::new(cfg, inst);
-        vm.configure()?;
-        crate::network::setup_tap(&cfg.network, inst)?;
-        let running = vm.start()?;
-        running.wait_for_boot()
+        let _operation = lock_instance_operation(inst)?;
+        start_firecracker_existing(cfg, inst)
     }
 
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
-        vm.stop()
+        let operation = lock_instance_operation(&inst)?;
+        if inst.probe_liveness()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
+            vm.stop()?;
+        }
+        Ok(StoppedInstance::new(inst, operation))
+    }
+
+    fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
+        crate::network::teardown_tap(&cfg.network, stopped.instance())
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-        if let Ok(vm) = crate::vm::FirecrackerVm::from_running(cfg, inst) {
+        let _operation = lock_instance_operation(inst)?;
+        if inst.probe_running()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
         crate::network::teardown_tap(&cfg.network, inst)?;
@@ -1034,7 +1118,7 @@ impl VmBackend for FirecrackerBackend {
         // every subsequent `coop start` and the instance would stay wedged.
         let previous = crate::vm::machine_resources(inst)?;
         crate::vm::set_machine_resources(inst, mem.map(VmMemory::get), vcpus)?;
-        if start_after && let Err(e) = self.start_existing(cfg, inst) {
+        if start_after && let Err(e) = start_firecracker_existing(cfg, inst) {
             if let Err(revert) =
                 crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
             {
@@ -1068,7 +1152,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !inst.is_running() {
+        if !inst.probe_liveness()? {
             return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
@@ -1076,7 +1160,8 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
-        if inst.is_running() {
+        let lock = lock_instance_operation(&inst)?;
+        if inst.probe_liveness()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
                  `coop stop {}`",
@@ -1084,7 +1169,7 @@ impl VmBackend for FirecrackerBackend {
                 inst.name,
             );
         }
-        Ok(StoppedInstance::new(inst))
+        Ok(StoppedInstance::new(inst, lock))
     }
 
     fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
@@ -1132,27 +1217,27 @@ impl VmBackend for FirecrackerBackend {
 
 // ── Lima backend ──────────────────────────────────────────────
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub struct LimaBackend;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl LimaBackend {
     pub fn new() -> Self {
         Self
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl std::fmt::Display for LimaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("lima")
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::UnsupportedByLima)?;
         crate::lima::setup(cfg, opts)
     }
 
@@ -1163,21 +1248,31 @@ impl VmBackend for LimaBackend {
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         crate::lima::create_and_start(cfg, inst, disk_gib, mounts)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        crate::lima::stop_running(&inst)
+        let operation = lock_instance_operation(&inst)?;
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst)?,
+            Some(crate::lima::LimaState::Stopped) => {}
+            Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
+            None => bail!("Lima instance '{}' is absent", inst.name),
+        }
+        Ok(StoppedInstance::new(inst, operation))
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
         crate::lima::destroy(inst)?;
         if inst.dir.exists()
             && let Err(e) = fs::remove_dir_all(&inst.dir)
@@ -1259,23 +1354,27 @@ impl VmBackend for LimaBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !crate::lima::is_running(&inst) {
-            return Ok(None);
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Running) => {}
+            Some(crate::lima::LimaState::Stopped) => return Ok(None),
+            None => bail!("Lima instance '{}' is absent", inst.name),
+            Some(state) => bail!(
+                "Lima instance '{}' is {state}; running state is unknown",
+                inst.name
+            ),
         }
         let target = crate::lima::ssh_target(cfg, &inst)?;
         Ok(Some(RunningInstance::new(inst, target)))
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
-        if crate::lima::is_running(&inst) {
-            bail!(
-                "Instance '{}' is running — stop it first with \
-                 `coop stop {}`",
-                inst.name,
-                inst.name,
-            );
+        let lock = lock_instance_operation(&inst)?;
+        match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Stopped) => {}
+            Some(state) => bail!("Lima instance '{}' is {state}, not stopped", inst.name),
+            None => bail!("Lima instance '{}' is absent, not stopped", inst.name),
         }
-        Ok(StoppedInstance::new(inst))
+        Ok(StoppedInstance::new(inst, lock))
     }
 
     fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
@@ -1397,9 +1496,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve claude.api_key")?;
-        env.set("ANTHROPIC_API_KEY", resolved);
+        env.set("ANTHROPIC_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        env.set("ANTHROPIC_API_KEY", key);
+        env.set("ANTHROPIC_API_KEY", key)?;
     }
 
     // OPENAI_API_KEY: prefer config, fall back to process env. In proxy mode
@@ -1414,9 +1513,9 @@ pub fn prepare_env_forwarding(
     } else if let Some(key) = &codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
-        env.set("OPENAI_API_KEY", resolved);
+        env.set("OPENAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        env.set("OPENAI_API_KEY", key);
+        env.set("OPENAI_API_KEY", key)?;
     }
 
     // XAI_API_KEY: prefer config, fall back to process env. Never written
@@ -1424,14 +1523,14 @@ pub fn prepare_env_forwarding(
     if let Some(key) = &grok.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve grok.api_key")?;
-        env.set("XAI_API_KEY", resolved);
+        env.set("XAI_API_KEY", resolved)?;
     } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        env.set("XAI_API_KEY", key);
+        env.set("XAI_API_KEY", key)?;
     }
 
     // GITHUB_TOKEN: resolve via configured strategy
     if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
-        env.set("GITHUB_TOKEN", token);
+        env.set("GITHUB_TOKEN", token)?;
     } else {
         tracing::debug!("no GITHUB_TOKEN forwarded to guest");
     }
@@ -1474,7 +1573,7 @@ pub fn prepare_env_forwarding(
         if !env.contains(name.as_str())
             && let Ok(val) = std::env::var(name.as_str())
         {
-            env.set(name.as_str(), val);
+            env.set(name.as_str(), val)?;
         }
     }
 
@@ -1491,7 +1590,7 @@ pub fn prepare_env_forwarding(
         if env.contains(name.as_str()) {
             tracing::warn!("guest_env entry '{name}' overrides a previously resolved value");
         }
-        env.set(name.as_str(), value.as_str());
+        env.set(name.as_str(), value.as_str())?;
     }
 
     Ok(env)
@@ -4119,6 +4218,160 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn start_rejects_unknown_pid_before_boot_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
+        std::fs::write(inst.rootfs_path(), "disk sentinel").unwrap();
+
+        let error = FirecrackerBackend::new()
+            .start_existing(&CoopConfig::default(), &inst)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(inst.rootfs_path()).unwrap(),
+            "disk sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(inst.pid_file_path()).unwrap(),
+            "invalid-pid"
+        );
+    }
+
+    #[test]
+    fn lima_stop_reprobes_state_without_rebuilding_ssh_target() {
+        let Ok(root) = std::env::var("COOP_TEST_LIMA_STOP_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let script = root.path().join("limactl");
+            std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_STOP_CALLS\"\ncase \"$1\" in\n list) echo '{\"name\":\"coop-test\",\"status\":\"Running\"}';;\n stop) exit 0;;\nesac\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::lima_stop_reprobes_state_without_rebuilding_ssh_target",
+                ])
+                .env("COOP_TEST_LIMA_STOP_ROOT", root.path())
+                .env("COOP_TEST_LIMA_STOP_CALLS", root.path().join("calls"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+            assert_eq!(
+                calls.lines().filter(|line| *line == "list --json").count(),
+                1
+            );
+            assert!(calls.contains("stop coop-test"), "{calls}");
+            return;
+        };
+
+        let root = PathBuf::from(root);
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let target = SshTarget {
+            host: Hostname::new("localhost").unwrap(),
+            port: NonZeroU16::new(22).unwrap(),
+            user: SshUser::new("ubuntu").unwrap(),
+            key_path: root.join("key"),
+        };
+        LimaBackend::new()
+            .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stop_reprobes_after_acquiring_operation_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let cfg = CoopConfig::default();
+        let backend = FirecrackerBackend::new();
+        let target = backend.ssh_target(&cfg, &inst).unwrap();
+        let lock = lock_instance_operation(&inst).unwrap();
+        let stale_running = RunningInstance::new(inst, target);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            done_tx.send(backend.stop(&cfg, stale_running)).unwrap();
+        });
+
+        // Another stop completed before this token reached the operation lock.
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stopped_probe_holds_lock_until_disk_mutation_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let disk = inst.dir.join("rootfs.ext4");
+        std::fs::write(&disk, "before").unwrap();
+        let backend = FirecrackerBackend::new();
+        let stopped = backend.as_stopped(inst.clone()).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut cfg = CoopConfig::default();
+        cfg.claude.config_dir = ConfigDir::Custom(crate::config::ConfigPath::new(
+            root.path().join("missing-claude-config"),
+        ));
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(backend.start_existing(&cfg, &inst).is_err())
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        std::fs::write(&disk, "after").unwrap();
+        drop(stopped);
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        thread.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&disk).unwrap(), "after");
+    }
+
     const SAMPLE_OUTPUT: &str = "\
 0.12 0.08 0.03 1/42 1234
 MemTotal:        2048000 kB
@@ -4136,6 +4389,27 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
         }
+    }
+
+    #[test]
+    fn every_transport_disables_host_agent() {
+        let target = ssh_test_target();
+        for (name, opts) in [
+            ("ssh", target.ssh_opts()),
+            ("scp", target.scp_opts()),
+            ("mux", target.ssh_opts_mux()),
+        ] {
+            for option in ["IdentityAgent=none", "ForwardAgent=no"] {
+                assert_eq!(
+                    opts.iter().filter(|opt| opt.as_str() == option).count(),
+                    1,
+                    "{name} must disable the host agent exactly once: {option}"
+                );
+            }
+        }
+        let rsync = target.rsync_ssh_cmd();
+        assert!(rsync.contains("-o IdentityAgent=none"));
+        assert!(rsync.contains("-o ForwardAgent=no"));
     }
 
     #[test]
@@ -4198,6 +4472,44 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&data_dir),
+            ..Default::default()
+        };
+        cfg.claude.config_dir =
+            ConfigDir::Custom(crate::config::ConfigPath::new(root.path().join("missing")));
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: vec!["ripgrep".to_string()],
+            post_install: Some(root.path().join("setup.sh")),
+            image: ImageName::new("default").unwrap(),
+            guest_user: crate::guest::GuestUser::default(),
+            builder_timeout: None,
+        };
+
+        let error = LimaBackend::new()
+            .setup(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("claude.config_dir"), "{error}");
+        assert!(
+            !data_dir.exists(),
+            "setup must not create the data directory"
+        );
     }
 
     #[test]
@@ -6578,14 +6890,265 @@ url = "https://example.com/m"
         assert!(resolve_clone_token(Some(&failed), url, Some(&assigned)).is_err());
     }
 
+    fn forwarding_session(entries: &[(&str, &str)]) -> SshSession {
+        let mut env = EnvForward::default();
+        for (name, value) in entries {
+            env.set(*name, *value).unwrap();
+        }
+        SshSession {
+            target: SshTarget {
+                host: Hostname::new("127.0.0.1").unwrap(),
+                port: NonZeroU16::new(22).unwrap(),
+                user: SshUser::new("ubuntu").unwrap(),
+                key_path: "/unused-test-key".into(),
+            },
+            env,
+        }
+    }
+
+    // Execute the actual guest wrapper with precisely the transport environment
+    // built for SSH. This needs neither a VM nor a host-wide environment change.
+    fn forwarding_guest(ssh: &Command) -> Command {
+        let mut guest = Command::new("/bin/sh");
+        guest.env_clear();
+        for (name, value) in ssh.get_envs() {
+            guest.env(name, value.unwrap());
+        }
+        guest.arg("-c").arg(ssh.get_args().last().unwrap());
+        guest
+    }
+
+    #[test]
+    fn forwarding_isolates_host_and_round_trips_guest_values() {
+        let entries = [
+            ("PATH", "./project-bin"),
+            ("LD_LIBRARY_PATH", "./project-libs"),
+            ("SSH_AUTH_SOCK", "./project-socket"),
+            ("SECRET", "sentinel-secret-'\"$()`\n雪"),
+            ("EMPTY", ""),
+            ("COOP_SSH_ENV_0", "guest-alias-collision"),
+        ];
+        let session = forwarding_session(&entries);
+        let ssh = session.command(&[], "/usr/bin/env -0").unwrap();
+        let host_env: Vec<_> = ssh.get_envs().collect();
+        assert_eq!(host_env.len(), entries.len());
+        for (index, (_, value)) in entries.iter().enumerate() {
+            let alias = format!("COOP_SSH_ENV_{index}");
+            assert!(
+                host_env
+                    .iter()
+                    .any(|(k, v)| *k == alias.as_str() && *v == Some(std::ffi::OsStr::new(value)))
+            );
+        }
+        for name in ["PATH", "LD_LIBRARY_PATH", "SSH_AUTH_SOCK", "SECRET"] {
+            assert!(!host_env.iter().any(|(k, _)| *k == name));
+        }
+        for arg in ssh.get_args() {
+            assert!(!arg.to_string_lossy().contains(entries[3].1));
+        }
+        let output = forwarding_guest(&ssh).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = String::from_utf8(output.stdout).unwrap();
+        let actual: BTreeMap<_, _> = bytes
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+        for (name, value) in entries {
+            if name == "PATH" {
+                assert_eq!(
+                    actual
+                        .get(name)
+                        .and_then(|path| path.split(':').next_back()),
+                    Some(value),
+                );
+            } else {
+                assert_eq!(actual.get(name), Some(&value));
+            }
+        }
+        assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+    }
+
+    #[test]
+    fn forwarding_preserves_login_shell_before_guest_shell_override() {
+        let session = forwarding_session(&[("SHELL", "/guest/custom-shell")]);
+        let ssh = session
+            .command(&[], "[[ $SHELL == /guest/custom-shell ]] && printf bash-ok")
+            .unwrap();
+        let output = forwarding_guest(&ssh)
+            .env("SHELL", "/bin/bash")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"bash-ok");
+    }
+
+    #[test]
+    fn forwarding_preserves_stdin_and_exit_status() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let session = forwarding_session(&[("SECRET", "not-in-argv")]);
+        let ssh = session.command(&[], "/bin/cat; exit 37").unwrap();
+        let mut child = forwarding_guest(&ssh)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"stdin payload\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.stdout, b"stdin payload\n");
+        assert_eq!(output.status.code(), Some(37));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires tests/integration-proxy-forward.sh isolated OpenSSH fixture"]
+    fn forwarding_over_openssh_preserves_session_behavior() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let fixture = PathBuf::from(std::env::var("COOP_FORWARD_TEST_DIR").unwrap());
+        let entries = [
+            ("PATH", "/guest-only:/usr/bin:/bin"),
+            ("LD_LIBRARY_PATH", "/guest-library-only"),
+            ("SECRET", "dummy-'\"$()`\n雪"),
+            ("EMPTY", ""),
+            ("COOP_SSH_ENV_0", "guest-alias-collision"),
+        ];
+        let mut session = forwarding_session(&entries);
+        session.target = SshTarget {
+            host: Hostname::new("192.0.2.2").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            user: SshUser::new("root").unwrap(),
+            key_path: fixture.join("client"),
+        };
+        let output = session
+            .command(&[], "/usr/bin/env -0")
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let actual: BTreeMap<_, _> = text
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .collect();
+        for (name, value) in entries {
+            assert_eq!(actual.get(name), Some(&value));
+        }
+        assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+
+        // Force a PTY even when the CI runner has no local terminal. The bash
+        // expression also checks preservation of the fixture account's shell.
+        let output = session
+            .command(
+                &["-tt".into()],
+                "test -t 0 && [[ 1 == 1 ]] && printf pty-ok",
+            )
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"pty-ok");
+
+        let mut child = session
+            .command(&[], "/bin/cat; exit 37")
+            .unwrap()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"stdin preserved\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.stdout, b"stdin preserved\n");
+        assert_eq!(output.status.code(), Some(37));
+
+        let output = session
+            .command(&[], "printf command-ran")
+            .unwrap()
+            .env_remove("COOP_SSH_ENV_0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing forwarded environment"));
+
+        session.env = EnvForward::default();
+        session.env.set("OPTIND", "private-test-value").unwrap();
+        let output = session
+            .command(&[], "printf command-ran")
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            b"coop: could not restore guest variable OPTIND\n"
+        );
+    }
+
+    #[test]
+    fn forwarding_missing_transport_fails_before_command() {
+        let session = forwarding_session(&[("EMPTY", "")]);
+        let ssh = session.command(&[], "printf command-ran").unwrap();
+        let output = forwarding_guest(&ssh)
+            .env_remove("COOP_SSH_ENV_0")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("missing forwarded environment"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_assignment_failure_redacts_values_and_stops_command() {
+        // The guest's dash shell treats OPTIND as numeric. This is a rejected
+        // assignment, not malformed transport; no value may reach diagnostics.
+        let session = forwarding_session(&[("OPTIND", "private-test-value")]);
+        let ssh = session.command(&[], "printf command-ran").unwrap();
+        let output = forwarding_guest(&ssh).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr,
+            b"coop: could not restore guest variable OPTIND\n"
+        );
+    }
+
+    #[test]
+    fn forwarding_rejects_invalid_names_and_nul_without_values_in_errors() {
+        let mut env = EnvForward::default();
+        let invalid_name = env.set("BAD-NAME", "secret-value").unwrap_err().to_string();
+        assert!(!invalid_name.contains("secret"));
+
+        let session = forwarding_session(&[("VALID", "secret\0value")]);
+        let invalid_value = session.command(&[], "true").unwrap_err().to_string();
+        assert!(!invalid_value.contains("secret"));
+    }
+
     // ── EnvForward Debug redaction ──────────────────────────
 
     #[test]
     fn env_forward_debug_redacts_all_values() {
         let mut env = EnvForward::default();
-        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value");
-        env.set("GITHUB_TOKEN", "ghp_secret_value");
-        env.set("MYORG_INTERNAL", "internal-secret-blob");
+        env.set("ANTHROPIC_API_KEY", "sk-ant-secret-value").unwrap();
+        env.set("GITHUB_TOKEN", "ghp_secret_value").unwrap();
+        env.set("MYORG_INTERNAL", "internal-secret-blob").unwrap();
         let debug = format!("{env:?}");
         for secret in [
             "sk-ant-secret-value",
@@ -6712,7 +7275,7 @@ url = "https://example.com/m"
         }
 
         assert_eq!(
-            env.as_envs().get("XAI_API_KEY").map(String::as_str),
+            env.guest_values().get("XAI_API_KEY").map(String::as_str),
             Some("xai-from-host-env"),
             "process XAI_API_KEY must be forwarded when grok.api_key is unset"
         );
@@ -6755,7 +7318,10 @@ url = "https://example.com/m"
         }
 
         assert_eq!(
-            forwarded.as_envs().get("MY_HOST_TOKEN").map(String::as_str),
+            forwarded
+                .guest_values()
+                .get("MY_HOST_TOKEN")
+                .map(String::as_str),
             Some("token-from-host"),
             "Grok MCP env mappings must forward the referenced host variable"
         );
@@ -6910,10 +7476,13 @@ url = "https://example.com/m"
         let cfg = cfg_with_guest_env(&[("RUST_LOG", "info"), ("MY_FLAG", "1")]);
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
-            env.as_envs().get("RUST_LOG").map(String::as_str),
+            env.guest_values().get("RUST_LOG").map(String::as_str),
             Some("info")
         );
-        assert_eq!(env.as_envs().get("MY_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.guest_values().get("MY_FLAG").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -6925,7 +7494,9 @@ url = "https://example.com/m"
 
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
-            env.as_envs().get("ANTHROPIC_API_KEY").map(String::as_str),
+            env.guest_values()
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
             Some("guest-env-wins"),
         );
     }
@@ -6936,7 +7507,10 @@ url = "https://example.com/m"
         // "set to empty" so users can intentionally clear inherited vars.
         let cfg = cfg_with_guest_env(&[("EMPTY", "")]);
         let env = prepare_env_forwarding(&cfg, None, false, false).unwrap();
-        assert_eq!(env.as_envs().get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(
+            env.guest_values().get("EMPTY").map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]
@@ -6955,7 +7529,7 @@ url = "https://example.com/m"
         let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("ANTHROPIC_API_KEY")
                 .map(String::as_str),
             Some("sk-ant-realkey")
@@ -6973,7 +7547,7 @@ url = "https://example.com/m"
         let forwarded = prepare_env_forwarding(&cfg, None, false, false).unwrap();
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("sk-openai-realkey")
@@ -7033,7 +7607,7 @@ url = "https://example.com/m"
         );
         assert_eq!(
             forwarded
-                .as_envs()
+                .guest_values()
                 .get("ANTHROPIC_API_KEY")
                 .map(String::as_str),
             Some("sk-ant-from-host-env"),

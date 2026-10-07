@@ -38,6 +38,8 @@ not publish it):
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --cert-identity https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<version> \
+  --source-ref refs/tags/<version> --deny-self-hosted-runners \
   --bundle attestations.jsonl
 ```
 
@@ -45,6 +47,10 @@ Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
 instead, which it will only do when `gh` is logged in. `install.sh` and `coop
 update` use that API path themselves for releases published without a usable
 bundle.
+Both paths require the release workflow at the selected tag (including its
+`v` prefix), with attestation generated on a GitHub-hosted runner. An older
+`gh` that does not support these flags fails verification; upgrade it before
+retrying.
 
 ## Upgrading from v0.5.4
 
@@ -71,7 +77,96 @@ The binaries land at `target/release/coop` and `target/release/coop-proxy`.
 Keep them in the same directory when installing: proxy mode looks for its
 companion next to `coop`.
 
+### Nix
+
+The flake supports native builds on macOS arm64 and Linux x86_64/arm64.
+It pins its inputs in `flake.lock` and reads the Rust version from
+`rust-toolchain.toml`.
+
+The commands below require **Nix 2.30 or newer**, with the `nix-command` and
+`flakes` experimental features enabled. Check your version with `nix --version`.
+(`nix profile add` was introduced in Nix 2.30.) From a checkout:
+
+```sh
+nix build
+./result/bin/coop --version
+nix run . -- --help
+```
+
+`result/bin` contains both `coop` and `coop-proxy`. To install them in your
+Nix profile:
+
+```sh
+nix profile add .#coop
+```
+
+The explicit `#coop` output names the profile entry `coop`, independently of
+the checkout directory name. If you previously installed with `nix profile add .`,
+check `nix profile list` for the existing entry name and use that name for
+upgrade/removal, or remove that entry and reinstall with `.#coop`.
+
+On macOS, the package includes Lima and the host command-line tools used by
+coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
+install the [host prerequisites](#prerequisites) separately and keep them on
+`PATH`. VM images are created by `coop setup`.
+
+Nix packages identify as development builds, which disables `coop update`
+and background release notifications. To upgrade, update your checkout and
+run `nix profile upgrade coop` (or `nix build` for a local build).
+Use `nix flake update` when intentionally updating the pinned Nix inputs.
+
+#### Removing a Nix installation
+
+`coop uninstall` refuses Nix-store binaries before changing any data, even with
+`--yes` or `--purge`. Do not use `sudo coop uninstall` or delete store paths.
+For a profile installation, remove the package with:
+
+```sh
+nix profile remove coop
+```
+
+This leaves VM instances, images, configuration and update-check state in place.
+For a declarative NixOS or Home Manager installation, remove the package from
+your configuration and rebuild instead.
+
+If you also want to delete coop's data, **perform the following cleanup before
+removing the package**, while the `coop` command is still available. Back up any
+VM-only work first; this destroys all instances and images for the selected
+configuration. With the default configuration and data directory:
+
+```sh
+coop destroy --all && rm -rf -- "$HOME/.coop"
+```
+
+`destroy --all` stops and destroys the VMs, cleans up backend resources and
+removes coop's SSH config entries. The second command removes the remaining
+data and configuration. With a custom configuration, use
+`coop --config /path/to/config.toml destroy --all`, then remove the actual
+`data_dir` configured there, rather than assuming it is `~/.coop`. A config file
+outside that directory must be removed separately if no longer needed. On Linux,
+root-owned files may require elevated permissions for that data-directory
+cleanup; never apply it to the Nix store.
+
+Remove the update-check state separately, if present:
+
+```sh
+# Linux
+rm -f -- "${XDG_STATE_HOME:-$HOME/.local/state}/coop/update-check.json"
+# macOS
+rm -f -- "$HOME/Library/Application Support/coop/update-check.json"
+```
+
+Then remove the package as described above. Credentials stored separately in a
+keychain, password manager, or secret-store directory are not removed by these
+steps.
+
 ## Configuration
+
+To share hook scripts or dotfiles with every VM, add
+[`[[guest_files]]`](configuration.md#guest-files) mappings. coop copies those
+files into writable guest locations on each boot, so tools can create their own
+configuration alongside them.
 
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 
@@ -361,17 +456,21 @@ Push local changes into a running VM:
 coop push
 ```
 
-Pull guest changes back to the host:
+Pull guest changes into a new review directory on the host:
 
 ```
-coop pull
+coop pull --dir ../my-project-from-vm
 ```
 
-Both commands default to the workspace path recorded by `coop up`. Override with `--dir`:
+Both commands default to the workspace path recorded by `coop up`, but pull
+refuses that normally nonempty directory unless `--force` is supplied. Prefer
+pulling into a missing or empty directory, reviewing the untrusted guest files,
+and only then copying back what you want. Override the push source or pull
+destination with `--dir`:
 
 ```
 coop push --dir ~/other-dir
-coop pull --dir ~/other-dir
+coop pull --dir ~/new-review-dir
 ```
 
 ### 7. Tear down

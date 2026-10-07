@@ -25,6 +25,7 @@ use crate::prompt::confirm;
 use crate::sha256_hash::Sha256Hash;
 
 const REPO: &str = "trailofbits/coop";
+const SIGNER_WORKFLOW: &str = ".github/workflows/release.yml";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// Release asset holding the Sigstore provenance bundle, published since #421.
 const BUNDLE_ASSET: &str = "attestations.jsonl";
@@ -120,11 +121,20 @@ fn api_base_overridden() -> bool {
     env::var("COOP_UPDATE_API_BASE_URL").is_ok()
 }
 
+fn skip_attestation_for_fixture() -> bool {
+    api_base_overridden() && env::var("COOP_UPDATE_TEST_VERIFY_ATTESTATION").as_deref() != Ok("1")
+}
+
 fn warn_if_api_base_overridden() {
-    if api_base_overridden() {
+    if skip_attestation_for_fixture() {
         tracing::warn!(
             "COOP_UPDATE_API_BASE_URL is set — attestation verification is DISABLED. \
              This is a test-only mode; do not use with untrusted URLs."
+        );
+    } else if api_base_overridden() {
+        tracing::warn!(
+            "COOP_UPDATE_API_BASE_URL is set — verifying a test-only release source. \
+             Do not use with untrusted URLs."
         );
     }
 }
@@ -392,13 +402,18 @@ fn verify_sha256(file: &Path, expected: &Sha256Hash) -> Result<()> {
 /// attestations API, so no GitHub credential is involved. What each transport
 /// does and does not pin is recorded in the `coop update` trust chain in
 /// `docs/trust-model.md`.
-fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsString> {
+fn attestation_verify_args(tarball: &Path, tag: &str, bundle: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "attestation".into(),
         "verify".into(),
         tarball.as_os_str().to_owned(),
         "--repo".into(),
         REPO.into(),
+        "--cert-identity".into(),
+        format!("https://github.com/{REPO}/{SIGNER_WORKFLOW}@refs/tags/{tag}").into(),
+        "--source-ref".into(),
+        format!("refs/tags/{tag}").into(),
+        "--deny-self-hosted-runners".into(),
     ];
     if let Some(bundle) = bundle {
         args.push("--bundle".into());
@@ -413,7 +428,8 @@ fn attestation_verify_args(tarball: &Path, bundle: Option<&Path>) -> Vec<OsStrin
 /// performs the download this describes.
 #[derive(Debug)]
 enum BundleDecision<'a> {
-    /// `COOP_UPDATE_API_BASE_URL` is set. The local fixture serves synthetic
+    /// `COOP_UPDATE_API_BASE_URL` is set without the verification test switch.
+    /// The local fixture serves synthetic
     /// artifacts that have no provenance in GitHub's attestation API, so
     /// verification is skipped; `warn_if_api_base_overridden` has already
     /// surfaced the override on stderr.
@@ -517,7 +533,11 @@ impl Provenance {
 /// Never fails the update: every problem with the bundle falls back to the
 /// attestations API or skips verification outright.
 fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
-    let asset = match bundle_decision(release, api_base_overridden(), command_exists("gh")) {
+    let asset = match bundle_decision(
+        release,
+        skip_attestation_for_fixture(),
+        command_exists("gh"),
+    ) {
         BundleDecision::TestMode => return Provenance::TestMode,
         BundleDecision::NoGh => return Provenance::NoGh,
         BundleDecision::NoAsset => {
@@ -559,7 +579,7 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
     Provenance::Bundle(dest)
 }
 
-fn verify_attestation(tarball: &Path, provenance: &Provenance) -> Result<()> {
+fn verify_attestation(tarball: &Path, tag: &str, provenance: &Provenance) -> Result<()> {
     match provenance {
         Provenance::TestMode => return Ok(()),
         Provenance::NoGh => {
@@ -568,7 +588,9 @@ fn verify_attestation(tarball: &Path, provenance: &Provenance) -> Result<()> {
                  The download was verified against the published `SHA256SUMS` checksum, which \
                  is the same assurance level as most `curl | bash` installers. For end-to-end \
                  Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
-                 verify manually: `gh attestation verify <tarball> --repo {REPO} --bundle \
+                 verify manually: `gh attestation verify <tarball> --repo {REPO} \
+                 --cert-identity https://github.com/{REPO}/{SIGNER_WORKFLOW}@refs/tags/{tag} \
+                 --source-ref refs/tags/{tag} --deny-self-hosted-runners --bundle \
                  {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
             );
             return Ok(());
@@ -576,7 +598,7 @@ fn verify_attestation(tarball: &Path, provenance: &Provenance) -> Result<()> {
         Provenance::Api(_) | Provenance::Bundle(_) => {}
     }
     Cmd::new("gh")
-        .args(attestation_verify_args(tarball, provenance.bundle()))
+        .args(attestation_verify_args(tarball, tag, provenance.bundle()))
         .run()
         .with_context(|| {
             format!(
@@ -747,7 +769,7 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
     verify_sha256(&tarball_path, &expected)?;
 
     let provenance = resolve_provenance(release, tmp.path());
-    verify_attestation(&tarball_path, &provenance)?;
+    verify_attestation(&tarball_path, &release.tag, &provenance)?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
     // `-C <tempdir>` plus modern tar's default refusal of `..`-segmented and absolute
@@ -1097,11 +1119,22 @@ mod tests {
     }
 
     #[test]
-    fn attestation_verify_args_pin_repo_and_omit_bundle_when_absent() {
-        let args = attestation_verify_args(Path::new("/tmp/coop.tar.gz"), None);
+    fn attestation_verify_args_pin_release_workflow_and_tag_without_bundle() {
+        let args = attestation_verify_args(Path::new("/tmp/coop.tar.gz"), "v9.9.9", None);
         assert_eq!(
             args,
-            ["attestation", "verify", "/tmp/coop.tar.gz", "--repo", REPO]
+            [
+                "attestation",
+                "verify",
+                "/tmp/coop.tar.gz",
+                "--repo",
+                REPO,
+                "--cert-identity",
+                "https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/v9.9.9",
+                "--source-ref",
+                "refs/tags/v9.9.9",
+                "--deny-self-hosted-runners",
+            ]
         );
     }
 
@@ -1109,6 +1142,7 @@ mod tests {
     fn attestation_verify_args_append_bundle_when_present() {
         let args = attestation_verify_args(
             Path::new("/tmp/coop.tar.gz"),
+            "v1.2.3-rc.1",
             Some(Path::new("/tmp/attestations.jsonl")),
         );
         assert_eq!(
@@ -1119,6 +1153,11 @@ mod tests {
                 "/tmp/coop.tar.gz",
                 "--repo",
                 REPO,
+                "--cert-identity",
+                "https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/v1.2.3-rc.1",
+                "--source-ref",
+                "refs/tags/v1.2.3-rc.1",
+                "--deny-self-hosted-runners",
                 "--bundle",
                 "/tmp/attestations.jsonl",
             ]

@@ -26,9 +26,6 @@ coop/
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
 │   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
-│   ├── devcontainer.rs     # devcontainer.json parse + translate to coop config
-│   ├── devcontainer_oci.rs # devcontainer Features from the GHCR OCI registry
-│   ├── git_repo_devcontainer.rs # fetch devcontainer.json from a remote repo
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
@@ -46,9 +43,9 @@ coop/
 │   ├── port_forward.rs     # ssh -L port forwards + state
 │   ├── signal.rs           # SIGINT/SIGTERM cooperative cancellation
 │   ├── paths.rs            # GuestPath / HostPath type split
-│   ├── fs_util.rs          # atomic file writes, file locks
+│   ├── fs_util.rs          # private directories/ACLs, atomic file writes, file locks
+│   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
-│   ├── jsonc.rs            # JSONC → JSON (for devcontainer.json)
 │   ├── naming.rs           # safe-name character class
 │   ├── completions.rs      # shell completion (static + dynamic candidates)
 │   ├── prompt.rs           # TTY prompts
@@ -104,36 +101,47 @@ Two lifecycle machines are encoded in the type system rather than in runtime
 flags — this is a load-bearing design choice (see
 [`code-style.md`](code-style.md#type-state-for-lifecycles)):
 
-- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) are unforgeable
-  liveness proofs with private fields, minted only by the probes `as_running`
-  / `as_stopped`. Operations that require a live (or stopped) VM take the proof
-  by value, so the precondition is checked once and then witnessed by the type.
+- **`RunningInstance` / `StoppedInstance`** (`backend.rs`) have private fields.
+  `as_running` records a point-in-time running observation; `as_stopped` and a
+  successful `stop` mint `StoppedInstance` only after confirming exit.
+  `StoppedInstance` holds the per-instance operation lock through cleanup and
+  stopped-only disk mutations. Lima only mints it for confirmed `Stopped`;
+  absent, broken, unknown, and failed probes stay distinct.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
-- **`boot_preflight(cfg)`** (`backend.rs`) is the single choke point every boot
-  path calls first; it runs `cfg.validate()` so no VM starts on an invalid
-  config.
+- **Setup preflight** rejects explicit inputs unsupported by the selected
+  backend before config loading at the CLI boundary and repeats that capability
+  check at the backend boundary. `boot_preflight(cfg)` then runs
+  `cfg.validate()` before backend setup or boot work, so no VM starts on an
+  invalid config.
+
+An instance operation lock is held from the stopped-state probe through disk
+resize, commit, or restore. Start, stop, and destroy acquire the same bounded
+lock. Its file is a sibling of the instance directory, so directory removal
+does not replace the lock inode. Allocation releases its directory lock before
+any instance operation lock is acquired.
 
 ## Command dispatch
 
 `lib.rs:run()` is the entrypoint. Order matters:
 
 1. Emit dynamic shell completions (before arg parsing) if requested.
-2. Parse `Cli` (clap derive), init tracing (→ **stderr**).
-3. Handle commands that must work **without** a loaded config —
-   `Completions`, `Init`, `Update`, `Uninstall`, `Devcontainer check` — first.
-4. `config::CoopConfig::load`, then fire the update-notifier check.
-5. Construct `backend::PlatformBackend::new()`.
-6. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
+2. Parse `Cli` (clap derive).
+3. Reject backend-unsupported explicit `setup` inputs before tracing, config
+   loading, or other setup side effects.
+4. Init tracing (→ **stderr**) and handle commands that must work **without** a
+   loaded config — `Completions`, `Init`, `Update`, `Uninstall` — first.
+5. `config::CoopConfig::load`, then fire the update-notifier check.
+6. Construct `backend::PlatformBackend::new()`.
+7. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
    handlers call `cfg.validate_and_warn()?` before VM work; query commands
    (`list`/`status`/`logs`) skip it.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
 exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
-`devcontainer.rs`, `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
+`profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
-`admin.rs` (init/validate/uninstall),
-and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
+`admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`
 re-exports the dispatch surface and holds cross-domain helpers
 (`merge_runtime_guest_env`, `purge_all_data`).
 
@@ -145,12 +153,18 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 1. **Resolve** the target repo/workspace and optionally prompt for a GitHub PAT
    (`pat_prompt::maybe_prompt`).
 2. **Ports** — merge forward-port specs and fail fast on host-port collisions
-   (`port_forward::check_host_port_collisions`).
+   (`port_forward::check_host_port_collisions`). Stage explicit `guest_files`
+   sources in private host temporary directories, resolving permitted symlinks
+   and rejecting invalid source trees before boot or disk replacement.
 3. **Boot** the VM (`be.create_and_start`), then `wait_until_ready` (SSH probe
    with backoff).
 4. **Forwards + state** — spawn `ssh -L` forwards, persist `ForwardsState`,
-   `GuestEnvState`, `DevcontainerState` as JSON sidecars in the instance dir.
-5. **Bootstrap** (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
+   `GuestEnvState` as JSON sidecars in the instance dir.
+5. **Guest files and bootstrap** — `guest_files.rs` uploads the staged copies;
+   `scripts/guest/copy-files.sh` rejects destination symlinks and live-mount
+   overlaps, then merges private, writable files without deletion. Host staging
+   drops at the end of the operation; guest staging is cleaned after each copy.
+   Then (`backend.rs:bootstrap_agents`): if a `GITHUB_TOKEN` is present,
    `gh auth setup-git`; then `bootstrap_claude` / `bootstrap_codex` inject the
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked
@@ -158,7 +172,9 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
 6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
-7. **`postStartCommand`** hook (warned, not fatal).
+7. **`post_start`** hook — runs after workspace and mount provisioning,
+   with an SSH session prepared after bootstrap to include newly created proxy
+   capability tokens. Hook command failures are warned, not fatal.
 
 Config, secrets, and workspace all cross the host→guest boundary here; the
 security-relevant details of each crossing are in
@@ -176,8 +192,11 @@ retrieval commands and resolved at VM-start by `resolve_cmd_value`.
 
 Per-instance runtime state is a set of JSON sidecar files under the instance
 dir: `instance.json`, `vm_config.json`, `workspace.json`, `forwards.json`,
-`guest_env.json`, `model.json`, `proxy.json`, `devcontainer_state.json`, plus
+`guest_env.json`, `model.json`, `proxy.json`, plus
 the Firecracker `.pid`/`.socket`/`.log`/vsock files.
+Allocation refuses an occupied instance path. If any instance directory has
+unreadable metadata, allocation stops because its network index cannot be
+trusted; existing healthy instances remain available through normal lookup.
 
 ## `coop update`
 
@@ -185,7 +204,9 @@ the Firecracker `.pid`/`.socket`/`.log`/vsock files.
 from the pinned `trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
 `attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
-when the release publishes no usable one (best-effort),
+when the release publishes no usable one (best-effort). Both paths pin the
+signer to `.github/workflows/release.yml` at the selected tag, require that
+source ref, and reject attestations generated on self-hosted runners. Then
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
 `coop-proxy` beside the CLI before replacing `coop`. Each replacement is
 atomic; the pair is not a single transaction. A background notifier checks for
@@ -213,9 +234,9 @@ Hold these when changing the code; the review agents check for their violation:
    filesystem escape. See [`trust-model.md`](trust-model.md).
 2. **Backend selection is compile-time.** Don't add a runtime backend enum;
    keep shared code correct for both Firecracker and Lima.
-3. **Liveness is a type, not a flag.** Route VM operations through
-   `RunningInstance`/`StoppedInstance` and `boot_preflight`, not ad-hoc
-   `if is_running` checks.
+3. **State-gated operations use probes and locks.** Route VM operations through
+   `RunningInstance`/`StoppedInstance` and `boot_preflight`; the stopped token
+   holds the operation lock until the disk mutation is complete.
 4. **Value invariants live in constructors.** Parse into a newtype at the
    boundary; don't re-validate primitives downstream.
 5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in

@@ -36,6 +36,13 @@ clippy with `-D warnings`, and the applicable broader tests. Use the
 changes. Re-run the review skill against the complete updated diff, not only the
 last fix commit.
 
+For changes to platform `#[cfg]` gates, backend aliases, or platform-only
+types/call paths, run check and clippy for every affected OS, natively or with
+an available cross target. Verify the ordinary non-test library build as well
+as tests: `--all-targets` does not select other operating systems, and
+`cfg(test)` can hide unused production variants. Report unavailable targets as
+unrun platform gates.
+
 Stop after two non-converging review/fix cycles, if the diff grows beyond about
 twice the baseline without approval, or when a local fix has become a redesign.
 

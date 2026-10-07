@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`guest_files.source`, `data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -16,7 +16,79 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
-| `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
+| `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
+| `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
+
+### Private host storage
+
+coop keeps `data_dir`, its image/instance/state directories, and each managed
+image or instance directory at `0700`. Environment snapshots, JSON state, file
+backend tokens, SSH private keys, and VM disks use `0600`. Atomic writes create
+private temporary files before writing their contents. Lima runs with a `077`
+child umask, reapplies disk modes after startup, and protects its coop instance directories under `LIMA_HOME` (or
+`~/.lima`).
+
+Commands seal shared storage roots and migrate existing entries without walking
+mounted guest filesystems or workspaces. Entries removed during migration are
+ignored; unsafe instance or image entries are reported without blocking unrelated
+commands. Loading a selected instance or image strictly checks its directory and
+managed files. Shared credential storage and the common SSH key remain strict. Repairing a
+root-owned Firecracker disk may request sudo. Private storage must be owned by
+the invoking user; Firecracker disks may also be root-owned. Symlinked managed
+paths, hardlinked sensitive files, and ancestors owned by another user are
+rejected. Lima’s same-directory `disk` → `diffdisk` compatibility alias is
+accepted. Root-owned OS directory aliases are allowed as ancestors. Writable
+ancestors must be sticky, as with `/tmp`; use a dedicated user-owned directory
+for custom storage. Extended ACL grants and directory inheritance are removed
+from private directories and user-owned sensitive files. On macOS, ancestor
+ACLs granting write or ownership/control access are rejected. Config edits
+preserve the permissions and ACLs of the directory containing `config.toml`.
+
+## Guest files
+
+Use one `[[guest_files]]` entry per host file or directory that you want to copy
+into every VM. For example, shared agent hooks can live alongside writable guest
+configuration directories without a host mount:
+
+```toml
+[[guest_files]]
+source = "~/.config/agents"
+destination = "~/.config/agents"
+
+[[guest_files]]
+source = "~/dotfiles/gitconfig"
+destination = "~/.gitconfig"
+```
+
+`source` expands `~` to your **host** home. `destination` expands `~/` to the
+configured **guest** user's home, or accepts an absolute guest path. Destinations
+must name a path below `/` or `~/`, without trailing slashes, empty components,
+`.` components, `..` components, or control characters. Parent directories are
+created as the guest user; copying to a location that user cannot write fails.
+
+A directory copies its contents into the exact destination directory; a file
+copies to the exact destination filename. Copies run before agent bootstrap on
+creation, restart, and `restore --reprovision`, including with `--no-agents`.
+Reconnecting to an already-running instance does not copy again. Agent bootstrap
+can subsequently replace files that it manages, such as `~/.codex/config.toml`.
+coop does not rewrite platform-specific paths or commands inside copied files.
+
+Each boot takes a private host snapshot before starting the VM. Copies overwrite
+matching guest files, retain guest-only files, include dotfiles, and ignore no
+files based on `.gitignore`. Removing a mapping or source file does not remove its
+previous guest copy. Copied directories have mode `0700`; files have mode `0600`,
+or `0700` when the source is owner-executable. Guest edits never sync to the host.
+
+Source symlinks are materialized as copies. Their targets must stay within an
+explicitly declared source root; add another mapping when you need to include an
+external target. Missing sources, dangling or cyclic links, and special files
+fail before boot. A source that contains the host staging directory is rejected;
+set `TMPDIR` outside your source directories if needed. Destination mappings cannot overlap each other or live host
+mounts. Existing destination symlinks are rejected instead of followed.
+
+These are explicit copies of everything under each source, including any secrets
+you place there. Select narrow directories. They do not change the agent-specific
+configuration allowlists or the proxy's credential-filtering behavior.
 
 ## GitHub auth
 
@@ -148,9 +220,10 @@ its association with the VM state, leaving the shared PAT intact.
 
 An active assignment rejects managed `GITHUB_TOKEN` **and** `GH_TOKEN` entries
 in `[guest_env]`, Claude, Codex, or Grok `env_forward`, a Grok stdio MCP `env`
-value that names either variable, or persisted `--env` / `containerEnv`
-overrides. Remove these conflicting entries, including saved keys in
-`<instance>/guest_env.json`, or unassign the PAT. This controls coop's
+value that names either variable, or persisted `--env` overrides. Instances
+created by older coop versions can also retain legacy devcontainer
+`containerEnv` overrides. Remove these conflicting entries, including saved
+keys in `<instance>/guest_env.json`, or unassign the PAT. This controls coop's
 delivery; the guest can still change its own environment. The VM receives the
 token's actual authority over every repository it covers.
 
@@ -208,15 +281,6 @@ The name is validated against the POSIX-portable pattern `[a-z_][a-z0-9_-]{0,31}
 
 The guest user is **baked into the image at setup time and immutable for the image's lifetime** — it is persisted in the image's `template_config.json`, and `up` / `start` / `shell` / `exec` read it back from there. To change it, destroy and recreate the image: `coop destroy && coop setup --guest-user <name>`.
 
-### devcontainer `remoteUser`
-
-When a workspace's `devcontainer.json` declares a `remoteUser` (e.g. `vscode` for the Microsoft devcontainer base images), the handling depends on the stage:
-
-- **At `coop setup`**, a valid `remoteUser` becomes the image's guest user unless `--guest-user` already pins one (the CLI flag wins, and the override is reported).
-- **At `coop up` / `coop start`**, the guest user is already baked in. If the file's `remoteUser` matches the image's persisted user, it is applied; if it differs, coop reports the mismatch, skips forwarding `containerEnv` (its values often reference a `/home/<remoteUser>/...` path that doesn't exist on disk), and points you at `coop destroy && coop setup --guest-user <remoteUser>` to switch.
-
-See [Devcontainer support](devcontainer.md) for the full translation table.
-
 ## Guest PATH
 
 Every guest SSH session — login, non-login, and `exec` — has the guest user's `~/.local/bin` on `PATH`. coop prepends it to `PATH` in `/etc/environment`, which `pam_env` applies to all sessions. This is where the Claude Code installer places its per-user `claude` binary.
@@ -231,9 +295,11 @@ RUST_LOG = "info"
 MY_FLAG = "1"
 ```
 
-Keys are env var names; values are the literals to inject. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
+Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. The values transit the host SSH process under inert internal aliases, so their original guest-controlled names—including names loaded from saved instance state—cannot configure that process. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
 
 **Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
+
+Variables with special meaning to the guest shell still follow that shell's rules. If its environment-restoration shell rejects an assignment, Coop stops the command and reports the variable name without its value.
 
 Override or extend per-invocation with `coop up --env KEY=VALUE` or `coop start --env KEY=VALUE` (repeatable).
 
