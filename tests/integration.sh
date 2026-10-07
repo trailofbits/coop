@@ -1197,8 +1197,8 @@ test_grok_bin_path() {
     fi
 
     local version
-    if version=$(coop_exec /home/ubuntu/.grok/bin/grok --version) \
-        && [[ "$version" =~ ^([Gg]rok[[:space:]]+([Vv]ersion[[:space:]]+)?)?v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
+    if version=$(coop_exec /home/ubuntu/.grok/bin/grok version) \
+        && [[ "$version" =~ ^([Gg]rok[[:space:]]+([Vv]ersion[[:space:]]+)?)?v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?([[:space:]]+\([0-9a-fA-F]+\))?$ ]]; then
         pass "grok binary reports a version via full path"
     else
         fail "grok binary reports a version via full path" \

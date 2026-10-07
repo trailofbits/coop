@@ -45,7 +45,7 @@ class ProbeTests(unittest.TestCase):
             }
             coop_exec() {
                 [[ "$#" -eq 2 && "$1" == /home/ubuntu/.grok/bin/grok \
-                    && "$2" == --version ]] || return 99
+                    && "$2" == version ]] || return 99
                 printf '%s\\n' "$VERSION"
                 return "$VERSION_STATUS"
             }
@@ -59,6 +59,7 @@ class ProbeTests(unittest.TestCase):
             ("1", "1", "", "0", "5,1,0"),
             ("1", "1", "grok 1.2.3", "0", "6,0,0"),
             ("1", "1", "grok version 1.2.3-alpha.1", "0", "6,0,0"),
+            ("1", "1", "grok 1.0.46 (2765805b9442)", "0", "6,0,0"),
             ("1", "1", "1.2.3", "0", "6,0,0"),
             ("1", "1", "grok 1.2", "0", "5,1,0"),
             ("1", "1", "Python 3.11.8", "0", "5,1,0"),
