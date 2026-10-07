@@ -38,6 +38,8 @@ not publish it):
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --cert-identity https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<version> \
+  --source-ref refs/tags/<version> --deny-self-hosted-runners \
   --bundle attestations.jsonl
 ```
 
@@ -45,6 +47,10 @@ Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
 instead, which it will only do when `gh` is logged in. `install.sh` and `coop
 update` use that API path themselves for releases published without a usable
 bundle.
+Both paths require the release workflow at the selected tag (including its
+`v` prefix), with attestation generated on a GitHub-hosted runner. An older
+`gh` that does not support these flags fails verification; upgrade it before
+retrying.
 
 ## Upgrading from v0.5.4
 
@@ -156,6 +162,11 @@ keychain, password manager, or secret-store directory are not removed by these
 steps.
 
 ## Configuration
+
+To share hook scripts or dotfiles with every VM, add
+[`[[guest_files]]`](configuration.md#guest-files) mappings. coop copies those
+files into writable guest locations on each boot, so tools can create their own
+configuration alongside them.
 
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 

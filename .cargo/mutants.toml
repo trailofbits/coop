@@ -57,6 +57,11 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # guest_files.rs: SSH transfer and cleanup; staging and path checks remain scoped.
+  "guest_files.rs:.*StagedFiles::install",
+  # Lifecycle staging resolves image metadata and backend mount behavior.
+  "BootPayload::prepare",
+
   # MigrationOutcome::report only emits a warning for an already classified
   # failure; policy decisions remain in scope and are unit-tested.
   "src/private_storage\\.rs:.*MigrationOutcome::report",
@@ -66,6 +71,14 @@ exclude_re = [
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
+  # Firecracker liveness invokes sudo and probes /proc plus a Unix socket;
+  # Linux-only process tests cover it outside the unit mutation sweep.
+  "\\bprobe_liveness\\b",
+  # Privileged socket wrapper/syscalls; the errno classifier remains in scope.
+  # Host regressions cover the real helper and full accept queue.
+  "\\bensure_firecracker_api_socket_stopped\\b",
+  "\\bprobe_firecracker_api_socket\\b",
+  "\\bconnect_firecracker_api_socket\\b",
 
   # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
   "\\brun_setup_pat\\b",
@@ -211,6 +224,9 @@ exclude_re = [
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
   "\\bstart_instance\\b",
+  # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
+  # the ordering is covered by a filesystem-backed lifecycle unit test.
+  "\\bcleanup_confirmed_stop\\b",
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
   # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.
@@ -316,11 +332,13 @@ exclude_re = [
   # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
   # via exclude_globs above.)
 
-  # lifecycle.rs — backend-driving session/bootstrap helpers. Both open an SSH
-  # session and bootstrap guest agents (prepare_session_from_target also reads
-  # persisted guest-env / model state from disk); their effects are observable
-  # only against a real VM.
-  "\\bbootstrap_and_post_start\\b",
+  # lifecycle.rs — backend-driving helpers: bootstrap_on_boot installs guest
+  # agents, run_configured_post_start executes the configured guest hook, and
+  # prepare_session_from_target reads persisted state and prepares SSH/env.
+  # VM tests cover their guest effects; an isolated unit test covers the
+  # post-start cancellation check before session preparation.
+  "\\bbootstrap_on_boot\\b",
+  "\\brun_configured_post_start\\b",
   "\\bprepare_session_from_target\\b",
 
   # ---- coop agent update (#402): in-guest agent refresh ----

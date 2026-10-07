@@ -20,7 +20,7 @@ use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
-use crate::setup::SetupOptions;
+use crate::setup::{ExplicitSetupInputSupport, SetupOptions};
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -187,9 +187,9 @@ impl RunningInstance {
 // ── Stopped instance ──────────────────────────────────────────
 
 /// Observation that an instance was stopped, with an operation lock held.
-/// Construct via [`VmBackend::as_stopped`]. The constructor probes live state
-/// while holding the lock, so a concurrent lifecycle mutation waits until
-/// the token is dropped.
+/// Construct via [`VmBackend::as_stopped`] or a successful [`VmBackend::stop`].
+/// Both paths confirm the stopped state while holding the lock, so a concurrent
+/// lifecycle mutation waits until the token is dropped.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
 /// The field is private so callers cannot construct one without a backend probe.
@@ -199,10 +199,9 @@ pub struct StoppedInstance {
 }
 
 impl StoppedInstance {
-    /// Mint a `StoppedInstance` after a successful live-state probe.
+    /// Mint a `StoppedInstance` after the backend confirms the instance stopped.
     ///
-    /// Crate-private so only backend impls can construct one. Callers
-    /// use [`VmBackend::as_stopped`] (which delegates here).
+    /// Crate-private so only backend implementations can construct one.
     pub(crate) fn new(inst: Instance, lock: FileLock) -> Self {
         Self { inst, _lock: lock }
     }
@@ -411,6 +410,10 @@ impl SshTarget {
             "StrictHostKeyChecking=no".into(),
             "-o".into(),
             "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "ForwardAgent=no".into(),
+            "-o".into(),
+            "IdentityAgent=none".into(),
             "-o".into(),
             "IdentitiesOnly=yes".into(),
             "-o".into(),
@@ -803,13 +806,26 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// filesystem state.
 ///
 /// Every backend boot entry (`setup`, `create_and_start`, `start_existing`)
-/// calls this first, so the check is unforgettable — a new lifecycle path
-/// that reaches boot cannot skip it, and it sees the world as it is at boot
-/// time rather than trusting a witness minted earlier. Warnings are dropped
-/// here; they are surfaced once at the handler via
+/// calls this before backend setup or boot work, so the check is unforgettable
+/// and sees the world as it is at boot time rather than trusting a witness
+/// minted earlier. Setup first rejects backend-unsupported explicit inputs.
+/// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
     cfg.validate().map(drop)
+}
+
+fn setup_preflight(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+    explicit_inputs: ExplicitSetupInputSupport,
+) -> Result<()> {
+    crate::setup::validate_explicit_setup_inputs(
+        explicit_inputs,
+        &opts.extra_packages,
+        opts.post_install.as_ref(),
+    )?;
+    boot_preflight(cfg)
 }
 
 /// VM backend for managing guest lifecycle.
@@ -827,8 +843,15 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    /// Stop an instance observed running at the preceding probe.
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop an instance observed running at the preceding probe and return it
+    /// with the operation lock held once the backend confirms it has exited.
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance>;
+    /// Finish backend cleanup for a confirmed-stopped instance.
+    /// Lima has no host TAP; Firecracker deletes it while the operation lock
+    /// carried by `stopped` prevents a concurrent restart.
+    fn cleanup_stopped(&self, _cfg: &CoopConfig, _stopped: &StoppedInstance) -> Result<()> {
+        Ok(())
+    }
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
@@ -967,7 +990,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
     }
 
@@ -999,14 +1022,18 @@ impl VmBackend for FirecrackerBackend {
         start_firecracker_existing(cfg, inst)
     }
 
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
-        if !inst.probe_running()? {
-            return Ok(());
+        let operation = lock_instance_operation(&inst)?;
+        if inst.probe_liveness()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
+            vm.stop()?;
         }
-        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
-        vm.stop()
+        Ok(StoppedInstance::new(inst, operation))
+    }
+
+    fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
+        crate::network::teardown_tap(&cfg.network, stopped.instance())
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1125,7 +1152,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !inst.probe_running()? {
+        if !inst.probe_liveness()? {
             return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
@@ -1134,7 +1161,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
         let lock = lock_instance_operation(&inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
                  `coop stop {}`",
@@ -1210,7 +1237,7 @@ impl std::fmt::Display for LimaBackend {
 #[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::UnsupportedByLima)?;
         crate::lima::setup(cfg, opts)
     }
 
@@ -1232,15 +1259,16 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
+        let operation = lock_instance_operation(&inst)?;
         match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
-            Some(crate::lima::LimaState::Stopped) => Ok(()),
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst)?,
+            Some(crate::lima::LimaState::Stopped) => {}
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
         }
+        Ok(StoppedInstance::new(inst, operation))
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -4364,6 +4392,27 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn every_transport_disables_host_agent() {
+        let target = ssh_test_target();
+        for (name, opts) in [
+            ("ssh", target.ssh_opts()),
+            ("scp", target.scp_opts()),
+            ("mux", target.ssh_opts_mux()),
+        ] {
+            for option in ["IdentityAgent=none", "ForwardAgent=no"] {
+                assert_eq!(
+                    opts.iter().filter(|opt| opt.as_str() == option).count(),
+                    1,
+                    "{name} must disable the host agent exactly once: {option}"
+                );
+            }
+        }
+        let rsync = target.rsync_ssh_cmd();
+        assert!(rsync.contains("-o IdentityAgent=none"));
+        assert!(rsync.contains("-o ForwardAgent=no"));
+    }
+
+    #[test]
     fn every_transport_is_bounded_against_a_wedged_guest() {
         let target = ssh_test_target();
         let ssh = target.ssh_opts();
@@ -4423,6 +4472,44 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&data_dir),
+            ..Default::default()
+        };
+        cfg.claude.config_dir =
+            ConfigDir::Custom(crate::config::ConfigPath::new(root.path().join("missing")));
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: vec!["ripgrep".to_string()],
+            post_install: Some(root.path().join("setup.sh")),
+            image: ImageName::new("default").unwrap(),
+            guest_user: crate::guest::GuestUser::default(),
+            builder_timeout: None,
+        };
+
+        let error = LimaBackend::new()
+            .setup(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("claude.config_dir"), "{error}");
+        assert!(
+            !data_dir.exists(),
+            "setup must not create the data directory"
+        );
     }
 
     #[test]

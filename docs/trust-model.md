@@ -118,6 +118,18 @@ itself authorize host execution.
 
 ## Secrets and how they cross into the guest
 
+`[[guest_files]]` explicitly authorizes copying complete host source trees into
+the guest, including any credentials in those trees. Each boot stages private
+copies before VM startup. Source links are materialized only within declared
+source roots; cycles, dangling links, and special files fail staging. Source
+components are opened relative to pinned directory descriptors without following
+symlinks; copying reads the validated file descriptor. Sources containing the
+staging directory are rejected. Destinations
+are guest paths, never inputs to host filesystem writes. Guest copying rejects
+symlinks and live-mount overlaps and does not delete unmatched guest files.
+These opt-in copies are separate from the agent allowlists and proxy filtering;
+users must select sources that contain only data they intend to expose.
+
 coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
 user `env_forward` entries, and the VM SSH key. The invariants:
@@ -231,7 +243,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 ## SSH boundary
 
 - coop connects to the guest with `StrictHostKeyChecking=no`,
-  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`
+  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
+  `ForwardAgent=no`, and `IdentityAgent=none`
   (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
   rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
@@ -240,7 +253,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   deliberate: guest keys are ephemeral and regenerated per VM, so there is no
   stable host key to pin. The trade-off is that a MITM on the path to the guest
   is not detected — acceptable because that path is loopback / a local TAP link
-  to a VM the host itself owns.
+  to a VM the host itself owns. Coop-owned transports disable host agent use
+  and forwarding; generated SSH config blocks set the same options for aliases,
+  subject to OpenSSH configuration precedence for the user-owned file.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
@@ -392,7 +407,12 @@ Self-update (`update.rs`) must preserve, in order:
    (`verify_sha256`, constant-size `Sha256Hash` compare).
 4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
    --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
-   downloaded from the same release.
+   downloaded from the same release. Both `update.rs` and `install.sh` also
+   require `--cert-identity
+   https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<tag>`,
+   `--source-ref refs/tags/<tag>`, and `--deny-self-hosted-runners` on both the
+   bundle and API paths. The signer must be the release workflow at the exact
+   selected tag, attesting on a GitHub-hosted runner.
 
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
@@ -413,8 +433,8 @@ Self-update (`update.rs`) must preserve, in order:
    - **The bundle path accepts a superset.** The API path only returns
      attestations registered in the repo's attestation store, so minting one
      requires `attestations: write`. The `--bundle` path accepts any
-     correctly-signed bundle sitting in a release, which requires only
-     `contents: write`.
+     correctly-signed bundle satisfying the signer/ref/runner policy sitting
+     in a release, whose publication requires only `contents: write`.
    - **The bundle path is unrevocable.** `DELETE
      /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
      carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
@@ -422,14 +442,12 @@ Self-update (`update.rs`) must preserve, in order:
      indefinitely after the attestation is deleted.
 
    What still defeats a substituted bundle is the **subject-digest binding** —
-   `gh` digests the artifact and requires a matching subject. `--repo
-   trailofbits/coop` pins the source repository and constrains the signer SAN
-   to that repo, but not to a specific workflow file or ref: any workflow on
-   any ref in `trailofbits/coop` holding `id-token: write` +
-   `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
-   / `--cert-identity` are the tighter pin and neither client passes one — the
-   API path is keyed by digest against the same repo-scoped store and is
-   equally unpinned there.
+   `gh` digests the artifact and requires a matching subject. Repository-only
+   verification could accept another workflow or ref in the same repository;
+   the exact certificate identity and source-ref checks reject those on both
+   verification paths. These checks pin a tag name, not an immutable commit
+   digest: moving a tag and rerunning the release workflow is not prevented
+   by this policy.
 
    A release that publishes no bundle asset — or one whose download fails, or
    whose bundle is empty — falls back to the API path, where `gh` requires a
@@ -444,13 +462,15 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode), unless
+   the updater integration suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1`
+   to exercise verification against a local fixture. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin **and** disables
+`COOP_UPDATE_API_BASE_URL` redirects the update origin and normally disables
 attestation; the checksum then only proves integrity against *that* server's own
 `SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
 attestation provide provenance. Flag any change that widens where that override

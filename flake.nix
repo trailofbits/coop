@@ -93,12 +93,20 @@
                 --replace-fail '/usr/bin/sed' '${pkgs.gnused}/bin/sed' \
                 --replace-fail 'SHELL=/bin/bash /bin/sh -c' \
                   'SHELL=${pkgs.bash}/bin/bash ${pkgs.bash}/bin/bash -c'
+              # The Linux sandbox has no /bin/mkdir for the limactl shim.
+              substituteInPlace src/lima.rs \
+                --replace-fail '/bin/mkdir' '${pkgs.coreutils}/bin/mkdir'
             '';
             # CMake builds aws-lc-sys through Cargo, not the top-level project.
             dontUseCmakeConfigure = true;
 
             # The SSH and TLS unit tests bind loopback listeners.
             __darwinAllowLocalNetworking = true;
+            # Private-storage preparation creates the Lima home on macOS; keep
+            # it out of the unwritable /homeless-shelter.
+            preCheck = ''
+              export LIMA_HOME="$TMPDIR/lima"
+            '';
             checkFlags =
               pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
                 # APFS rejects the invalid UTF-8 name before this test can
@@ -113,8 +121,9 @@
                 "--skip=config::tests::is_running_true_for_live_firecracker_like_pid"
 
                 # Nix's Linux syscall filter rejects setxattr with ENOTSUP, so
-                # the default-ACL fixture fails even on ACL-capable filesystems.
+                # the ACL fixtures fail even on ACL-capable filesystems.
                 "--skip=vm::tests::pid_trampoline_normalizes_inherited_default_acl"
+                "--skip=private_storage::tests::removes_access_and_inherited_acls"
               ];
 
             # Nix owns upgrades of these immutable binaries. Keep the existing
@@ -161,8 +170,9 @@
               mkdir -p "$runtimeCheckDir/state"
               printf 'data_dir = "%s/state"\n' "$runtimeCheckDir" > "$runtimeCheckDir/config.toml"
               # Stop at key generation, before any VM or image is created.
-              # The dangling link makes ssh-keygen fail when saving its key.
-              ln -s missing/key "$runtimeCheckDir/state/vm_key"
+              # Private-storage preparation rejects symlinked state, so block the
+              # public-key path instead: ssh-keygen fails when saving its key.
+              mkdir "$runtimeCheckDir/state/vm_key.pub"
               if env PATH= LIMA_HOME="$runtimeCheckDir/lima" \
                 "$out/bin/coop" --config "$runtimeCheckDir/config.toml" setup \
                 > "$runtimeCheckDir/setup.log" 2>&1; then

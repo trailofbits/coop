@@ -884,6 +884,11 @@ fn restart_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
+    let files = crate::guest_files::StagedFiles::prepare(
+        &cfg.guest_files,
+        &backend::persisted_guest_user(cfg, &inst.image),
+        &[],
+    )?;
     crate::github_assignment::active(cfg, inst)?;
     be.start_existing(cfg, inst)?;
 
@@ -914,7 +919,8 @@ fn restart_instance(
     }
     .save(inst)?;
 
-    bootstrap_and_post_start(
+    files.install(&target)?;
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -923,6 +929,7 @@ fn restart_instance(
         opts,
         backend::BootMode::Restart,
     )?;
+    run_configured_post_start(cfg, inst, &target, repo.as_ref(), opts)?;
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}:{}",
@@ -984,9 +991,33 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
-    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
+}
+
+struct BootPayload {
+    forwards: Vec<config::PortForward>,
+    files: crate::guest_files::StagedFiles,
+}
+
+impl BootPayload {
+    fn prepare(
+        be: &backend::PlatformBackend,
+        cfg: &config::CoopConfig,
+        image: &config::ImageName,
+        mounts: &[config::Mount],
+        forwards: Vec<config::PortForward>,
+    ) -> Result<Self> {
+        let live_mounts = if be.mounts_are_live() { mounts } else { &[] };
+        let files = crate::guest_files::StagedFiles::prepare(
+            &cfg.guest_files,
+            &backend::persisted_guest_user(cfg, image),
+            live_mounts,
+        )?;
+        Ok(Self { forwards, files })
+    }
 }
 
 /// Everything a first boot needs once the guest is up: port forwards,
@@ -1001,10 +1032,10 @@ fn start_instance(
 /// and `/workspace` survived on the guest disk.
 ///
 /// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, plus what
-/// [`bootstrap_and_post_start`] consumes (`no_agents`, `post_start_override`).
+/// `exclude_git`, `persisted_guest_env`, `post_start_override`, plus what
+/// [`bootstrap_on_boot`] consumes (`no_agents`).
 /// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
-/// resolved forward set arrives as `forwards`, because callers merge it
+/// resolved forward set arrives in `payload`, because callers merge it
 /// differently. Reaching for one of those fields here would silently change
 /// behavior for `reprovision_instance` only, which passes placeholders for them.
 fn provision_first_boot(
@@ -1013,8 +1044,9 @@ fn provision_first_boot(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
     repo: Option<&github_repo::RepoSlug>,
-    forwards: &[config::PortForward],
+    payload: &BootPayload,
 ) -> Result<()> {
+    let forwards = payload.forwards.as_slice();
     signal::check_shutdown()?;
 
     let target = be.ssh_target(cfg, inst)?;
@@ -1043,7 +1075,8 @@ fn provision_first_boot(
         entries: opts.persisted_guest_env.clone(),
     }
     .save(inst)?;
-    bootstrap_and_post_start(
+    payload.files.install(&target)?;
+    bootstrap_on_boot(
         be,
         cfg,
         inst,
@@ -1123,6 +1156,8 @@ fn provision_first_boot(
             );
         }
     }
+
+    run_configured_post_start(cfg, inst, &target, repo, opts)?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}:{}",
@@ -1350,10 +1385,8 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
-/// Open a session and run the post-boot agent bootstrap plus any
-/// `post_start` hook, honoring `--no-agents`. Shared by fresh start and
-/// restart, which differ only in the [`backend::BootMode`].
-fn bootstrap_and_post_start(
+/// Bootstrap guest agents after boot, before workspace provisioning.
+fn bootstrap_on_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -1362,7 +1395,6 @@ fn bootstrap_and_post_start(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
-    let post_start = opts.post_start_override.or(cfg.post_start.as_deref());
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1388,7 +1420,7 @@ fn bootstrap_and_post_start(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents && post_start.is_none() {
+    if opts.no_agents {
         if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
@@ -1400,27 +1432,26 @@ fn bootstrap_and_post_start(
     // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
     // defeating proxy-mode non-exposure (issue #411).
     let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
-    if opts.no_agents {
-        tracing::info!("Skipping guest agent bootstrap (--no-agents)");
-    } else {
-        let guest_host = be.guest_host_address(&cfg.network);
-        backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
-    }
-    if let Some(cmd) = post_start {
-        // Agent bootstrap may have just minted the per-instance capability
-        // token (proxy mode), which is forwarded to sessions via `SendEnv`
-        // (Codex's `COOP_LOCAL_API_KEY`). The session above was built before
-        // the token existed, so re-prepare it here — otherwise a `post_start`
-        // that runs Codex in proxy mode would lack the token and fail to
-        // authenticate. Under --no-agents no proxy started, so nothing new to
-        // pick up; keep the original session.
-        let session = if opts.no_agents {
-            session
-        } else {
-            prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?
-        };
-        backend::run_post_start(&session, cmd);
-    }
+    let guest_host = be.guest_host_address(&cfg.network);
+    backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
+    Ok(())
+}
+
+/// Run the hook after bootstrap and workspace provisioning have succeeded.
+fn run_configured_post_start(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    target: &backend::SshTarget,
+    repo: Option<&github_repo::RepoSlug>,
+    opts: &StartOpts<'_>,
+) -> Result<()> {
+    let Some(command) = opts.post_start_override.or(cfg.post_start.as_deref()) else {
+        return Ok(());
+    };
+    signal::check_shutdown()?;
+    // Bootstrap may mint a proxy capability token; construct this session afterward.
+    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    backend::run_post_start(&session, command);
     Ok(())
 }
 
@@ -1563,29 +1594,41 @@ pub(crate) fn cmd_stop(
     inst: &config::Instance,
 ) -> Result<()> {
     tracing::info!("Stopping instance '{}'", inst.name);
-    // Preserve probe errors: unknown state cannot be reported as stopped.
-    if let Some(running) = be.as_running(cfg, inst.clone())? {
+    // `RunningInstance` records a point-in-time observation from this probe;
+    // `be.stop` rechecks under the backend operation lock before mutating.
+    let stopped = if let Some(running) = be.as_running(cfg, inst.clone())? {
         // Tear down forwards before shutting down the VM so the
         // control master can exit cleanly while SSH is still
         // reachable.
         port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?;
+        be.stop(cfg, running)?
     } else {
-        tracing::debug!("Instance '{}' is not running — nothing to stop", inst.name);
+        tracing::debug!("Instance '{}' is not running", inst.name);
         // Stale forwards may still exist even when the VM is gone.
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
-    }
+        // Reconfirm the stopped state while acquiring the operation lock.
+        be.as_stopped(inst.clone())?
+    };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
-    // proxy mode was never on.
-    crate::proxy::stop(inst);
+    // proxy mode was never on. Do this only after confirmed exit, but before
+    // backend cleanup so TAP deletion errors do not leave stale credentials.
+    cleanup_confirmed_stop(&stopped, |stopped| be.cleanup_stopped(cfg, stopped))?;
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
     // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
     Ok(())
+}
+
+fn cleanup_confirmed_stop(
+    stopped: &backend::StoppedInstance,
+    cleanup: impl FnOnce(&backend::StoppedInstance) -> Result<()>,
+) -> Result<()> {
+    crate::proxy::stop(stopped.instance());
+    cleanup(stopped)
 }
 
 pub(crate) fn cmd_destroy(
@@ -1964,6 +2007,8 @@ fn reprovision_instance(
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
+    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
+    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
@@ -2013,14 +2058,13 @@ fn reprovision_instance(
     // `check_host_port_collisions` binds each host port to probe it, so while
     // the instance is still running its *own* forwarder holds them and every
     // forward would look taken.
-    let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
     // The bail names `--forward-port`, which `restore` does not expose, and
     // the instance is stopped by now — so say both. Reachable without the
     // user having asked about ports at all: a `forward_ports` entry added to
     // `config.toml` since creation whose host port is busy, or two entries
     // with distinct guest ports sharing one host port (`merge_forward_ports`
     // dedupes on the guest port only).
-    port_forward::check_host_port_collisions(&forwards).with_context(|| {
+    port_forward::check_host_port_collisions(&payload.forwards).with_context(|| {
         format!(
             "Instance '{}' is stopped and was not reprovisioned. Free the host port \
              or drop the conflicting `forward_ports` entry from config.toml, then \
@@ -2095,7 +2139,7 @@ fn reprovision_instance(
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &forwards)
+    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &payload)
         .with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
@@ -2309,6 +2353,8 @@ mod tests {
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
         let disk = inst.rootfs_path();
         std::fs::write(&disk, "disk sentinel").expect("disk sentinel");
         let cfg = cfg_with_data_dir(root.path().to_path_buf());
@@ -2322,6 +2368,10 @@ mod tests {
             std::fs::read_to_string(inst.pid_file_path()).expect("retained pid"),
             "invalid-pid"
         );
+        assert_eq!(
+            std::fs::read_to_string(&proxy_token).expect("retained proxy token"),
+            "proxy sentinel"
+        );
         let error = backend
             .destroy_instance(&cfg, &inst)
             .expect_err("unknown liveness cannot authorize destroy")
@@ -2334,11 +2384,98 @@ mod tests {
         assert!(inst.dir.is_dir());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_stop_removes_proxy_before_cleanup_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").expect("name"),
+            index: super::config::InstanceIndex::new(0).expect("index"),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").expect("image"),
+        };
+        std::fs::create_dir(&inst.dir).expect("instance dir");
+        let proxy_token = inst.dir.join("proxy-openai.token");
+        std::fs::write(&proxy_token, "proxy sentinel").expect("proxy token");
+        let backend = super::backend::FirecrackerBackend::new();
+        let stopped = backend
+            .as_stopped(inst)
+            .expect("instance is confirmed stopped");
+
+        let error = super::cleanup_confirmed_stop(&stopped, |_| {
+            assert!(!proxy_token.exists(), "proxy token survived confirmed stop");
+            Err(anyhow::anyhow!("cleanup failed"))
+        })
+        .expect_err("cleanup failure must propagate")
+        .to_string();
+
+        assert_eq!(error, "cleanup failed");
+        assert!(!proxy_token.exists());
+    }
+
     fn cfg_with_data_dir(dir: std::path::PathBuf) -> super::config::CoopConfig {
         super::config::CoopConfig {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[test]
+    fn post_start_stops_before_session_preparation_when_interrupted() {
+        const CHILD: &str = "COOP_POST_START_INTERRUPTED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "commands::lifecycle::tests::",
+                        "post_start_stops_before_session_preparation_when_interrupted",
+                    ),
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        assert_interrupted_post_start();
+    }
+
+    fn assert_interrupted_post_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = instance_named("test", tmp.path());
+        std::fs::create_dir(inst.model_state_path()).unwrap();
+        let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        cfg.post_start = Some("true".to_string());
+        let target = super::backend::SshTarget {
+            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: super::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("id_test"),
+        };
+        let opts = start_opts(Vec::new(), tmp.path());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert!(format!("{error:#}").contains("model.json"), "{error:#}");
+        let _signals = super::signal::install_handlers();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(super::signal::shutdown_requested());
+        let error =
+            super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap_err();
+        assert_eq!(error.to_string(), "Interrupted by signal — cleaning up");
+        cfg.post_start = None;
+        super::run_configured_post_start(&cfg, &inst, &target, None, &opts).unwrap();
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {

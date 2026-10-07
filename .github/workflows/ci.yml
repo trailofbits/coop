@@ -52,8 +52,14 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
-      - name: Install network test tools
-        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping util-linux openssh-client openssh-server
+      - name: Install integration test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iptables iputils-ping jq rsync util-linux \
+            openssh-client openssh-server
+
+      - name: Guest-file copy regression tests
+        run: bash tests/guest-files-copy.sh
 
       - name: Release preflight regression tests
         run: python3 tests/test-preflight-release.py
@@ -87,7 +93,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
+        uses: cargo-bins/cargo-binstall@422f3094be6a0843857aa008b499caaf6bce0da8 # v1.24.0
 
       # Pin to match CARGO_DENY_VERSION in scripts/install-dev-tools.sh so CI and
       # local installs run the same version.

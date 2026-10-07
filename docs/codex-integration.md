@@ -2,6 +2,16 @@
 
 coop installs Codex into every guest image and gives you a dedicated `coop codex` launcher. This guide covers the `coop codex` command, the configuration that controls what gets injected into the guest, and the bootstrap sequence that runs when a VM starts.
 
+## Shared dotfiles and hook dependencies
+
+If your Codex configuration invokes hooks from a shared directory such as
+`~/.config/agents`, add that directory to
+[`[[guest_files]]`](configuration.md#guest-files). coop copies it before Codex
+bootstrap on every boot, leaving the guest's `~/.config` writable for tools such
+as `uv`. Use separate entries for additional files or directories. Commands and
+absolute paths inside configuration files must work on Linux; coop does not
+translate macOS-specific commands.
+
 ## Launching Codex
 
 ```bash

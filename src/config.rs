@@ -6,6 +6,8 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_os = "macos"))]
+use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -741,13 +745,18 @@ pub struct CoopConfig {
     #[serde(default)]
     pub guest_env: BTreeMap<crate::guest_env_state::EnvVarName, String>,
 
+    /// Explicit host files and directories copied into the guest at every boot.
+    #[serde(default)]
+    pub guest_files: Vec<crate::guest_files::GuestFile>,
+
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
 
     /// Shell command to run inside the guest after every successful boot.
     ///
-    /// Executed after the VM is up and SSH is ready, before any interactive
+    /// Executed after SSH, agent bootstrap, and workspace/mount provisioning,
+    /// before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
     #[serde(default)]
@@ -2462,6 +2471,7 @@ impl Default for CoopConfig {
             grok: GrokConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
+            guest_files: Vec::new(),
             profiles: HashMap::new(),
             post_start: None,
             forward_ports: Vec::new(),
@@ -2761,6 +2771,173 @@ impl Instance {
         }
 
         Ok(true)
+    }
+
+    /// Probe Firecracker liveness without treating an uncertain probe
+    /// or an orphaned API socket as a confirmed exit.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid = match fs::read_to_string(&pid_path) {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<i32>()
+                    .context("Invalid Firecracker PID file")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+
+        if let Some(pid) = pid {
+            if pid <= 0 {
+                bail!("Invalid Firecracker PID file: {pid}");
+            }
+            // EPERM means the root-owned process exists. ESRCH confirms exit,
+            // including when /proc hides other users' processes.
+            let exists = if unsafe { libc::kill(pid, 0) } == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EPERM) => true,
+                    Some(libc::ESRCH) => false,
+                    _ => return Err(error).context("Failed to probe Firecracker PID"),
+                }
+            };
+            if exists {
+                let cmdline = Cmd::new("cat")
+                    .arg(format!("/proc/{pid}/cmdline"))
+                    .sudo()
+                    .capture()
+                    .context("Failed to inspect Firecracker PID")?;
+                if cmdline.contains("firecracker") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        if pid.is_some()
+            && let Err(error) = fs::remove_file(&pid_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove stale Firecracker PID file {} (non-fatal): {error}",
+                pid_path.display()
+            );
+        }
+        Ok(false)
+    }
+}
+
+/// Confirm that the root-owned Firecracker API socket is no longer accepting
+/// connections. An unprivileged connect sees `EACCES` for both live and stale
+/// mode-0755 sockets, so it cannot safely distinguish those states.
+#[cfg(not(target_os = "macos"))]
+fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => bail!(
+            "Firecracker API socket path is not a Unix socket: {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+    }
+
+    let output = Cmd::new(crate::privileged_disk::running_executable_path())
+        .arg("__probe-firecracker-socket")
+        .arg(socket_path)
+        .sudo()
+        .output()
+        .context("Failed to run privileged Firecracker API socket probe")?;
+    if !output.status.success() {
+        bail!(
+            "Privileged Firecracker API socket probe failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Run in the privileged helper so permission denial cannot mask a listener.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_firecracker_api_socket(socket_path: &Path) -> Result<()> {
+    classify_firecracker_socket_probe(connect_firecracker_api_socket(socket_path))
+}
+
+#[cfg(target_os = "linux")]
+fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(socket_path.as_os_str().as_bytes())?;
+    // SAFETY: sockaddr_un is a plain C struct; zeroing terminates sun_path.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family =
+        libc::sa_family_t::try_from(libc::AF_UNIX).map_err(std::io::Error::other)?;
+    if path.as_bytes_with_nul().len() > address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Firecracker API socket path is too long",
+        ));
+    }
+    // SAFETY: the checked destination holds the entire NUL-terminated path.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path.as_ptr().cast::<u8>(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path.as_bytes_with_nul().len(),
+        );
+    }
+    // Nonblocking connect returns EAGAIN for a full accept queue rather than
+    // waiting indefinitely. Only ENOENT/ECONNREFUSED can authorize cleanup.
+    // SAFETY: socket creates a new descriptor with these Linux flags.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful socket call returns a newly owned descriptor.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let address_len = libc::socklen_t::try_from(std::mem::size_of_val(&address))
+        .map_err(std::io::Error::other)?;
+    // SAFETY: the initialized sockaddr_un and its length are valid; socket
+    // owns the descriptor until after connect returns, including on error.
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            address_len,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
+    match connection {
+        Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
     }
 }
 
@@ -3155,6 +3332,80 @@ mod tests {
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn firecracker_socket_probe_rejects_live_socket() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn firecracker_socket_probe_classifies_connect_errors() {
+        assert!(classify_firecracker_socket_probe(Ok(())).is_err());
+        for errno in [libc::ECONNREFUSED, libc::ENOENT] {
+            classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                .unwrap();
+        }
+        for errno in [
+            libc::EAGAIN,
+            libc::ETIMEDOUT,
+            libc::EACCES,
+            libc::EINPROGRESS,
+        ] {
+            assert!(
+                classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_api_path() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_confirms_exited_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+        assert!(!inst.probe_liveness().unwrap());
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_invalid_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), "invalid").unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_recognizes_running_firecracker() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let result = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap());
     }
 
     #[test]

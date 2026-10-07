@@ -1395,6 +1395,8 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
+         \x20   IdentityAgent none\n\
+         \x20   ForwardAgent no\n\
          \x20   StrictHostKeyChecking no\n\
          \x20   UserKnownHostsFile /dev/null\n\
          \x20   LogLevel ERROR\n\
@@ -2542,6 +2544,8 @@ Host coop-app\n\
         assert!(block.contains("Port 2222"));
         assert!(block.contains("User ubuntu"));
         assert!(block.contains("IdentityFile /tmp/key"));
+        assert!(block.contains("    IdentityAgent none\n"));
+        assert!(block.contains("    ForwardAgent no\n"));
         assert!(block.contains("StrictHostKeyChecking no"));
         assert!(block.contains("UserKnownHostsFile /dev/null"));
     }

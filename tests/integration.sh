@@ -2697,14 +2697,116 @@ test_guest_fingerprint() {
 
 # ── Stop / status-stopped / restart ───────────────────────────
 
+test_stop_preserves_recent_writes() {
+    echo ""
+    echo "=== Phase: stop preserves recent guest writes ==="
+
+    if coop_exec python3 -c '
+from pathlib import Path
+import os
+root = Path.home() / ".coop-stop-durability-test"
+root.mkdir(exist_ok=True)
+(root / "changed").write_text("before")
+(root / "deleted").write_text("before")
+os.sync()
+(root / "changed").write_text("after")
+(root / "created").write_text("new")
+(root / "deleted").unlink()
+'; then
+        pass "write guest disk changes before stop"
+    else
+        fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
+        return
+    fi
+    if ! coop stop "$INSTANCE"; then
+        fail "stop after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! coop start "$INSTANCE" --no-agents; then
+        fail "restart after recent writes" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if coop_exec python3 -c '
+from pathlib import Path
+import shutil
+root = Path.home() / ".coop-stop-durability-test"
+assert (root / "changed").read_text() == "after", "overwrite lost"
+assert (root / "created").read_text() == "new", "new file lost"
+assert not (root / "deleted").exists(), "deleted file restored"
+shutil.rmtree(root)
+'; then
+        pass "recent writes and deletion survive stop/start"
+    else
+        fail "recent writes and deletion survive stop/start" "stderr: $(guest_stderr)"
+    fi
+}
+
 test_stop() {
     echo ""
     echo "=== Phase: stop ==="
+
+    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0
+    if [[ "$(uname -s)" == Linux ]]; then
+        ip=$(guest_ip_of "$INSTANCE") || ip=""
+        if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
+            && (( 10#${BASH_REMATCH[1]} >= 2 && 10#${BASH_REMATCH[1]} <= 254 )); then
+            tap="tap$(( 10#${BASH_REMATCH[1]} - 2 ))"
+            if [[ -e "/sys/class/net/$tap" ]]; then
+                pass "instance TAP exists before stop"
+            else
+                fail "instance TAP exists before stop" "$tap is absent"
+            fi
+        else
+            fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
+        fi
+
+        # Firecracker and its socket run as root. Kill the VMM without its
+        # graceful cleanup so `coop stop` must recognize the abandoned
+        # root-owned socket and still remove the TAP.
+        fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
+        socket_metadata=$(stat -c '%U:%a' "$socket_path" 2>/dev/null || true)
+        if [[ -n "$fc_pid" && -S "$socket_path" \
+            && "$socket_metadata" == "root:755" ]]; then
+            if sudo -n kill -9 "$fc_pid"; then
+                for _ in {1..50}; do
+                    if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
+                        exited=1
+                        break
+                    fi
+                    sleep 0.1
+                done
+                if [[ "$exited" -eq 1 && -S "$socket_path" ]]; then
+                    pass "unexpected Firecracker exit leaves a root-owned API socket"
+                else
+                    fail "unexpected Firecracker exit leaves a root-owned API socket" \
+                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$socket_path" ]] && echo yes || echo no )"
+                fi
+            else
+                fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
+            fi
+        else
+            fail "Firecracker stop fixture has a root-owned mode-0755 socket" \
+                "pid=${fc_pid:-<missing>} socket=$socket_path metadata=${socket_metadata:-missing}"
+        fi
+    fi
 
     if coop stop "$INSTANCE"; then
         pass "stop exits 0"
     else
         fail "stop exits 0" "exit code: $?"
+    fi
+    if [[ -n "$tap" ]]; then
+        if [[ -e "/sys/class/net/$tap" ]]; then
+            fail "stop removes instance TAP" "$tap still exists"
+        else
+            pass "stop removes instance TAP"
+        fi
+        if [[ -e "$HOME/.coop/instances/$INSTANCE/firecracker.pid" ]]; then
+            fail "stop removes stale Firecracker PID file" "PID file still exists"
+        else
+            pass "stop removes stale Firecracker PID file"
+        fi
     fi
 }
 
@@ -4059,7 +4161,8 @@ test_git_repo() {
     # git-repo + extra-mount combination is the workspace-sync path that
     # regressed on Firecracker before this change.
     if coop up --git-repo "$repo_url" --name "$gr_instance" \
-            --extra-mount "$data_dir:/data" --no-agents; then
+            --extra-mount "$data_dir:/data" --no-agents \
+            --post-start 'test -d /workspace/.git && cat /data/marker.txt > /tmp/clone-post-start'; then
         STARTED_INSTANCES+=("$gr_instance")
         pass "up --git-repo creates an instance"
     else
@@ -4069,6 +4172,14 @@ test_git_repo() {
     fi
 
     GUEST_INSTANCE="$gr_instance"
+
+    local hook_marker
+    hook_marker=$(guest_exec cat /tmp/clone-post-start 2>/dev/null) || hook_marker=""
+    if [[ "$hook_marker" == "extra-mount-marker" ]]; then
+        pass "post-start runs after clone and extra mount provisioning"
+    else
+        fail "post-start runs after clone and extra mount provisioning" "got: $hook_marker"
+    fi
 
     if guest_exec test -d /workspace/.git; then
         pass "up --git-repo clones the repository into /workspace"
@@ -6653,6 +6764,177 @@ test_interrupted_setup() {
     coop images --delete "$img" 2>/dev/null || true
 }
 
+# ── Explicit guest files (--full only) ─────────────────────────
+
+# shellcheck disable=SC2016 # Expand paths and inspect copied contents inside the guest.
+test_guest_files() {
+    echo ""
+    echo "=== Phase: guest_files copies ==="
+    local inst_name="${INSTANCE}-files"
+    local source="$tmpdir/guest-files-source"
+    local cfg="$tmpdir/guest-files.toml"
+    prepare_guest_files_fixture "$source" "$cfg"
+    if coop --config "$cfg" up "$source/workspace" --name "$inst_name" \
+        --no-agents \
+        --post-start 'test -f "$HOME/.config/coop-test-hooks/.input" && touch /tmp/files-ready'; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "guest_files copies with --no-agents before post_start"
+    else
+        fail "guest_files copies with --no-agents before post_start" "$HARNESS_ERR"
+        return
+    fi
+    GUEST_INSTANCE="$inst_name"
+    check_guest_files_initial_copy
+    printf '%s\n' 'second' > "$source/hooks/.input"
+    coop stop "$inst_name"
+    if coop --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        guest_exec bash -c 'test "$(cat ~/.config/coop-test-hooks/.input)" = second &&
+            test "$(cat ~/.config/coop-test-hooks/retained)" = guest-only'; then
+        pass "guest_files refreshes on restart and retains guest-only files"
+    else
+        fail "guest_files refreshes on restart and retains guest-only files" "$HARNESS_ERR"
+    fi
+    coop stop "$inst_name"
+    if coop --config "$cfg" start "$inst_name" --no-prompt &&
+        guest_exec bash -c 'test "$(cat ~/.claude/CLAUDE.md)" = agent-bootstrap'; then
+        pass "agent bootstrap runs after guest_files copies"
+    else
+        fail "agent bootstrap runs after guest_files copies" "$HARNESS_ERR"
+    fi
+    test_guest_files_reprovision "$inst_name" "$cfg" "$source"
+    test_guest_files_symlink "$inst_name" "$cfg"
+    unset GUEST_INSTANCE
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+    test_guest_files_live_mount
+}
+
+prepare_guest_files_fixture() {
+    local source=$1 cfg=$2
+    mkdir -p "$source/hooks" "$source/workspace" "$source/claude"
+    printf '%s\n' 'first' > "$source/hooks/.input"
+    printf '%s\n' 'executable' > "$source/hooks/run"
+    chmod 555 "$source/hooks/run"
+    ln -s .input "$source/hooks/link"
+    printf '%s\n' 'single' > "$source/single"
+    printf '%s\n' 'agent-bootstrap' > "$source/claude/CLAUDE.md"
+    cat > "$cfg" <<TOML
+ github = "off"
+ [[guest_files]]
+ source = "$source/hooks"
+ destination = "~/.config/coop-test-hooks"
+ [[guest_files]]
+ source = "$source/single"
+ destination = "~/.coop-test-file"
+ [[guest_files]]
+ source = "$source/single"
+ destination = "~/.claude/CLAUDE.md"
+ [claude]
+ config_dir = "$source/claude"
+ [codex]
+ config_dir = false
+ [grok]
+ config_dir = false
+TOML
+}
+
+# shellcheck disable=SC2016 # Inspect the guest snapshot and create guest-only content.
+check_guest_files_initial_copy() {
+    if guest_exec bash -c 'test -f /tmp/files-ready &&
+        test "$(cat ~/.config/coop-test-hooks/.input)" = first &&
+        test "$(cat ~/.config/coop-test-hooks/link)" = first &&
+        test ! -L ~/.config/coop-test-hooks/link &&
+        test "$(cat ~/.coop-test-file)" = single &&
+        test "$(cat ~/.claude/CLAUDE.md)" = single &&
+        test "$(stat -c %a ~/.config/coop-test-hooks/run)" = 700 &&
+        test "$(stat -c %a ~/.coop-test-file)" = 600 &&
+        mkdir -p ~/.config/coop-test-neighbor && touch ~/.config/coop-test-neighbor/settings &&
+        echo guest-only > ~/.config/coop-test-hooks/retained'; then
+        pass "guest_files preserves contents and modes and leaves neighboring config writable"
+    else
+        fail "guest_files preserves contents and modes and leaves neighboring config writable"
+    fi
+}
+
+# shellcheck disable=SC2016 # Inspect restored copies inside the guest.
+test_guest_files_reprovision() {
+    local inst_name=$1 cfg=$2 source=$3
+    if ! guest_exec bash -c 'echo old-disk > ~/.coop-guest-files-old-disk &&
+        test "$(cat ~/.coop-guest-files-old-disk)" = old-disk'; then
+        fail "seed guest_files reprovision disk witness" "stderr: $(guest_stderr)"
+        return
+    fi
+    printf '%s\n' 'reprovision-directory' > "$source/hooks/.input"
+    printf '%s\n' 'reprovision-file' > "$source/single"
+    if coop --config "$cfg" restore "$inst_name" --reprovision --no-agents --no-prompt -y; then
+        pass "guest_files restore --reprovision exits 0"
+    else
+        fail "guest_files restore --reprovision exits 0" "$HARNESS_ERR"
+        return
+    fi
+    if guest_exec bash -c 'test ! -e ~/.coop-guest-files-old-disk'; then
+        pass "guest_files reprovision replaces the guest disk"
+    else
+        fail "guest_files reprovision replaces the guest disk" "stderr: $(guest_stderr)"
+    fi
+    if guest_exec bash -c 'test "$(cat ~/.config/coop-test-hooks/.input)" = reprovision-directory &&
+        test "$(cat ~/.coop-test-file)" = reprovision-file'; then
+        pass "guest_files reprovision restores directory and file mappings"
+    else
+        fail "guest_files reprovision restores directory and file mappings" \
+            "stderr: $(guest_stderr)"
+    fi
+}
+
+test_guest_files_symlink() {
+    local inst_name=$1 cfg=$2
+    guest_exec bash -c 'mkdir -p ~/coop-test-elsewhere &&
+        ln -s ~/coop-test-elsewhere ~/.config/coop-test-hooks/unsafe'
+    coop stop "$inst_name"
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        [[ "$HARNESS_ERR" == *"destination contains a symlink"* ]]; then
+        pass "guest_files refuses existing destination symlinks on restart"
+    else
+        fail "guest_files refuses existing destination symlinks on restart" "$HARNESS_ERR"
+    fi
+}
+
+test_guest_files_live_mount() {
+    if [[ $(uname -s) != Darwin ]]; then
+        skip "guest_files live-mount guard (Lima only)"
+        return
+    fi
+    local inst_name="${INSTANCE}-files-mount"
+    local source="$tmpdir/guest-files-mounted"
+    local cfg="$tmpdir/guest-files-mount.toml"
+    mkdir -p "$source/workspace" "$source/shared" "$source/copy"
+    printf '%s\n' 'host-original' > "$source/shared/sentinel"
+    printf '%s\n' 'must-not-copy' > "$source/copy/sentinel"
+    if coop up "$source/workspace" --name "$inst_name" --no-agents \
+        --extra-mount "$source/shared:/files-shared"; then
+        STARTED_INSTANCES+=("$inst_name")
+    else
+        fail "guest_files live-mount fixture starts" "$HARNESS_ERR"
+        return
+    fi
+    coop stop "$inst_name"
+    cat > "$cfg" <<TOML
+ github = "off"
+ [[guest_files]]
+ source = "$source/copy"
+ destination = "/files-shared"
+TOML
+    if coop_fails --config "$cfg" start "$inst_name" --no-agents --no-prompt &&
+        [[ "$HARNESS_ERR" == *"destination overlaps a live host mount"* ]] &&
+        [[ $(cat "$source/shared/sentinel") == host-original ]]; then
+        pass "guest_files restart rejects persisted live mounts without changing host files"
+    else
+        fail "guest_files restart rejects persisted live mounts without changing host files" "$HARNESS_ERR"
+    fi
+    coop destroy "$inst_name"
+    untrack_instance "$inst_name"
+}
+
 # ── post_start hook (--full only) ──────────────────────────────
 
 test_post_start() {
@@ -6662,12 +6944,16 @@ test_post_start() {
     local inst_name="${INSTANCE}-poststart"
     local marker="/tmp/coop-post-start-$$.marker"
 
-    # --post-start runs the command in the guest after SSH is ready.
-    # The marker file written by the hook is the assertion.
     local post_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$post_ws"
+    local post_data="$tmpdir/${inst_name}-data"
+    mkdir -p "$post_ws" "$post_data"
+    printf '%s\n' 'workspace-ready' > "$post_ws/input.txt"
+    printf '%s\n' 'mount-ready' > "$post_data/input.txt"
+    printf '%s\n' 'set -eu' 'cat /workspace/input.txt /post-start-data/input.txt' \
+        > "$post_ws/setup.sh"
     if coop up "$post_ws" --name "$inst_name" --no-agents \
-        --post-start "echo hooked > $marker"; then
+        --extra-mount "$post_data:/post-start-data" \
+        --post-start "bash /workspace/setup.sh > $marker"; then
         STARTED_INSTANCES+=("$inst_name")
         pass "up --post-start exits 0"
     else
@@ -6680,12 +6966,50 @@ test_post_start() {
     seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
     unset GUEST_INSTANCE
 
-    if [[ "$seen" == *hooked* ]]; then
-        pass "--post-start hook ran in the guest"
+    if [[ "$seen" == $'workspace-ready\nmount-ready' ]]; then
+        pass "post-start reads copied workspace and extra mount contents"
     else
-        fail "--post-start hook ran in the guest" "marker contents: '$seen'"
+        fail "post-start reads copied workspace and extra mount contents" "got: '$seen'"
     fi
 
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+    test_post_start_mount
+    test_post_start_failure
+}
+
+test_post_start_mount() {
+    local inst_name="${INSTANCE}-poststart-mount"
+    local marker="/tmp/coop-mount-post-start-$$.marker"
+    local mount_dir="$tmpdir/${inst_name}-data"
+    mkdir -p "$mount_dir"
+    printf '%s\n' 'mount-only-ready' > "$mount_dir/input.txt"
+
+    if coop up "$mount_dir" --name "$inst_name" --no-agents --mount \
+        --post-start "cat /workspace/input.txt > $marker"; then
+        STARTED_INSTANCES+=("$inst_name")
+        pass "up with mount-only post-start exits 0"
+    else
+        fail "up with mount-only post-start exits 0" "exit code: $?"
+        return
+    fi
+
+    GUEST_INSTANCE="$inst_name"
+    local seen
+    seen=$(guest_exec cat "$marker" 2>/dev/null) || seen=""
+    unset GUEST_INSTANCE
+
+    if [[ "$seen" == "mount-only-ready" ]]; then
+        pass "post-start reads mount-only contents during startup"
+    else
+        fail "post-start reads mount-only contents during startup" "got: '$seen'"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
+test_post_start_failure() {
     # Verify a failing hook does not fail `coop up` (warn-and-continue).
     local fail_inst="${INSTANCE}-poststart-fail"
     local fail_ws="$tmpdir/${fail_inst}-ws"
@@ -6698,8 +7022,6 @@ test_post_start() {
         fail "up succeeds when --post-start fails" "exit code: $?"
     fi
 
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
     coop destroy "$fail_inst" 2>/dev/null || true
     untrack_instance "$fail_inst"
 }
@@ -7057,6 +7379,7 @@ EOF
     test_guest_fingerprint
 
     # Stop + restart + stopped-state verification
+    test_stop_preserves_recent_writes
     test_stop
     test_stop_idempotency
     test_auto_resolve_stopped
@@ -7095,6 +7418,7 @@ EOF
         test_builtin_profiles
         test_builtin_profile_plugins
         test_post_start
+        test_guest_files
 
         # Local marketplace directory copy
         test_local_marketplace

@@ -41,6 +41,59 @@ pub struct SetupOptions {
     pub builder_timeout: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitSetupInputSupport {
+    Supported,
+    #[cfg(any(target_os = "macos", test))]
+    UnsupportedByLima,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT: ExplicitSetupInputSupport =
+    ExplicitSetupInputSupport::UnsupportedByLima;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT: ExplicitSetupInputSupport =
+    ExplicitSetupInputSupport::Supported;
+
+pub(crate) fn validate_explicit_setup_inputs<T>(
+    support: ExplicitSetupInputSupport,
+    extra_packages: &[String],
+    post_install: Option<&T>,
+) -> Result<()> {
+    if support == ExplicitSetupInputSupport::Supported {
+        return Ok(());
+    }
+
+    let mut unsupported = Vec::new();
+    if !extra_packages.is_empty() {
+        unsupported.push("--extra-packages");
+    }
+    if post_install.is_some() {
+        unsupported.push("--post-install");
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    let options = unsupported.join(" and ");
+    bail!(
+        "setup {kind} {options} {verb} not supported by the Lima backend; \
+         {pronoun} available only on Linux/Firecracker",
+        kind = if unsupported.len() == 1 {
+            "option"
+        } else {
+            "options"
+        },
+        verb = if unsupported.len() == 1 { "is" } else { "are" },
+        pronoun = if unsupported.len() == 1 {
+            "it is"
+        } else {
+            "they are"
+        },
+    )
+}
+
 /// Persisted template configuration (profiles, packages, hashes).
 ///
 /// `guest_user` is set at setup time and immutable for the image's
@@ -1699,6 +1752,106 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use super::*;
+
+    fn setup_options(extra_packages: &[&str], post_install: Option<PathBuf>) -> SetupOptions {
+        SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: extra_packages
+                .iter()
+                .map(|package| (*package).to_string())
+                .collect(),
+            post_install,
+            image: ImageName::new("default").unwrap(),
+            guest_user: GuestUser::default(),
+            builder_timeout: None,
+        }
+    }
+
+    #[test]
+    fn lima_rejects_extra_packages_setup_input() {
+        let opts = setup_options(&["ripgrep"], None);
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--extra-packages"), "{error}");
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("--post-install"), "{error}");
+    }
+
+    #[test]
+    fn lima_rejects_post_install_setup_input() {
+        let opts = setup_options(&[], Some(PathBuf::from("setup.sh")));
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--post-install"), "{error}");
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("--extra-packages"), "{error}");
+    }
+
+    #[test]
+    fn lima_reports_all_unsupported_setup_inputs() {
+        let opts = setup_options(&["ripgrep"], Some(PathBuf::from("setup.sh")));
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+    }
+
+    #[test]
+    fn lima_accepts_setup_without_explicit_provisioning_inputs() {
+        let opts = setup_options(&[], None);
+        validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn firecracker_accepts_and_consumes_explicit_setup_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let post_install = root.path().join("setup.sh");
+        fs::write(&post_install, "touch /firecracker-input-witness\n").unwrap();
+        let opts = setup_options(&["ripgrep", "fd-find"], Some(post_install));
+
+        validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::Supported,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap();
+        let (_, extra_packages) = resolve_template_config(&CoopConfig::default(), &opts).unwrap();
+        let post_install = load_post_install(opts.post_install.as_ref()).unwrap();
+
+        assert_eq!(extra_packages, ["ripgrep", "fd-find"]);
+        assert_eq!(
+            post_install.as_deref(),
+            Some("touch /firecracker-input-witness\n")
+        );
+    }
 
     #[test]
     fn system_packages_without_apt() {
