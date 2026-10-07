@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Add optional persistent terminal sessions for long-running `coop shell`,
+  `coop claude`, `coop claude-agents`, `coop codex`, and `coop grok`
+  invocations via `--session tmux` or `--session zellij`. coop derives stable
+  default session names and visual titles from the instance and launch kind,
+  and `--session-name` creates parallel sessions for the same VM.
+- Install `tmux` in every golden image so `--session tmux` works out of the box
+  after rebuilding or reprovisioning the image. `--session zellij` is supported
+  when the image supplies a `zellij` binary.
+
 ## v0.7.1
 
 ### Fixes

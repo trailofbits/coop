@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::backend::SshSession;
 use crate::shell::shell_escape;
+use crate::terminal_session::{TerminalSession, TerminalSessionKind};
 
 fn join_escaped(args: &[String]) -> String {
     args.iter()
@@ -21,6 +22,59 @@ fn render_remote(command: &[String]) -> String {
         "cd /workspace && exec $SHELL -l".to_string()
     } else {
         format!("cd /workspace && {}", join_escaped(command))
+    }
+}
+
+fn render_exec_command(command: &[String]) -> String {
+    if command.is_empty() {
+        "exec $SHELL -l".to_string()
+    } else {
+        format!("exec {}", join_escaped(command))
+    }
+}
+
+fn require_tool(tool: &str) -> String {
+    format!(
+        "command -v {tool} >/dev/null 2>&1 || \
+         {{ echo '{tool} is not installed in this image' >&2; exit 127; }}"
+    )
+}
+
+fn render_tmux(command: &[String], session: &TerminalSession) -> String {
+    let inner = render_exec_command(command);
+    format!(
+        "cd /workspace && {{ {}; exec tmux new-session -A -s {} -n {} {}; }}",
+        require_tool("tmux"),
+        shell_escape(&session.name),
+        shell_escape(&session.title),
+        shell_escape(&inner),
+    )
+}
+
+fn render_zellij(command: &[String], session: &TerminalSession) -> String {
+    let title = shell_escape(&session.title);
+    let script = format!(
+        "printf '\\033]0;%s\\007' {title}; \
+         zellij action rename-tab -- {title} >/dev/null 2>&1 || true; \
+         zellij action rename-pane -- {title} >/dev/null 2>&1 || true; {}",
+        render_exec_command(command),
+    );
+    format!(
+        "cd /workspace && {{ {}; exec zellij attach --create {} -- sh -lc {}; }}",
+        require_tool("zellij"),
+        shell_escape(&session.name),
+        shell_escape(&script),
+    )
+}
+
+fn render_interactive(command: &[String], terminal_session: Option<&TerminalSession>) -> String {
+    match terminal_session {
+        None => render_remote(command),
+        Some(session) => match session.kind {
+            TerminalSessionKind::Direct => render_remote(command),
+            TerminalSessionKind::Tmux => render_tmux(command, session),
+            TerminalSessionKind::Zellij => render_zellij(command, session),
+        },
     }
 }
 
@@ -78,8 +132,12 @@ fn restore_terminal() {
 ///
 /// Empty `command` opens a bare interactive shell. Otherwise the
 /// arguments are shell-escaped and run inside the user's login shell.
-pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
-    let remote_cmd = render_remote(command);
+pub fn run_interactive(
+    session: &SshSession,
+    command: &[String],
+    terminal_session: Option<&TerminalSession>,
+) -> Result<()> {
+    let remote_cmd = render_interactive(command, terminal_session);
 
     tracing::info!(
         "Connecting via SSH to {}:{} ({remote_cmd})",
@@ -250,7 +308,7 @@ mod tests {
                 .expect("session exec");
             run_command(&session, &args).expect("noninteractive");
             exec_command(&session, &args).expect("captured");
-            run_interactive(&session, &args).expect("interactive");
+            run_interactive(&session, &args, None).expect("interactive");
             return;
         }
         let fixture = tempfile::tempdir().expect("fixture");
@@ -303,6 +361,64 @@ printf x >> "$COOP_FORWARDING_MARKER"
         assert_eq!(
             render_remote(&cmd),
             "cd /workspace && '/usr/bin/foo' '--bar'",
+        );
+    }
+
+    #[test]
+    fn tmux_wraps_command_with_attach_or_create_and_title() {
+        let session = TerminalSession {
+            kind: TerminalSessionKind::Tmux,
+            name: "coop-demo-claude-review".into(),
+            title: "review fixes".into(),
+        };
+        let cmd = vec!["claude".into(), "--model".into(), "sonnet".into()];
+        let rendered = render_interactive(&cmd, Some(&session));
+        assert!(rendered.contains("command -v tmux"));
+        assert!(rendered.contains("tmux new-session -A"));
+        assert!(rendered.contains("-s 'coop-demo-claude-review'"));
+        assert!(rendered.contains("-n 'review fixes'"));
+        assert!(rendered.contains("'exec '\\''claude'\\'' '\\''--model'\\'' '\\''sonnet'\\'''"));
+    }
+
+    #[test]
+    fn tmux_wraps_shell_login_command() {
+        let session = TerminalSession {
+            kind: TerminalSessionKind::Tmux,
+            name: "coop-demo-shell".into(),
+            title: "coop:demo:shell".into(),
+        };
+        assert_eq!(
+            render_interactive(&[], Some(&session)),
+            "cd /workspace && { command -v tmux >/dev/null 2>&1 || { echo 'tmux is not installed in this image' >&2; exit 127; }; exec tmux new-session -A -s 'coop-demo-shell' -n 'coop:demo:shell' 'exec $SHELL -l'; }",
+        );
+    }
+
+    #[test]
+    fn zellij_wraps_command_with_attach_create_and_initial_command() {
+        let session = TerminalSession {
+            kind: TerminalSessionKind::Zellij,
+            name: "coop-demo-codex".into(),
+            title: "codex review".into(),
+        };
+        let cmd = vec!["codex".into(), "--model".into(), "gpt-5".into()];
+        let rendered = render_interactive(&cmd, Some(&session));
+        assert!(rendered.contains("command -v zellij"));
+        assert!(rendered.contains("zellij attach --create 'coop-demo-codex' -- sh -lc"));
+        assert!(rendered.contains("rename-tab"));
+        assert!(rendered.contains("rename-pane"));
+        assert!(rendered.contains("exec '\\''codex'\\'' '\\''--model'\\'' '\\''gpt-5'\\''"));
+    }
+
+    #[test]
+    fn mux_titles_are_shell_escaped() {
+        let session = TerminalSession {
+            kind: TerminalSessionKind::Tmux,
+            name: "coop-demo-claude".into(),
+            title: "it isn't plain".into(),
+        };
+        assert!(
+            render_interactive(&["claude".into()], Some(&session))
+                .contains("-n 'it isn'\\''t plain'")
         );
     }
 }

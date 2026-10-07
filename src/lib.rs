@@ -56,6 +56,7 @@ mod signal;
 mod setup;
 mod shell;
 mod ssh;
+mod terminal_session;
 mod update;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
@@ -72,12 +73,15 @@ use backend::VmBackend as _;
 use commands::{
     AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts, ReprovisionOpts,
     ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy,
-    cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
-    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_ssh_session,
-    preflight_start_target, prepend_binary, resolve_running,
+    apply_runtime_guest_env, apply_vm_overrides, claude_starts_interactive_session,
+    cmd_agent_update, cmd_commit, cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init,
+    cmd_list, cmd_model, cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore,
+    cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate,
+    codex_launch_args, codex_starts_interactive_session, grok_launch_args,
+    grok_starts_interactive_session, open_ssh_session_with_instance, preflight_start_target,
+    prepend_binary, resolve_running,
 };
+use terminal_session::{InteractiveLaunch, TerminalSession, TerminalSessionCli};
 
 #[derive(Parser)]
 #[command(name = "coop", version = env!("COOP_VERSION_STR"))]
@@ -303,6 +307,8 @@ enum Commands {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
+        #[command(flatten)]
+        session: TerminalSessionCli,
         /// Command to run (non-interactive, no PTY)
         #[arg(allow_hyphen_values = true, last = true)]
         command: Vec<String>,
@@ -318,6 +324,8 @@ enum Commands {
         /// Prompt for permissions instead of skipping them
         #[arg(long)]
         ask: bool,
+        #[command(flatten)]
+        session: TerminalSessionCli,
         /// Extra arguments passed to `claude`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -334,6 +342,8 @@ enum Commands {
             add = ArgValueCandidates::new(completions::running_instance_candidates),
         )]
         name: Option<config::InstanceName>,
+        #[command(flatten)]
+        session: TerminalSessionCli,
         /// Extra arguments passed to `claude agents`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -349,6 +359,8 @@ enum Commands {
         /// Keep Codex's sandbox and approval prompts instead of bypassing them
         #[arg(long)]
         ask: bool,
+        #[command(flatten)]
+        session: TerminalSessionCli,
         /// Extra arguments passed to `codex`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -364,6 +376,8 @@ enum Commands {
         /// Prompt for permissions instead of skipping them
         #[arg(long)]
         ask: bool,
+        #[command(flatten)]
+        session: TerminalSessionCli,
         /// Extra arguments passed to `grok`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -910,6 +924,21 @@ where
         .any(|a| a.as_ref() == "--no-claude" || a.as_ref().starts_with("--no-claude="))
 }
 
+fn resolve_terminal_session(
+    cli: TerminalSessionCli,
+    instance: &config::InstanceName,
+    launch: InteractiveLaunch,
+    starts_long_running_session: bool,
+    command: &str,
+) -> Result<Option<TerminalSession>> {
+    if starts_long_running_session {
+        cli.into_launch(instance, launch)
+    } else {
+        cli.ensure_direct_for_short_command(command)?;
+        Ok(None)
+    }
+}
+
 /// Parse CLI arguments and dispatch to the matching command.
 ///
 /// # Errors
@@ -1155,13 +1184,25 @@ pub fn run() -> Result<()> {
             apply_runtime_guest_env(&mut cfg, &guest_env, &mut start_opts);
             cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
-        Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
+        Commands::Shell {
+            name,
+            session,
+            command,
+        } => cmd_shell(&be, &cfg, name.as_ref(), &command, session),
         Commands::Claude {
             name,
             ask,
+            session,
             mut args,
         } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+            let (inst, sess) = open_ssh_session_with_instance(&be, &cfg, name.as_ref())?;
+            let terminal = resolve_terminal_session(
+                session,
+                &inst.name,
+                InteractiveLaunch::Claude,
+                claude_starts_interactive_session(&args),
+                "claude short command",
+            )?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -1169,19 +1210,44 @@ pub fn run() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            ssh::run_interactive(
+                &sess,
+                &prepend_binary(claude_bin.as_ref(), args),
+                terminal.as_ref(),
+            )
         }
-        Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+        Commands::ClaudeAgents {
+            name,
+            session,
+            mut args,
+        } => {
+            let (inst, sess) = open_ssh_session_with_instance(&be, &cfg, name.as_ref())?;
+            let terminal = session.into_launch(&inst.name, InteractiveLaunch::ClaudeAgents)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            ssh::run_interactive(
+                &sess,
+                &prepend_binary(claude_bin.as_ref(), args),
+                terminal.as_ref(),
+            )
         }
-        Commands::Codex { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+        Commands::Codex {
+            name,
+            ask,
+            session,
+            args,
+        } => {
+            let (inst, sess) = open_ssh_session_with_instance(&be, &cfg, name.as_ref())?;
+            let starts_session = codex_starts_interactive_session(&args);
+            let terminal = resolve_terminal_session(
+                session,
+                &inst.name,
+                InteractiveLaunch::Codex,
+                starts_session,
+                "codex short command",
+            )?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
-                let inst = cfg.resolve_instance(name.as_ref())?;
                 let model_state = model_state::ModelState::load_or_default(&inst)?;
                 backend::ensure_codex_remote_auth_consistent(&cfg, &inst, &model_state)?;
                 backend::ensure_codex_account_guest_support(&sess.target)?;
@@ -1193,13 +1259,33 @@ pub fn run() -> Result<()> {
             } else {
                 guest::codex_bin()
             };
-            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
+            ssh::run_interactive(
+                &sess,
+                &prepend_binary(codex_bin.as_ref(), args),
+                terminal.as_ref(),
+            )
         }
-        Commands::Grok { name, ask, args } => {
-            let sess = open_ssh_session(&be, &cfg, name.as_ref())?;
+        Commands::Grok {
+            name,
+            ask,
+            session,
+            args,
+        } => {
+            let (inst, sess) = open_ssh_session_with_instance(&be, &cfg, name.as_ref())?;
+            let terminal = resolve_terminal_session(
+                session,
+                &inst.name,
+                InteractiveLaunch::Grok,
+                grok_starts_interactive_session(&args),
+                "grok short command",
+            )?;
             let args = grok_launch_args(ask, args);
             let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
-            ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
+            ssh::run_interactive(
+                &sess,
+                &prepend_binary(grok_bin.as_ref(), args),
+                terminal.as_ref(),
+            )
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1922,6 +2008,33 @@ token = "test-pat"
     }
 
     #[test]
+    fn claude_session_flags_parse() {
+        let cli = parse(&[
+            "claude",
+            "myvm",
+            "--session",
+            "tmux",
+            "--session-name",
+            "review",
+            "--session-title",
+            "review fixes",
+            "--",
+            "--model",
+            "opus",
+        ]);
+        let super::Commands::Claude { session, args, .. } = cli.command else {
+            panic!("expected Claude variant");
+        };
+        assert!(matches!(
+            session.kind,
+            super::terminal_session::TerminalSessionKind::Tmux
+        ));
+        assert!(session.session_name.is_some());
+        assert_eq!(session.title.as_deref(), Some("review fixes"));
+        assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[test]
     fn claude_agents_subcommand_parses() {
         let cli = parse(&["claude-agents"]);
         assert!(matches!(cli.command, super::Commands::ClaudeAgents { .. }));
@@ -1949,7 +2062,10 @@ token = "test-pat"
     #[test]
     fn codex_name_and_trailing_args_parse() {
         let cli = parse(&["codex", "myvm", "--", "--model", "gpt-5"]);
-        let super::Commands::Codex { name, ask, args } = cli.command else {
+        let super::Commands::Codex {
+            name, ask, args, ..
+        } = cli.command
+        else {
             panic!("expected Codex variant");
         };
         assert_eq!(
@@ -1971,9 +2087,25 @@ token = "test-pat"
     }
 
     #[test]
+    fn invalid_session_name_rejected_by_parser() {
+        let err = parse_err(&[
+            "codex",
+            "myvm",
+            "--session",
+            "zellij",
+            "--session-name",
+            "bad/name",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn grok_name_and_trailing_args_parse() {
         let cli = parse(&["grok", "myvm", "--", "--model", "grok-4.6"]);
-        let super::Commands::Grok { name, ask, args } = cli.command else {
+        let super::Commands::Grok {
+            name, ask, args, ..
+        } = cli.command
+        else {
             panic!("expected Grok variant");
         };
         assert_eq!(

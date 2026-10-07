@@ -371,6 +371,18 @@ Pass extra arguments through to `claude`:
 coop claude -- --model opus
 ```
 
+For terminal persistence across disconnects, launch long-running interactive
+sessions through tmux or Zellij:
+
+```
+coop claude --session tmux
+coop codex --session zellij --session-name review --session-title "review fixes"
+```
+
+Repeating the same wrapped command reconnects to the same guest session. Use
+`--session-name` for parallel sessions in the same VM. Golden images include
+`tmux`; `--session zellij` requires an image or profile that installs `zellij`.
+
 **Launch Codex inside the VM:**
 
 ```

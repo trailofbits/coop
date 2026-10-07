@@ -265,6 +265,7 @@ pub const BASE_PACKAGES: &[&str] = &[
     "gnome-keyring",
     "less",
     "libsecret-tools",
+    "tmux",
 ];
 
 pub const GH_PACKAGES: &[&str] = &["gh"];
@@ -939,6 +940,7 @@ mod tests {
             "gnome-keyring",
             "libsecret-tools",
             "util-linux",
+            "tmux",
         ] {
             assert!(
                 BASE_PACKAGES.contains(&expected),

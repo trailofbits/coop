@@ -10,7 +10,7 @@ use super::{merge_runtime_guest_env, purge_all_data};
 use crate::backend::VmBackend as _;
 use crate::{
     backend, config, github_repo, guest, guest_env_state, model_state, pat_prompt, port_forward,
-    prompt, proxy, proxy_state, setup, signal, ssh, workspace,
+    prompt, proxy, proxy_state, setup, signal, ssh, terminal_session, workspace,
 };
 
 pub(crate) struct UpOpts<'a> {
@@ -1236,11 +1236,16 @@ pub(crate) fn cmd_shell(
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
     command: &[String],
+    terminal: terminal_session::TerminalSessionCli,
 ) -> Result<()> {
-    let session = open_ssh_session(be, cfg, name)?;
     if command.is_empty() {
-        ssh::run_interactive(&session, &[])
+        let (inst, session) = open_ssh_session_with_instance(be, cfg, name)?;
+        let terminal =
+            terminal.into_launch(&inst.name, terminal_session::InteractiveLaunch::Shell)?;
+        ssh::run_interactive(&session, &[], terminal.as_ref())
     } else {
+        terminal.ensure_direct_for_short_command("shell command")?;
+        let session = open_ssh_session(be, cfg, name)?;
         ssh::run_command(&session, command)
     }
 }
@@ -1281,6 +1286,25 @@ pub(crate) fn codex_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String>
         args.insert(0, CODEX_BYPASS_FLAG.to_string());
     }
     args
+}
+
+const NON_INTERACTIVE_HELP_ARGS: &[&str] = &["help", "--help", "-h", "--version", "-V", "version"];
+const CLAUDE_SHORT_SUBCOMMANDS: &[&str] = &["login", "logout", "update", "mcp", "config", "doctor"];
+
+fn starts_interactive_agent_session(args: &[String], short_subcommands: &[&str]) -> bool {
+    let Some(first) = args.first() else {
+        return true;
+    };
+    !NON_INTERACTIVE_HELP_ARGS.contains(&first.as_str())
+        && !short_subcommands.contains(&first.as_str())
+}
+
+pub(crate) fn claude_starts_interactive_session(args: &[String]) -> bool {
+    starts_interactive_agent_session(args, CLAUDE_SHORT_SUBCOMMANDS)
+}
+
+pub(crate) fn codex_starts_interactive_session(args: &[String]) -> bool {
+    starts_interactive_agent_session(args, CODEX_AUTH_SUBCOMMANDS)
 }
 
 /// Grok Build flags for running unrestricted (always-approve + folder trust).
@@ -1324,6 +1348,10 @@ pub(crate) fn grok_launch_args(ask: bool, mut args: Vec<String>) -> Vec<String> 
     args
 }
 
+pub(crate) fn grok_starts_interactive_session(args: &[String]) -> bool {
+    starts_interactive_agent_session(args, GROK_AUTH_SUBCOMMANDS)
+}
+
 pub(crate) fn cmd_exec(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
@@ -1344,10 +1372,19 @@ pub(crate) fn open_ssh_session(
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
 ) -> Result<backend::SshSession> {
+    open_ssh_session_with_instance(be, cfg, name).map(|(_, session)| session)
+}
+
+pub(crate) fn open_ssh_session_with_instance(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    name: Option<&config::InstanceName>,
+) -> Result<(config::Instance, backend::SshSession)> {
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+    let session = prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
+    Ok((inst, session))
 }
 
 /// Open a session and run the post-boot agent bootstrap plus any
@@ -2519,6 +2556,21 @@ mod tests {
     fn codex_launch_args_bypass_flag_leads_empty_args() {
         let args = super::codex_launch_args(false, Vec::new());
         assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
+    }
+
+    #[test]
+    fn agent_session_detection_rejects_short_commands_only_in_leading_position() {
+        assert!(super::codex_starts_interactive_session(&[]));
+        assert!(!super::codex_starts_interactive_session(&["login".into()]));
+        assert!(!super::codex_starts_interactive_session(&["--help".into()]));
+        assert!(super::codex_starts_interactive_session(&[
+            "--model".into(),
+            "login".into(),
+        ]));
+        assert!(!super::grok_starts_interactive_session(&["logout".into()]));
+        assert!(!super::claude_starts_interactive_session(
+            &["doctor".into()]
+        ));
     }
 
     #[test]

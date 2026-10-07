@@ -18,7 +18,7 @@ coop stores the result under `~/.coop/images/<name>/`. When creating an instance
 
 Every template installs these packages regardless of profile selection.
 
-**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`
+**Base packages:** `openssh-server`, `dbus-user-session`, `curl`, `wget`, `git`, `build-essential`, `ca-certificates`, `gnupg`, `lsb-release`, `sudo`, `iproute2`, `iptables`, `kmod`, `procps`, `util-linux`, `jq`, `rsync`, `unzip`, `zip`, `file`, `gnome-keyring`, `less`, `libsecret-tools`, `tmux`
 
 **Docker:** `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
 
@@ -47,6 +47,11 @@ Codex, so it costs nothing at run time.
 `~/.grok/bin/grok` with a same-file `agent` link; `/usr/local/bin/grok`
 points there. The image also installs a `grok-yolo`
 shortcut.
+
+**Terminal multiplexers:** `tmux` is installed in every image for persistent
+`--session tmux` launches. `--session zellij` is supported when a custom image
+or profile installs `zellij`; coop does not add an unofficial Zellij package
+repository during setup.
 
 The agents are installed at whatever version was current when the template was built, and that version is not part of the staleness hash — a plain `coop setup` does not refresh them. There are two ways to get newer agents:
 

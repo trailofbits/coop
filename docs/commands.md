@@ -231,15 +231,27 @@ coop shell [NAME] [FLAGS] [-- COMMAND...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
+| `--session direct\|tmux\|zellij` | Run the interactive shell directly, or attach/create a persistent tmux/Zellij session |
+| `--session-name <NAME>` | Create or reconnect to a distinct session suffix (`letters`, `digits`, `_`, `-`, `.`) |
+| `--session-title <TITLE>` | Visual title for the multiplexer window/tab/pane |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
 Without a trailing command, `shell` drops you into an interactive shell at `/workspace`. With a trailing command, it executes the command and returns its exit code.
+Session wrapping applies only to the interactive form.
 
 ```
 coop shell
 coop shell my-project
+coop shell my-project --session tmux
+coop shell my-project --session zellij --session-name debug --session-title "debug server"
 coop shell my-project -- cat /etc/os-release
 ```
+
+For wrapped sessions, repeating the same command reconnects to the same
+`coop-<instance>-<command>` session. Use `--session-name` to create parallel
+sessions for the same VM and command.
+Golden images include `tmux`; `--session zellij` requires an image or profile
+that installs `zellij`.
 
 ### `claude`
 
@@ -253,11 +265,15 @@ coop claude [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Prompt for permissions instead of skipping them |
+| `--session direct\|tmux\|zellij` | Run directly, or attach/create a persistent tmux/Zellij session |
+| `--session-name <NAME>` | Create or reconnect to a distinct session suffix |
+| `--session-title <TITLE>` | Visual title for the multiplexer window/tab/pane |
 | `ARGS...` | Extra arguments passed through to `claude` |
 
 ```
 coop claude
 coop claude my-project --ask
+coop claude my-project --session tmux --session-name review --session-title "review fixes"
 coop claude my-project -- --model sonnet
 ```
 
@@ -275,6 +291,9 @@ coop ca [NAME] [FLAGS] [ARGS...]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
+| `--session direct\|tmux\|zellij` | Run directly, or attach/create a persistent tmux/Zellij session |
+| `--session-name <NAME>` | Create or reconnect to a distinct session suffix |
+| `--session-title <TITLE>` | Visual title for the multiplexer window/tab/pane |
 | `ARGS...` | Extra arguments passed through to `claude agents` |
 
 Alias: `ca`.
@@ -282,6 +301,7 @@ Alias: `ca`.
 ```
 coop claude-agents
 coop ca my-project
+coop ca my-project --session zellij
 coop ca my-project -- --cwd /workspace
 ```
 
@@ -297,14 +317,21 @@ coop codex [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Keep Codex's sandbox and approval prompts instead of bypassing them |
+| `--session direct\|tmux\|zellij` | Run directly, or attach/create a persistent tmux/Zellij session |
+| `--session-name <NAME>` | Create or reconnect to a distinct session suffix |
+| `--session-title <TITLE>` | Visual title for the multiplexer window/tab/pane |
 | `ARGS...` | Extra arguments passed through to `codex` |
 
 ```
 coop codex
 coop codex my-project --ask
+coop codex my-project --session zellij --session-name refactor
 coop codex my-project -- --model gpt-5
 coop codex my-project -- login --device-auth
 ```
+
+Session wrapping is rejected for short-lived commands such as `codex login`,
+`codex logout`, and help/version invocations.
 
 ### `grok`
 
@@ -328,14 +355,21 @@ coop grok [NAME] [FLAGS] [ARGS...]
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--ask` | Prompt for permissions instead of skipping them |
+| `--session direct\|tmux\|zellij` | Run directly, or attach/create a persistent tmux/Zellij session |
+| `--session-name <NAME>` | Create or reconnect to a distinct session suffix |
+| `--session-title <TITLE>` | Visual title for the multiplexer window/tab/pane |
 | `ARGS...` | Extra arguments passed through to `grok` |
 
 ```
 coop grok
 coop grok my-project --ask
+coop grok my-project --session tmux
 coop grok my-project -- --model grok-4.6
 coop grok my-project -- login --device-auth
 ```
+
+Session wrapping is rejected for short-lived commands such as `grok login`,
+`grok logout`, and help/version invocations.
 
 ### `exec`
 
