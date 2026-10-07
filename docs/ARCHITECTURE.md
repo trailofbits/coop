@@ -261,6 +261,10 @@ The Linux network control plane adds a narrower host-launch invariant on top
 of item 6. Its `sudo`, `ip`, `bridge`, `iptables`, and `sysctl` identities are
 resolved from fixed absolute system candidates, validated before use, and
 launched from `/` with an environment cleared to deterministic locale values.
+The invocation-selected config may replace any identity with one exact absolute
+path for non-FHS layouts. An override never falls back; it retains the full
+root-owned, non-writable path-chain checks but intentionally does not claim
+package, hash, basename, or command-semantic identity.
 `setup_tap` resolves the complete set before its first probe or mutation. This
 policy is specific to `network.rs`; other host subprocess families retain their
 own launch contracts until migrated.

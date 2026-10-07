@@ -238,7 +238,10 @@ The trusted-host-tool unit fixtures use a private synthetic filesystem root so
 they do not depend on tools installed on the development host. They cover fixed
 candidate mapping, missing/relative/writable rejection, trusted symlink hops,
 ambient-`PATH` exclusion, explicit cwd/environment, absolute elevated argv, and
-complete `setup_tap` resolution before the first probe. The ignored Linux
+complete `setup_tap` resolution before the first probe. Tests for configured
+paths cover exact-no-fallback behavior, non-FHS symlink targets, unknown config
+keys, path syntax, cleanup-category independence, and kernel-ordered handling
+of parent components inside symlink targets. The ignored Linux
 network namespace test additionally resolves the production `sudo` and
 `bridge` policy before exercising bridge-port isolation; ordinary unit tests do
 not require the production tools because CI installs those prerequisites only

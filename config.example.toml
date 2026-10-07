@@ -53,6 +53,16 @@
 # host_ip = "172.16.0.1"
 # subnet_mask = "/24"
 # host_iface = "auto"           # "auto" detects at runtime
+#
+# Exact paths for non-FHS Linux hosts. Set fields only when the corresponding
+# built-in /usr/{bin,sbin} or /{bin,sbin} candidates are unsuitable. A set
+# field replaces the built-in candidates for that tool; it never falls back.
+# [network.host_tools]
+# sudo = "/run/wrappers/bin/sudo"                 # NixOS example
+# ip = "/run/current-system/sw/bin/ip"
+# bridge = "/run/current-system/sw/bin/bridge"
+# iptables = "/run/current-system/sw/bin/iptables"
+# sysctl = "/run/current-system/sw/bin/sysctl"
 
 # [guest_env]                   # Literal env vars to set in the guest.
 #                               # Overrides forwarded values on key

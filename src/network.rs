@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::cmd::Cmd;
-use crate::config::{HostInterface, Instance, NetworkConfig};
+use crate::config::{AbsoluteHostToolPath, HostInterface, Instance, NetworkConfig};
 use crate::host_tool::{
-    ResolvedHostTool, TrustedLaunchContext, TrustedToolPolicy, resolve_host_tool,
+    ResolvedHostTool, TrustedLaunchContext, TrustedToolPolicy, resolve_exact_host_tool,
+    resolve_host_tool,
 };
 
 const BRIDGE_NAME: &str = "br0";
@@ -60,6 +61,16 @@ impl NetworkTool {
             ],
         }
     }
+
+    fn configured_path(self, cfg: &NetworkConfig) -> Option<&AbsoluteHostToolPath> {
+        match self {
+            Self::Sudo => cfg.host_tools.sudo.as_ref(),
+            Self::Ip => cfg.host_tools.ip.as_ref(),
+            Self::Bridge => cfg.host_tools.bridge.as_ref(),
+            Self::Iptables => cfg.host_tools.iptables.as_ref(),
+            Self::Sysctl => cfg.host_tools.sysctl.as_ref(),
+        }
+    }
 }
 
 impl fmt::Display for NetworkTool {
@@ -85,8 +96,18 @@ fn production_network_policy() -> Result<TrustedToolPolicy> {
 
 fn resolve_network_tool(
     tool: NetworkTool,
+    cfg: &NetworkConfig,
     policy: &TrustedToolPolicy,
 ) -> Result<ResolvedHostTool<NetworkTool>> {
+    if let Some(path) = tool.configured_path(cfg) {
+        return resolve_exact_host_tool(tool, path.as_path(), policy).with_context(|| {
+            format!(
+                "configured network.host_tools.{} path '{}' is not trusted; built-in fallback was not attempted",
+                tool.name(),
+                path.as_path().display()
+            )
+        });
+    }
     let candidates = tool
         .production_candidates()
         .iter()
@@ -113,8 +134,8 @@ struct SetupNetworkTools {
 }
 
 impl SetupNetworkTools {
-    fn resolve(policy: &TrustedToolPolicy) -> Result<Self> {
-        Self::resolve_with(policy, |tool| {
+    fn resolve(cfg: &NetworkConfig, policy: &TrustedToolPolicy) -> Result<Self> {
+        Self::resolve_with(cfg, policy, |tool| {
             tool.production_candidates()
                 .iter()
                 .map(PathBuf::from)
@@ -123,32 +144,38 @@ impl SetupNetworkTools {
     }
 
     fn resolve_with(
+        cfg: &NetworkConfig,
         policy: &TrustedToolPolicy,
         candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            sudo: resolve_network_tool_from_candidates(
+            sudo: resolve_network_tool_with_candidates(
                 NetworkTool::Sudo,
+                cfg,
                 &candidates(NetworkTool::Sudo),
                 policy,
             )?,
-            ip: resolve_network_tool_from_candidates(
+            ip: resolve_network_tool_with_candidates(
                 NetworkTool::Ip,
+                cfg,
                 &candidates(NetworkTool::Ip),
                 policy,
             )?,
-            bridge: resolve_network_tool_from_candidates(
+            bridge: resolve_network_tool_with_candidates(
                 NetworkTool::Bridge,
+                cfg,
                 &candidates(NetworkTool::Bridge),
                 policy,
             )?,
-            iptables: resolve_network_tool_from_candidates(
+            iptables: resolve_network_tool_with_candidates(
                 NetworkTool::Iptables,
+                cfg,
                 &candidates(NetworkTool::Iptables),
                 policy,
             )?,
-            sysctl: resolve_network_tool_from_candidates(
+            sysctl: resolve_network_tool_with_candidates(
                 NetworkTool::Sysctl,
+                cfg,
                 &candidates(NetworkTool::Sysctl),
                 policy,
             )?,
@@ -195,8 +222,8 @@ impl IsolationNetworkTools {
     fn resolve_production() -> Result<Self> {
         let policy = production_network_policy()?;
         Ok(Self {
-            sudo: resolve_network_tool(NetworkTool::Sudo, &policy)?,
-            bridge: resolve_network_tool(NetworkTool::Bridge, &policy)?,
+            sudo: resolve_network_tool(NetworkTool::Sudo, &NetworkConfig::default(), &policy)?,
+            bridge: resolve_network_tool(NetworkTool::Bridge, &NetworkConfig::default(), &policy)?,
             launch: TrustedLaunchContext::system(),
         })
     }
@@ -215,20 +242,22 @@ struct CleanupNetworkTools {
 }
 
 impl CleanupNetworkTools {
-    fn resolve(policy: &TrustedToolPolicy) -> Result<Self> {
+    fn resolve(cfg: &NetworkConfig, policy: &TrustedToolPolicy) -> Result<Self> {
         Ok(Self {
-            sudo: resolve_network_tool(NetworkTool::Sudo, policy)?,
+            sudo: resolve_network_tool(NetworkTool::Sudo, cfg, policy)?,
             launch: TrustedLaunchContext::system(),
         })
     }
 
     fn resolve_with(
+        cfg: &NetworkConfig,
         policy: &TrustedToolPolicy,
         candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            sudo: resolve_network_tool_from_candidates(
+            sudo: resolve_network_tool_with_candidates(
                 NetworkTool::Sudo,
+                cfg,
                 &candidates(NetworkTool::Sudo),
                 policy,
             )?,
@@ -247,6 +276,24 @@ impl CleanupNetworkTools {
     fn iptables(&self, iptables: &ResolvedHostTool<NetworkTool>) -> Cmd {
         self.launch.elevated(&self.sudo, iptables)
     }
+}
+
+fn resolve_network_tool_with_candidates(
+    tool: NetworkTool,
+    cfg: &NetworkConfig,
+    candidates: &[PathBuf],
+    policy: &TrustedToolPolicy,
+) -> Result<ResolvedHostTool<NetworkTool>> {
+    if let Some(path) = tool.configured_path(cfg) {
+        return resolve_exact_host_tool(tool, path.as_path(), policy).with_context(|| {
+            format!(
+                "configured network.host_tools.{} path '{}' is not trusted; built-in fallback was not attempted",
+                tool.name(),
+                path.as_path().display()
+            )
+        });
+    }
+    resolve_network_tool_from_candidates(tool, candidates, policy)
 }
 
 /// Rewrite a host-visible endpoint URL into one reachable from inside the
@@ -288,7 +335,7 @@ fn host_is_loopback(host: Option<&url::Host<&str>>) -> bool {
 /// instance's tap device. Sets up NAT rules if this is the first instance.
 pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let policy = production_network_policy()?;
-    let tools = SetupNetworkTools::resolve(&policy)?;
+    let tools = SetupNetworkTools::resolve(cfg, &policy)?;
     setup_tap_with_tools(cfg, inst, &tools)
 }
 
@@ -299,7 +346,7 @@ fn setup_tap_with_policy(
     policy: &TrustedToolPolicy,
     candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
 ) -> Result<()> {
-    let tools = SetupNetworkTools::resolve_with(policy, candidates)?;
+    let tools = SetupNetworkTools::resolve_with(cfg, policy, candidates)?;
     setup_tap_with_tools(cfg, inst, &tools)
 }
 
@@ -354,8 +401,8 @@ fn setup_tap_with_tools(
 /// Remove the instance's tap device. Tears down the bridge if no taps remain.
 pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let policy = production_network_policy()?;
-    let tools = CleanupNetworkTools::resolve(&policy)?;
-    let ip = resolve_network_tool(NetworkTool::Ip, &policy)?;
+    let tools = CleanupNetworkTools::resolve(cfg, &policy)?;
+    let ip = resolve_network_tool(NetworkTool::Ip, cfg, &policy)?;
     let tap = inst.tap_device();
     tracing::info!("Tearing down TAP device {tap}");
 
@@ -371,7 +418,7 @@ pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     if bridge_exists(tools.ip_probe(&ip)) && bridge_is_empty(tools.ip_probe(&ip)) {
         let host_iface = resolve_host_iface(&cfg.host_iface, tools.ip_probe(&ip))
             .unwrap_or_else(|_| "eth0".into());
-        let iptables = resolve_network_tool(NetworkTool::Iptables, &policy);
+        let iptables = resolve_network_tool(NetworkTool::Iptables, cfg, &policy);
         if let Err(error) = &iptables {
             tracing::debug!("Cannot resolve trusted iptables for cleanup (non-fatal): {error}");
         }
@@ -404,15 +451,19 @@ fn teardown_all_with_policy(
     policy: &TrustedToolPolicy,
     candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
 ) {
-    let tools = match CleanupNetworkTools::resolve_with(policy, &candidates) {
+    let tools = match CleanupNetworkTools::resolve_with(cfg, policy, &candidates) {
         Ok(tools) => tools,
         Err(error) => {
             tracing::debug!("Cannot resolve trusted network cleanup tools (non-fatal): {error}");
             return;
         }
     };
-    let ip =
-        resolve_network_tool_from_candidates(NetworkTool::Ip, &candidates(NetworkTool::Ip), policy);
+    let ip = resolve_network_tool_with_candidates(
+        NetworkTool::Ip,
+        cfg,
+        &candidates(NetworkTool::Ip),
+        policy,
+    );
     if let Err(error) = &ip {
         tracing::debug!("Cannot resolve trusted ip for cleanup (non-fatal): {error}");
     }
@@ -423,8 +474,9 @@ fn teardown_all_with_policy(
         }
         (HostInterface::Auto, None) => "eth0".to_string(),
     };
-    let iptables = resolve_network_tool_from_candidates(
+    let iptables = resolve_network_tool_with_candidates(
         NetworkTool::Iptables,
+        cfg,
         &candidates(NetworkTool::Iptables),
         policy,
     );
@@ -931,6 +983,79 @@ mod tests {
     }
 
     #[test]
+    fn configured_exact_path_replaces_builtin_candidates_without_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["sudo", "ip", "bridge", "iptables", "sysctl"] {
+            let executable = bin.join(name);
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let configured_missing = anchor.join("run/current-system/sw/bin/ip");
+        let cfg: NetworkConfig = toml::from_str(&format!(
+            "[host_tools]\nip = {:?}\n",
+            configured_missing.display().to_string()
+        ))
+        .unwrap();
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+
+        let result =
+            SetupNetworkTools::resolve_with(&cfg, &policy, |tool| vec![bin.join(tool.name())]);
+        assert!(
+            result.is_err(),
+            "configured missing path must not fall back"
+        );
+        let error = result.err().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("network.host_tools.ip"));
+        assert!(message.contains("built-in fallback was not attempted"));
+        assert!(message.contains(&configured_missing.display().to_string()));
+    }
+
+    #[test]
+    fn configured_paths_can_select_trusted_non_fhs_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        let profile = anchor.join("run/current-system/sw/bin");
+        let wrappers = anchor.join("run/wrappers/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&wrappers).unwrap();
+        for name in ["ip", "bridge", "iptables", "sysctl"] {
+            let executable = profile.join(name);
+            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sudo = wrappers.join("sudo");
+        fs::write(&sudo, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg: NetworkConfig = toml::from_str(&format!(
+            "[host_tools]\nsudo = {sudo:?}\nip = {ip:?}\nbridge = {bridge:?}\niptables = {iptables:?}\nsysctl = {sysctl:?}\n",
+            sudo = sudo.display().to_string(),
+            ip = profile.join("ip").display().to_string(),
+            bridge = profile.join("bridge").display().to_string(),
+            iptables = profile.join("iptables").display().to_string(),
+            sysctl = profile.join("sysctl").display().to_string(),
+        ))
+        .unwrap();
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+        let tools =
+            SetupNetworkTools::resolve_with(&cfg, &policy, |tool| vec![bin.join(tool.name())])
+                .unwrap();
+
+        assert_eq!(tools.sudo.launch_path(), sudo);
+        assert_eq!(tools.ip.launch_path(), profile.join("ip"));
+        assert_eq!(tools.bridge.launch_path(), profile.join("bridge"));
+        assert_eq!(tools.iptables.launch_path(), profile.join("iptables"));
+        assert_eq!(tools.sysctl.launch_path(), profile.join("sysctl"));
+    }
+
+    #[test]
     fn teardown_all_keeps_firewall_cleanup_when_ip_is_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let anchor = temp.path().join("root");
@@ -954,6 +1079,40 @@ mod tests {
         teardown_all_with_policy(&NetworkConfig::default(), &policy, |tool| {
             vec![bin.join(tool.name())]
         });
+        assert_eq!(fs::read_to_string(marker).unwrap(), "run\n".repeat(4));
+    }
+
+    #[test]
+    fn teardown_exact_ip_failure_does_not_suppress_exact_iptables_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        let profile = anchor.join("run/current-system/sw/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        let marker = temp.path().join("iptables-runs");
+
+        let sudo = bin.join("sudo");
+        fs::write(&sudo, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
+        fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+        let iptables = profile.join("iptables");
+        fs::write(
+            &iptables,
+            format!("#!/bin/sh\nprintf 'run\\n' >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&iptables, fs::Permissions::from_mode(0o755)).unwrap();
+        let missing_ip = profile.join("ip");
+        let cfg: NetworkConfig = toml::from_str(&format!(
+            "[host_tools]\nip = {ip:?}\niptables = {iptables:?}\n",
+            ip = missing_ip.display().to_string(),
+            iptables = iptables.display().to_string(),
+        ))
+        .unwrap();
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+
+        teardown_all_with_policy(&cfg, &policy, |tool| vec![bin.join(tool.name())]);
         assert_eq!(fs::read_to_string(marker).unwrap(), "run\n".repeat(4));
     }
 }

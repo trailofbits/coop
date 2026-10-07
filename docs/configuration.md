@@ -330,6 +330,39 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 | `subnet_mask` | string (CIDR) | `/24` | Subnet mask in CIDR notation. Must be `/0` through `/32`. |
 | `host_iface` | string | `auto` | Host network interface for NAT (e.g., `eth0`, `ens5`). `auto` detects it at runtime. |
 
+### Exact network host-tool paths
+
+Conventional Linux hosts need no additional configuration. A non-FHS host can
+select exact paths for any of the five network control-plane tools:
+
+```toml
+[network.host_tools]
+sudo = "/run/wrappers/bin/sudo"
+ip = "/run/current-system/sw/bin/ip"
+bridge = "/run/current-system/sw/bin/bridge"
+iptables = "/run/current-system/sw/bin/iptables"
+sysctl = "/run/current-system/sw/bin/sysctl"
+```
+
+These are NixOS's stable system-profile and privilege-wrapper paths; do not
+configure generation-specific `/nix/store` paths because garbage collection can
+remove them. Each field is optional. An unset field uses coop's built-in
+`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. A set field uses only
+the configured absolute path and never falls back.
+
+Configured paths cannot contain shell expansion, `.` or `..`. Immediately
+before use, coop follows the actual symlink chain and requires every traversed
+component and the final executable to be root-owned and not group/other
+writable. The target must be a regular executable, but coop does not prove its
+package, hash, basename, or command semantics. The invocation-selected config
+is therefore trusted operator input; coop does not automatically import these
+values from a project, guest, or saved instance state.
+
+Tool paths are re-resolved from the current config on setup and cleanup. If the
+config changes or a selected path disappears, cleanup for that tool category
+cannot run until the configuration is corrected. The table is parsed but has
+no effect on the Lima backend.
+
 ## Guest user
 
 The guest VM runs as an unprivileged account, `ubuntu` (uid 1000) by default. Override the username at setup time with `coop setup --guest-user <name>`:

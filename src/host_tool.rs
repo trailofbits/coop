@@ -261,6 +261,76 @@ mod tests {
     }
 
     #[test]
+    fn explicit_path_accepts_a_trusted_target_outside_builtin_roots() {
+        let fixture = Fixture::new();
+        let store = fixture.anchor.join("nix/store/package/bin");
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("ip");
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let candidate = fixture.bin.join("ip");
+        symlink(&target, &candidate).unwrap();
+
+        let builtin = resolve_host_tool(
+            TestTool::Ip,
+            std::slice::from_ref(&candidate),
+            &fixture.policy,
+        )
+        .unwrap_err();
+        assert!(builtin.to_string().contains("outside the allowed roots"));
+
+        let explicit = resolve_exact_host_tool(TestTool::Ip, &candidate, &fixture.policy).unwrap();
+        assert_eq!(explicit.launch_path(), candidate);
+        assert_eq!(explicit.canonical_target(), target);
+    }
+
+    #[test]
+    fn symlink_parent_components_follow_kernel_resolution_order() {
+        let fixture = Fixture::new();
+        let a = fixture.anchor.join("a");
+        let outside = fixture.anchor.join("outside");
+        let deep = outside.join("deep");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&deep).unwrap();
+
+        // Lexically collapsing `link/..` would inspect a/tool. The kernel
+        // follows link first, then applies `..`, and therefore executes
+        // outside/tool instead.
+        let decoy = a.join("tool");
+        fs::write(&decoy, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+        let actual = outside.join("tool");
+        fs::write(&actual, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o777)).unwrap();
+        symlink("../outside/deep", a.join("link")).unwrap();
+        let candidate = fixture.bin.join("ip");
+        symlink("../../a/link/../tool", &candidate).unwrap();
+
+        let error = resolve_exact_host_tool(TestTool::Ip, &candidate, &fixture.policy).unwrap_err();
+        assert!(
+            error.to_string().contains("canonical target is writable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn symlink_parent_component_cannot_climb_above_trust_anchor() {
+        let fixture = Fixture::new();
+        let candidate = fixture.bin.join("ip");
+        symlink("../../../bin/sh", &candidate).unwrap();
+        let error = resolve_exact_host_tool(TestTool::Ip, &candidate, &fixture.policy).unwrap_err();
+        assert!(error.to_string().contains("escapes trust anchor"));
+    }
+
+    #[test]
+    fn exact_path_api_rejects_parent_components() {
+        let fixture = Fixture::new();
+        let candidate = fixture.bin.join("../bin/ip");
+        let error = resolve_exact_host_tool(TestTool::Ip, &candidate, &fixture.policy).unwrap_err();
+        assert!(error.to_string().contains("parent-directory component"));
+    }
+
+    #[test]
     fn rejects_unreadable_candidates_and_non_directory_allowed_roots() {
         let fixture = Fixture::new();
         let locked = fixture.anchor.join("locked");
@@ -468,7 +538,7 @@ pub(crate) fn resolve_host_tool<I: Copy + fmt::Display>(
             }
             Ok(_) => {}
         }
-        match validate_candidate(candidate, policy) {
+        match validate_builtin_candidate(candidate, policy) {
             Ok(canonical_target) => {
                 return Ok(ResolvedHostTool {
                     identity,
@@ -493,7 +563,63 @@ pub(crate) fn resolve_host_tool<I: Copy + fmt::Display>(
     })
 }
 
-fn validate_candidate(candidate: &Path, policy: &TrustedToolPolicy) -> Result<PathBuf, String> {
+/// Resolve one exact path explicitly selected by trusted host configuration.
+///
+/// The explicit selection replaces the built-in candidate set, so FHS target
+/// containment is not relevant. Full path-chain ownership and mode checks
+/// remain mandatory; this API must not be used for ambient discovery.
+pub(crate) fn resolve_exact_host_tool<I: Copy + fmt::Display>(
+    identity: I,
+    candidate: &Path,
+    policy: &TrustedToolPolicy,
+) -> Result<ResolvedHostTool<I>, ResolveHostToolError> {
+    let failure = |reason| ResolveHostToolError {
+        tool: identity.to_string(),
+        attempts: AttemptFailures(vec![CandidateFailure {
+            path: candidate.to_path_buf(),
+            reason,
+        }]),
+    };
+    if !candidate.is_absolute() {
+        return Err(failure("candidate is not absolute".to_string()));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(failure(
+            "configured path contains a parent-directory component".to_string(),
+        ));
+    }
+    fs::symlink_metadata(candidate)
+        .map_err(|error| failure(format!("cannot inspect configured path: {error}")))?;
+    let canonical_target =
+        validate_candidate(candidate, policy, TargetContainment::Explicit).map_err(failure)?;
+    Ok(ResolvedHostTool {
+        identity,
+        launch_path: candidate.to_path_buf(),
+        canonical_target,
+    })
+}
+
+fn validate_builtin_candidate(
+    candidate: &Path,
+    policy: &TrustedToolPolicy,
+) -> Result<PathBuf, String> {
+    validate_candidate(candidate, policy, TargetContainment::BuiltInRoots)
+}
+
+#[derive(Clone, Copy)]
+enum TargetContainment {
+    BuiltInRoots,
+    Explicit,
+}
+
+fn validate_candidate(
+    candidate: &Path,
+    policy: &TrustedToolPolicy,
+    containment: TargetContainment,
+) -> Result<PathBuf, String> {
     if !candidate.is_absolute() {
         return Err("candidate is not absolute".to_string());
     }
@@ -505,6 +631,10 @@ fn validate_candidate(candidate: &Path, policy: &TrustedToolPolicy) -> Result<Pa
         return Err("canonical target is not executable".to_string());
     }
     validate_owner_and_mode(&metadata, policy.expected_uid, "canonical target")?;
+
+    if matches!(containment, TargetContainment::Explicit) {
+        return Ok(canonical_target);
+    }
 
     let mut allowed = false;
     let mut root_failures = Vec::new();
@@ -535,8 +665,9 @@ fn validate_candidate(candidate: &Path, policy: &TrustedToolPolicy) -> Result<Pa
 }
 
 /// Resolve symlinks one hop at a time while validating every directory that
-/// controls a hop. This accepts merged-/usr and alternatives layouts without
-/// allowing a writable intermediate directory to steer resolution.
+/// controls a hop. Parent components in symlink targets are processed in
+/// kernel order, after preceding components and their symlinks have resolved;
+/// lexical normalization here could validate a different object than exec.
 fn resolve_and_validate(
     path: &Path,
     policy: &TrustedToolPolicy,
@@ -564,6 +695,19 @@ fn resolve_and_validate(
         let Some(component) = pending.pop_front() else {
             return Ok((current, anchor_metadata));
         };
+        if matches!(component, PathStep::Parent) {
+            if current == anchor {
+                return Err(format!(
+                    "symbolic link target escapes trust anchor {}",
+                    policy.trust_anchor.display()
+                ));
+            }
+            current.pop();
+            continue;
+        }
+        let PathStep::Normal(component) = component else {
+            unreachable!("parent path step handled above")
+        };
         let next = current.join(&component);
         let metadata = fs::symlink_metadata(&next)
             .map_err(|error| format!("cannot inspect path component: {error}"))?;
@@ -582,21 +726,20 @@ fn resolve_and_validate(
             }
             let target = fs::read_link(&next)
                 .map_err(|error| format!("cannot read symbolic link: {error}"))?;
-            let target = if target.is_absolute() {
-                normalize_absolute(&target)?
+            let mut redirected = if target.is_absolute() {
+                let target_relative = target.strip_prefix(&anchor).map_err(|_| {
+                    format!(
+                        "symbolic link target {} escapes trust anchor",
+                        target.display()
+                    )
+                })?;
+                current.clone_from(&anchor);
+                symlink_target_components(target_relative)?
             } else {
-                normalize_absolute(&current.join(target))?
+                symlink_target_components(&target)?
             };
-            let target_relative = target.strip_prefix(&anchor).map_err(|_| {
-                format!(
-                    "symbolic link target {} escapes trust anchor",
-                    target.display()
-                )
-            })?;
-            let mut redirected = normal_components(target_relative)?;
             redirected.append(&mut pending);
             pending = redirected;
-            current.clone_from(&anchor);
             continue;
         }
 
@@ -655,11 +798,28 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn normal_components(path: &Path) -> Result<VecDeque<OsString>, String> {
+#[derive(Debug)]
+enum PathStep {
+    Normal(OsString),
+    Parent,
+}
+
+fn normal_components(path: &Path) -> Result<VecDeque<PathStep>, String> {
     path.components()
         .map(|component| match component {
-            Component::Normal(value) => Ok(value.to_owned()),
+            Component::Normal(value) => Ok(PathStep::Normal(value.to_owned())),
             _ => Err("path contains a non-normal component".to_string()),
+        })
+        .collect()
+}
+
+fn symlink_target_components(path: &Path) -> Result<VecDeque<PathStep>, String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::CurDir | Component::RootDir => None,
+            Component::ParentDir => Some(Ok(PathStep::Parent)),
+            Component::Normal(value) => Some(Ok(PathStep::Normal(value.to_owned()))),
+            Component::Prefix(_) => Some(Err("unsupported path prefix".to_string())),
         })
         .collect()
 }

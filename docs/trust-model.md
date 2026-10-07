@@ -123,11 +123,15 @@ itself authorize host execution.
 
 The Linux network control-plane family is one narrow implementation of this
 contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
-only from exact candidates under `/usr/bin`, `/usr/sbin`, `/bin`, or `/sbin`.
-It validates every controlling path component and symlink hop, requires the
-canonical target to remain under those roots, and requires root ownership, a
-regular executable target, and no group/other write bits. It executes the
-selected absolute candidate (preserving alternatives/multi-call argv[0]),
+from exact absolute paths. Unset fields use candidates under `/usr/bin`,
+`/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
+under those roots. The invocation-selected config can replace an identity with
+one exact path for non-FHS layouts; an override never falls back to built-ins.
+Both forms validate every actually traversed path component and symlink hop and
+require root ownership, a regular executable target, and no group/other write
+bits. Configured paths establish filesystem control only, not package, hash,
+basename, or command-semantic identity. Coop executes the selected absolute
+spelling (preserving alternatives/multi-call argv[0]),
 clears the launcher environment, supplies only `LANG=C` and `LC_ALL=C`, and
 sets cwd to `/`. Elevated commands use both the resolved absolute `sudo` and
 resolved absolute target. `sudo` may rebuild the elevated command's environment
@@ -137,8 +141,8 @@ context supplied to `sudo`, not an exact post-policy root environment.
 This remains pathname-based validation followed by pathname-based execution;
 it does not pin an inode, validate an executable's loader/library closure, or
 close inherited file descriptors. It also does not cover other host subprocess
-families. Non-FHS layouts such as NixOS/Guix require a separate reviewed policy
-instead of trusting broad `/run`, store, or user-profile roots.
+families. Exact overrides are re-resolved from the current config on every
+operation and are never persisted into instance state.
 
 ## Secrets and how they cross into the guest
 

@@ -61,6 +61,10 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 - **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
 - **curl**: Required for downloading the Firecracker binary and kernel.
 - **System packages**: Setup checks for `setfacl`, `unsquashfs`, `mkfs.ext4`, `ssh`, and `rsync`. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. If `apt-get` is unavailable, setup lists the missing tools; install the packages providing them with your host's package manager and rerun `coop setup`. No package manager is needed for this check when all these tools are already on `PATH`. The guest remains Ubuntu regardless of the host distribution.
+- **Network control-plane tools**: `sudo`, `ip`, `bridge`, `iptables`, and
+  `sysctl` use validated absolute system paths. Non-FHS hosts can provide exact
+  per-tool paths under `[network.host_tools]`; see
+  [configuration](configuration.md#exact-network-host-tool-paths).
 
 ### Setup process
 
