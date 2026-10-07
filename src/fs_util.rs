@@ -1022,6 +1022,24 @@ mod tests {
         assert!(!trusted_disk_owner(1000, 0));
     }
 
+    #[test]
+    fn pin_existing_regular_distinguishes_missing_from_open_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = PrivateDir::open_existing(root.path()).unwrap();
+        assert!(
+            directory
+                .pin_existing_regular(OsStr::new("missing"))
+                .unwrap()
+                .is_none()
+        );
+        let too_long = "x".repeat(4096);
+        assert!(
+            directory
+                .pin_existing_regular(OsStr::new(&too_long))
+                .is_err()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn disk_identity_does_not_require_read_access() {
