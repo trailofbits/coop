@@ -292,8 +292,7 @@ test_completions() {
     echo ""
     echo "=== Phase: shell completions ==="
 
-    # Static script generation — must succeed for each supported shell and
-    # the bash script must reference our subcommands.
+    # Dynamic script generation must succeed for each supported shell.
     for shell in bash zsh fish powershell elvish; do
         if coop completions "$shell" >/dev/null; then
             pass "completions $shell exits 0"
@@ -302,25 +301,30 @@ test_completions() {
         fi
     done
 
-    if coop completions bash; then
+    local dyn_out
+    if dyn_out=$(bash --noprofile --norc -c '
+        completion_binary=$1
+        source <("$completion_binary" completions bash)
+        coop() { "$completion_binary" "$@"; }
+        COMP_WORDS=(coop "")
+        COMP_CWORD=1
+        COMP_TYPE=9
+        _clap_complete_coop coop ""
+        printf "%s\n" "${COMPREPLY[@]}"
+    ' bash "$BINARY" 2>&1); then
         for sub in shell claude destroy completions; do
-            # Here-string, not `echo | grep -q`: pipefail + early grep match
-            # SIGPIPE's bash's echo on this 48 KB script and turns matches into false misses.
-            if grep -q "coop,$sub" <<<"$HARNESS_OUT"; then
-                pass "bash completion script references \`$sub\`"
+            if grep -Fxq "$sub" <<<"$dyn_out"; then
+                pass "generated bash completion offers \`$sub\`"
             else
-                fail "bash completion script references \`$sub\`" \
-                    "output (truncated): $(head -c 400 <<<"$HARNESS_OUT")"
+                fail "generated bash completion offers \`$sub\`" "got: $dyn_out"
             fi
         done
     else
-        fail "bash completion script content check" \
-             "completions bash exited non-zero: $?, stderr: $HARNESS_ERR"
+        fail "generated bash completion request exits 0" "exit code: $?, output: $dyn_out"
     fi
 
     # Dynamic completion: the engine must return a usable subcommand list
     # when called via the CompleteEnv protocol.
-    local dyn_out
     if dyn_out=$(_CLAP_COMPLETE_INDEX=1 _CLAP_IFS=$'\013' \
                  COMPLETE=bash "$BINARY" -- coop "" 2>&1); then
         for sub in shell claude destroy completions; do

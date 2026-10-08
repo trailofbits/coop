@@ -975,7 +975,7 @@ coop uninstall --yes --purge         # CI: remove binary and data, explicit
 
 ### `completions`
 
-Print a static shell completion script. Pair with `source <(COMPLETE=<shell> coop)` in your shell rc for dynamic completion of live instance, image, and profile names. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
+Print a dynamic shell completion script, including live instance, image, and profile names. Regenerate saved scripts after upgrading coop. See [docs/shell-completion.md](shell-completion.md) for full setup recipes per shell.
 
 ```
 coop completions <SHELL>

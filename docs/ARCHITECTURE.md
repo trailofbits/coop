@@ -47,7 +47,7 @@ coop/
 │   ├── private_storage.rs  # managed state and disk permission repair
 │   ├── sha256_hash.rs      # Sha256Hash newtype
 │   ├── naming.rs           # safe-name character class
-│   ├── completions.rs      # shell completion (static + dynamic candidates)
+│   ├── completions.rs      # dynamic shell registration + candidates
 │   ├── prompt.rs           # TTY prompts
 │   ├── update.rs           # `coop update` self-update + background notifier
 │   └── commands/           # one module per command domain (see below)
