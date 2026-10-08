@@ -223,7 +223,13 @@ pub fn create_instance(
 
 /// Resize a stopped Firecracker instance's rootfs.
 #[cfg(target_os = "linux")]
-pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
+pub fn resize_rootfs(
+    stopped: &crate::backend::StoppedInstance,
+    new_size: crate::config::GiB,
+) -> Result<()> {
+    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let inst = stopped.instance();
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
         bail!("Instance rootfs not found at {}", rootfs.display(),);
@@ -232,28 +238,27 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
     let current_bytes = std::fs::metadata(&rootfs)
         .with_context(|| format!("Failed to stat {}", rootfs.display()))?
         .len();
-    let current_gib = current_bytes / (1024 * 1024 * 1024);
-    let new_gib = u64::from(new_size.as_u32());
+    let requested_bytes = u64::from(new_size.as_u32()) * GIB_BYTES;
 
-    if new_gib < current_gib {
+    if requested_bytes < current_bytes {
         bail!(
-            "Shrinking is not supported (current: {current_gib} GiB, \
-             requested: {new_gib} GiB)"
+            "Shrinking is not supported (current image: {current_bytes} bytes, \
+             requested: {requested_bytes} bytes)"
         );
     }
-    if new_gib == current_gib {
-        tracing::info!("Disk is already {current_gib} GiB — nothing to do");
-        return Ok(());
+    if requested_bytes > current_bytes {
+        tracing::info!(
+            "Resizing instance '{}' from {} to {new_size} GiB",
+            inst.name,
+            current_bytes / GIB_BYTES
+        );
+        crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
     }
 
-    tracing::info!(
-        "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
-        inst.name
-    );
-    crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
+    // A previous attempt may have extended the image before ext4 was grown.
     crate::privileged_disk::fsck_fix(&rootfs)?;
     crate::privileged_disk::resize(&rootfs)?;
-    tracing::info!("Resize complete");
+    tracing::info!("Filesystem resize complete");
     Ok(())
 }
 
