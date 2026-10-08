@@ -1101,7 +1101,7 @@ impl VmBackend for FirecrackerBackend {
         new_size: crate::config::GiB,
     ) -> Result<()> {
         let _ = cfg;
-        crate::setup::resize_rootfs(stopped.instance(), new_size)
+        crate::setup::resize_rootfs(stopped, new_size)
     }
 
     fn set_machine_resources(

@@ -760,6 +760,10 @@ authoritative — the value survives restarts and is reported by `coop status`.
 The global `[vm]` settings in `config.toml` only seed these values for *new*
 instances.
 
+On Firecracker, retry an interrupted disk resize with the same absolute
+`--size` while the instance is stopped. The retry checks and grows the ext4
+filesystem even if the image file already has the requested length.
+
 By default the instance is left stopped and the change takes effect on the next
 `coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
 `--start` boot fails (e.g. more memory than the host has), the previous mem/vcpu

@@ -356,13 +356,17 @@ cargo test --lib unmount_rejects_name_swapped_to_outside_mount -- --ignored
 
 The VM integration suite checks host directory, JSON state, template disk, and
 instance disk modes after creation and after commit/restore on both backends.
+On Firecracker it also extends a stopped instance's image without growing ext4,
+retries `coop resize` at that same absolute size, and checks ext4 capacity.
 
 On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
 It also corrupts an ext4 inode reference count, checks that read-only verification
-rejects it, and repairs the filesystem before resizing. The repair operation
+rejects it, then retries `coop resize` at the already extended image size and
+checks the filesystem's block capacity. It also checks a completed no-op retry
+and rejects a shrink hidden by whole-GiB rounding. The repair operation
 accepts exit code 1 (errors corrected), as defined by
 [e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
 Nonzero results from other disk tools, reboot-required results, error combinations,

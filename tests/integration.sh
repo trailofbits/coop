@@ -2985,6 +2985,57 @@ test_resize_status() {
     fi
 }
 
+test_resize_retry_firecracker() {
+    echo ""
+    echo "=== Phase: Firecracker disk resize retry ==="
+    if [[ $(uname -s) != Linux ]]; then
+        skip "Firecracker disk resize retry" "Linux only"
+        return
+    fi
+
+    local data_dir="$HOME/.coop"
+    local rootfs="$data_dir/instances/$INSTANCE/rootfs.ext4"
+    local current_bytes target_gib target_bytes before_bytes after_bytes
+    if ! current_bytes=$(stat -c %s "$rootfs"); then
+        fail "inspect Firecracker image before retry" "stat failed"
+        return
+    fi
+    target_gib=$((current_bytes / 1073741824 + 1))
+    target_bytes=$((target_gib * 1073741824))
+
+    # Leave the image at the target length without growing ext4, as a failed
+    # fsck or resize2fs would. The public retry must finish the work.
+    if ! sudo -n "$BINARY" __disk-op truncate "$data_dir" "$rootfs" "$target_gib"; then
+        fail "extend Firecracker image for retry" "privileged truncate failed"
+        return
+    fi
+    if ! before_bytes=$(sudo -n dumpe2fs -h "$rootfs" 2>/dev/null |
+        awk '/^Block count:/ { count = $3 } /^Block size:/ { size = $3 } END { if (!count || !size) exit 1; printf "%.0f", count * size }'); then
+        fail "inspect Firecracker filesystem before retry" "dumpe2fs failed"
+        return
+    fi
+    if [[ "$before_bytes" -ge "$target_bytes" ]]; then
+        fail "retry fixture has a smaller filesystem" "fs=$before_bytes image=$target_bytes"
+        return
+    fi
+
+    if ! coop resize "$INSTANCE" --size "$target_gib"; then
+        fail "same-size Firecracker resize retry exits 0" "stderr: $HARNESS_ERR"
+        return
+    fi
+    if ! after_bytes=$(sudo -n dumpe2fs -h "$rootfs" 2>/dev/null |
+        awk '/^Block count:/ { count = $3 } /^Block size:/ { size = $3 } END { if (!count || !size) exit 1; printf "%.0f", count * size }'); then
+        fail "inspect Firecracker filesystem after retry" "dumpe2fs failed"
+        return
+    fi
+    if [[ "$after_bytes" == "$target_bytes" ]]; then
+        pass "same-size retry grows the ext4 filesystem"
+    else
+        fail "same-size retry grows the ext4 filesystem" \
+            "fs=$after_bytes image=$target_bytes"
+    fi
+}
+
 test_reconfigure() {
     echo ""
     echo "=== Phase: resize changes memory and vCPUs ==="
@@ -7718,6 +7769,7 @@ EOF
     test_list_stopped
     test_stopped_vm_completions
     test_resize_status
+    test_resize_retry_firecracker
     test_reconfigure
     test_commit_restore
     test_private_storage

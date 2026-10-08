@@ -125,9 +125,28 @@ if sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" \
     exit 1
 fi
 grep -Fq '/usr/sbin/e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
-sudo -n "$coop_bin" __disk-op fsck-fix "$data_dir" "$instance" >/dev/null
+
+# The image grew before fsck, but ext4 did not. Retrying the same absolute size
+# must repair the inode and finish the filesystem grow through the public CLI.
+printf '%s\n' '{"name":"test","index":0}' >"$data_dir/instances/test/instance.json"
+fs_bytes() {
+    sudo -n dumpe2fs -h "$instance" 2>/dev/null |
+        awk '/^Block count:/ { count = $3 } /^Block size:/ { size = $3 } END { if (!count || !size) exit 1; printf "%.0f", count * size }'
+}
+[[ $(fs_bytes) -lt $(stat -c %s "$instance") ]]
+"$coop_bin" --config "$data_dir/config.toml" resize test --size 1G
+[[ $(fs_bytes) == $(stat -c %s "$instance") ]]
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" >/dev/null
-sudo -n "$coop_bin" __disk-op resize "$data_dir" "$instance" >/dev/null
+"$coop_bin" --config "$data_dir/config.toml" resize test --size 1G
+[[ $(fs_bytes) == $(stat -c %s "$instance") ]]
+
+# A file even one block larger than the target is still a shrink request.
+sudo -n truncate -s $((1073741824 + 4096)) "$instance"
+if "$coop_bin" --config "$data_dir/config.toml" resize test --size 1G 2>/dev/null; then
+    echo 'unaligned disk shrink was accepted' >&2
+    exit 1
+fi
+[[ $(stat -c %s "$instance") == $((1073741824 + 4096)) ]]
 sudo -n "$coop_bin" __disk-op swap "$data_dir" "$stage"
 sudo -n "$coop_bin" __disk-op remove "$data_dir" "$instance"
 [[ ! -e $instance ]]
