@@ -206,6 +206,7 @@ exclude_re = [
   # pre-resolution decision remain in unit/mutation scope; real effects are
   # covered by the isolated Linux network gate and full Firecracker suite.
   "\\bsetup_tap_with_tools\\b",
+  "\\bteardown_tap_with_policy\\b",
   "\\bteardown_bridge_device\\b",
 
   # ---- src/commands/ and the lib.rs/main.rs shims ----

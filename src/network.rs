@@ -79,6 +79,13 @@ impl fmt::Display for NetworkTool {
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the shared Firecracker module must reject accidental use on non-Linux hosts"
+    )
+)]
 fn production_network_policy() -> Result<TrustedToolPolicy> {
     #[cfg(target_os = "linux")]
     {
@@ -94,6 +101,7 @@ fn production_network_policy() -> Result<TrustedToolPolicy> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
 fn resolve_network_tool(
     tool: NetworkTool,
     cfg: &NetworkConfig,
@@ -242,13 +250,6 @@ struct CleanupNetworkTools {
 }
 
 impl CleanupNetworkTools {
-    fn resolve(cfg: &NetworkConfig, policy: &TrustedToolPolicy) -> Result<Self> {
-        Ok(Self {
-            sudo: resolve_network_tool(NetworkTool::Sudo, cfg, policy)?,
-            launch: TrustedLaunchContext::system(),
-        })
-    }
-
     fn resolve_with(
         cfg: &NetworkConfig,
         policy: &TrustedToolPolicy,
@@ -401,24 +402,55 @@ fn setup_tap_with_tools(
 /// Remove the instance's tap device. Tears down the bridge if no taps remain.
 pub fn teardown_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let policy = production_network_policy()?;
-    let tools = CleanupNetworkTools::resolve(cfg, &policy)?;
-    let ip = resolve_network_tool(NetworkTool::Ip, cfg, &policy)?;
+    teardown_tap_with_policy(cfg, inst, &policy, |tool| {
+        tool.production_candidates()
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
+fn teardown_tap_with_policy(
+    cfg: &NetworkConfig,
+    inst: &Instance,
+    policy: &TrustedToolPolicy,
+    candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
+) -> Result<()> {
+    let ip = resolve_network_tool_with_candidates(
+        NetworkTool::Ip,
+        cfg,
+        &candidates(NetworkTool::Ip),
+        policy,
+    )?;
+    let launch = TrustedLaunchContext::system();
+    let mut tools = None;
     let tap = inst.tap_device();
     tracing::info!("Tearing down TAP device {tap}");
 
-    if tap_exists(&tap, tools.ip_probe(&ip)) {
-        tools
+    if tap_exists(&tap, launch.command(&ip)) {
+        let resolved = CleanupNetworkTools::resolve_with(cfg, policy, &candidates)?;
+        resolved
             .ip(&ip)
             .args(["link", "del", &tap])
             .run()
             .context("Failed to delete TAP device")?;
+        tools = Some(resolved);
     }
 
     // If no tap devices remain on the bridge, tear it down
-    if bridge_exists(tools.ip_probe(&ip)) && bridge_is_empty(tools.ip_probe(&ip)) {
-        let host_iface = resolve_host_iface(&cfg.host_iface, tools.ip_probe(&ip))
+    if bridge_exists(launch.command(&ip)) && bridge_is_empty(launch.command(&ip)) {
+        let host_iface = resolve_host_iface(&cfg.host_iface, launch.command(&ip))
             .unwrap_or_else(|_| "eth0".into());
-        let iptables = resolve_network_tool(NetworkTool::Iptables, cfg, &policy);
+        let tools = match tools {
+            Some(tools) => tools,
+            None => CleanupNetworkTools::resolve_with(cfg, policy, &candidates)?,
+        };
+        let iptables = resolve_network_tool_with_candidates(
+            NetworkTool::Iptables,
+            cfg,
+            &candidates(NetworkTool::Iptables),
+            policy,
+        );
         if let Err(error) = &iptables {
             tracing::debug!("Cannot resolve trusted iptables for cleanup (non-fatal): {error}");
         }
@@ -1053,6 +1085,109 @@ mod tests {
         assert_eq!(tools.bridge.launch_path(), profile.join("bridge"));
         assert_eq!(tools.iptables.launch_path(), profile.join("iptables"));
         assert_eq!(tools.sysctl.launch_path(), profile.join("sysctl"));
+    }
+
+    #[test]
+    fn teardown_tap_uses_configured_exact_ip_and_sudo_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let profile = anchor.join("run/current-system/sw/bin");
+        let wrappers = anchor.join("run/wrappers/bin");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&wrappers).unwrap();
+        let marker = temp.path().join("runs");
+        let inst = Instance {
+            name: InstanceName::new("exact-cleanup").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: temp.path().join("instance"),
+            image: default_image_name(),
+        };
+        let tap = inst.tap_device();
+
+        let ip = profile.join("ip");
+        fs::write(
+            &ip,
+            format!(
+                "#!/bin/sh\nprintf 'ip:%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$*\" = 'link show {tap}' ]; then exit 0; fi\n\
+                 if [ \"$*\" = 'link del {tap}' ]; then exit 0; fi\n\
+                 exit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sudo = wrappers.join("sudo");
+        fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\nprintf 'sudo\\n' >> '{}'\n[ \"$1\" = '--' ] || exit 97\nshift\nexec \"$@\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg: NetworkConfig = toml::from_str(&format!(
+            "[host_tools]\nsudo = {sudo:?}\nip = {ip:?}\n",
+            sudo = sudo.display().to_string(),
+            ip = ip.display().to_string(),
+        ))
+        .unwrap();
+        let policy = TrustedToolPolicy::new(
+            &anchor,
+            std::iter::empty::<PathBuf>(),
+            fs::metadata(&anchor).unwrap().uid(),
+        );
+
+        teardown_tap_with_policy(&cfg, &inst, &policy, |_| Vec::new()).unwrap();
+
+        let runs = fs::read_to_string(marker).unwrap();
+        assert!(runs.contains(&format!("ip:link show {tap}\n")));
+        assert!(runs.contains("sudo\n"));
+        assert!(runs.contains(&format!("ip:link del {tap}\n")));
+    }
+
+    #[test]
+    fn teardown_tap_does_not_require_sudo_when_nothing_needs_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let profile = anchor.join("run/current-system/sw/bin");
+        fs::create_dir_all(&profile).unwrap();
+        let marker = temp.path().join("ip-probes");
+        let ip = profile.join("ip");
+        fs::write(
+            &ip,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o755)).unwrap();
+        let missing_sudo = anchor.join("run/wrappers/bin/sudo");
+        let cfg: NetworkConfig = toml::from_str(&format!(
+            "[host_tools]\nsudo = {sudo:?}\nip = {ip:?}\n",
+            sudo = missing_sudo.display().to_string(),
+            ip = ip.display().to_string(),
+        ))
+        .unwrap();
+        let policy = TrustedToolPolicy::new(
+            &anchor,
+            std::iter::empty::<PathBuf>(),
+            fs::metadata(&anchor).unwrap().uid(),
+        );
+        let inst = Instance {
+            name: InstanceName::new("idempotent-cleanup").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: temp.path().join("instance"),
+            image: default_image_name(),
+        };
+
+        teardown_tap_with_policy(&cfg, &inst, &policy, |_| Vec::new()).unwrap();
+
+        assert_eq!(fs::read_to_string(marker).unwrap(), "probe\nprobe\n");
     }
 
     #[test]

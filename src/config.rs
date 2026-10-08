@@ -5136,6 +5136,31 @@ sysctl = "/run/current-system/sw/bin/sysctl"
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_an_unusable_configured_host_tool() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("network.host_tools.ip"), "{error}");
+        assert!(
+            error.contains("/coop-test-missing/network-tools/ip"),
+            "{error}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn validate_does_not_probe_linux_host_tool_paths_on_other_platforms() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        cfg.validate().unwrap();
+    }
+
     #[test]
     fn load_unknown_fields_ignored() {
         let tmp = TempDir::new().unwrap();
