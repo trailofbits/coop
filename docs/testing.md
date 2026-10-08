@@ -96,8 +96,10 @@ existing stop failure test checks PID retention after failed forced signals.
 
 `cargo test --test firecracker_socket` exercises the Linux socket helper and
 `coop stop` with a full Unix listener accept queue. It checks proxy-token
-retention and TAP cleanup through a fake `ip` boundary, then closes the listener
-and requires cleanup to succeed. It does not replace either VM integration gate.
+retention, then closes the listener and requires cleanup to succeed. An exact
+`/bin/false` network-tool path reports TAP and bridge objects absent without
+relying on ambient `PATH`; dedicated network tests cover TAP mutation and
+cleanup. This test does not replace either VM integration gate.
 
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project

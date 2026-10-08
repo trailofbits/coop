@@ -3,18 +3,11 @@
 
 use std::fs;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::process::Command;
 
-fn script(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-
 #[test]
-fn stop_retains_proxy_and_tap_for_full_socket_queue() {
+fn stop_retains_proxy_for_full_socket_queue_and_cleans_after_close() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let instance = data.join("instances/test");
@@ -26,22 +19,15 @@ fn stop_retains_proxy_and_tap_for_full_socket_queue() {
     .unwrap();
     let token = instance.join("proxy-openai.token");
     fs::write(&token, "proxy sentinel").unwrap();
-    let tap = root.path().join("tap-present");
-    fs::write(&tap, "TAP sentinel").unwrap();
-    let tools = root.path().join("bin");
-    fs::create_dir(&tools).unwrap();
-    // Replace only the privilege and network boundaries. The real coop
-    // command and socket helper still run and see the kernel's connect errno.
-    script(&tools.join("sudo"), "#!/bin/sh\nexec \"$@\"\n");
-    script(
-        &tools.join("ip"),
-        "#!/bin/sh\ncase \"$*\" in\n\
-         'link show tap0') test -f \"$COOP_TEST_TAP\" ;;\n\
-         'link del tap0') rm \"$COOP_TEST_TAP\" ;;\n\
-         *) exit 1 ;;\nesac\n",
-    );
     let config = root.path().join("config.toml");
-    fs::write(&config, format!("data_dir = {data:?}\n")).unwrap();
+    // This test exercises socket-state and proxy cleanup, not TAP mutation.
+    // Use a root-owned exact probe that always reports network objects absent
+    // instead of relying on PATH interception, which production forbids.
+    fs::write(
+        &config,
+        format!("data_dir = {data:?}\n[network.host_tools]\nip = '/bin/false'\n"),
+    )
+    .unwrap();
     let socket = instance.join("firecracker.socket");
     let listener = UnixListener::bind(&socket).unwrap();
     // Linux permits backlog + 1 pending connections. With backlog zero,
@@ -49,17 +35,12 @@ fn stop_retains_proxy_and_tap_for_full_socket_queue() {
     // SAFETY: listener owns a valid listening socket descriptor.
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
     let client = UnixStream::connect(&socket).unwrap();
-    let mut search_path = vec![tools];
-    search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let search_path = std::env::join_paths(search_path).unwrap();
     let stop = || {
         Command::new(env!("CARGO_BIN_EXE_coop"))
             .args(["--config"])
             .arg(&config)
             .args(["stop", "test"])
-            .env("PATH", &search_path)
             .env("HOME", root.path())
-            .env("COOP_TEST_TAP", &tap)
             .output()
             .unwrap()
     };
@@ -78,11 +59,11 @@ fn stop_retains_proxy_and_tap_for_full_socket_queue() {
         assert!(!output.status.success(), "{error}");
         assert!(error.contains("os error 11"), "{error}");
         assert_eq!(fs::read_to_string(&token).unwrap(), "proxy sentinel");
-        assert_eq!(fs::read_to_string(&tap).unwrap(), "TAP sentinel");
     }
 
-    // A closed listener leaves the socket path behind. The same command
-    // must now clean up both resources, proving the teardown tripwires work.
+    // A closed listener leaves the socket path behind. The same command must
+    // now clean up the proxy resource. Network teardown has dedicated tests
+    // because production network-tool lookup intentionally ignores PATH.
     drop(client);
     drop(listener);
     let output = stop();
@@ -92,7 +73,6 @@ fn stop_retains_proxy_and_tap_for_full_socket_queue() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!token.exists());
-    assert!(!tap.exists());
 }
 
 #[test]
