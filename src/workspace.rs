@@ -179,6 +179,15 @@ pub fn tar_pipe_transfer_to(
         source_dir.display(),
     );
 
+    let extract_cmd = tar_extract_cmd(guest_path);
+    let mut ssh_command = target.ssh_command()?;
+    ssh_command
+        .arg(target.addr())
+        .arg(extract_cmd.into_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
     let mut tar_cmd = tar_command();
     tar_cmd.args(["cf", "-"]);
     for exc in DEFAULT_EXCLUDES {
@@ -208,18 +217,19 @@ pub fn tar_pipe_transfer_to(
         .take()
         .context("Failed to get tar stderr")?;
 
-    let extract_cmd = tar_extract_cmd(guest_path);
-    let mut ssh_args = target.ssh_opts();
-    ssh_args.push(target.addr());
-    ssh_args.push(extract_cmd.into_string());
-
-    let mut ssh_child = Command::new("ssh")
-        .args(&ssh_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to start SSH for tar-pipe transfer")?;
+    let mut ssh_child = match ssh_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = tar_child.kill();
+            let reap_result = tar_child.wait();
+            return match reap_result {
+                Ok(_) => Err(error).context("Failed to start SSH for tar-pipe transfer"),
+                Err(reap_error) => Err(error).context(format!(
+                    "Failed to start SSH for tar-pipe transfer; additionally failed to reap tar child: {reap_error}"
+                )),
+            };
+        }
+    };
 
     let mut ssh_stdin = ssh_child.stdin.take().context("Failed to get SSH stdin")?;
     let ssh_stderr = ssh_child
@@ -501,7 +511,7 @@ pub fn push(
         state.guest_path
     );
 
-    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+    if target.exec_ok(RemoteCommand::new().literal("which rsync"))? {
         rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
     } else {
         tar_push_fallback(
@@ -572,7 +582,7 @@ pub fn pull(running: &RunningInstance, dir: Option<&str>, force: bool) -> Result
         dest_dir.display()
     );
 
-    if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+    if target.exec_ok(RemoteCommand::new().literal("which rsync"))? {
         rsync_pull(target, &state.guest_path, &dest_dir, &operation)?;
     } else {
         tracing::info!("rsync not available on guest, using tar-pipe");
@@ -615,7 +625,7 @@ pub fn sync_mount_contents(
 
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
-        if target.exec_ok(RemoteCommand::new().literal("which rsync")) {
+        if target.exec_ok(RemoteCommand::new().literal("which rsync"))? {
             rsync_push(target, &m.host_path, guest, exclude_git)?;
         } else {
             tracing::info!("rsync not available on guest, using tar-pipe");
@@ -786,8 +796,8 @@ fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
 
 // ── Transport: rsync ──────────────────────────────────────────
 
-fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
-    let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()];
+fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Result<Vec<String>> {
+    let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()?];
     // `.git/` rule must precede the per-directory `.gitignore` merge: rsync
     // uses first-match-wins, so without this a repo whose `.gitignore`
     // happens to list `.git/` would silently strip git state from the
@@ -802,7 +812,7 @@ fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Vec<String> {
     for exc in DEFAULT_EXCLUDES {
         args.push(format!("--exclude={exc}"));
     }
-    args
+    Ok(args)
 }
 
 pub(crate) fn rsync_push(
@@ -811,12 +821,13 @@ pub(crate) fn rsync_push(
     guest_path: &GuestPath,
     exclude_git: bool,
 ) -> Result<()> {
-    let mut args = rsync_base_args(target, exclude_git);
+    let mut args = rsync_base_args(target, exclude_git)?;
     args.push("--delete".to_string());
     args.push(format!("{}/", source.display()));
     args.push(format!("{}:{guest_path}/", target.addr()));
 
-    let status = Command::new("rsync")
+    let status = target
+        .rsync_command()?
         .args(&args)
         .status()
         .context("Failed to run rsync")?;
@@ -833,7 +844,7 @@ fn rsync_pull(
     dest: &Path,
     operation: &PullOperation,
 ) -> Result<()> {
-    let mut args = rsync_pull_args(target);
+    let mut args = rsync_pull_args(target)?;
     args.push(format!("{}:{guest_path}/", target.addr()));
     // A compromised guest controls the remote rsync sender. Stage its file
     // list away from the destination, then apply the Git-metadata exclusion
@@ -842,28 +853,32 @@ fn rsync_pull(
     args.push(format!("{}/", staging.path()?.display()));
 
     let result = (|| {
-        let mut command = locked_rsync_command(&args, operation);
+        let mut command = locked_rsync_command(target, &args, operation)?;
         let status = command.status().context("Failed to run rsync")?;
 
         if !status.success() {
             bail!("rsync pull failed");
         }
-        install_staged_pull(staging.path()?, dest, operation)
+        install_staged_pull(target, staging.path()?, dest, operation)
     })();
     staging.finish(result)
 }
 
-fn rsync_pull_args(target: &SshTarget) -> Vec<String> {
+fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
     // Guest-authored Git administration data is active configuration, not
     // workspace content. Apply the common-name filter as defense-in-depth.
     rsync_base_args(target, true)
 }
 
-fn locked_rsync_command(args: &[String], operation: &PullOperation) -> Command {
-    let mut command = Command::new("rsync");
+fn locked_rsync_command(
+    target: &SshTarget,
+    args: &[String],
+    operation: &PullOperation,
+) -> Result<Command> {
+    let mut command = target.rsync_command()?;
     command.args(args);
     operation.inherit_lock_in(&mut command);
-    command
+    Ok(command)
 }
 
 // ── Transport: tar-pipe ───────────────────────────────────────
@@ -933,9 +948,14 @@ fn locked_tar_pull_extract_cmd(dest: &Path, operation: &PullOperation) -> Comman
     command
 }
 
-fn install_staged_pull(source: &Path, dest: &Path, operation: &PullOperation) -> Result<()> {
+fn install_staged_pull(
+    target: &SshTarget,
+    source: &Path,
+    dest: &Path,
+    operation: &PullOperation,
+) -> Result<()> {
     let args = install_staged_pull_args(source, dest);
-    let mut command = locked_rsync_command(&args, operation);
+    let mut command = locked_rsync_command(target, &args, operation)?;
     let status = command.status().context("Failed to install staged pull")?;
 
     if !status.success() {
@@ -978,13 +998,10 @@ fn tar_pipe_pull_staged(
     dest: &Path,
     operation: &PullOperation,
 ) -> Result<()> {
-    let mut ssh_args = target.ssh_opts();
-    ssh_args.push(target.addr());
-    ssh_args.push(remote_cmd.to_string());
-
-    let mut ssh_command = Command::new("ssh");
+    let mut ssh_command = target.ssh_command()?;
     ssh_command
-        .args(&ssh_args)
+        .arg(target.addr())
+        .arg(remote_cmd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut ssh_child = ssh_command
@@ -1068,7 +1085,7 @@ fn tar_pipe_pull_staged(
         );
     }
 
-    install_staged_pull(staging, dest, operation)
+    install_staged_pull(target, staging, dest, operation)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1272,19 +1289,22 @@ fn make_staging_directories_traversable(path: &Path) -> Result<()> {
 }
 
 fn resolve_host_dir(explicit: Option<&str>, state: &WorkspaceState, cmd: &str) -> Result<PathBuf> {
-    if let Some(d) = explicit {
-        return Ok(PathBuf::from(d));
-    }
-    state
-        .source
-        .host_path()
-        .map(Path::to_path_buf)
-        .with_context(|| {
-            format!(
-                "No host_path in workspace.json and no --dir given.\n\
-                 Provide a directory: coop {cmd} --dir ./my-project"
-            )
-        })
+    let path = if let Some(d) = explicit {
+        PathBuf::from(d)
+    } else {
+        state
+            .source
+            .host_path()
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "No host_path in workspace.json and no --dir given.\n\
+                     Provide a directory: coop {cmd} --dir ./my-project"
+                )
+            })?
+    };
+    std::path::absolute(&path)
+        .with_context(|| format!("Failed to make workspace path {} absolute", path.display()))
 }
 
 fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
@@ -1310,12 +1330,10 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
           fi",
         );
 
-    let mut args = target.ssh_opts();
-    args.push(target.addr());
-    args.push(check_cmd.into_string());
-
-    let output = Command::new("ssh")
-        .args(&args)
+    let output = target
+        .ssh_command()?
+        .arg(target.addr())
+        .arg(check_cmd.into_string())
         .output()
         .context("Failed to check guest workspace status")?;
 
@@ -1749,9 +1767,16 @@ mod tests {
                 "clean",
                 "force",
             ] {
-                let temp = tempfile::tempdir().unwrap();
+                let temp = crate::host_tool::trusted_test_tempdir();
                 let ssh = temp.path().join("ssh");
-                fs::write(&ssh, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_CAPTURE\"\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) for last; do :; done; exec sh -c \"$last\";;\n ssh_failure) exit 255;;\n guest_dirty) echo ' M guest-file'; exit 0;;\n clean|force) case \"$*\" in *'which rsync'*) exit 1;; esac; cat >/dev/null; exit 0;;\nesac\n").unwrap();
+                let capture = temp.path().join("ssh-calls");
+                let script = format!(
+                    "#!/bin/sh\nCOOP_TEST_CLEANLINESS_MODE={}\nCOOP_TEST_CAPTURE={}\nPATH={}:$PATH\nexport COOP_TEST_CLEANLINESS_MODE COOP_TEST_CAPTURE PATH\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_CAPTURE\"\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) for last; do :; done; exec sh -c \"$last\";;\n ssh_failure) exit 255;;\n guest_dirty) echo ' M guest-file'; exit 0;;\n clean|force) case \"$*\" in *'which rsync'*) exit 1;; esac; cat >/dev/null; exit 0;;\nesac\n",
+                    crate::shell::shell_escape(mode),
+                    crate::shell::shell_escape(&capture.to_string_lossy()),
+                    crate::shell::shell_escape(&temp.path().to_string_lossy()),
+                );
+                fs::write(&ssh, script).unwrap();
                 fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
                 let git = temp.path().join("git");
                 fs::write(&git, "#!/bin/sh\ncase \"$COOP_TEST_CLEANLINESS_MODE\" in\n guest_git_failure|guest_git_file_failure) exit 42;;\nesac\n").unwrap();
@@ -1768,7 +1793,7 @@ mod tests {
                     ])
                     .env("COOP_TEST_CLEANLINESS_MODE", mode)
                     .env("COOP_TEST_CLEANLINESS_ROOT", temp.path())
-                    .env("COOP_TEST_CAPTURE", temp.path().join("ssh-calls"))
+                    .env("COOP_TEST_CAPTURE", &capture)
                     .env("PATH", path)
                     .output()
                     .unwrap();
@@ -1820,6 +1845,12 @@ mod tests {
             port: NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&root.join("ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
         };
         let running = RunningInstance::new(inst, target);
         let result = push(&running, None, mode == "force", false);
@@ -1849,10 +1880,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let Ok(root) = std::env::var("COOP_TEST_PUSH_FALLBACK_ROOT") else {
-            let temp = tempfile::Builder::new()
-                .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir()
-                .unwrap();
+            let temp = crate::host_tool::trusted_test_tempdir();
             let fake_ssh = temp.path().join("ssh");
             fs::write(
                 &fake_ssh,
@@ -1903,6 +1931,12 @@ mod tests {
             port: NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&root.join("ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
         };
         let running = RunningInstance::new(inst, target);
         push(&running, None, true, false).unwrap();
@@ -2058,6 +2092,21 @@ mod tests {
         };
         let dir = resolve_host_dir(Some("/from/cli"), &state, "push").expect("explicit dir");
         assert_eq!(dir, PathBuf::from("/from/cli"));
+    }
+
+    #[test]
+    fn resolve_host_dir_makes_relative_transport_paths_absolute() {
+        let state = WorkspaceState {
+            guest_path: GuestPath::absolute("/workspace").unwrap(),
+            source: WorkspaceSource::Workspace {
+                host_path: PathBuf::from("/from/state"),
+            },
+        };
+        let dir = resolve_host_dir(Some("relative-workspace"), &state, "push").unwrap();
+        assert_eq!(
+            dir,
+            std::env::current_dir().unwrap().join("relative-workspace")
+        );
     }
 
     #[test]
@@ -2702,6 +2751,7 @@ Host coop-other\n\
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("ubuntu").expect("valid user"),
             key_path: PathBuf::from("/tmp/key"),
+            host_tools: crate::config::SshHostToolsConfig::default(),
         }
     }
 
@@ -2742,7 +2792,7 @@ Host coop-other\n\
         /// unchecked.
         #[test]
         fn rsync_base_args_membership_and_git_filter_ordering(exclude_git in any::<bool>()) {
-            let args = rsync_base_args(&fake_ssh_target(), exclude_git);
+            let args = rsync_base_args(&fake_ssh_target(), exclude_git).unwrap();
 
             for exc in DEFAULT_EXCLUDES {
                 let needle = format!("--exclude={exc}");
@@ -2781,7 +2831,7 @@ Host coop-other\n\
     #[test]
     fn pull_transports_apply_best_effort_git_exclusions() {
         let target = fake_ssh_target();
-        let rsync_args = rsync_pull_args(&target);
+        let rsync_args = rsync_pull_args(&target).unwrap();
         assert!(
             rsync_args
                 .iter()
@@ -2949,7 +2999,7 @@ Host coop-other\n\
             format!("{}/", source.display()),
             format!("{}/", dest.display()),
         ];
-        let mut command = locked_rsync_command(&args, &operation);
+        let mut command = locked_rsync_command(&fake_ssh_target(), &args, &operation).unwrap();
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.process_group(0);
         let mut child = command.spawn().unwrap();
@@ -3026,7 +3076,7 @@ Host coop-other\n\
         const REAL_RSYNC_ENV: &str = "COOP_TEST_RSYNC_PULL_REAL_RSYNC";
 
         let Ok(root) = std::env::var(ROOT_ENV) else {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::host_tool::trusted_test_tempdir();
             let dest = temp.path().join("dest");
             let bin = temp.path().join("bin");
             let staging_parent = temp.path().join("pull-tmp");
@@ -3041,11 +3091,13 @@ Host coop-other\n\
                 .unwrap();
             assert!(real_rsync.status.success());
             let real_rsync = String::from_utf8(real_rsync.stdout).unwrap();
+            let real_rsync = crate::shell::shell_escape(real_rsync.trim());
 
             let rsync = bin.join("rsync");
             fs::write(
                 &rsync,
-                "#!/bin/sh\n\
+                format!(
+                    "#!/bin/sh\n\
                  case \"$*\" in\n\
                    *:/workspace/*)\n\
                      for last do :; done\n\
@@ -3053,8 +3105,9 @@ Host coop-other\n\
                      printf 'guest-controlled\\n' > \"$last/.git/config\"\n\
                      printf 'worktree\\n' > \"$last/workspace-file\"\n\
                      ;;\n\
-                   *) exec \"$COOP_TEST_RSYNC_PULL_REAL_RSYNC\" \"$@\" ;;\n\
-                 esac\n",
+                   *) exec {real_rsync} \"$@\" ;;\n\
+                 esac\n"
+                ),
             )
             .unwrap();
             fs::set_permissions(&rsync, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3069,7 +3122,7 @@ Host coop-other\n\
                     "workspace::tests::rsync_pull_stages_a_malicious_sender_before_installation",
                 ])
                 .env(ROOT_ENV, temp.path())
-                .env(REAL_RSYNC_ENV, real_rsync.trim())
+                .env(REAL_RSYNC_ENV, "/unused-explicit-environment-sentinel")
                 .env("TMPDIR", &staging_parent)
                 .env("PATH", path)
                 .output()
@@ -3086,8 +3139,15 @@ Host coop-other\n\
         let dest = root.join("dest");
         let staging = root.join("pull-tmp/staging");
         let operation = PullOperation::new(staging.clone()).unwrap();
+        let mut target = fake_ssh_target();
+        target.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
+            None,
+            None,
+            Some(&root.join("bin/rsync")),
+        )
+        .unwrap();
         rsync_pull(
-            &fake_ssh_target(),
+            &target,
             &GuestPath::absolute("/workspace").unwrap(),
             &dest,
             &operation,
@@ -3177,7 +3237,7 @@ Host coop-other\n\
         const ARCHIVE_ENV: &str = "COOP_TEST_TAR_PULL_STAGING_ARCHIVE";
 
         let Ok(root) = std::env::var(ROOT_ENV) else {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::host_tool::trusted_test_tempdir();
             let source = temp.path().join("source");
             let dest = temp.path().join("dest");
             let bin = temp.path().join("bin");
@@ -3204,7 +3264,10 @@ Host coop-other\n\
             let ssh = bin.join("ssh");
             fs::write(
                 &ssh,
-                "#!/bin/sh\ncat \"$COOP_TEST_TAR_PULL_STAGING_ARCHIVE\"\n",
+                format!(
+                    "#!/bin/sh\ncat {}\n",
+                    crate::shell::shell_escape(&archive.to_string_lossy())
+                ),
             )
             .unwrap();
             fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3236,8 +3299,15 @@ Host coop-other\n\
         let dest = root.join("dest");
         let staging = root.join("pull-tmp/staging");
         let operation = PullOperation::new(staging.clone()).unwrap();
+        let mut target = fake_ssh_target();
+        target.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
+            Some(&root.join("bin/ssh")),
+            None,
+            None,
+        )
+        .unwrap();
         let result = tar_pipe_pull(
-            &fake_ssh_target(),
+            &target,
             &GuestPath::absolute("/workspace").unwrap(),
             &dest,
             &operation,
@@ -3266,7 +3336,7 @@ Host coop-other\n\
         fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
 
         let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
-        install_staged_pull(&staging, &dest, &operation).unwrap();
+        install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
 
         assert_eq!(
             fs::read_to_string(dest.join("workspace-file")).unwrap(),

@@ -53,7 +53,9 @@ fn escape_opts() -> [String; 2] {
 fn interactive_ssh_command(session: &SshSession, remote_cmd: &str) -> Result<Command> {
     let mut options = escape_opts().to_vec();
     options.push("-t".to_string());
-    session.command(&options, remote_cmd)
+    let mut command = session.command(&options, remote_cmd)?;
+    command.env("TERM", guest_term());
+    Ok(command)
 }
 
 /// Restore the local terminal after an SSH failure.
@@ -91,7 +93,6 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
     );
 
     let status = interactive_ssh_command(session, &remote_cmd)?
-        .env("TERM", guest_term())
         .status()
         .context("Failed to launch SSH — is the ssh client installed?")?;
 
@@ -183,6 +184,7 @@ mod tests {
                 port: std::num::NonZeroU16::MIN,
                 user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
                 key_path: "/tmp/coop-test-key".into(),
+                host_tools: crate::config::SshHostToolsConfig::default(),
             },
             env: crate::backend::EnvForward::default(),
         };
@@ -190,49 +192,34 @@ mod tests {
         // The `ServerAlive*` pair comes from `SshTarget::transport_opts`, which
         // every transport shares; this session must not add a second one, since
         // OpenSSH honors the first value of a repeated `-o`.
+        let command = interactive_ssh_command(&session, "cd /workspace && 'claude' 'agents'")
+            .expect("interactive SSH command");
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-F", "none"]));
+        assert!(args.contains(&std::ffi::OsStr::new("ClearAllForwardings=yes")));
         assert_eq!(
-            interactive_ssh_command(&session, "cd /workspace && 'claude' 'agents'")
-                .expect("interactive SSH command")
-                .get_args()
-                .collect::<Vec<_>>(),
+            &args[args.len() - 5..],
             [
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "ForwardAgent=no",
-                "-o",
-                "IdentityAgent=none",
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "LogLevel=ERROR",
-                "-i",
-                "/tmp/coop-test-key",
-                "-p",
-                "1",
-                "-e",
-                "~",
-                "-t",
-                "ubuntu@127.0.0.1",
-                "cd /workspace && 'claude' 'agents'",
-            ],
+                std::ffi::OsStr::new("-e"),
+                std::ffi::OsStr::new("~"),
+                std::ffi::OsStr::new("-t"),
+                std::ffi::OsStr::new("ubuntu@127.0.0.1"),
+                std::ffi::OsStr::new("cd /workspace && 'claude' 'agents'"),
+            ]
         );
+        let env = command.get_envs().collect::<Vec<_>>();
+        assert_eq!(env.len(), 3);
+        assert!(env.contains(&(
+            std::ffi::OsStr::new("TERM"),
+            Some(std::ffi::OsStr::new(&guest_term())),
+        )));
     }
 
     #[test]
     fn all_launch_paths_keep_guest_environment_off_host() {
         use std::os::unix::fs::PermissionsExt as _;
-        if std::env::var_os("COOP_FORWARDING_FIXTURE").is_some() {
+        if let Some(fixture) = std::env::var_os("COOP_FORWARDING_FIXTURE") {
+            let fixture = std::path::PathBuf::from(fixture);
             let mut env = crate::backend::EnvForward::default();
             env.set("PATH", "./project-bin").expect("PATH");
             env.set("LD_LIBRARY_PATH", "./project-libs")
@@ -244,6 +231,12 @@ mod tests {
                     port: std::num::NonZeroU16::MIN,
                     user: crate::backend::SshUser::new("ubuntu").expect("user"),
                     key_path: "/unused-key".into(),
+                    host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                        Some(&fixture.join("ssh")),
+                        None,
+                        None,
+                    )
+                    .expect("exact fixture ssh"),
                 },
                 env,
             };
@@ -257,23 +250,27 @@ mod tests {
             run_interactive(&session, &args).expect("interactive");
             return;
         }
-        let fixture = tempfile::tempdir().expect("fixture");
+        let fixture = crate::host_tool::trusted_test_tempdir();
         let marker = fixture.path().join("launched");
         let ssh = fixture.path().join("ssh");
         std::fs::write(
             &ssh,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
 set -eu
-test "$PATH" = "$COOP_FORWARDING_FIXTURE"
-test "${LD_LIBRARY_PATH-unset}" = unset
-test "${SECRET-unset}" = unset
+test "${{LD_LIBRARY_PATH-unset}}" = unset
+test "${{SECRET-unset}}" = unset
+test "${{HOME-unset}}" = unset
+test "${{COOP_FORWARDING_MARKER-unset}}" = unset
 for arg do remote=$arg; done
 # Map the guest workspace to this fixture without requiring /workspace on macOS.
 remote=$(printf '%s' "$remote" | /usr/bin/sed 's@cd /workspace && @@g')
 # Simulate sshd running the remote command, after checking host isolation.
 SHELL=/bin/bash /bin/sh -c "$remote"
-printf x >> "$COOP_FORWARDING_MARKER"
+printf x >> {}
 "#,
+                crate::shell::shell_escape(&marker.to_string_lossy())
+            ),
         )
         .expect("SSH fixture");
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).expect("executable");

@@ -29,6 +29,7 @@ coop/
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
+│   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing

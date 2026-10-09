@@ -306,7 +306,7 @@ fn reinstall_as_root(session: &SshSession, script: &str) -> Result<()> {
             .literal("sudo env GUEST_USER=")
             .arg(user.as_str())
             .literal(" COOP_FORCE_INSTALL=1 bash -s"),
-        script.as_bytes().to_vec(),
+        script.as_bytes(),
     )
 }
 

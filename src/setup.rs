@@ -157,7 +157,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
     check_host_requirements()?;
-    install_system_packages(opts.skip_confirm)?;
+    install_system_packages(cfg, opts.skip_confirm)?;
     ensure_kvm_access(opts.skip_confirm)?;
     install_firecracker(cfg, opts.skip_confirm)?;
     fetch_kernel(cfg, opts.skip_confirm)?;
@@ -1100,7 +1100,7 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_system_packages(skip_confirm: bool) -> Result<()> {
+fn install_system_packages(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     let mut missing = Vec::new();
     let mut missing_tools = Vec::new();
 
@@ -1108,12 +1108,31 @@ fn install_system_packages(skip_confirm: bool) -> Result<()> {
         ("setfacl", "acl"),
         ("unsquashfs", "squashfs-tools"),
         ("mkfs.ext4", "e2fsprogs"),
-        ("ssh", "openssh-client"),
-        ("rsync", "rsync"),
     ] {
         if !command_exists(tool) {
             missing.push(package);
             missing_tools.push(tool);
+        }
+    }
+
+    for (tool, identity, package) in [
+        ("ssh", crate::openssh::OpenSshTool::Ssh, "openssh-client"),
+        ("scp", crate::openssh::OpenSshTool::Scp, "openssh-client"),
+        ("rsync", crate::openssh::OpenSshTool::Rsync, "rsync"),
+    ] {
+        match crate::openssh::prerequisite_available(identity, &cfg.ssh.host_tools) {
+            Ok(true) => {}
+            Ok(false) => {
+                if !missing.contains(&package) {
+                    missing.push(package);
+                }
+                missing_tools.push(tool);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to validate required host transport client '{tool}'")
+                });
+            }
         }
     }
 
@@ -1756,6 +1775,8 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     fn setup_options(extra_packages: &[&str], post_install: Option<PathBuf>) -> SetupOptions {
@@ -1861,28 +1882,59 @@ mod tests {
     #[test]
     fn system_packages_without_apt() {
         const CHILD: &str = "COOP_TEST_SYSTEM_PACKAGES";
+        const ROOT: &str = "COOP_TEST_SYSTEM_PACKAGES_ROOT";
         if let Ok(scenario) = std::env::var(CHILD) {
-            let result = install_system_packages(true);
-            if scenario == "present" {
-                result.unwrap();
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("Missing host tools: unsquashfs, ssh, rsync."));
-                assert!(error.contains("apt-get, which was not found on PATH"));
-                assert!(error.contains("host's package manager"));
-                assert!(error.contains("rerun `coop setup`"));
+            let root = PathBuf::from(std::env::var(ROOT).unwrap());
+            let mut cfg = CoopConfig::default();
+            cfg.ssh.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&root.join("ssh")),
+                Some(&root.join("scp")),
+                Some(&root.join("rsync")),
+            )
+            .unwrap();
+            let result = install_system_packages(&cfg, true);
+            match scenario.as_str() {
+                "present" => result.unwrap(),
+                "missing" => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains("Failed to validate required host transport client 'ssh'")
+                    );
+                    assert!(error.contains("built-in fallback was not attempted"));
+                    assert!(!error.contains("apt-get"));
+                }
+                "rejected" => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains("Failed to validate required host transport client 'ssh'")
+                    );
+                    assert!(error.contains("writable"), "{error}");
+                    assert!(!error.contains("apt-get"));
+                }
+                other => panic!("unexpected scenario {other}"),
             }
             return;
         }
 
         // Isolate PATH in child processes instead of mutating the test runner's
         // environment. No fixture can invoke a real package manager or sudo.
-        for scenario in ["present", "missing"] {
-            let bin = tempfile::tempdir().unwrap();
+        for scenario in ["present", "missing", "rejected"] {
+            let bin = crate::host_tool::trusted_test_tempdir();
             std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
-            for tool in ["setfacl", "unsquashfs", "mkfs.ext4", "ssh", "rsync"] {
+            for tool in ["setfacl", "unsquashfs", "mkfs.ext4", "ssh", "scp", "rsync"] {
                 if scenario == "present" || matches!(tool, "setfacl" | "mkfs.ext4") {
                     std::os::unix::fs::symlink("/bin/sh", bin.path().join(tool)).unwrap();
+                } else if scenario == "rejected" {
+                    if tool == "ssh" {
+                        fs::write(bin.path().join(tool), "#!/bin/sh\nexit 0\n").unwrap();
+                        fs::set_permissions(
+                            bin.path().join(tool),
+                            fs::Permissions::from_mode(0o777),
+                        )
+                        .unwrap();
+                    } else {
+                        std::os::unix::fs::symlink("/bin/sh", bin.path().join(tool)).unwrap();
+                    }
                 }
             }
             let output = Command::new(std::env::current_exe().unwrap())
@@ -1893,6 +1945,7 @@ mod tests {
                 ])
                 .env("PATH", bin.path())
                 .env(CHILD, scenario)
+                .env(ROOT, bin.path())
                 .output()
                 .unwrap();
             assert!(

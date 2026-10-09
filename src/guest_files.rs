@@ -145,7 +145,7 @@ impl StagedFiles {
                     .arg(remote.as_ref())
                     .literal(" ")
                     .arg(destination.as_ref()),
-                include_bytes!("../scripts/guest/copy-files.sh").to_vec(),
+                include_bytes!("../scripts/guest/copy-files.sh"),
             )
         })();
         let cleanup = target.exec(

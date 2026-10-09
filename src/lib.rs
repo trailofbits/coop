@@ -22,6 +22,7 @@ pub mod guest_files;
 mod host_tool;
 mod model_state;
 mod naming;
+mod openssh;
 mod pat_prompt;
 mod paths;
 mod port_forward;

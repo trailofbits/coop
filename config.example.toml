@@ -64,6 +64,15 @@
 # iptables = "/run/current-system/sw/bin/iptables"
 # sysctl = "/run/current-system/sw/bin/sysctl"
 
+# Coop-managed SSH/SCP/rsync processes ignore user and system SSH config and
+# use a cleared environment. Conventional Linux and macOS hosts need no
+# overrides. Set exact paths only for non-FHS or alternate installations; a
+# set field replaces built-in candidates and never falls back.
+# [ssh.host_tools]
+# ssh = "/run/current-system/sw/bin/ssh"
+# scp = "/run/current-system/sw/bin/scp"
+# rsync = "/run/current-system/sw/bin/rsync"
+
 # [guest_env]                   # Literal env vars to set in the guest.
 #                               # Overrides forwarded values on key
 #                               # collision (warning logged). Avoid for

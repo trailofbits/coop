@@ -319,7 +319,7 @@ fn execute(session: &SshSession, command: &CreationCommand, directory: &str) -> 
                 .literal(" && cat > ")
                 .arg(&remote)
                 .literal("/hook.sh"),
-            script(command, directory).into_bytes(),
+            script(command, directory).as_bytes(),
         )?;
         execute_staged(session, &remote)
     })();
@@ -886,6 +886,12 @@ mod tests {
                 port: std::num::NonZeroU16::MIN,
                 user: crate::backend::SshUser::new("ubuntu").unwrap(),
                 key_path: root.join("unused-key"),
+                host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                    Some(&root.join("host-bin/ssh")),
+                    None,
+                    None,
+                )
+                .unwrap(),
             },
             env,
         };
@@ -898,15 +904,18 @@ mod tests {
         let ssh = root.join("host-bin/ssh");
         fs::write(
             &ssh,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
 set -eu
-test "$PATH" = "$COOP_CREATION_FIXTURE/host-bin"
-test "${LD_LIBRARY_PATH-unset}" = unset
-test "${SECRET-unset}" = unset
-printf host > "$COOP_CREATION_FIXTURE/host-launched"
+test "${{LD_LIBRARY_PATH-unset}}" = unset
+test "${{SECRET-unset}}" = unset
+test "${{COOP_CREATION_FIXTURE-unset}}" = unset
+printf host > {0}/host-launched
 for arg do remote=$arg; done
 SHELL=/bin/bash /bin/sh -c "$remote"
 "#,
+                crate::shell::shell_escape(&root.to_string_lossy())
+            ),
         )
         .unwrap();
         fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
@@ -919,14 +928,18 @@ SHELL=/bin/bash /bin/sh -c "$remote"
         fs::set_permissions(injected, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
             root.join("hook.sh"),
-            r#"#!/bin/bash
+            format!(
+                r#"#!/bin/bash
 set -euo pipefail
-test "$PATH" = "$COOP_CREATION_FIXTURE/guest-bin:/usr/bin:/bin"
+test "$PATH" = {1}
 test "$LD_LIBRARY_PATH" = /creation-guest-libraries
 test "$SECRET" = creation-guest-only
 test "$COOP_SSH_ENV_0" = creation-alias
-printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
+printf guest > {0}/guest-restored
 "#,
+                crate::shell::shell_escape(&root.to_string_lossy()),
+                crate::shell::shell_escape(&format!("{}/guest-bin:/usr/bin:/bin", root.display())),
+            ),
         )
         .unwrap();
     }
@@ -937,7 +950,7 @@ printf guest > "$COOP_CREATION_FIXTURE/guest-restored"
             run_creation_transport_fixture(Path::new(&root));
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::host_tool::trusted_test_tempdir();
         prepare_creation_transport_fixture(root.path());
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
