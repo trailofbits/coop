@@ -526,6 +526,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn staging_removes_inherited_read_acls() {
+        // BSD ACL flags must work even when GNU coreutils is first on PATH.
         use std::process::Command;
         const MARKER: &str = "COOP_TEST_STAGING_ACL";
         if std::env::var_os(MARKER).is_some() {
@@ -537,7 +538,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-            let listing = Command::new("ls")
+            let listing = Command::new("/bin/ls")
                 .arg("-lde")
                 .arg(staged.directory.path())
                 .output()
@@ -552,7 +553,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .arg("+a")
                 .arg("everyone allow read,search,file_inherit,directory_inherit")
                 .arg(root.path())

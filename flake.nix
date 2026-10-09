@@ -67,6 +67,7 @@
               pkgs.gitMinimal
               pkgs.gnused
               pkgs.openssh
+              pkgs.rsync
             ];
             # Guest simulations need store tools and a usable login shell.
             # Use Bash's readonly BASHOPTS for the rejected-assignment fixture;
@@ -88,7 +89,14 @@
               substituteInPlace src/commands/lifecycle.rs \
                 --replace-fail '"/usr/bin/printenv PATH"' '"${pkgs.coreutils}/bin/printenv PATH"' \
                 --replace-fail '.envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))' \
-                  '.env("SHELL", "${pkgs.bash}/bin/bash").envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))'
+                  '.env("SHELL", "${pkgs.bash}/bin/bash").envs(ssh.get_envs().map(|(name, value)| (name, value.unwrap())))' \
+                --replace-fail '#!/bin/bash' '#!${pkgs.bash}/bin/bash' \
+                --replace-fail 'exec /bin/cat --' 'exec ${pkgs.coreutils}/bin/cat --'
+              substituteInPlace src/creation_hooks.rs \
+                --replace-fail 'SHELL=/bin/bash /bin/sh -c' \
+                  'SHELL=${pkgs.bash}/bin/bash ${pkgs.bash}/bin/bash -c' \
+                --replace-fail 'r#"#!/bin/bash' 'r#"#!${pkgs.bash}/bin/bash' \
+                --replace-fail '/guest-bin:/usr/bin:/bin' '/guest-bin:${pkgs.bash}/bin:/usr/bin:/bin'
               substituteInPlace src/ssh.rs \
                 --replace-fail '/usr/bin/sed' '${pkgs.gnused}/bin/sed' \
                 --replace-fail 'SHELL=/bin/bash /bin/sh -c' \
@@ -96,6 +104,11 @@
               # The Linux sandbox has no /bin/mkdir for the limactl shim.
               substituteInPlace src/lima.rs \
                 --replace-fail '/bin/mkdir' '${pkgs.coreutils}/bin/mkdir'
+              # Shutdown fixtures clear PATH to test a missing SSH client.
+              substituteInPlace src/vm.rs \
+                --replace-fail '/bin/sleep' '${pkgs.coreutils}/bin/sleep' \
+                --replace-fail '/bin/cat' '${pkgs.coreutils}/bin/cat' \
+                --replace-fail '/bin/rm' '${pkgs.coreutils}/bin/rm'
             '';
             # CMake builds aws-lc-sys through Cargo, not the top-level project.
             dontUseCmakeConfigure = true;
@@ -119,6 +132,9 @@
                 # multicall coreutils. Its probes also require privileged sudo,
                 # which is unavailable in the Nix build sandbox.
                 "--skip=config::tests::is_running_true_for_live_firecracker_like_pid"
+                "--skip=config::tests::probe_liveness_recognizes_running_firecracker"
+                # This CLI test also invokes the privileged socket probe via sudo.
+                "--skip=stop_retains_proxy_for_full_socket_queue_and_cleans_after_close"
 
                 # Nix's Linux syscall filter rejects setxattr with ENOTSUP, so
                 # the ACL fixtures fail even on ACL-capable filesystems.

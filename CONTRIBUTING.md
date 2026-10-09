@@ -181,6 +181,10 @@ CI must pass before a pull request can merge. The
 - **`cargo fmt -- --check`** — formatting.
 - **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — lints.
 - **`cargo test --workspace`** — tests for both crates.
+- **`nix build .#coop`** — sandboxed package builds, workspace unit tests, and
+  installation checks on Linux x86_64 (`ubuntu-24.04`) and Apple Silicon macOS
+  (`macos-15`), using the committed `flake.lock` and the package's
+  platform-specific test exclusions in `flake.nix`.
 - **`./tests/integration-install.sh`**, **`./tests/integration-update.sh`**,
   and **`./tests/integration-uninstall.sh`** — installer provenance, update,
   and uninstall flows.
