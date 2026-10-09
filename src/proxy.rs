@@ -625,6 +625,15 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn forward_master_pid(fixture: &Path) -> i32 {
+        fs::read_to_string(fixture.join("master.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn ports_are_per_instance_and_per_provider() {
         assert_eq!(Provider::Anthropic.port(&inst_with_index(0)), 8788);
@@ -832,13 +841,6 @@ mod tests {
             )
             .unwrap(),
         };
-        let master_pid = || -> i32 {
-            fs::read_to_string(fixture.join("master.pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap()
-        };
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let port = destination.local_addr().unwrap().port();
@@ -853,7 +855,7 @@ mod tests {
                 .is_err(),
             "ambient SSH configuration added an unexpected remote forward"
         );
-        let pid = master_pid();
+        let pid = forward_master_pid(&fixture);
         assert_eq!(
             fs::read_to_string(fwd_pid_path(&inst, "test")).unwrap(),
             pid.to_string()
@@ -908,7 +910,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let result = spawn_reverse_forward(&inst, "test", &target, port);
-        let rejected_pid = master_pid();
+        let rejected_pid = forward_master_pid(&fixture);
         assert!(
             result.is_err(),
             "authenticated reverse bind refusal must fail startup"
