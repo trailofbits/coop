@@ -1549,7 +1549,7 @@ impl VmBackend for FirecrackerBackend {
             // guest filesystem or unlink its still-mounted backing file.
             crate::privileged_disk::ensure_disk_unmounted(&inst.rootfs_path())?;
             Cmd::new("rm")
-                .args(["-rf"])
+                .args(["-rf", "--"])
                 .arg(&inst.dir)
                 .sudo()
                 .run()
@@ -1562,7 +1562,11 @@ impl VmBackend for FirecrackerBackend {
     fn destroy_shared(&self, cfg: &CoopConfig) {
         let images_dir = cfg.images_dir();
         if images_dir.exists()
-            && let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&images_dir).sudo().run()
+            && let Err(e) = Cmd::new("rm")
+                .args(["-rf", "--"])
+                .arg(&images_dir)
+                .sudo()
+                .run()
         {
             tracing::debug!("Failed to remove images dir (non-fatal): {e}");
         }
@@ -1575,7 +1579,7 @@ impl VmBackend for FirecrackerBackend {
             cfg.data_dir.join("jailer"),
         ] {
             if path.exists()
-                && let Err(e) = Cmd::new("rm").arg("-f").arg(&path).sudo().run()
+                && let Err(e) = Cmd::new("rm").arg("-f").arg("--").arg(&path).sudo().run()
             {
                 tracing::debug!("Failed to remove {} (non-fatal): {e}", path.display());
             }
@@ -1588,7 +1592,7 @@ impl VmBackend for FirecrackerBackend {
             bail!("Image '{image}' does not exist");
         }
         Cmd::new("rm")
-            .args(["-rf"])
+            .args(["-rf", "--"])
             .arg(&dir)
             .sudo()
             .run()
