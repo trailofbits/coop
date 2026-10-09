@@ -363,6 +363,34 @@ config changes or a selected path disappears, cleanup for that tool category
 cannot run until the configuration is corrected. The table is parsed but has
 no effect on the Lima backend.
 
+## `ssh` section
+
+Coop-owned guest transports use fixed absolute system candidates for `ssh`,
+`scp`, and `rsync`. They do not inherit user or system SSH configuration, host
+shell environment, or the caller's working directory. This applies only to
+processes launched by coop; the generated `ssh coop-<name>` operator alias uses
+the operator's normal SSH client configuration.
+
+Non-FHS and alternate installations can select exact executables:
+
+```toml
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+```
+
+Each field is optional. A configured field replaces the built-in candidates
+and never falls back. Every path component and the executable must be owned by
+root or the invoking user and must not be group/other writable; the target must
+be a regular executable. These checks authorize a filesystem identity only,
+not package provenance or implementation semantics.
+
+Rsync passes its SSH executable and options through rsync's `-e` command
+grammar. Coop rejects an exact SSH path or key path containing bytes that
+cannot be represented there unambiguously; choose stable paths without spaces
+or shell metacharacters for rsync-backed workspaces.
+
 ## Guest user
 
 The guest VM runs as an unprivileged account, `ubuntu` (uid 1000) by default. Override the username at setup time with `coop setup --guest-user <name>`:

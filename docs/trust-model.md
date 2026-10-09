@@ -270,11 +270,26 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 ## SSH boundary
 
+- Every coop-owned `ssh`, `scp`, and rsync-with-SSH launch resolves a validated
+  absolute executable from fixed system candidates or an exact
+  `[ssh.host_tools]` setting. The child environment is cleared and rebuilt with
+  `LANG=C` and `LC_ALL=C`, plus only generated `COOP_SSH_ENV_*` aliases or the
+  normalized interactive `TERM` value required by that invocation. Managed
+  clients run from `/` and pass `-F none`, so neither user nor system SSH
+  configuration contributes proxy commands, local commands, environment
+  forwarding, identities, agents, canonicalization, or forwards. Forwarding
+  is disabled unless the call site constructs a specific coop port or proxy
+  forward. The `ssh coop-<name>` alias written for an operator is not a
+  coop-owned process and remains subject to the operator's SSH configuration.
+- An exact host-tool setting authorizes only the validated filesystem identity:
+  coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
+  semantics. Resolution is pathname-based and does not pin an executable
+  descriptor or its dynamic-loader closure.
 - coop connects to the guest with `StrictHostKeyChecking=no`,
   `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
   `ForwardAgent=no`, and `IdentityAgent=none`
-  (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
-  rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
+  (`openssh.rs:authority_options` — the one list `ssh`, `scp`, and rsync's
+  `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
   falling back to a password prompt; the `~/.ssh/config` block written for the
   user's own `ssh coop-<name>` deliberately does not. This is

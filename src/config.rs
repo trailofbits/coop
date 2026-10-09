@@ -746,6 +746,69 @@ pub struct NetworkHostToolsConfig {
     pub sysctl: Option<AbsoluteHostToolPath>,
 }
 
+/// Optional exact paths for coop-managed OpenSSH transport tools.
+///
+/// Unknown fields are rejected so a typo cannot silently select a built-in
+/// executable instead of the operator's intended path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshHostToolsConfig {
+    pub ssh: Option<AbsoluteHostToolPath>,
+    pub scp: Option<AbsoluteHostToolPath>,
+    pub rsync: Option<AbsoluteHostToolPath>,
+}
+
+impl SshHostToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.ssh.is_none() && self.scp.is_none() && self.rsync.is_none()
+    }
+
+    pub(crate) fn configured(&self) -> impl Iterator<Item = (&'static str, &AbsoluteHostToolPath)> {
+        [
+            ("ssh", self.ssh.as_ref()),
+            ("scp", self.scp.as_ref()),
+            ("rsync", self.rsync.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_exact_paths(
+        ssh: Option<&Path>,
+        scp: Option<&Path>,
+        rsync: Option<&Path>,
+    ) -> std::result::Result<Self, String> {
+        let parse = |path: Option<&Path>| {
+            path.map(|path| {
+                path.to_str()
+                    .ok_or_else(|| "test host-tool path is not UTF-8".to_string())
+                    .and_then(AbsoluteHostToolPath::new)
+            })
+            .transpose()
+        };
+        Ok(Self {
+            ssh: parse(ssh)?,
+            scp: parse(scp)?,
+            rsync: parse(rsync)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshConfig {
+    /// Exact host-tool paths selected only by trusted host configuration.
+    #[serde(default, skip_serializing_if = "SshHostToolsConfig::is_empty")]
+    pub host_tools: SshHostToolsConfig,
+}
+
+impl SshConfig {
+    fn is_empty(&self) -> bool {
+        self.host_tools.is_empty()
+    }
+}
+
 impl NetworkHostToolsConfig {
     fn is_empty(&self) -> bool {
         self.sudo.is_none()
@@ -783,6 +846,10 @@ pub struct CoopConfig {
     pub vm: VmConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Coop-managed OpenSSH client configuration.
+    #[serde(default, skip_serializing_if = "SshConfig::is_empty")]
+    pub ssh: SshConfig,
 
     /// SSH port on the guest
     #[serde(default = "default_ssh_port")]
@@ -2221,6 +2288,18 @@ impl CoopConfig {
             }
         }
 
+        let ssh_policy = crate::openssh::configured_tool_policy();
+        for (name, path) in self.ssh.host_tools.configured() {
+            if let Err(error) =
+                crate::host_tool::resolve_exact_host_tool(name, path.as_path(), &ssh_policy)
+            {
+                errors.push(format!(
+                    "ssh.host_tools.{name} '{}': {error}",
+                    path.as_path().display()
+                ));
+            }
+        }
+
         if let ConfigDir::Custom(ref path) = self.claude.config_dir
             && !path.is_dir()
         {
@@ -2570,6 +2649,7 @@ impl Default for CoopConfig {
             data_dir: default_data_dir(),
             vm: VmConfig::default(),
             network: NetworkConfig::default(),
+            ssh: SshConfig::default(),
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
             github: None,
@@ -5067,6 +5147,37 @@ sysctl = "/run/current-system/sw/bin/sysctl"
             parsed.network.host_tools.iptables.unwrap().as_path(),
             Path::new("/run/current-system/sw/bin/iptables")
         );
+    }
+
+    #[test]
+    fn ssh_host_tool_paths_parse_all_identities_and_roundtrip() {
+        let source = r#"
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+"#;
+        let cfg: CoopConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            cfg.ssh.host_tools.ssh.as_ref().unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/ssh")
+        );
+        let parsed: CoopConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.ssh.host_tools.scp.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/scp")
+        );
+        assert_eq!(
+            parsed.ssh.host_tools.rsync.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/rsync")
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_table_rejects_unknown_fields() {
+        let error = toml::from_str::<CoopConfig>("[ssh.host_tools]\nssh_typo = \"/usr/bin/ssh\"\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     #[test]

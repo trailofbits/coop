@@ -269,9 +269,10 @@ loopback port and requires startup to return an error without publishing a PID
 or leaving the SSH master alive. Separate host and guest network namespaces
 allow the destination and reverse listener to use the same port.
 
-The runner requires Rust/Cargo, Python 3, passwordless sudo, iproute2,
+The runner requires Python 3, passwordless sudo, iproute2,
 util-linux, coreutils, hostname, and OpenSSH client/server tools. It builds
-unprivileged, then confines the fixture to disposable mount, network, UTS, and
+the test binary with Cargo unless `COOP_TEST_PREBUILT_BINARY` names one, then
+confines the fixture to disposable mount, network, UTS, and
 PID namespaces. No user SSH configuration or keys are used. Namespace teardown
 removes all children and temporary files on success, failure, or timeout.
 Linux CI and release preflight run this gate explicitly; ordinary unit tests
@@ -281,8 +282,9 @@ not replace the Firecracker and Lima VM integration gates.
 The same fixture exercises guest environment forwarding through real OpenSSH:
 literal values, empty values, transport-name collisions, PTYs, stdin, exit
 status, missing forwarding, and redacted assignment failures. Its sshd accepts
-only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
-bypassing the transport. The ordinary unit suite separately checks host
+`COOP_SSH_ENV_*` plus a dedicated unrelated canary used to prove that hostile
+`SendEnv`, `SetEnv`, and forwarding policy remains inactive. Original guest
+names therefore cannot satisfy the test by bypassing alias restoration. The ordinary unit suite separately checks host
 environment isolation on all four SSH launch paths and saved CLI guest environment values through a later session.
 
 The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'

@@ -796,7 +796,8 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
         host: Hostname::new("127.0.0.1")?,
         port,
         user: SshUser::new(guest_user.as_str())?,
-        key_path: cfg.ssh_key_path(),
+        key_path: std::path::absolute(cfg.ssh_key_path())?,
+        host_tools: cfg.ssh.host_tools.clone(),
     })
 }
 
@@ -1190,7 +1191,8 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         host: Hostname::new("127.0.0.1")?,
         port,
         user: SshUser::new(guest_user.as_str())?,
-        key_path: cfg.ssh_key_path(),
+        key_path: std::path::absolute(cfg.ssh_key_path())?,
+        host_tools: cfg.ssh.host_tools.clone(),
     })
 }
 
@@ -1920,7 +1922,8 @@ fn wait_for_lima_ssh(
         host: Hostname::new("127.0.0.1")?,
         port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
         user: SshUser::new(guest_user.as_str())?,
-        key_path: cfg.ssh_key_path(),
+        key_path: std::path::absolute(cfg.ssh_key_path())?,
+        host_tools: cfg.ssh.host_tools.clone(),
     };
     let mut delay = Duration::from_millis(500);
 
@@ -1934,7 +1937,7 @@ fn wait_for_lima_ssh(
             }
             return Ok(());
         }
-        if target.exec_ok(RemoteCommand::new().literal("true")) {
+        if target.exec_ok(RemoteCommand::new().literal("true"))? {
             tracing::info!("SSH ready on port {port}");
             return Ok(());
         }
