@@ -1382,6 +1382,7 @@ fn build_template(
     if let Err(e) = SetupTool::Rm
         .elevated()?
         .arg("-rf")
+        .arg("--")
         .arg(&unpack_dir)
         .run_bounded(SETUP_TOOL_DEADLINE)
     {
@@ -2443,6 +2444,7 @@ fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str) -> Result<()> 
             if let Err(e) = SetupTool::Rm
                 .elevated()?
                 .arg("-rf")
+                .arg("--")
                 .arg(&unpack_dir)
                 .run_bounded(SETUP_TOOL_DEADLINE)
             {
