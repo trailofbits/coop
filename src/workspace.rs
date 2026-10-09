@@ -920,6 +920,7 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
 
     let output = target
         .ssh_command()?
+        .arg("--")
         .arg(target.addr())
         .arg(check_cmd.into_string())
         .output()
