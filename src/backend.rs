@@ -658,7 +658,7 @@ impl SshTarget {
             "ControlPath={}",
             crate::openssh::config_path(socket, "SSH control socket path")?
         );
-        ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()]);
+        ssh.args(["-O", "exit", "-o", &control_arg, "--", &self.addr()]);
         Ok(ssh)
     }
 
@@ -687,6 +687,7 @@ impl SshTarget {
         let cmd = command.into_string();
         let status = self
             .ssh_command()?
+            .arg("--")
             .arg(self.addr())
             .arg(&cmd)
             .status()
@@ -709,6 +710,7 @@ impl SshTarget {
         let cmd = command.into_string();
         let mut child = self
             .ssh_command()?
+            .arg("--")
             .arg(self.addr())
             .arg(&cmd)
             .stdin(Stdio::piped())
@@ -739,6 +741,7 @@ impl SshTarget {
         let command = command.into_string();
         let status = self
             .ssh_command()?
+            .arg("--")
             .arg(self.addr())
             .arg(command)
             .stdout(std::process::Stdio::null())
@@ -754,6 +757,7 @@ impl SshTarget {
 
         let status = self
             .ssh_mux_command()?
+            .arg("--")
             .arg(self.addr())
             .arg(command)
             .stdout(std::process::Stdio::null())
@@ -802,7 +806,8 @@ impl SshTarget {
     /// SCP a local file to the guest.
     pub fn scp_to(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
         let status = crate::openssh::scp_command(self)?
-            .arg(local.as_path())
+            .arg("--")
+            .arg(std::path::absolute(local.as_path()).context("Failed to resolve local SCP path")?)
             .arg(format!("{}:{remote}", self.addr()))
             .status()
             .context("Failed to run scp")?;
@@ -817,7 +822,8 @@ impl SshTarget {
     pub fn scp_to_recursive(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
         let status = crate::openssh::scp_command(self)?
             .arg("-r")
-            .arg(local.as_path())
+            .arg("--")
+            .arg(std::path::absolute(local.as_path()).context("Failed to resolve local SCP path")?)
             .arg(format!("{}:{remote}", self.addr()))
             .status()
             .context("Failed to run scp")?;
@@ -841,6 +847,7 @@ impl SshTarget {
     pub fn capture(&self, cmd: &str) -> Result<String> {
         let output = self
             .ssh_command()?
+            .arg("--")
             .arg(self.addr())
             .arg(cmd)
             .stderr(std::process::Stdio::null())
@@ -888,7 +895,10 @@ impl SshSession {
     pub fn command(&self, options: &[String], remote: &str) -> Result<Command> {
         let mut ssh = self.target.ssh_command()?;
         let remote = self.env.wrap_command(&mut ssh, remote)?;
-        ssh.args(options).arg(self.target.addr()).arg(remote);
+        ssh.args(options)
+            .arg("--")
+            .arg(self.target.addr())
+            .arg(remote);
         Ok(ssh)
     }
 
@@ -5311,12 +5321,13 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let teardown = command_args(&target.mux_teardown_command(socket).unwrap());
         assert!(teardown.windows(2).any(|args| args == ["-p", "22"]));
         assert_eq!(
-            &teardown[teardown.len() - 5..],
+            &teardown[teardown.len() - 6..],
             [
                 "-O",
                 "exit",
                 "-o",
                 "ControlPath=/tmp/coop-test-control.sock",
+                "--",
                 "ubuntu@192.0.2.1",
             ]
         );

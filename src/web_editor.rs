@@ -295,6 +295,7 @@ fn check_project(target: &SshTarget, project: &GuestPath) -> Result<()> {
     let remote = RemoteCommand::new().literal("test -d ").arg(project);
     let mut probe = target.ssh_command()?;
     probe
+        .arg("--")
         .arg(target.addr())
         .arg(remote.into_string())
         .stdout(Stdio::null())
@@ -506,6 +507,7 @@ fn ssh_launch(
     command
         .args(["-T", "-o", "ExitOnForwardFailure=yes", "-L"])
         .arg(format!("127.0.0.1:{port}:{guest_socket}"))
+        .arg("--")
         .arg(target.addr())
         .arg(remote);
     Ok(command)
