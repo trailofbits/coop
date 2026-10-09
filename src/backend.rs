@@ -4774,7 +4774,7 @@ fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
         .literal(
             "sudo mkdir -p /workspace && \
              sudo chown $(whoami):$(whoami) /workspace && \
-             git clone ",
+             git clone --end-of-options ",
         )
         .arg(repo_url)
         .literal(
@@ -4809,7 +4809,7 @@ fn build_clone_with_token_script(repo_url: &str) -> RemoteCommand {
              export GH_TOKEN\n\
              sudo mkdir -p /workspace\n\
              sudo chown \"$(whoami):$(whoami)\" /workspace\n\
-             git -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f' clone ",
+             git -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f' clone --end-of-options ",
         )
         .arg(repo_url)
         .literal(
@@ -7839,7 +7839,9 @@ url = "https://example.com/m"
             "credential helper malformed: {script}"
         );
         assert!(
-            script.contains(" clone 'https://github.com/owner/repo.git' /workspace\n"),
+            script.contains(
+                " clone --end-of-options 'https://github.com/owner/repo.git' /workspace\n"
+            ),
             "missing escaped clone target: {script}"
         );
     }
