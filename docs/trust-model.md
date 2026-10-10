@@ -446,9 +446,16 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 Self-update (`update.rs`) must preserve, in order:
 
-1. Metadata from the pinned `trailofbits/coop` GitHub repo (compile-time const).
-2. `normalize_tag` — the version tag is validated as semver **before** it enters
-   the API URL path (path-traversal guard).
+1. Metadata from the fixed
+   `https://api.github.com/repos/trailofbits/coop/releases` identity. Official
+   builds reject the retired runtime origin override before network I/O; the
+   background check applies the same policy.
+2. The requested or returned tag must be canonical `v`-prefixed semver. Before
+   an asset download, metadata entries for the platform archive, `SHA256SUMS`,
+   and optional `attestations.jsonl` are independently bound to the exact
+   `https://github.com/trailofbits/coop/releases/download/<tag>/<filename>`
+   identity. Userinfo, ports, queries, fragments, encoded separators, path
+   ambiguity, lookalike names, and conflicting duplicates are rejected.
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
@@ -464,7 +471,7 @@ Self-update (`update.rs`) must preserve, in order:
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
    The bundle asset is fetched with a deliberately unauthenticated request
-   (`curl_download(url, dest, None)` in `update.rs`, `download_bundle` in
+   (`curl_download(asset, dest, None)` in `update.rs`, `download_bundle` in
    `install.sh`) rather than through `download_asset` / `gh release download`,
    which would re-attach the very credential this transport exists to avoid — a
    SAML-restricted token would then 403 on the fetch and drop the chain back to
@@ -509,19 +516,19 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode), unless
-   the updater integration suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1`
-   to exercise verification against a local fixture. So
+   in the separately compiled test-source build unless the updater integration
+   suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1` to exercise verification
+   against its loopback fixture. Official builds cannot construct that source. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin and normally disables
-attestation; the checksum then only proves integrity against *that* server's own
-`SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
-attestation provide provenance. Flag any change that widens where that override
-is honored, or that softens any step above.
+Production curl transfers restrict both initial and redirected protocols to
+HTTPS and retain curl's default refusal to forward authorization headers across
+hosts. `install.sh` remains a separate update path with its own policy. Flag any
+change that makes a production update source runtime-selectable or softens any
+step above.
 
 ## Documented, accepted trade-offs
 

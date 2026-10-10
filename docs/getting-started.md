@@ -31,7 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | 
 `SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
 also verifies its Sigstore build-provenance attestation. `coop update` runs the
 same verification, except that it treats the checksum as mandatory and refuses
-to install without it. To verify a tarball by hand, download
+to install without it. Official `coop update` builds also fix metadata lookup to
+the `trailofbits/coop` GitHub repository and validate the expected release tag
+and exact asset identities before downloading them. To verify a tarball by hand, download
 `attestations.jsonl` from the same release and pass `--bundle` (this needs no
 GitHub credential — releases up to v0.5.4 predate the bundle asset and do
 not publish it):
