@@ -213,15 +213,18 @@ trusted; existing healthy instances remain available through normal lookup.
 ## `coop update`
 
 `update.rs` self-updates the CLI and its proxy companion: fetch release metadata
-from the pinned `trailofbits/coop` repo, download the platform tarball + `SHA256SUMS` +
-`attestations.jsonl`, verify the checksum (mandatory), verify the Sigstore
+from the fixed `https://api.github.com/repos/trailofbits/coop/releases` source,
+validate the canonical release tag and exact GitHub identity of the platform
+tarball, `SHA256SUMS`, and optional `attestations.jsonl` before download, verify the checksum (mandatory), verify the Sigstore
 attestation via `gh` against that bundle, falling back to the attestations API
 when the release publishes no usable one (best-effort). Both paths pin the
 signer to `.github/workflows/release.yml` at the selected tag, require that
 source ref, and reject attestations generated on self-hosted runners. Then
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
 `coop-proxy` beside the CLI before replacing `coop`. Each replacement is
-atomic; the pair is not a single transaction. A background notifier checks for
+atomic; the pair is not a single transaction. Official builds cannot replace
+the metadata origin at runtime. A separately compiled test policy permits only
+a loopback fixture for the host-only updater integration test. A background notifier checks for
 new versions on a 24-hour interval (disabled in dev/CI/non-TTY). The full verification chain and
 its trust properties are documented in [`trust-model.md`](trust-model.md#coop-update-trust-chain).
 

@@ -18,17 +18,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::cmd::{Cmd, command_exists};
 use crate::fs_util::atomic_write_json;
 use crate::prompt::confirm;
 use crate::sha256_hash::Sha256Hash;
+#[cfg(test)]
+use crate::update_policy::{Asset, asset_name, normalize_tag, validate_asset_identity};
+use crate::update_policy::{
+    BUNDLE_ASSET, LEGACY_API_OVERRIDE, REPO, Release, ReleaseTag, TEST_API_BASE_URL,
+    TEST_VERIFY_ATTESTATION, UpdateSource, ValidatedAsset, ValidatedRelease, strip_v,
+    validate_release_assets, validate_release_tag,
+};
 
-const REPO: &str = "trailofbits/coop";
 const SIGNER_WORKFLOW: &str = ".github/workflows/release.yml";
-const DEFAULT_API_BASE: &str = "https://api.github.com";
-/// Release asset holding the Sigstore provenance bundle, published since #421.
-const BUNDLE_ASSET: &str = "attestations.jsonl";
 const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -108,87 +112,20 @@ pub fn target_triple() -> Result<&'static str> {
     }
 }
 
-#[must_use]
-pub fn asset_name(tag: &str, triple: &str) -> String {
-    format!("coop-{tag}-{triple}.tar.gz")
+fn self_update_source() -> Result<UpdateSource> {
+    UpdateSource::for_current_build(
+        env::var_os(LEGACY_API_OVERRIDE).is_some(),
+        env::var(TEST_API_BASE_URL).ok().as_deref(),
+        env::var(TEST_VERIFY_ATTESTATION).as_deref() == Ok("1"),
+    )
 }
 
-fn api_base() -> String {
-    env::var("COOP_UPDATE_API_BASE_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string())
-}
-
-fn api_base_overridden() -> bool {
-    env::var("COOP_UPDATE_API_BASE_URL").is_ok()
-}
-
-fn skip_attestation_for_fixture() -> bool {
-    api_base_overridden() && env::var("COOP_UPDATE_TEST_VERIFY_ATTESTATION").as_deref() != Ok("1")
-}
-
-fn warn_if_api_base_overridden() {
-    if skip_attestation_for_fixture() {
-        tracing::warn!(
-            "COOP_UPDATE_API_BASE_URL is set — attestation verification is DISABLED. \
-             This is a test-only mode; do not use with untrusted URLs."
-        );
-    } else if api_base_overridden() {
-        tracing::warn!(
-            "COOP_UPDATE_API_BASE_URL is set — verifying a test-only release source. \
-             Do not use with untrusted URLs."
-        );
-    }
-}
-
-/// Normalize a user-supplied version to a `v`-prefixed semver tag.
-///
-/// Rejects any input that does not parse as semver once the optional `v`
-/// prefix is stripped. This is the security boundary for `coop update
-/// --version <tag>`: the tag string is interpolated into the GitHub API
-/// URL path, so admitting only semver-like values prevents path traversal
-/// (e.g. `../other-user/repo/releases/latest`).
-fn normalize_tag(input: &str) -> Result<String> {
-    let trimmed = input.trim();
-    let body = trimmed.strip_prefix('v').unwrap_or(trimmed);
-    Version::parse(body)
-        .with_context(|| format!("--version {trimmed:?} is not a valid semver tag"))?;
-    Ok(format!("v{body}"))
-}
-
-fn strip_v(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
-}
-
-// ── GitHub release metadata ──────────────────────────────────────────────────
-
-/// Minimal subset of the GitHub release JSON schema.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Release {
-    #[serde(rename = "tag_name")]
-    pub tag: String,
-    #[serde(default)]
-    pub assets: Vec<Asset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Asset {
-    pub name: String,
-    #[serde(rename = "browser_download_url")]
-    pub url: String,
-}
-
-impl Release {
-    fn find_asset(&self, name: &str) -> Option<&Asset> {
-        self.assets.iter().find(|a| a.name == name)
-    }
-}
-
-pub fn fetch_latest() -> Result<Release> {
-    fetch_release_metadata(REPO, "latest").context("Failed to fetch latest release metadata")
-}
-
-pub fn fetch_by_tag(tag: &str) -> Result<Release> {
-    fetch_release_metadata(REPO, &format!("tags/{tag}"))
-        .with_context(|| format!("Failed to fetch release metadata for {tag}"))
+fn fetch_self_release(source: &UpdateSource, requested: Option<&ReleaseTag>) -> Result<Release> {
+    let suffix = requested.map_or_else(|| "latest".to_string(), |tag| format!("tags/{tag}"));
+    fetch_release_metadata(source, REPO, &suffix).with_context(|| match requested {
+        Some(tag) => format!("Failed to fetch release metadata for {tag}"),
+        None => "Failed to fetch latest release metadata".to_string(),
+    })
 }
 
 /// Fetch the `tag_name` of another repository's latest release.
@@ -198,9 +135,11 @@ pub fn fetch_by_tag(tag: &str) -> Result<Release> {
 /// slug (e.g. `openai/codex`) — never user input — so it carries none of
 /// the path-traversal risk `coop update --version` guards against.
 pub(crate) fn latest_release_tag(repo: &str) -> Result<String> {
-    Ok(fetch_release_metadata(repo, "latest")
-        .with_context(|| format!("Failed to fetch latest release metadata for {repo}"))?
-        .tag)
+    Ok(
+        fetch_release_metadata(&UpdateSource::official(), repo, "latest")
+            .with_context(|| format!("Failed to fetch latest release metadata for {repo}"))?
+            .tag,
+    )
 }
 
 /// Fetch release JSON for `repo` (an `owner/name` slug) and the given API
@@ -208,16 +147,16 @@ pub(crate) fn latest_release_tag(repo: &str) -> Result<String> {
 ///
 /// Selects an auth strategy at call time so changes to `GITHUB_TOKEN` /
 /// `gh auth` between invocations take effect.
-fn fetch_release_metadata(repo: &str, path_suffix: &str) -> Result<Release> {
-    let body = match select_auth_strategy_from_env() {
+fn fetch_release_metadata(source: &UpdateSource, repo: &str, path_suffix: &str) -> Result<Release> {
+    let body = match select_auth_strategy_from_env(source) {
         AuthStrategy::Gh => gh_api_capture(&format!("repos/{repo}/releases/{path_suffix}"))?,
         AuthStrategy::CurlBearer(token) => {
-            let url = format!("{}/repos/{repo}/releases/{path_suffix}", api_base());
-            curl_capture(&url, Some(&token))?
+            let url = source.metadata_url(repo, path_suffix)?;
+            curl_capture(source, &url, Some(&token))?
         }
         AuthStrategy::CurlBare => {
-            let url = format!("{}/repos/{repo}/releases/{path_suffix}", api_base());
-            curl_capture(&url, None)?
+            let url = source.metadata_url(repo, path_suffix)?;
+            curl_capture(source, &url, None)?
         }
     };
     serde_json::from_str(&body).context("Failed to parse GitHub release JSON")
@@ -238,16 +177,16 @@ enum AuthStrategy {
 
 /// Pure strategy picker. Extracted from I/O so it is unit-testable.
 ///
-/// When `api_base_overridden` is true, the integration test fixture is in use
+/// When `fixture_source` is true, the integration test fixture is in use
 /// and we must not consult `gh` or `GITHUB_TOKEN` — the local server speaks
 /// neither.
 fn select_auth_strategy(
-    api_base_overridden: bool,
+    fixture_source: bool,
     has_gh: bool,
     gh_authed: bool,
     github_token: Option<&str>,
 ) -> AuthStrategy {
-    if api_base_overridden {
+    if fixture_source {
         return AuthStrategy::CurlBare;
     }
     if has_gh && gh_authed {
@@ -259,12 +198,12 @@ fn select_auth_strategy(
     }
 }
 
-fn select_auth_strategy_from_env() -> AuthStrategy {
-    let overridden = api_base_overridden();
-    let has_gh = !overridden && command_exists("gh");
+fn select_auth_strategy_from_env(source: &UpdateSource) -> AuthStrategy {
+    let fixture = source.is_fixture();
+    let has_gh = !fixture && command_exists("gh");
     let gh_authed = has_gh && gh_authenticated();
     let token = env::var("GITHUB_TOKEN").ok();
-    select_auth_strategy(overridden, has_gh, gh_authed, token.as_deref())
+    select_auth_strategy(fixture, has_gh, gh_authed, token.as_deref())
 }
 
 fn gh_authenticated() -> bool {
@@ -278,8 +217,17 @@ fn gh_authenticated() -> bool {
 
 // ── Network I/O (shell-out to curl / gh) ─────────────────────────────────────
 
-fn curl_capture(url: &str, bearer_token: Option<&str>) -> Result<String> {
-    let mut cmd = Cmd::new("curl")
+fn curl_command(source: &UpdateSource) -> Cmd {
+    let (initial, redirects) = source.curl_protocols();
+    Cmd::new("curl")
+        .arg("--proto")
+        .arg(initial)
+        .arg("--proto-redir")
+        .arg(redirects)
+}
+
+fn curl_capture(source: &UpdateSource, url: &Url, bearer_token: Option<&str>) -> Result<String> {
+    let mut cmd = curl_command(source)
         .arg("-fsSL")
         .arg("-H")
         .arg("Accept: application/vnd.github+json");
@@ -291,35 +239,39 @@ fn curl_capture(url: &str, bearer_token: Option<&str>) -> Result<String> {
             .arg("@-")
             .stdin_input(format!("Authorization: token {token}\n"));
     }
-    cmd.arg(url)
+    cmd.arg(url.as_str())
         .capture()
         .with_context(|| format!("curl GET {url} failed"))
 }
 
 fn gh_api_capture(path: &str) -> Result<String> {
-    Cmd::new("gh")
-        .arg("api")
-        .arg(path)
-        .arg("-H")
-        .arg("Accept: application/vnd.github+json")
+    gh_api_command(path)
         .capture()
         .with_context(|| format!("gh api {path} failed"))
 }
 
+fn gh_api_command(path: &str) -> Cmd {
+    Cmd::new("gh")
+        .arg("api")
+        .arg(path)
+        .arg("--hostname")
+        .arg("github.com")
+        .arg("-H")
+        .arg("Accept: application/vnd.github+json")
+}
+
 /// Download a release asset, choosing auth strategy at call time.
 ///
-/// `tag` and `asset_name` are required for the `gh release download` path;
-/// `url` is the `browser_download_url` used by the curl fallbacks.
-fn download_asset(tag: &str, asset_name: &str, url: &str, dest: &Path) -> Result<()> {
-    match select_auth_strategy_from_env() {
-        AuthStrategy::Gh => gh_release_download(tag, asset_name, dest),
-        AuthStrategy::CurlBearer(token) => curl_download(url, dest, Some(&token)),
-        AuthStrategy::CurlBare => curl_download(url, dest, None),
+fn download_asset(asset: &ValidatedAsset, dest: &Path) -> Result<()> {
+    match select_auth_strategy_from_env(asset.source()) {
+        AuthStrategy::Gh => gh_release_download(asset.tag(), asset.name(), dest),
+        AuthStrategy::CurlBearer(token) => curl_download(asset, dest, Some(&token)),
+        AuthStrategy::CurlBare => curl_download(asset, dest, None),
     }
 }
 
-fn curl_download(url: &str, dest: &Path, bearer_token: Option<&str>) -> Result<()> {
-    let mut cmd = Cmd::new("curl").arg("-fsSL");
+fn curl_download(asset: &ValidatedAsset, dest: &Path, bearer_token: Option<&str>) -> Result<()> {
+    let mut cmd = curl_command(asset.source()).arg("-fsSL");
     if let Some(token) = bearer_token {
         // Pass the auth header on stdin via curl's `-H @-` so the secret
         // never touches argv (visible in /proc and `Cmd::describe` logs).
@@ -328,25 +280,15 @@ fn curl_download(url: &str, dest: &Path, bearer_token: Option<&str>) -> Result<(
             .arg("@-")
             .stdin_input(format!("Authorization: token {token}\n"));
     }
-    cmd.arg(url)
+    cmd.arg(asset.url().as_str())
         .arg("-o")
         .arg(dest)
         .run()
-        .with_context(|| format!("curl download from {url} failed"))
+        .with_context(|| format!("curl download of {} failed", asset.name()))
 }
 
-fn gh_release_download(tag: &str, asset_name: &str, dest: &Path) -> Result<()> {
-    Cmd::new("gh")
-        .arg("release")
-        .arg("download")
-        .arg(tag)
-        .arg("--repo")
-        .arg(REPO)
-        .arg("--pattern")
-        .arg(asset_name)
-        .arg("--output")
-        .arg(dest)
-        .arg("--clobber")
+fn gh_release_download(tag: &ReleaseTag, asset_name: &str, dest: &Path) -> Result<()> {
+    gh_release_download_command(tag, asset_name, dest)
         .run()
         .with_context(|| {
             format!(
@@ -354,6 +296,20 @@ fn gh_release_download(tag: &str, asset_name: &str, dest: &Path) -> Result<()> {
                 dest.display()
             )
         })
+}
+
+fn gh_release_download_command(tag: &ReleaseTag, asset_name: &str, dest: &Path) -> Cmd {
+    Cmd::new("gh")
+        .arg("release")
+        .arg("download")
+        .arg(tag.as_str())
+        .arg("--repo")
+        .arg(format!("github.com/{REPO}"))
+        .arg("--pattern")
+        .arg(asset_name)
+        .arg("--output")
+        .arg(dest)
+        .arg("--clobber")
 }
 
 // ── Checksum verification ────────────────────────────────────────────────────
@@ -428,32 +384,25 @@ fn attestation_verify_args(tarball: &Path, tag: &str, bundle: Option<&Path>) -> 
 /// performs the download this describes.
 #[derive(Debug)]
 enum BundleDecision<'a> {
-    /// `COOP_UPDATE_API_BASE_URL` is set without the verification test switch.
-    /// The local fixture serves synthetic
-    /// artifacts that have no provenance in GitHub's attestation API, so
-    /// verification is skipped; `warn_if_api_base_overridden` has already
-    /// surfaced the override on stderr.
+    /// The explicit test source serves synthetic artifacts that have no
+    /// provenance in GitHub's attestation API, so verification is skipped.
     TestMode,
     /// `gh` is absent, so nothing can verify an attestation.
     NoGh,
     /// The release publishes no bundle asset.
     NoAsset,
     /// The release publishes one; download it from this asset.
-    Fetch(&'a Asset),
+    Fetch(&'a ValidatedAsset),
 }
 
-fn bundle_decision(
-    release: &Release,
-    api_overridden: bool,
-    gh_present: bool,
-) -> BundleDecision<'_> {
-    if api_overridden {
+fn bundle_decision(release: &ValidatedRelease, gh_present: bool) -> BundleDecision<'_> {
+    if !release.tarball().source().verifies_attestation() {
         return BundleDecision::TestMode;
     }
     if !gh_present {
         return BundleDecision::NoGh;
     }
-    match release.find_asset(BUNDLE_ASSET) {
+    match release.bundle() {
         Some(asset) => BundleDecision::Fetch(asset),
         None => BundleDecision::NoAsset,
     }
@@ -532,19 +481,15 @@ impl Provenance {
 ///
 /// Never fails the update: every problem with the bundle falls back to the
 /// attestations API or skips verification outright.
-fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
-    let asset = match bundle_decision(
-        release,
-        skip_attestation_for_fixture(),
-        command_exists("gh"),
-    ) {
+fn resolve_provenance(release: &ValidatedRelease, dir: &Path) -> Provenance {
+    let asset = match bundle_decision(release, command_exists("gh")) {
         BundleDecision::TestMode => return Provenance::TestMode,
         BundleDecision::NoGh => return Provenance::NoGh,
         BundleDecision::NoAsset => {
             tracing::info!(
                 "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
                  GitHub API, for which `gh` needs a credential authorized for {REPO}.",
-                release.tag
+                release.tag()
             );
             return Provenance::Api(ApiReason::NoAsset);
         }
@@ -559,12 +504,12 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
     // and drop the chain back to the API path, failing with the original error.
     // The bundle is a public release asset, so a bare curl reaches it and keeps
     // the path credential-free end to end.
-    if let Err(err) = curl_download(&asset.url, &dest, None) {
+    if let Err(err) = curl_download(asset, &dest, None) {
         tracing::warn!(
             "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — verifying the \
              attestation through the GitHub API, for which `gh` needs a credential authorized \
              for {REPO}.",
-            release.tag
+            release.tag()
         );
         return Provenance::Api(ApiReason::DownloadFailed);
     }
@@ -572,7 +517,7 @@ fn resolve_provenance(release: &Release, dir: &Path) -> Provenance {
         tracing::warn!(
             "{BUNDLE_ASSET} for release {} is empty — verifying the attestation through the \
              GitHub API, for which `gh` needs a credential authorized for {REPO}.",
-            release.tag
+            release.tag()
         );
         return Provenance::Api(ApiReason::EmptyBundle);
     }
@@ -696,18 +641,29 @@ pub fn run(opts: &UpdateOpts) -> Result<()> {
         );
     }
 
-    warn_if_api_base_overridden();
+    let source = self_update_source()?;
+    if source.is_fixture() {
+        if source.verifies_attestation() {
+            tracing::warn!("using the explicit test update source with attestation verification");
+        } else {
+            tracing::warn!(
+                "using the explicit test update source — attestation verification is DISABLED"
+            );
+        }
+    }
 
     let triple = target_triple()?;
     let current = Version::parse(current_version())
         .with_context(|| format!("Current version {} is not valid semver", current_version()))?;
 
-    let release = match &opts.pinned_version {
-        Some(v) => fetch_by_tag(&normalize_tag(v)?)?,
-        None => fetch_latest()?,
-    };
-    let target = Version::parse(strip_v(&release.tag))
-        .with_context(|| format!("Release tag {} is not valid semver", release.tag))?;
+    let requested = opts
+        .pinned_version
+        .as_deref()
+        .map(ReleaseTag::from_requested)
+        .transpose()?;
+    let release = fetch_self_release(&source, requested.as_ref())?;
+    let returned_tag = validate_release_tag(&release, requested.as_ref())?;
+    let target = returned_tag.version().clone();
 
     let newer = target > current;
     if opts.check_only {
@@ -724,52 +680,41 @@ pub fn run(opts: &UpdateOpts) -> Result<()> {
         return Ok(());
     }
 
+    // Validate every asset identity together before prompting or crossing the
+    // downloader boundary. A valid archive entry cannot authorize its checksum
+    // or optional attestation neighbor.
+    let validated = validate_release_assets(&source, &release, requested.as_ref(), triple)?;
+
     if !opts.skip_confirm && !confirm(&format!("Update coop from {current} to {target}?"))? {
         tracing::info!("Update cancelled");
         return Ok(());
     }
 
-    perform_update(&release, triple)?;
+    perform_update(&validated, triple)?;
     tracing::info!("coop updated to {target}");
-    persist_state(Some(&release.tag));
+    persist_state(Some(validated.tag().as_str()));
     Ok(())
 }
 
-fn perform_update(release: &Release, triple: &str) -> Result<()> {
+fn perform_update(release: &ValidatedRelease, triple: &str) -> Result<()> {
     let tmp = tempfile::tempdir().context("Failed to create temporary working directory")?;
-    let tarball_name = asset_name(&release.tag, triple);
+    let tarball_name = release.tarball().name();
 
-    let tarball_asset = release.find_asset(&tarball_name).with_context(|| {
-        format!(
-            "Release {} has no asset {tarball_name}; \
-             this platform may not be supported by that release.",
-            release.tag
-        )
-    })?;
-    let sums_asset = release
-        .find_asset("SHA256SUMS")
-        .context("Release has no SHA256SUMS asset; refusing to install unverified binary")?;
-
-    let tarball_path = tmp.path().join(&tarball_name);
+    let tarball_path = tmp.path().join(tarball_name);
     let sums_path = tmp.path().join("SHA256SUMS");
 
     tracing::info!("Downloading {tarball_name}");
-    download_asset(
-        &release.tag,
-        &tarball_name,
-        &tarball_asset.url,
-        &tarball_path,
-    )?;
-    download_asset(&release.tag, "SHA256SUMS", &sums_asset.url, &sums_path)?;
+    download_asset(release.tarball(), &tarball_path)?;
+    download_asset(release.sums(), &sums_path)?;
 
     let sums_content = fs::read_to_string(&sums_path)
         .with_context(|| format!("Failed to read {}", sums_path.display()))?;
-    let expected = parse_sha256sums(&sums_content, &tarball_name)
+    let expected = parse_sha256sums(&sums_content, tarball_name)
         .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
     verify_sha256(&tarball_path, &expected)?;
 
     let provenance = resolve_provenance(release, tmp.path());
-    verify_attestation(&tarball_path, &release.tag, &provenance)?;
+    verify_attestation(&tarball_path, release.tag().as_str(), &provenance)?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
     // `-C <tempdir>` plus modern tar's default refusal of `..`-segmented and absolute
@@ -784,7 +729,7 @@ fn perform_update(release: &Release, triple: &str) -> Result<()> {
         .run()
         .context("Failed to extract release tarball")?;
 
-    let extract_dir = tmp.path().join(format!("coop-{}-{triple}", release.tag));
+    let extract_dir = tmp.path().join(format!("coop-{}-{triple}", release.tag()));
     let extracted = extract_dir.join("coop");
     ensure!(
         extracted.exists(),
@@ -936,9 +881,20 @@ pub fn maybe_run_background_check(cfg: &UpdateConfig) {
         return;
     }
     persist_state(state.latest_known_version.as_deref());
-    std::thread::spawn(|| match fetch_latest() {
-        Ok(release) => persist_state(Some(&release.tag)),
-        Err(e) => tracing::debug!("background update-check failed: {e}"),
+    let source = match self_update_source() {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::debug!("background update source policy rejected the check: {error}");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        match fetch_self_release(&source, None)
+            .and_then(|release| validate_release_tag(&release, None))
+        {
+            Ok(tag) => persist_state(Some(tag.as_str())),
+            Err(e) => tracing::debug!("background update-check failed: {e}"),
+        }
     });
 }
 
@@ -996,6 +952,252 @@ mod tests {
             asset_name("v0.3.1", "x86_64-unknown-linux-musl"),
             "coop-v0.3.1-x86_64-unknown-linux-musl.tar.gz"
         );
+    }
+
+    #[test]
+    fn official_source_is_fixed_and_rejects_the_legacy_override() {
+        let source = UpdateSource::for_test_build_kind("release", false, None, false).unwrap();
+        assert_eq!(source, UpdateSource::official());
+        assert!(!source.is_fixture());
+        assert_eq!(
+            source.metadata_url(REPO, "latest").unwrap().as_str(),
+            "https://api.github.com/repos/trailofbits/coop/releases/latest"
+        );
+        let error = UpdateSource::for_test_build_kind("release", true, None, false).unwrap_err();
+        assert!(error.to_string().contains(LEGACY_API_OVERRIDE));
+    }
+
+    #[test]
+    fn current_build_source_uses_the_compiled_build_kind() {
+        let source =
+            UpdateSource::for_current_build(false, Some("http://127.0.0.1:4321"), false).unwrap();
+        if env!("COOP_BUILD_KIND") == "test" {
+            assert!(source.is_fixture());
+        } else {
+            assert_eq!(source, UpdateSource::official());
+            assert!(UpdateSource::for_current_build(true, None, false).is_err());
+        }
+    }
+
+    #[test]
+    fn test_source_is_explicit_and_loopback_only() {
+        let source =
+            UpdateSource::for_test_build_kind("test", false, Some("http://127.0.0.1:4321"), false)
+                .unwrap();
+        assert!(source.is_fixture());
+        assert_eq!(
+            source.metadata_url(REPO, "latest").unwrap().as_str(),
+            "http://127.0.0.1:4321/repos/trailofbits/coop/releases/latest"
+        );
+        assert!(UpdateSource::for_test_build_kind("test", false, None, false).is_err());
+        assert!(
+            UpdateSource::for_test_build_kind("test", false, Some("https://example.com"), false)
+                .is_err()
+        );
+        // A test-only runtime value cannot change an official build's policy.
+        assert_eq!(
+            UpdateSource::for_test_build_kind(
+                "release",
+                false,
+                Some("http://127.0.0.1:4321"),
+                true,
+            )
+            .unwrap(),
+            UpdateSource::official()
+        );
+    }
+
+    #[test]
+    fn release_tag_validation_accepts_latest_and_matching_pinned_metadata() {
+        let release = Release {
+            tag: "v1.2.3".to_string(),
+            assets: Vec::new(),
+        };
+        let requested = ReleaseTag::from_requested("1.2.3").unwrap();
+        assert_eq!(requested.to_string(), "v1.2.3");
+        assert_eq!(validate_release_tag(&release, None).unwrap(), requested);
+        assert_eq!(
+            validate_release_tag(&release, Some(&requested)).unwrap(),
+            requested
+        );
+    }
+
+    #[test]
+    fn release_tag_validation_rejects_mismatch_and_ambiguous_latest_tags() {
+        let requested = ReleaseTag::from_requested("1.2.3").unwrap();
+        let mismatch = Release {
+            tag: "v1.2.4".to_string(),
+            assets: Vec::new(),
+        };
+        assert!(
+            validate_release_tag(&mismatch, Some(&requested))
+                .unwrap_err()
+                .to_string()
+                .contains("tag mismatch")
+        );
+        for tag in ["1.2.3", "latest", "v1.2.3/../other", " v1.2.3"] {
+            let release = Release {
+                tag: tag.to_string(),
+                assets: Vec::new(),
+            };
+            assert!(
+                validate_release_tag(&release, None).is_err(),
+                "metadata tag {tag:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn official_asset_identity_accepts_only_the_exact_release_url() {
+        let source = UpdateSource::official();
+        let tag = ReleaseTag::from_metadata("v1.2.3").unwrap();
+        let name = asset_name(tag.as_str(), "x86_64-unknown-linux-musl");
+        let expected = source.expected_asset_url(&tag, &name).unwrap().to_string();
+        let valid = Asset {
+            name: name.clone(),
+            url: expected.clone(),
+        };
+        assert_eq!(
+            validate_asset_identity(&source, &tag, &name, &valid)
+                .unwrap()
+                .url()
+                .as_str(),
+            expected
+        );
+
+        let invalid_urls = [
+            expected.replacen("https://", "http://", 1),
+            expected.replacen("github.com", "evil.example", 1),
+            expected.replacen("trailofbits", "trailofbit", 1),
+            expected.replacen("/coop/", "/coop-lookalike/", 1),
+            expected.replacen("v1.2.3", "v1.2.4", 1),
+            expected.replacen(&name, "coop-v1.2.3-lookalike.tar.gz", 1),
+            expected.replacen("github.com", "user@github.com", 1),
+            expected.replacen("github.com", "github.com:443", 1),
+            format!("{expected}?download=1"),
+            format!("{expected}#fragment"),
+            expected.replacen("/releases/", "/releases%2f", 1),
+            expected.replacen("/download/", "/other/../download/", 1),
+            expected.replacen("/download/", "/download\\", 1),
+        ];
+        for url in invalid_urls {
+            let asset = Asset {
+                name: name.clone(),
+                url,
+            };
+            assert!(
+                validate_asset_identity(&source, &tag, &name, &asset).is_err(),
+                "invalid asset URL was accepted: {}",
+                asset.url
+            );
+        }
+
+        let lookalike_name = Asset {
+            name: format!("{name}.sig"),
+            url: expected,
+        };
+        assert!(validate_asset_identity(&source, &tag, &name, &lookalike_name).is_err());
+    }
+
+    #[test]
+    fn expected_assets_are_validated_independently_and_duplicates_fail_closed() {
+        let source = UpdateSource::official();
+        let mut release = raw_test_release(&source, "v9.9.9", true);
+        validate_release_assets(&source, &release, None, "test-triple").unwrap();
+
+        for expected_name in [
+            asset_name("v9.9.9", "test-triple"),
+            "SHA256SUMS".to_string(),
+            BUNDLE_ASSET.to_string(),
+        ] {
+            let mut changed = release.clone();
+            changed
+                .assets
+                .iter_mut()
+                .find(|asset| asset.name == expected_name)
+                .unwrap()
+                .url
+                .push_str("?wrong");
+            assert!(
+                validate_release_assets(&source, &changed, None, "test-triple").is_err(),
+                "invalid {expected_name} identity was accepted"
+            );
+        }
+
+        let exact_duplicate = release.assets[0].clone();
+        release.assets.push(exact_duplicate);
+        validate_release_assets(&source, &release, None, "test-triple").unwrap();
+        let last = release.assets.last_mut().unwrap();
+        last.url.push_str("?conflict");
+        assert!(validate_release_assets(&source, &release, None, "test-triple").is_err());
+    }
+
+    #[test]
+    fn production_curl_and_gh_commands_pin_protocol_origin_repo_tag_and_name() {
+        let curl = curl_command(&UpdateSource::official()).build();
+        let curl_args = curl
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(curl_args, ["--proto", "=https", "--proto-redir", "=https"]);
+        assert!(!curl_args.iter().any(|arg| arg == "--location-trusted"));
+
+        let gh_api = gh_api_command("repos/trailofbits/coop/releases/latest").build();
+        let gh_api_args = gh_api
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gh_api_args,
+            [
+                "api",
+                "repos/trailofbits/coop/releases/latest",
+                "--hostname",
+                "github.com",
+                "-H",
+                "Accept: application/vnd.github+json",
+            ]
+        );
+
+        let tag = ReleaseTag::from_metadata("v1.2.3").unwrap();
+        let gh =
+            gh_release_download_command(&tag, "SHA256SUMS", Path::new("/tmp/SHA256SUMS")).build();
+        let gh_args = gh
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            gh_args,
+            [
+                "release",
+                "download",
+                "v1.2.3",
+                "--repo",
+                "github.com/trailofbits/coop",
+                "--pattern",
+                "SHA256SUMS",
+                "--output",
+                "/tmp/SHA256SUMS",
+                "--clobber",
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_agent_metadata_uses_official_origin_without_asset_authority() {
+        let url = UpdateSource::official()
+            .metadata_url("openai/codex", "latest")
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/openai/codex/releases/latest"
+        );
+        let self_tag = ReleaseTag::from_metadata("v1.2.3").unwrap();
+        let self_asset = UpdateSource::official()
+            .expected_asset_url(&self_tag, "SHA256SUMS")
+            .unwrap();
+        assert!(self_asset.as_str().contains("/trailofbits/coop/"));
+        assert!(!self_asset.as_str().contains("/openai/codex/"));
     }
 
     #[test]
@@ -1164,22 +1366,36 @@ mod tests {
         );
     }
 
-    fn release_with_bundle() -> Release {
-        serde_json::from_str(&format!(
-            r#"{{"tag_name":"v9.9.9","assets":[
-                 {{"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}},
-                 {{"name":"{BUNDLE_ASSET}","browser_download_url":"https://example.com/B"}}
-               ]}}"#
-        ))
-        .unwrap()
+    fn raw_test_release(source: &UpdateSource, tag: &str, include_bundle: bool) -> Release {
+        let tag = ReleaseTag::from_metadata(tag).unwrap();
+        let tarball_name = asset_name(tag.as_str(), "test-triple");
+        let mut names = vec![tarball_name, "SHA256SUMS".to_string()];
+        if include_bundle {
+            names.push(BUNDLE_ASSET.to_string());
+        }
+        let assets = names
+            .into_iter()
+            .map(|name| Asset {
+                url: source.expected_asset_url(&tag, &name).unwrap().to_string(),
+                name,
+            })
+            .collect();
+        Release {
+            tag: tag.as_str().to_string(),
+            assets,
+        }
     }
 
-    /// A release predating the bundle asset.
-    fn release_without_bundle() -> Release {
-        serde_json::from_str(
-            r#"{"tag_name":"v0.5.4","assets":[
-                 {"name":"SHA256SUMS","browser_download_url":"https://example.com/S"}
-               ]}"#,
+    fn validated_test_release(
+        source: &UpdateSource,
+        tag: &str,
+        include_bundle: bool,
+    ) -> ValidatedRelease {
+        validate_release_assets(
+            source,
+            &raw_test_release(source, tag, include_bundle),
+            None,
+            "test-triple",
         )
         .unwrap()
     }
@@ -1257,18 +1473,22 @@ mod tests {
 
     #[test]
     fn bundle_decision_skips_when_verification_would_not_run() {
-        let release = release_with_bundle();
-        match bundle_decision(&release, true, true) {
+        let fixture =
+            UpdateSource::for_test_build_kind("test", false, Some("http://127.0.0.1:1234"), false)
+                .unwrap();
+        let release = validated_test_release(&fixture, "v9.9.9", true);
+        match bundle_decision(&release, true) {
             BundleDecision::TestMode => {}
             other => panic!("expected TestMode, got {other:?}"),
         }
-        match bundle_decision(&release, false, false) {
+        let official = validated_test_release(&UpdateSource::official(), "v9.9.9", true);
+        match bundle_decision(&official, false) {
             BundleDecision::NoGh => {}
             other => panic!("expected NoGh, got {other:?}"),
         }
-        // The API-base override is checked first, so it reports TestMode
-        // rather than NoGh when `gh` is also absent.
-        match bundle_decision(&release, true, false) {
+        // The fixture policy is checked first, so it reports TestMode rather
+        // than NoGh when `gh` is also absent.
+        match bundle_decision(&release, false) {
             BundleDecision::TestMode => {}
             other => panic!("expected TestMode, got {other:?}"),
         }
@@ -1276,11 +1496,13 @@ mod tests {
 
     #[test]
     fn bundle_decision_fetches_only_when_the_release_publishes_the_asset() {
-        match bundle_decision(&release_with_bundle(), false, true) {
-            BundleDecision::Fetch(asset) => assert_eq!(asset.url, "https://example.com/B"),
+        let with_bundle = validated_test_release(&UpdateSource::official(), "v9.9.9", true);
+        match bundle_decision(&with_bundle, true) {
+            BundleDecision::Fetch(asset) => assert_eq!(asset.name(), BUNDLE_ASSET),
             other => panic!("expected Fetch, got {other:?}"),
         }
-        match bundle_decision(&release_without_bundle(), false, true) {
+        let without_bundle = validated_test_release(&UpdateSource::official(), "v0.5.4", false);
+        match bundle_decision(&without_bundle, true) {
             BundleDecision::NoAsset => {}
             other => panic!("expected NoAsset, got {other:?}"),
         }
@@ -1389,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn select_auth_strategy_prefers_bare_when_api_base_overridden() {
+    fn select_auth_strategy_prefers_bare_for_fixture_source() {
         // Even with gh authed and a token present, the local fixture forces bare curl.
         let strat = select_auth_strategy(true, true, true, Some("ghp_xyz"));
         assert_eq!(strat, AuthStrategy::CurlBare);

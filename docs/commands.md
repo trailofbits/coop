@@ -914,6 +914,10 @@ coop profiles show rust
 ### `update`
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Official builds fetch metadata for the compiled `trailofbits/coop` repository
+from GitHub and validate the selected tag plus the exact repository, tag, and
+filename identity of the archive, checksum file, and optional attestation bundle
+before downloading any asset. The update source is not runtime-configurable.
 Attestation verification requires `.github/workflows/release.yml` at the selected
 release tag and rejects attestations generated on self-hosted runners. The same
 policy applies to the release bundle and GitHub API fallback.
