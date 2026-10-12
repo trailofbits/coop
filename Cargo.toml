@@ -31,7 +31,9 @@ indexmap = "2"
 libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
+serde-saphyr = { version = "1.3.0", default-features = false, features = [
+  "serialize",
+] }
 toml = "1.1.2"
 tracing = "0.1"
 semver = "1"
@@ -49,6 +51,9 @@ url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
+serde-saphyr = { version = "1.3.0", default-features = false, features = [
+  "deserialize",
+] }
 
 [lints]
 workspace = true
