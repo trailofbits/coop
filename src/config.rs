@@ -2264,7 +2264,10 @@ impl CoopConfig {
             }
         }
 
-        if !self.firecracker_bin.exists() && cfg!(target_os = "linux") {
+        if should_warn_about_missing_firecracker(
+            self.firecracker_bin.exists(),
+            cfg!(target_os = "linux"),
+        ) {
             warnings.push(format!(
                 "firecracker_bin '{}' does not exist \
                  (will be installed on setup)",
@@ -2503,9 +2506,7 @@ impl CoopConfig {
             // `instances_dir/<name>/`, so the metadata is one file read
             // away. Skipping the full directory walk avoids parsing every
             // other `instance.json` on `coop stop`/`shell`/`destroy`.
-            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str()))
-                && &inst.name == name
-            {
+            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str())) {
                 return Ok(inst);
             }
             // Miss or stale metadata: fall back to the full listing so
@@ -2616,11 +2617,7 @@ impl CoopConfig {
         };
 
         let dir = self.instances_dir().join(name.as_str());
-        match fs::symlink_metadata(&dir) {
-            Ok(_) => bail!("Instance '{name}' already exists"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("Failed to check instance directory"),
-        }
+        classify_instance_dir_probe(&name, fs::symlink_metadata(&dir).map(|_| ()))?;
         let instance = Instance {
             name,
             index,
@@ -2894,6 +2891,7 @@ impl Instance {
     /// Validates the PID is alive and belongs to a Firecracker process
     /// (guards against PID reuse). Removes stale PID files as a side
     /// effect when the process is gone or belongs to something else.
+    #[mutants::skip] // OS process probe wrapper; Linux process tests exercise it directly
     pub fn is_running(&self) -> bool {
         self.probe_running().unwrap_or_else(|error| {
             tracing::warn!(
@@ -2906,6 +2904,7 @@ impl Instance {
 
     /// Fallible Firecracker state probe for operations that must distinguish
     /// confirmed absence from a failed liveness or identity check.
+    #[mutants::skip] // /proc and kill(2) wrapper; Linux process tests cover its effects
     pub fn probe_running(&self) -> Result<bool> {
         let pid_path = self.pid_file_path();
         let pid_str = match fs::read_to_string(&pid_path) {
@@ -3116,7 +3115,7 @@ fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
     match connection {
         Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
@@ -3129,6 +3128,18 @@ fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<
             Ok(())
         }
         Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
+    }
+}
+
+fn should_warn_about_missing_firecracker(path_exists: bool, is_linux: bool) -> bool {
+    !path_exists && is_linux
+}
+
+fn classify_instance_dir_probe(name: &InstanceName, result: std::io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => bail!("Instance '{name}' already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("Failed to check instance directory"),
     }
 }
 
@@ -3535,7 +3546,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn firecracker_socket_probe_classifies_connect_errors() {
         assert!(classify_firecracker_socket_probe(Ok(())).is_err());
         for errno in [libc::ECONNREFUSED, libc::ENOENT] {
@@ -3740,6 +3750,30 @@ mod tests {
             .allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn instance_directory_probe_classifies_every_result() {
+        let name = iname("probe");
+
+        let exists = classify_instance_dir_probe(&name, Ok(())).unwrap_err();
+        assert!(exists.to_string().contains("already exists"), "{exists:#}");
+
+        classify_instance_dir_probe(
+            &name,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .unwrap();
+
+        let denied = classify_instance_dir_probe(
+            &name,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{denied:#}").contains("Failed to check instance directory"),
+            "{denied:#}"
+        );
     }
 
     #[test]
@@ -5174,6 +5208,48 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
+    fn ssh_host_tool_empty_state_and_configured_entries_are_exact() {
+        let empty = SshHostToolsConfig::default();
+        assert!(empty.is_empty());
+        assert!(SshConfig::default().is_empty());
+        assert_eq!(empty.configured().count(), 0);
+
+        for (field, expected_name) in [("ssh", "ssh"), ("scp", "scp"), ("rsync", "rsync")] {
+            let source = format!("[ssh.host_tools]\n{field} = \"/trusted/{field}\"\n");
+            let cfg: CoopConfig = toml::from_str(&source).unwrap();
+            assert!(!cfg.ssh.host_tools.is_empty());
+            assert!(!cfg.ssh.is_empty());
+            let configured = cfg.ssh.host_tools.configured().collect::<Vec<_>>();
+            assert_eq!(configured.len(), 1);
+            assert_eq!(configured[0].0, expected_name);
+            assert_eq!(
+                configured[0].1.as_path(),
+                Path::new(&format!("/trusted/{field}"))
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_omits_empty_ssh_table() {
+        let serialized = toml::to_string(&CoopConfig::default()).unwrap();
+        assert!(!serialized.contains("[ssh]"), "{serialized}");
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_configured_ssh_tool() {
+        let mut cfg = CoopConfig::default();
+        cfg.ssh.host_tools.ssh =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/ssh-tools/ssh").unwrap());
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("ssh.host_tools.ssh"), "{error}");
+        assert!(
+            error.contains("/coop-test-missing/ssh-tools/ssh"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn ssh_host_tool_table_rejects_unknown_fields() {
         let error = toml::from_str::<CoopConfig>("[ssh.host_tools]\nssh_typo = \"/usr/bin/ssh\"\n")
             .unwrap_err();
@@ -5723,6 +5799,14 @@ rsync = "/run/current-system/sw/bin/rsync"
             !warnings.iter().any(|w| w.contains("firecracker_bin")),
             "firecracker_bin warning must be gated on Linux, got {warnings:?}"
         );
+    }
+
+    #[test]
+    fn missing_firecracker_warning_requires_linux_and_an_absent_path() {
+        assert!(should_warn_about_missing_firecracker(false, true));
+        assert!(!should_warn_about_missing_firecracker(true, true));
+        assert!(!should_warn_about_missing_firecracker(false, false));
+        assert!(!should_warn_about_missing_firecracker(true, false));
     }
 
     // Pins `!parent.as_os_str().is_empty()`: a bare relative `data_dir`
