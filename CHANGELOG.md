@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.8.1
+
+### Security
+
+- Resolve coop-managed Linux network tools and OpenSSH clients through trusted
+  absolute paths, and launch them with an isolated environment and working
+  directory. Optional paths for nonstandard installations are validated for
+  ownership, permissions, symlink safety, and executable type before use.
+- Bind updater archives, checksums, and attestation bundles to the official
+  `trailofbits/coop` repository, canonical tags, and exact release asset URLs.
+  Reject ambiguous asset metadata and runtime source overrides, and restrict
+  download protocols across redirects.
+- Harden Lima template serialization so adversarial provision scripts, image
+  locations, and mount paths remain inert YAML scalar values. Replace the
+  deprecated `serde_yaml` dependency with `serde-saphyr`.
+
 ### Changed
 
 - Store new 1Password GitHub PATs and proxy credentials as API Credential items
@@ -9,6 +25,12 @@
   rotating a token or rerunning proxy setup creates an API Credential replacement
   with a concealed `password` compatibility field, so the previous lookup still
   works if saving the new retrieval command fails.
+
+### Fixed
+
+- Resume Firecracker filesystem growth after an interrupted setup when the disk
+  image has already reached the requested byte size but the filesystem still
+  needs repair or expansion.
 
 ## v0.8.0
 
