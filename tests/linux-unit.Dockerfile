@@ -5,7 +5,7 @@ FROM rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea96
 # CI installs cmake and the network tools in .github/workflows/ci.yml.
 # tests/test-linux-unit-runner.py checks this list against those CI packages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake musl-tools iproute2 iptables iputils-ping jq rsync util-linux \
+    cmake musl-tools zsh iproute2 iptables iputils-ping jq rsync util-linux \
     openssh-client openssh-server \
     sudo python3 && rm -rf /var/lib/apt/lists/*
 
