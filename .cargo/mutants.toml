@@ -15,7 +15,7 @@
 # doc_contains_literal_token, the SSH-config marker-block helpers
 # (remove_marker_blocks / remove_named_marker_block / remove_*_ssh_config_at,
 # split from remove_all_ssh_config / remove_ssh_config), CmdToken::from_words's
-# Linux/op arms, atomic_write_with_mode, and the editor strategy helpers
+# cross-platform op/file arms, atomic_write_with_mode, and the editor strategy helpers
 # (vscode_strategies / zed_strategies / editor_strategies / install_hints /
 # may_try_after_nonzero_exit — the last two split out of launch_editor so the
 # per-editor hint and fallthrough choices are in scope, since launch_editor
@@ -163,14 +163,17 @@ exclude_re = [
   "\\bremove_all_ssh_config\\b",
   "\\bremove_ssh_config\\b",
 
-  # secret_store.rs — $PATH probes and the macOS keychain write. The macOS
-  # `find-generic-password` arm of CmdToken::from_words is compiled out on the
-  # Linux sweep host (so its mutant is a no-op there) and pinned on macOS by
-  # parse_recognises_macos_keychain; its Linux/op arms stay as real gaps.
+  # secret_store.rs — $PATH probes and platform-specific secret writes. The
+  # platform-specific arms of CmdToken::from_words are compiled out on the
+  # opposite host (so their mutants are no-ops there). Each is pinned on its
+  # native host by parse_recognises_{macos_keychain,linux_secret_service}; the
+  # cross-platform op/file arms stay in scope.
   "Backend::is_available",
   "\\btool_on_path\\b",
   "\\bstore_keychain\\b",
+  "\\bstore_secret_service\\b",
   "find-generic-password",
+  "secret-tool",
 
   # private_storage.rs — root-owned disk repair invokes sudo; host integration
   # covers that branch. The user-owned mode and ACL paths have unit regressions.
@@ -208,6 +211,21 @@ exclude_re = [
   "\\bsetup_tap_with_tools\\b",
   "\\bteardown_tap_with_policy\\b",
   "\\bteardown_bridge_device\\b",
+  # Production entrypoints and readback helpers execute real host networking
+  # commands. Their effects are covered by the Firecracker and isolated Linux
+  # network gates; the candidate/config policy they delegate to stays scoped.
+  "src/network\\.rs:.*\\bsetup_tap\\b",
+  "src/network\\.rs:.*\\bteardown_tap\\b",
+  "src/network\\.rs:.*\\bteardown_all\\b",
+  "src/network\\.rs:.*\\bensure_bridge\\b",
+  "src/network\\.rs:.*\\bbridge_is_empty\\b",
+  "src/network\\.rs:.*\\bresolve_host_iface\\b",
+  "src/network\\.rs:.*\\bdetect_default_iface\\b",
+  # Linux-only helpers for the ignored namespace test are absent from the
+  # macOS mutation build and exercised by tests/integration-network.sh.
+  "src/network\\.rs:.*\\bresolve_network_tool\\b",
+  "IsolationNetworkTools::resolve_production",
+  "<impl BridgeToolset for IsolationNetworkTools>::bridge",
 
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into
