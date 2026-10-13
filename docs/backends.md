@@ -60,7 +60,11 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 - **KVM access**: `/dev/kvm` must exist and be readable/writable by the current user. Setup checks this and offers to fix permissions via `setfacl` or by adding the user to the `kvm` group.
 - **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
 - **curl**: Required for downloading the Firecracker binary and kernel.
-- **System packages**: Setup checks for `setfacl`, `unsquashfs`, `mkfs.ext4`, `ssh`, and `rsync`. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. If `apt-get` is unavailable, setup lists the missing tools; install the packages providing them with your host's package manager and rerun `coop setup`. No package manager is needed for this check when all these tools are already on `PATH`. The guest remains Ubuntu regardless of the host distribution.
+- **System packages**: Setup checks for `setfacl`, `unsquashfs`, and `mkfs.ext4` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If `apt-get` is unavailable, setup lists the missing tools; install or configure the tools and rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
+- **Network control-plane tools**: `sudo`, `ip`, `bridge`, `iptables`, and
+  `sysctl` use validated absolute system paths. Non-FHS hosts can provide exact
+  per-tool paths under `[network.host_tools]`; see
+  [configuration](configuration.md#exact-network-host-tool-paths).
 
 ### Setup process
 
@@ -128,7 +132,7 @@ These settings are ignored on macOS. Lima handles its own networking. coop's gen
 
 ### Resize (disk, memory, vCPUs)
 
-Resizing a stopped Firecracker instance's disk runs `truncate` to extend the rootfs image, then `e2fsck -fy` and `resize2fs` to grow the filesystem in place. Shrinking is not supported.
+Resizing a stopped Firecracker instance's disk extends the rootfs image if needed, then runs `e2fsck -fy` and `resize2fs` to grow the filesystem in place. Retrying the same absolute size resumes an interrupted filesystem resize when the filesystem is repairable; it also checks a fully grown filesystem. Shrinking is not supported.
 
 Memory and vCPU changes edit the `machine-config` block of the instance's per-instance JSON (`vm_config.json`), written atomically so a crash mid-write leaves the prior values intact. This JSON is authoritative: on every restart `configure()` regenerates the infra fields (kernel path, boot args, drive, network) from the global config so they roll forward, but preserves the on-disk `mem_size_mib`/`vcpu_count` rather than resetting them to the global `[vm]` defaults. Those defaults therefore only seed *new* instances. Firecracker does not boot the VM to apply the change; it takes effect on the next `coop start` (or immediately with `--start`).
 
@@ -151,19 +155,21 @@ The integration test runner (`tests/run-integration.sh --remote`) automates this
 
 ## Feature parity
 
-Both backends support the same CLI commands and guest capabilities:
+Both backends support the same core CLI commands and guest capabilities, with
+the intentional setup and mount differences listed below:
 
 | Capability | Lima (macOS) | Firecracker (Linux) |
 |---|---|---|
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
+| Explicit `setup --extra-packages` / `--post-install` | Refused | Consumed by provisioning and image staleness checks |
 | `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
-| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM, SIGKILL |
+| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM/SIGKILL fallback, remove TAP |
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
-| `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: truncates + resize2fs on rootfs. Mem/vCPU: edits per-instance JSON |
+| `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: extends rootfs image if needed, then runs fsck + resize2fs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |
 | `--mount` host mounts | Live virtiofs (changes visible immediately) | One-time rsync sync (use `push`/`pull` to re-sync) |

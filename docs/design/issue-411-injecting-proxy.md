@@ -502,9 +502,12 @@ Each slice is gated behind explicit config (proxy mode is opt-in), per coop's
 **The attestation is over the tarball, so bundle the proxy inside it.** The release
 workflow attests each per-target artifact — `actions/attest-build-provenance` with
 `subject-path: "coop-*.tar.gz"` (`release.yml`) — and `install.sh` verifies it with
-`gh attestation verify <tarball> --repo trailofbits/coop`, falling back to the
-published `SHA256SUMS`. Anything shipped *inside* that already-attested tarball
-inherits the identical SLSA build-provenance guarantee with **no new attestation
+`gh attestation verify`, pinning `trailofbits/coop`'s release workflow and exact
+tag and rejecting self-hosted runners (see the
+[verification policy](../trust-model.md#coop-update-trust-chain)). Without `gh`,
+verification uses only the published `SHA256SUMS`. Anything shipped *inside*
+that already-attested tarball inherits the identical SLSA build-provenance
+guarantee with **no new attestation
 machinery**. So `coop-proxy` ships in the same tarball as `coop`.
 
 `coop-proxy` runs on the **host** (it holds the secret and forwards upstream), so

@@ -5,6 +5,124 @@ and three manual quality checks — mutation testing, fuzzing, and formal
 verification (kani). Only the integration and unit tests run in CI; the other
 three are manual, run when a change warrants them.
 
+## Cross-platform compile and lint checks
+
+The workspace uses compile-time backend selection. `cargo clippy --all-targets`
+checks library, binary, test, and example targets for the current Rust target;
+it does not compile another operating system's `#[cfg]` branches.
+
+When a change adds or modifies a platform `#[cfg]`, `PlatformBackend` alias,
+platform-only enum variant, constant, trait implementation, or call path, run
+check and clippy for every affected OS. Prefer a native host. A configured
+cross target is useful compile evidence when native hardware is unavailable:
+
+```bash
+# Native host target
+cargo check --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Example: exercise normal Linux compilation from another host
+rustup target add x86_64-unknown-linux-musl
+cargo check --workspace --target x86_64-unknown-linux-musl
+cargo clippy --workspace --all-targets --all-features \
+  --target x86_64-unknown-linux-musl -- -D warnings
+```
+
+Use the target triple that matches the affected platform and available build
+prerequisites. A cross-target compile is not native runtime or VM-backend
+evidence; report that distinction and every target not checked.
+
+Inspect normal library compilation separately from tests. `cfg(test)` can make
+a platform-only item appear used in unit tests while the ordinary library build
+still rejects it as dead code under `-D warnings`. Gate declarations with the
+same platform conditions as their production consumers instead of suppressing
+that warning, unless the item intentionally forms a supported public surface.
+
+## Linux unit tests from macOS
+
+For changes to Linux-only `#[cfg]` branches, Firecracker host-side logic, Linux
+test targets, or platform-specific code, macOS developers should use this
+optional pre-push check. It is not a CI gate or a prerequisite for ordinary
+macOS-only changes. Native Linux developers should run `cargo test --workspace`
+instead. The Docker runner builds the current tracked working-tree
+sources inside Linux and runs the full workspace by default:
+
+```bash
+./tests/run-linux-unit.sh
+./tests/run-linux-unit.sh -p coop --test firecracker_socket
+./tests/run-linux-unit.sh -- --nocapture  # full workspace with test output
+python3 tests/test-linux-unit-runner.py  # host-only runner regressions; no Docker needed
+```
+
+Prerequisites are Python 3, Git, a Docker-compatible CLI and daemon (for example,
+Docker Desktop or Colima), and macOS arm64 or x86_64. Apple Silicon selects
+native `linux/arm64`; Intel selects native `linux/amd64`. An explicit
+`--platform linux/amd64` or `--platform linux/arm64` is an
+explicit override; the runner warns when it differs from the host architecture
+because emulation may change process behavior. It detects Apple Silicon even
+when Python itself runs through Rosetta. The Rust image uses the version
+in `rust-toolchain.toml`. `tests/linux-unit.Dockerfile` pins the matching
+`rust:<version>-bookworm` multi-architecture image digest. When the toolchain
+changes, update its tag and digest together; the runner rejects a tag mismatch.
+Update the Dockerfile's `RUSTUP_TOOLCHAIN` override at the same time. It selects
+the already-installed image toolchain without downloading unused components on
+each run. The runner checks `rustc --version` inside the container before
+staging sources.
+The Dockerfile package list includes the packages installed by
+`.github/workflows/ci.yml`; `tests/test-linux-unit-runner.py` checks that
+relationship, so update both when CI prerequisites change.
+
+The runner archives only files tracked in the Git index, reading their current
+working-tree contents and modes. Staged additions are included; untracked files,
+tracked deletions, `.git`, `target`, ignored paths, and credential-like paths are
+not copied. If an existing tracked path is ignored or looks private, the runner
+fails loudly instead of silently testing an incomplete source tree. It extracts
+the archive onto the container filesystem and runs Cargo as a non-root user with
+container-local passwordless sudo. It does not mount the source tree, Docker
+socket, KVM, or host credentials.
+Docker's normal container `/proc`, loopback, Unix sockets, and filesystem
+semantics apply. Only PATH, HOME, and Docker connection/configuration variables
+reach the Docker CLI;
+none of the caller's other environment is forwarded to it or the container.
+Cargo registry, Git, and target caches are Docker volumes named by Rust version
+and Linux architecture. A lock serializes workspace clean, build, and test on
+the shared target volume; workspace artifacts are rebuilt from each staged
+source tree while dependency artifacts remain cached. To reclaim the caches,
+list and remove the matching volumes:
+
+```bash
+docker volume ls --filter name=coop-linux-unit-
+docker volume rm $(docker volume ls -q --filter name=coop-linux-unit-)
+```
+
+This is an early-warning layer for Linux-only code and test targets, and for
+container-available `/proc`, process, signal, Unix-socket, filesystem-mode,
+symlink, and permission behavior. It also exercises Firecracker host-side logic
+that does not need a real VM, KVM, TAP device, system service, or host network
+mutation. It does **not** establish Firecracker boot or KVM behavior; real TAP,
+bridge, iptables, forwarding, or host-routing behavior; systemd integration or
+the host's sudoers policy; macOS/Lima correctness; x86-64 Linux runtime
+correctness when run natively as arm64; or full lifecycle, guest-visible,
+installation, update, or release behavior. Tests requiring broader container
+privileges are unsupported here.
+
+In this Docker image, the `firecracker_socket` fixture runs its exact socket
+helper as the test user. Docker's default capabilities do not allow root to
+execute another user's `/proc/<pid>/exe`. The fixture still exercises the real
+`coop stop` path, asserts the helper runs on every attempt, and keeps other
+`sudo` calls real. Ordinary native Linux workspace tests, including Linux CI,
+use real `sudo` for this probe as before. The Docker result does not establish
+privileged access to a root-owned Firecracker socket; the real
+Linux/Firecracker integration gate remains necessary for that behavior.
+
+A green Docker run does **not** replace either platform integration gate.
+Lifecycle and guest-visible changes still require both real backends:
+
+```bash
+./tests/run-integration.sh                       # macOS/Lima
+./tests/run-integration.sh --remote user@host    # Linux/Firecracker
+```
+
 ## Integration tests
 
 Generated completion is checked without a VM by
@@ -56,6 +174,9 @@ The test exercises the full VM lifecycle (setup → start → status → shell �
 guest environment → docker → stop → destroy). CI additionally runs the fast,
 host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
 `tests/integration-uninstall.sh` suites.
+The full VM suite rebuilds the image and requires the Grok CLI to report a
+version. The shorter suite may reuse an older image and reports that check as
+skipped when Grok is absent.
 
 The stop phase writes, overwrites, and deletes guest files immediately before
 stopping, then verifies those changes after restart without syncing them in
@@ -65,10 +186,23 @@ SSH refusal, a hung client, a missing client, and liveness-probe failure. It
 checks forced-signal fallback, bounded waits, and SSH client reaping. The
 existing stop failure test checks PID retention after failed forced signals.
 
+`cargo test --test firecracker_socket` exercises the Linux socket helper and
+`coop stop` with a full Unix listener accept queue. It checks proxy-token
+retention, then closes the listener and requires cleanup to succeed. An exact
+`/bin/false` network-tool path reports TAP and bridge objects absent without
+relying on ambient `PATH`; dedicated network tests cover TAP mutation and
+cleanup. This test does not replace either VM integration gate.
+
 The `--full` suite includes a dedicated `--no-github` phase. It captures the
 boot session through `post_start` for fresh `up`, `start`, and a stopped-project
 `up`, checks that model credentials still arrive, and witnesses normal GitHub
 forwarding on an intervening invocation without the flag.
+
+The full post-start tests run a script from the copied workspace that reads an
+additional mount. The clone phase also checks that a post-start hook can read
+both the cloned repository and its additional mount. These assertions detect
+hooks running before workspace provisioning. A mount-only instance also checks
+that its startup hook reads the mounted file during startup.
 
 When adding new features, consider whether they should be covered here. New
 commands or guest-visible changes are good candidates for a new test phase.
@@ -80,6 +214,13 @@ temporary loopback HTTP server and require Python 3, Bash, and curl;
 Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
+
+Run `tests/integration-update.sh` for the host-only self-updater flow. The
+script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
+can construct the fixture source. Normal release builds reject the retired
+`COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers
+checksum and attestation failures without changing an installed coop binary.
 
 Run `python3 tests/test-codex-account.py` for the account wrapper's argument,
 login/logout, API-key passthrough, and `codex-yolo` regressions (also in Linux
@@ -142,9 +283,10 @@ loopback port and requires startup to return an error without publishing a PID
 or leaving the SSH master alive. Separate host and guest network namespaces
 allow the destination and reverse listener to use the same port.
 
-The runner requires Rust/Cargo, Python 3, passwordless sudo, iproute2,
+The runner requires Python 3, passwordless sudo, iproute2,
 util-linux, coreutils, hostname, and OpenSSH client/server tools. It builds
-unprivileged, then confines the fixture to disposable mount, network, UTS, and
+the test binary with Cargo unless `COOP_TEST_PREBUILT_BINARY` names one, then
+confines the fixture to disposable mount, network, UTS, and
 PID namespaces. No user SSH configuration or keys are used. Namespace teardown
 removes all children and temporary files on success, failure, or timeout.
 Linux CI and release preflight run this gate explicitly; ordinary unit tests
@@ -154,8 +296,9 @@ not replace the Firecracker and Lima VM integration gates.
 The same fixture exercises guest environment forwarding through real OpenSSH:
 literal values, empty values, transport-name collisions, PTYs, stdin, exit
 status, missing forwarding, and redacted assignment failures. Its sshd accepts
-only `COOP_SSH_ENV_*`, so original guest names cannot satisfy the test by
-bypassing the transport. The ordinary unit suite separately checks host
+`COOP_SSH_ENV_*` plus a dedicated unrelated canary used to prove that hostile
+`SendEnv`, `SetEnv`, and forwarding policy remains inactive. Original guest
+names therefore cannot satisfy the test by bypassing alias restoration. The ordinary unit suite separately checks host
 environment isolation on all four SSH launch paths and saved CLI guest environment values through a later session.
 
 The forwarding code in `backend.rs` and `ssh.rs` is outside cargo-mutants'
@@ -166,9 +309,7 @@ redaction must fail the assignment-error regression. Restore the code and
 rerun the tests after each check.
 
 The filesystem-backed non-UTF-8 workspace test runs on Linux; macOS APFS
-rejects the fixture filename. The Lima resize spawn-failure test runs in an
-isolated child process with an empty executable search directory, so it cannot
-find a host `truncate` or change another test's environment.
+rejects the fixture filename.
 
 ## Host subprocess boundary tests
 
@@ -196,6 +337,19 @@ from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
 
+The trusted-host-tool unit fixtures use a private synthetic filesystem root so
+they do not depend on tools installed on the development host. They cover fixed
+candidate mapping, missing/relative/writable rejection, trusted symlink hops,
+ambient-`PATH` exclusion, explicit cwd/environment, absolute elevated argv, and
+complete `setup_tap` resolution before the first probe. Tests for configured
+paths cover exact-no-fallback behavior, non-FHS symlink targets, unknown config
+keys, path syntax, cleanup-category independence, and kernel-ordered handling
+of parent components inside symlink targets. The ignored Linux
+network namespace test additionally resolves the production `sudo` and
+`bridge` policy before exercising bridge-port isolation; ordinary unit tests do
+not require the production tools because CI installs those prerequisites only
+for the later isolated network gate.
+
 For file-transfer changes, extend the fixture through the later host operation
 that consumes the transferred data. Use the relevant real tool to exercise
 implicit file discovery, with a disposable destination and no real credentials
@@ -218,13 +372,17 @@ cargo test --lib unmount_rejects_name_swapped_to_outside_mount -- --ignored
 
 The VM integration suite checks host directory, JSON state, template disk, and
 instance disk modes after creation and after commit/restore on both backends.
+On Firecracker it also extends a stopped instance's image without growing ext4,
+retries `coop resize` at that same absolute size, and checks ext4 capacity.
 
 On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
 It also corrupts an ext4 inode reference count, checks that read-only verification
-rejects it, and repairs the filesystem before resizing. The repair operation
+rejects it, then retries `coop resize` at the already extended image size and
+checks the filesystem's block capacity. It also checks a completed no-op retry
+and rejects a shrink hidden by whole-GiB rounding. The repair operation
 accepts exit code 1 (errors corrected), as defined by
 [e2fsprogs 1.47.0](https://github.com/tytso/e2fsprogs/blob/v1.47.0/e2fsck/e2fsck.8.in).
 Nonzero results from other disk tools, reboot-required results, error combinations,
@@ -232,6 +390,36 @@ and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
+
+Guest-file unit tests cover multiple mappings, guest-home expansion, destination
+validation, source snapshots, private writable modes, macOS staging ACL inheritance,
+symlink materialization,
+cycles, missing sources, special files, concurrent source-path replacement, staging
+directory overlap, and mount/destination overlaps. The full
+VM suite checks initial copies, restart refresh, reprovisioned directory and file
+mappings, retained guest-only content,
+writable neighboring configuration directories, bootstrap ordering, and restart
+rejection of persisted live host mounts.
+
+`bash tests/guest-files-copy.sh` checks the guest copy script on Linux without a
+VM. CI runs it to verify that directory and single-file mappings overwrite changed
+bytes even when size and modification time match, while retaining guest-only files.
+Pass a copy-script path as the first argument to check a deliberate regression.
+
+Creation-hook tests cover shell strings, invalid commands, private recipe
+storage, completion progress, legacy instances, restore invalidation and
+unchanged-disk failure rollback, startup-hook
+precedence, and shell quoting. Recipe reads and writes reject unsafe links and
+ancestors. An isolated SSH fixture checks that creation hooks receive guest
+environment values without changing host executable lookup or loader settings.
+A stale restart must reject a running VM without changing saved creation progress.
+Removed project-stage and argv recipes fail closed.
+Full VM tests cover global-hook failure,
+debugging access, agent gating, retries without repeating completed hooks,
+workspace availability, environment forwarding, failed-hook descendant cleanup,
+cancellation, and retries during paused or failed restart file copying.
+Hook counters live in the guest home so boot-time cleanup
+of `/tmp` does not invalidate restart assertions.
 
 ## Mutation testing
 
@@ -258,6 +446,8 @@ parsing, or state composition:
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
   parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
+- `src/update_policy.rs` — updater source, tag, and release-asset identity
+  policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
   byte-to-GiB arithmetic kernels, and predicates such as
   `is_sensitive_workspace`

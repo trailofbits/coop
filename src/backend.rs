@@ -11,16 +11,17 @@ use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use toml::Value as TomlValue;
 
+#[cfg(target_os = "linux")]
 use crate::cmd::Cmd;
 use crate::config::{
     CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
-    McpServerDef, NetworkConfig, VmMemory,
+    McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
 };
 use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
 use crate::paths::{GuestPath, HostPath};
 use crate::remote_command::RemoteCommand;
-use crate::setup::SetupOptions;
+use crate::setup::{ExplicitSetupInputSupport, SetupOptions};
 
 // ── Operation modes ───────────────────────────────────────────
 
@@ -187,9 +188,9 @@ impl RunningInstance {
 // ── Stopped instance ──────────────────────────────────────────
 
 /// Observation that an instance was stopped, with an operation lock held.
-/// Construct via [`VmBackend::as_stopped`]. The constructor probes live state
-/// while holding the lock, so a concurrent lifecycle mutation waits until
-/// the token is dropped.
+/// Construct via [`VmBackend::as_stopped`] or a successful [`VmBackend::stop`].
+/// Both paths confirm the stopped state while holding the lock, so a concurrent
+/// lifecycle mutation waits until the token is dropped.
 ///
 /// No SSH target is carried: a stopped VM has nothing to connect to.
 /// The field is private so callers cannot construct one without a backend probe.
@@ -199,10 +200,9 @@ pub struct StoppedInstance {
 }
 
 impl StoppedInstance {
-    /// Mint a `StoppedInstance` after a successful live-state probe.
+    /// Mint a `StoppedInstance` after the backend confirms the instance stopped.
     ///
-    /// Crate-private so only backend impls can construct one. Callers
-    /// use [`VmBackend::as_stopped`] (which delegates here).
+    /// Crate-private so only backend implementations can construct one.
     pub(crate) fn new(inst: Instance, lock: FileLock) -> Self {
         Self { inst, _lock: lock }
     }
@@ -214,7 +214,7 @@ impl StoppedInstance {
 
 const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
+pub(crate) fn lock_instance_operation(inst: &Instance) -> Result<FileLock> {
     lock_sibling_bounded(&inst.dir, OPERATION_LOCK_TIMEOUT)
 }
 
@@ -342,6 +342,7 @@ pub struct SshTarget {
     pub port: NonZeroU16,
     pub user: SshUser,
     pub key_path: PathBuf,
+    pub(crate) host_tools: SshHostToolsConfig,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -382,76 +383,38 @@ impl SshTarget {
         dir.join(format!("coop-{short:08x}.sock"))
     }
 
-    /// Options every transport shares, up to the port flag.
-    ///
-    /// `ssh`, `scp`, and rsync's `-e` command all take these; only the port
-    /// flag differs (`-p` vs `-P`), so all three derive from here instead of
-    /// hand-copying a list that then drifts.
-    ///
-    /// The bounds, in the order they take effect. `ConnectTimeout` caps the
-    /// TCP connect and banner exchange. `BatchMode` refuses password and
-    /// passphrase prompts, so a key the guest rejects fails instead of
-    /// blocking on stdin where no interactive user exists (`coop up` in CI).
-    /// `ServerAlive*` then covers the established session: a paused VM, a
-    /// wedged sshd, or a lost TAP device otherwise leaves SSH blocked on a
-    /// dead socket with no deadline. It is answered by sshd itself, not by
-    /// the remote command, so a silent hour-long install is never at risk —
-    /// only a guest whose sshd cannot answer for 90s.
-    fn transport_opts(&self) -> Vec<String> {
-        vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "ServerAliveInterval=30".into(),
-            "-o".into(),
-            "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "IdentitiesOnly=yes".into(),
-            "-o".into(),
-            "LogLevel=ERROR".into(),
-            "-i".into(),
-            self.key_path.display().to_string(),
-        ]
-    }
-
-    /// SSH options for commands.
-    pub fn ssh_opts(&self) -> Vec<String> {
-        let mut opts = self.transport_opts();
-        opts.extend(["-p".into(), self.port.to_string()]);
-        opts
-    }
-
-    /// SSH options with connection multiplexing.
+    /// SSH command with connection multiplexing.
     ///
     /// Only used during boot probing (`wait_until_ready`) where rapid
     /// retries benefit from a shared master connection. The master is
     /// torn down after probing to avoid poisoning later connections
     /// that need `SendEnv` for environment forwarding.
-    fn ssh_opts_mux(&self) -> Vec<String> {
-        let mut opts = self.ssh_opts();
-        opts.extend([
+    fn ssh_mux_command(&self) -> Result<Command> {
+        let mut command = self.ssh_command()?;
+        command.args([
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
-            format!("ControlPath={}", self.control_path().display()),
+            format!(
+                "ControlPath={}",
+                crate::openssh::config_path(&self.control_path(), "SSH control socket path")?
+            ),
             "-o".into(),
             "ControlPersist=60".into(),
         ]);
-        opts
+        Ok(command)
     }
 
-    /// SCP options (uses -P for port instead of -p).
-    pub fn scp_opts(&self) -> Vec<String> {
-        let mut opts = vec!["-q".to_string()];
-        opts.extend(self.transport_opts());
-        opts.extend(["-P".into(), self.port.to_string()]);
-        opts
+    pub(crate) fn ssh_command(&self) -> Result<Command> {
+        crate::openssh::ssh_command(self, crate::openssh::Forwarding::Disabled)
+    }
+
+    pub(crate) fn ssh_forward_command(&self) -> Result<Command> {
+        crate::openssh::ssh_command(self, crate::openssh::Forwarding::Explicit)
+    }
+
+    pub(crate) fn rsync_command(&self) -> Result<Command> {
+        crate::openssh::rsync_command(self)
     }
 
     /// user@host address string.
@@ -462,12 +425,10 @@ impl SshTarget {
     /// Run a command on the guest via SSH.
     pub fn exec(&self, command: RemoteCommand) -> Result<()> {
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
-
-        let status = Command::new("ssh")
-            .args(&args)
+        let status = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(&cmd)
             .status()
             .context("Failed to run SSH command")?;
 
@@ -482,44 +443,64 @@ impl SshTarget {
     /// The bytes are written to ssh's stdin and forwarded to the remote shell.
     /// Use this when the command needs to consume secrets that must not appear
     /// on argv or in the SSH debug log — e.g. tokens read via `read -r VAR`.
-    pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: Vec<u8>) -> Result<()> {
+    pub fn exec_with_stdin(&self, command: RemoteCommand, stdin: &[u8]) -> Result<()> {
+        use std::io::Write as _;
+        use std::process::Stdio;
         let cmd = command.into_string();
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.clone());
-        Cmd::new("ssh")
-            .args(args)
-            .stdin_input(stdin)
-            .run()
-            .with_context(|| format!("SSH command failed: {cmd}"))
+        let mut child = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(&cmd)
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to start SSH command")?;
+        let mut child_stdin = child.stdin.take().context("SSH stdin pipe missing")?;
+        let write_result = child_stdin.write_all(stdin);
+        drop(child_stdin);
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let reap_result = child.wait();
+            return match reap_result {
+                Ok(_) => Err(error).context("Failed to write SSH stdin"),
+                Err(reap_error) => Err(error).context(format!(
+                    "Failed to write SSH stdin; additionally failed to reap SSH child: {reap_error}"
+                )),
+            };
+        }
+        let status = child.wait().context("Failed to wait for SSH command")?;
+        if !status.success() {
+            bail!("SSH command failed: {cmd}");
+        }
+        Ok(())
     }
 
     /// Check if a command succeeds on the guest.
-    pub fn exec_ok(&self, command: RemoteCommand) -> bool {
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(command.into_string());
-
-        Command::new("ssh")
-            .args(&args)
+    pub fn exec_ok(&self, command: RemoteCommand) -> Result<bool> {
+        let command = command.into_string();
+        let status = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(command)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .context("Failed to launch SSH command probe")?;
+        Ok(status.success())
     }
 
     /// Like `exec_ok` but uses connection multiplexing for fast retries.
-    fn probe_ok_mux(&self, command: RemoteCommand) -> bool {
-        let mut args = self.ssh_opts_mux();
-        args.push(self.addr());
-        args.push(command.into_string());
+    fn probe_ok_mux(&self, command: RemoteCommand) -> Result<bool> {
+        let command = command.into_string();
 
-        Command::new("ssh")
-            .args(&args)
+        let status = self
+            .ssh_mux_command()?
+            .arg(self.addr())
+            .arg(command)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .context("Failed to launch multiplexed SSH readiness probe")?;
+        Ok(status.success())
     }
 
     /// Wait until SSH is ready, retrying with exponential backoff.
@@ -538,7 +519,7 @@ impl SshTarget {
         tracing::info!("Probing SSH readiness (timeout: {timeout:?})");
 
         loop {
-            if self.probe_ok_mux(RemoteCommand::new().literal("true")) {
+            if self.probe_ok_mux(RemoteCommand::new().literal("true"))? {
                 tracing::info!("SSH is ready");
                 self.close_mux();
                 return Ok(());
@@ -560,8 +541,7 @@ impl SshTarget {
 
     /// SCP a local file to the guest.
     pub fn scp_to(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
-        let status = Command::new("scp")
-            .args(self.scp_opts())
+        let status = crate::openssh::scp_command(self)?
             .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
             .status()
@@ -575,8 +555,7 @@ impl SshTarget {
 
     /// Copy a local directory to the guest recursively via scp.
     pub fn scp_to_recursive(&self, local: &HostPath, remote: &GuestPath) -> Result<()> {
-        let status = Command::new("scp")
-            .args(self.scp_opts())
+        let status = crate::openssh::scp_command(self)?
             .arg("-r")
             .arg(local.as_path())
             .arg(format!("{}:{remote}", self.addr()))
@@ -591,21 +570,19 @@ impl SshTarget {
 
     /// SSH command string for rsync's -e flag.
     ///
-    /// Derived from [`Self::ssh_opts`] so a transfer inherits the same bounds
-    /// as any other guest command. rsync splits this string on whitespace, so
-    /// it stays unquoted — a key path containing spaces has never worked here.
-    pub fn rsync_ssh_cmd(&self) -> String {
-        format!("ssh {}", self.ssh_opts().join(" "))
+    /// Built from the resolved SSH executable and shared transport authority
+    /// policy. Every word is validated against rsync's `-e` parser grammar;
+    /// paths that cannot be represented unambiguously are rejected.
+    pub fn rsync_ssh_cmd(&self) -> Result<String> {
+        crate::openssh::rsync_ssh_command(self)
     }
 
     /// Run a command on the guest via SSH and capture stdout.
     pub fn capture(&self, cmd: &str) -> Result<String> {
-        let mut args = self.ssh_opts();
-        args.push(self.addr());
-        args.push(cmd.to_string());
-
-        let output = Command::new("ssh")
-            .args(&args)
+        let output = self
+            .ssh_command()?
+            .arg(self.addr())
+            .arg(cmd)
             .stderr(std::process::Stdio::null())
             .output()
             .context("Failed to run SSH command")?;
@@ -626,12 +603,17 @@ impl SshTarget {
             return;
         }
         tracing::debug!("Closing SSH control master at {}", sock.display());
-        let control_arg = format!("ControlPath={}", sock.display());
-        let result = Command::new("ssh")
-            .args(["-O", "exit", "-o", &control_arg, &self.addr()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let result = self.ssh_command().and_then(|mut ssh| {
+            let control_arg = format!(
+                "ControlPath={}",
+                crate::openssh::config_path(&sock, "SSH control socket path")?
+            );
+            ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .context("Failed to launch SSH control request")
+        });
         match result {
             Ok(s) if s.success() => {
                 tracing::debug!("Closed SSH control master");
@@ -649,8 +631,7 @@ impl SshTarget {
 impl SshSession {
     /// Build every environment-bearing SSH launch through the same boundary.
     pub fn command(&self, options: &[String], remote: &str) -> Result<Command> {
-        let mut ssh = Command::new("ssh");
-        ssh.args(self.target.ssh_opts());
+        let mut ssh = self.target.ssh_command()?;
         let remote = self.env.wrap_command(&mut ssh, remote)?;
         ssh.args(options).arg(self.target.addr()).arg(remote);
         Ok(ssh)
@@ -803,13 +784,26 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// filesystem state.
 ///
 /// Every backend boot entry (`setup`, `create_and_start`, `start_existing`)
-/// calls this first, so the check is unforgettable — a new lifecycle path
-/// that reaches boot cannot skip it, and it sees the world as it is at boot
-/// time rather than trusting a witness minted earlier. Warnings are dropped
-/// here; they are surfaced once at the handler via
+/// calls this before backend setup or boot work, so the check is unforgettable
+/// and sees the world as it is at boot time rather than trusting a witness
+/// minted earlier. Setup first rejects backend-unsupported explicit inputs.
+/// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
     cfg.validate().map(drop)
+}
+
+fn setup_preflight(
+    cfg: &CoopConfig,
+    opts: &SetupOptions,
+    explicit_inputs: ExplicitSetupInputSupport,
+) -> Result<()> {
+    crate::setup::validate_explicit_setup_inputs(
+        explicit_inputs,
+        &opts.extra_packages,
+        opts.post_install.as_ref(),
+    )?;
+    boot_preflight(cfg)
 }
 
 /// VM backend for managing guest lifecycle.
@@ -827,8 +821,15 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
-    /// Stop an instance observed running at the preceding probe.
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()>;
+    /// Stop an instance observed running at the preceding probe and return it
+    /// with the operation lock held once the backend confirms it has exited.
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance>;
+    /// Finish backend cleanup for a confirmed-stopped instance.
+    /// Lima has no host TAP; Firecracker deletes it while the operation lock
+    /// carried by `stopped` prevents a concurrent restart.
+    fn cleanup_stopped(&self, _cfg: &CoopConfig, _stopped: &StoppedInstance) -> Result<()> {
+        Ok(())
+    }
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
@@ -967,7 +968,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
     }
 
@@ -999,14 +1000,18 @@ impl VmBackend for FirecrackerBackend {
         start_firecracker_existing(cfg, inst)
     }
 
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
-        if !inst.probe_running()? {
-            return Ok(());
+        let operation = lock_instance_operation(&inst)?;
+        if inst.probe_liveness()? {
+            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
+            vm.stop()?;
         }
-        let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
-        vm.stop()
+        Ok(StoppedInstance::new(inst, operation))
+    }
+
+    fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
+        crate::network::teardown_tap(&cfg.network, stopped.instance())
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1074,7 +1079,7 @@ impl VmBackend for FirecrackerBackend {
         new_size: crate::config::GiB,
     ) -> Result<()> {
         let _ = cfg;
-        crate::setup::resize_rootfs(stopped.instance(), new_size)
+        crate::setup::resize_rootfs(stopped, new_size)
     }
 
     fn set_machine_resources(
@@ -1125,7 +1130,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        if !inst.probe_running()? {
+        if !inst.probe_liveness()? {
             return Ok(None);
         }
         let target = self.ssh_target(cfg, &inst)?;
@@ -1134,7 +1139,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
         let lock = lock_instance_operation(&inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             bail!(
                 "Instance '{}' is running — stop it first with \
                  `coop stop {}`",
@@ -1166,7 +1171,8 @@ impl VmBackend for FirecrackerBackend {
             host: Hostname::from(inst.guest_ip()),
             port: cfg.ssh_port,
             user: SshUser::new(guest_user.as_str())?,
-            key_path: cfg.ssh_key_path(),
+            key_path: std::path::absolute(cfg.ssh_key_path())?,
+            host_tools: cfg.ssh.host_tools.clone(),
         })
     }
 
@@ -1210,7 +1216,7 @@ impl std::fmt::Display for LimaBackend {
 #[cfg(any(target_os = "macos", test))]
 impl VmBackend for LimaBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
-        boot_preflight(cfg)?;
+        setup_preflight(cfg, opts, ExplicitSetupInputSupport::UnsupportedByLima)?;
         crate::lima::setup(cfg, opts)
     }
 
@@ -1232,15 +1238,16 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<()> {
+    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
         let (inst, _target) = running.into_parts();
-        let _operation = lock_instance_operation(&inst)?;
+        let operation = lock_instance_operation(&inst)?;
         match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst),
-            Some(crate::lima::LimaState::Stopped) => Ok(()),
+            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst)?,
+            Some(crate::lima::LimaState::Stopped) => {}
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
         }
+        Ok(StoppedInstance::new(inst, operation))
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1640,7 +1647,7 @@ fn bootstrap_claude(
         if needs_claude_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&claude_bin))?
         {
             bail!(
                 "Claude Code CLI is not installed in the guest.\n\
@@ -1773,7 +1780,7 @@ fn bootstrap_codex(
             RemoteCommand::new()
                 .literal("test -x ")
                 .arg(crate::guest::codex_bin()),
-        ) {
+        )? {
             // The caller's guard tears down the proxy started above on this error.
             bail!("{}", codex_missing_guest_cli_message());
         }
@@ -1879,7 +1886,7 @@ fn bootstrap_grok(
         if needs_grok_cli
             && !session
                 .target
-                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&grok_bin))
+                .exec_ok(RemoteCommand::new().literal("test -x ").arg(&grok_bin))?
         {
             bail!(
                 "Grok Build CLI is not installed in the guest.\n\
@@ -1982,7 +1989,7 @@ pub fn ensure_codex_keyring_configured(target: &SshTarget) -> Result<()> {
     let configured = target.exec_ok(RemoteCommand::new().literal(
         "IFS= read -r first_line < ~/.codex/config.toml \
          && [ \"$first_line\" = 'cli_auth_credentials_store = \"keyring\"' ]",
-    ));
+    ))?;
     if configured {
         return Ok(());
     }
@@ -1997,7 +2004,7 @@ pub fn ensure_codex_account_guest_support(target: &SshTarget) -> Result<()> {
             .literal(" && command -v dbus-run-session >/dev/null 2>&1")
             .literal(" && command -v gnome-keyring-daemon >/dev/null 2>&1")
             .literal(" && command -v secret-tool >/dev/null 2>&1"),
-    );
+    )?;
     if supported {
         return Ok(());
     }
@@ -2207,7 +2214,7 @@ fn prepare_claude_config_import(
             "t=\"$(mktemp ~/.claude/coop-import.json.XXXXXX)\" && \
              cat > \"$t\" && mv \"$t\" ~/.claude/coop-import.json",
         ),
-        serde_json::to_vec(&snapshot)?,
+        &serde_json::to_vec(&snapshot)?,
     )?;
     Ok(Some(staged))
 }
@@ -2233,7 +2240,7 @@ fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
 /// Owner-only mode for a copied host `~/.grok/auth.json`. `scp` without `-p`
 /// creates the guest file with the remote umask (typically 0644).
 fn restrict_guest_grok_auth(target: &SshTarget) -> Result<()> {
-    if !target.exec_ok(RemoteCommand::new().literal("test -f ~/.grok/auth.json")) {
+    if !target.exec_ok(RemoteCommand::new().literal("test -f ~/.grok/auth.json"))? {
         return Ok(());
     }
     target
@@ -2296,7 +2303,7 @@ fn write_managed_grok_config(
                 "t=\"$(mktemp ~/.grok/config.toml.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.grok/config.toml",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write managed ~/.grok/config.toml")?;
     Ok(())
@@ -2443,7 +2450,7 @@ fn write_workspace_folder_trust(target: &SshTarget) -> Result<()> {
                 "t=\"$(mktemp ~/.grok/trusted_folders.toml.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.grok/trusted_folders.toml",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write ~/.grok/trusted_folders.toml")?;
     Ok(())
@@ -2934,7 +2941,7 @@ fn write_managed_claude_settings(
                 "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
-            merged.into_bytes(),
+            merged.as_bytes(),
         )
         .context("Failed to write managed ~/.claude/settings.json in guest")?;
     tracing::debug!("Wrote managed ~/.claude/settings.json to guest");
@@ -3060,7 +3067,7 @@ fn write_claude_json(target: &SshTarget, contents: &str) -> Result<()> {
                 "t=\"$(mktemp ~/.claude.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude.json",
             ),
-            contents.as_bytes().to_vec(),
+            contents.as_bytes(),
         )
         .context("Failed to write ~/.claude.json in guest")
 }
@@ -4098,7 +4105,7 @@ fn clone_with_token(target: &SshTarget, repo_url: &str, token: &str) -> Result<(
     let mut stdin = Vec::with_capacity(token.len() + 1);
     stdin.extend_from_slice(token.as_bytes());
     stdin.push(b'\n');
-    target.exec_with_stdin(build_clone_with_token_script(repo_url), stdin)
+    target.exec_with_stdin(build_clone_with_token_script(repo_url), &stdin)
 }
 
 /// Build the remote shell script that reads a GitHub token from stdin and
@@ -4270,6 +4277,7 @@ mod tests {
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: root.join("key"),
+            host_tools: SshHostToolsConfig::default(),
         };
         LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
@@ -4360,15 +4368,47 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             port: NonZeroU16::new(22).unwrap(),
             user: SshUser::new("ubuntu").unwrap(),
             key_path: PathBuf::from("/tmp/test-key"),
+            host_tools: SshHostToolsConfig::default(),
         }
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_transport_disables_host_agent() {
+        let target = ssh_test_target();
+        for (name, opts) in [
+            ("ssh", command_args(&target.ssh_command().unwrap())),
+            (
+                "scp",
+                command_args(&crate::openssh::scp_command(&target).unwrap()),
+            ),
+            ("mux", command_args(&target.ssh_mux_command().unwrap())),
+        ] {
+            for option in ["IdentityAgent=none", "ForwardAgent=no"] {
+                assert_eq!(
+                    opts.iter().filter(|opt| opt.as_str() == option).count(),
+                    1,
+                    "{name} must disable the host agent exactly once: {option}"
+                );
+            }
+        }
+        let rsync = target.rsync_ssh_cmd().unwrap();
+        assert!(rsync.contains("-o IdentityAgent=none"));
+        assert!(rsync.contains("-o ForwardAgent=no"));
     }
 
     #[test]
     fn every_transport_is_bounded_against_a_wedged_guest() {
         let target = ssh_test_target();
-        let ssh = target.ssh_opts();
-        let scp = target.scp_opts();
-        let rsync = target.rsync_ssh_cmd();
+        let ssh = command_args(&target.ssh_command().unwrap());
+        let scp = command_args(&crate::openssh::scp_command(&target).unwrap());
+        let rsync = target.rsync_ssh_cmd().unwrap();
 
         for bound in [
             "BatchMode=yes",
@@ -4387,7 +4427,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         for (name, opts) in [
             ("ssh", ssh),
             ("scp", scp),
-            ("mux", target.ssh_opts_mux()),
+            ("mux", command_args(&target.ssh_mux_command().unwrap())),
             ("rsync", rsync.split(' ').map(str::to_string).collect()),
         ] {
             let pairs = opts.iter().filter(|o| o.starts_with("ServerAlive")).count();
@@ -4396,13 +4436,92 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     }
 
     #[test]
+    fn readiness_preserves_host_tool_resolution_failures() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(
+            Some(&fixture.path().join("missing-ssh")),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let error = target.wait_until_ready(Duration::ZERO).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("built-in fallback was not attempted"));
+        assert!(!message.contains("SSH not ready"));
+    }
+
+    #[test]
+    fn command_probe_preserves_process_launch_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let ssh = fixture.path().join("ssh");
+        fs::write(&ssh, "#!/definitely/missing/coop-test-interpreter\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+
+        let error = target
+            .exec_ok(RemoteCommand::new().literal("true"))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Failed to launch SSH command probe"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stdin_write_failure_reaps_the_ssh_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let pid_file = fixture.path().join("ssh.pid");
+        let ssh = fixture.path().join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexit 0\n",
+                crate::shell::shell_escape(&pid_file.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+
+        let error = target
+            .exec_with_stdin(
+                RemoteCommand::new().literal("true"),
+                &vec![b'x'; 8 * 1024 * 1024],
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Failed to write SSH stdin"));
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
     fn ssh_and_scp_options_differ_only_in_the_port_flag() {
         let target = ssh_test_target();
-        let ssh = target.ssh_opts();
-        let scp = target.scp_opts();
+        let ssh = command_args(&target.ssh_command().unwrap());
+        let scp = command_args(&crate::openssh::scp_command(&target).unwrap());
 
         assert_eq!(scp.first().map(String::as_str), Some("-q"));
-        assert_eq!(scp[1..scp.len() - 2], ssh[..ssh.len() - 2]);
+        assert_eq!(scp[1..scp.len() - 4], ssh[..ssh.len() - 2]);
+        assert_eq!(scp[scp.len() - 4], "-S");
+        assert!(Path::new(&scp[scp.len() - 3]).is_absolute());
         assert!(scp.ends_with(&["-P".to_string(), "22".to_string()]));
         assert!(ssh.ends_with(&["-p".to_string(), "22".to_string()]));
     }
@@ -4423,6 +4542,44 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&data_dir),
+            ..Default::default()
+        };
+        cfg.claude.config_dir =
+            ConfigDir::Custom(crate::config::ConfigPath::new(root.path().join("missing")));
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: vec!["ripgrep".to_string()],
+            post_install: Some(root.path().join("setup.sh")),
+            image: ImageName::new("default").unwrap(),
+            guest_user: crate::guest::GuestUser::default(),
+            builder_timeout: None,
+        };
+
+        let error = LimaBackend::new()
+            .setup(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("claude.config_dir"), "{error}");
+        assert!(
+            !data_dir.exists(),
+            "setup must not create the data directory"
+        );
     }
 
     #[test]
@@ -6814,6 +6971,7 @@ url = "https://example.com/m"
                 port: NonZeroU16::new(22).unwrap(),
                 user: SshUser::new("ubuntu").unwrap(),
                 key_path: "/unused-test-key".into(),
+                host_tools: SshHostToolsConfig::default(),
             },
             env,
         }
@@ -6844,7 +7002,17 @@ url = "https://example.com/m"
         let session = forwarding_session(&entries);
         let ssh = session.command(&[], "/usr/bin/env -0").unwrap();
         let host_env: Vec<_> = ssh.get_envs().collect();
-        assert_eq!(host_env.len(), entries.len());
+        assert_eq!(host_env.len(), entries.len() + 2);
+        assert!(
+            host_env.iter().any(|(key, value)| {
+                *key == "LANG" && *value == Some(std::ffi::OsStr::new("C"))
+            })
+        );
+        assert!(
+            host_env.iter().any(|(key, value)| {
+                *key == "LC_ALL" && *value == Some(std::ffi::OsStr::new("C"))
+            })
+        );
         for (index, (_, value)) in entries.iter().enumerate() {
             let alias = format!("COOP_SSH_ENV_{index}");
             assert!(
@@ -6942,6 +7110,12 @@ url = "https://example.com/m"
             port: NonZeroU16::new(2222).unwrap(),
             user: SshUser::new("root").unwrap(),
             key_path: fixture.join("client"),
+            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&fixture.join("bin/ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
         };
         let output = session
             .command(&[], "/usr/bin/env -0")
@@ -6958,6 +7132,7 @@ url = "https://example.com/m"
             assert_eq!(actual.get(name), Some(&value));
         }
         assert!(!actual.contains_key("COOP_SSH_ENV_1"));
+        assert!(!actual.contains_key("COOP_AMBIENT_SENTINEL"));
 
         // Force a PTY even when the CI runner has no local terminal. The bash
         // expression also checks preservation of the fixture account's shell.

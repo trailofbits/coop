@@ -142,6 +142,48 @@ impl PrivateDir {
         Ok(writable)
     }
 
+    /// Pin a managed disk's identity without requiring read access to root-owned data.
+    pub(crate) fn pin_existing_regular(&self, name: &OsStr) -> Result<Option<File>> {
+        #[cfg(target_os = "linux")]
+        let access = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let access = libc::O_RDONLY;
+        let file = match open_file_at(
+            &self.file,
+            &child_name(name)?,
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_file() || metadata.nlink() != 1 || !trusted_disk_owner(metadata.uid(), uid)
+        {
+            bail!("Managed disk must be a singly linked owned regular file");
+        }
+        Ok(Some(file))
+    }
+
+    /// Check whether this directory entry still names the pinned regular file.
+    pub(crate) fn names_file(&self, name: &OsStr, file: &File) -> Result<bool> {
+        let entry = match stat_child_at(&self.file, &child_name(name)?) {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let original = file.metadata()?;
+        #[cfg(target_os = "macos")]
+        let device = u64::try_from(entry.st_dev)?;
+        #[cfg(not(target_os = "macos"))]
+        let device = entry.st_dev;
+        Ok(entry.st_mode & libc::S_IFMT == libc::S_IFREG
+            && device == original.dev()
+            && entry.st_ino == original.ino())
+    }
+
     fn open_checked_regular(&self, name: &OsStr, access: libc::c_int) -> Result<File> {
         let name = child_name(name)?;
         let file = open_file_at(
@@ -497,6 +539,10 @@ fn check_user_regular(file: &File) -> Result<()> {
         bail!("Private storage requires an owned regular file with one link");
     }
     Ok(())
+}
+
+fn trusted_disk_owner(owner: u32, current_uid: u32) -> bool {
+    owner == current_uid || owner == 0
 }
 
 #[derive(Clone, Copy)]
@@ -969,6 +1015,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disk_identity_accepts_only_root_or_current_owner() {
+        assert!(trusted_disk_owner(0, 1000));
+        assert!(trusted_disk_owner(1000, 1000));
+        assert!(!trusted_disk_owner(1001, 1000));
+        assert!(!trusted_disk_owner(1000, 0));
+    }
+
+    #[test]
+    fn pin_existing_regular_distinguishes_missing_from_open_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = PrivateDir::open_existing(root.path()).unwrap();
+        assert!(
+            directory
+                .pin_existing_regular(OsStr::new("missing"))
+                .unwrap()
+                .is_none()
+        );
+        let too_long = "x".repeat(4096);
+        assert!(
+            directory
+                .pin_existing_regular(OsStr::new(&too_long))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_identity_does_not_require_read_access() {
+        let root = tempfile::tempdir().unwrap();
+        let disk = root.path().join("disk");
+        fs::write(&disk, "private disk").unwrap();
+        fs::set_permissions(&disk, fs::Permissions::from_mode(0o000)).unwrap();
+        let directory = PrivateDir::open_existing(root.path()).unwrap();
+        let pinned = directory
+            .pin_existing_regular(OsStr::new("disk"))
+            .unwrap()
+            .unwrap();
+        // SAFETY: geteuid has no preconditions; root can bypass the permission fixture.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(File::open(&disk).is_err());
+        }
+        assert!(directory.names_file(OsStr::new("disk"), &pinned).unwrap());
+        fs::remove_file(&disk).unwrap();
+        fs::write(&disk, "replacement").unwrap();
+        assert!(!directory.names_file(OsStr::new("disk"), &pinned).unwrap());
+    }
+
+    #[test]
     fn sparse_copy_preserves_contents_and_holes() {
         let root = tempfile::tempdir().unwrap();
         let source = fs::OpenOptions::new()
@@ -1292,7 +1386,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone allow add_file"])
                 .arg(root.path())
                 .status()
@@ -1301,7 +1395,7 @@ mod tests {
         );
         assert!(private_dir(&root.path().join("private")).is_err());
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .arg("-N")
                 .arg(root.path())
                 .status()
@@ -1309,7 +1403,7 @@ mod tests {
                 .success()
         );
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone deny delete"])
                 .arg(root.path())
                 .status()
@@ -1320,7 +1414,7 @@ mod tests {
         let file = root.path().join("private/state.json");
         fs::write(&file, "canary").unwrap();
         assert!(
-            Command::new("chmod")
+            Command::new("/bin/chmod")
                 .args(["+a", "everyone allow read"])
                 .arg(&file)
                 .status()
@@ -1328,7 +1422,11 @@ mod tests {
                 .success()
         );
         crate::private_storage::private_file(&file).unwrap();
-        let listing = Command::new("ls").arg("-le").arg(&file).output().unwrap();
+        let listing = Command::new("/bin/ls")
+            .arg("-le")
+            .arg(&file)
+            .output()
+            .unwrap();
         assert!(listing.status.success());
         assert!(!String::from_utf8_lossy(&listing.stdout).contains("allow read"));
         assert_eq!(fs::read_to_string(&file).unwrap(), "canary");

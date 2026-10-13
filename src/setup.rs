@@ -41,6 +41,59 @@ pub struct SetupOptions {
     pub builder_timeout: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitSetupInputSupport {
+    Supported,
+    #[cfg(any(target_os = "macos", test))]
+    UnsupportedByLima,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT: ExplicitSetupInputSupport =
+    ExplicitSetupInputSupport::UnsupportedByLima;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) const PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT: ExplicitSetupInputSupport =
+    ExplicitSetupInputSupport::Supported;
+
+pub(crate) fn validate_explicit_setup_inputs<T>(
+    support: ExplicitSetupInputSupport,
+    extra_packages: &[String],
+    post_install: Option<&T>,
+) -> Result<()> {
+    if support == ExplicitSetupInputSupport::Supported {
+        return Ok(());
+    }
+
+    let mut unsupported = Vec::new();
+    if !extra_packages.is_empty() {
+        unsupported.push("--extra-packages");
+    }
+    if post_install.is_some() {
+        unsupported.push("--post-install");
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    let options = unsupported.join(" and ");
+    bail!(
+        "setup {kind} {options} {verb} not supported by the Lima backend; \
+         {pronoun} available only on Linux/Firecracker",
+        kind = if unsupported.len() == 1 {
+            "option"
+        } else {
+            "options"
+        },
+        verb = if unsupported.len() == 1 { "is" } else { "are" },
+        pronoun = if unsupported.len() == 1 {
+            "it is"
+        } else {
+            "they are"
+        },
+    )
+}
+
 /// Persisted template configuration (profiles, packages, hashes).
 ///
 /// `guest_user` is set at setup time and immutable for the image's
@@ -104,7 +157,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
     check_host_requirements()?;
-    install_system_packages(opts.skip_confirm)?;
+    install_system_packages(cfg, opts.skip_confirm)?;
     ensure_kvm_access(opts.skip_confirm)?;
     install_firecracker(cfg, opts.skip_confirm)?;
     fetch_kernel(cfg, opts.skip_confirm)?;
@@ -170,7 +223,13 @@ pub fn create_instance(
 
 /// Resize a stopped Firecracker instance's rootfs.
 #[cfg(target_os = "linux")]
-pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
+pub fn resize_rootfs(
+    stopped: &crate::backend::StoppedInstance,
+    new_size: crate::config::GiB,
+) -> Result<()> {
+    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let inst = stopped.instance();
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
         bail!("Instance rootfs not found at {}", rootfs.display(),);
@@ -179,28 +238,27 @@ pub fn resize_rootfs(inst: &Instance, new_size: crate::config::GiB) -> Result<()
     let current_bytes = std::fs::metadata(&rootfs)
         .with_context(|| format!("Failed to stat {}", rootfs.display()))?
         .len();
-    let current_gib = current_bytes / (1024 * 1024 * 1024);
-    let new_gib = u64::from(new_size.as_u32());
+    let requested_bytes = u64::from(new_size.as_u32()) * GIB_BYTES;
 
-    if new_gib < current_gib {
+    if requested_bytes < current_bytes {
         bail!(
-            "Shrinking is not supported (current: {current_gib} GiB, \
-             requested: {new_gib} GiB)"
+            "Shrinking is not supported (current image: {current_bytes} bytes, \
+             requested: {requested_bytes} bytes)"
         );
     }
-    if new_gib == current_gib {
-        tracing::info!("Disk is already {current_gib} GiB — nothing to do");
-        return Ok(());
+    if requested_bytes > current_bytes {
+        tracing::info!(
+            "Resizing instance '{}' from {} to {new_size} GiB",
+            inst.name,
+            current_bytes / GIB_BYTES
+        );
+        crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
     }
 
-    tracing::info!(
-        "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
-        inst.name
-    );
-    crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
+    // A previous attempt may have extended the image before ext4 was grown.
     crate::privileged_disk::fsck_fix(&rootfs)?;
     crate::privileged_disk::resize(&rootfs)?;
-    tracing::info!("Resize complete");
+    tracing::info!("Filesystem resize complete");
     Ok(())
 }
 
@@ -1042,7 +1100,7 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_system_packages(skip_confirm: bool) -> Result<()> {
+fn install_system_packages(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     let mut missing = Vec::new();
     let mut missing_tools = Vec::new();
 
@@ -1050,12 +1108,31 @@ fn install_system_packages(skip_confirm: bool) -> Result<()> {
         ("setfacl", "acl"),
         ("unsquashfs", "squashfs-tools"),
         ("mkfs.ext4", "e2fsprogs"),
-        ("ssh", "openssh-client"),
-        ("rsync", "rsync"),
     ] {
         if !command_exists(tool) {
             missing.push(package);
             missing_tools.push(tool);
+        }
+    }
+
+    for (tool, identity, package) in [
+        ("ssh", crate::openssh::OpenSshTool::Ssh, "openssh-client"),
+        ("scp", crate::openssh::OpenSshTool::Scp, "openssh-client"),
+        ("rsync", crate::openssh::OpenSshTool::Rsync, "rsync"),
+    ] {
+        match crate::openssh::prerequisite_available(identity, &cfg.ssh.host_tools) {
+            Ok(true) => {}
+            Ok(false) => {
+                if !missing.contains(&package) {
+                    missing.push(package);
+                }
+                missing_tools.push(tool);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to validate required host transport client '{tool}'")
+                });
+            }
         }
     }
 
@@ -1698,33 +1775,166 @@ fn confirm(action: &str, skip: bool) -> Result<bool> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
+
+    fn setup_options(extra_packages: &[&str], post_install: Option<PathBuf>) -> SetupOptions {
+        SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: extra_packages
+                .iter()
+                .map(|package| (*package).to_string())
+                .collect(),
+            post_install,
+            image: ImageName::new("default").unwrap(),
+            guest_user: GuestUser::default(),
+            builder_timeout: None,
+        }
+    }
+
+    #[test]
+    fn lima_rejects_extra_packages_setup_input() {
+        let opts = setup_options(&["ripgrep"], None);
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--extra-packages"), "{error}");
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("--post-install"), "{error}");
+    }
+
+    #[test]
+    fn lima_rejects_post_install_setup_input() {
+        let opts = setup_options(&[], Some(PathBuf::from("setup.sh")));
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--post-install"), "{error}");
+        assert!(error.contains("Lima backend"), "{error}");
+        assert!(!error.contains("--extra-packages"), "{error}");
+    }
+
+    #[test]
+    fn lima_reports_all_unsupported_setup_inputs() {
+        let opts = setup_options(&["ripgrep"], Some(PathBuf::from("setup.sh")));
+        let error = validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("--extra-packages and --post-install"),
+            "{error}"
+        );
+        assert!(error.contains("Lima backend"), "{error}");
+    }
+
+    #[test]
+    fn lima_accepts_setup_without_explicit_provisioning_inputs() {
+        let opts = setup_options(&[], None);
+        validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::UnsupportedByLima,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn firecracker_accepts_and_consumes_explicit_setup_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let post_install = root.path().join("setup.sh");
+        fs::write(&post_install, "touch /firecracker-input-witness\n").unwrap();
+        let opts = setup_options(&["ripgrep", "fd-find"], Some(post_install));
+
+        validate_explicit_setup_inputs(
+            ExplicitSetupInputSupport::Supported,
+            &opts.extra_packages,
+            opts.post_install.as_ref(),
+        )
+        .unwrap();
+        let (_, extra_packages) = resolve_template_config(&CoopConfig::default(), &opts).unwrap();
+        let post_install = load_post_install(opts.post_install.as_ref()).unwrap();
+
+        assert_eq!(extra_packages, ["ripgrep", "fd-find"]);
+        assert_eq!(
+            post_install.as_deref(),
+            Some("touch /firecracker-input-witness\n")
+        );
+    }
 
     #[test]
     fn system_packages_without_apt() {
         const CHILD: &str = "COOP_TEST_SYSTEM_PACKAGES";
+        const ROOT: &str = "COOP_TEST_SYSTEM_PACKAGES_ROOT";
         if let Ok(scenario) = std::env::var(CHILD) {
-            let result = install_system_packages(true);
-            if scenario == "present" {
-                result.unwrap();
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("Missing host tools: unsquashfs, ssh, rsync."));
-                assert!(error.contains("apt-get, which was not found on PATH"));
-                assert!(error.contains("host's package manager"));
-                assert!(error.contains("rerun `coop setup`"));
+            let root = PathBuf::from(std::env::var(ROOT).unwrap());
+            let mut cfg = CoopConfig::default();
+            cfg.ssh.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&root.join("ssh")),
+                Some(&root.join("scp")),
+                Some(&root.join("rsync")),
+            )
+            .unwrap();
+            let result = install_system_packages(&cfg, true);
+            match scenario.as_str() {
+                "present" => result.unwrap(),
+                "missing" => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains("Failed to validate required host transport client 'ssh'")
+                    );
+                    assert!(error.contains("built-in fallback was not attempted"));
+                    assert!(!error.contains("apt-get"));
+                }
+                "rejected" => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains("Failed to validate required host transport client 'ssh'")
+                    );
+                    assert!(error.contains("writable"), "{error}");
+                    assert!(!error.contains("apt-get"));
+                }
+                other => panic!("unexpected scenario {other}"),
             }
             return;
         }
 
         // Isolate PATH in child processes instead of mutating the test runner's
         // environment. No fixture can invoke a real package manager or sudo.
-        for scenario in ["present", "missing"] {
-            let bin = tempfile::tempdir().unwrap();
+        for scenario in ["present", "missing", "rejected"] {
+            let bin = crate::host_tool::trusted_test_tempdir();
             std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
-            for tool in ["setfacl", "unsquashfs", "mkfs.ext4", "ssh", "rsync"] {
+            for tool in ["setfacl", "unsquashfs", "mkfs.ext4", "ssh", "scp", "rsync"] {
                 if scenario == "present" || matches!(tool, "setfacl" | "mkfs.ext4") {
                     std::os::unix::fs::symlink("/bin/sh", bin.path().join(tool)).unwrap();
+                } else if scenario == "rejected" {
+                    if tool == "ssh" {
+                        fs::write(bin.path().join(tool), "#!/bin/sh\nexit 0\n").unwrap();
+                        fs::set_permissions(
+                            bin.path().join(tool),
+                            fs::Permissions::from_mode(0o777),
+                        )
+                        .unwrap();
+                    } else {
+                        std::os::unix::fs::symlink("/bin/sh", bin.path().join(tool)).unwrap();
+                    }
                 }
             }
             let output = Command::new(std::env::current_exe().unwrap())
@@ -1735,6 +1945,7 @@ mod tests {
                 ])
                 .env("PATH", bin.path())
                 .env(CHILD, scenario)
+                .env(ROOT, bin.path())
                 .output()
                 .unwrap();
             assert!(

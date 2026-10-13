@@ -6,6 +6,8 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_os = "macos"))]
+use crate::cmd::Cmd;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -682,6 +686,152 @@ impl<'de> Deserialize<'de> for ConfigPath {
     }
 }
 
+/// Exact executable path selected by the invocation's trusted coop config.
+///
+/// Unlike [`ConfigPath`], this type deliberately performs no `~` expansion:
+/// privileged host-tool selection must be explicit and absolute. Filesystem
+/// ownership and mode are checked immediately before each use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbsoluteHostToolPath(PathBuf);
+
+impl AbsoluteHostToolPath {
+    fn new(value: &str) -> std::result::Result<Self, String> {
+        if value.is_empty() {
+            return Err("host tool path must not be empty".to_string());
+        }
+        if value.contains('$') || value.split('/').any(|part| part == "~") {
+            return Err("host tool path must not contain shell expansions".to_string());
+        }
+        let path = PathBuf::from(&value);
+        if !path.is_absolute() {
+            return Err("host tool path must be absolute".to_string());
+        }
+        if value != "/"
+            && value
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("host tool path must contain only normal path components".to_string());
+        }
+        if value == "/" {
+            return Err("host tool path must name an executable".to_string());
+        }
+        Ok(Self(path))
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AbsoluteHostToolPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Optional exact paths for the Linux network control-plane tools.
+///
+/// Unknown fields are rejected so a typo cannot silently select the built-in
+/// fallback instead of the operator's intended executable.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkHostToolsConfig {
+    pub sudo: Option<AbsoluteHostToolPath>,
+    pub ip: Option<AbsoluteHostToolPath>,
+    pub bridge: Option<AbsoluteHostToolPath>,
+    pub iptables: Option<AbsoluteHostToolPath>,
+    pub sysctl: Option<AbsoluteHostToolPath>,
+}
+
+/// Optional exact paths for coop-managed OpenSSH transport tools.
+///
+/// Unknown fields are rejected so a typo cannot silently select a built-in
+/// executable instead of the operator's intended path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshHostToolsConfig {
+    pub ssh: Option<AbsoluteHostToolPath>,
+    pub scp: Option<AbsoluteHostToolPath>,
+    pub rsync: Option<AbsoluteHostToolPath>,
+}
+
+impl SshHostToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.ssh.is_none() && self.scp.is_none() && self.rsync.is_none()
+    }
+
+    pub(crate) fn configured(&self) -> impl Iterator<Item = (&'static str, &AbsoluteHostToolPath)> {
+        [
+            ("ssh", self.ssh.as_ref()),
+            ("scp", self.scp.as_ref()),
+            ("rsync", self.rsync.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_exact_paths(
+        ssh: Option<&Path>,
+        scp: Option<&Path>,
+        rsync: Option<&Path>,
+    ) -> std::result::Result<Self, String> {
+        let parse = |path: Option<&Path>| {
+            path.map(|path| {
+                path.to_str()
+                    .ok_or_else(|| "test host-tool path is not UTF-8".to_string())
+                    .and_then(AbsoluteHostToolPath::new)
+            })
+            .transpose()
+        };
+        Ok(Self {
+            ssh: parse(ssh)?,
+            scp: parse(scp)?,
+            rsync: parse(rsync)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshConfig {
+    /// Exact host-tool paths selected only by trusted host configuration.
+    #[serde(default, skip_serializing_if = "SshHostToolsConfig::is_empty")]
+    pub host_tools: SshHostToolsConfig,
+}
+
+impl SshConfig {
+    fn is_empty(&self) -> bool {
+        self.host_tools.is_empty()
+    }
+}
+
+impl NetworkHostToolsConfig {
+    fn is_empty(&self) -> bool {
+        self.sudo.is_none()
+            && self.ip.is_none()
+            && self.bridge.is_none()
+            && self.iptables.is_none()
+            && self.sysctl.is_none()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn configured(&self) -> impl Iterator<Item = (&'static str, &AbsoluteHostToolPath)> {
+        [
+            ("sudo", self.sudo.as_ref()),
+            ("ip", self.ip.as_ref()),
+            ("bridge", self.bridge.as_ref()),
+            ("iptables", self.iptables.as_ref()),
+            ("sysctl", self.sysctl.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
     /// Invocation-only opt-out; never persisted.
@@ -696,6 +846,10 @@ pub struct CoopConfig {
     pub vm: VmConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+
+    /// Coop-managed OpenSSH client configuration.
+    #[serde(default, skip_serializing_if = "SshConfig::is_empty")]
+    pub ssh: SshConfig,
 
     /// SSH port on the guest
     #[serde(default = "default_ssh_port")]
@@ -741,17 +895,26 @@ pub struct CoopConfig {
     #[serde(default)]
     pub guest_env: BTreeMap<crate::guest_env_state::EnvVarName, String>,
 
+    /// Explicit host files and directories copied into the guest at every boot.
+    #[serde(default)]
+    pub guest_files: Vec<crate::guest_files::GuestFile>,
+
     /// User-defined profiles (name -> definition)
     #[serde(default)]
     pub profiles: HashMap<String, CustomProfile>,
 
     /// Shell command to run inside the guest after every successful boot.
     ///
-    /// Executed after the VM is up and SSH is ready, before any interactive
+    /// Executed after SSH, agent bootstrap, workspace/mount provisioning, and creation hooks,
+    /// before any interactive
     /// `shell` / agent launch. A failure is logged at `WARN` and does not
     /// fail the start — a transient hook failure shouldn't strand the VM.
     #[serde(default)]
     pub post_start: Option<String>,
+
+    /// Global guest command run once per newly provisioned VM, after workspace setup.
+    #[serde(default)]
+    pub post_create: Option<String>,
 
     /// Default host:guest port forwards applied to every VM startup.
     ///
@@ -1003,6 +1166,12 @@ pub struct NetworkConfig {
     /// Host network interface for NAT (`"auto"` or a name like `eth0`, `ens5`)
     #[serde(default = "default_host_iface")]
     pub host_iface: HostInterface,
+
+    /// Optional exact Linux host-tool paths. These are selected from the
+    /// invocation's config only; project, guest, and saved instance state do
+    /// not contribute values.
+    #[serde(default, skip_serializing_if = "NetworkHostToolsConfig::is_empty")]
+    pub host_tools: NetworkHostToolsConfig,
 }
 
 /// GitHub authentication mode for the guest VM.
@@ -2095,12 +2264,43 @@ impl CoopConfig {
             }
         }
 
-        if !self.firecracker_bin.exists() && cfg!(target_os = "linux") {
+        if should_warn_about_missing_firecracker(
+            self.firecracker_bin.exists(),
+            cfg!(target_os = "linux"),
+        ) {
             warnings.push(format!(
                 "firecracker_bin '{}' does not exist \
                  (will be installed on setup)",
                 self.firecracker_bin.display()
             ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let policy =
+                crate::host_tool::TrustedToolPolicy::new("/", std::iter::empty::<PathBuf>(), 0);
+            for (name, path) in self.network.host_tools.configured() {
+                if let Err(error) =
+                    crate::host_tool::resolve_exact_host_tool(name, path.as_path(), &policy)
+                {
+                    errors.push(format!(
+                        "network.host_tools.{name} '{}': {error}",
+                        path.as_path().display()
+                    ));
+                }
+            }
+        }
+
+        let ssh_policy = crate::openssh::configured_tool_policy();
+        for (name, path) in self.ssh.host_tools.configured() {
+            if let Err(error) =
+                crate::host_tool::resolve_exact_host_tool(name, path.as_path(), &ssh_policy)
+            {
+                errors.push(format!(
+                    "ssh.host_tools.{name} '{}': {error}",
+                    path.as_path().display()
+                ));
+            }
         }
 
         if let ConfigDir::Custom(ref path) = self.claude.config_dir
@@ -2306,9 +2506,7 @@ impl CoopConfig {
             // `instances_dir/<name>/`, so the metadata is one file read
             // away. Skipping the full directory walk avoids parsing every
             // other `instance.json` on `coop stop`/`shell`/`destroy`.
-            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str()))
-                && &inst.name == name
-            {
+            if let Ok(inst) = Instance::load(&self.instances_dir().join(name.as_str())) {
                 return Ok(inst);
             }
             // Miss or stale metadata: fall back to the full listing so
@@ -2419,11 +2617,7 @@ impl CoopConfig {
         };
 
         let dir = self.instances_dir().join(name.as_str());
-        match fs::symlink_metadata(&dir) {
-            Ok(_) => bail!("Instance '{name}' already exists"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("Failed to check instance directory"),
-        }
+        classify_instance_dir_probe(&name, fs::symlink_metadata(&dir).map(|_| ()))?;
         let instance = Instance {
             name,
             index,
@@ -2452,6 +2646,7 @@ impl Default for CoopConfig {
             data_dir: default_data_dir(),
             vm: VmConfig::default(),
             network: NetworkConfig::default(),
+            ssh: SshConfig::default(),
             ssh_port: default_ssh_port(),
             firecracker_bin: default_firecracker_bin(),
             github: None,
@@ -2462,8 +2657,10 @@ impl Default for CoopConfig {
             grok: GrokConfig::default(),
             proxy: ProxyConfig::default(),
             guest_env: BTreeMap::new(),
+            guest_files: Vec::new(),
             profiles: HashMap::new(),
             post_start: None,
+            post_create: None,
             forward_ports: Vec::new(),
             updates: crate::update::UpdateConfig::default(),
         }
@@ -2488,6 +2685,7 @@ impl Default for NetworkConfig {
             host_ip: default_host_ip(),
             subnet_mask: default_subnet_mask(),
             host_iface: default_host_iface(),
+            host_tools: NetworkHostToolsConfig::default(),
         }
     }
 }
@@ -2693,6 +2891,7 @@ impl Instance {
     /// Validates the PID is alive and belongs to a Firecracker process
     /// (guards against PID reuse). Removes stale PID files as a side
     /// effect when the process is gone or belongs to something else.
+    #[mutants::skip] // OS process probe wrapper; Linux process tests exercise it directly
     pub fn is_running(&self) -> bool {
         self.probe_running().unwrap_or_else(|error| {
             tracing::warn!(
@@ -2705,6 +2904,7 @@ impl Instance {
 
     /// Fallible Firecracker state probe for operations that must distinguish
     /// confirmed absence from a failed liveness or identity check.
+    #[mutants::skip] // /proc and kill(2) wrapper; Linux process tests cover its effects
     pub fn probe_running(&self) -> Result<bool> {
         let pid_path = self.pid_file_path();
         let pid_str = match fs::read_to_string(&pid_path) {
@@ -2761,6 +2961,185 @@ impl Instance {
         }
 
         Ok(true)
+    }
+
+    /// Probe Firecracker liveness without treating an uncertain probe
+    /// or an orphaned API socket as a confirmed exit.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        let pid_path = self.pid_file_path();
+        let pid = match fs::read_to_string(&pid_path) {
+            Ok(value) => Some(
+                value
+                    .trim()
+                    .parse::<i32>()
+                    .context("Invalid Firecracker PID file")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to read Firecracker PID file"),
+        };
+
+        if let Some(pid) = pid {
+            if pid <= 0 {
+                bail!("Invalid Firecracker PID file: {pid}");
+            }
+            // EPERM means the root-owned process exists. ESRCH confirms exit,
+            // including when /proc hides other users' processes.
+            let exists = if unsafe { libc::kill(pid, 0) } == 0 {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EPERM) => true,
+                    Some(libc::ESRCH) => false,
+                    _ => return Err(error).context("Failed to probe Firecracker PID"),
+                }
+            };
+            if exists {
+                let cmdline = Cmd::new("cat")
+                    .arg(format!("/proc/{pid}/cmdline"))
+                    .sudo()
+                    .capture()
+                    .context("Failed to inspect Firecracker PID")?;
+                if cmdline.contains("firecracker") {
+                    return Ok(true);
+                }
+            }
+        }
+
+        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        if pid.is_some()
+            && let Err(error) = fs::remove_file(&pid_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove stale Firecracker PID file {} (non-fatal): {error}",
+                pid_path.display()
+            );
+        }
+        Ok(false)
+    }
+}
+
+/// Confirm that the root-owned Firecracker API socket is no longer accepting
+/// connections. An unprivileged connect sees `EACCES` for both live and stale
+/// mode-0755 sockets, so it cannot safely distinguish those states.
+#[cfg(not(target_os = "macos"))]
+fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => bail!(
+            "Firecracker API socket path is not a Unix socket: {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+    }
+
+    let output = Cmd::new(crate::privileged_disk::running_executable_path())
+        .arg("__probe-firecracker-socket")
+        .arg(socket_path)
+        .sudo()
+        .output()
+        .context("Failed to run privileged Firecracker API socket probe")?;
+    if !output.status.success() {
+        bail!(
+            "Privileged Firecracker API socket probe failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Run in the privileged helper so permission denial cannot mask a listener.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_firecracker_api_socket(socket_path: &Path) -> Result<()> {
+    classify_firecracker_socket_probe(connect_firecracker_api_socket(socket_path))
+}
+
+#[cfg(target_os = "linux")]
+fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(socket_path.as_os_str().as_bytes())?;
+    // SAFETY: sockaddr_un is a plain C struct; zeroing terminates sun_path.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family =
+        libc::sa_family_t::try_from(libc::AF_UNIX).map_err(std::io::Error::other)?;
+    if path.as_bytes_with_nul().len() > address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Firecracker API socket path is too long",
+        ));
+    }
+    // SAFETY: the checked destination holds the entire NUL-terminated path.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path.as_ptr().cast::<u8>(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path.as_bytes_with_nul().len(),
+        );
+    }
+    // Nonblocking connect returns EAGAIN for a full accept queue rather than
+    // waiting indefinitely. Only ENOENT/ECONNREFUSED can authorize cleanup.
+    // SAFETY: socket creates a new descriptor with these Linux flags.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful socket call returns a newly owned descriptor.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let address_len = libc::socklen_t::try_from(std::mem::size_of_val(&address))
+        .map_err(std::io::Error::other)?;
+    // SAFETY: the initialized sockaddr_un and its length are valid; socket
+    // owns the descriptor until after connect returns, including on error.
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            address_len,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
+    match connection {
+        Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
+    }
+}
+
+fn should_warn_about_missing_firecracker(path_exists: bool, is_linux: bool) -> bool {
+    !path_exists && is_linux
+}
+
+fn classify_instance_dir_probe(name: &InstanceName, result: std::io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => bail!("Instance '{name}' already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("Failed to check instance directory"),
     }
 }
 
@@ -3159,6 +3538,79 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn firecracker_socket_probe_rejects_live_socket() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
+    }
+
+    #[test]
+    fn firecracker_socket_probe_classifies_connect_errors() {
+        assert!(classify_firecracker_socket_probe(Ok(())).is_err());
+        for errno in [libc::ECONNREFUSED, libc::ENOENT] {
+            classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                .unwrap();
+        }
+        for errno in [
+            libc::EAGAIN,
+            libc::ETIMEDOUT,
+            libc::EACCES,
+            libc::EINPROGRESS,
+        ] {
+            assert!(
+                classify_firecracker_socket_probe(Err(std::io::Error::from_raw_os_error(errno)))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_api_path() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_confirms_exited_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
+        assert!(!inst.probe_liveness().unwrap());
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_invalid_pid() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.pid_file_path(), "invalid").unwrap();
+        assert!(inst.probe_liveness().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_recognizes_running_firecracker() {
+        let tmp = TempDir::new().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_firecracker_like();
+        wait_for_firecracker_cmdline(child.id());
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let result = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
         let tmp = TempDir::new().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
@@ -3298,6 +3750,30 @@ mod tests {
             .allocate_instance(Some(&iname("dupe")), &default_img(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn instance_directory_probe_classifies_every_result() {
+        let name = iname("probe");
+
+        let exists = classify_instance_dir_probe(&name, Ok(())).unwrap_err();
+        assert!(exists.to_string().contains("already exists"), "{exists:#}");
+
+        classify_instance_dir_probe(
+            &name,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .unwrap();
+
+        let denied = classify_instance_dir_probe(
+            &name,
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{denied:#}").contains("Failed to check instance directory"),
+            "{denied:#}"
+        );
     }
 
     #[test]
@@ -4681,6 +5157,198 @@ skip = ["not-a-slug"]
     }
 
     #[test]
+    fn network_host_tool_paths_parse_exact_absolute_values_and_roundtrip() {
+        let source = r#"
+[network.host_tools]
+sudo = "/run/wrappers/bin/sudo"
+ip = "/run/current-system/sw/bin/ip"
+bridge = "/run/current-system/sw/bin/bridge"
+iptables = "/run/current-system/sw/bin/iptables"
+sysctl = "/run/current-system/sw/bin/sysctl"
+"#;
+        let cfg: CoopConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            cfg.network.host_tools.sudo.as_ref().unwrap().as_path(),
+            Path::new("/run/wrappers/bin/sudo")
+        );
+        assert_eq!(
+            cfg.network.host_tools.ip.as_ref().unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/ip")
+        );
+
+        let parsed: CoopConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.network.host_tools.iptables.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/iptables")
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_paths_parse_all_identities_and_roundtrip() {
+        let source = r#"
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+"#;
+        let cfg: CoopConfig = toml::from_str(source).unwrap();
+        assert_eq!(
+            cfg.ssh.host_tools.ssh.as_ref().unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/ssh")
+        );
+        let parsed: CoopConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            parsed.ssh.host_tools.scp.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/scp")
+        );
+        assert_eq!(
+            parsed.ssh.host_tools.rsync.unwrap().as_path(),
+            Path::new("/run/current-system/sw/bin/rsync")
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_empty_state_and_configured_entries_are_exact() {
+        let empty = SshHostToolsConfig::default();
+        assert!(empty.is_empty());
+        assert!(SshConfig::default().is_empty());
+        assert_eq!(empty.configured().count(), 0);
+
+        for (field, expected_name) in [("ssh", "ssh"), ("scp", "scp"), ("rsync", "rsync")] {
+            let source = format!("[ssh.host_tools]\n{field} = \"/trusted/{field}\"\n");
+            let cfg: CoopConfig = toml::from_str(&source).unwrap();
+            assert!(!cfg.ssh.host_tools.is_empty());
+            assert!(!cfg.ssh.is_empty());
+            let configured = cfg.ssh.host_tools.configured().collect::<Vec<_>>();
+            assert_eq!(configured.len(), 1);
+            assert_eq!(configured[0].0, expected_name);
+            assert_eq!(
+                configured[0].1.as_path(),
+                Path::new(&format!("/trusted/{field}"))
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_omits_empty_ssh_table() {
+        let serialized = toml::to_string(&CoopConfig::default()).unwrap();
+        assert!(!serialized.contains("[ssh]"), "{serialized}");
+    }
+
+    #[test]
+    fn validate_rejects_an_unusable_configured_ssh_tool() {
+        let mut cfg = CoopConfig::default();
+        cfg.ssh.host_tools.ssh =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/ssh-tools/ssh").unwrap());
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("ssh.host_tools.ssh"), "{error}");
+        assert!(
+            error.contains("/coop-test-missing/ssh-tools/ssh"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ssh_host_tool_table_rejects_unknown_fields() {
+        let error = toml::from_str::<CoopConfig>("[ssh.host_tools]\nssh_typo = \"/usr/bin/ssh\"\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn network_host_tool_paths_reject_ambiguous_or_non_absolute_values() {
+        for value in [
+            "ip",
+            "~/bin/ip",
+            "/usr/../bin/ip",
+            "/usr/./bin/ip",
+            "/usr//bin/ip",
+            "/usr/bin/$TOOL",
+            "",
+            "/",
+        ] {
+            let source = format!("[network.host_tools]\nip = {value:?}\n");
+            let error = toml::from_str::<CoopConfig>(&source).unwrap_err();
+            assert!(
+                error.to_string().contains("host tool path"),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_host_tool_table_rejects_unknown_fields() {
+        let error = toml::from_str::<CoopConfig>(
+            "[network.host_tools]\niptables_typo = \"/usr/sbin/iptables\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `iptables_typo`"));
+    }
+
+    #[test]
+    fn network_host_tool_paths_deserialize_from_json() {
+        let cfg: CoopConfig =
+            serde_json::from_str(r#"{"network":{"host_tools":{"sudo":"/run/wrappers/bin/sudo"}}}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.network.host_tools.sudo.as_ref().unwrap().as_path(),
+            Path::new("/run/wrappers/bin/sudo")
+        );
+    }
+
+    #[test]
+    fn network_host_tool_empty_state_and_configured_entries_are_exact() {
+        let empty = NetworkHostToolsConfig::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.configured().count(), 0);
+
+        for (field, expected_name) in [
+            ("sudo", "sudo"),
+            ("ip", "ip"),
+            ("bridge", "bridge"),
+            ("iptables", "iptables"),
+            ("sysctl", "sysctl"),
+        ] {
+            let source = format!("[network.host_tools]\n{field} = \"/trusted/{field}\"\n");
+            let cfg: CoopConfig = toml::from_str(&source).unwrap();
+            assert!(!cfg.network.host_tools.is_empty());
+            let configured = cfg.network.host_tools.configured().collect::<Vec<_>>();
+            assert_eq!(configured.len(), 1);
+            assert_eq!(configured[0].0, expected_name);
+            assert_eq!(
+                configured[0].1.as_path(),
+                Path::new(&format!("/trusted/{field}"))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_an_unusable_configured_host_tool() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("network.host_tools.ip"), "{error}");
+        assert!(
+            error.contains("/coop-test-missing/network-tools/ip"),
+            "{error}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn validate_does_not_probe_linux_host_tool_paths_on_other_platforms() {
+        let mut cfg = CoopConfig::default();
+        cfg.network.host_tools.ip =
+            Some(AbsoluteHostToolPath::new("/coop-test-missing/network-tools/ip").unwrap());
+
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn load_unknown_fields_ignored() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
@@ -5131,6 +5799,14 @@ skip = ["not-a-slug"]
             !warnings.iter().any(|w| w.contains("firecracker_bin")),
             "firecracker_bin warning must be gated on Linux, got {warnings:?}"
         );
+    }
+
+    #[test]
+    fn missing_firecracker_warning_requires_linux_and_an_absent_path() {
+        assert!(should_warn_about_missing_firecracker(false, true));
+        assert!(!should_warn_about_missing_firecracker(true, true));
+        assert!(!should_warn_about_missing_firecracker(false, false));
+        assert!(!should_warn_about_missing_firecracker(true, false));
     }
 
     // Pins `!parent.as_os_str().is_empty()`: a bare relative `data_dir`

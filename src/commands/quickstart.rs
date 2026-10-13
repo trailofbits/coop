@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::lifecycle::{allocate_and_start, find_workspace_instance};
-use super::{StartOpts, cmd_start, open_ssh_session, prepend_binary};
+use super::{StartOpts, cmd_start, open_agent_session, prepend_binary};
 use crate::backend::VmBackend as _;
 use crate::{backend, config, guest, prompt, setup, signal, ssh};
 
@@ -60,6 +60,7 @@ pub(crate) fn cmd_quickstart(
 
     let inst = match existing {
         Some(inst) if be.is_running(&inst) => {
+            crate::commands::lifecycle::resume_running_creation(be, cfg, &inst)?;
             tracing::info!("Reusing running instance '{}'", inst.name);
             inst
         }
@@ -90,7 +91,7 @@ pub(crate) fn cmd_quickstart(
         None => quickstart_fresh_start(be, cfg, config_path, &image, workspace_dir.as_deref())?,
     };
 
-    let sess = open_ssh_session(be, cfg, Some(&inst.name))?;
+    let sess = open_agent_session(be, cfg, Some(&inst.name))?;
     let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
     ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
 }

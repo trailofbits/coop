@@ -89,6 +89,11 @@ user launched it.
   `git status --porcelain` from the guest. Today this only gates control flow /
   is printed to the user — it is never fed into `sh -c` on the host. Keep it
   that way.
+- **Global creation commands.** `post_create` becomes a private guest script
+  sent over SSH stdin; it never becomes host shell source. Selected recipes may
+  contain secrets, so `creation.json` is owner-only and debug output redacts
+  commands. Creation commands have the guest user's existing environment and
+  sudo access; failure gates agent launch, not shell/exec access for debugging.
 - **Downloaded update artifacts.** `update.rs` tarball + `SHA256SUMS` from the
   release host — gated by checksum and (best-effort) Sigstore attestation.
 
@@ -116,7 +121,42 @@ host execution authority. Record which consumer interprets each file and what
 authority that interpretation grants; explicit transfer opt-in does not by
 itself authorize host execution.
 
+The Linux network control-plane family is one narrow implementation of this
+contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
+from exact absolute paths. Unset fields use candidates under `/usr/bin`,
+`/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
+under those roots. The invocation-selected config can replace an identity with
+one exact path for non-FHS layouts; an override never falls back to built-ins.
+Both forms validate every actually traversed path component and symlink hop and
+require root ownership, a regular executable target, and no group/other write
+bits. Configured paths establish filesystem control only, not package, hash,
+basename, or command-semantic identity. Coop executes the selected absolute
+spelling (preserving alternatives/multi-call argv[0]),
+clears the launcher environment, supplies only `LANG=C` and `LC_ALL=C`, and
+sets cwd to `/`. Elevated commands use both the resolved absolute `sudo` and
+resolved absolute target. `sudo` may rebuild the elevated command's environment
+or cwd according to trusted sudoers/plugins; the guarantee here is the bounded
+context supplied to `sudo`, not an exact post-policy root environment.
+
+This remains pathname-based validation followed by pathname-based execution;
+it does not pin an inode, validate an executable's loader/library closure, or
+close inherited file descriptors. It also does not cover other host subprocess
+families. Exact overrides are re-resolved from the current config on every
+operation and are never persisted into instance state.
+
 ## Secrets and how they cross into the guest
+
+`[[guest_files]]` explicitly authorizes copying complete host source trees into
+the guest, including any credentials in those trees. Each boot stages private
+copies before VM startup. Source links are materialized only within declared
+source roots; cycles, dangling links, and special files fail staging. Source
+components are opened relative to pinned directory descriptors without following
+symlinks; copying reads the validated file descriptor. Sources containing the
+staging directory are rejected. Destinations
+are guest paths, never inputs to host filesystem writes. Guest copying rejects
+symlinks and live-mount overlaps and does not delete unmatched guest files.
+These opt-in copies are separate from the agent allowlists and proxy filtering;
+users must select sources that contain only data they intend to expose.
 
 coop relays several secrets from the host into the guest: `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, `XAI_API_KEY`, `GITHUB_TOKEN`/PAT, `CLAUDE_CODE_OAUTH_TOKEN`, arbitrary
@@ -230,17 +270,35 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 ## SSH boundary
 
+- Every coop-owned `ssh`, `scp`, and rsync-with-SSH launch resolves a validated
+  absolute executable from fixed system candidates or an exact
+  `[ssh.host_tools]` setting. The child environment is cleared and rebuilt with
+  `LANG=C` and `LC_ALL=C`, plus only generated `COOP_SSH_ENV_*` aliases or the
+  normalized interactive `TERM` value required by that invocation. Managed
+  clients run from `/` and pass `-F none`, so neither user nor system SSH
+  configuration contributes proxy commands, local commands, environment
+  forwarding, identities, agents, canonicalization, or forwards. Forwarding
+  is disabled unless the call site constructs a specific coop port or proxy
+  forward. The `ssh coop-<name>` alias written for an operator is not a
+  coop-owned process and remains subject to the operator's SSH configuration.
+- An exact host-tool setting authorizes only the validated filesystem identity:
+  coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
+  semantics. Resolution is pathname-based and does not pin an executable
+  descriptor or its dynamic-loader closure.
 - coop connects to the guest with `StrictHostKeyChecking=no`,
-  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`
-  (`backend.rs:SshTarget::transport_opts` — the one list `ssh`, `scp`, and
-  rsync's `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
+  `UserKnownHostsFile=/dev/null`, `IdentitiesOnly=yes`,
+  `ForwardAgent=no`, and `IdentityAgent=none`
+  (`openssh.rs:authority_options` — the one list `ssh`, `scp`, and rsync's
+  `-e` all derive from — and `workspace.rs:ssh_config_block`). coop's
   own transports add `BatchMode=yes`, so a rejected key fails instead of
   falling back to a password prompt; the `~/.ssh/config` block written for the
   user's own `ssh coop-<name>` deliberately does not. This is
   deliberate: guest keys are ephemeral and regenerated per VM, so there is no
   stable host key to pin. The trade-off is that a MITM on the path to the guest
   is not detected — acceptable because that path is loopback / a local TAP link
-  to a VM the host itself owns.
+  to a VM the host itself owns. Coop-owned transports disable host agent use
+  and forwarding; generated SSH config blocks set the same options for aliases,
+  subject to OpenSSH configuration precedence for the user-owned file.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
@@ -258,6 +316,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   TAP, enables `ip_forward`, and adds a `MASQUERADE` + `FORWARD` ruleset so the
   guest reaches the internet through the host's default interface. A change
   that widens guest egress or adds inbound reachability is a finding.
+- Firecracker setup resolves all five required network-tool identities before
+  default-interface discovery or the first network mutation. Teardown resolves
+  only the tools needed for each cleanup category, logs unavailable best-effort
+  categories, and never falls back to ambient `PATH`.
 - **Guest VMs cannot reach each other by IP.** All Firecracker guests share
   `br0` and a single subnet, so this is enforced, not structural, and it takes
   **two** complementary controls — removing either one re-opens the path:
@@ -384,20 +446,32 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 Self-update (`update.rs`) must preserve, in order:
 
-1. Metadata from the pinned `trailofbits/coop` GitHub repo (compile-time const).
-2. `normalize_tag` — the version tag is validated as semver **before** it enters
-   the API URL path (path-traversal guard).
+1. Metadata from the fixed
+   `https://api.github.com/repos/trailofbits/coop/releases` identity. Official
+   builds reject the retired runtime origin override before network I/O; the
+   background check applies the same policy.
+2. The requested or returned tag must be canonical `v`-prefixed semver. Before
+   an asset download, metadata entries for the platform archive, `SHA256SUMS`,
+   and optional `attestations.jsonl` are independently bound to the exact
+   `https://github.com/trailofbits/coop/releases/download/<tag>/<filename>`
+   identity. Userinfo, ports, queries, fragments, encoded separators, path
+   ambiguity, lookalike names, and conflicting duplicates are rejected.
 3. **Mandatory checksum.** The `SHA256SUMS` asset must be present (install is
    refused otherwise) and every downloaded tarball is verified against it
    (`verify_sha256`, constant-size `Sha256Hash` compare).
 4. **Best-effort attestation.** `gh attestation verify --repo trailofbits/coop
    --bundle attestations.jsonl` (Sigstore provenance), against the bundle asset
-   downloaded from the same release.
+   downloaded from the same release. Both `update.rs` and `install.sh` also
+   require `--cert-identity
+   https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<tag>`,
+   `--source-ref refs/tags/<tag>`, and `--deny-self-hosted-runners` on both the
+   bundle and API paths. The signer must be the release workflow at the exact
+   selected tag, attesting on a GitHub-hosted runner.
 
    `--bundle` means **no attestations-API call and no credential** — `gh` marks
    the flag `DisableAuthCheckFlag`, so no token or `gh auth login` is needed.
    The bundle asset is fetched with a deliberately unauthenticated request
-   (`curl_download(url, dest, None)` in `update.rs`, `download_bundle` in
+   (`curl_download(asset, dest, None)` in `update.rs`, `download_bundle` in
    `install.sh`) rather than through `download_asset` / `gh release download`,
    which would re-attach the very credential this transport exists to avoid — a
    SAML-restricted token would then 403 on the fetch and drop the chain back to
@@ -413,8 +487,8 @@ Self-update (`update.rs`) must preserve, in order:
    - **The bundle path accepts a superset.** The API path only returns
      attestations registered in the repo's attestation store, so minting one
      requires `attestations: write`. The `--bundle` path accepts any
-     correctly-signed bundle sitting in a release, which requires only
-     `contents: write`.
+     correctly-signed bundle satisfying the signer/ref/runner policy sitting
+     in a release, whose publication requires only `contents: write`.
    - **The bundle path is unrevocable.** `DELETE
      /orgs/{org}/attestations/digest/{digest}` exists, Fulcio certificates
      carry no CRL or OCSP, and nothing in `gh`'s verification path consults a
@@ -422,14 +496,12 @@ Self-update (`update.rs`) must preserve, in order:
      indefinitely after the attestation is deleted.
 
    What still defeats a substituted bundle is the **subject-digest binding** —
-   `gh` digests the artifact and requires a matching subject. `--repo
-   trailofbits/coop` pins the source repository and constrains the signer SAN
-   to that repo, but not to a specific workflow file or ref: any workflow on
-   any ref in `trailofbits/coop` holding `id-token: write` +
-   `attestations: write` mints a bundle that satisfies it. `--signer-workflow`
-   / `--cert-identity` are the tighter pin and neither client passes one — the
-   API path is keyed by digest against the same repo-scoped store and is
-   equally unpinned there.
+   `gh` digests the artifact and requires a matching subject. Repository-only
+   verification could accept another workflow or ref in the same repository;
+   the exact certificate identity and source-ref checks reject those on both
+   verification paths. These checks pin a tag name, not an immutable commit
+   digest: moving a tag and rerunning the release workflow is not prevented
+   by this policy.
 
    A release that publishes no bundle asset — or one whose download fails, or
    whose bundle is empty — falls back to the API path, where `gh` requires a
@@ -444,17 +516,19 @@ Self-update (`update.rs`) must preserve, in order:
    API — that is no stricter on integrity, but a digest mismatch, a corrupt
    download and an unusable `gh` all surface here, and switching transports
    would mask them. Skipped with a logged note if `gh` is absent, and skipped
-   entirely when `COOP_UPDATE_API_BASE_URL` is overridden (test mode). So
+   in the separately compiled test-source build unless the updater integration
+   suite sets `COOP_UPDATE_TEST_VERIFY_ATTESTATION=1` to exercise verification
+   against its loopback fixture. Official builds cannot construct that source. So
    provenance is *not* guaranteed on hosts without `gh` — checksum is the
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
 
-`COOP_UPDATE_API_BASE_URL` redirects the update origin **and** disables
-attestation; the checksum then only proves integrity against *that* server's own
-`SHA256SUMS`, giving no provenance. Only the pinned `github.com` default +
-attestation provide provenance. Flag any change that widens where that override
-is honored, or that softens any step above.
+Production curl transfers restrict both initial and redirected protocols to
+HTTPS and retain curl's default refusal to forward authorization headers across
+hosts. `install.sh` remains a separate update path with its own policy. Flag any
+change that makes a production update source runtime-selectable or softens any
+step above.
 
 ## Documented, accepted trade-offs
 

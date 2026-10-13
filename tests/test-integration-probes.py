@@ -28,6 +28,52 @@ def shell(script, **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_grok_binary_requirement_tracks_rebuilt_image(self):
+        fixture = functions("test_grok_bin_path") + '''
+            pass() { pass_count=$((pass_count + 1)); }
+            fail() { fail_count=$((fail_count + 1)); }
+            skip() { skip_count=$((skip_count + 1)); }
+            guest_exec() {
+                case "$*" in
+                    "test -x /home/ubuntu/.grok/bin/grok") [[ "$PRESENT" == 1 ]];;
+                    "readlink /usr/local/bin/grok") echo /home/ubuntu/.grok/bin/grok;;
+                    "printenv PATH") echo /home/ubuntu/.grok/bin:/usr/bin;;
+                    "test -x /usr/local/bin/grok-yolo") return 0;;
+                    "cat /usr/local/bin/grok-yolo") echo grok --always-approve;;
+                    *) return 99;;
+                esac
+            }
+            coop_exec() {
+                [[ "$#" -eq 2 && "$1" == /home/ubuntu/.grok/bin/grok \
+                    && "$2" == version ]] || return 99
+                printf '%s\\n' "$VERSION"
+                return "$VERSION_STATUS"
+            }
+            pass_count=0; fail_count=0; skip_count=0
+            test_grok_bin_path
+            printf 'COUNTS=%s,%s,%s\\n' "$pass_count" "$fail_count" "$skip_count"
+        '''
+        cases = [
+            ("1", "0", "", "0", "0,1,0"),
+            ("0", "0", "", "0", "0,0,1"),
+            ("1", "1", "", "0", "5,1,0"),
+            ("1", "1", "grok 1.2.3", "0", "6,0,0"),
+            ("1", "1", "grok version 1.2.3-alpha.1", "0", "6,0,0"),
+            ("1", "1", "grok 1.0.46 (2765805b9442)", "0", "6,0,0"),
+            ("1", "1", "1.2.3", "0", "6,0,0"),
+            ("1", "1", "grok 1.2", "0", "5,1,0"),
+            ("1", "1", "Python 3.11.8", "0", "5,1,0"),
+            ("1", "1", "error: latest is 1.2.3", "0", "5,1,0"),
+            ("1", "1", "grok 1.2.3", "1", "5,1,0"),
+        ]
+        for full, present, version, status, expected in cases:
+            with self.subTest(full=full, present=present, version=version,
+                              status=status):
+                result = shell(fixture, FULL=full, PRESENT=present,
+                               VERSION=version, VERSION_STATUS=status)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("COUNTS=" + expected, result.stdout)
+
     def test_codex_installer_requires_complete_pair(self):
         installer = (Path(__file__).parent.parent / "scripts/guest/codex.sh").read_text()
         for download_status, install_status, launch_status, host_status, cli_only_profile in [

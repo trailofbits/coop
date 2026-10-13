@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+### Changed
+
+- Store new 1Password GitHub PATs and proxy credentials as API Credential items
+  instead of Login items. Existing Login retrieval commands remain supported;
+  rotating a token or rerunning proxy setup creates an API Credential replacement
+  with a concealed `password` compatibility field, so the previous lookup still
+  works if saving the new retrieval command fails.
+
+## v0.8.0
+
+### Security
+
+- Disable use and forwarding of the host SSH agent for coop-managed SSH, SCP,
+  rsync, connection multiplexing, and tunnel transports. Generated `coop-*`
+  SSH aliases also set `IdentityAgent none` and `ForwardAgent no`; use
+  `ssh -G coop-<name>` to check whether an earlier user-owned SSH configuration
+  entry overrides those alias settings.
+- Pin installer and updater provenance verification to this repository's
+  release workflow and the selected release tag, and reject attestations from
+  self-hosted runners. The policy applies to both the published attestation
+  bundle and the GitHub API fallback.
+
+### New features
+
+- Add a global `post_create` hook for installing tools or configuring each new
+  VM after workspace provisioning and before `post_start`. coop persists the
+  selected recipe and completion state privately, retains failed VMs for
+  debugging, blocks agent launch until creation succeeds, and retries pending
+  hooks through `up` or `start`. Restore resets progress; reprovisioning also
+  restores the workspace before rerunning the saved recipe.
+- Add repeatable `[[guest_files]]` mappings for copying explicit host files or
+  directories into each VM before agent bootstrap. Copies refresh on creation,
+  restart, and reprovisioning, including with `--no-agents`; retain guest-only
+  files; and use private permissions. Source links are limited to declared
+  roots, and unsafe sources, destinations, overlaps, and special files are
+  rejected before boot.
+
+### Changed
+
+- Run `post_start` after agent bootstrap and copied, cloned, or mounted
+  workspace provisioning. Hooks can now use project files, additional mounts,
+  and freshly minted proxy credentials during creation and reprovisioning.
+
+### Fixed
+
+- `coop stop` now removes a Firecracker instance's TAP after the VM exits,
+  including when Firecracker exited before the stop command.
+- Honor the recorded guest workspace path when `coop push` falls back from
+  rsync to tar extraction. On Lima, refuse that fallback for a live mount so
+  extraction cannot write into the host source.
+
+## v0.7.1
+
+### Fixes
+
+- Accept `e2fsck`'s successful-repair status when resizing a Firecracker disk,
+  so coop continues after filesystem errors are corrected while still rejecting
+  read-only check failures, reboot-required results, combined errors, and
+  signals.
+- Gracefully shut down Firecracker guests over SSH before falling back to
+  `SIGTERM` and `SIGKILL`. This flushes recent filesystem changes on ARM64,
+  where Firecracker does not support the Ctrl-Alt-Delete API action.
+- Restore `nix build .#coop` on macOS and Linux after the private-storage
+  hardening changes.
+- Reject `coop setup --extra-packages` and `--post-install` on Lima instead of
+  silently ignoring them. These options remain supported on Linux/Firecracker.
+
 ## v0.7.0
 
 ### Security
@@ -528,9 +595,9 @@
   `tmux` package is also dropped from the guest base image. Claude
   Code's `claude agents` daemon (`coop claude-agents`) already
   provides session persistence without a terminal multiplexer; users
-  who still want detachable terminals can install tmux themselves via
-  `coop setup --extra-packages tmux` and start it manually inside
-  `coop shell`.
+  who still want detachable terminals can, on Linux/Firecracker, install tmux
+  themselves via `coop setup --extra-packages tmux` and start it manually
+  inside `coop shell`.
 
 - **Devcontainer auto-discovery prompts on `up` / `setup --workspace`**
   (#129, #130, #242) — When the workspace contains

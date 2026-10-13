@@ -4,7 +4,7 @@ coop reads configuration from `~/.coop/config.toml` by default. Pass `--config <
 
 If the file does not exist, coop falls back to built-in defaults. A valid minimal config is an empty file.
 
-A leading `~` is expanded to the home directory in every path-valued field (`data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
+A leading `~` is expanded to the home directory in every path-valued field (`guest_files.source`, `data_dir`, `firecracker_bin`, `vm.kernel_path`, `claude.config_dir`, `codex.config_dir`, `grok.config_dir`, and the `claude.marketplaces` / `codex.marketplaces` / `grok.marketplaces` / `profiles.<name>.marketplaces` lists). The shell does not expand `~` inside config-file values, so coop does it when loading the file.
 
 Run `coop validate` to surface errors and warnings before anything touches a VM.
 
@@ -16,7 +16,9 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
-| `post_start` | string | unset | Shell command run in the guest after every successful boot, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
+| `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
+| `post_create` | string | unset | Global shell command run during VM creation, after workspace provisioning. Successful completion is recorded; failures retain the VM and block agent launch. See [Creation hooks](#creation-hooks). |
+| `post_start` | string | unset | Shell command run in the guest after every successful boot and workspace/mount provisioning, before any interactive `shell` / agent launch. Failure is logged at `WARN` and does not fail startup. Override per invocation with `coop up --post-start <cmd>` or `coop start --post-start <cmd>`. |
 
 ### Private host storage
 
@@ -42,6 +44,112 @@ for custom storage. Extended ACL grants and directory inheritance are removed
 from private directories and user-owned sensitive files. On macOS, ancestor
 ACLs granting write or ownership/control access are rejected. Config edits
 preserve the permissions and ACLs of the directory containing `config.toml`.
+
+## Creation hooks
+
+Set a global `post_create` command in `~/.coop/config.toml` to install tools or
+apply guest configuration to every new VM. This is a top-level field; place it
+before table headers such as `[claude]` or `[[guest_files]]`:
+
+```toml
+post_create = '''
+set -eu
+sudo apt-get update
+sudo apt-get install -y htop
+'''
+```
+
+The command runs inside the VM as the configured guest user, with the same
+forwarded environment as other guest commands and access to passwordless `sudo`.
+It starts in the guest user's home and runs through `sh -c`.
+
+Creation runs in this order:
+
+1. Boot, copy `guest_files`, and bootstrap agents.
+2. Copy or clone the workspace and prepare additional mounts.
+3. Run global `post_create`.
+4. Run `post_start` and allow agent launch.
+
+`--no-agents` skips agent bootstrap but still runs file copies and creation
+commands. Creation hooks do not run while building a golden image with `setup`;
+use image profiles for that purpose.
+
+If a creation command fails or is interrupted, coop returns an error and retains
+the VM. `post_start` waits until creation succeeds. `coop claude`, `coop codex`,
+`coop grok`, and `quickstart` do not launch an agent until setup completes.
+Use `coop shell <name>` or `coop exec <name> -- <command>` to investigate and fix
+guest state. Then repeat `coop up <project>` for a running VM, or stop it and run
+`coop start <name>`. A successful hook is skipped; an unfinished hook retries.
+Concurrent attempts for the same VM are serialized, including file copying and
+bootstrap before the hooks. If those boot prerequisites fail, stop the VM and
+run `coop start` to finish provisioning before retrying creation commands.
+Failed or interrupted commands have their process groups terminated. Successful
+commands can leave background services running.
+
+The selected command and progress are saved in the instance's private
+`creation.json`. Changes to the host config do not replace
+that recipe; recreate the VM to select a new recipe. A deferred `post_start` also
+keeps its original selection until creation finishes; an explicit `--post-start`
+on a restart still overrides it. Ordinary later boots use the existing
+`post_start` selection rules. An already-running VM with completed setup does not
+rerun hooks when you reconnect.
+
+Commands must tolerate retries: interruption after a command succeeds but before
+its success is recorded can cause it to run again. Host-side progress is reset
+before a disk restore. If replacement fails and the original disk is proven unchanged,
+completion is preserved. A missing, replaced, or unverifiable disk keeps the recipe
+pending. Abrupt termination during restore can also leave it pending on the original
+disk. `restore --reprovision` copies the workspace before rerunning the saved recipe.
+Plain `restore` does not copy the workspace; use reprovisioning
+when the restored image does not contain the project files that setup needs.
+Older instances without `creation.json` remain unchanged and do not automatically
+pick up new creation hooks.
+
+## Guest files
+
+Use one `[[guest_files]]` entry per host file or directory that you want to copy
+into every VM. For example, shared agent hooks can live alongside writable guest
+configuration directories without a host mount:
+
+```toml
+[[guest_files]]
+source = "~/.config/agents"
+destination = "~/.config/agents"
+
+[[guest_files]]
+source = "~/dotfiles/gitconfig"
+destination = "~/.gitconfig"
+```
+
+`source` expands `~` to your **host** home. `destination` expands `~/` to the
+configured **guest** user's home, or accepts an absolute guest path. Destinations
+must name a path below `/` or `~/`, without trailing slashes, empty components,
+`.` components, `..` components, or control characters. Parent directories are
+created as the guest user; copying to a location that user cannot write fails.
+
+A directory copies its contents into the exact destination directory; a file
+copies to the exact destination filename. Copies run before agent bootstrap on
+creation, restart, and `restore --reprovision`, including with `--no-agents`.
+Reconnecting to an already-running instance does not copy again. Agent bootstrap
+can subsequently replace files that it manages, such as `~/.codex/config.toml`.
+coop does not rewrite platform-specific paths or commands inside copied files.
+
+Each boot takes a private host snapshot before starting the VM. Copies overwrite
+matching guest files, retain guest-only files, include dotfiles, and ignore no
+files based on `.gitignore`. Removing a mapping or source file does not remove its
+previous guest copy. Copied directories have mode `0700`; files have mode `0600`,
+or `0700` when the source is owner-executable. Guest edits never sync to the host.
+
+Source symlinks are materialized as copies. Their targets must stay within an
+explicitly declared source root; add another mapping when you need to include an
+external target. Missing sources, dangling or cyclic links, and special files
+fail before boot. A source that contains the host staging directory is rejected;
+set `TMPDIR` outside your source directories if needed. Destination mappings cannot overlap each other or live host
+mounts. Existing destination symlinks are rejected instead of followed.
+
+These are explicit copies of everything under each source, including any secrets
+you place there. Select narrow directories. They do not change the agent-specific
+configuration allowlists or the proxy's credential-filtering behavior.
 
 ## GitHub auth
 
@@ -123,8 +231,15 @@ token = "cmd:vault read -field=token secret/coop/github/trailofbits-coop"
 
 # 1Password (matches what the wizard emits)
 [github.pat."trailofbits/coop-plugins"]
-token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields password --reveal"
+token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields credential --reveal"
 ```
+
+The 1Password wizard creates **API Credential** items and stores the token in
+the `credential` field. Existing **Login** items with `--fields password`
+retrieval commands remain supported. Rotating a token creates an API Credential
+replacement and updates its saved retrieval command. The replacement also keeps
+a concealed `password` field so the previous lookup still works if saving the
+new retrieval command fails.
 
 Other subcommands:
 
@@ -221,6 +336,67 @@ Firecracker TAP networking. These fields apply to Linux only. The Lima backend o
 | `host_ip` | string (IPv4) | `172.16.0.1` | Host-side IP address on TAP interfaces. |
 | `subnet_mask` | string (CIDR) | `/24` | Subnet mask in CIDR notation. Must be `/0` through `/32`. |
 | `host_iface` | string | `auto` | Host network interface for NAT (e.g., `eth0`, `ens5`). `auto` detects it at runtime. |
+
+### Exact network host-tool paths
+
+Conventional Linux hosts need no additional configuration. A non-FHS host can
+select exact paths for any of the five network control-plane tools:
+
+```toml
+[network.host_tools]
+sudo = "/run/wrappers/bin/sudo"
+ip = "/run/current-system/sw/bin/ip"
+bridge = "/run/current-system/sw/bin/bridge"
+iptables = "/run/current-system/sw/bin/iptables"
+sysctl = "/run/current-system/sw/bin/sysctl"
+```
+
+These are NixOS's stable system-profile and privilege-wrapper paths; do not
+configure generation-specific `/nix/store` paths because garbage collection can
+remove them. Each field is optional. An unset field uses coop's built-in
+`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. A set field uses only
+the configured absolute path and never falls back.
+
+Configured paths cannot contain shell expansion, `.` or `..`. Immediately
+before use, coop follows the actual symlink chain and requires every traversed
+component and the final executable to be root-owned and not group/other
+writable. The target must be a regular executable, but coop does not prove its
+package, hash, basename, or command semantics. The invocation-selected config
+is therefore trusted operator input; coop does not automatically import these
+values from a project, guest, or saved instance state.
+
+Tool paths are re-resolved from the current config on setup and cleanup. If the
+config changes or a selected path disappears, cleanup for that tool category
+cannot run until the configuration is corrected. The table is parsed but has
+no effect on the Lima backend.
+
+## `ssh` section
+
+Coop-owned guest transports use fixed absolute system candidates for `ssh`,
+`scp`, and `rsync`. They do not inherit user or system SSH configuration, host
+shell environment, or the caller's working directory. This applies only to
+processes launched by coop; the generated `ssh coop-<name>` operator alias uses
+the operator's normal SSH client configuration.
+
+Non-FHS and alternate installations can select exact executables:
+
+```toml
+[ssh.host_tools]
+ssh = "/run/current-system/sw/bin/ssh"
+scp = "/run/current-system/sw/bin/scp"
+rsync = "/run/current-system/sw/bin/rsync"
+```
+
+Each field is optional. A configured field replaces the built-in candidates
+and never falls back. Every path component and the executable must be owned by
+root or the invoking user and must not be group/other writable; the target must
+be a regular executable. These checks authorize a filesystem identity only,
+not package provenance or implementation semantics.
+
+Rsync passes its SSH executable and options through rsync's `-e` command
+grammar. Coop rejects an exact SSH path or key path containing bytes that
+cannot be represented there unambiguously; choose stable paths without spaces
+or shell metacharacters for rsync-backed workspaces.
 
 ## Guest user
 

@@ -6,6 +6,9 @@
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Guest SSH port
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
+# post_create = "sudo apt-get update && sudo apt-get install -y htop"
+# Creation commands run once per VM creation, after workspace setup.
+# post_start = "echo guest ready"         # Every boot, after creation/workspace setup
 # GitHub auth strategy. Pick ONE of the two forms below — `github` cannot
 # be both a string and a table at the same time.
 #
@@ -26,6 +29,16 @@
 # [github.pat."trailofbits/coop"]
 # token = "cmd:security find-generic-password -s coop-github-pat -a trailofbits-coop -w"
 
+# Optional copies into each VM, refreshed before agent bootstrap at every boot.
+# Repeat [[guest_files]] for multiple sources. ~ in destination means guest home.
+# [[guest_files]]
+# source = "~/.config/agents"
+# destination = "~/.config/agents"
+#
+# [[guest_files]]
+# source = "~/dotfiles/gitconfig"
+# destination = "~/.gitconfig"
+
 # [setup]
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
@@ -40,6 +53,25 @@
 # host_ip = "172.16.0.1"
 # subnet_mask = "/24"
 # host_iface = "auto"           # "auto" detects at runtime
+#
+# Exact paths for non-FHS Linux hosts. Set fields only when the corresponding
+# built-in /usr/{bin,sbin} or /{bin,sbin} candidates are unsuitable. A set
+# field replaces the built-in candidates for that tool; it never falls back.
+# [network.host_tools]
+# sudo = "/run/wrappers/bin/sudo"                 # NixOS example
+# ip = "/run/current-system/sw/bin/ip"
+# bridge = "/run/current-system/sw/bin/bridge"
+# iptables = "/run/current-system/sw/bin/iptables"
+# sysctl = "/run/current-system/sw/bin/sysctl"
+
+# Coop-managed SSH/SCP/rsync processes ignore user and system SSH config and
+# use a cleared environment. Conventional Linux and macOS hosts need no
+# overrides. Set exact paths only for non-FHS or alternate installations; a
+# set field replaces built-in candidates and never falls back.
+# [ssh.host_tools]
+# ssh = "/run/current-system/sw/bin/ssh"
+# scp = "/run/current-system/sw/bin/scp"
+# rsync = "/run/current-system/sw/bin/rsync"
 
 # [guest_env]                   # Literal env vars to set in the guest.
 #                               # Overrides forwarded values on key

@@ -376,7 +376,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         .try_clone()
         .context("Failed to clone proxy tunnel log")?;
 
-    let mut args = target.ssh_opts();
+    let mut args = Vec::new();
     args.extend([
         "-N".into(),
         "-T".into(),
@@ -387,11 +387,12 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         "-o".into(),
         "ForkAfterAuthentication=no".into(),
         "-S".into(),
-        control_path.display().to_string(),
+        crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
     ]);
     args.push(target.addr());
 
-    let mut child = Command::new("ssh")
+    let mut child = target
+        .ssh_forward_command()?
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -423,17 +424,18 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         // accepted a reverse forward. -O forward waits for that acknowledgment
         // and returns nonzero for a rejected bind. The master stays the direct
         // child, so its existing PID-file teardown remains authoritative.
-        let mut forward_args = target.ssh_opts();
+        let mut forward_args = Vec::new();
         forward_args.extend([
             "-S".into(),
-            control_path.display().to_string(),
+            crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
             "-O".into(),
             "forward".into(),
             "-R".into(),
             format!("127.0.0.1:{port}:127.0.0.1:{port}"),
         ]);
         forward_args.push(target.addr());
-        let request = Command::new("ssh")
+        let request = target
+            .ssh_forward_command()?
             .args(&forward_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -623,6 +625,15 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn forward_master_pid(fixture: &Path) -> i32 {
+        fs::read_to_string(fixture.join("master.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn ports_are_per_instance_and_per_provider() {
         assert_eq!(Provider::Anthropic.port(&inst_with_index(0)), 8788);
@@ -793,6 +804,7 @@ mod tests {
             port: std::num::NonZeroU16::new(port).unwrap(),
             user: crate::backend::SshUser::new("coop").unwrap(),
             key_path: tmp.path().join("unused-key"),
+            host_tools: crate::config::SshHostToolsConfig::default(),
         };
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
@@ -822,19 +834,28 @@ mod tests {
             port: std::num::NonZeroU16::new(2222).unwrap(),
             user: crate::backend::SshUser::new("root").unwrap(),
             key_path: fixture.join("client"),
-        };
-        let master_pid = || -> i32 {
-            fs::read_to_string(fixture.join("master.pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap()
+            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&fixture.join("bin/ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
         };
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let port = destination.local_addr().unwrap().port();
         spawn_reverse_forward(&inst, "test", &target, port).unwrap();
-        let pid = master_pid();
+        let ambient_port = std::env::var("COOP_FORWARD_TEST_AMBIENT_PORT")
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let ambient_addr = format!("192.0.2.2:{ambient_port}").parse().unwrap();
+        assert!(
+            std::net::TcpStream::connect_timeout(&ambient_addr, Duration::from_millis(200))
+                .is_err(),
+            "ambient SSH configuration added an unexpected remote forward"
+        );
+        let pid = forward_master_pid(&fixture);
         assert_eq!(
             fs::read_to_string(fwd_pid_path(&inst, "test")).unwrap(),
             pid.to_string()
@@ -889,7 +910,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let result = spawn_reverse_forward(&inst, "test", &target, port);
-        let rejected_pid = master_pid();
+        let rejected_pid = forward_master_pid(&fixture);
         assert!(
             result.is_err(),
             "authenticated reverse bind refusal must fail startup"

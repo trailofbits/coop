@@ -23,10 +23,9 @@ first to change creation-time choices such as transport, image, disk size, or
 extra mounts.
 
 `coop up` in copy mode tar-pipes the project into `/workspace` inside the
-guest over SSH. Both sides independently SHA-256-hash the tar stream. If the
-checksums diverge, the transfer aborts. coop persists the host-to-guest path
-mapping in `workspace.json` so that later `push` and `pull` calls resolve paths
-automatically.
+guest over SSH. coop checks the local tar and guest SSH exit statuses, then
+persists the host-to-guest path mapping in `workspace.json` so that later
+`push` and `pull` calls resolve paths automatically.
 
 `coop up --mount` mounts the project directory into the guest. Behavior differs
 by backend:
@@ -77,7 +76,7 @@ Creating a project VM with `coop up` writes a `workspace.json` in the instance d
 | Field        | Description                                                    |
 |-------------|----------------------------------------------------------------|
 | `host_path`  | Absolute path on the host for local workspace and mount sources |
-| `guest_path` | Path inside the guest VM (always `/workspace`)                 |
+| `guest_path` | Path inside the guest VM (`/workspace` by default; the first mount's path for mount-only VMs) |
 | `source`     | How the workspace was created: `workspace`, `mount`, or `git_repo` |
 
 `push` and `pull` read this file to resolve default paths.
@@ -102,7 +101,7 @@ If either signal finds anything, push prints it and exits. `--force` overrides b
 Transfer method selection is automatic:
 
 1. **rsync** if the guest has it. Uses `--delete` to mirror the host directory exactly. Reads `.gitignore` files via `--filter=':- .gitignore'`.
-2. **tar-pipe** otherwise. Streams a tar archive over SSH with end-to-end SHA-256 verification.
+2. **tar-pipe** otherwise. Streams a tar archive over SSH to the recorded guest path. On Lima, `push` refuses this fallback for a live mount because extraction could write into its own host source. Lima mounts normally expose host changes directly in the guest.
 
 ## Pulling: guest to host
 
@@ -173,13 +172,11 @@ A repo whose `.gitignore` lists `.git/` (rare, but legal — sometimes seen in d
 - **Pulls**: transports attempt to exclude common `.git` entries independently
   of `.gitignore`; this is not a security guarantee.
 
-## Checksum verification
+## Transfer integrity
 
-Host-to-guest tar-pipe transfers hash the archive with SHA-256 on both the
-sending and receiving sides. A mismatch fails the transfer and reports both
-hash values. Guest-to-host pull does not add an application-level checksum: it
-relies on SSH transport integrity and checks both the remote tar and local
-extraction status. A checksum supplied by the untrusted guest would not make
-guest-authored content trustworthy.
+Tar-pipe transfers rely on SSH transport integrity and check both the sending
+and receiving process statuses. They do not add an application-level checksum.
+A checksum supplied by the untrusted guest would not make guest-authored pull
+content trustworthy.
 
 Rsync handles integrity internally. No additional checksumming is layered on top.

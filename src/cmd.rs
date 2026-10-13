@@ -46,6 +46,9 @@ pub struct Cmd {
     args: Vec<Arg>,
     sudo: bool,
     stdin: Option<Vec<u8>>,
+    env_clear: bool,
+    env: Vec<(OsString, OsString)>,
+    current_dir: Option<OsString>,
 }
 
 impl Cmd {
@@ -55,6 +58,9 @@ impl Cmd {
             args: Vec::new(),
             sudo: false,
             stdin: None,
+            env_clear: false,
+            env: Vec::new(),
+            current_dir: None,
         }
     }
 
@@ -89,6 +95,25 @@ impl Cmd {
         self
     }
 
+    /// Start the child with no inherited environment.
+    pub fn env_clear(mut self) -> Self {
+        self.env_clear = true;
+        self
+    }
+
+    /// Add one explicit child environment value.
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.env
+            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        self
+    }
+
+    /// Set the child's working directory explicitly.
+    pub fn current_dir(mut self, dir: impl AsRef<OsStr>) -> Self {
+        self.current_dir = Some(dir.as_ref().to_owned());
+        self
+    }
+
     /// Pipe `bytes` to the child's stdin instead of inheriting the parent's.
     ///
     /// Use this for any data that must NOT appear on argv — secrets, tokens,
@@ -106,7 +131,7 @@ impl Cmd {
     /// need custom stdio, spawn, or other `Command` methods.
     pub fn build(&self) -> Command {
         let raw_args = self.args.iter().map(Arg::value);
-        if self.sudo {
+        let mut cmd = if self.sudo {
             let mut cmd = Command::new("sudo");
             cmd.arg(&self.program);
             cmd.args(raw_args);
@@ -115,7 +140,15 @@ impl Cmd {
             let mut cmd = Command::new(&self.program);
             cmd.args(raw_args);
             cmd
+        };
+        if self.env_clear {
+            cmd.env_clear();
         }
+        cmd.envs(self.env.iter().map(|(key, value)| (key, value)));
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
+        cmd
     }
 
     fn describe(&self) -> String {

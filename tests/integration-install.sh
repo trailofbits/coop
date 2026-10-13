@@ -70,13 +70,25 @@ fi
 if [ "$1 $2" = "attestation verify" ]; then
     [ "${COOP_TEST_GH_VERIFY_FAIL:-0}" != "1" ] || exit 42
     bundle=""
+    repo=""
+    identity=""
+    source_ref=""
+    deny_self_hosted=0
+    shift 3
     while [ "$#" -gt 0 ]; do
-        if [ "$1" = "--bundle" ]; then
-            bundle="$2"
-            break
-        fi
-        shift
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            --cert-identity) identity="$2"; shift 2 ;;
+            --source-ref) source_ref="$2"; shift 2 ;;
+            --deny-self-hosted-runners) deny_self_hosted=1; shift ;;
+            --bundle) bundle="$2"; shift 2 ;;
+            *) exit 46 ;;
+        esac
     done
+    [ "$repo" = "trailofbits/coop" ] || exit 47
+    [ "$identity" = "https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/$VERSION" ] || exit 48
+    [ "$source_ref" = "refs/tags/$VERSION" ] || exit 49
+    [ "$deny_self_hosted" = 1 ] || exit 50
     if [ "${COOP_TEST_GH_REQUIRE_BUNDLE:-0}" = "1" ]; then
         [ -n "$bundle" ] && [ -s "$bundle" ] || exit 43
     fi
@@ -159,7 +171,7 @@ else
     fail "installer extracts coop and coop-proxy"
 fi
 
-if grep -q 'attestation verify .* --repo trailofbits/coop --bundle ' "$GH_LOG"; then
+if grep -q 'attestation verify .* --repo trailofbits/coop .* --bundle ' "$GH_LOG"; then
     pass "gh verifies the tarball with the downloaded bundle"
 else
     fail "gh verifies the tarball with the downloaded bundle" "gh calls: $(cat "$GH_LOG")"
@@ -172,6 +184,7 @@ else
 fi
 
 echo "==> Test 2: bundle verification failure is fail-closed"
+: >"$GH_LOG"
 printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"
 printf '%s\n' 'keep-existing-proxy' >"$INSTALL_DIR/coop-proxy"
 COOP_TEST_GH_VERIFY_FAIL=1
@@ -187,6 +200,12 @@ else
         "$(tail -10 "$TEST_ROOT/t2.log")"
 fi
 unset COOP_TEST_GH_VERIFY_FAIL
+if [[ "$(grep -c '^attestation verify ' "$GH_LOG")" == 1 ]] \
+    && grep -q -- '--bundle' "$GH_LOG"; then
+    pass "failed bundle verification never retries through the API"
+else
+    fail "failed bundle verification never retries through the API" "gh calls: $(cat "$GH_LOG")"
+fi
 
 echo "==> Test 3: releases without a usable bundle retain API fallback"
 : >"$GH_LOG"
@@ -200,12 +219,30 @@ else
 fi
 unset COOP_TEST_BUNDLE_FAIL
 
-if grep -q 'attestation verify .* --repo trailofbits/coop$' "$GH_LOG" \
+if grep -q 'attestation verify .* --repo trailofbits/coop .* --deny-self-hosted-runners$' "$GH_LOG" \
     && ! grep -q -- '--bundle' "$GH_LOG"; then
     pass "legacy fallback verifies through the attestations API"
 else
     fail "legacy fallback verifies through the attestations API" "gh calls: $(cat "$GH_LOG")"
 fi
+
+echo "==> Test 3b: API verification failure is fail-closed"
+printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"
+printf '%s\n' 'keep-existing-proxy' >"$INSTALL_DIR/coop-proxy"
+COOP_TEST_BUNDLE_FAIL=1
+COOP_TEST_GH_VERIFY_FAIL=1
+export COOP_TEST_BUNDLE_FAIL COOP_TEST_GH_VERIFY_FAIL
+if run_installer >"$TEST_ROOT/t3b.log" 2>&1; then
+    fail "failed API verification aborts installation" "installer exited 0"
+elif grep -q "Attestation verification failed" "$TEST_ROOT/t3b.log" \
+    && [[ "$(cat "$INSTALL_DIR/coop")" == "keep-existing-install" \
+       && "$(cat "$INSTALL_DIR/coop-proxy")" == "keep-existing-proxy" ]]; then
+    pass "failed API verification leaves both installed binaries unchanged"
+else
+    fail "failed API verification leaves both installed binaries unchanged" \
+        "$(tail -10 "$TEST_ROOT/t3b.log")"
+fi
+unset COOP_TEST_BUNDLE_FAIL COOP_TEST_GH_VERIFY_FAIL
 
 echo "==> Test 4: checksum rejection preserves both binaries"
 printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"

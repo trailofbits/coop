@@ -71,6 +71,9 @@ Host coop-my-instance
     Port 22222
     User ubuntu
     IdentityFile /path/to/.coop/ssh_key
+    IdentitiesOnly yes
+    IdentityAgent none
+    ForwardAgent no
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR

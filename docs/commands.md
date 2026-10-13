@@ -2,6 +2,17 @@
 
 coop creates isolated VM environments for running Claude Code, Codex, and Grok Build. It runs Firecracker microVMs on Linux and Lima VMs on macOS, selecting the backend automatically based on platform.
 
+Configured [`guest_files`](configuration.md#guest-files) are copied before agent
+bootstrap when you create or restart a VM, including `restore --reprovision` and
+`--no-agents`. Reconnecting to an already-running VM does not refresh them.
+
+[Creation hooks](configuration.md#creation-hooks) run after the workspace is
+ready. A failed hook retains the VM and blocks agent launch. Use `shell` or
+`exec` to debug, then retry `up` on the running VM or `start` after stopping it.
+Completed creation hooks are skipped on ordinary restarts. `restore` resets
+progress; `restore --reprovision` also copies the workspace before rerunning the
+saved recipe.
+
 ## Global Flags
 
 | Flag | Description |
@@ -65,7 +76,7 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
 | `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
-| `--post-start <cmd>` | Shell command to run inside the guest after boot |
+| `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
 
 ```
@@ -93,8 +104,8 @@ first so those options can take effect.
 Devcontainer files are ordinary workspace data; coop does not discover,
 translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
 mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
-agent bootstrap but before a copied workspace or Firecracker mount is synced;
-commands that require project files must run after `coop up` completes.
+agent bootstrap, workspace/mount provisioning, and creation hooks, so commands
+can use copied, cloned, and mounted project files.
 
 Upgrading does not rewrite existing images or VMs. Delete affected images with
 `coop images --delete <image>`, then recreate them with `coop setup --image
@@ -171,8 +182,8 @@ coop setup [FLAGS]
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
 | `--profile <list>` | Comma-separated install profiles: `python`, `node`, `c`, `fuzz`, `rust`, `go` |
-| `--extra-packages <list>` | Comma-separated extra apt packages to install |
-| `--post-install <path>` | Path to a post-install script to run in the chroot |
+| `--extra-packages <list>` | Comma-separated extra apt packages to install (Linux/Firecracker only; Lima refuses this option) |
+| `--post-install <path>` | Path to a post-install script to run in the chroot (Linux/Firecracker only; Lima refuses this option) |
 | `--template-size <GiB>` | Template rootfs size in GiB (default: 8) |
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
@@ -182,6 +193,8 @@ coop setup [FLAGS]
 coop setup -y --profile python,node --template-size 12
 coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
 ```
+
+The second example is Linux/Firecracker only.
 
 ### `start`
 
@@ -579,8 +592,9 @@ coop logs my-project -f
 
 ### `push`
 
-Copy a local directory into the running VM at `/workspace`. Defaults to the
-host path recorded when the instance was created with `coop up`.
+Copy a local directory into the running VM at the recorded guest path (usually
+`/workspace`). Defaults to the host path recorded when the instance was created
+with `coop up`.
 
 ```
 coop push [NAME] [FLAGS]
@@ -603,7 +617,7 @@ coop push my-project --dir ./src --force
 
 ### `pull`
 
-Copy the VM's `/workspace` to a local directory. Defaults to the host path
+Copy the VM's recorded guest path to a local directory. Defaults to the host path
 recorded when the instance was created with `coop up`. Pulled files are
 controlled by the untrusted guest and may be malicious. Review them before
 executing them or interpreting them with Git, editors, build tools, shells, or
@@ -686,9 +700,14 @@ refresh keeps the alias current without you re-running the command. On
 Linux/Firecracker the host and port are stable, so the refresh is a no-op.
 
 The block sets `StrictHostKeyChecking no` and `UserKnownHostsFile /dev/null`,
-so `ssh coop-*` connections skip host-key verification. This is intentional —
-these VMs regenerate their host keys, so pinning them would only produce
-spurious mismatch warnings.
+so `ssh coop-*` connections skip host-key verification. It also sets
+`IdentityAgent none` and `ForwardAgent no`. Coop's internal SSH, SCP, and rsync
+transports enforce these settings on the command line. For generated `coop-*`
+aliases, OpenSSH uses the first value from matching configuration entries, so
+an earlier global or `Host *` setting can override them; check the effective
+values with `ssh -G coop-<name>`. Host-key verification is disabled because
+these VMs regenerate their host keys, which would otherwise cause mismatch
+warnings.
 
 Use `ssh-config` for ad-hoc copies of arbitrary paths. To sync the tracked
 workspace directory in bulk, use [`push`](#push) / [`pull`](#pull) instead.
@@ -740,6 +759,10 @@ config (the Firecracker per-instance JSON or the Lima `lima.yaml`), which is
 authoritative — the value survives restarts and is reported by `coop status`.
 The global `[vm]` settings in `config.toml` only seed these values for *new*
 instances.
+
+On Firecracker, retry an interrupted disk resize with the same absolute
+`--size` while the instance is stopped. The retry checks and grows the ext4
+filesystem even if the image file already has the requested length.
 
 By default the instance is left stopped and the change takes effect on the next
 `coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
@@ -835,15 +858,20 @@ Kept across the wipe, because coop persists them host-side:
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
 | Guest env | `guest_env.json` |
+| Creation recipe and deferred startup | `creation.json`; disk replacement resets progress |
 | Model mode and proxy settings | `model.json` / `proxy.json` |
 | Credentials saved in the host secret store | unchanged; guest forwarding depends on the configured auth mode |
+
+A failed disk replacement preserves completed creation-hook progress when the original
+disk is proven unchanged.
 
 **Not replayed**, because coop does not persist them:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
 - `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
-- An invocation-level `--post-start` command. The override is not persisted;
-  reprovisioning runs the current `post_start` value from `config.toml`, if set.
+- An invocation-level `--post-start` command when no creation hook was selected.
+  When a creation hook was selected, its saved startup command runs after the
+  reset hook completes. Ordinary boots use the current `post_start` selection.
 
 Before replacing the disk, coop checks that the image exists, the state files
 parse, the recorded workspace directory is still there, and host ports for
@@ -886,6 +914,13 @@ coop profiles show rust
 ### `update`
 
 Replace the running coop binary with a release from `github.com/trailofbits/coop`. Downloads the tarball matching the current host triple, verifies its SHA-256 against the release's `SHA256SUMS`, and (when `gh` is installed) verifies the GitHub build-provenance attestation before swapping the binary atomically.
+Official builds fetch metadata for the compiled `trailofbits/coop` repository
+from GitHub and validate the selected tag plus the exact repository, tag, and
+filename identity of the archive, checksum file, and optional attestation bundle
+before downloading any asset. The update source is not runtime-configurable.
+Attestation verification requires `.github/workflows/release.yml` at the selected
+release tag and rejects attestations generated on self-hosted runners. The same
+policy applies to the release bundle and GitHub API fallback.
 
 No authentication is required. When [`gh`](https://cli.github.com/) is authenticated against `github.com` or `GITHUB_TOKEN` is set, `coop update` uses it, which helps avoid GitHub API rate limits.
 

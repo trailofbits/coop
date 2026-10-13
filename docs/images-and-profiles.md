@@ -9,8 +9,8 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 1. Creates an ext4 disk image (default 8 GiB, configurable with `--template-size`)
 2. Provisions a base Ubuntu system (a downloaded Firecracker CI squashfs on Firecracker, Ubuntu 24.04 cloud image on Lima)
 3. Installs base packages, Docker, GitHub CLI, Claude Code, Codex, and Grok Build
-4. Applies requested profiles and extra packages
-5. Runs post-install scripts if provided
+4. Applies requested profiles and, on Linux/Firecracker, extra packages
+5. On Linux/Firecracker, runs a requested `--post-install` script
 
 coop stores the result under `~/.coop/images/<name>/`. When creating an instance, coop copies the template to create an instance-specific rootfs. The copy uses `cp --reflink=auto` on Linux. On filesystems that support reflinks (btrfs, XFS), this shares storage blocks until written, making the copy fast and space-efficient.
 
@@ -129,23 +129,30 @@ coop up . --image ml-dev
 
 ## Extra packages
 
-For one-off additions without a full profile, use `--extra-packages`:
+On Linux/Firecracker, use `--extra-packages` for one-off additions without a
+full profile:
 
 ```bash
 coop setup --extra-packages ripgrep,fd-find,bat
 ```
 
-These are installed via apt during the template build. coop tracks them in the template config and includes them in staleness detection. Changing the list triggers a rebuild.
+These are installed via apt during the template build. coop tracks them in the
+template config and includes them in staleness detection. Changing the list
+triggers a rebuild. The Lima backend refuses `--extra-packages`.
 
 ## Post-install scripts
 
-For provisioning beyond apt packages, pass a shell script with `--post-install`:
+On Linux/Firecracker, pass a shell script with `--post-install` for
+provisioning beyond apt packages:
 
 ```bash
 coop setup --profile python --post-install ./my-setup.sh
 ```
 
-The script runs inside the template's chroot after all packages are installed. It has root access and network connectivity. coop hashes the script content for staleness detection; modifying the script causes the next `coop setup` to rebuild automatically.
+The script runs inside the template's chroot after all packages are installed.
+It has root access and network connectivity. coop hashes the script content for
+staleness detection; modifying the script causes the next `coop setup` to
+rebuild automatically. The Lima backend refuses `--post-install`.
 
 ## Named images
 
@@ -209,15 +216,17 @@ The `coop start` in that recipe does not re-sync `/workspace` or reinstall plugi
 coop records what went into each template in a `template-config.json` file alongside the image. This config contains:
 
 - **Version number**: a monotonic counter that increments when base install logic changes. A newer coop version triggers a rebuild.
-- **Install script hash**: SHA-256 of the composed install recipe (base + profile + extra packages). Changing profiles or extra packages changes this hash.
-- **Post-install script hash**: SHA-256 of the post-install script content, if one was provided.
-- **Profile list and extra packages**: the exact inputs used to build the template.
+- **Install script hash**: SHA-256 of the composed install recipe (base + profile + Linux/Firecracker extra packages). Changing profiles or extra packages changes this hash.
+- **Post-install script hash**: SHA-256 of the Linux/Firecracker post-install script content, if one was provided.
+- **Profile list and extra packages**: the exact inputs used to build the template; explicit extra packages are Linux/Firecracker only.
 - **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On VM startup, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
 - **Creation timestamp**: when the template was built.
 
 On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, the template is stale and coop rebuilds it. A missing config file (orphaned image) also triggers a rebuild.
 
-When you omit `--profile` and `--extra-packages`, `coop setup` reuses the values from the existing template config. Running `coop setup` with no flags only rebuilds if the underlying install logic changed.
+On Linux/Firecracker, when you omit `--profile` and `--extra-packages`, `coop
+setup` reuses the values from the existing template config. Running `coop setup`
+with no flags only rebuilds if the underlying install logic changed.
 
 ## Rebuilding
 

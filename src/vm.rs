@@ -438,7 +438,8 @@ impl<'a> FirecrackerVm<'a, Running> {
                 host: self.inst.guest_ip().into(),
                 port: self.cfg.ssh_port,
                 user: crate::backend::SshUser::new(user.as_str())?,
-                key_path: self.cfg.ssh_key_path(),
+                key_path: std::path::absolute(self.cfg.ssh_key_path())?,
+                host_tools: self.cfg.ssh.host_tools.clone(),
             },
             env: crate::backend::EnvForward::default(),
         };
@@ -476,7 +477,8 @@ impl<'a> FirecrackerVm<'a, Running> {
             host: crate::backend::Hostname::from(self.inst.guest_ip()),
             port: self.cfg.ssh_port,
             user: crate::backend::SshUser::new(guest_user.as_str())?,
-            key_path: self.cfg.ssh_key_path(),
+            key_path: std::path::absolute(self.cfg.ssh_key_path())?,
+            host_tools: self.cfg.ssh.host_tools.clone(),
         };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
             let _ = write!(out, "\n  {usage}");
@@ -884,6 +886,12 @@ mod tests {
             data_dir: crate::config::ConfigPath::new(root.join("data")),
             ..CoopConfig::default()
         };
+        cfg.ssh.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
+            Some(&root.join("ssh")),
+            None,
+            None,
+        )
+        .unwrap();
         cfg.guest_env
             .insert("PATH".parse().unwrap(), "/guest-only".into());
         let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
@@ -949,13 +957,19 @@ mod tests {
 
     fn run_shutdown_fixture(mode: &str) {
         use std::os::unix::fs::PermissionsExt as _;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::host_tool::trusted_test_tempdir();
         let sudo = root.path().join("sudo");
         std::fs::write(&sudo, SHUTDOWN_SUDO).unwrap();
         std::fs::set_permissions(sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
         if mode != "missing" {
             let ssh = root.path().join("ssh");
-            std::fs::write(&ssh, SHUTDOWN_SSH).unwrap();
+            let script = format!(
+                "#!/bin/sh\nCOOP_TEST_SHUTDOWN_ROOT={}\nCOOP_TEST_SHUTDOWN_MODE={}\nexport COOP_TEST_SHUTDOWN_ROOT COOP_TEST_SHUTDOWN_MODE\n{}",
+                crate::shell::shell_escape(&root.path().to_string_lossy()),
+                crate::shell::shell_escape(mode),
+                SHUTDOWN_SSH.strip_prefix("#!/bin/sh\n").unwrap(),
+            );
+            std::fs::write(&ssh, script).unwrap();
             std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())

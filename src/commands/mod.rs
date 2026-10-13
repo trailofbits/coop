@@ -21,7 +21,7 @@ pub(crate) use lifecycle::{
     ProfileImageTarget, ProjectTransport, ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts,
     StartOpts, UpOpts, UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_commit,
     cmd_destroy, cmd_exec, cmd_list, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status,
-    cmd_stop, cmd_up, codex_launch_args, grok_launch_args, open_ssh_session,
+    cmd_stop, cmd_up, codex_launch_args, grok_launch_args, open_agent_session,
     preflight_start_target, prepare_session_from_target, prepend_binary, resolve_running,
 };
 pub(crate) use model::cmd_model;

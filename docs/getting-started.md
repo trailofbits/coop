@@ -17,7 +17,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
-- Setup also checks for `setfacl`, `unsquashfs`, `ssh`, and `rsync`. Automatic installation of missing tools requires `apt-get`; on other hosts, install the packages providing the reported tools manually and rerun `coop setup`. See [backend prerequisites](backends.md#prerequisites-1).
+- Setup also checks for `setfacl` and `unsquashfs` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
 ## Install
 
@@ -31,13 +31,17 @@ curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | 
 `SHA256SUMS` and, when the [GitHub CLI](https://cli.github.com/) is installed,
 also verifies its Sigstore build-provenance attestation. `coop update` runs the
 same verification, except that it treats the checksum as mandatory and refuses
-to install without it. To verify a tarball by hand, download
+to install without it. Official `coop update` builds also fix metadata lookup to
+the `trailofbits/coop` GitHub repository and validate the expected release tag
+and exact asset identities before downloading them. To verify a tarball by hand, download
 `attestations.jsonl` from the same release and pass `--bundle` (this needs no
 GitHub credential — releases up to v0.5.4 predate the bundle asset and do
 not publish it):
 
 ```sh
 gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
+  --cert-identity https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/<version> \
+  --source-ref refs/tags/<version> --deny-self-hosted-runners \
   --bundle attestations.jsonl
 ```
 
@@ -45,6 +49,10 @@ Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
 instead, which it will only do when `gh` is logged in. `install.sh` and `coop
 update` use that API path themselves for releases published without a usable
 bundle.
+Both paths require the release workflow at the selected tag (including its
+`v` prefix), with attestation generated on a GitHub-hosted runner. An older
+`gh` that does not support these flags fails verification; upgrade it before
+retrying.
 
 ## Upgrading from v0.5.4
 
@@ -156,6 +164,16 @@ keychain, password manager, or secret-store directory are not removed by these
 steps.
 
 ## Configuration
+
+To share hook scripts or dotfiles with every VM, add
+[`[[guest_files]]`](configuration.md#guest-files) mappings. coop copies those
+files into writable guest locations on each boot, so tools can create their own
+configuration alongside them.
+
+For tools you want in every new VM, set a top-level
+[`post_create`](configuration.md#creation-hooks) command. coop runs it after the
+workspace is ready. Failed setup keeps the
+VM available for debugging and resumes when you repeat `coop up`.
 
 coop reads `~/.coop/config.toml` by default. Override the path with `--config`. If the file doesn't exist, coop falls back to built-in defaults. Run `coop init` to generate a starter config file.
 

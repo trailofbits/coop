@@ -117,23 +117,31 @@ full_assets_block() {
 JSON
 }
 
-# ── Build both coop binaries (real HOME, before isolation) ───────────────────
+# ── Build coop policy variants (real HOME, before isolation) ─────────────────
 #
-# Both `cargo build` invocations must run before HOME is redirected — cargo
+# All `cargo build` invocations must run before HOME is redirected — cargo
 # uses $HOME for its registry and toolchain caches.
 
-echo "==> Building release binary..."
+echo "==> Building explicit test-source binary..."
+(
+    cd "$PROJECT_DIR"
+    COOP_FORCE_BUILD_KIND=test cargo build --release --quiet
+)
+# Stash each binary at a stable path. The later builds share
+# `target/release/coop`, so we can't keep referring to that path after
+# `cargo build` runs again.
+FIXTURE_BIN="$TMPDIR/bin/coop-test-source"
+cp "$PROJECT_DIR/target/release/coop" "$FIXTURE_BIN"
+cp "$FIXTURE_BIN" "$TMPDIR/bin/coop"
+export COOP_BIN="$TMPDIR/bin/coop"
+
+echo "==> Building official release-policy binary..."
 (
     cd "$PROJECT_DIR"
     COOP_FORCE_BUILD_KIND=release cargo build --release --quiet
 )
-# Stash the release binary at a stable path. The dev build below shares
-# `target/release/coop`, so we can't keep referring to that path after
-# `cargo build` runs again.
-RELEASE_BIN="$TMPDIR/bin/coop-release"
-cp "$PROJECT_DIR/target/release/coop" "$RELEASE_BIN"
-cp "$RELEASE_BIN" "$TMPDIR/bin/coop"
-export COOP_BIN="$TMPDIR/bin/coop"
+OFFICIAL_BIN="$TMPDIR/bin/coop-official"
+cp "$PROJECT_DIR/target/release/coop" "$OFFICIAL_BIN"
 
 echo "==> Building dev binary..."
 # Force kind=dev rather than relying on git state. When CI runs on a tag
@@ -180,7 +188,7 @@ chmod +x "$TMPDIR/build/${FAKE_DIR}/coop" "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
 
 PICK_PORT='import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 PORT="$(python3 -c "$PICK_PORT")"
-(cd "$FIXTURE" && python3 -m http.server "$PORT" > /dev/null 2>&1) &
+(cd "$FIXTURE" && python3 -m http.server "$PORT" > /dev/null 2> "$TMPDIR/server.log") &
 SERVER_PID=$!
 BASE_URL="http://127.0.0.1:${PORT}"
 
@@ -196,7 +204,25 @@ if ! curl -fsS "${BASE_URL}/SHA256SUMS" > /dev/null 2>&1; then
     exit 1
 fi
 
-export COOP_UPDATE_API_BASE_URL="$BASE_URL"
+export COOP_UPDATE_TEST_API_BASE_URL="$BASE_URL"
+
+# ── Test 0: build/source policy boundaries ───────────────────────────────────
+
+echo "==> Test 0a: test-source binary is visibly non-release"
+if "$FIXTURE_BIN" --version | grep -q -- '-dev'; then
+    pass "test-source build reports a non-release version"
+else
+    fail "test-source build must report a non-release version"
+fi
+
+echo "==> Test 0b: official update source is not runtime-overridable"
+if COOP_UPDATE_API_BASE_URL="$BASE_URL" "$OFFICIAL_BIN" update --check > "$TMPDIR/t0.log" 2>&1; then
+    fail "official update should reject COOP_UPDATE_API_BASE_URL"
+elif grep -q 'update source policy rejected COOP_UPDATE_API_BASE_URL' "$TMPDIR/t0.log"; then
+    pass "official policy rejects the legacy runtime update source"
+else
+    fail "official source rejection message missing" "$(cat "$TMPDIR/t0.log")"
+fi
 
 # ── Test 1: success flow ─────────────────────────────────────────────────────
 
@@ -215,6 +241,12 @@ if "$COOP_BIN" update --yes > "$TMPDIR/t1.log" 2>&1; then
     fi
 else
     fail "update --yes returned non-zero" "$(tail -5 "$TMPDIR/t1.log")"
+fi
+
+if grep -q 'explicit test update source — attestation verification is DISABLED' "$TMPDIR/t1.log"; then
+    pass "fixture mode warns that attestation is disabled"
+else
+    fail "fixture mode must warn when attestation is disabled"
 fi
 
 if [[ -x "$TMPDIR/bin/coop-proxy" ]] \
@@ -241,7 +273,7 @@ fi
 # ── Test 2: --check when already up to date ──────────────────────────────────
 
 # Restore the real binary; point "latest" at its version.
-cp "$RELEASE_BIN" "$COOP_BIN"
+cp "$FIXTURE_BIN" "$COOP_BIN"
 CURRENT_VERSION="$("$COOP_BIN" --version | awk '{print $2}')"
 write_release_json \
     "$FIXTURE/repos/trailofbits/coop/releases/latest" \
@@ -261,7 +293,51 @@ fi
 
 # ── Test 3: checksum mismatch leaves binary unchanged ────────────────────────
 
-cp "$RELEASE_BIN" "$COOP_BIN"
+echo "==> Test 3: wrong-origin metadata cannot reach the downloader"
+cp "$FIXTURE_BIN" "$COOP_BIN"
+ORIG_SHA="$(sha_of "$COOP_BIN")"
+write_release_json \
+    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FAKE_TAG" \
+    "$(cat << JSON
+[
+  {"name": "${FAKE_TARBALL}", "browser_download_url": "http://localhost:${PORT}/${FAKE_TARBALL}"},
+  {"name": "SHA256SUMS", "browser_download_url": "${BASE_URL}/SHA256SUMS"}
+]
+JSON
+)"
+requests_before="$(wc -l < "$TMPDIR/server.log" | tr -d ' ')"
+if "$COOP_BIN" update --yes > "$TMPDIR/t3-origin.log" 2>&1; then
+    fail "wrong-origin metadata should have failed"
+else
+    requests_after="$(wc -l < "$TMPDIR/server.log" | tr -d ' ')"
+    if grep -q 'release asset identity mismatch' "$TMPDIR/t3-origin.log" \
+        && [[ "$requests_after" -eq $((requests_before + 1)) ]] \
+        && [[ "$(sha_of "$COOP_BIN")" == "$ORIG_SHA" ]]; then
+        pass "wrong-origin metadata stops after metadata retrieval"
+    else
+        fail "wrong-origin metadata reached a later seam" \
+            "requests before=${requests_before} after=${requests_after}; $(tail -5 "$TMPDIR/t3-origin.log")"
+    fi
+fi
+
+echo "==> Test 3b: pinned metadata must return the requested tag"
+write_release_json \
+    "$FIXTURE/repos/trailofbits/coop/releases/tags/${FAKE_TAG}" \
+    "v9.9.8" \
+    "$(full_assets_block)"
+if "$COOP_BIN" update --version "$FAKE_TAG" --yes > "$TMPDIR/t3-tag.log" 2>&1; then
+    fail "pinned update should reject metadata for another tag"
+elif grep -q 'release metadata tag mismatch' "$TMPDIR/t3-tag.log" \
+    && [[ "$(sha_of "$COOP_BIN")" == "$ORIG_SHA" ]]; then
+    pass "pinned update rejects metadata for another tag before replacement"
+else
+    fail "pinned tag mismatch was not reported" "$(tail -5 "$TMPDIR/t3-tag.log")"
+fi
+
+# ── Test 3c: checksum mismatch leaves binary unchanged ───────────────────────
+
+cp "$FIXTURE_BIN" "$COOP_BIN"
 ORIG_SHA="$(sha_of "$COOP_BIN")"
 printf '%s\n' 'keep-existing-proxy' > "$TMPDIR/bin/coop-proxy"
 ORIG_PROXY_SHA="$(sha_of "$TMPDIR/bin/coop-proxy")"
@@ -274,7 +350,7 @@ write_release_json \
 echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ${FAKE_TARBALL}" \
     > "$FIXTURE/SHA256SUMS"
 
-echo "==> Test 3: checksum mismatch aborts"
+echo "==> Test 3c: checksum mismatch aborts"
 if "$COOP_BIN" update --yes > "$TMPDIR/t3.log" 2>&1; then
     fail "update --yes should have failed on checksum mismatch"
 else
@@ -307,7 +383,7 @@ fi
 # ── Test 5: update replaces an existing companion ───────────────────────────
 
 echo "==> Test 5: update replaces both existing binaries"
-cp "$RELEASE_BIN" "$COOP_BIN"
+cp "$FIXTURE_BIN" "$COOP_BIN"
 if "$COOP_BIN" update --yes > "$TMPDIR/t5.log" 2>&1 \
     && [[ "$("$COOP_BIN")" == "MARKER: fake-replacement-binary" \
        && "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
@@ -319,7 +395,7 @@ fi
 # ── Test 6: older packages without a companion remain supported ──────────────
 
 echo "==> Test 6: legacy update without a proxy"
-cp "$RELEASE_BIN" "$COOP_BIN"
+cp "$FIXTURE_BIN" "$COOP_BIN"
 rm "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
 (cd "$TMPDIR/build" && tar -czf "$FIXTURE/${FAKE_TARBALL}" "$FAKE_DIR")
 (cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
@@ -330,6 +406,90 @@ if "$COOP_BIN" update --yes > "$TMPDIR/t6.log" 2>&1 \
     pass "legacy update replaces coop and preserves the existing companion"
 else
     fail "legacy update replaces coop and preserves the existing companion" "$(tail -5 "$TMPDIR/t6.log")"
+fi
+
+# ── Test 7: attestation policy and refusal preserve installed binaries ────────
+
+echo "==> Test 7: attestation verification gates replacement"
+cp "$FIXTURE_BIN" "$COOP_BIN"
+cat > "$TMPDIR/build/${FAKE_DIR}/coop-proxy" << 'EOF'
+#!/bin/sh
+echo "MARKER: fake-proxy-binary"
+EOF
+chmod +x "$TMPDIR/build/${FAKE_DIR}/coop-proxy"
+(cd "$TMPDIR/build" && tar -czf "$FIXTURE/${FAKE_TARBALL}" "$FAKE_DIR")
+(cd "$FIXTURE" && sha256sums_line "${FAKE_TARBALL}" > SHA256SUMS)
+printf '%s\n' 'keep-existing-proxy' > "$TMPDIR/bin/coop-proxy"
+ORIG_SHA="$(sha_of "$COOP_BIN")"
+ORIG_PROXY_SHA="$(sha_of "$TMPDIR/bin/coop-proxy")"
+printf '%s\n' 'synthetic bundle' > "$FIXTURE/attestations.jsonl"
+write_release_json \
+    "$FIXTURE/repos/trailofbits/coop/releases/latest" \
+    "$FAKE_TAG" \
+    "$(cat << JSON
+[
+  {"name": "${FAKE_TARBALL}", "browser_download_url": "${BASE_URL}/${FAKE_TARBALL}"},
+  {"name": "SHA256SUMS", "browser_download_url": "${BASE_URL}/SHA256SUMS"},
+  {"name": "attestations.jsonl", "browser_download_url": "${BASE_URL}/attestations.jsonl"}
+]
+JSON
+)"
+
+mkdir -p "$TMPDIR/mock-bin"
+cat > "$TMPDIR/mock-bin/gh" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$GH_MOCK_ARGS"
+previous=''
+for arg do
+    if [ "$previous" = '--bundle' ] && [ -s "$arg" ]; then
+        printf '%s\n' 'nonempty bundle' > "$GH_MOCK_BUNDLE_PROOF"
+    fi
+    previous="$arg"
+done
+exit "$GH_MOCK_EXIT"
+EOF
+chmod +x "$TMPDIR/mock-bin/gh"
+export PATH="$TMPDIR/mock-bin:$PATH"
+export COOP_UPDATE_TEST_VERIFY_ATTESTATION=1
+export GH_MOCK_ARGS="$TMPDIR/gh-args"
+export GH_MOCK_BUNDLE_PROOF="$TMPDIR/gh-bundle-proof"
+
+GH_MOCK_EXIT=1 "$COOP_BIN" update --yes > "$TMPDIR/t7-fail.log" 2>&1 && result=0 || result=$?
+if [[ "$result" -ne 0 \
+    && -f "$GH_MOCK_ARGS" \
+    && "$(head -n 2 "$GH_MOCK_ARGS" | tr '\n' ' ')" == "attestation verify " \
+    && "$(sha_of "$COOP_BIN")" == "$ORIG_SHA" \
+    && "$(sha_of "$TMPDIR/bin/coop-proxy")" == "$ORIG_PROXY_SHA" ]] \
+    && grep -q 'Attestation verification failed' "$TMPDIR/t7-fail.log" \
+    && grep -q 'using the explicit test update source with attestation verification' "$TMPDIR/t7-fail.log"; then
+    pass "rejected attestation leaves both binaries unchanged"
+else
+    fail "rejected attestation must preserve both binaries" "$(tail -5 "$TMPDIR/t7-fail.log")"
+fi
+
+if grep -Fxq -- '--repo' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'trailofbits/coop' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--cert-identity' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- \
+        'https://github.com/trailofbits/coop/.github/workflows/release.yml@refs/tags/v9.9.9' \
+        "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--source-ref' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'refs/tags/v9.9.9' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--deny-self-hosted-runners' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- '--bundle' "$GH_MOCK_ARGS" \
+    && grep -Fxq -- 'nonempty bundle' "$GH_MOCK_BUNDLE_PROOF"; then
+    pass "updater passes the release signer policy to gh"
+else
+    fail "updater omitted a release signer policy argument" "$(cat "$GH_MOCK_ARGS")"
+fi
+
+GH_MOCK_EXIT=0 "$COOP_BIN" update --yes > "$TMPDIR/t7-pass.log" 2>&1 && result=0 || result=$?
+if [[ "$result" -eq 0 \
+    && "$("$COOP_BIN")" == "MARKER: fake-replacement-binary" \
+    && "$("$TMPDIR/bin/coop-proxy")" == "MARKER: fake-proxy-binary" ]]; then
+    pass "accepted attestation permits replacement"
+else
+    fail "accepted attestation must permit replacement" "$(tail -5 "$TMPDIR/t7-pass.log")"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

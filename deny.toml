@@ -5,9 +5,7 @@ ignore = []
 allow = ["MIT", "Apache-2.0", "MPL-2.0", "Unicode-3.0", "ISC"]
 confidence-threshold = 0.8
 
-# Crate-scoped license exceptions keep the global allowlist tight: these
-# licenses appear only in the credential-proxy's TLS stack (issue #411), so
-# they are permitted for exactly the crates that carry them.
+# Crate-scoped exceptions permit these licenses only where needed.
 [[licenses.exceptions]]
 # FIPS-capable crypto backend for rustls (the recommended provider).
 crate = "aws-lc-sys"
@@ -21,6 +19,11 @@ allow = ["CDLA-Permissive-2.0"]
 [[licenses.exceptions]]
 # Constant-time primitives used by the rustls/aws-lc-rs crypto stack.
 crate = "subtle"
+allow = ["BSD-3-Clause"]
+
+[[licenses.exceptions]]
+# YAML test deserialization's character encoding support.
+crate = "encoding_rs"
 allow = ["BSD-3-Clause"]
 
 [licenses.private]

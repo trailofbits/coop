@@ -3,8 +3,9 @@
 //! Emits four compile-time env vars consumed via `env!()` in the crate:
 //! - `COOP_GIT_SHA` — short commit sha, or "unknown" if no git tree.
 //! - `COOP_GIT_DIRTY` — "true" if `git status --porcelain` is non-empty, else "false".
-//! - `COOP_BUILD_KIND` — "release" iff HEAD is tagged with `v{CARGO_PKG_VERSION}` and the
-//!   tree is clean, otherwise "dev".
+//! - `COOP_BUILD_KIND` — normally "release" iff HEAD is tagged with
+//!   `v{CARGO_PKG_VERSION}` and the tree is clean, otherwise "dev". Updater
+//!   integration tests can compile a visibly non-release "test" variant.
 //! - `COOP_VERSION_STR` — pre-formatted version string for clap's `--version` output.
 
 use std::env;
@@ -19,10 +20,9 @@ fn main() {
     for path in git_rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    // Build-time test hook: lets the integration test pin `COOP_BUILD_KIND` to either
-    // "release" (from an untagged branch) or "dev" (from a tagged commit), independent
-    // of git state. Runtime behaviour is unaffected — the override only influences
-    // what build.rs bakes into `COOP_BUILD_KIND`.
+    // Build-time test hook: lets integration tests pin `COOP_BUILD_KIND` independently
+    // of git state. `test` is the only build kind allowed to construct the explicit
+    // loopback update fixture; normal release builds can never select it at runtime.
     println!("cargo:rerun-if-env-changed=COOP_FORCE_BUILD_KIND");
 
     let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
@@ -32,6 +32,7 @@ fn main() {
     let kind = match env::var("COOP_FORCE_BUILD_KIND").as_deref() {
         Ok("release") => "release",
         Ok("dev") => "dev",
+        Ok("test") => "test",
         Ok(_) | Err(_) => computed,
     };
     let version_str = format_version(&pkg_version, &sha, dirty, kind);
@@ -109,7 +110,7 @@ fn build_kind(sha: &str, dirty: bool, pkg_version: &str) -> &'static str {
 }
 
 fn format_version(pkg_version: &str, sha: &str, dirty: bool, kind: &str) -> String {
-    let dev_suffix = if kind == "dev" { "-dev" } else { "" };
+    let dev_suffix = if kind == "release" { "" } else { "-dev" };
     let dirty_suffix = if dirty { "+dirty" } else { "" };
     format!("{pkg_version}{dev_suffix} ({sha}{dirty_suffix})")
 }
