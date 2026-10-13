@@ -41,10 +41,11 @@ coop completions fish > ~/.config/fish/completions/coop.fish
 
 ```powershell
 coop completions powershell | Set-Content -Encoding utf8 "$HOME/coop-completion.ps1"
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PROFILE) | Out-Null
 Add-Content $PROFILE '. "$HOME/coop-completion.ps1"'
 ```
 
-The profile line loads the saved script on each shell start. Ensure `$PROFILE` exists before adding the line.
+The profile line loads the saved script on each shell start.
 
 ### elvish
 
