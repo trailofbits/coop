@@ -1101,7 +1101,7 @@ fn provision_first_boot(
 
     signal::check_shutdown()?;
 
-    // Workspace sync: tar-pipe for --workspace, git clone for --git-repo.
+    // Workspace sync: rsync for --workspace, git clone for --git-repo.
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
@@ -1116,7 +1116,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),

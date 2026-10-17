@@ -129,21 +129,18 @@ exclude_re = [
   # (equivalent: human label; the serde token is the tested contract).
   "\\bbuild_status\\b",
 
-  # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
-  "\\btar_pipe_transfer\\b",
-  "\\btar_pipe_transfer_to\\b",
-  "\\btar_push_fallback\\b",
-  "\\btar_pipe_pull\\b",
-  "\\btar_pipe_pull_staged\\b",
+  # workspace.rs — rsync transfers, SSH-config IO, editor launch.
   # Shells out to rsync; install_staged_pull_args remains in scope and pins the
   # security-relevant source, destination, and Git-metadata exclusion.
   "\\binstall_staged_pull\\b",
-  "\\bjoin_drainer\\b",
   "\\bsync_mounts\\b",
   "\\bsync_mount_contents\\b",
   "\\bopen_editor\\b",
   "\\blaunch_editor\\b",
   "\\brsync_push\\b",
+  "\\brsync_to_guest\\b",
+  "\\brequire_guest_rsync\\b",
+  "\\bcopy_workspace\\b",
   "\\brsync_pull\\b",
   "\\bcheck_guest_dirty\\b",
   "\\batomic_write\\b",
@@ -260,7 +257,7 @@ exclude_re = [
   "\\bcleanup_confirmed_stop\\b",
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
-  # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.
+  # bootstraps agents and syncs the workspace — none `--lib`-observable.
   # The pure helpers `--reprovision` adds — check_reprovision_workspace_source,
   # reprovision_workspace_inputs, reprovision_confirmation and
   # reprovision_partial_message — stay IN scope and are unit-tested.

@@ -50,15 +50,15 @@ user launched it.
 ## Taint sources (treat as untrusted)
 
 - **Guest filesystem content pulled to the host.** `workspace.rs` `pull` /
-  `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
+  `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
   Files retain their untrusted origin after transfer, including when a host tool
   discovers them implicitly or consumes them during a later operation.
   Pull never invokes host Git to inspect its destination. It refuses a nonempty
   destination unless the user supplies `--force`, which authorizes overwriting
-  matching files but does not change their trust level. The transports attempt
-  to omit common ASCII-case `.git` paths, and both pull transports write into
+  matching files but does not change their trust level. Pull attempts
+  to omit common ASCII-case `.git` paths, and pull writes into
   an empty staging directory before a trusted host-side filtered installation.
   The staging boundary is a host-owned `0700` outer directory under private
   coop storage; transfer tools write only into its child. Pulls sharing a coop

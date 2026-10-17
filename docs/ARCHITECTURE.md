@@ -25,7 +25,7 @@ coop/
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
-│   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
+│   ├── workspace.rs        # workspace sync (rsync) + ~/.ssh/config injection
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
@@ -93,9 +93,9 @@ code, it must hold for **both** backends. Known intentional divergences:
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|
 | `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
-| `mounts_are_live` | `false` (one-time rsync/tar sync) | `true` (virtiofs) |
+| `mounts_are_live` | `false` (one-time rsync sync) | `true` (virtiofs) |
 | `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
-| workspace/mounts | rsync or tar-pipe over SSH | live mounts |
+| workspace/mounts | rsync over SSH | live mounts |
 
 ### Typestate invariants
 
@@ -171,7 +171,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked
    into the golden image.
-6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
+6. **Workspace** — `--workspace` copies via rsync; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
 7. **Creation hooks** — select a recipe before first boot and persist it in

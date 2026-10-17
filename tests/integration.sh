@@ -4371,6 +4371,16 @@ test_workspace_sync() {
     mkdir -p "$ws_tmpdir/subdir"
     echo "nested" > "$ws_tmpdir/subdir/nested.txt"
 
+    local excluded
+    mkdir -p "$ws_tmpdir/files" "$ws_tmpdir/links"
+    for excluded in node_modules target __pycache__ .venv .coop; do
+        mkdir -p "$ws_tmpdir/$excluded" "$ws_tmpdir/subdir/$excluded"
+        echo excluded > "$ws_tmpdir/$excluded/marker"
+        echo excluded > "$ws_tmpdir/subdir/$excluded/marker"
+        echo retained > "$ws_tmpdir/files/$excluded"
+        ln -s ../subdir "$ws_tmpdir/links/$excluded"
+    done
+
     # Initialise a git repo so the .git/ inclusion path (issue #91) is
     # exercised end-to-end. Use a local-only commit; no remote is set up.
     (
@@ -4393,6 +4403,15 @@ test_workspace_sync() {
     # Verify files were synced to guest
     local file_content
     GUEST_INSTANCE="$ws_instance"
+
+    if guest_exec sh -c 'for name in node_modules target __pycache__ .venv .coop; do
+        test ! -e "/workspace/$name" && test ! -e "/workspace/subdir/$name" &&
+        test -f "/workspace/files/$name" && test -L "/workspace/links/$name" || exit 1
+    done'; then
+        pass "initial copy applies directory-only rsync exclusions"
+    else
+        fail "initial copy applies directory-only rsync exclusions" "stderr: $(guest_stderr)"
+    fi
 
     if file_content=$(guest_exec cat /workspace/hello.txt); then
         if [[ "$file_content" == "workspace-test-content" ]]; then
@@ -4437,10 +4456,24 @@ test_workspace_sync() {
     coop_exec sh -c \
         'echo modified-in-guest > /workspace/hello.txt && git -C /workspace config core.fsmonitor ./guest-payload && mkdir -p /workspace/.GIT && echo guest-alias > /workspace/.GIT/config' || true
 
+    guest_exec sh -c 'for name in node_modules target __pycache__ .venv .coop; do
+        mkdir -p "/workspace/$name" "/workspace/subdir/$name" || exit 1
+        echo excluded > "/workspace/$name/marker" || exit 1
+    done' || fail "seed guest build directories" "stderr: $(guest_stderr)"
+
     local pull_dir
     pull_dir=$(mktemp -d)
     if coop pull "$ws_instance" --dir "$pull_dir"; then
         pass "pull into empty destination exits 0 without --force"
+
+        for excluded in node_modules target __pycache__ .venv .coop; do
+            if [[ ! -e "$pull_dir/$excluded" && ! -e "$pull_dir/subdir/$excluded" &&
+                  -f "$pull_dir/files/$excluded" && -L "$pull_dir/links/$excluded" ]]; then
+                pass "pull applies directory-only exclusion: $excluded"
+            else
+                fail "pull applies directory-only exclusion: $excluded" "unexpected copied entries"
+            fi
+        done
 
         local pulled
         pulled=$(cat "$pull_dir/hello.txt" 2>/dev/null)
@@ -4565,14 +4598,8 @@ EOF
     ws_tmpdir=""
 }
 
-# macOS hosts: `coop up --copy` streams the workspace through host tar, whose
-# default copyfile(3) metadata path emits AppleDouble `._*` sidecar entries
-# for xattrs/resource forks. Those land in the Linux guest as ordinary files;
-# entries inside .git can break Git's pack/ref discovery, while worktree
-# sidecars can be pulled back to the host. coop sets COPYFILE_DISABLE=1 on
-# host-side tar creation to suppress them; this phase reproduces the round-trip
-# and pins the fix.
-# Skipped off macOS, where tar has no copyfile path.
+# Copy/pull must not synthesize AppleDouble sidecars from macOS metadata.
+# Exercise xattr-bearing source files against the Linux guest.
 test_appledouble_sidecars() {
     echo ""
     echo "=== Phase: appledouble sidecars (macOS --copy round-trip) ==="
@@ -4615,8 +4642,7 @@ test_appledouble_sidecars() {
         return
     fi
 
-    # The push side is where host tar creation runs, so check the guest
-    # first: sidecars appearing here mean COPYFILE_DISABLE didn't apply.
+    # Check both the initial copy and the return transfer.
     GUEST_INSTANCE="$ad_instance"
     if sidecars=$(coop_exec sh -c 'find /workspace -name "._*"'); then
         if [[ -z "$sidecars" ]]; then
