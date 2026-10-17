@@ -2916,8 +2916,6 @@ fn write_managed_claude_settings(
     target: &SshTarget,
     local_env: &BTreeMap<String, String>,
 ) -> Result<()> {
-    target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
-
     // Read and merge as one fallible step so a read failure falls back to
     // managed defaults rather than aborting boot. `capture` decodes the file as
     // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
@@ -2938,7 +2936,7 @@ fn write_managed_claude_settings(
     target
         .exec_with_stdin(
             RemoteCommand::new().literal(
-                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
+                "mkdir -p ~/.claude && t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
             merged.as_bytes(),
@@ -5541,6 +5539,140 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let staging = stage_allowed_files(src.path()).unwrap();
         let count = std::fs::read_dir(staging.path()).unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    /// Execute the guest shell against a disposable home, without an SSH server.
+    fn managed_settings_target() -> (tempfile::TempDir, SshTarget) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = crate::shell::shell_escape(&fixture.path().to_string_lossy());
+        let ssh = fixture.path().join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" >> {root}/argv
+for command do :; done
+printf '%s\n' "$command" >> {root}/calls
+prefix=''
+case "$command" in
+  *settings.json.XXXXXX*)
+    if test -f {root}/fail; then
+      operation=$(cat {root}/fail)
+      prefix="$operation() {{ return 1; }}; "
+    fi
+    ;;
+esac
+exec env HOME={root} /bin/sh -c "$prefix$command"
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut target = ssh_test_target();
+        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        (fixture, target)
+    }
+
+    fn managed_settings_calls(root: &std::path::Path) -> Vec<String> {
+        fs::read_to_string(root.join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn managed_settings_uses_three_ssh_calls_and_preserves_preferences() {
+        let (fixture, target) = managed_settings_target();
+        let dir = fixture.path().join(".claude");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"enabledPlugins":{"guest@market":true,"copied@skills-dir":true},"extraKnownMarketplaces":{"market":{"source":"guest"}},"outputStyle":"guest","theme":"dark","env":{"OLD":"stale"}}"#).unwrap();
+        fs::write(dir.join("coop-import.json"), r#"{"preferences":{"enabledPlugins":{"copied@skills-dir":false},"outputStyle":"imported","disableAllHooks":true}}"#).unwrap();
+        let marker = fixture.path().join("should-not-exist");
+        let secret = format!(
+            "stdin-only-secret-$(touch {})",
+            crate::shell::shell_escape(&marker.to_string_lossy())
+        );
+        let local_env = BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".into(), secret.clone())]);
+        write_managed_claude_settings(&target, &local_env).unwrap();
+
+        let calls = managed_settings_calls(fixture.path());
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].contains("coop-import.json"));
+        assert!(calls[1].starts_with("cat ~/.claude/settings.json"));
+        assert!(calls[2].starts_with("mkdir -p ~/.claude &&"));
+        let argv = fs::read_to_string(fixture.path().join("argv")).unwrap();
+        assert!(!argv.contains(&secret));
+        assert!(!marker.exists());
+        let body: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(body["enabledPlugins"]["guest@market"], true);
+        assert_eq!(body["enabledPlugins"]["copied@skills-dir"], false);
+        assert_eq!(body["extraKnownMarketplaces"]["market"]["source"], "guest");
+        assert_eq!(body["outputStyle"], "imported");
+        assert_eq!(body["disableAllHooks"], true);
+        assert_eq!(body["theme"], "dark");
+        assert_eq!(body["env"], serde_json::json!(local_env));
+        assert_eq!(body["permissions"]["defaultMode"], "bypassPermissions");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn managed_settings_creates_missing_directory_and_defaults() {
+        let (fixture, target) = managed_settings_target();
+        write_managed_claude_settings(&target, &BTreeMap::new()).unwrap();
+        let body = fs::read_to_string(fixture.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(body, managed_claude_settings_json(&BTreeMap::new()));
+        assert_eq!(managed_settings_calls(fixture.path()).len(), 3);
+    }
+
+    #[test]
+    fn managed_settings_corrupt_import_aborts_before_write() {
+        let (fixture, target) = managed_settings_target();
+        let dir = fixture.path().join(".claude");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("coop-import.json"), "corrupt-secret").unwrap();
+        fs::write(dir.join("settings.json"), "unchanged").unwrap();
+        let error = write_managed_claude_settings(&target, &BTreeMap::new()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid Claude import preference snapshot"
+        );
+        assert_eq!(managed_settings_calls(fixture.path()).len(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.join("settings.json")).unwrap(),
+            "unchanged"
+        );
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn managed_settings_write_failures_preserve_existing_file_and_redact_stdin() {
+        for operation in ["mkdir", "mktemp", "cat", "mv"] {
+            let (fixture, target) = managed_settings_target();
+            let dir = fixture.path().join(".claude");
+            fs::create_dir(&dir).unwrap();
+            let existing = r#"{"theme":"dark"}"#;
+            fs::write(dir.join("settings.json"), existing).unwrap();
+            fs::write(fixture.path().join("fail"), operation).unwrap();
+            let secret = "stdin-only-secret";
+            let local_env = BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".into(), secret.into())]);
+            let error = write_managed_claude_settings(&target, &local_env).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("Failed to write managed ~/.claude/settings.json in guest"),
+                "{operation}: {message}"
+            );
+            assert!(!message.contains(secret));
+            assert_eq!(managed_settings_calls(fixture.path()).len(), 3);
+            assert_eq!(
+                fs::read_to_string(dir.join("settings.json")).unwrap(),
+                existing,
+                "{operation}"
+            );
+        }
     }
 
     #[test]
