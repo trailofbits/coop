@@ -241,16 +241,16 @@ impl<'a> FirecrackerVm<'a, Configured> {
             kill_process_on_socket(&socket_path);
         }
 
-        // Remove stale files from previous runs (may be owned by root)
+        // The instance directory is a pinned, user-owned 0700 namespace, so
+        // its owner can safely unlink root-owned Firecracker entries without
+        // following a substituted final component or invoking a shell as root.
         for stale in [&socket_path, &self.inst.vsock_path(), &log_path, &pid_path] {
-            if stale.exists()
-                && let Err(e) = Cmd::new("rm").arg("-f").arg(stale).sudo().run()
-            {
-                tracing::debug!(
-                    "Failed to remove stale file {} (non-fatal): {e}",
+            crate::fs_util::remove_private_if_exists(stale).with_context(|| {
+                format!(
+                    "Failed to remove stale Firecracker path {}",
                     stale.display()
-                );
-            }
+                )
+            })?;
         }
 
         // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
@@ -383,16 +383,8 @@ impl<'a> FirecrackerVm<'a, Running> {
             terminate_firecracker(pid, term_timeout, kill_timeout, &mut wait)?;
         }
 
-        if let Err(e) = fs::remove_file(&pid_path) {
-            tracing::debug!("Failed to remove PID file (non-fatal): {e}");
-        }
-        if let Err(e) = Cmd::new("rm")
-            .arg("-f")
-            .arg(self.inst.api_socket_path())
-            .sudo()
-            .run()
-        {
-            tracing::debug!("Failed to remove API socket (non-fatal): {e}");
+        if let Err(error) = cleanup_runtime_paths(self.inst) {
+            tracing::debug!("Failed to remove stopped Firecracker runtime paths: {error:#}");
         }
 
         Ok(())
@@ -519,6 +511,43 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 }
 
+/// Remove Firecracker's per-run state after the VMM is confirmed stopped.
+///
+/// This is separate from [`FirecrackerVm::stop`] because lifecycle probing can
+/// discover that the VMM exited before `coop stop` acquired its operation lock.
+/// The checked parent descriptor keeps cleanup inside the private instance
+/// directory even if an untrusted guest caused an abrupt exit.
+pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()> {
+    let mut first_error = None;
+    let mut additional_errors = Vec::new();
+    for stale in [
+        inst.pid_file_path(),
+        inst.api_socket_path(),
+        inst.vsock_path(),
+    ] {
+        if let Err(error) = crate::fs_util::remove_private_if_exists(&stale)
+            .with_context(|| format!("Failed to remove Firecracker path {}", stale.display()))
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            } else {
+                additional_errors.push(format!("{error:#}"));
+            }
+        }
+    }
+    let Some(error) = first_error else {
+        return Ok(());
+    };
+    if additional_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(error.context(format!(
+            "Additional Firecracker path cleanup failures: {}",
+            additional_errors.join("; ")
+        )))
+    }
+}
+
 /// Find and kill any process holding the given Unix socket.
 ///
 /// Uses `lsof` to find the PID, then sends SIGKILL. This handles
@@ -560,6 +589,11 @@ const PID_TRAMPOLINE: &str = concat!(
     r#"chmod 644 "$pid_tmp" || exit 1; "#,
     r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
     r#"trap - EXIT HUP INT TERM; "#,
+    // Firecracker creates its API and base-vsock sockets as root. Their
+    // containing instance directory is user-owned mode 0700, so mode 0666
+    // grants the invoking user access without exposing either socket to other
+    // users. This also avoids a post-bind chmod race.
+    r#"umask 0111 || exit 1; "#,
     r#"shift; exec "$@""#,
 );
 
@@ -654,9 +688,29 @@ fn terminate_firecracker(
 mod tests {
     use super::{
         Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        read_machine_config, wait_for_exit, wait_for_pid_file,
+        cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    fn runtime_cleanup_attempts_every_path_after_an_error() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+        };
+        crate::test_support::create_private_dir_all(&inst.dir).unwrap();
+        std::fs::create_dir(inst.pid_file_path()).unwrap();
+        std::fs::write(inst.api_socket_path(), "api").unwrap();
+        std::fs::write(inst.vsock_path(), "vsock").unwrap();
+
+        assert!(cleanup_runtime_paths(&inst).is_err());
+        assert!(inst.pid_file_path().is_dir());
+        assert!(!inst.api_socket_path().exists());
+        assert!(!inst.vsock_path().exists());
+    }
 
     #[test]
     fn configure_creates_and_replaces_private_config_under_permissive_umask() {

@@ -67,6 +67,7 @@ mod update;
 mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
+mod vsock_proxy;
 mod workspace;
 
 use std::path::PathBuf;
@@ -105,6 +106,14 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal OpenSSH `ProxyCommand` for Firecracker vsock.
+    #[command(name = "__vsock-proxy", hide = true)]
+    VsockProxy {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        port: std::num::NonZeroU32,
+    },
     /// Internal privileged Firecracker API socket liveness probe.
     #[cfg(target_os = "linux")]
     #[command(name = "__probe-firecracker-socket", hide = true)]
@@ -947,6 +956,10 @@ pub fn run() -> Result<()> {
     validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
+    if let Commands::VsockProxy { ref socket, port } = cli.command {
+        return vsock_proxy::run(socket, port);
+    }
+
     #[cfg(target_os = "linux")]
     if let Commands::ProbeFirecrackerSocket { ref path } = cli.command {
         return config::probe_firecracker_api_socket(path);
@@ -1040,6 +1053,7 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        Commands::VsockProxy { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::ProbeFirecrackerSocket { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
@@ -1442,6 +1456,22 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("coop").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn parses_internal_vsock_proxy_command() {
+        let cli = parse(&[
+            "__vsock-proxy",
+            "--socket",
+            "/tmp/vsock.sock",
+            "--port",
+            "22",
+        ]);
+        let super::Commands::VsockProxy { socket, port } = cli.command else {
+            panic!("expected vsock proxy command");
+        };
+        assert_eq!(socket, std::path::PathBuf::from("/tmp/vsock.sock"));
+        assert_eq!(port.get(), 22);
     }
 
     fn parse_err(args: &[&str]) -> clap::Error {

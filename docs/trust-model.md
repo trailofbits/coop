@@ -315,6 +315,17 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   to a VM the host itself owns. Coop-owned transports disable host agent use
   and forwarding; generated SSH config blocks set the same options for aliases,
   subject to OpenSSH configuration precedence for the user-owned file.
+- The Firecracker-vsock transport renders `ProxyCommand` only from the running
+  coop executable, a trusted per-instance socket path, and a non-zero numeric
+  guest port. Paths reject OpenSSH expansion characters and control bytes,
+  escape `%` tokens, and are POSIX-shell quoted before OpenSSH interprets the
+  command. The helper accepts no command text from the guest: it sends one
+  bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
+  and then relays bytes. The base socket lives inside the user-owned mode-0700
+  instance directory; Firecracker may create it mode 0666 so the unprivileged
+  coop process can connect without making it reachable through the directory
+  by other users. Stale runtime entries are unlinked through that pinned
+  private directory rather than a root shell command.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

@@ -170,7 +170,7 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `firecracker.log` | Serial console log |
 | `vm_config.json` | Firecracker VM configuration |
 | `workspace.json` | Workspace sync state (host path, guest path, source) |
-| `vsock.sock` | Vsock socket for host-guest communication |
+| `vsock.sock` | Firecracker base vsock socket (inside the private instance directory) |
 
 On Lima, the directory structure differs because Lima manages its own VM state. `instance.json` and `workspace.json` are always present regardless of backend.
 

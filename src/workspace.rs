@@ -441,7 +441,7 @@ pub fn write_ssh_config(running: &RunningInstance) -> Result<()> {
     update_ssh_config(target, inst)?;
 
     let host = ssh_config_host(inst);
-    let block = ssh_config_block(target, inst);
+    let block = ssh_config_block(target, inst)?;
     writeln!(
         std::io::stderr(),
         "\nSSH alias '{host}' is ready:\n\n{block}\n\n\
@@ -991,10 +991,10 @@ fn ssh_config_path() -> Result<PathBuf> {
     Ok(home.join(".ssh/config"))
 }
 
-fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
+fn ssh_config_block(target: &SshTarget, inst: &Instance) -> Result<String> {
     let host = ssh_config_host(inst);
-    let transport = target.ssh_config_transport();
-    format!(
+    let transport = target.ssh_config_transport()?;
+    Ok(format!(
         "{MARKER_PREFIX} {host}\n\
          Host {host}\n\
          {transport}\
@@ -1009,7 +1009,7 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          {MARKER_END}",
         target.user(),
         target.key_path().display(),
-    )
+    ))
 }
 
 fn update_ssh_config(target: &SshTarget, inst: &Instance) -> Result<()> {
@@ -1019,7 +1019,7 @@ fn update_ssh_config(target: &SshTarget, inst: &Instance) -> Result<()> {
         fs::create_dir_all(parent).context("Failed to create ~/.ssh directory")?;
     }
 
-    let block = ssh_config_block(target, inst);
+    let block = ssh_config_block(target, inst)?;
     let host = ssh_config_host(inst);
 
     let existing = if ssh_config.exists() {
@@ -1275,7 +1275,7 @@ fn launch_editor(
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU16, NonZeroU32};
     use std::process::Stdio;
 
     use super::*;
@@ -2178,7 +2178,7 @@ Host coop-app\n\
     fn ssh_config_block_has_expected_fields() {
         let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
-        let block = ssh_config_block(&fake_ssh_target(), &inst);
+        let block = ssh_config_block(&fake_ssh_target(), &inst).unwrap();
 
         assert_eq!(
             block,
@@ -2198,6 +2198,27 @@ Host coop-app\n\
                 "# coop END",
             )
         );
+    }
+
+    #[test]
+    fn ssh_config_block_uses_firecracker_vsock_proxy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inst = temp_instance(dir.path());
+        let target = SshTarget::firecracker_vsock_with_proxy(
+            PathBuf::from("/tmp/instance path/vsock.sock"),
+            NonZeroU32::new(22).unwrap(),
+            PathBuf::from("/opt/coop bin/coop"),
+            SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/key"),
+            crate::config::SshHostToolsConfig::default(),
+        );
+        let block = ssh_config_block(&target, &inst).unwrap();
+
+        assert!(block.contains("    HostName coop-vsock\n"));
+        assert!(block.contains(
+            "    ProxyCommand '/opt/coop bin/coop' __vsock-proxy --socket '/tmp/instance path/vsock.sock' --port 22\n"
+        ));
+        assert!(!block.contains("    Port "));
     }
 
     #[test]

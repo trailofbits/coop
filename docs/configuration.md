@@ -413,9 +413,9 @@ be a regular executable. These checks authorize a filesystem identity only,
 not package provenance or implementation semantics.
 
 Rsync passes its SSH executable and options through rsync's `-e` command
-grammar. Coop rejects an exact SSH path or key path containing bytes that
-cannot be represented there unambiguously; choose stable paths without spaces
-or shell metacharacters for rsync-backed workspaces.
+grammar. Coop quotes words with rsync's own quote rules, including paths with
+spaces or shell metacharacters. Non-UTF-8 paths and control characters cannot
+be represented unambiguously and are rejected for rsync-backed workspaces.
 
 ## Guest user
 

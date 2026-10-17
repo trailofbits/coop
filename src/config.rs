@@ -3083,8 +3083,10 @@ impl Instance {
 }
 
 /// Confirm that the root-owned Firecracker API socket is no longer accepting
-/// connections. An unprivileged connect sees `EACCES` for both live and stale
-/// mode-0755 sockets, so it cannot safely distinguish those states.
+/// connections. Current sockets are connectable inside their private instance
+/// directory, but a pre-migration mode-0755 socket yields `EACCES` to the
+/// unprivileged caller whether it is live or stale, so the compatibility probe
+/// remains privileged.
 #[cfg(not(target_os = "macos"))]
 fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
     match fs::symlink_metadata(socket_path) {

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 #[cfg(any(target_os = "macos", test))]
 use std::fs;
-use std::num::{NonZeroU8, NonZeroU16};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -348,6 +348,7 @@ pub struct SshTarget {
 #[derive(Debug, Clone)]
 enum SshTransport {
     Tcp(TcpSshTransport),
+    Vsock(FirecrackerVsockTransport),
 }
 
 /// TCP endpoint for an SSH transport.
@@ -355,6 +356,30 @@ enum SshTransport {
 struct TcpSshTransport {
     host: Hostname,
     port: NonZeroU16,
+}
+
+/// Firecracker host-initiated vsock endpoint used by OpenSSH's `ProxyCommand`.
+#[derive(Debug, Clone)]
+struct FirecrackerVsockTransport {
+    socket_path: PathBuf,
+    guest_port: NonZeroU32,
+    proxy_executable: PathBuf,
+}
+
+impl FirecrackerVsockTransport {
+    fn proxy_command(&self) -> Result<String> {
+        fn word(path: &Path, description: &str) -> Result<String> {
+            let literal = crate::openssh::literal_path(path, description)?;
+            Ok(crate::shell::shell_escape(&literal))
+        }
+
+        Ok(format!(
+            "{} __vsock-proxy --socket {} --port {}",
+            word(&self.proxy_executable, "coop vsock proxy executable")?,
+            word(&self.socket_path, "Firecracker vsock socket path")?,
+            self.guest_port,
+        ))
+    }
 }
 
 /// OpenSSH client whose transport arguments are being rendered.
@@ -396,6 +421,53 @@ impl SshTarget {
         }
     }
 
+    /// Construct a target reached through Firecracker's base vsock socket.
+    #[expect(
+        dead_code,
+        reason = "Firecracker lifecycle traffic still uses the TCP target"
+    )]
+    pub(crate) fn firecracker_vsock(
+        socket_path: PathBuf,
+        guest_port: NonZeroU32,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Result<Self> {
+        let proxy_executable = std::env::current_exe()
+            .context("Failed to resolve coop executable for Firecracker vsock ProxyCommand")?;
+        Ok(Self {
+            transport: SshTransport::Vsock(FirecrackerVsockTransport {
+                socket_path,
+                guest_port,
+                proxy_executable,
+            }),
+            user,
+            key_path,
+            host_tools,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn firecracker_vsock_with_proxy(
+        socket_path: PathBuf,
+        guest_port: NonZeroU32,
+        proxy_executable: PathBuf,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Self {
+        Self {
+            transport: SshTransport::Vsock(FirecrackerVsockTransport {
+                socket_path,
+                guest_port,
+                proxy_executable,
+            }),
+            user,
+            key_path,
+            host_tools,
+        }
+    }
+
     pub(crate) fn user(&self) -> &SshUser {
         &self.user
     }
@@ -431,22 +503,29 @@ impl SshTarget {
                 .to_string(),
                 tcp.port.to_string(),
             ],
+            SshTransport::Vsock(_) => Vec::new(),
         }
     }
 
     /// Proxy option for the selected transport.
-    pub(crate) fn proxy_command_option(&self) -> String {
+    pub(crate) fn proxy_command_option(&self) -> Result<String> {
         match &self.transport {
-            SshTransport::Tcp(_) => "ProxyCommand=none".to_string(),
+            SshTransport::Tcp(_) => Ok("ProxyCommand=none".to_string()),
+            SshTransport::Vsock(vsock) => Ok(format!("ProxyCommand={}", vsock.proxy_command()?)),
         }
     }
 
     /// Transport-specific lines for a user-facing SSH config block.
-    pub(crate) fn ssh_config_transport(&self) -> String {
+    pub(crate) fn ssh_config_transport(&self) -> Result<String> {
         match &self.transport {
-            SshTransport::Tcp(tcp) => {
-                format!("    HostName {}\n    Port {}\n", tcp.host, tcp.port)
-            }
+            SshTransport::Tcp(tcp) => Ok(format!(
+                "    HostName {}\n    Port {}\n",
+                tcp.host, tcp.port
+            )),
+            SshTransport::Vsock(vsock) => Ok(format!(
+                "    HostName coop-vsock\n    ProxyCommand {}\n",
+                vsock.proxy_command()?
+            )),
         }
     }
 
@@ -454,6 +533,9 @@ impl SshTarget {
     pub(crate) fn connection_description(&self) -> String {
         match &self.transport {
             SshTransport::Tcp(tcp) => format!("{}:{}", tcp.host, tcp.port),
+            SshTransport::Vsock(vsock) => {
+                format!("vsock:{}:{}", vsock.socket_path.display(), vsock.guest_port)
+            }
         }
     }
 
@@ -465,6 +547,15 @@ impl SshTarget {
                     .parse()
                     .context("Invalid guest address")?;
                 Ok(std::net::TcpStream::connect_timeout(&address, timeout).is_ok())
+            }
+            SshTransport::Vsock(vsock) => {
+                match crate::vsock_proxy::connect(&vsock.socket_path, vsock.guest_port, timeout) {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        tracing::debug!("Firecracker vsock is not reachable: {error:#}");
+                        Ok(false)
+                    }
+                }
             }
         }
     }
@@ -489,6 +580,12 @@ impl SshTarget {
         match &self.transport {
             SshTransport::Tcp(tcp) => {
                 std::hash::Hash::hash(&(&tcp.host, tcp.port), &mut hasher);
+            }
+            SshTransport::Vsock(vsock) => {
+                std::hash::Hash::hash(
+                    &("firecracker-vsock", &vsock.socket_path, vsock.guest_port),
+                    &mut hasher,
+                );
             }
         }
         let hash = std::hash::Hasher::finish(&hasher);
@@ -547,6 +644,7 @@ impl SshTarget {
     pub fn addr(&self) -> String {
         match &self.transport {
             SshTransport::Tcp(tcp) => format!("{}@{}", self.user, tcp.host),
+            SshTransport::Vsock(_) => format!("{}@coop-vsock", self.user),
         }
     }
 
@@ -1154,7 +1252,15 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
-        crate::network::teardown_tap(&cfg.network, stopped.instance())
+        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance());
+        let network = crate::network::teardown_tap(&cfg.network, stopped.instance());
+        match (runtime, network) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(runtime), Err(network)) => Err(runtime.context(format!(
+                "Firecracker network teardown also failed: {network:#}"
+            ))),
+        }
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {

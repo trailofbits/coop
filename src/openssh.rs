@@ -219,7 +219,7 @@ pub(crate) fn authority_options(target: &SshTarget, forwarding: Forwarding) -> R
         "-o".into(),
         "PermitLocalCommand=no".into(),
         "-o".into(),
-        target.proxy_command_option(),
+        target.proxy_command_option()?,
         "-o".into(),
         "ProxyJump=none".into(),
         "-o".into(),
@@ -283,21 +283,25 @@ fn rsync_word(value: &OsStr, description: &str) -> Result<String> {
     let value = value
         .to_str()
         .with_context(|| format!("{description} is not valid UTF-8 for rsync's -e parser"))?;
-    if value.is_empty()
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'/' | b'_' | b'-' | b'.' | b':' | b'=' | b'@' | b'+' | b'%'
-                )
-        })
-    {
+    if value.is_empty() || value.chars().any(char::is_control) {
         bail!(
             "{description} '{}' cannot be represented unambiguously in rsync's -e command",
             Path::new(value).display()
         );
     }
-    Ok(value.to_owned())
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'/' | b'_' | b'-' | b'.' | b':' | b'=' | b'@' | b'+' | b'%'
+            )
+    }) {
+        return Ok(value.to_owned());
+    }
+    // rsync's -e parser uses its own quote grammar rather than a POSIX shell:
+    // backslashes do not preserve spaces, and a quote inside a quoted word is
+    // represented by doubling it.
+    Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
 pub(crate) fn rsync_ssh_command(target: &SshTarget) -> Result<String> {
@@ -320,7 +324,7 @@ pub(crate) fn rsync_ssh_command(target: &SshTarget) -> Result<String> {
 #[expect(clippy::unwrap_used, reason = "test fixtures")]
 mod tests {
     use std::fs;
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU16, NonZeroU32};
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -329,6 +333,17 @@ mod tests {
         SshTarget::tcp(
             crate::backend::Hostname::new("127.0.0.1").unwrap(),
             NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/coop-test-key"),
+            config,
+        )
+    }
+
+    fn vsock_target(config: SshHostToolsConfig, proxy_executable: PathBuf) -> SshTarget {
+        SshTarget::firecracker_vsock_with_proxy(
+            PathBuf::from("/tmp/coop instance/vsock.sock"),
+            NonZeroU32::new(22).unwrap(),
+            proxy_executable,
             crate::backend::SshUser::new("ubuntu").unwrap(),
             PathBuf::from("/tmp/coop-test-key"),
             config,
@@ -512,6 +527,58 @@ mod tests {
     }
 
     #[test]
+    fn vsock_transport_is_shared_without_tcp_port_options() {
+        let proxy = PathBuf::from("/opt/coop bin/coop");
+        let target = vsock_target(SshHostToolsConfig::default(), proxy);
+        let expected = "ProxyCommand='/opt/coop bin/coop' __vsock-proxy --socket '/tmp/coop instance/vsock.sock' --port 22";
+
+        let ssh = ssh_command(&target, Forwarding::Disabled)
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let scp = scp_command(&target)
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let rsync = rsync_ssh_command(&target).unwrap();
+
+        assert!(ssh.contains(&expected.to_string()));
+        assert!(scp.contains(&expected.to_string()));
+        assert!(!ssh.iter().any(|arg| arg == "-p"));
+        assert!(!scp.iter().any(|arg| arg == "-P"));
+        assert!(rsync.contains("__vsock-proxy"));
+        assert!(!rsync.ends_with(" -p 22"));
+    }
+
+    #[test]
+    fn vsock_proxy_command_quotes_shell_words_and_open_ssh_tokens() {
+        let target = SshTarget::firecracker_vsock_with_proxy(
+            PathBuf::from("/tmp/socket'-%p"),
+            NonZeroU32::new(22).unwrap(),
+            PathBuf::from("/opt/coop'-%h"),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/key"),
+            SshHostToolsConfig::default(),
+        );
+        assert_eq!(
+            target.proxy_command_option().unwrap(),
+            "ProxyCommand='/opt/coop'\\''-%%h' __vsock-proxy --socket '/tmp/socket'\\''-%%p' --port 22"
+        );
+
+        let rejected = SshTarget::firecracker_vsock_with_proxy(
+            PathBuf::from("/tmp/$socket"),
+            NonZeroU32::new(22).unwrap(),
+            PathBuf::from("/opt/coop"),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/key"),
+            SshHostToolsConfig::default(),
+        );
+        assert!(rejected.proxy_command_option().is_err());
+    }
+
+    #[test]
     fn forward_mode_preserves_only_call_site_forwards() {
         let target = target(SshHostToolsConfig::default());
         let session = ssh_command(&target, Forwarding::Disabled).unwrap();
@@ -609,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn rsync_transport_uses_resolved_ssh_and_rejects_ambiguous_exact_path() {
+    fn rsync_transport_uses_resolved_ssh_and_quotes_spaced_exact_path() {
         let fixture = crate::host_tool::trusted_test_tempdir();
         let safe = executable(fixture.path(), "safe-ssh");
         let safe_config = SshHostToolsConfig::with_exact_paths(Some(&safe), None, None).unwrap();
@@ -618,11 +685,12 @@ mod tests {
         assert!(transport.contains(" -F none "));
 
         let spaced_dir = fixture.path().join("with space");
-        fs::create_dir(&spaced_dir).unwrap();
+        crate::test_support::create_private_dir_all(&spaced_dir).unwrap();
         let ambiguous = executable(&spaced_dir, "ssh");
         let ambiguous_config =
             SshHostToolsConfig::with_exact_paths(Some(&ambiguous), None, None).unwrap();
-        assert!(rsync_ssh_command(&target(ambiguous_config)).is_err());
+        let transport = rsync_ssh_command(&target(ambiguous_config)).unwrap();
+        assert!(transport.starts_with(&rsync_word(ambiguous.as_os_str(), "path").unwrap()));
     }
 
     #[test]
@@ -675,6 +743,47 @@ mod tests {
     }
 
     #[test]
+    fn installed_rsync_parser_preserves_vsock_proxy_command_as_one_argument() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let capture = fixture.path().join("ssh-argv");
+        let ssh = fixture.path().join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 1\n",
+                crate::shell::shell_escape(&capture.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        let proxy = fixture.path().join("coop proxy");
+        let target = vsock_target(config, proxy.clone());
+        let transport = rsync_ssh_command(&target).unwrap();
+        let destination = fixture.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+
+        let status = rsync_command(&target)
+            .unwrap()
+            .args([
+                "-e",
+                &transport,
+                "ubuntu@coop-vsock:/missing",
+                destination.to_str().unwrap(),
+            ])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        let argv = fs::read_to_string(capture).unwrap();
+        let expected = format!(
+            "ProxyCommand={} __vsock-proxy --socket '/tmp/coop instance/vsock.sock' --port 22",
+            crate::shell::shell_escape(proxy.to_str().unwrap())
+        );
+        assert!(argv.lines().any(|arg| arg == expected), "argv = {argv:?}");
+    }
+
+    #[test]
     fn production_transport_sources_have_no_bare_launches() {
         for (name, source) in [
             ("backend", include_str!("backend.rs")),
@@ -703,8 +812,15 @@ mod tests {
     #[test]
     fn rsync_words_reject_ambiguous_and_non_utf8_values() {
         assert!(rsync_word(OsStr::new("/safe/path"), "path").is_ok());
-        assert!(rsync_word(OsStr::new("/path with space"), "path").is_err());
-        assert!(rsync_word(OsStr::new("-oProxyCommand=sh -c true"), "option").is_err());
+        assert_eq!(
+            rsync_word(OsStr::new("/path with space"), "path").unwrap(),
+            "'/path with space'"
+        );
+        assert_eq!(
+            rsync_word(OsStr::new("-oProxyCommand=sh -c true"), "option").unwrap(),
+            "'-oProxyCommand=sh -c true'"
+        );
+        assert!(rsync_word(OsStr::new("line\nbreak"), "option").is_err());
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;

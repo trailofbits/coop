@@ -30,6 +30,7 @@ coop/
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
 │   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
+│   ├── vsock_proxy.rs      # bounded Firecracker CONNECT handshake + byte relay
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
@@ -117,6 +118,15 @@ flags — this is a load-bearing design choice (see
   check at the backend boundary. `boot_preflight(cfg)` then runs
   `cfg.validate()` before backend setup or boot work, so no VM starts on an
   invalid config.
+
+`backend::SshTarget` keeps backend identity separate from its closed transport
+choice. TCP targets carry a validated hostname and port. The Firecracker-vsock
+variant carries the trusted per-instance Unix-socket path and guest port, and
+renders the same Rust `__vsock-proxy` helper for SSH, SCP, rsync, forwarding,
+and generated SSH configuration. The helper bounds and validates Firecracker's
+text `CONNECT` handshake before relaying raw bytes. The guest listener and
+transport helper are available, while Firecracker lifecycle traffic and Lima
+remain TCP-based.
 
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
