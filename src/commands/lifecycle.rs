@@ -733,7 +733,10 @@ pub(super) fn allocate_and_start(
         }
         crate::proxy::stop(&inst);
         if let Err(cleanup_err) = be.destroy_instance(cfg, &inst) {
-            tracing::debug!("Cleanup failed (non-fatal): {cleanup_err}");
+            tracing::warn!(
+                "Failed-start cleanup retained instance '{}': {cleanup_err}",
+                inst.name
+            );
         }
         if let Err(ssh_err) = workspace::remove_ssh_config(&inst) {
             tracing::debug!("SSH config cleanup failed (non-fatal): {ssh_err}");

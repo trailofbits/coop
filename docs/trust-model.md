@@ -202,6 +202,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   a private lock. Sudo runs the current executable through the parent's procfs
   executable link, which pins its inode even if its install pathname changes.
   Privileged unmounts use the kernel's no-follow flag on guest mountpoint names.
+  Disk replacement and failed-start directory removal stop if the rootfs mount
+  still has a distinct kernel mount ID.
   Atomic replacement assumes the trusted host user does not
   concurrently replace names inside the private directory. `limactl` accepts
   paths rather than inherited descriptors, so its own path resolution remains

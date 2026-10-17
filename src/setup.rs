@@ -340,6 +340,7 @@ struct MountGuard {
     mount_path: String,
     disk_path: PathBuf,
     kind: MountKind,
+    mounted: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -351,6 +352,7 @@ impl MountGuard {
             mount_path: mount_path.to_string(),
             disk_path: PathBuf::from(rootfs),
             kind: MountKind::Simple,
+            mounted: true,
         })
     }
 
@@ -361,13 +363,35 @@ impl MountGuard {
             mount_path: mount_path.to_string(),
             disk_path: PathBuf::from(rootfs),
             kind: MountKind::Chroot,
+            mounted: true,
         })
+    }
+
+    fn unmount_simple_with(&mut self, unmount: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        unmount(&self.disk_path)?;
+        self.mounted = false;
+        Ok(())
+    }
+
+    fn finish_simple_with(&mut self, unmount: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        self.unmount_simple_with(unmount)
+            .with_context(|| format!("Failed to unmount {}", self.mount_path))?;
+        if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
+            tracing::warn!(
+                "Failed to remove mount dir {} (non-fatal): {e}",
+                self.mount_path
+            );
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for MountGuard {
     fn drop(&mut self) {
+        if !self.mounted {
+            return;
+        }
         match self.kind {
             MountKind::Chroot => unmount_chroot(&self.disk_path, &self.mount_path),
             MountKind::Simple => {
@@ -400,19 +424,34 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         inst.guest_ip()
     );
 
-    let _guard = MountGuard::simple(&rootfs_str, &mount_str)?;
+    let mut guard = MountGuard::simple(&rootfs_str, &mount_str)?;
+    patch_guest_network_mounted(
+        &mut guard,
+        || {
+            Cmd::new(crate::privileged_disk::running_executable_path())
+                .arg("__patch-guest-network")
+                .arg(&mount_str)
+                .arg(&hostname)
+                .arg(inst.guest_ip().to_string())
+                .sudo()
+                .run()
+                .context("Failed to patch guest network and identity")
+        },
+        crate::privileged_disk::unmount,
+    )
+}
 
-    Cmd::new(crate::privileged_disk::running_executable_path())
-        .arg("__patch-guest-network")
-        .arg(&mount_str)
-        .arg(&hostname)
-        .arg(inst.guest_ip().to_string())
-        .sudo()
-        .run()
-        .context("Failed to patch guest network and identity")?;
-
-    // _guard dropped here → unmount + rmdir
-    Ok(())
+#[cfg(target_os = "linux")]
+fn patch_guest_network_mounted(
+    guard: &mut MountGuard,
+    patch: impl FnOnce() -> Result<()>,
+    unmount: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let patch_result = patch();
+    // A failed unmount must prevent Firecracker from opening this disk. Drop
+    // makes one more cleanup attempt if the explicit unmount fails.
+    guard.finish_simple_with(unmount)?;
+    patch_result
 }
 
 /// Debian/Ubuntu convention: the machine's own name lives on a `127.0.1.1`
@@ -1778,6 +1817,31 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn busy_network_patch_unmount_returns_error_before_start() {
+        let mut guard = MountGuard {
+            mount_path: "unused".to_string(),
+            disk_path: PathBuf::from("/unused/rootfs.ext4"),
+            kind: MountKind::Simple,
+            mounted: true,
+        };
+        let error = patch_guest_network_mounted(
+            &mut guard,
+            || Ok(()),
+            |_| Err(io::Error::from_raw_os_error(libc::EBUSY).into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        assert!(guard.mounted);
+
+        guard.unmount_simple_with(|_| Ok(())).unwrap();
+        assert!(!guard.mounted);
+    }
 
     fn setup_options(extra_packages: &[&str], post_install: Option<PathBuf>) -> SetupOptions {
         SetupOptions {

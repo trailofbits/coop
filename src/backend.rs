@@ -1021,13 +1021,16 @@ impl VmBackend for FirecrackerBackend {
             vm.stop()?;
         }
         crate::network::teardown_tap(&cfg.network, inst)?;
-        if inst.dir.exists()
-            && let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&inst.dir).sudo().run()
-        {
-            tracing::debug!(
-                "Failed to remove instance dir {} (non-fatal): {e}",
-                inst.dir.display()
-            );
+        if inst.dir.exists() {
+            // A failed patch-time unmount must not let rm descend into the
+            // guest filesystem or unlink its still-mounted backing file.
+            crate::privileged_disk::ensure_disk_unmounted(&inst.rootfs_path())?;
+            if let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&inst.dir).sudo().run() {
+                tracing::debug!(
+                    "Failed to remove instance dir {} (non-fatal): {e}",
+                    inst.dir.display()
+                );
+            }
         }
         Ok(())
     }
