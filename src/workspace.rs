@@ -993,11 +993,11 @@ fn ssh_config_path() -> Result<PathBuf> {
 
 fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
     let host = ssh_config_host(inst);
+    let transport = target.ssh_config_transport();
     format!(
         "{MARKER_PREFIX} {host}\n\
          Host {host}\n\
-         \x20   HostName {}\n\
-         \x20   Port {}\n\
+         {transport}\
          \x20   User {}\n\
          \x20   IdentityFile {}\n\
          \x20   IdentitiesOnly yes\n\
@@ -1007,10 +1007,8 @@ fn ssh_config_block(target: &SshTarget, inst: &Instance) -> String {
          \x20   UserKnownHostsFile /dev/null\n\
          \x20   LogLevel ERROR\n\
          {MARKER_END}",
-        target.host,
-        target.port,
-        target.user,
-        target.key_path.display(),
+        target.user(),
+        target.key_path().display(),
     )
 }
 
@@ -1376,10 +1374,10 @@ mod tests {
         }
         .save(&inst)
         .unwrap();
-        let mut target = fake_ssh_target();
-        target.host_tools =
+        let target = fake_ssh_target().with_host_tools(
             crate::config::SshHostToolsConfig::with_exact_paths(Some(&ssh), None, Some(&rsync))
-                .unwrap();
+                .unwrap(),
+        );
         let running = RunningInstance::new(inst, target);
         let result = match operation {
             "copy" => copy_workspace(running.target(), &source, false),
@@ -1441,10 +1439,10 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&rsync, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut target = fake_ssh_target();
-        target.host_tools =
+        let target = fake_ssh_target().with_host_tools(
             crate::config::SshHostToolsConfig::with_exact_paths(Some(&ssh), None, Some(&rsync))
-                .unwrap();
+                .unwrap(),
+        );
         let source = root.join("source with spaces");
         fs::create_dir(&source).unwrap();
         let read_args = || {
@@ -1627,18 +1625,18 @@ mod tests {
         }
         .save(&inst)
         .unwrap();
-        let target = SshTarget {
-            host: Hostname::new("localhost").unwrap(),
-            port: NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: root.join("key"),
-            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+        let target = SshTarget::tcp(
+            Hostname::new("localhost").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            root.join("key"),
+            crate::config::SshHostToolsConfig::with_exact_paths(
                 Some(&root.join("ssh")),
                 None,
                 Some(&root.join("rsync")),
             )
             .unwrap(),
-        };
+        );
         let running = RunningInstance::new(inst, target);
         let result = push(&running, None, mode == "force", false);
         match mode {
@@ -2182,17 +2180,24 @@ Host coop-app\n\
         let inst = temp_instance(dir.path());
         let block = ssh_config_block(&fake_ssh_target(), &inst);
 
-        assert!(block.starts_with("# coop START coop-test"));
-        assert!(block.trim_end().ends_with("# coop END"));
-        assert!(block.contains("Host coop-test"));
-        assert!(block.contains("HostName 127.0.0.1"));
-        assert!(block.contains("Port 2222"));
-        assert!(block.contains("User ubuntu"));
-        assert!(block.contains("IdentityFile /tmp/key"));
-        assert!(block.contains("    IdentityAgent none\n"));
-        assert!(block.contains("    ForwardAgent no\n"));
-        assert!(block.contains("StrictHostKeyChecking no"));
-        assert!(block.contains("UserKnownHostsFile /dev/null"));
+        assert_eq!(
+            block,
+            concat!(
+                "# coop START coop-test\n",
+                "Host coop-test\n",
+                "    HostName 127.0.0.1\n",
+                "    Port 2222\n",
+                "    User ubuntu\n",
+                "    IdentityFile /tmp/key\n",
+                "    IdentitiesOnly yes\n",
+                "    IdentityAgent none\n",
+                "    ForwardAgent no\n",
+                "    StrictHostKeyChecking no\n",
+                "    UserKnownHostsFile /dev/null\n",
+                "    LogLevel ERROR\n",
+                "# coop END",
+            )
+        );
     }
 
     #[test]
@@ -2342,13 +2347,13 @@ Host coop-other\n\
 
     fn fake_ssh_target() -> SshTarget {
         use crate::backend::{Hostname, SshUser};
-        SshTarget {
-            host: Hostname::new("127.0.0.1").expect("valid host"),
-            port: std::num::NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("ubuntu").expect("valid user"),
-            key_path: PathBuf::from("/tmp/key"),
-            host_tools: crate::config::SshHostToolsConfig::default(),
-        }
+        SshTarget::tcp(
+            Hostname::new("127.0.0.1").expect("valid host"),
+            std::num::NonZeroU16::new(2222).unwrap(),
+            SshUser::new("ubuntu").expect("valid user"),
+            PathBuf::from("/tmp/key"),
+            crate::config::SshHostToolsConfig::default(),
+        )
     }
 
     #[test]
@@ -2683,13 +2688,14 @@ Host coop-other\n\
         let dest = root.join("dest");
         let staging = root.join("pull-tmp/staging");
         let operation = PullOperation::new(staging.clone()).unwrap();
-        let mut target = fake_ssh_target();
-        target.host_tools = crate::config::SshHostToolsConfig::with_exact_paths(
-            Some(&root.join("bin/ssh")),
-            None,
-            Some(&root.join("bin/rsync")),
-        )
-        .unwrap();
+        let target = fake_ssh_target().with_host_tools(
+            crate::config::SshHostToolsConfig::with_exact_paths(
+                Some(&root.join("bin/ssh")),
+                None,
+                Some(&root.join("bin/rsync")),
+            )
+            .unwrap(),
+        );
         rsync_pull(
             &target,
             &GuestPath::absolute("/workspace").unwrap(),

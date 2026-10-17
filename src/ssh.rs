@@ -84,9 +84,8 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
     let remote_cmd = render_remote(command);
 
     tracing::info!(
-        "Connecting via SSH to {}:{} ({remote_cmd})",
-        session.target.host,
-        session.target.port,
+        "Connecting via SSH to {} ({remote_cmd})",
+        session.target.connection_description(),
     );
     tracing::info!(
         "If the remote session stops responding, type Enter, then ~. to disconnect; run `stty sane` if your terminal remains broken.",
@@ -178,20 +177,19 @@ mod tests {
     #[test]
     fn interactive_args_force_escape_before_target() {
         let session = SshSession {
-            target: crate::backend::SshTarget {
-                host: crate::backend::Hostname::new("127.0.0.1")
-                    .expect("test host should be valid"),
-                port: std::num::NonZeroU16::MIN,
-                user: crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
-                key_path: "/tmp/coop-test-key".into(),
-                host_tools: crate::config::SshHostToolsConfig::default(),
-            },
+            target: crate::backend::SshTarget::tcp(
+                crate::backend::Hostname::new("127.0.0.1").expect("test host should be valid"),
+                std::num::NonZeroU16::MIN,
+                crate::backend::SshUser::new("ubuntu").expect("test user should be valid"),
+                "/tmp/coop-test-key".into(),
+                crate::config::SshHostToolsConfig::default(),
+            ),
             env: crate::backend::EnvForward::default(),
         };
 
-        // The `ServerAlive*` pair comes from `SshTarget::transport_opts`, which
-        // every transport shares; this session must not add a second one, since
-        // OpenSSH honors the first value of a repeated `-o`.
+        // The `ServerAlive*` pair comes from the shared OpenSSH authority
+        // options; this session must not add a second one, since OpenSSH honors
+        // the first value of a repeated `-o`.
         let command = interactive_ssh_command(&session, "cd /workspace && 'claude' 'agents'")
             .expect("interactive SSH command");
         let args = command.get_args().collect::<Vec<_>>();
@@ -226,18 +224,18 @@ mod tests {
                 .expect("LD_LIBRARY_PATH");
             env.set("SECRET", "guest-only-sentinel").expect("SECRET");
             let session = SshSession {
-                target: crate::backend::SshTarget {
-                    host: crate::backend::Hostname::new("127.0.0.1").expect("host"),
-                    port: std::num::NonZeroU16::MIN,
-                    user: crate::backend::SshUser::new("ubuntu").expect("user"),
-                    key_path: "/unused-key".into(),
-                    host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+                target: crate::backend::SshTarget::tcp(
+                    crate::backend::Hostname::new("127.0.0.1").expect("host"),
+                    std::num::NonZeroU16::MIN,
+                    crate::backend::SshUser::new("ubuntu").expect("user"),
+                    "/unused-key".into(),
+                    crate::config::SshHostToolsConfig::with_exact_paths(
                         Some(&fixture.join("ssh")),
                         None,
                         None,
                     )
                     .expect("exact fixture ssh"),
-                },
+                ),
                 env,
             };
             let check = "test \"$PATH\" = ./project-bin && test \"$LD_LIBRARY_PATH\" = ./project-libs && test \"$SECRET\" = guest-only-sentinel";

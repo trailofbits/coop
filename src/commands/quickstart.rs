@@ -92,7 +92,7 @@ pub(crate) fn cmd_quickstart(
     };
 
     let sess = open_agent_session(be, cfg, Some(&inst.name))?;
-    let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+    let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
     ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), Vec::new()))
 }
 

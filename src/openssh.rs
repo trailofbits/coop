@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::SshTarget;
+use crate::backend::{SshTarget, SshTransportClient};
 use crate::config::{AbsoluteHostToolPath, SshHostToolsConfig};
 use crate::host_tool::{
     ResolvedHostTool, TrustedLaunchContext, TrustedToolPolicy, resolve_exact_host_tool,
@@ -219,7 +219,7 @@ pub(crate) fn authority_options(target: &SshTarget, forwarding: Forwarding) -> R
         "-o".into(),
         "PermitLocalCommand=no".into(),
         "-o".into(),
-        "ProxyCommand=none".into(),
+        target.proxy_command_option(),
         "-o".into(),
         "ProxyJump=none".into(),
         "-o".into(),
@@ -244,7 +244,7 @@ pub(crate) fn authority_options(target: &SshTarget, forwarding: Forwarding) -> R
         "-o".into(),
         format!(
             "IdentityFile={}",
-            config_path(&target.key_path, "managed SSH identity path")?
+            config_path(target.key_path(), "managed SSH identity path")?
         ),
     ])
 }
@@ -254,28 +254,28 @@ fn command(tool: &ResolvedHostTool<OpenSshTool>) -> Command {
 }
 
 pub(crate) fn ssh_command(target: &SshTarget, forwarding: Forwarding) -> Result<Command> {
-    let tool = resolve(OpenSshTool::Ssh, &target.host_tools)?;
+    let tool = resolve(OpenSshTool::Ssh, target.host_tools())?;
     let mut command = command(&tool);
     command.args(authority_options(target, forwarding)?);
-    command.args(["-p", &target.port.to_string()]);
+    command.args(target.transport_options(SshTransportClient::Ssh));
     Ok(command)
 }
 
 pub(crate) fn scp_command(target: &SshTarget) -> Result<Command> {
-    let scp = resolve(OpenSshTool::Scp, &target.host_tools)?;
+    let scp = resolve(OpenSshTool::Scp, target.host_tools())?;
     // scp launches ssh as a child. Pin that nested executable explicitly so
     // it cannot bypass the same trusted-path policy applied to direct SSH.
-    let ssh = resolve(OpenSshTool::Ssh, &target.host_tools)?;
+    let ssh = resolve(OpenSshTool::Ssh, target.host_tools())?;
     let mut command = command(&scp);
     command.arg("-q");
     command.args(authority_options(target, Forwarding::Disabled)?);
     command.arg("-S").arg(ssh.launch_path());
-    command.args(["-P", &target.port.to_string()]);
+    command.args(target.transport_options(SshTransportClient::Scp));
     Ok(command)
 }
 
 pub(crate) fn rsync_command(target: &SshTarget) -> Result<Command> {
-    let tool = resolve(OpenSshTool::Rsync, &target.host_tools)?;
+    let tool = resolve(OpenSshTool::Rsync, target.host_tools())?;
     Ok(command(&tool))
 }
 
@@ -301,7 +301,7 @@ fn rsync_word(value: &OsStr, description: &str) -> Result<String> {
 }
 
 pub(crate) fn rsync_ssh_command(target: &SshTarget) -> Result<String> {
-    let ssh = resolve(OpenSshTool::Ssh, &target.host_tools)?;
+    let ssh = resolve(OpenSshTool::Ssh, target.host_tools())?;
     let mut words = Vec::new();
     words.push(rsync_word(
         ssh.launch_path().as_os_str(),
@@ -310,8 +310,9 @@ pub(crate) fn rsync_ssh_command(target: &SshTarget) -> Result<String> {
     for option in authority_options(target, Forwarding::Disabled)? {
         words.push(rsync_word(OsStr::new(&option), "OpenSSH transport option")?);
     }
-    words.push("-p".to_string());
-    words.push(target.port.to_string());
+    for option in target.transport_options(SshTransportClient::Ssh) {
+        words.push(rsync_word(OsStr::new(&option), "OpenSSH transport option")?);
+    }
     Ok(words.join(" "))
 }
 
@@ -325,13 +326,13 @@ mod tests {
     use super::*;
 
     fn target(config: SshHostToolsConfig) -> SshTarget {
-        SshTarget {
-            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: NonZeroU16::new(2222).unwrap(),
-            user: crate::backend::SshUser::new("ubuntu").unwrap(),
-            key_path: PathBuf::from("/tmp/coop-test-key"),
-            host_tools: config,
-        }
+        SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/coop-test-key"),
+            config,
+        )
     }
 
     #[test]
@@ -472,6 +473,42 @@ mod tests {
         );
 
         assert_scp_uses_ssh(&scp_command(&target).unwrap(), &ssh_path);
+    }
+
+    #[test]
+    fn tcp_transport_is_shared_with_client_specific_port_spelling() {
+        let target = target(SshHostToolsConfig::default());
+        let ssh = ssh_command(&target, Forwarding::Disabled)
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let scp = scp_command(&target)
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let rsync = rsync_ssh_command(&target)
+            .unwrap()
+            .split(' ')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for shared in [
+            "ProxyCommand=none",
+            "IdentityFile=/tmp/coop-test-key",
+            "ServerAliveInterval=30",
+        ] {
+            assert!(ssh.contains(&shared.to_string()), "ssh omitted {shared}");
+            assert!(scp.contains(&shared.to_string()), "scp omitted {shared}");
+            assert!(
+                rsync.contains(&shared.to_string()),
+                "rsync omitted {shared}"
+            );
+        }
+        assert_eq!(&ssh[ssh.len() - 2..], ["-p", "2222"]);
+        assert_eq!(&scp[scp.len() - 2..], ["-P", "2222"]);
+        assert_eq!(&rsync[rsync.len() - 2..], ["-p", "2222"]);
     }
 
     #[test]
@@ -687,8 +724,8 @@ mod tests {
         );
         assert!(config_path(Path::new("/tmp/${HOME}/key"), "identity path").is_err());
 
-        let mut target = target(SshHostToolsConfig::default());
-        target.key_path = PathBuf::from("/tmp/key-%h");
+        let target =
+            target(SshHostToolsConfig::default()).with_key_path(PathBuf::from("/tmp/key-%h"));
         let command = ssh_command(&target, Forwarding::Disabled).unwrap();
         assert!(
             command

@@ -169,13 +169,13 @@ mod tests {
         inst: &Instance,
         repo: Option<&RepoSlug>,
     ) -> anyhow::Result<Option<String>> {
-        let target = SshTarget {
-            host: Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: inst.dir.join("unused"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = SshTarget::tcp(
+            Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            inst.dir.join("unused"),
+            cfg.ssh.host_tools.clone(),
+        );
         let session = crate::commands::prepare_session_from_target(cfg, Some(inst), target, repo)?;
         Ok(session.env.guest_values().get("GITHUB_TOKEN").cloned())
     }

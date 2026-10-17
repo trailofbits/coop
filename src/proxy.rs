@@ -393,6 +393,38 @@ fn confined_command(bin: &Path) -> Command {
 #[cfg(target_os = "macos")]
 const SEATBELT_PROFILE: &str = include_str!("seatbelt-proxy.sb");
 
+fn reverse_forward_master_args(control_path: &Path, target: &SshTarget) -> Result<Vec<String>> {
+    Ok(vec![
+        "-N".into(),
+        "-T".into(),
+        "-o".into(),
+        "ControlMaster=yes".into(),
+        "-o".into(),
+        "ControlPersist=no".into(),
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
+        "-S".into(),
+        crate::openssh::literal_path(control_path, "proxy SSH control socket path")?,
+        target.addr(),
+    ])
+}
+
+fn reverse_forward_request_args(
+    control_path: &Path,
+    target: &SshTarget,
+    port: u16,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        "-S".into(),
+        crate::openssh::literal_path(control_path, "proxy SSH control socket path")?,
+        "-O".into(),
+        "forward".into(),
+        "-R".into(),
+        format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+        target.addr(),
+    ])
+}
+
 /// Establish a per-instance reverse SSH tunnel so the guest reaches the
 /// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
 /// and tracked by a PID file like the proxy process, so teardown needs no SSH
@@ -410,20 +442,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         .try_clone()
         .context("Failed to clone proxy tunnel log")?;
 
-    let mut args = Vec::new();
-    args.extend([
-        "-N".into(),
-        "-T".into(),
-        "-o".into(),
-        "ControlMaster=yes".into(),
-        "-o".into(),
-        "ControlPersist=no".into(),
-        "-o".into(),
-        "ForkAfterAuthentication=no".into(),
-        "-S".into(),
-        crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
-    ]);
-    args.push(target.addr());
+    let args = reverse_forward_master_args(&control_path, target)?;
 
     let mut child = target
         .ssh_forward_command()?
@@ -458,16 +477,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         // accepted a reverse forward. -O forward waits for that acknowledgment
         // and returns nonzero for a rejected bind. The master stays the direct
         // child, so its existing PID-file teardown remains authoritative.
-        let mut forward_args = Vec::new();
-        forward_args.extend([
-            "-S".into(),
-            crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
-            "-O".into(),
-            "forward".into(),
-            "-R".into(),
-            format!("127.0.0.1:{port}:127.0.0.1:{port}"),
-        ]);
-        forward_args.push(target.addr());
+        let forward_args = reverse_forward_request_args(&control_path, target, port)?;
         let request = target
             .ssh_forward_command()?
             .args(&forward_args)
@@ -702,6 +712,47 @@ mod tests {
     }
 
     #[test]
+    fn reverse_forward_arguments_preserve_tcp_target_and_loopback_binding() {
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("192.0.2.2").unwrap(),
+            std::num::NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/key"),
+            crate::config::SshHostToolsConfig::default(),
+        );
+        let socket = Path::new("/tmp/proxy-control.sock");
+
+        assert_eq!(
+            reverse_forward_master_args(socket, &target).unwrap(),
+            [
+                "-N",
+                "-T",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ForkAfterAuthentication=no",
+                "-S",
+                "/tmp/proxy-control.sock",
+                "ubuntu@192.0.2.2",
+            ]
+        );
+        assert_eq!(
+            reverse_forward_request_args(socket, &target, 8788).unwrap(),
+            [
+                "-S",
+                "/tmp/proxy-control.sock",
+                "-O",
+                "forward",
+                "-R",
+                "127.0.0.1:8788:127.0.0.1:8788",
+                "ubuntu@192.0.2.2",
+            ]
+        );
+    }
+
+    #[test]
     fn provider_ranges_do_not_overlap() {
         // 252 is the max instance index (0..=252); the Anthropic range top
         // must stay strictly below the OpenAI base so no (VM, provider) pair
@@ -809,13 +860,13 @@ mod tests {
             credential: Secret::new("sk-wrong-type".to_string()),
             auth: ProxyAuthScheme::CodexAccessToken,
         };
-        let target = SshTarget {
-            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: crate::backend::SshUser::new("ubuntu").unwrap(),
-            key_path: tmp.path().join("unused_key"),
-            host_tools: crate::config::CoopConfig::default().ssh.host_tools,
-        };
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("unused_key"),
+            crate::config::CoopConfig::default().ssh.host_tools,
+        );
         let mut stale = StaleProvider::seed(&inst);
         let error = start_provider(&inst, Provider::Openai, &upstream, &target).unwrap_err();
         stale.assert_stopped(&inst);
@@ -1083,13 +1134,13 @@ mod tests {
                 }
             }
         });
-        let target = SshTarget {
-            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(port).unwrap(),
-            user: crate::backend::SshUser::new("coop").unwrap(),
-            key_path: tmp.path().join("unused-key"),
-            host_tools: crate::config::SshHostToolsConfig::default(),
-        };
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(port).unwrap(),
+            crate::backend::SshUser::new("coop").unwrap(),
+            tmp.path().join("unused-key"),
+            crate::config::SshHostToolsConfig::default(),
+        );
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
         // Also clean up the old implementation when deliberately regressed.
@@ -1113,18 +1164,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut inst = inst_with_index(0);
         inst.dir = tmp.path().to_path_buf();
-        let target = SshTarget {
-            host: crate::backend::Hostname::new("192.0.2.2").unwrap(),
-            port: std::num::NonZeroU16::new(2222).unwrap(),
-            user: crate::backend::SshUser::new("root").unwrap(),
-            key_path: fixture.join("client"),
-            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("192.0.2.2").unwrap(),
+            std::num::NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("root").unwrap(),
+            fixture.join("client"),
+            crate::config::SshHostToolsConfig::with_exact_paths(
                 Some(&fixture.join("bin/ssh")),
                 None,
                 None,
             )
             .unwrap(),
-        };
+        );
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let port = destination.local_addr().unwrap().port();

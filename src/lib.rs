@@ -1191,13 +1191,13 @@ pub fn run() -> Result<()> {
                 args.insert(0, "default".to_string());
                 args.insert(0, "--permission-mode".to_string());
             }
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
             let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             args.insert(0, "agents".to_string());
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
@@ -1221,7 +1221,7 @@ pub fn run() -> Result<()> {
         Commands::Grok { name, ask, args } => {
             let sess = open_agent_session(&be, &cfg, name.as_ref())?;
             let args = grok_launch_args(ask, args);
-            let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
+            let grok_bin = guest::GuestUser::new(sess.target.user().as_ref())?.grok_bin();
             ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
         }
         Commands::Stop { name } => {

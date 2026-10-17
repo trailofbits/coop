@@ -338,11 +338,34 @@ impl AsRef<str> for SshUser {
 /// SSH connection details for reaching a guest VM.
 #[derive(Debug, Clone)]
 pub struct SshTarget {
-    pub host: Hostname,
-    pub port: NonZeroU16,
-    pub user: SshUser,
-    pub key_path: PathBuf,
-    pub(crate) host_tools: SshHostToolsConfig,
+    transport: SshTransport,
+    user: SshUser,
+    key_path: PathBuf,
+    host_tools: SshHostToolsConfig,
+}
+
+/// Closed set of transports OpenSSH can use to reach a guest.
+#[derive(Debug, Clone)]
+enum SshTransport {
+    Tcp(TcpSshTransport),
+}
+
+/// TCP endpoint for an SSH transport.
+#[derive(Debug, Clone)]
+struct TcpSshTransport {
+    host: Hostname,
+    port: NonZeroU16,
+}
+
+/// OpenSSH client whose transport arguments are being rendered.
+///
+/// SSH and rsync's SSH transport spell the port option `-p`; SCP spells it
+/// `-P`. Keeping that choice typed prevents a caller from selecting the wrong
+/// spelling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SshTransportClient {
+    Ssh,
+    Scp,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -357,6 +380,95 @@ pub struct SshSession {
 }
 
 impl SshTarget {
+    /// Construct a target reached directly over TCP.
+    pub fn tcp(
+        host: Hostname,
+        port: NonZeroU16,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Self {
+        Self {
+            transport: SshTransport::Tcp(TcpSshTransport { host, port }),
+            user,
+            key_path,
+            host_tools,
+        }
+    }
+
+    pub(crate) fn user(&self) -> &SshUser {
+        &self.user
+    }
+
+    pub(crate) fn key_path(&self) -> &Path {
+        &self.key_path
+    }
+
+    pub(crate) fn host_tools(&self) -> &SshHostToolsConfig {
+        &self.host_tools
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_key_path(mut self, key_path: PathBuf) -> Self {
+        self.key_path = key_path;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_host_tools(mut self, host_tools: SshHostToolsConfig) -> Self {
+        self.host_tools = host_tools;
+        self
+    }
+
+    /// Options that select how an OpenSSH client reaches the guest.
+    pub(crate) fn transport_options(&self, client: SshTransportClient) -> Vec<String> {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => vec![
+                match client {
+                    SshTransportClient::Ssh => "-p",
+                    SshTransportClient::Scp => "-P",
+                }
+                .to_string(),
+                tcp.port.to_string(),
+            ],
+        }
+    }
+
+    /// Proxy option for the selected transport.
+    pub(crate) fn proxy_command_option(&self) -> String {
+        match &self.transport {
+            SshTransport::Tcp(_) => "ProxyCommand=none".to_string(),
+        }
+    }
+
+    /// Transport-specific lines for a user-facing SSH config block.
+    pub(crate) fn ssh_config_transport(&self) -> String {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => {
+                format!("    HostName {}\n    Port {}\n", tcp.host, tcp.port)
+            }
+        }
+    }
+
+    /// Human-readable endpoint used in lifecycle and interactive diagnostics.
+    pub(crate) fn connection_description(&self) -> String {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => format!("{}:{}", tcp.host, tcp.port),
+        }
+    }
+
+    /// Check whether the selected transport accepts a connection.
+    pub(crate) fn transport_is_reachable(&self, timeout: Duration) -> Result<bool> {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => {
+                let address = format!("{}:{}", tcp.host, tcp.port)
+                    .parse()
+                    .context("Invalid guest address")?;
+                Ok(std::net::TcpStream::connect_timeout(&address, timeout).is_ok())
+            }
+        }
+    }
+
     /// Control socket path for SSH connection multiplexing.
     ///
     /// Uses `XDG_RUNTIME_DIR` (per-user, 0700 on Linux) when available,
@@ -370,11 +482,15 @@ impl SshTarget {
     fn control_path(&self) -> PathBuf {
         let dir =
             std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        // Hash host:port to keep the filename short and predictable.
+        // Hash the transport identity to keep the filename short and predictable.
         // 8 hex chars (32 bits) is enough to avoid collisions across
         // the handful of concurrent instances this tool manages.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(&self.host, self.port), &mut hasher);
+        match &self.transport {
+            SshTransport::Tcp(tcp) => {
+                std::hash::Hash::hash(&(&tcp.host, tcp.port), &mut hasher);
+            }
+        }
         let hash = std::hash::Hasher::finish(&hasher);
         // Truncation to 32 bits is intentional — we only need enough
         // uniqueness to distinguish a handful of concurrent instances.
@@ -405,6 +521,16 @@ impl SshTarget {
         Ok(command)
     }
 
+    fn mux_teardown_command(&self, socket: &Path) -> Result<Command> {
+        let mut ssh = self.ssh_command()?;
+        let control_arg = format!(
+            "ControlPath={}",
+            crate::openssh::config_path(socket, "SSH control socket path")?
+        );
+        ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()]);
+        Ok(ssh)
+    }
+
     pub(crate) fn ssh_command(&self) -> Result<Command> {
         crate::openssh::ssh_command(self, crate::openssh::Forwarding::Disabled)
     }
@@ -419,7 +545,9 @@ impl SshTarget {
 
     /// user@host address string.
     pub fn addr(&self) -> String {
-        format!("{}@{}", self.user, self.host)
+        match &self.transport {
+            SshTransport::Tcp(tcp) => format!("{}@{}", self.user, tcp.host),
+        }
     }
 
     /// Run a command on the guest via SSH.
@@ -505,7 +633,7 @@ impl SshTarget {
 
     /// Wait until SSH is ready, retrying with exponential backoff.
     ///
-    /// TCP reachability (checked by `wait_for_boot`) does not guarantee
+    /// Transport reachability (checked by `wait_for_boot`) does not guarantee
     /// sshd is accepting authentication. This probe retries a trivial
     /// command until it succeeds or the timeout expires.
     ///
@@ -603,13 +731,8 @@ impl SshTarget {
             return;
         }
         tracing::debug!("Closing SSH control master at {}", sock.display());
-        let result = self.ssh_command().and_then(|mut ssh| {
-            let control_arg = format!(
-                "ControlPath={}",
-                crate::openssh::config_path(&sock, "SSH control socket path")?
-            );
-            ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()])
-                .stdout(std::process::Stdio::null())
+        let result = self.mux_teardown_command(&sock).and_then(|mut ssh| {
+            ssh.stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .context("Failed to launch SSH control request")
@@ -965,6 +1088,26 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     running.wait_for_boot()
 }
 
+/// Build the legacy Linux/Firecracker TCP control transport.
+///
+/// This seam remains while Firecracker TCP is a supported control transport
+/// and can be removed when that compatibility window closes. Lima continues
+/// through its own TCP constructor because its host, port, and lifecycle
+/// assumptions differ.
+pub(crate) fn legacy_firecracker_tcp_target(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> Result<SshTarget> {
+    let guest_user = persisted_guest_user(cfg, &inst.image);
+    Ok(SshTarget::tcp(
+        Hostname::from(inst.guest_ip()),
+        cfg.ssh_port,
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
+}
+
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
@@ -1166,14 +1309,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-        let guest_user = persisted_guest_user(cfg, &inst.image);
-        Ok(SshTarget {
-            host: Hostname::from(inst.guest_ip()),
-            port: cfg.ssh_port,
-            user: SshUser::new(guest_user.as_str())?,
-            key_path: std::path::absolute(cfg.ssh_key_path())?,
-            host_tools: cfg.ssh.host_tools.clone(),
-        })
+        legacy_firecracker_tcp_target(cfg, inst)
     }
 
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf> {
@@ -4277,13 +4413,13 @@ mod tests {
             image: ImageName::new("default").unwrap(),
         };
         std::fs::create_dir(&inst.dir).unwrap();
-        let target = SshTarget {
-            host: Hostname::new("localhost").unwrap(),
-            port: NonZeroU16::new(22).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: root.join("key"),
-            host_tools: SshHostToolsConfig::default(),
-        };
+        let target = SshTarget::tcp(
+            Hostname::new("localhost").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            root.join("key"),
+            SshHostToolsConfig::default(),
+        );
         LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
             .unwrap();
@@ -4368,13 +4504,76 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 ";
 
     fn ssh_test_target() -> SshTarget {
-        SshTarget {
-            host: Hostname::new("192.0.2.1").unwrap(),
-            port: NonZeroU16::new(22).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: PathBuf::from("/tmp/test-key"),
-            host_tools: SshHostToolsConfig::default(),
-        }
+        SshTarget::tcp(
+            Hostname::new("192.0.2.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/test-key"),
+            SshHostToolsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn firecracker_and_lima_style_tcp_targets_preserve_identity() {
+        let firecracker = ssh_test_target();
+        let lima = SshTarget::tcp(
+            Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(60022).unwrap(),
+            SshUser::new("lima").unwrap(),
+            PathBuf::from("/tmp/lima-key"),
+            SshHostToolsConfig::default(),
+        );
+
+        assert_eq!(firecracker.addr(), "ubuntu@192.0.2.1");
+        assert_eq!(firecracker.connection_description(), "192.0.2.1:22");
+        assert_eq!(lima.addr(), "lima@127.0.0.1");
+        assert_eq!(lima.connection_description(), "127.0.0.1:60022");
+        assert_ne!(firecracker.control_path(), lima.control_path());
+        assert_eq!(
+            firecracker.control_path(),
+            firecracker.clone().control_path()
+        );
+        let mut old_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(
+                Hostname::new("192.0.2.1").unwrap(),
+                NonZeroU16::new(22).unwrap(),
+            ),
+            &mut old_hasher,
+        );
+        #[expect(clippy::cast_possible_truncation)]
+        let old_short = std::hash::Hasher::finish(&old_hasher) as u32;
+        assert_eq!(
+            firecracker
+                .control_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("coop-{old_short:08x}.sock")
+        );
+    }
+
+    #[test]
+    fn multiplexing_and_teardown_keep_tcp_transport_arguments() {
+        let target = ssh_test_target();
+        let mux = command_args(&target.ssh_mux_command().unwrap());
+        assert!(mux.windows(2).any(|args| args == ["-p", "22"]));
+        assert!(mux.iter().any(|arg| arg == "ControlMaster=auto"));
+        assert!(mux.iter().any(|arg| arg == "ControlPersist=60"));
+
+        let socket = Path::new("/tmp/coop-test-control.sock");
+        let teardown = command_args(&target.mux_teardown_command(socket).unwrap());
+        assert!(teardown.windows(2).any(|args| args == ["-p", "22"]));
+        assert_eq!(
+            &teardown[teardown.len() - 5..],
+            [
+                "-O",
+                "exit",
+                "-o",
+                "ControlPath=/tmp/coop-test-control.sock",
+                "ubuntu@192.0.2.1",
+            ]
+        );
     }
 
     fn command_args(command: &Command) -> Vec<String> {
@@ -4443,13 +4642,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn readiness_preserves_host_tool_resolution_failures() {
         let fixture = crate::host_tool::trusted_test_tempdir();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(
-            Some(&fixture.path().join("missing-ssh")),
-            None,
-            None,
-        )
-        .unwrap();
+        let target = ssh_test_target().with_host_tools(
+            SshHostToolsConfig::with_exact_paths(
+                Some(&fixture.path().join("missing-ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
 
         let error = target.wait_until_ready(Duration::ZERO).unwrap_err();
         let message = format!("{error:#}");
@@ -4465,8 +4665,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let ssh = fixture.path().join("ssh");
         fs::write(&ssh, "#!/definitely/missing/coop-test-interpreter\n").unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        let target = ssh_test_target()
+            .with_host_tools(SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap());
 
         let error = target
             .exec_ok(RemoteCommand::new().literal("true"))
@@ -4493,8 +4693,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         )
         .unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        let target = ssh_test_target()
+            .with_host_tools(SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap());
 
         let error = target
             .exec_with_stdin(
@@ -6971,13 +7171,13 @@ url = "https://example.com/m"
             env.set(*name, *value).unwrap();
         }
         SshSession {
-            target: SshTarget {
-                host: Hostname::new("127.0.0.1").unwrap(),
-                port: NonZeroU16::new(22).unwrap(),
-                user: SshUser::new("ubuntu").unwrap(),
-                key_path: "/unused-test-key".into(),
-                host_tools: SshHostToolsConfig::default(),
-            },
+            target: SshTarget::tcp(
+                Hostname::new("127.0.0.1").unwrap(),
+                NonZeroU16::new(22).unwrap(),
+                SshUser::new("ubuntu").unwrap(),
+                "/unused-test-key".into(),
+                SshHostToolsConfig::default(),
+            ),
             env,
         }
     }
@@ -7110,18 +7310,18 @@ url = "https://example.com/m"
             ("COOP_SSH_ENV_0", "guest-alias-collision"),
         ];
         let mut session = forwarding_session(&entries);
-        session.target = SshTarget {
-            host: Hostname::new("192.0.2.2").unwrap(),
-            port: NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("root").unwrap(),
-            key_path: fixture.join("client"),
-            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+        session.target = SshTarget::tcp(
+            Hostname::new("192.0.2.2").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            SshUser::new("root").unwrap(),
+            fixture.join("client"),
+            crate::config::SshHostToolsConfig::with_exact_paths(
                 Some(&fixture.join("bin/ssh")),
                 None,
                 None,
             )
             .unwrap(),
-        };
+        );
         let output = session
             .command(&[], "/usr/bin/env -0")
             .unwrap()

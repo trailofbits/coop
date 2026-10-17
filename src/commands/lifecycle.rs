@@ -943,10 +943,9 @@ fn restart_instance(
     run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
 
     tracing::info!(
-        "Instance '{}' restarted — SSH: {}:{}",
+        "Instance '{}' restarted — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
     Ok(())
 }
@@ -1173,10 +1172,9 @@ fn provision_first_boot(
     run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
-        "Instance '{}' started — SSH: {}:{}",
+        "Instance '{}' started — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
     Ok(())
 }
@@ -2633,13 +2631,13 @@ mod tests {
         std::fs::create_dir(inst.model_state_path()).unwrap();
         let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         cfg.post_start = Some("true".to_string());
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: super::backend::SshUser::new("ubuntu").unwrap(),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
         let error =
             super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
                 .unwrap_err();
@@ -2939,13 +2937,13 @@ mod tests {
             "cfg-value".to_string(),
         );
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3017,13 +3015,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::ApiKey,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3066,13 +3064,13 @@ mod tests {
         let mut cfg = super::config::CoopConfig::default();
         cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3109,13 +3107,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::Bearer,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
         // session on the same instance must still come up. `coop codex` and
@@ -3172,13 +3170,13 @@ mod tests {
                 } else {
                     cfg.proxy.openai = Some(upstream);
                 }
-                let target = super::backend::SshTarget {
-                    host: super::backend::Hostname::new("127.0.0.1").unwrap(),
-                    port: NonZeroU16::new(22).unwrap(),
-                    user: super::backend::SshUser::new("ubuntu").unwrap(),
-                    key_path: tmp.path().join("id_test"),
-                    host_tools: cfg.ssh.host_tools.clone(),
-                };
+                let target = super::backend::SshTarget::tcp(
+                    super::backend::Hostname::new("127.0.0.1").unwrap(),
+                    NonZeroU16::new(22).unwrap(),
+                    super::backend::SshUser::new("ubuntu").unwrap(),
+                    tmp.path().join("id_test"),
+                    cfg.ssh.host_tools.clone(),
+                );
                 let session =
                     super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
                         .unwrap();
@@ -3237,13 +3235,13 @@ mod tests {
         );
         assert!(cfg.proxy.openai.is_none(), "fixture must have no proxy");
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
@@ -3268,13 +3266,13 @@ mod tests {
 
         let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = super::config::CoopConfig::default();
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, None, target, None).expect("session");

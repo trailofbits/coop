@@ -280,7 +280,7 @@ pub(crate) fn run_pending(inst: &Instance, session: &SshSession) -> Result<Creat
         return Ok(CreationProgress::Unchanged);
     }
     ensure_prepared(&state)?;
-    let directory = crate::guest::GuestUser::new(session.target.user.as_ref())?.home();
+    let directory = crate::guest::GuestUser::new(session.target.user().as_ref())?.home();
     tracing::info!("Running global post_create");
     execute(session, &stage.command, directory.as_ref()).context("global post_create failed")?;
     stage.completion = Completion::Succeeded;
@@ -881,18 +881,18 @@ mod tests {
         env.set("SECRET", "creation-guest-only").unwrap();
         env.set("COOP_SSH_ENV_0", "creation-alias").unwrap();
         let session = crate::backend::SshSession {
-            target: crate::backend::SshTarget {
-                host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-                port: std::num::NonZeroU16::MIN,
-                user: crate::backend::SshUser::new("ubuntu").unwrap(),
-                key_path: root.join("unused-key"),
-                host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+            target: crate::backend::SshTarget::tcp(
+                crate::backend::Hostname::new("127.0.0.1").unwrap(),
+                std::num::NonZeroU16::MIN,
+                crate::backend::SshUser::new("ubuntu").unwrap(),
+                root.join("unused-key"),
+                crate::config::SshHostToolsConfig::with_exact_paths(
                     Some(&root.join("host-bin/ssh")),
                     None,
                     None,
                 )
                 .unwrap(),
-            },
+            ),
             env,
         };
         execute_staged(&session, root.to_str().unwrap()).unwrap();

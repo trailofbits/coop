@@ -133,6 +133,43 @@ fn forwards_control_path(inst: &Instance) -> PathBuf {
     inst.dir.join("forwards.sock")
 }
 
+fn local_forward_args(
+    inst: &Instance,
+    target: &SshTarget,
+    forwards: &[PortForward],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let control_path = forwards_control_path(inst);
+    let mut args = vec![
+        "-f".into(),
+        "-N".into(),
+        "-T".into(),
+        "-o".into(),
+        "ControlMaster=yes".into(),
+        "-o".into(),
+        format!(
+            "ControlPath={}",
+            crate::openssh::config_path(&control_path, "SSH forward control socket path")?
+        ),
+        "-o".into(),
+        "ControlPersist=yes".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+    ];
+    let mut specs = Vec::new();
+    for forward in forwards {
+        let spec = format!(
+            "127.0.0.1:{}:127.0.0.1:{}",
+            forward.host.get(),
+            forward.guest.get()
+        );
+        args.push("-L".into());
+        args.push(spec.clone());
+        specs.push(spec);
+    }
+    args.push(target.addr());
+    Ok((args, specs))
+}
+
 /// Spawn a backgrounded SSH connection with `-L` forwards for every
 /// entry in `forwards`. The connection is owned by a dedicated control
 /// master at `<inst>/forwards.sock`, so `teardown_ssh_forwards` can
@@ -166,7 +203,6 @@ pub fn spawn_ssh_forwards(
         })?;
     }
 
-    let mut args = Vec::new();
     // -f: fork to background after authentication. The parent exits 0
     //     and the child holds the forwards.
     // -N: no remote command — pure tunneling.
@@ -179,31 +215,7 @@ pub fn spawn_ssh_forwards(
     //     loud errors rather than silently lost forwards.
     // The `ServerAlive*` bound that keeps this tunnel from outliving a dead
     // VM comes from `openssh::authority_options` via `ssh_forward_command`.
-    args.extend([
-        "-f".into(),
-        "-N".into(),
-        "-T".into(),
-        "-o".into(),
-        "ControlMaster=yes".into(),
-        "-o".into(),
-        format!(
-            "ControlPath={}",
-            crate::openssh::config_path(&control_path, "SSH forward control socket path")?
-        ),
-        "-o".into(),
-        "ControlPersist=yes".into(),
-        "-o".into(),
-        "ExitOnForwardFailure=yes".into(),
-    ]);
-
-    let mut spec_log: Vec<String> = Vec::new();
-    for f in forwards {
-        let spec = format!("127.0.0.1:{}:127.0.0.1:{}", f.host.get(), f.guest.get());
-        args.push("-L".into());
-        args.push(spec.clone());
-        spec_log.push(spec);
-    }
-    args.push(target.addr());
+    let (args, spec_log) = local_forward_args(inst, target, forwards)?;
 
     tracing::info!("Establishing SSH port forwards: {}", spec_log.join(", "));
 
@@ -310,13 +322,13 @@ mod tests {
     }
 
     fn fixture_target(ssh: &std::path::Path) -> SshTarget {
-        SshTarget {
-            host: Hostname::new("127.0.0.1").unwrap(),
-            port: NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: PathBuf::from("/tmp/test-key"),
-            host_tools: SshHostToolsConfig::with_exact_paths(Some(ssh), None, None).unwrap(),
-        }
+        SshTarget::tcp(
+            Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/test-key"),
+            SshHostToolsConfig::with_exact_paths(Some(ssh), None, None).unwrap(),
+        )
     }
 
     fn pf(guest: u16, host: u16) -> PortForward {
@@ -363,6 +375,31 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("9000"), "msg = {msg}");
         assert!(msg.contains("Duplicate host port"), "msg = {msg}");
+    }
+
+    #[test]
+    fn local_forward_arguments_preserve_tcp_transport_and_loopback_binding() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let inst = fixture_instance(fixture.path().to_path_buf());
+        let ssh = fixture.path().join("ssh");
+        fs::write(&ssh, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = fixture_target(&ssh);
+        let (args, specs) = local_forward_args(&inst, &target, &[pf(3000, 10001)]).unwrap();
+        let mut command = target.ssh_forward_command().unwrap();
+        command.args(args);
+        let command = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(command.windows(2).any(|args| args == ["-p", "2222"]));
+        assert!(command.contains(&"ClearAllForwardings=no".to_string()));
+        assert_eq!(specs, ["127.0.0.1:10001:127.0.0.1:3000"]);
+        assert_eq!(
+            &command[command.len() - 3..],
+            ["-L", "127.0.0.1:10001:127.0.0.1:3000", "ubuntu@127.0.0.1",]
+        );
     }
 
     #[test]

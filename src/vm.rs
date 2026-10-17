@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::marker::PhantomData;
-use std::net::TcpStream;
 use std::num::NonZeroU8;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -322,7 +321,7 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     /// Wait for the guest to become reachable via SSH.
     pub fn wait_for_boot(&self) -> Result<()> {
-        let addr = format!("{}:{}", self.inst.guest_ip(), self.cfg.ssh_port);
+        let target = crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?;
         let timeout = Duration::from_secs(60);
         let start = Instant::now();
 
@@ -332,12 +331,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             if let Err(e) = self.check_alive() {
                 bail!("Firecracker crashed during boot: {e}");
             }
-            if TcpStream::connect_timeout(
-                &addr.parse().context("Invalid guest address")?,
-                Duration::from_secs(2),
-            )
-            .is_ok()
-            {
+            if target.transport_is_reachable(Duration::from_secs(2))? {
                 tracing::info!("Guest SSH is reachable");
                 return Ok(());
             }
@@ -432,15 +426,8 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 
     fn shutdown_command(&self) -> Result<Command> {
-        let user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
         let session = crate::backend::SshSession {
-            target: crate::backend::SshTarget {
-                host: self.inst.guest_ip().into(),
-                port: self.cfg.ssh_port,
-                user: crate::backend::SshUser::new(user.as_str())?,
-                key_path: std::path::absolute(self.cfg.ssh_key_path())?,
-                host_tools: self.cfg.ssh.host_tools.clone(),
-            },
+            target: crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?,
             env: crate::backend::EnvForward::default(),
         };
         // Firecracker exits on guest reboot; its CtrlAltDel API is x86-only.
@@ -460,26 +447,18 @@ impl<'a> FirecrackerVm<'a, Running> {
             mem_size_mib: self.cfg.vm.mem_size_mib.get().as_u32(),
         });
 
+        let target = crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?;
         let mut out = format!(
             "Instance '{}' running (PID: {pid})\n  \
              vCPUs: {}\n  Memory: {} MiB\n  \
-             Guest IP: {}\n  SSH: {}:{}",
+             Guest IP: {}\n  SSH: {}",
             self.inst.name,
             machine.vcpu_count,
             machine.mem_size_mib,
             self.inst.guest_ip(),
-            self.inst.guest_ip(),
-            self.cfg.ssh_port,
+            target.connection_description(),
         );
 
-        let guest_user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
-        let target = crate::backend::SshTarget {
-            host: crate::backend::Hostname::from(self.inst.guest_ip()),
-            port: self.cfg.ssh_port,
-            user: crate::backend::SshUser::new(guest_user.as_str())?,
-            key_path: std::path::absolute(self.cfg.ssh_key_path())?,
-            host_tools: self.cfg.ssh.host_tools.clone(),
-        };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
             let _ = write!(out, "\n  {usage}");
         }

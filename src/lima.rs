@@ -791,13 +791,13 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
 
     let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
 
-    Ok(SshTarget {
-        host: Hostname::new("127.0.0.1")?,
+    Ok(SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    })
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
 }
 
 // ── Setup helpers ─────────────────────────────────────────────
@@ -1184,13 +1184,13 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         .context("Builder VM has no sshLocalPort")?;
     let port = u16::try_from(port).context("SSH port out of range")?;
     let port = std::num::NonZeroU16::new(port).context("Builder SSH port is 0")?;
-    Ok(SshTarget {
-        host: Hostname::new("127.0.0.1")?,
+    Ok(SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    })
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
 }
 
 /// Marketplace/plugin lists baked into a golden image, recorded in
@@ -1909,13 +1909,13 @@ fn wait_for_lima_ssh(
     // TCP connects to Lima's proxy port immediately, but the guest
     // sshd isn't ready for several seconds. Auth probing detects
     // true readiness so the caller's wait_until_ready is instant.
-    let target = SshTarget {
-        host: Hostname::new("127.0.0.1")?,
-        port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    };
+    let target = SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
+        std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    );
     let mut delay = Duration::from_millis(500);
 
     loop {
