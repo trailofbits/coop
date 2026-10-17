@@ -241,7 +241,7 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
                 status: StatusCode::BAD_REQUEST,
                 msg: "request headers could not be rewritten",
             })?;
-    parts.uri = origin_form(&parts.uri).map_err(|_| Refusal {
+    parts.uri = upstream_uri(&parts.uri, &ctx.cfg.upstream_host).map_err(|_| Refusal {
         status: StatusCode::BAD_REQUEST,
         msg: "invalid request target",
     })?;
@@ -267,7 +267,7 @@ fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
 
     matches!(
         (upstream_host, uri.path()),
-        ("api.openai.com", "/v1/responses")
+        ("api.openai.com" | "chatgpt.com", "/v1/responses")
             | (
                 "api.anthropic.com",
                 "/v1/messages" | "/v1/messages/count_tokens"
@@ -382,7 +382,15 @@ fn build_upstream_headers(
 ) -> Result<HeaderMap> {
     let mut out = HeaderMap::with_capacity(incoming.len() + 1);
     for (name, value) in incoming {
-        if is_hop_by_hop(name) || name == HOST || is_credential_header(name) {
+        if is_hop_by_hop(name)
+            || name == HOST
+            || is_credential_header(name)
+            || (matches!(injection, Injection::CodexAccessToken { .. })
+                && matches!(
+                    name.as_str(),
+                    "chatgpt-account-id" | "x-openai-fedramp" | "x-openai-actor-authorization"
+                ))
+        {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -401,11 +409,26 @@ fn build_upstream_headers(
             value.set_sensitive(true);
             out.insert(x_api_key(), value);
         }
-        Injection::Bearer { credential } => {
+        Injection::Bearer { credential } | Injection::CodexAccessToken { credential, .. } => {
             let mut value = HeaderValue::from_str(&format!("Bearer {}", credential.expose()))
                 .context("credential is not a valid header value")?;
             value.set_sensitive(true);
             out.insert(AUTHORIZATION, value);
+        }
+    }
+
+    if let Injection::CodexAccessToken {
+        account_id,
+        is_fedramp,
+        ..
+    } = injection
+    {
+        out.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_str(account_id).context("invalid Codex workspace header")?,
+        );
+        if *is_fedramp {
+            out.insert("x-openai-fedramp", HeaderValue::from_static("true"));
         }
     }
 
@@ -439,6 +462,22 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 fn origin_form(uri: &Uri) -> Result<Uri> {
     let pq = uri.path_and_query().map_or("/", |p| p.as_str());
     pq.parse::<Uri>().context("invalid path-and-query")
+}
+
+/// The guest uses the same Responses provider in both proxy modes. Only the
+/// host-selected Codex profile translates its allowed inference operation;
+/// no guest-supplied backend URL or workspace header controls the destination.
+fn upstream_uri(uri: &Uri, upstream_host: &str) -> Result<Uri> {
+    if upstream_host == "chatgpt.com" {
+        anyhow::ensure!(uri.path() == "/v1/responses", "unsupported Codex operation");
+        let mut path = "/backend-api/codex/responses".to_string();
+        if let Some(query) = uri.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        return path.parse().context("invalid Codex request target");
+    }
+    origin_form(uri)
 }
 
 fn error_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody> {
@@ -619,6 +658,80 @@ mod tests {
             &create_with_query,
             "api.openai.com"
         ));
+    }
+
+    #[test]
+    fn codex_profile_allows_only_inference_and_pins_the_backend_path() {
+        for path in [
+            "/v1/responses",
+            "/v1/responses?foo=bar",
+            "https://attacker.invalid/v1/responses?foo=bar",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(operation_allowed(&Method::POST, &uri, "chatgpt.com"));
+            let expected = if uri.query().is_some() {
+                "/backend-api/codex/responses?foo=bar"
+            } else {
+                "/backend-api/codex/responses"
+            };
+            assert_eq!(
+                upstream_uri(&uri, "chatgpt.com").unwrap().to_string(),
+                expected
+            );
+            assert_eq!(
+                upstream_uri(&uri, "api.openai.com").unwrap(),
+                origin_form(&uri).unwrap()
+            );
+            for method in [Method::GET, Method::DELETE, Method::HEAD, Method::CONNECT] {
+                assert!(!operation_allowed(&method, &uri, "chatgpt.com"));
+            }
+        }
+        for path in [
+            "/backend-api/codex/responses",
+            "/v1/responses/compact",
+            "/v1/responses/resp_1",
+            "/v1/models",
+            "/backend-api/me",
+            "/v1/messages",
+            "/v1/responses/",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(!operation_allowed(&Method::POST, &uri, "chatgpt.com"));
+            assert!(upstream_uri(&uri, "chatgpt.com").is_err());
+        }
+    }
+
+    #[test]
+    fn codex_headers_replace_guest_identity_and_preserve_stream_metadata() {
+        let mut incoming = HeaderMap::new();
+        for (key, value) in [
+            ("authorization", "Bearer cap-private"),
+            ("x-api-key", "cap-private"),
+            ("host", "attacker.invalid"),
+            ("chatgpt-account-id", "attacker-workspace"),
+            ("x-openai-fedramp", "true"),
+            ("x-openai-actor-authorization", "attacker-identity"),
+            ("content-type", "application/json"),
+            ("originator", "codex_cli_rs"),
+        ] {
+            incoming.insert(HeaderName::from_bytes(key.as_bytes()).unwrap(), hv(value));
+        }
+        for is_fedramp in [false, true] {
+            let injection: Injection = serde_json::from_value(serde_json::json!({ "scheme": "codex_access_token", "credential": "at-private", "account_id": "workspace-123", "is_fedramp": is_fedramp })).unwrap();
+            let out = build_upstream_headers(&incoming, "chatgpt.com", &injection).unwrap();
+            assert_eq!(out[AUTHORIZATION], "Bearer at-private");
+            assert!(out[AUTHORIZATION].is_sensitive());
+            assert_eq!(out[HOST], "chatgpt.com");
+            assert_eq!(out["chatgpt-account-id"], "workspace-123");
+            assert!(out.get("x-api-key").is_none());
+            assert!(out.get("x-openai-actor-authorization").is_none());
+            assert_eq!(out.get("x-openai-fedramp").is_some(), is_fedramp);
+            if is_fedramp {
+                assert_eq!(out["x-openai-fedramp"], "true");
+            }
+            assert_eq!(out["originator"], "codex_cli_rs");
+            assert_eq!(out["content-type"], "application/json");
+        }
     }
 
     #[test]

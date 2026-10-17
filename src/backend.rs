@@ -1455,6 +1455,7 @@ pub fn prepare_env_forwarding(
     let claude = &cfg.claude;
     let codex = &cfg.codex;
     let grok = &cfg.grok;
+    let codex_proxy_active = suppress_openai_key;
     let codex_account_auth = codex.auth.uses_chatgpt_account();
     let suppress_openai_key = suppress_openai_key || codex_account_auth;
     // Only ever read under `suppress_openai_key`, so there is no "not
@@ -1524,6 +1525,9 @@ pub fn prepare_env_forwarding(
     }
     if suppress_openai_key {
         suppressed.push("OPENAI_API_KEY");
+    }
+    if codex_proxy_active {
+        suppressed.push("CODEX_ACCESS_TOKEN");
     }
     let suppression_reason = |name: &str| {
         if name == "OPENAI_API_KEY" {
@@ -1928,8 +1932,9 @@ fn codex_missing_guest_cli_message() -> &'static str {
 
 pub fn codex_chatgpt_proxy_conflict_message() -> &'static str {
     "codex.auth = \"chatgpt\" conflicts with the effective OpenAI proxy for \
-     this VM; Codex account auth uses ChatGPT workspace credentials, while \
-     the OpenAI proxy uses an API key"
+     this VM; guest account login and host proxy credentials are separate auth paths. \
+     For a workspace token through the proxy, set [proxy.openai] auth = \"codex_access_token\" \
+     and leave [codex] auth at its default"
 }
 
 /// Reject the one Codex remote-auth combination `CoopConfig::validate` cannot
@@ -7639,6 +7644,21 @@ url = "https://example.com/m"
                 .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("sk-openai-realkey")
+        );
+    }
+
+    #[test]
+    fn proxy_mode_suppresses_codex_access_token_from_guest_env() {
+        let cfg = cfg_with_guest_env(&[("CODEX_ACCESS_TOKEN", "at-private")]);
+        let suppressed = prepare_env_forwarding(&cfg, None, false, true).unwrap();
+        assert!(!suppressed.contains("CODEX_ACCESS_TOKEN"));
+        let direct = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+        assert_eq!(
+            direct
+                .guest_values()
+                .get("CODEX_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("at-private")
         );
     }
 

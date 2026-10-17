@@ -244,6 +244,20 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex access-token proxy auth stays on the host.** With `[proxy.openai]
+  auth = "codex_access_token"`, coop validates a Codex workspace PAT (`at-...`)
+  through a fixed, bounded HTTPS lookup at `auth.openai.com` before starting
+  the proxy. The token goes to curl and the proxy on stdin, never argv. Only
+  the workspace ID and FedRAMP routing flag are retained from the metadata
+  response; malformed metadata fails closed without echoing the response.
+  The proxy pins `chatgpt.com`, translates only the allowed Responses creation
+  operation to `/backend-api/codex/responses`, and replaces guest-supplied
+  workspace, actor-authorization, and FedRAMP headers. Both `OPENAI_API_KEY`
+  and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
+  OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
+  unsupported; there is no refresh or API-key fallback. Token rotation takes
+  effect on VM restart. The guest's capability still authorizes inference
+  using the token creator's workspace entitlements; it is not a usage budget.
 - **Codex ChatGPT account auth is persistent guest state.** With
   `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
   process env, `env_forward`, and persisted `--env` overlays, writes

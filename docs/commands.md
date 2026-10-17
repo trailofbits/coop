@@ -1054,12 +1054,13 @@ model.
 
 | Subcommand | Effect |
 |------------|--------|
-| `setup [--anthropic] [--openai] [--vm <name>] [--api-key]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic (Claude) is the default provider; pass `--openai` for Codex. `--vm <name>` stores the credential as a per-VM override in that instance's state instead of the global default. Anthropic only: `--api-key` stores an API key (`x-api-key`) instead of a Claude `setup-token`; ignored for `--openai`, whose keys are always injected as `Authorization: Bearer`. |
+| `setup [--anthropic] [--openai] [--vm <name>] [--api-key] [--codex-access-token]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic is the default; `--api-key` stores an API key instead of a Claude setup token. `--openai` stores a Platform API key, or add `--codex-access-token` to validate and store a Codex workspace PAT (`at-...`) using workspace entitlements. `--codex-access-token` requires `--openai` and conflicts with `--api-key`. `--vm <name>` selects a per-VM override. |
 | `status [--vm <name>]` | Show what each VM's agents resolve to (per-VM override → default → off), with credentials redacted. Pass `--vm <name>` for the effective resolution of a single VM instead of all. |
 
 ```
 coop proxy setup
 coop proxy setup --openai
+coop proxy setup --openai --codex-access-token
 coop proxy setup --vm my-project
 coop proxy setup --api-key
 coop proxy status

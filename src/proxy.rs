@@ -33,6 +33,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::backend::SshTarget;
+use crate::codex_token::CodexTokenMetadata;
 use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value};
 
 /// The proxy binary name, expected next to the `coop` binary.
@@ -139,6 +140,7 @@ pub fn start_provider(
     upstream: &ProxyUpstream,
     target: &SshTarget,
 ) -> Result<ProxyHandle> {
+    ensure_auth_supported(provider, upstream.auth)?;
     let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
         format!(
             "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
@@ -147,15 +149,25 @@ pub fn start_provider(
         )
     })?;
 
+    let metadata = if upstream.auth == ProxyAuthScheme::CodexAccessToken {
+        Some(crate::codex_token::load_metadata(&credential)?)
+    } else {
+        None
+    };
     let token = mint_capability_token()?;
     let port = provider.port(inst);
     let listen = SocketAddr::from(([127, 0, 0, 1], port));
     let json = wire_config_json(
         &listen,
         &token,
-        provider.upstream_host(),
+        if metadata.is_some() {
+            "chatgpt.com"
+        } else {
+            provider.upstream_host()
+        },
         upstream.auth,
         &credential,
+        metadata.as_ref(),
     )?;
 
     spawn_proxy(inst, provider.name(), listen, &json)?;
@@ -586,8 +598,24 @@ struct WireConfig<'a> {
 #[derive(Serialize)]
 #[serde(tag = "scheme", rename_all = "snake_case")]
 enum WireInjection<'a> {
-    XApiKey { credential: &'a str },
-    Bearer { credential: &'a str },
+    XApiKey {
+        credential: &'a str,
+    },
+    Bearer {
+        credential: &'a str,
+    },
+    CodexAccessToken {
+        credential: &'a str,
+        account_id: &'a str,
+        is_fedramp: bool,
+    },
+}
+
+fn ensure_auth_supported(provider: Provider, auth: ProxyAuthScheme) -> Result<()> {
+    if provider != Provider::Openai && auth == ProxyAuthScheme::CodexAccessToken {
+        bail!("codex_access_token auth is supported only by [proxy.openai]");
+    }
+    Ok(())
 }
 
 fn wire_config_json(
@@ -596,10 +624,19 @@ fn wire_config_json(
     upstream_host: &str,
     auth: ProxyAuthScheme,
     credential: &str,
+    metadata: Option<&CodexTokenMetadata>,
 ) -> Result<String> {
     let injection = match auth {
         ProxyAuthScheme::ApiKey => WireInjection::XApiKey { credential },
         ProxyAuthScheme::Bearer => WireInjection::Bearer { credential },
+        ProxyAuthScheme::CodexAccessToken => {
+            let metadata = metadata.context("Codex proxy requires validated workspace metadata")?;
+            WireInjection::CodexAccessToken {
+                credential,
+                account_id: &metadata.chatgpt_account_id,
+                is_fedramp: metadata.chatgpt_account_is_fedramp,
+            }
+        }
     };
     let wire = WireConfig {
         listen: listen.to_string(),
@@ -683,6 +720,7 @@ mod tests {
             "api.anthropic.com",
             ProxyAuthScheme::ApiKey,
             "sk-real",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -694,6 +732,79 @@ mod tests {
     }
 
     #[test]
+    fn wire_json_codex_token_carries_host_validated_metadata() {
+        let metadata = CodexTokenMetadata {
+            chatgpt_account_id: "workspace-123".to_string(),
+            chatgpt_account_is_fedramp: true,
+        };
+        let listen = "127.0.0.1:9788".parse().unwrap();
+        let json = wire_config_json(
+            &listen,
+            "cap",
+            "chatgpt.com",
+            ProxyAuthScheme::CodexAccessToken,
+            "at-private",
+            Some(&metadata),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["upstream_host"], "chatgpt.com");
+        assert_eq!(value["injection"]["scheme"], "codex_access_token");
+        assert_eq!(value["injection"]["credential"], "at-private");
+        assert_eq!(value["injection"]["account_id"], "workspace-123");
+        assert_eq!(value["injection"]["is_fedramp"], true);
+        assert!(
+            wire_config_json(
+                &listen,
+                "cap",
+                "chatgpt.com",
+                ProxyAuthScheme::CodexAccessToken,
+                "at-private",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_token_auth_is_openai_only_including_vm_overrides() {
+        assert!(ensure_auth_supported(Provider::Openai, ProxyAuthScheme::CodexAccessToken).is_ok());
+        assert!(
+            ensure_auth_supported(Provider::Anthropic, ProxyAuthScheme::CodexAccessToken).is_err()
+        );
+        for auth in [ProxyAuthScheme::ApiKey, ProxyAuthScheme::Bearer] {
+            assert!(ensure_auth_supported(Provider::Anthropic, auth).is_ok());
+            assert!(ensure_auth_supported(Provider::Openai, auth).is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_codex_token_fails_before_proxy_or_tunnel_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let upstream = ProxyUpstream {
+            credential: Secret::new("sk-wrong-type".to_string()),
+            auth: ProxyAuthScheme::CodexAccessToken,
+        };
+        let target = SshTarget {
+            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            port: std::num::NonZeroU16::new(22).unwrap(),
+            user: crate::backend::SshUser::new("ubuntu").unwrap(),
+            key_path: tmp.path().join("unused_key"),
+            host_tools: crate::config::CoopConfig::default().ssh.host_tools,
+        };
+        let error = start_provider(&inst, Provider::Openai, &upstream, &target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected a Codex personal access token")
+        );
+        assert!(!format!("{error:#}").contains("sk-wrong-type"));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn wire_json_bearer_shape() {
         let listen: SocketAddr = "172.16.0.1:8900".parse().unwrap();
         let json = wire_config_json(
@@ -702,6 +813,7 @@ mod tests {
             "api.openai.com",
             ProxyAuthScheme::Bearer,
             "sk-openai",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

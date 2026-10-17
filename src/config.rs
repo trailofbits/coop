@@ -1789,8 +1789,8 @@ pub struct ProxyConfig {
     pub anthropic: Option<ProxyUpstream>,
 
     /// `OpenAI` (Codex) upstream. Its presence enables proxy mode for Codex
-    /// when the VM is in remote model mode. `OpenAI` API keys are injected as
-    /// `Authorization: Bearer`.
+    /// when the VM is in remote model mode. Accepts bearer API keys, or
+    /// `codex_access_token` for workspace PATs and Codex plan entitlements.
     ///
     /// Proxy mode is resolved per provider and per VM (a per-VM override can
     /// enable it even when this default is absent) by
@@ -1802,26 +1802,30 @@ pub struct ProxyConfig {
 /// A single proxied upstream: the real credential and how to inject it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyUpstream {
-    /// The real credential (an API key or a Claude `setup-token`), a plain
+    /// The real credential (an API key, Claude `setup-token`, or Codex access token), a plain
     /// value or a `cmd:` indirection resolved via [`resolve_cmd_value`] at
     /// proxy start — never written to disk, never forwarded into the guest.
     pub credential: Secret<String>,
 
-    /// How the proxy injects the credential upstream. Defaults to `api_key`
-    /// (`x-api-key`); use `bearer` for a Claude `setup-token`.
+    /// How the proxy authenticates upstream. Defaults to `api_key`
+    /// (`x-api-key`); use `bearer` for API keys/Claude setup tokens or
+    /// OpenAI-only `codex_access_token` for workspace PATs.
     #[serde(default)]
     pub auth: ProxyAuthScheme,
 }
 
-/// The header form the proxy injects the real credential as.
+/// The credential profile: header injection plus Codex-specific routing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyAuthScheme {
     /// `x-api-key: <credential>` — the Anthropic API-key form.
     #[default]
     ApiKey,
-    /// `authorization: Bearer <credential>` — a Claude `setup-token`.
+    /// `authorization: Bearer <credential>` — an API key or Claude `setup-token`.
     Bearer,
+    /// Codex workspace personal access token: bearer auth to the Codex backend,
+    /// with account metadata validated on the host before starting the proxy.
+    CodexAccessToken,
 }
 
 /// A local (host-side) model endpoint that `coop model <vm> local`
@@ -2141,6 +2145,23 @@ fn expand_marketplaces(entries: &mut [String]) {
     }
 }
 
+fn check_proxy_auth(proxy: &ProxyConfig, codex_auth: CodexAuthMode, errors: &mut Vec<String>) {
+    if codex_auth.uses_chatgpt_account() && proxy.openai.is_some() {
+        errors.push(
+            "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
+             guest account login and host proxy credentials are separate auth paths"
+                .to_string(),
+        );
+    }
+    if proxy
+        .anthropic
+        .as_ref()
+        .is_some_and(|upstream| upstream.auth == ProxyAuthScheme::CodexAccessToken)
+    {
+        errors.push("codex_access_token auth is supported only by [proxy.openai]".to_string());
+    }
+}
+
 /// Push a validation error for each marketplace entry that looks like a
 /// local (absolute) path but does not exist. `field` is the config key
 /// prefix (e.g. `"claude.marketplaces"`) used in the message.
@@ -2330,14 +2351,7 @@ impl CoopConfig {
             ));
         }
 
-        if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
-            errors.push(
-                "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
-                 Codex account auth uses ChatGPT workspace credentials, while \
-                 the OpenAI proxy uses an API key"
-                    .to_string(),
-            );
-        }
+        check_proxy_auth(&self.proxy, self.codex.auth, &mut errors);
 
         check_local_marketplaces(
             "claude.marketplaces",
@@ -4268,6 +4282,33 @@ auth = "bearer"
         let up = cfg.proxy.openai.unwrap();
         assert_eq!(up.credential.expose(), "cmd:op read op://x");
         assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+    }
+
+    #[test]
+    fn codex_token_proxy_config_preserves_the_credential_reference() {
+        let cfg: CoopConfig = toml::from_str(
+            "[proxy.openai]\ncredential = 'cmd:token-store'\nauth = 'codex_access_token'\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let upstream = cfg.proxy.openai.unwrap();
+        assert_eq!(upstream.auth, ProxyAuthScheme::CodexAccessToken);
+        assert_eq!(upstream.credential.expose(), "cmd:token-store");
+        assert_eq!(cfg.codex.auth, CodexAuthMode::ApiKey);
+    }
+
+    #[test]
+    fn codex_token_auth_is_rejected_for_anthropic() {
+        let cfg: CoopConfig = toml::from_str(
+            "[proxy.anthropic]\ncredential = 'cmd:token-store'\nauth = 'codex_access_token'\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("supported only by [proxy.openai]")
+        );
     }
 
     #[test]

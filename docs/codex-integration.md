@@ -155,8 +155,10 @@ Security and billing guardrails in this mode:
   explicitly set `CODEX_HOME`, preventing Codex from writing account
   credentials to an unmanaged `auth.json`; unset `CODEX_HOME` when using
   ChatGPT account auth.
-- `[proxy.openai]` is rejected with `auth = "chatgpt"`, because the proxy path
-  uses an OpenAI API key and would switch Codex back to API billing.
+- `[proxy.openai]` is rejected with `auth = "chatgpt"`, because guest login and
+  host proxy authentication are separate paths. For workspace entitlements
+  through the proxy, use `coop proxy setup --openai --codex-access-token` and
+  leave `[codex] auth` at its default. See the [proxy guide](credential-proxy.md).
 
 Because coop must keep `cli_auth_credentials_store` in the guest
 `~/.codex/config.toml`, this mode rewrites that file on every start. Codex's

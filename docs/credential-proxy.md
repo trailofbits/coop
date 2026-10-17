@@ -25,22 +25,23 @@ for the lifetime of the VM:
     — Codex keeps its own, only its egress is redirected.
 - The proxy verifies that token (constant-time), strips it, injects the real
   credential (`x-api-key`, or `Authorization: Bearer`), and streams the request
-  to the pinned upstream (`api.anthropic.com` / `api.openai.com`) over TLS.
+  to the pinned upstream (`api.anthropic.com`, `api.openai.com`, or the
+  Codex backend on `chatgpt.com`) over TLS.
 - The raw `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is no longer forwarded, and in
   proxy mode Codex's `~/.codex/auth.json` is **not** staged onto the guest disk
   (it holds a refreshable subscription token — the exact at-rest exposure #411
-  closes). Codex subscription is therefore out of scope in proxy mode; use an
-  OpenAI API key.
+  closes). A cached ChatGPT OAuth session is not supported in proxy mode;
+  use an OpenAI API key or a Codex workspace personal access token.
 
 When agent bootstrap runs with an OpenAI proxy, coop also removes any existing
 `~/.codex/auth.json` left by a previous direct-auth boot. If removal fails,
 proxy bootstrap aborts and tears down the proxy. `--no-agents` skips this
 cleanup along with the rest of agent bootstrap.
 
-For Codex account or workspace access without API billing, use
+For workspace entitlements through the proxy, use a Codex personal access
+token as described below. For interactive account login inside the guest, use
 `[codex] auth = "chatgpt"` instead of `[proxy.openai]`. That mode stores Codex
-credentials in the guest Linux keyring and is rejected when an OpenAI proxy is
-also active.
+credentials in the guest Linux keyring and cannot be combined with a proxy.
 
 The capability token is worthless off the host — it only authorizes the local
 proxy, which holds the real key itself — so exfiltrating it gains a compromised
@@ -54,6 +55,7 @@ before connecting upstream. The only allowed method/path pairs are:
 | Provider | Allowed operation |
 | --- | --- |
 | OpenAI | `POST /v1/responses` |
+| Codex access token | `POST /v1/responses`, translated to `POST /backend-api/codex/responses` on `chatgpt.com` |
 | Anthropic | `POST /v1/messages` |
 | Anthropic | `POST /v1/messages/count_tokens` |
 
@@ -92,6 +94,12 @@ a `cmd:` reference — so the credential is never plaintext in the config.
   inference-scoped, ~1 year).
 - **OpenAI (Codex):** `coop proxy setup --openai` takes an OpenAI API key
   (always injected as `Authorization: Bearer`).
+- **Codex workspace access token:** `coop proxy setup --openai --codex-access-token`
+  takes a Codex-scoped personal access token (`at-...`) from
+  [ChatGPT Admin > Access tokens](https://chatgpt.com/admin/access-tokens).
+  Requests use the creator's workspace Codex entitlements and controls rather
+  than Platform API billing. Availability and usage charges follow the workspace
+  plan. A Workspace Agents-only token is not a Codex inference credential.
 
 Or configure it by hand:
 
@@ -104,6 +112,35 @@ auth = "api_key"   # api_key → x-api-key (default); bearer → a Claude setup-
 credential = "cmd:op read op://Private/OpenAI/credential"
 auth = "bearer"    # OpenAI keys inject as Authorization: Bearer
 ```
+
+For a Codex workspace token, use this OpenAI block instead:
+
+```toml
+[proxy.openai]
+credential = "cmd:op read op://Private/Codex/access-token"
+auth = "codex_access_token"
+```
+
+Leave `[codex] auth` at its default (`api_key`); in proxy mode the host
+credential determines billing, and the guest authenticates only with its
+capability token. No guest `codex login` is required. Cached OAuth credentials
+and legacy agent-identity JWTs are not accepted by this mode.
+
+Setup and every proxy start validate the token with a bounded HTTPS metadata
+request to `auth.openai.com`. Host `curl` is required. The proxy then pins
+`chatgpt.com` and the workspace headers returned by that lookup, replacing any
+guest-supplied account or FedRAMP headers. The real token travels through stdin
+to curl and the proxy; it is never a command-line argument. The guest cannot
+call metadata, login, refresh, or arbitrary ChatGPT endpoints through the proxy.
+
+The guest provider uses streaming HTTP Responses requests with WebSockets
+disabled. Model selection stays with Codex; choose a model available to your
+workspace. This inference-only proxy does not expose ChatGPT plugins or account
+management. Expired/revoked tokens fail authentication; there is no OAuth
+refresh or API-key fallback. Rotate the secret, then restart the VM to load it.
+`CODEX_ACCESS_TOKEN`, as well as `OPENAI_API_KEY`, is suppressed from managed
+environment forwarding whenever the OpenAI proxy is active. Explicit
+`guest_files` copies remain a separate credential-exposure opt-in.
 
 The `credential` uses the same `cmd:` resolution as every other coop secret and
 is resolved on the **host** at VM start. For Claude subscription billing without

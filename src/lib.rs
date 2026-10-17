@@ -7,6 +7,7 @@
 
 mod backend;
 mod cmd;
+mod codex_token;
 mod commands;
 mod completions;
 pub mod config;
@@ -857,6 +858,10 @@ enum ProxyAction {
         /// `setup-token`. Ignored for `--openai` (always Bearer).
         #[arg(long)]
         api_key: bool,
+        /// `OpenAI` only: use a Codex-scoped workspace access token and its
+        /// `ChatGPT` plan entitlements instead of a Platform API key.
+        #[arg(long, requires = "openai", conflicts_with_all = ["api_key", "anthropic"])]
+        codex_access_token: bool,
     },
     /// Show what each VM's agents resolve to (per-VM override → default → off),
     /// with credentials redacted.
@@ -1441,6 +1446,49 @@ mod tests {
         match Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())) {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
+        }
+    }
+
+    #[test]
+    fn codex_proxy_token_flag_requires_openai_and_excludes_api_key() {
+        let cli = parse(&[
+            "proxy",
+            "setup",
+            "--openai",
+            "--codex-access-token",
+            "--vm",
+            "my-vm",
+        ]);
+        let super::Commands::Proxy {
+            action:
+                super::ProxyAction::Setup {
+                    openai,
+                    codex_access_token,
+                    vm,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected proxy setup");
+        };
+        assert!(openai);
+        assert!(codex_access_token);
+        assert_eq!(vm.as_deref(), Some("my-vm"));
+        for args in [
+            &["proxy", "setup", "--codex-access-token"][..],
+            &["proxy", "setup", "--anthropic", "--codex-access-token"][..],
+            &[
+                "proxy",
+                "setup",
+                "--openai",
+                "--codex-access-token",
+                "--api-key",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())).is_err(),
+                "expected parse failure for {args:?}"
+            );
         }
     }
 

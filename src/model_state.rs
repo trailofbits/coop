@@ -273,6 +273,16 @@ pub fn codex_proxy_config(base_url: &str) -> toml::Table {
         "wire_api".to_string(),
         toml::Value::String("responses".to_string()),
     );
+    // The guest authenticates only with its capability token. This proxy
+    // supports streaming HTTP, so no first-party login or WS is needed.
+    provider.insert(
+        "requires_openai_auth".to_string(),
+        toml::Value::Boolean(false),
+    );
+    provider.insert(
+        "supports_websockets".to_string(),
+        toml::Value::Boolean(false),
+    );
     provider.insert(
         "env_key".to_string(),
         toml::Value::String(CODEX_LOCAL_ENV_KEY.to_string()),
@@ -635,6 +645,8 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
         assert_eq!(provider["name"].as_str().unwrap(), "coop credential proxy");
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
     }
 
     #[test]

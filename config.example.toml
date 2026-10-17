@@ -195,9 +195,13 @@
 # [proxy.openai]                    # Codex. OpenAI keys are always Bearer.
 # credential = "cmd:op read op://Private/OpenAI/credential"
 # auth = "bearer"                   # OpenAI keys inject as Authorization: Bearer.
+#                                   # For subscription/workspace Codex usage:
+#                                   # `coop proxy setup --openai --codex-access-token`
+#                                   # stores a Codex-scoped PAT (at-...). Set
+#                                   # auth = "codex_access_token" for that mode.
 #                                   # Cannot be combined with
-#                                   # [codex] auth = "chatgpt"; proxy mode uses
-#                                   # an API key.
+#                                   # [codex] auth = "chatgpt"; proxy mode holds
+#                                   # its credential on the host.
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]

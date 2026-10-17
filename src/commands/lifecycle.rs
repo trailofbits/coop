@@ -1615,7 +1615,7 @@ pub(crate) fn prepare_session_from_target(
         .transpose()?
         .flatten();
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, suppress_openai_key)?;
+    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
@@ -1627,6 +1627,7 @@ pub(crate) fn prepare_session_from_target(
                 // `prepare_env_forwarding`.
                 if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
+                    || (proxy_openai && name.as_str() == "CODEX_ACCESS_TOKEN")
                 {
                     let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
@@ -3110,6 +3111,86 @@ mod tests {
             !session.env.guest_values().contains_key("OPENAI_API_KEY"),
             "proxy mode must keep the raw key on the host",
         );
+    }
+
+    #[test]
+    fn prepare_session_suppresses_persisted_codex_token_for_effective_proxy() {
+        use std::num::NonZeroU16;
+
+        for per_vm in [false, true] {
+            for auth in [
+                super::config::ProxyAuthScheme::Bearer,
+                super::config::ProxyAuthScheme::CodexAccessToken,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let inst = super::config::Instance {
+                    name: super::config::InstanceName::new("test").unwrap(),
+                    index: super::config::InstanceIndex::new(0).unwrap(),
+                    dir: tmp.path().to_path_buf(),
+                    image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+                };
+                let mut state = super::guest_env_state::GuestEnvState::default();
+                for (name, value) in [
+                    ("CODEX_ACCESS_TOKEN", "at-private"),
+                    ("FROM_CLI", "saved-value"),
+                ] {
+                    state.entries.insert(
+                        super::guest_env_state::EnvVarName::new(name).unwrap(),
+                        value.to_string(),
+                    );
+                }
+                state.save(&inst).unwrap();
+                let mut cfg = super::config::CoopConfig::default();
+                let upstream = super::config::ProxyUpstream {
+                    credential: super::config::Secret::new("cmd:false".to_string()),
+                    auth,
+                };
+                if per_vm {
+                    super::proxy_state::ProxyState {
+                        openai: Some(upstream),
+                        ..Default::default()
+                    }
+                    .save(&inst)
+                    .unwrap();
+                } else {
+                    cfg.proxy.openai = Some(upstream);
+                }
+                let target = super::backend::SshTarget {
+                    host: super::backend::Hostname::new("127.0.0.1").unwrap(),
+                    port: NonZeroU16::new(22).unwrap(),
+                    user: super::backend::SshUser::new("ubuntu").unwrap(),
+                    key_path: tmp.path().join("id_test"),
+                    host_tools: cfg.ssh.host_tools.clone(),
+                };
+                let session =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
+                        .unwrap();
+                assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
+                assert_eq!(
+                    session
+                        .env
+                        .guest_values()
+                        .get("FROM_CLI")
+                        .map(String::as_str),
+                    Some("saved-value")
+                );
+                let model = super::model_state::ModelState {
+                    mode: super::model_state::ModelMode::Local,
+                    ..Default::default()
+                };
+                model.save(&inst).unwrap();
+                let local =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+                assert_eq!(
+                    local
+                        .env
+                        .guest_values()
+                        .get("CODEX_ACCESS_TOKEN")
+                        .map(String::as_str),
+                    Some("at-private")
+                );
+            }
+        }
     }
 
     #[test]

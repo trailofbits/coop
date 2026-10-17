@@ -571,9 +571,10 @@ Every golden image installs the Secret Service packages this mode needs
 gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
 serve it.
 
-`[proxy.openai]` is API-key based and cannot be combined with
+`[proxy.openai]` accepts an OpenAI API key or a Codex workspace personal access
+token and cannot be combined with
 `[codex] auth = "chatgpt"`. Use one Codex remote auth path per VM: the proxy
-for an OpenAI API key, or ChatGPT auth for account/workspace access.
+for a host-held credential, or ChatGPT auth for login inside the guest.
 
 Proxy mode applies only in remote model mode
 ([`coop model <vm> remote`](commands.md#model)); local mode takes precedence.
@@ -585,8 +586,8 @@ Both blocks take the same fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `credential` | string | required | The real credential — an API key or a Claude `setup-token`. A plain value or a `cmd:` invocation resolved at proxy start. Never written to disk and never forwarded into the guest. |
-| `auth` | `api_key` \| `bearer` | `api_key` | How the proxy injects the credential upstream. `api_key` sends `x-api-key: <credential>` (the Anthropic API-key form); `bearer` sends `Authorization: Bearer <credential>`, used for a Claude `setup-token`. OpenAI keys are always Bearer. |
+| `credential` | string | required | An API key, Claude `setup-token`, or Codex personal access token. A plain value or a `cmd:` invocation resolved at proxy start. Resolved secrets are held in memory and never forwarded into the guest. |
+| `auth` | `api_key` \| `bearer` \| `codex_access_token` | `api_key` | `api_key` sends `x-api-key`; `bearer` sends `Authorization: Bearer` for API keys or Claude setup tokens. OpenAI-only `codex_access_token` validates a workspace PAT (`at-...`) on the host and routes inference to the ChatGPT Codex backend using workspace entitlements. |
 
 ```toml
 [proxy.anthropic]

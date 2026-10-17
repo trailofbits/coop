@@ -423,6 +423,10 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bconfined_command\\b",
   "src/proxy\\.rs:.*\\bwrite_token_file\\b",
   "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
+  # Codex PAT metadata lookup performs a bounded HTTPS curl request. Its
+  # token/metadata parsers and fixed command construction remain in scope.
+  "src/codex_token\\.rs:.*\\bload_metadata\\b",
+  "src/codex_token\\.rs:.*\\bload_metadata_with_command\\b",
   "src/proxy\\.rs:.*\\bpid_path\\b",
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
