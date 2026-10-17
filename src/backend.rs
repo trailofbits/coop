@@ -882,6 +882,11 @@ pub trait VmBackend: std::fmt::Display {
         image: &ImageName,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// Point-in-time observations for list output, in input order.
+    /// Never use these observations to authorize lifecycle operations.
+    fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
+        instances.iter().map(|inst| self.is_running(inst)).collect()
+    }
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM
@@ -1330,6 +1335,10 @@ impl VmBackend for LimaBackend {
 
     fn is_running(&self, inst: &Instance) -> bool {
         crate::lima::is_running(inst)
+    }
+
+    fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
+        crate::lima::list_running(instances)
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
