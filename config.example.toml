@@ -4,7 +4,7 @@
 # Run `coop validate` to check your config.
 
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
-# ssh_port = 22                 # Guest SSH port
+# ssh_port = 22                 # Legacy TCP guest SSH port (vsock proxies fixed port 22)
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
 # post_create = "sudo apt-get update && sudo apt-get install -y htop"
 # Creation commands run once per VM creation, after workspace setup.
@@ -43,6 +43,7 @@
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
 # [vm]
+# firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
 # mem_size_mib = 4096           # Memory in MiB (override: --mem)
 # template_size_gib = 8         # Template disk in GiB (override: --template-size)

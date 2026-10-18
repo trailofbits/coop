@@ -40,6 +40,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     ensure_ssh_key(cfg)?;
 
     let image = &opts.image;
+    let _image_lock = crate::setup::lock_image_publication(cfg, image)?;
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
@@ -63,6 +64,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     }
 
     generate_start_template(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)?;
 
     eprintln!("\nSetup complete.");
     eprintln!("Run `coop up` in a project directory to launch a VM.");
@@ -462,7 +464,12 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 /// the image's `lima-base.img` and regenerates the fast-start template
 /// so it points at the new base. The caller has gated on the instance
 /// being stopped and decided whether overwriting is allowed.
-pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+pub fn commit_disk(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+) -> Result<()> {
     let (_disk_dir, src, source) = open_instance_disk(inst, DiskAccess::Read)?;
 
     let image_dir = cfg.image_dir(image);
@@ -471,6 +478,7 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
 
     let base_img = cfg.lima_base_path(image);
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    crate::setup::begin_image_publication(cfg, image)?;
     image_dir_handle
         .copy_atomic_sparse(
             base_img.file_name().context("Base image has no name")?,
@@ -478,7 +486,9 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
             0o600,
         )
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
-    generate_start_template(cfg, image)
+    generate_start_template(cfg, image)?;
+    metadata.save_for(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)
 }
 
 /// Replace a stopped instance's disk with image `image`'s base image.
@@ -1022,6 +1032,7 @@ fn build_golden_image(
         grok_marketplaces: baked.grok_marketplaces,
         grok_plugins: baked.grok_plugins,
         guest_user: guest_user.clone(),
+        capabilities: std::collections::BTreeSet::new(),
     };
     template_config.save_for(cfg, image)?;
 
@@ -2351,6 +2362,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let metadata = inst.dir.join("instance.json");
@@ -2542,6 +2554,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root_path.to_path_buf(),
             image: ImageName::new("test.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let inst_dir = root_path.join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
@@ -2998,6 +3011,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let mounts = [crate::config::Mount {
             host_path: root.path().into(),
@@ -3045,8 +3059,25 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: image.clone(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
-        commit_disk(&cfg, &inst, &image).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: utc_timestamp(),
+            install_script_hash: Sha256Hash::of("fixture"),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: GuestUser::default(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        commit_disk(&cfg, &inst, &image, &metadata).unwrap();
         let copied = fs::metadata(cfg.lima_base_path(&image)).unwrap();
         assert_eq!(copied.len(), 64 * 1024 * 1024);
         assert!(

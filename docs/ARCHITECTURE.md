@@ -95,7 +95,7 @@ code, it must hold for **both** backends. Known intentional divergences:
 |--------|-------------|------|
 | `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
 | `mounts_are_live` | `false` (one-time rsync sync) | `true` (virtiofs) |
-| `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
+| `ssh_target` | legacy TCP from `guest_ip` + `ssh_port`, or persisted vsock socket + guest port | queried from `limactl` (per-boot forwarded port) |
 | copied workspace (`--copy`) | one-time rsync over SSH | one-time rsync over SSH |
 | project and extra mounts | one-time rsync over SSH | live virtiofs mounts |
 
@@ -124,9 +124,11 @@ choice. TCP targets carry a validated hostname and port. The Firecracker-vsock
 variant carries the trusted per-instance Unix-socket path and guest port, and
 renders the same Rust `__vsock-proxy` helper for SSH, SCP, rsync, forwarding,
 and generated SSH configuration. The helper bounds and validates Firecracker's
-text `CONNECT` handshake before relaying raw bytes. The guest listener and
-transport helper are available, while Firecracker lifecycle traffic and Lima
-remain TCP-based.
+text `CONNECT` handshake before relaying raw bytes. New Firecracker instances
+persist the configured `FirecrackerControlMode`; the opt-in `vsock` mode is
+then used for readiness, shutdown, and every shared SSH consumer. Older state
+without the tag maps to `LegacyTcp` in memory without an eager rewrite. Lima
+remains TCP-based.
 
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded

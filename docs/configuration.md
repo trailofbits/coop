@@ -13,7 +13,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
-| `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
+| `ssh_port` | integer | `22` | SSH port for the legacy Firecracker TCP transport. Must be > 0. The opt-in vsock listener proxies fixed guest port 22; Lima uses its dynamically assigned host port. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
@@ -340,6 +340,7 @@ whole GiB disk size. Human image sizes are approximate display values; JSON
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `firecracker_control` | string | `legacy_tcp` | Control transport recorded for newly created Linux/Firecracker instances: `legacy_tcp` or opt-in `vsock`. Existing instances keep their persisted mode; older state without the field loads as `legacy_tcp` without being rewritten. A vsock instance requires image metadata from a current `coop setup`; incompatible images are rejected with rebuild guidance before instance allocation or restore. Ignored by Lima, which remains TCP-based. |
 | `vcpu_count` | integer | `2` | Number of vCPUs for **new** instances. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. Change an existing instance with `coop resize --vcpus`. |
 | `mem_size_mib` | integer | `4096` | Memory in MiB for **new** instances. Must be >= 128. Overridable with `--mem` on `setup` and `up`. Change an existing instance with `coop resize --mem`. |
 | `template_size_gib` | integer | `8` | Template rootfs disk size in GiB. Must be > 0. Overridable with `--template-size` on `setup`. |

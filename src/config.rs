@@ -995,6 +995,12 @@ pub struct CustomProfile {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmConfig {
+    /// Control transport assigned to newly created Firecracker instances.
+    ///
+    /// Lima ignores this setting and continues to use its TCP transport.
+    #[serde(default = "legacy_firecracker_control_mode")]
+    pub firecracker_control: FirecrackerControlMode,
+
     /// Number of vCPUs
     #[serde(default = "default_vcpus")]
     pub vcpu_count: NonZeroU8,
@@ -2684,6 +2690,7 @@ impl CoopConfig {
             index,
             dir,
             image: image.clone(),
+            firecracker_control: self.vm.firecracker_control,
         };
         instance.save()?;
         Ok(instance)
@@ -2731,6 +2738,7 @@ impl Default for CoopConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
+            firecracker_control: legacy_firecracker_control_mode(),
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_mib(),
             kernel_path: default_kernel_path(),
@@ -2738,6 +2746,24 @@ impl Default for VmConfig {
             template_size_gib: default_template_size_gib(),
         }
     }
+}
+
+/// Durable control transport selected when a Firecracker instance is created.
+///
+/// The value records a mechanism, not a runtime endpoint. Hostnames, ports,
+/// and socket paths continue to be derived from trusted configuration and the
+/// instance directory when the target is constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirecrackerControlMode {
+    /// Compatibility mode for instances created before vsock selection.
+    LegacyTcp,
+    /// OpenSSH reaches the guest through Firecracker's base vsock socket.
+    Vsock,
+}
+
+fn legacy_firecracker_control_mode() -> FirecrackerControlMode {
+    FirecrackerControlMode::LegacyTcp
 }
 
 impl Default for NetworkConfig {
@@ -2810,6 +2836,8 @@ struct InstanceMeta {
     index: InstanceIndex,
     #[serde(default = "default_image_name")]
     image: ImageName,
+    #[serde(default = "legacy_firecracker_control_mode")]
+    firecracker_control: FirecrackerControlMode,
 }
 
 /// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
@@ -2826,6 +2854,8 @@ pub struct Instance {
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
     pub image: ImageName,
+    /// Firecracker control transport chosen at instance creation time.
+    pub firecracker_control: FirecrackerControlMode,
 }
 
 impl Instance {
@@ -2907,6 +2937,7 @@ impl Instance {
             name: self.name.clone(),
             index: self.index,
             image: self.image.clone(),
+            firecracker_control: self.firecracker_control,
         };
         let json =
             serde_json::to_string_pretty(&meta).context("Failed to serialize instance metadata")?;
@@ -2944,6 +2975,7 @@ impl Instance {
             index: meta.index,
             dir: dir.to_path_buf(),
             image: meta.image,
+            firecracker_control: meta.firecracker_control,
         })
     }
 
@@ -3414,6 +3446,7 @@ mod tests {
             index,
             dir: dir.join("instances").join(name),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
         inst
@@ -3425,6 +3458,7 @@ mod tests {
             index,
             dir,
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         }
     }
 
@@ -3528,6 +3562,42 @@ mod tests {
         assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
         assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+    }
+
+    #[test]
+    fn instance_save_load_roundtrip_preserves_vsock_control() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("myinst");
+        let mut inst = test_inst("myinst", idx(42), dir.clone());
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        inst.save().unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(loaded.firecracker_control, FirecrackerControlMode::Vsock);
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "vsock""#));
+    }
+
+    #[test]
+    fn loading_legacy_instance_does_not_rewrite_its_state() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("legacy");
+        crate::test_support::create_private_dir_all(&dir).unwrap();
+        let original =
+            b"{\n  \"name\": \"legacy\",\n  \"index\": 3,\n  \"image\": \"default\"\n}\n";
+        fs::write(dir.join("instance.json"), original).unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+        assert_eq!(fs::read(dir.join("instance.json")).unwrap(), original);
     }
 
     #[test]
@@ -3546,6 +3616,12 @@ mod tests {
         // lookup and `coop status` lineage survive a reload).
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.image.as_str(), "safe-point");
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "legacy_tcp""#));
     }
 
     // ── Instance::is_running / is_firecracker_process ────────
@@ -3769,6 +3845,22 @@ mod tests {
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::LegacyTcp);
+    }
+
+    #[test]
+    fn allocation_persists_configured_firecracker_control_mode() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::Vsock);
+        assert_eq!(
+            Instance::load(&inst.dir).unwrap().firecracker_control,
+            FirecrackerControlMode::Vsock
+        );
     }
 
     #[test]
@@ -4119,6 +4211,7 @@ mod tests {
             index: idx(0),
             dir: instances.join("wanted"),
             image: default_img(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         stale.save().unwrap();
 
@@ -5628,6 +5721,24 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
+    fn firecracker_control_mode_is_explicit_and_opt_in() {
+        let default_cfg: CoopConfig = toml::from_str("[vm]\n").unwrap();
+        assert_eq!(
+            default_cfg.vm.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+
+        let vsock_cfg: CoopConfig =
+            toml::from_str("[vm]\nfirecracker_control = \"vsock\"\n").unwrap();
+        assert_eq!(
+            vsock_cfg.vm.firecracker_control,
+            FirecrackerControlMode::Vsock
+        );
+
+        assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_control = \"tcp\"\n").is_err());
+    }
+
+    #[test]
     fn deserialize_rejects_invalid_host_ip() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
@@ -6105,6 +6216,7 @@ rsync = "/run/current-system/sw/bin/rsync"
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("python-dev").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
         let loaded = Instance::load(&dir).unwrap();
@@ -6231,6 +6343,7 @@ rsync = "/run/current-system/sw/bin/rsync"
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
 
@@ -6240,6 +6353,7 @@ rsync = "/run/current-system/sw/bin/rsync"
             index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("custom").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst2.save().unwrap();
 

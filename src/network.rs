@@ -1007,6 +1007,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let error = setup_tap_with_policy(&cfg, &inst, &policy, |tool| vec![bin.join(tool.name())])
             .unwrap_err();
@@ -1101,6 +1102,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let tap = inst.tap_device();
 
@@ -1183,6 +1185,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: temp.path().join("instance"),
             image: default_image_name(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
 
         teardown_tap_with_policy(&cfg, &inst, &policy, |_| Vec::new()).unwrap();

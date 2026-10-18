@@ -332,6 +332,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   a live listener, non-socket entry, or uncertain result blocks it. Coop never
   kills a process found through a socket lookup. Confirmed stale entries are
   unlinked through the pinned private directory rather than a root shell command.
+- A Firecracker instance's control mode is persisted at creation. `vsock`
+  mode never silently retries TCP: readiness, shutdown, shell, file transfer,
+  forwarding, and generated SSH configuration all derive the same target from
+  that tag. Older untagged instances map to `legacy_tcp` for compatibility.
+  This is control-plane independence, not host network isolation: the guest
+  NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

@@ -163,7 +163,7 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 
 | File | Purpose |
 |------|---------|
-| `instance.json` | Instance metadata (name, index, image) |
+| `instance.json` | Instance metadata (name, index, image, persisted Firecracker control mode) |
 | `rootfs.ext4` | Instance root filesystem (Firecracker) |
 | `firecracker.pid` | PID of the running Firecracker process |
 | `firecracker.socket` | Legacy Firecracker API socket (only for VMs started by older versions) |
@@ -181,6 +181,12 @@ path from the error with `sudo lsof -nP <socket-path>` and verify and stop any
 process holding it before retrying.
 
 On Lima, the directory structure differs because Lima manages its own VM state. `instance.json` and `workspace.json` are always present regardless of backend.
+
+Older `instance.json` files without a Firecracker control field load as
+`legacy_tcp` and are not rewritten merely by being read. The configured mode
+applies only when a new instance is allocated; changing the global setting
+does not migrate existing instances. An ordinary metadata update may materialize
+the explicit legacy tag while preserving the instance's behavior.
 
 ## Concurrent access and file locking
 

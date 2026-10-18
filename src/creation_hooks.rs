@@ -389,6 +389,7 @@ mod tests {
             name: InstanceName::new("hooks").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 

@@ -462,6 +462,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: dir.path().join("token-vm"),
             image: crate::config::ImageName::new("base.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         store_vm_override(

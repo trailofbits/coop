@@ -14,8 +14,8 @@ use toml::Value as TomlValue;
 #[cfg(target_os = "linux")]
 use crate::cmd::Cmd;
 use crate::config::{
-    CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
-    McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
+    CodexAuthMode, ConfigDir, CoopConfig, FirecrackerControlMode, GitHubAuth, ImageName, Instance,
+    LocalModel, McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
 };
 use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
@@ -422,10 +422,6 @@ impl SshTarget {
     }
 
     /// Construct a target reached through Firecracker's base vsock socket.
-    #[expect(
-        dead_code,
-        reason = "Firecracker lifecycle traffic still uses the TCP target"
-    )]
     pub(crate) fn firecracker_vsock(
         socket_path: PathBuf,
         guest_port: NonZeroU32,
@@ -1037,6 +1033,17 @@ fn setup_preflight(
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
+    /// Reject an image that cannot satisfy the control transport which would
+    /// be persisted for a new or restored instance. Backends without an
+    /// image-level control dependency need no additional validation.
+    fn validate_image_control(
+        &self,
+        cfg: &CoopConfig,
+        image: &ImageName,
+        _mode: FirecrackerControlMode,
+    ) -> Result<()> {
+        crate::setup::validate_image_publication(cfg, image)
+    }
     fn create_and_start(
         &self,
         cfg: &CoopConfig,
@@ -1085,17 +1092,20 @@ pub trait VmBackend: std::fmt::Display {
         vcpus: Option<NonZeroU8>,
         start_after: bool,
     ) -> Result<()>;
-    /// Save a stopped instance's filesystem as image `image` (the
-    /// backend-specific disk artifacts only — the caller carries over
-    /// the shared `template-config.json`). Takes a [`StoppedInstance`]
-    /// observation and lock through the filesystem copy. Overwriting an
-    /// existing image is the caller's decision, gated before this call.
+    /// Save a stopped instance's filesystem and matching metadata as image
+    /// `image`. Takes a [`StoppedInstance`] observation and lock through
+    /// publication. Overwriting an existing image is the caller's decision,
+    /// gated before this call.
     fn commit_disk(
         &self,
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()>;
+    /// Record capabilities that this backend re-established in the committed
+    /// disk before its metadata is published.
+    fn prepare_committed_image_metadata(&self, _metadata: &mut crate::setup::TemplateConfig) {}
     /// Replace a stopped instance's disk with image `image`'s template,
     /// leaving the instance otherwise intact. The dual of
     /// [`Self::commit_disk`]; like it, gated on a [`StoppedInstance`].
@@ -1191,10 +1201,10 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
 /// Build the legacy Linux/Firecracker TCP control transport.
 ///
-/// This seam remains while Firecracker TCP is a supported control transport
-/// and can be removed when that compatibility window closes. Lima continues
-/// through its own TCP constructor because its host, port, and lifecycle
-/// assumptions differ.
+/// This serves untagged and `legacy_tcp` Firecracker instances and can be
+/// removed when the supported compatibility window excludes both forms. Lima
+/// continues through its own TCP constructor because its host, port, and
+/// lifecycle assumptions differ.
 pub(crate) fn legacy_firecracker_tcp_target(
     cfg: &CoopConfig,
     inst: &Instance,
@@ -1209,11 +1219,60 @@ pub(crate) fn legacy_firecracker_tcp_target(
     ))
 }
 
+/// Derive the runtime SSH target from an instance's persisted control mode.
+pub(crate) fn firecracker_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
+    match inst.firecracker_control {
+        FirecrackerControlMode::LegacyTcp => legacy_firecracker_tcp_target(cfg, inst),
+        FirecrackerControlMode::Vsock => {
+            let guest_user = persisted_guest_user(cfg, &inst.image);
+            let guest_port =
+                NonZeroU32::new(22).context("fixed SSH vsock port must be non-zero")?;
+            SshTarget::firecracker_vsock(
+                inst.vsock_path(),
+                guest_port,
+                SshUser::new(guest_user.as_str())?,
+                std::path::absolute(cfg.ssh_key_path())?,
+                cfg.ssh.host_tools.clone(),
+            )
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
+    }
+
+    fn validate_image_control(
+        &self,
+        cfg: &CoopConfig,
+        image: &ImageName,
+        mode: FirecrackerControlMode,
+    ) -> Result<()> {
+        crate::setup::validate_image_publication(cfg, image)?;
+        if mode == FirecrackerControlMode::LegacyTcp {
+            return Ok(());
+        }
+
+        let metadata = crate::setup::TemplateConfig::load_for(cfg, image).with_context(|| {
+            format!(
+                "Cannot verify that image '{image}' supports Firecracker vsock control. \
+                 Rebuild it with `coop setup --image {image} --rebuild`"
+            )
+        })?;
+        if !metadata
+            .capabilities
+            .contains(&crate::setup::ImageCapability::FirecrackerVsockSsh)
+        {
+            bail!(
+                "Image '{image}' does not contain the Firecracker vsock SSH listener required by \
+                 `[vm].firecracker_control = \"vsock\"`. Rebuild it with \
+                 `coop setup --image {image} --rebuild`"
+            );
+        }
+        Ok(())
     }
 
     fn create_and_start(
@@ -1364,8 +1423,15 @@ impl VmBackend for FirecrackerBackend {
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()> {
-        crate::setup::commit_instance_rootfs(cfg, stopped.instance(), image)
+        crate::setup::commit_instance_rootfs(cfg, stopped.instance(), image, metadata)
+    }
+
+    fn prepare_committed_image_metadata(&self, metadata: &mut crate::setup::TemplateConfig) {
+        metadata
+            .capabilities
+            .insert(crate::setup::ImageCapability::FirecrackerVsockSsh);
     }
 
     fn restore_disk(
@@ -1418,7 +1484,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-        legacy_firecracker_tcp_target(cfg, inst)
+        firecracker_ssh_target(cfg, inst)
     }
 
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf> {
@@ -1560,8 +1626,9 @@ impl VmBackend for LimaBackend {
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()> {
-        crate::lima::commit_disk(cfg, stopped.instance(), image)
+        crate::lima::commit_disk(cfg, stopped.instance(), image, metadata)
     }
 
     fn restore_disk(
@@ -4456,6 +4523,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
@@ -4520,6 +4588,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let target = SshTarget::tcp(
@@ -4543,6 +4612,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let cfg = CoopConfig::default();
@@ -4574,6 +4644,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let disk = inst.dir.join("rootfs.ext4");
@@ -4690,6 +4761,137 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 .to_string_lossy(),
             format!("coop-{old_short:08x}.sock")
         );
+    }
+
+    #[test]
+    fn persisted_firecracker_control_mode_selects_one_transport_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let mut inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+
+        let tcp = firecracker_ssh_target(&cfg, &inst).unwrap();
+        assert_eq!(tcp.connection_description(), "172.16.0.2:22");
+        assert_eq!(tcp.proxy_command_option().unwrap(), "ProxyCommand=none");
+
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        let vsock = firecracker_ssh_target(&cfg, &inst).unwrap();
+        assert_eq!(
+            vsock.connection_description(),
+            format!("vsock:{}:22", inst.vsock_path().display())
+        );
+        assert!(
+            vsock
+                .proxy_command_option()
+                .unwrap()
+                .contains("__vsock-proxy")
+        );
+        assert!(!vsock.transport_is_reachable(Duration::ZERO).unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn firecracker_vsock_control_rejects_legacy_image_metadata() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("legacy").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        std::fs::write(
+            cfg.template_config_path_for(&image),
+            r#"{
+                "version": 2,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null
+            }"#,
+        )
+        .unwrap();
+
+        let backend = FirecrackerBackend::new();
+        backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::LegacyTcp)
+            .unwrap();
+        let error = backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not contain"), "{error}");
+        assert!(
+            error.contains("coop setup --image legacy --rebuild"),
+            "{error}"
+        );
+
+        let mut metadata = crate::setup::TemplateConfig::load_for(&cfg, &image).unwrap();
+        metadata
+            .capabilities
+            .insert(crate::setup::ImageCapability::FirecrackerVsockSsh);
+        metadata.save_for(&cfg, &image).unwrap();
+        backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn firecracker_vsock_validation_does_not_create_a_missing_image() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("missing").unwrap();
+
+        FirecrackerBackend::new()
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap_err();
+        assert!(!cfg.image_dir(&image).exists());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn incomplete_publication_rejects_every_firecracker_control_mode() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        crate::setup::begin_image_publication(&cfg, &image).unwrap();
+
+        let backend = FirecrackerBackend::new();
+        for mode in [
+            FirecrackerControlMode::LegacyTcp,
+            FirecrackerControlMode::Vsock,
+        ] {
+            let error = backend
+                .validate_image_control(&cfg, &image, mode)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("incomplete commit"), "{error}");
+        }
     }
 
     #[test]
@@ -5163,6 +5365,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: dir.to_path_buf(),
             image: crate::config::ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 

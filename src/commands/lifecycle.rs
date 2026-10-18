@@ -715,11 +715,24 @@ pub(super) fn allocate_and_start(
     workspace_path: Option<&Path>,
     opts: &StartOpts<'_>,
 ) -> Result<config::Instance> {
+    {
+        let _image_lock = setup::lock_image_publication(cfg, image)?;
+        // Validate before persisting an instance: old Firecracker images do not
+        // necessarily contain the guest listener required by vsock control.
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let inst = cfg.allocate_instance(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    let result = start_instance(be, &mut *cfg, &inst, opts);
+    // Keep the global lock order consistent with reprovisioning: an instance's
+    // provisioning lock is always acquired before its image publication lock.
+    // Re-lock and revalidate the image immediately before the backend consumes
+    // it, since a commit could have replaced it after the pre-allocation check.
+    let result = (|| {
+        let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
+        start_instance(be, &mut *cfg, &inst, opts, Some(image))
+    })();
 
     if let Err(error) = &result
         && error.is::<crate::creation_hooks::CreationIncomplete>()
@@ -986,6 +999,7 @@ fn start_instance(
     cfg: &mut config::CoopConfig,
     inst: &config::Instance,
     opts: &StartOpts<'_>,
+    image_to_consume: Option<&config::ImageName>,
 ) -> Result<()> {
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
@@ -1001,8 +1015,13 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let _image_lock = image_to_consume
+        .map(|image| setup::lock_image_publication(cfg, image))
+        .transpose()?;
+    if let Some(image) = image_to_consume {
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
-    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
     crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
 
@@ -1906,6 +1925,12 @@ pub(crate) fn cmd_commit(
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
+    // Serialize disk/template/metadata publication as one image operation.
+    // Firecracker setup uses the same sibling lock, so it cannot reuse the
+    // fixed staging name while commit is repairing it.
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
+    let destination_existed = cfg.image_dir(image).exists();
+
     // Refuse to clobber an existing image unless asked. Checked before
     // gating on stopped state so a typo'd or already-taken name fails fast.
     if be.image_is_built(cfg, image) && !force {
@@ -1924,10 +1949,19 @@ pub(crate) fn cmd_commit(
             format!("Failed to load template config for source image '{source_image}'")
         })?;
 
-    be.commit_disk(cfg, &stopped, image)?;
-
     template_config.created = setup::utc_timestamp();
-    template_config.save_for(cfg, image)?;
+    template_config.capabilities.clear();
+    be.prepare_committed_image_metadata(&mut template_config);
+    if let Err(error) = be.commit_disk(cfg, &stopped, image, &template_config) {
+        // A pre-publication failure for a new image may leave only the empty
+        // private directory created for staging. Remove it so `coop images`
+        // cannot report a phantom; a marker/disk from an interrupted
+        // publication makes this intentionally fail with DirectoryNotEmpty.
+        if !destination_existed {
+            setup::cleanup_unpublished_image_dir(cfg, image);
+        }
+        return Err(error);
+    }
 
     tracing::info!(
         "Committed instance '{}' to image '{image}'. \
@@ -1994,6 +2028,18 @@ pub(crate) struct ReprovisionOpts<'a> {
 /// leave them alone. [`RestoreMode::Reprovision`] is the other case — a base
 /// image, with nothing on the new disk to preserve — and routes to
 /// [`reprovision_instance`] instead.
+fn ensure_restore_image_usable(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    image: &config::ImageName,
+    control: config::FirecrackerControlMode,
+) -> Result<()> {
+    if !be.image_is_built(cfg, image) {
+        bail!("No image '{image}' found. Run `coop images` to list available images.");
+    }
+    be.validate_image_control(cfg, image, control)
+}
+
 pub(crate) fn cmd_restore(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -2007,10 +2053,9 @@ pub(crate) fn cmd_restore(
     };
 
     let inst = cfg.resolve_instance(opts.name)?;
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
 
-    if !be.image_is_built(cfg, image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control)?;
 
     let stopped = be.as_stopped(inst)?;
     crate::creation_hooks::restore_disk(
@@ -2063,9 +2108,9 @@ fn reprovision_instance(
     let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
     let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
-    if !be.image_is_built(cfg, &image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    let initial_image_lock = setup::lock_image_publication(cfg, &image)?;
+    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
+    drop(initial_image_lock);
 
     // Ordering rule for the whole pre-swap half: anything that can fail
     // cheaply runs before `restore_disk`, because a stopped instance can be
@@ -2086,7 +2131,6 @@ fn reprovision_instance(
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
-    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
@@ -2127,6 +2171,14 @@ fn reprovision_instance(
     // It swallows a failed `as_running` probe, which is fine here: the
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
+
+    // Re-check and snapshot the image contract only after interactive work is
+    // over, then keep the publication lock through the disk copy and lineage
+    // update. A concurrent forced commit cannot swap the image between its
+    // metadata validation and consumption.
+    let image_lock = setup::lock_image_publication(cfg, &image)?;
+    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
+    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
     // The instance's own forward set is authoritative — it already folded in
     // `cfg.forward_ports` at creation; merging again picks up forwards added
@@ -2193,6 +2245,7 @@ fn reprovision_instance(
     // Persist lineage only after replacement finishes.
     let mut inst = stopped.instance().clone();
     inst.set_image(image.clone()).with_context(partial)?;
+    drop(image_lock);
 
     let replacement_bytes = current_disk_bytes(be, &inst).with_context(partial)?;
     if let Some(target) =
@@ -2443,6 +2496,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: crate::config::ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         crate::creation_hooks::CreationState::select(&cfg, None)
             .unwrap()
@@ -2529,6 +2583,7 @@ mod tests {
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
@@ -2572,6 +2627,7 @@ mod tests {
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         let proxy_token = inst.dir.join("proxy-openai.token");
@@ -2597,6 +2653,171 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_legacy_firecracker_image(
+        cfg: &super::config::CoopConfig,
+        image: &super::config::ImageName,
+    ) {
+        crate::fs_util::private_dir(&cfg.image_dir(image)).unwrap();
+        std::fs::write(cfg.template_path_for(image), b"legacy disk sentinel").unwrap();
+        std::fs::write(
+            cfg.template_config_path_for(image),
+            r#"{
+                "version": 2,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_creation_rejects_legacy_image_before_allocating_state() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("must-not-exist").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_creation_cleans_up_when_provisioning_lock_cannot_open() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("lock-failure").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+
+        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
+        let lock_path = cfg
+            .instances_dir()
+            .join(format!("..{name}.provisioning.operation.lock"));
+        std::os::unix::fs::symlink(cfg.instances_dir(), &lock_path).unwrap();
+
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Failed to open operation lock"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vsock_instance_with_disk(
+        cfg: &mut super::config::CoopConfig,
+        name: &super::config::InstanceName,
+    ) -> super::config::Instance {
+        let image = super::config::default_image_name();
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let inst = cfg.allocate_instance(Some(name), &image, None).unwrap();
+        std::fs::write(inst.rootfs_path(), b"original instance disk").unwrap();
+        inst
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_restore_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("restore-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::DiskOnly { image: &target },
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_reprovision_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("reprovision-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let config_path = root.path().join("config.toml");
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::Reprovision(super::ReprovisionOpts {
+                image: Some(&target),
+                yes: true,
+                no_agents: true,
+                no_prompt: true,
+                config_path: &config_path,
+            }),
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
     }
 
     #[test]
@@ -2917,6 +3138,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2997,6 +3219,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -3049,6 +3272,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -3098,6 +3322,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         let mut cfg = super::config::CoopConfig::default();
@@ -3143,6 +3368,7 @@ mod tests {
                     index: super::config::InstanceIndex::new(0).unwrap(),
                     dir: tmp.path().to_path_buf(),
                     image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+                    firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
                 };
                 let mut state = super::guest_env_state::GuestEnvState::default();
                 for (name, value) in [
@@ -3219,6 +3445,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         // No `[proxy.openai]`, so ChatGPT account auth is the *only* reason
@@ -3984,6 +4211,7 @@ mod tests {
             dir: dir.to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 

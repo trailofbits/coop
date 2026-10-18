@@ -135,6 +135,10 @@ enum Commands {
         hostname: String,
         ip: std::net::Ipv4Addr,
     },
+    /// Internal privileged repair for a committed Firecracker rootfs.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__patch-guest-vsock-listener", hide = true)]
+    PatchGuestVsockListener { mount: PathBuf },
 
     /// Ensure an environment for a project directory exists and is running.
     ///
@@ -986,6 +990,11 @@ pub fn run() -> Result<()> {
         return setup::patch_guest_network_files(mount, hostname, ip);
     }
 
+    #[cfg(target_os = "linux")]
+    if let Commands::PatchGuestVsockListener { ref mount } = cli.command {
+        return setup::patch_guest_vsock_listener_files(mount);
+    }
+
     if let Commands::Completions { shell } = cli.command {
         completions::emit(shell)?;
         return Ok(());
@@ -1060,6 +1069,10 @@ pub fn run() -> Result<()> {
         Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
+        #[cfg(target_os = "linux")]
+        Commands::PatchGuestVsockListener { .. } => {
+            unreachable!("handled before config loading")
+        }
         Commands::Up {
             dir,
             name,

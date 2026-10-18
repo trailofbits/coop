@@ -318,7 +318,7 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     /// Wait for the guest to become reachable via SSH.
     pub fn wait_for_boot(&self) -> Result<()> {
-        let target = crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?;
+        let target = crate::backend::firecracker_ssh_target(self.cfg, self.inst)?;
         let timeout = Duration::from_secs(60);
         let start = Instant::now();
 
@@ -416,7 +416,7 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     fn shutdown_command(&self) -> Result<Command> {
         let session = crate::backend::SshSession {
-            target: crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?,
+            target: crate::backend::firecracker_ssh_target(self.cfg, self.inst)?,
             env: crate::backend::EnvForward::default(),
         };
         // Firecracker exits on guest reboot; the control API is disabled.
@@ -436,7 +436,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             mem_size_mib: self.cfg.vm.mem_size_mib.get().as_u32(),
         });
 
-        let target = crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?;
+        let target = crate::backend::firecracker_ssh_target(self.cfg, self.inst)?;
         let mut out = format!(
             "Instance '{}' running (PID: {pid})\n  \
              vCPUs: {}\n  Memory: {} MiB\n  \
@@ -696,6 +696,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         crate::test_support::create_private_dir_all(&inst.dir).unwrap();
         std::fs::create_dir(inst.pid_file_path()).unwrap();
@@ -733,6 +734,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let vm = FirecrackerVm::new(&cfg, &inst);
         vm.configure().unwrap();
@@ -844,6 +846,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         fs::create_dir(&inst.dir).unwrap();
         let pid = match mode.as_str() {
@@ -904,6 +907,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let mut process = std::process::Command::new("/bin/sleep")

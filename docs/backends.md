@@ -123,7 +123,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
-3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Firecracker lifecycle traffic remains TCP-based.
+3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Newly created instances persist `[vm].firecracker_control`; `vsock` is opt-in, while existing and untagged instances retain `legacy_tcp`. Image metadata records whether the listener is present, so selecting or restoring an older image in vsock mode fails before disk or instance state is changed and tells the user to rebuild it. Because committed disks contain guest-authored state, Firecracker commit repairs and verifies a staging disk first, marks publication incomplete, and only then swaps the disk and atomically replaces its capability metadata. The marker prevents consumers from using old metadata during publication while preserving it so a same-image commit can be retried. An interrupted publication remains unusable until commit is retried or the image is rebuilt.
 
 All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
 
@@ -225,7 +225,7 @@ the intentional setup and mount differences listed below:
 | `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
-| `coop shell` | SSH to localhost on Lima-assigned port | SSH to guest IP on configured port |
+| `coop shell` | SSH to localhost on Lima-assigned port | SSH over the instance's persisted control mode: guest IP for `legacy_tcp`, Firecracker vsock ProxyCommand for `vsock` |
 | `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: extends rootfs image if needed, then runs fsck + resize2fs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |
 | Docker in guest | Works (full kernel) | Works (with iptables-legacy workaround) |

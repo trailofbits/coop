@@ -1289,6 +1289,7 @@ mod tests {
             index: InstanceIndex::new(0).expect("0 is in range"),
             dir: dir.to_path_buf(),
             image: ImageName::new("default").expect("valid image name"),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 

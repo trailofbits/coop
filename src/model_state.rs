@@ -338,6 +338,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir,
             image: ImageName::new("test.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 

@@ -691,6 +691,7 @@ mod tests {
             index: InstanceIndex::new(index).unwrap(),
             dir: PathBuf::from("/tmp/coop-test"),
             image: ImageName::new("t.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
