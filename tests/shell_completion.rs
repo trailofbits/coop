@@ -60,7 +60,7 @@ fn completion_protocol_returns_live_candidates_for_every_shell() -> anyhow::Resu
 const BASH_HARNESS: &str = r#"
 set -eu
 test_binary=$1
-source <("$test_binary" completions bash)
+source /dev/stdin <<<"$("$test_binary" completions bash)"
 coop() {
     if [[ ${3-} == stop ]]; then
         [[ $COMPLETE == bash && $# == 4 && $1 == -- && $2 == coop && $4 == '' ]]

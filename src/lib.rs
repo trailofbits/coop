@@ -701,7 +701,7 @@ Examples:
 All scripts include live instance / image / profile names. Regenerate saved
 scripts after upgrading coop. Alternatively, generate them on shell startup:
 
-  bash:  source <(coop completions bash)
+  bash:  source /dev/stdin <<<\"$(coop completions bash)\"
   zsh:   source <(coop completions zsh)  # after compinit
   fish:  coop completions fish | source
 ";

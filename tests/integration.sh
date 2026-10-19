@@ -304,7 +304,7 @@ test_completions() {
     local dyn_out
     if dyn_out=$(bash --noprofile --norc -c '
         completion_binary=$1
-        source <("$completion_binary" completions bash)
+        source /dev/stdin <<<"$("$completion_binary" completions bash)"
         coop() { "$completion_binary" "$@"; }
         COMP_WORDS=(coop "")
         COMP_CWORD=1
