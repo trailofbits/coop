@@ -126,14 +126,12 @@ pub fn create_and_start(
         base_image_size_gib(&base_file).unwrap_or(cfg.vm.template_size_gib)
     });
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
-    let mut child = private_limactl()
-        .arg("start")
+    let mut child = headless_limactl_start()
         .arg(&effective_template)
         .arg(format!("--name={name}"))
         .arg(format!("--cpus={}", cfg.vm.vcpu_count))
         .arg(format!("--memory={mem_gib}"))
         .arg(format!("--disk={disk}"))
-        .arg("--tty=false")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -212,8 +210,8 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
-    let mut child = private_limactl()
-        .args(["start", &name])
+    let mut child = headless_limactl_start()
+        .arg(&name)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1078,8 +1076,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
-    let mut command = private_limactl();
-    command.arg("start");
+    let mut command = headless_limactl_start();
     if let Some(timeout) = builder_timeout {
         command
             .arg("--timeout")
@@ -1088,7 +1085,6 @@ fn run_builder_vm(
     let status = command
         .arg(builder_template)
         .arg(format!("--name={BUILDER_NAME}"))
-        .arg("--tty=false")
         .status()
         .context("Failed to run limactl start for builder")?;
 
@@ -1565,6 +1561,9 @@ mounts: []
 containerd:
   system: false
   user: false
+
+video:
+  display: "none"
 "#,
         image_path = image_path,
         arch = arch,
@@ -2065,6 +2064,17 @@ fn private_limactl() -> Command {
     command
 }
 
+/// Start Lima without any interactive or graphical UI.
+///
+/// The explicit video override also repairs existing instances whose persisted
+/// `lima.yaml` enables a display, while the generated template keeps new
+/// instances headless from creation.
+fn headless_limactl_start() -> Command {
+    let mut command = private_limactl();
+    command.args(["start", "--tty=false", "--set", ".video.display=\"none\""]);
+    command
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_private_storage() -> Result<()> {
     let home = lima_home()?;
@@ -2195,6 +2205,19 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn lima_start_disables_interactive_and_graphical_ui() {
+        let command = headless_limactl_start();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["start", "--tty=false", "--set", ".video.display=\"none\""]
+        );
+    }
 
     #[test]
     fn private_lima_child_creates_private_files_and_directories() {
@@ -2910,6 +2933,7 @@ mod tests {
         let parsed: serde_json::Value = serde_saphyr::from_str(&generated).unwrap();
         assert_eq!(parsed["images"][0]["location"].as_str(), disk.to_str());
         assert_eq!(parsed["mounts"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["video"]["display"].as_str(), Some("none"));
     }
 
     #[test]

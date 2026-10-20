@@ -167,6 +167,36 @@ guest_stderr() {
     cat "$tmpdir/guest_stderr" 2>/dev/null
 }
 
+lima_display() {
+    limactl list --json | python3 -c '
+import json
+import sys
+
+target = sys.argv[1]
+for line in sys.stdin:
+    entry = json.loads(line)
+    if entry.get("name") == target:
+        print(entry.get("config", {}).get("video", {}).get("display", ""))
+        raise SystemExit(0)
+raise SystemExit(1)
+' "coop-$INSTANCE"
+}
+
+# Assert the effective Lima configuration stays headless. This is intentionally
+# end-to-end: it catches create or restart paths that bypass coop's shared
+# headless launcher or persist a graphical display in lima.yaml.
+assert_lima_headless() {
+    local phase="$1" display=""
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    if display=$(lima_display) && [[ "$display" == "none" ]]; then
+        pass "Lima stays headless $phase"
+    else
+        fail "Lima stays headless $phase" "video.display=${display:-missing}"
+    fi
+}
+
 # Cross-platform timeout wrapper. Prefer GNU timeout (Linux, or macOS with
 # coreutils installed as `gtimeout`); fall back to a perl-based implementation
 # since perl ships in the macOS base system.
@@ -629,6 +659,7 @@ EOF
         echo "FATAL: primary instance creation failed, cannot continue"
         exit 1
     fi
+    assert_lima_headless "after creation"
 
     local copied_file="" env_value=""
     if copied_file=$(guest_exec cat /workspace/.devcontainer/devcontainer.json) \
@@ -3337,6 +3368,23 @@ test_restart_stopped() {
     echo ""
     echo "=== Phase: restart stopped instance ==="
 
+    # Seed a stopped Lima VM with a persisted graphical display so this test
+    # proves the restart path repairs it instead of preserving a headless value.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local display=""
+        if limactl edit --tty=false --set '.video.display="default"' "coop-$INSTANCE" \
+                >/dev/null \
+            && display=$(lima_display) \
+            && [[ "$display" == "default" ]]; then
+            pass "restart fixture enables Lima display"
+        else
+            fail "restart fixture enables Lima display" \
+                "video.display=${display:-missing}"
+            echo "FATAL: could not prepare graphical Lima restart fixture"
+            exit 1
+        fi
+    fi
+
     # Restart the stopped instance (was stopped in previous phase)
     if coop start "$INSTANCE" --no-agents; then
         pass "restart stopped instance exits 0"
@@ -3346,6 +3394,7 @@ test_restart_stopped() {
         echo "FATAL: restart failed, cannot continue"
         exit 1
     fi
+    assert_lima_headless "after restart"
 
     # Verify it's running again
     if coop status "$INSTANCE"; then

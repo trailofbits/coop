@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.9.1
+
+### Fixed
+
+- Keep Lima VM starts headless, including restarts of existing instances whose
+  persisted configuration enables a graphical display.
+
 ## v0.9.0
 
 ### Security

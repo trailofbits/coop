@@ -61,6 +61,15 @@ Only scp's SFTP mode has this issue.
 The coop binary's tracing output (INFO/DEBUG/WARN logs) goes to **stderr**, so
 stdout stays clean for machine-readable (`--json`) output and piped consumers.
 
+## Lima starts are always headless
+
+All Lima create, restart, and builder paths must use the shared headless start
+launcher in `src/lima.rs`. It disables interactive TUI behavior and overrides
+`video.display` to `none`; the latter also repairs existing instances whose
+persisted `lima.yaml` enables a graphical display. The fast-start template
+records the same setting explicitly. The macOS integration suite checks the
+effective Lima configuration after both instance creation and restart.
+
 ## Firecracker base-image networking
 
 The upstream Firecracker image may enable `fcnet.service`, which assigns an
