@@ -61,6 +61,8 @@ mod signal;
 mod setup;
 mod shell;
 mod ssh;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]

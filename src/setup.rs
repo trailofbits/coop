@@ -1858,7 +1858,7 @@ mod tests {
 
     #[test]
     fn firecracker_accepts_and_consumes_explicit_setup_inputs() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let post_install = root.path().join("setup.sh");
         fs::write(&post_install, "touch /firecracker-input-witness\n").unwrap();
         let opts = setup_options(&["ripgrep", "fd-find"], Some(post_install));
@@ -2478,7 +2478,7 @@ mod tests {
     fn patch_guest_hosts_replaces_regular_file_without_modifying_hardlinks() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let etc = root.path().join("etc");
         fs::create_dir(&etc).unwrap();
         let original = "127.0.0.1 localhost\n127.0.1.1 old\n10.0.0.5 registry\n";
@@ -2519,8 +2519,8 @@ mod tests {
     fn patch_guest_network_files_replaces_symlinks_without_writing_outside_rootfs() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         let etc = root.path().join("etc");
         fs::create_dir_all(etc.join("systemd/network")).unwrap();
         fs::write(etc.join("hosts"), "127.0.0.1 localhost\n").unwrap();
@@ -2552,8 +2552,8 @@ mod tests {
     fn patch_guest_network_files_rejects_symlinked_parent() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         fs::create_dir_all(root.path().join("etc/systemd")).unwrap();
         fs::create_dir(outside.path().join("network")).unwrap();
         let sentinel = outside.path().join("network/10-eth0.network");
@@ -2577,7 +2577,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         for kind in ["missing", "symlink", "fifo", "oversized", "non-utf8"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let etc = root.path().join("etc");
             fs::create_dir(&etc).unwrap();
             let hosts = etc.join("hosts");
@@ -2617,8 +2617,8 @@ mod tests {
     fn patch_guest_hosts_rejects_symlinked_etc_and_directory_hosts() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let other = crate::test_support::private_tempdir().unwrap();
         symlink(other.path(), root.path().join("etc")).unwrap();
         assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
         assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);

@@ -756,7 +756,7 @@ mod tests {
                 "probe_failure",
                 "already_exited",
             ] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::test_support::private_tempdir().unwrap();
                 let sudo = root.path().join("sudo");
                 fs::write(
                     &sudo,
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn read_machine_config_parses_persisted_json() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("vm_config.json");
         std::fs::write(&path, SAMPLE_CONFIG_JSON).unwrap();
         let machine = read_machine_config(&path).unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn read_machine_config_returns_none_for_missing_or_malformed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let missing = dir.path().join("nope.json");
         assert!(read_machine_config(&missing).is_none(), "missing file");
 
@@ -1114,7 +1114,7 @@ mod tests {
     fn pid_trampoline_publishes_readable_pid_under_hardened_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         // Pause any post-publication chmod in the shell itself. This makes the
         // old create-then-chmod window deterministic without sudo or a VM.
@@ -1147,7 +1147,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let directory = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
         // Linux POSIX default ACL u::rwx,g::---,o::---. Such an ACL replaces
         // the umask during file creation; changing the umask cannot grant read.
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn pid_trampoline_cleans_staging_file_when_chmod_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         let result = std::process::Command::new("sh")
             .args([
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn wait_for_pid_file_returns_immediately_when_already_valid() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         std::fs::write(&path, "4242\n").unwrap();
 
@@ -1253,7 +1253,7 @@ mod tests {
         // The trampoline's `echo $$ > "$1"` truncates before it writes, so a
         // reader can legitimately observe a zero-byte file. That must retry,
         // not fail.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         std::fs::write(&path, "").unwrap();
 
@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn wait_for_pid_file_times_out_when_never_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("never-written.pid");
 
         let err = wait_for_pid_file(&path, Duration::from_millis(300)).unwrap_err();
@@ -1284,7 +1284,7 @@ mod tests {
         // A directory reads as EISDIR, not NotFound: abort rather than spin
         // until the timeout. This is the arm an unreadable root-owned PID
         // file also takes.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
 
         let start = Instant::now();
         let err = wait_for_pid_file(dir.path(), Duration::from_secs(30)).unwrap_err();

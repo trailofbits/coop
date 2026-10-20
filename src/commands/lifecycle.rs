@@ -2474,7 +2474,7 @@ mod tests {
             check_stale_restart_preserves_creation_progress(std::path::Path::new(&root));
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let controller = root.path().join("limactl");
         std::fs::write(
             &controller,
@@ -2507,7 +2507,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_reports_unknown_process_state_and_preserves_pid_file() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
@@ -2550,7 +2550,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_stop_removes_proxy_before_cleanup_error() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
@@ -2610,7 +2610,7 @@ mod tests {
     }
 
     fn assert_interrupted_post_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = instance_named("test", tmp.path());
         std::fs::create_dir(inst.model_state_path()).unwrap();
         let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
@@ -2894,7 +2894,7 @@ mod tests {
     fn prepare_session_overlays_persisted_guest_env() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
@@ -2974,7 +2974,7 @@ mod tests {
     fn prepare_session_suppresses_persisted_proxy_key() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
@@ -3026,7 +3026,7 @@ mod tests {
     fn prepare_session_suppresses_persisted_openai_key_for_chatgpt_auth() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
@@ -3075,7 +3075,7 @@ mod tests {
     fn prepare_session_survives_chatgpt_auth_with_openai_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
@@ -3121,7 +3121,7 @@ mod tests {
                 super::config::ProxyAuthScheme::Bearer,
                 super::config::ProxyAuthScheme::CodexAccessToken,
             ] {
-                let tmp = tempfile::tempdir().unwrap();
+                let tmp = crate::test_support::private_tempdir().unwrap();
                 let inst = super::config::Instance {
                     name: super::config::InstanceName::new("test").unwrap(),
                     index: super::config::InstanceIndex::new(0).unwrap(),
@@ -3196,7 +3196,7 @@ mod tests {
     fn prepare_session_suppresses_openai_key_for_chatgpt_auth_without_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
@@ -3248,7 +3248,7 @@ mod tests {
     fn prepare_session_skips_overlay_without_instance() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = super::config::CoopConfig::default();
         let target = super::backend::SshTarget {
             host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
@@ -3320,7 +3320,7 @@ mod tests {
         // at `/workspace` on a reprovision would be a silent relocation.
         // A real directory: `Mount::from_parts` canonicalizes and rejects a
         // host path that is not one.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let host = tmp.path().canonicalize().expect("canonical tempdir");
         let state = ws_state_at(
             super::workspace::WorkspaceSource::Mount {
@@ -3346,7 +3346,7 @@ mod tests {
         // reaches `rsync`, which parses its own source argument. Routing it
         // through `Mount::from_parts` is what rejects it, and doing so before
         // the disk swap is what keeps the instance recoverable.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let not_a_dir = tmp.path().join("regular-file");
         std::fs::write(&not_a_dir, b"x").expect("write file");
 
@@ -3367,7 +3367,7 @@ mod tests {
     #[test]
     fn check_reprovision_workspace_source_accepts_a_live_host_directory() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: tmp.path().to_path_buf(),
         });
@@ -3415,7 +3415,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
 
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         // 0xFF is not valid UTF-8 in any position.
         let host_path = tmp.path().join(std::ffi::OsStr::from_bytes(b"proj-\xff"));
         std::fs::create_dir(&host_path).expect("create non-UTF-8 dir");
@@ -3539,7 +3539,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_uses_first_mount_origin() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3565,7 +3565,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_non_github_mount() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3583,7 +3583,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_no_mounts() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let slug = super::resolve_start_repo(&opts).expect("ok");
@@ -3592,7 +3592,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_allows_workspace_affinity_key() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let mut opts = start_opts(Vec::new(), &cfg_path);
         opts.workspace_dir = Some("/some/workspace");
@@ -3601,7 +3601,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_rejects_workspace_with_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let name = super::config::InstanceName::new("explicit").expect("valid name");
         let mut opts = start_opts(Vec::new(), &cfg_path);
@@ -3612,7 +3612,7 @@ mod tests {
 
     #[test]
     fn no_stopped_instance_message_points_creation_to_up() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let msg = super::no_stopped_instance_message(&opts, None);
@@ -3621,7 +3621,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_returns_none_when_unmatched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let found = super::find_git_repo_instance(&cfg, "https://example.com/org/absent.git")
             .expect("lookup");
@@ -3630,7 +3630,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_errors_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3650,7 +3650,7 @@ mod tests {
 
     #[test]
     fn ensure_up_git_repo_name_matches_rejects_mismatch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let inst = cfg.allocate_instance(None, &img, None).expect("inst");
@@ -3667,7 +3667,7 @@ mod tests {
 
     #[test]
     fn up_copy_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
@@ -3698,7 +3698,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3720,7 +3720,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_profile_target() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3747,7 +3747,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3766,7 +3766,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3795,7 +3795,7 @@ mod tests {
 
     #[test]
     fn up_running_rejects_restart_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3813,7 +3813,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_returns_none_when_no_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let ws = tmp.path().join("project");
         std::fs::create_dir(&ws).expect("create_dir");
@@ -3823,7 +3823,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_finds_single_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3842,7 +3842,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_bails_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3874,7 +3874,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_ignores_unrelated_workspaces() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws_a = tmp.path().join("a");
@@ -3928,7 +3928,7 @@ mod tests {
 
     #[test]
     fn creation_options_rejected_message_names_instance_and_recovery() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = instance_named("demo", tmp.path());
         let msg = super::creation_options_rejected_message(&inst);
         assert!(msg.contains("demo"), "{msg}");
@@ -3941,7 +3941,7 @@ mod tests {
     /// *different* image). Pins the `!=` comparison at the image check.
     #[test]
     fn up_existing_accepts_matching_image() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3969,7 +3969,7 @@ mod tests {
     /// `extra_mount` emptiness test.
     #[test]
     fn up_existing_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -4012,7 +4012,7 @@ mod tests {
     /// a matching transport).
     #[test]
     fn up_existing_accepts_matching_transport() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -4034,7 +4034,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_accepts_matching_image_and_profile() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
 
         // Matching --image is compatible.
@@ -4063,7 +4063,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let inst = cfg
             .allocate_instance(None, &super::config::default_image_name(), None)

@@ -133,7 +133,7 @@ mod tests {
     use crate::guest_env_state::{EnvVarName, GuestEnvState};
 
     fn fixture() -> (tempfile::TempDir, CoopConfig, Instance) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg: CoopConfig = toml::from_str(
             r#"
             [github]

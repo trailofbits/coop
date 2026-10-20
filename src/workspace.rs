@@ -1486,7 +1486,7 @@ mod tests {
     fn rsync_default_exclusions_are_directory_only() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let source = temp.path().join("source");
         let dest = temp.path().join("dest");
         fs::create_dir_all(source.join("files")).unwrap();
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[test]
     fn git_repo_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
@@ -1823,7 +1823,7 @@ mod tests {
 
     #[test]
     fn project_mounted_rule_allows_workspace_mount() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("proj");
         std::fs::create_dir(&data).expect("data");
         // A project legitimately mounted at /workspace (coop up --mount) is
@@ -1837,7 +1837,7 @@ mod tests {
 
     #[test]
     fn assemble_rejects_duplicate_guest_paths_under_every_rule() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         std::fs::create_dir(&a).expect("a");
@@ -1903,7 +1903,7 @@ mod tests {
 
     #[test]
     fn try_load_returns_none_when_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let result = WorkspaceState::try_load(&inst).expect("no IO error");
         assert!(result.is_none());
@@ -1911,7 +1911,7 @@ mod tests {
 
     #[test]
     fn try_load_errors_on_invalid_json() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         fs::write(inst.workspace_state_path(), "not json").expect("write");
         let result = WorkspaceState::try_load(&inst);
@@ -1925,7 +1925,7 @@ mod tests {
         // a WARN that names the degraded feature (`consequence`) and the
         // instance. Both arms are pinned here so a mutant that drops either
         // the pass-through or the warning is caught.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
 
         // Present: the loaded state flows through unchanged, no warning.
@@ -1965,7 +1965,7 @@ mod tests {
 
     #[test]
     fn load_or_default_uses_saved_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let state = WorkspaceState {
             guest_path: GuestPath::absolute("/custom").unwrap(),
@@ -1984,7 +1984,7 @@ mod tests {
 
     #[test]
     fn load_or_default_falls_back_with_dir_arg() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         // No workspace.json exists; the synthetic state carries the
         // explicit --dir as its host_path so consumers can read it
@@ -1999,10 +1999,10 @@ mod tests {
 
     #[test]
     fn record_mount_state_persists_first_mount() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
-        let primary = tempfile::tempdir().expect("primary");
-        let secondary = tempfile::tempdir().expect("secondary");
+        let primary = crate::test_support::private_tempdir().expect("primary");
+        let secondary = crate::test_support::private_tempdir().expect("secondary");
         let mounts = vec![
             crate::config::Mount {
                 host_path: primary.path().to_path_buf(),
@@ -2026,7 +2026,7 @@ mod tests {
 
     #[test]
     fn record_mount_state_noop_on_empty() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         record_mount_state(&inst, &[]).expect("ok");
         assert!(
@@ -2061,7 +2061,7 @@ mod tests {
             m1 in arb_mount(),
             m2 in arb_mount(),
         ) {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = crate::test_support::private_tempdir().expect("tempdir");
             let inst = temp_instance(dir.path());
 
             record_mount_state(&inst, std::slice::from_ref(&m1)).expect("record m1");
@@ -2080,7 +2080,7 @@ mod tests {
 
     #[test]
     fn load_or_default_errors_without_dir_or_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let result = load_or_default(&inst, None, "pull");
         assert!(result.is_err());
@@ -2178,7 +2178,7 @@ Host coop-app\n\
 
     #[test]
     fn ssh_config_block_has_expected_fields() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         let block = ssh_config_block(&fake_ssh_target(), &inst);
 
@@ -2244,7 +2244,7 @@ Host coop-other\n\
 
     #[test]
     fn remove_all_ssh_config_at_strips_coop_keeps_rest() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let path = dir.path().join("config");
         let original = "\
 Host keep\n\
@@ -2270,7 +2270,7 @@ Host coop-test\n\
 
     #[test]
     fn remove_all_ssh_config_at_leaves_unrelated_file_byte_identical() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let path = dir.path().join("config");
         let original = "Host keep\n    HostName 9.9.9.9\n";
         std::fs::write(&path, original).expect("write config");
@@ -2286,7 +2286,7 @@ Host coop-test\n\
 
     #[test]
     fn remove_ssh_config_at_removes_only_target_instance() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let path = dir.path().join("config");
         let inst = temp_instance(dir.path()); // host coop-test
         let original = "\
@@ -2319,7 +2319,7 @@ Host coop-other\n\
 
     #[test]
     fn remove_ssh_config_at_leaves_file_byte_identical_when_host_absent() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let path = dir.path().join("config");
         let inst = temp_instance(dir.path()); // host coop-test, absent below
         let original = "\
@@ -2434,8 +2434,8 @@ Host coop-other\n\
     fn pull_staging_cleanup_repairs_guest_directory_modes_without_following_symlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let parent = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         let operation = test_pull_operation(parent.path());
         let mut staging = operation.staging().unwrap();
         let staging_path = staging.path().unwrap().to_path_buf();
@@ -2464,7 +2464,7 @@ Host coop-other\n\
 
     #[test]
     fn pull_staging_path_is_a_stable_private_storage_sibling() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let instances = temp.path().join("instances");
         let inst = temp_instance(&instances.join("test"));
 
@@ -2517,7 +2517,7 @@ Host coop-other\n\
     fn pull_staging_replaces_the_bounded_tree_left_by_an_interrupted_pull() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::private_tempdir().unwrap();
         let root = parent.path().join("pull-staging/work");
         let stale = root.join("contents/locked");
         fs::create_dir_all(&stale).unwrap();
@@ -2535,7 +2535,7 @@ Host coop-other\n\
 
     #[test]
     fn pull_staging_cleanup_propagates_inspection_errors_other_than_missing() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::private_tempdir().unwrap();
         let non_directory = parent.path().join("file");
         fs::write(&non_directory, "not a directory").unwrap();
 
@@ -2551,7 +2551,7 @@ Host coop-other\n\
     fn pull_rsync_writer_keeps_operation_lock_after_parent_guard_drops() {
         use std::os::unix::process::CommandExt as _;
 
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::private_tempdir().unwrap();
         let source = parent.path().join("source");
         let dest = parent.path().join("dest");
         fs::create_dir(&source).unwrap();
@@ -2581,8 +2581,8 @@ Host coop-other\n\
     fn pull_staging_drop_is_a_cleanup_fallback() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let parent = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         let operation = test_pull_operation(parent.path());
         let staging_path = {
             let staging = operation.staging().unwrap();
@@ -2621,9 +2621,9 @@ Host coop-other\n\
             let dest = temp.path().join("dest");
             let bin = temp.path().join("bin");
             let staging_parent = temp.path().join("pull-tmp");
-            fs::create_dir_all(dest.join(".git")).unwrap();
-            fs::create_dir(&bin).unwrap();
-            fs::create_dir(&staging_parent).unwrap();
+            crate::test_support::create_private_dir_all(dest.join(".git")).unwrap();
+            crate::test_support::create_private_dir_all(&bin).unwrap();
+            crate::test_support::create_private_dir_all(&staging_parent).unwrap();
             fs::write(dest.join(".git/config"), "host-owned\n").unwrap();
 
             let real_rsync = Command::new("sh")
@@ -2710,7 +2710,7 @@ Host coop-other\n\
 
     #[test]
     fn staged_pull_best_effort_filter_leaves_common_host_git_path_untouched() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let staging = temp.path().join("staging");
         let dest = temp.path().join("dest");
         fs::create_dir_all(staging.join(".GiT")).unwrap();
@@ -2734,7 +2734,7 @@ Host coop-other\n\
 
     #[test]
     fn pull_destination_requires_force_based_only_on_directory_contents() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let missing = temp.path().join("missing");
         let empty = temp.path().join("empty");
         let nonempty = temp.path().join("nonempty");
@@ -2766,7 +2766,7 @@ Host coop-other\n\
         // guest_path must be rejected at load — `GuestPath`'s transparent
         // deserialize would otherwise accept it and let it flow into the
         // remote shell commands that interpolate the path.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         fs::write(
             inst.workspace_state_path(),
@@ -2787,7 +2787,7 @@ Host coop-other\n\
     fn try_load_legacy_shape_emits_migration_hint() {
         // The pre-#147 flat shape no longer parses; the error context
         // points the user at the remediation.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::private_tempdir().expect("tempdir");
         let inst = temp_instance(dir.path());
         fs::write(
             inst.workspace_state_path(),

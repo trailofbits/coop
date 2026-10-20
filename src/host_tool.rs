@@ -22,6 +22,7 @@ pub(crate) fn trusted_test_tempdir() -> tempfile::TempDir {
     let home = dirs::home_dir().expect("test user has a home directory");
     tempfile::Builder::new()
         .prefix(".coop-trusted-tool-test-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(home)
         .expect("create trusted host-tool fixture")
 }
@@ -108,10 +109,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_support::private_tempdir().unwrap();
             let anchor = temp.path().join("root");
             let bin = anchor.join("usr/bin");
-            fs::create_dir_all(&bin).unwrap();
+            crate::test_support::create_private_dir_all(&bin).unwrap();
             let uid = fs::metadata(&anchor).unwrap().uid();
             let policy = TrustedToolPolicy::new(&anchor, [bin.clone()], uid);
             Self {
@@ -184,11 +185,11 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::private_tempdir().unwrap();
         let anchor = temp.path().join("root");
-        fs::create_dir_all(anchor.join("usr/bin")).unwrap();
+        crate::test_support::create_private_dir_all(anchor.join("usr/bin")).unwrap();
         let hostile = temp.path().join("hostile");
-        fs::create_dir(&hostile).unwrap();
+        crate::test_support::create_private_dir_all(&hostile).unwrap();
         let marker = temp.path().join("executed");
         let hostile_ip = hostile.join("ip");
         fs::write(
@@ -244,7 +245,7 @@ mod tests {
         assert!(non_executable.to_string().contains("not executable"));
 
         let directory = fixture.bin.join("directory");
-        fs::create_dir(&directory).unwrap();
+        crate::test_support::create_private_dir_all(&directory).unwrap();
         let non_regular =
             resolve_host_tool(TestTool::Ip, &[directory], &fixture.policy).unwrap_err();
         assert!(non_regular.to_string().contains("not a regular file"));
@@ -254,7 +255,7 @@ mod tests {
     fn accepts_merged_usr_symlink_when_every_hop_is_trusted() {
         let fixture = Fixture::new();
         let sbin_target = fixture.anchor.join("usr/sbin");
-        fs::create_dir_all(&sbin_target).unwrap();
+        crate::test_support::create_private_dir_all(&sbin_target).unwrap();
         let target = sbin_target.join("ip");
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -281,7 +282,7 @@ mod tests {
 
         let target = fixture.executable("real-ip", "#!/bin/sh\nexit 0\n");
         let writable = fixture.anchor.join("writable");
-        fs::create_dir(&writable).unwrap();
+        crate::test_support::create_private_dir_all(&writable).unwrap();
         fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
         let candidate = writable.join("ip");
         symlink(&target, &candidate).unwrap();
@@ -298,7 +299,7 @@ mod tests {
     fn explicit_path_accepts_a_trusted_target_outside_builtin_roots() {
         let fixture = Fixture::new();
         let store = fixture.anchor.join("nix/store/package/bin");
-        fs::create_dir_all(&store).unwrap();
+        crate::test_support::create_private_dir_all(&store).unwrap();
         let target = store.join("ip");
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -324,8 +325,8 @@ mod tests {
         let a = fixture.anchor.join("a");
         let outside = fixture.anchor.join("outside");
         let deep = outside.join("deep");
-        fs::create_dir_all(&a).unwrap();
-        fs::create_dir_all(&deep).unwrap();
+        crate::test_support::create_private_dir_all(&a).unwrap();
+        crate::test_support::create_private_dir_all(&deep).unwrap();
 
         // Lexically collapsing `link/..` would inspect a/tool. The kernel
         // follows link first, then applies `..`, and therefore executes
@@ -368,7 +369,7 @@ mod tests {
     fn rejects_unreadable_candidates_and_non_directory_allowed_roots() {
         let fixture = Fixture::new();
         let locked = fixture.anchor.join("locked");
-        fs::create_dir(&locked).unwrap();
+        crate::test_support::create_private_dir_all(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable =
             resolve_host_tool(TestTool::Ip, &[locked.join("ip")], &fixture.policy).unwrap_err();

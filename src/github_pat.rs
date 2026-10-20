@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn vm_assignment_status_keeps_entry_listing_and_reports_missing_reference() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg: CoopConfig = toml::from_str(
             r#"
             [github]
@@ -1334,7 +1334,7 @@ mod tests {
 
     #[test]
     fn upsert_creates_new_file_with_entry() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let s = slug("trailofbits/coop");
         upsert_pat_entry(&path, &s, "cmd:cat ./t.txt").unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[test]
     fn upsert_preserves_other_keys() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn upsert_upgrades_string_github_to_table() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
         upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
@@ -1378,7 +1378,7 @@ mod tests {
         // not rewrite the file. Verified by leaving a comment in the input
         // — `toml::Value` strips comments on round-trip, so a rewrite would
         // be visible as comment loss.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let original = "# user comment\n[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n";
         std::fs::write(&path, original).unwrap();
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn upsert_removes_repo_from_skip_list() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn remove_pat_entry_is_idempotent_on_missing() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         remove_pat_entry(&path, &slug("x/y")).unwrap();
         assert!(!path.exists());
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn remove_pat_entry_drops_only_named_entry() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
@@ -1431,7 +1431,7 @@ mod tests {
     fn upsert_replaces_non_table_pat_value() {
         // A pre-existing `github.pat` that isn't a table must be upgraded to
         // one (not left in place, which would fail the later `as_table_mut`).
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "[github]\nmode = \"pat\"\npat = \"garbage\"\n").unwrap();
         upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
@@ -1443,7 +1443,7 @@ mod tests {
     fn skip_marker_replaces_non_array_skip_value() {
         // A pre-existing `github.skip` that isn't an array must be replaced
         // with one before the marker is appended.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "[github]\nmode = \"pat\"\nskip = \"garbage\"\n").unwrap();
         add_skip_marker(&path, &slug("a/b")).unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn skip_marker_added_idempotent() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         add_skip_marker(&path, &slug("a/b")).unwrap();
         add_skip_marker(&path, &slug("a/b")).unwrap();
@@ -1465,7 +1465,7 @@ mod tests {
     fn skip_marker_survives_when_starting_mode_is_off() {
         // Regression: previously the marker was written under
         // `[github] mode = "off"`, and the deserializer dropped it.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
         add_skip_marker(&path, &slug("a/b")).unwrap();
@@ -1478,7 +1478,7 @@ mod tests {
         // Regression: full sequence — start at "off", record skip, then
         // run setup-pat. The skip marker must be cleared, and the new
         // entry must be present.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "github = \"off\"\n").unwrap();
         add_skip_marker(&path, &slug("a/b")).unwrap();
@@ -1740,7 +1740,7 @@ mod tests {
     // ── status report ───────────────────────────────────────────
 
     fn config_from(s: &str) -> CoopConfig {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, s).unwrap();
         CoopConfig::load(&path).unwrap()

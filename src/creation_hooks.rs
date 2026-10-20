@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn selected_recipe_is_private_and_independent_of_later_config() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let mut cfg = CoopConfig {
             post_create: Some("original secret".into()),
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn failed_restore_preserves_completed_progress_on_original_disk() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let original = fs::read(root.path().join("creation.json")).unwrap();
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn destructive_restore_failures_keep_progress_pending() {
         for change in ["removed", "replaced", "symlink", "missing initially"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let (inst, disk) = completed_restore_fixture(root.path());
             if change == "missing initially" {
                 fs::remove_file(&disk).unwrap();
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn successful_restore_keeps_progress_pending() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         crate::creation_hooks::restore_disk(&inst, &disk, || {
             fs::remove_file(&disk)?;
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn unsafe_disk_or_corrupt_progress_prevents_restore() {
         for failure in ["symlink", "hardlink", "corrupt recipe"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let (inst, disk) = completed_restore_fixture(root.path());
             let recipe = root.path().join("creation.json");
             let before = fs::read(&recipe).unwrap();
@@ -616,7 +616,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
             fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000))?;
@@ -664,7 +664,7 @@ mod tests {
             assert!(!pending(&inst).unwrap());
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn rollback_failure_reports_both_errors() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let (inst, disk) = completed_restore_fixture(root.path());
         let recipe = root.path().join("creation.json");
         let error = crate::creation_hooks::restore_disk(&inst, &disk, || {
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn legacy_restore_has_no_creation_progress_side_effects() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let called = std::cell::Cell::new(false);
         let error =
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn completed_hook_is_skipped_and_restore_resets_progress() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let cfg = CoopConfig {
             post_create: Some("global".into()),
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn legacy_and_empty_recipes_are_ready_but_corruption_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         assert!(ensure_complete(&inst).is_ok());
         restore_disk(&inst, &root.path().join("missing-disk"), || Ok(())).unwrap();
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn unreadable_recipe_is_not_treated_as_a_legacy_instance() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         fs::create_dir(root.path().join("creation.json")).unwrap();
         assert!(CreationState::load(&inst).is_err());
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn recipe_reads_and_replacements_tighten_private_storage() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("instance"));
         let cfg = CoopConfig {
             post_create: Some("saved command".into()),
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn recipe_links_cannot_bypass_completion_or_overwrite_other_files() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("instance"));
         let state = CreationState::select(&CoopConfig::default(), None).unwrap();
         state.save(&inst).unwrap();
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn recipes_reject_symlinked_and_writable_ancestors() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let parent = root.path().join("shared");
         let inst = instance(&parent.join("instance"));
         let state = CreationState::select(&CoopConfig::default(), None).unwrap();
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn missing_instance_recipe_does_not_create_storage() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(&root.path().join("missing/instance"));
         assert!(CreationState::load(&inst).unwrap().is_none());
         assert!(!root.path().join("missing").exists());
@@ -899,8 +899,8 @@ mod tests {
     }
 
     fn prepare_creation_transport_fixture(root: &Path) {
-        fs::create_dir(root.join("host-bin")).unwrap();
-        fs::create_dir(root.join("guest-bin")).unwrap();
+        crate::test_support::create_private_dir_all(root.join("host-bin")).unwrap();
+        crate::test_support::create_private_dir_all(root.join("guest-bin")).unwrap();
         let ssh = root.join("host-bin/ssh");
         fs::write(
             &ssh,
@@ -982,7 +982,7 @@ printf guest > {0}/guest-restored
 
     #[test]
     fn global_shell_command_preserves_quoting_and_selected_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let command =
             CreationCommand::shell(r#"printf '%s' "literal \$(touch injected); ' space" > result"#)
                 .unwrap();
@@ -1003,7 +1003,7 @@ printf guest > {0}/guest-restored
 
     #[test]
     fn removed_project_and_argv_recipes_fail_closed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = instance(root.path());
         let cfg = CoopConfig {
             post_create: Some("true".into()),
@@ -1026,7 +1026,7 @@ printf guest > {0}/guest-restored
 
     #[test]
     fn missing_hook_directory_fails_without_entering_supervisor() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let path = root.path().join("hook.sh");
         let command = CreationCommand::shell("touch executed").unwrap();
         fs::write(

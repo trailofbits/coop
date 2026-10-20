@@ -363,6 +363,9 @@ both assertions work. Apply the execution restrictions above.
 Unit tests cover private creation under permissive and restrictive umasks, atomic replacement,
 legacy state repair, concurrent instance removal, unsafe links and parents,
 Firecracker config creation/replacement, and Linux POSIX ACL removal.
+Trusted-path fixtures create their directories with explicit private modes. On
+Linux, check them under a group-writable umask with
+`(umask 0002; cargo test --workspace)`.
 The umask fixtures run in child processes to avoid changing other tests' umask. Two Linux unit probes require passwordless sudo:
 
 ```bash

@@ -3303,7 +3303,7 @@ mod tests {
 
     #[test]
     fn validate_unique_guest_paths_rejects_duplicates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         std::fs::create_dir(&a).unwrap();
@@ -3318,7 +3318,7 @@ mod tests {
 
     #[test]
     fn validate_unique_guest_paths_accepts_distinct() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         std::fs::create_dir(&a).unwrap();
@@ -3397,7 +3397,7 @@ mod tests {
 
     #[test]
     fn instance_load_rejects_out_of_range_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -3454,7 +3454,7 @@ mod tests {
 
     #[test]
     fn instance_save_load_roundtrip() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("myinst");
         let inst = test_inst("myinst", idx(42), dir.clone());
         inst.save().unwrap();
@@ -3468,7 +3468,7 @@ mod tests {
 
     #[test]
     fn set_image_updates_field_and_persists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("myinst");
         let mut inst = test_inst("myinst", idx(7), dir.clone());
         inst.save().unwrap();
@@ -3544,7 +3544,7 @@ mod tests {
 
     #[test]
     fn is_running_false_when_pid_file_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
@@ -3553,7 +3553,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn firecracker_socket_probe_rejects_live_socket() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
         assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
@@ -3582,7 +3582,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_rejects_non_socket_api_path() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.api_socket_path(), "not a socket").unwrap();
 
@@ -3592,7 +3592,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_confirms_exited_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
         assert!(!inst.probe_liveness().unwrap());
@@ -3602,7 +3602,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_rejects_invalid_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), "invalid").unwrap();
         assert!(inst.probe_liveness().is_err());
@@ -3611,7 +3611,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_recognizes_running_firecracker() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
@@ -3626,7 +3626,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
 
@@ -3640,7 +3640,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_sleep();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
@@ -3659,7 +3659,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_true_for_live_firecracker_like_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
@@ -3684,7 +3684,7 @@ mod tests {
 
     #[test]
     fn allocate_first_instance_gets_index_zero() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
@@ -3693,7 +3693,7 @@ mod tests {
 
     #[test]
     fn allocate_rejects_corrupt_instance_directory_without_touching_its_disk() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let healthy = cfg
             .allocate_instance(Some(&iname("healthy")), &default_img(), None)
@@ -3729,7 +3729,7 @@ mod tests {
 
     #[test]
     fn allocate_sequential_instances() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let a = cfg.allocate_instance(None, &default_img(), None).unwrap();
@@ -3743,7 +3743,7 @@ mod tests {
 
     #[test]
     fn allocate_with_custom_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let inst = cfg
@@ -3755,7 +3755,7 @@ mod tests {
 
     #[test]
     fn allocate_rejects_duplicate_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         cfg.allocate_instance(Some(&iname("dupe")), &default_img(), None)
@@ -3792,7 +3792,7 @@ mod tests {
 
     #[test]
     fn allocate_continues_after_highest() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // Create instance at index 0, then remove it, then create at 1
@@ -3817,7 +3817,7 @@ mod tests {
 
     #[test]
     fn allocate_fills_gap_when_at_ceiling() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // Create instance at index 252 (max)
@@ -3920,7 +3920,7 @@ mod tests {
 
     #[test]
     fn list_empty_returns_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let instances = cfg.list_instances().unwrap();
         assert!(instances.is_empty());
@@ -3928,7 +3928,7 @@ mod tests {
 
     #[test]
     fn list_returns_sorted_by_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "high", idx(10));
@@ -3942,7 +3942,7 @@ mod tests {
 
     #[test]
     fn list_rejects_metadata_for_a_different_instance_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let mut instance = make_instance(tmp.path(), "alias", idx(1));
         instance.name = iname("other");
@@ -3956,7 +3956,7 @@ mod tests {
 
     #[test]
     fn resolve_auto_selects_single() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "only", idx(0));
@@ -3967,7 +3967,7 @@ mod tests {
 
     #[test]
     fn resolve_errors_when_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let err = cfg.resolve_instance(None).unwrap_err();
@@ -3976,7 +3976,7 @@ mod tests {
 
     #[test]
     fn resolve_errors_when_ambiguous() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "a", idx(0));
@@ -3988,7 +3988,7 @@ mod tests {
 
     #[test]
     fn resolve_by_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "alpha", idx(0));
@@ -4001,7 +4001,7 @@ mod tests {
 
     #[test]
     fn resolve_unknown_name_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "real", idx(0));
@@ -4014,7 +4014,7 @@ mod tests {
 
     #[test]
     fn resolve_unknown_name_with_no_instances_lists_none() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let err = cfg.resolve_instance(Some(&iname("ghost"))).unwrap_err();
@@ -4030,7 +4030,7 @@ mod tests {
     fn resolve_ignores_stale_fast_path_dir() {
         // A mismatched metadata name must be rejected by both the fast path
         // and the fallback directory listing.
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let instances = tmp.path().join("instances");
 
@@ -4048,14 +4048,14 @@ mod tests {
 
     #[test]
     fn format_instance_list_or_none_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         assert_eq!(cfg.format_instance_list_or_none(), "No instances exist.");
     }
 
     #[test]
     fn format_instance_list_or_none_lists_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         make_instance(tmp.path(), "alpha", idx(0));
         make_instance(tmp.path(), "beta", idx(1));
@@ -5013,7 +5013,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_accepts_subnet_mask_string_and_integer() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
 
         let with_slash = tmp.path().join("slash.toml");
         fs::write(&with_slash, "[network]\nsubnet_mask = \"/16\"\n").unwrap();
@@ -5033,7 +5033,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_rejects_invalid_subnet_mask() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nsubnet_mask = \"/33\"\n").unwrap();
         assert!(CoopConfig::load(&path).is_err());
@@ -5119,7 +5119,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_rejects_typo_host_iface() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         // " auto" with a leading space — the bug the enum exists to prevent.
         fs::write(&path, "[network]\nhost_iface = \" auto\"\n").unwrap();
@@ -5128,7 +5128,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_valid_toml_parses() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "ssh_port = 2222\n\n[vm]\nvcpu_count = 4\n").unwrap();
 
@@ -5142,7 +5142,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_invalid_toml_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "not valid toml [[[").unwrap();
 
@@ -5155,7 +5155,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_empty_toml_uses_all_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "").unwrap();
 
@@ -5172,7 +5172,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_partial_vm_config_fills_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[vm]\nmem_size_mib = 8192\n").unwrap();
 
@@ -5184,7 +5184,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_partial_network_config_fills_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nhost_iface = \"eth0\"\n").unwrap();
 
@@ -5391,7 +5391,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_unknown_fields_ignored() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "ssh_port = 2222\nunknown_field = true\n").unwrap();
 
@@ -5403,7 +5403,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_json_backward_compat() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("coop.json");
         fs::write(&path, r#"{"ssh_port": 2222, "vm": {"vcpu_count": 4}}"#).unwrap();
 
@@ -5549,7 +5549,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn deserialize_rejects_invalid_host_ip() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nhost_ip = \"not-an-ip\"\n").unwrap();
         let err = CoopConfig::load(&path).unwrap_err();
@@ -5586,7 +5586,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_accepts_existing_local_marketplace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("my-skills");
         fs::create_dir(&dir).unwrap();
 
@@ -5597,7 +5597,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[claude]\nmarketplaces = [\"~/my-skills\"]\n").unwrap();
 
@@ -5612,7 +5612,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_preserves_url_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let url = "https://github.com/anthropics/plugins";
         fs::write(&path, format!("[claude]\nmarketplaces = [\"{url}\"]\n")).unwrap();
@@ -5634,7 +5634,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_codex_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[codex]\nmarketplaces = [\"~/codex-plugins\"]\n").unwrap();
 
@@ -5649,7 +5649,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_and_warn_preserves_validation_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir =
             ConfigDir::Custom(ConfigPath::new(tmp.path().join("missing-config")));
@@ -5704,7 +5704,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // with a non-empty, non-existent parent, the warning must fire.
     #[test]
     fn validate_warns_when_data_dir_parent_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("absent").join("coop");
         let cfg = validate_fixture(&data_dir);
         let warnings = cfg.validate().unwrap();
@@ -5720,7 +5720,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // must NOT fire (catches the negation being deleted).
     #[test]
     fn validate_no_data_dir_warning_when_parent_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("coop");
         let cfg = validate_fixture(&data_dir);
         let warnings = cfg.validate().unwrap();
@@ -5734,7 +5734,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // the template is present and the kernel is absent, warn.
     #[test]
     fn validate_warns_kernel_missing_when_template_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
@@ -5755,7 +5755,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // the kernel is present, no warning even with the template built.
     #[test]
     fn validate_no_kernel_warning_when_kernel_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
@@ -5777,7 +5777,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // template is absent, the kernel check is skipped entirely.
     #[test]
     fn validate_no_kernel_warning_when_template_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5792,7 +5792,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(target_os = "linux")]
     fn validate_warns_firecracker_missing_on_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5811,7 +5811,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(target_os = "linux")]
     fn validate_no_firecracker_warning_when_present_on_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let firecracker = data_dir.join("firecracker");
@@ -5831,7 +5831,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn validate_no_firecracker_warning_on_non_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5884,7 +5884,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // one of the two names.
     #[test]
     fn validate_collects_all_marketplace_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = validate_fixture(tmp.path());
         cfg.claude.marketplaces = vec![
             "/nonexistent/marketplace-a".to_string(),
@@ -5931,7 +5931,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn post_start_deserializes() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "post_start = \"touch /tmp/booted\"\n").unwrap();
 
@@ -5975,7 +5975,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_images_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let images = cfg.list_images().unwrap();
         assert!(images.is_empty());
@@ -5983,10 +5983,16 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_images_finds_dirs() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("alpha").unwrap())).unwrap();
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("beta").unwrap())).unwrap();
+        crate::test_support::create_private_dir_all(
+            cfg.image_dir(&ImageName::new("alpha").unwrap()),
+        )
+        .unwrap();
+        crate::test_support::create_private_dir_all(
+            cfg.image_dir(&ImageName::new("beta").unwrap()),
+        )
+        .unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].name.as_str(), "alpha");
@@ -5999,11 +6005,12 @@ rsync = "/run/current-system/sw/bin/rsync"
     /// `list_instances` for corrupted instance dirs.
     #[test]
     fn list_images_skips_invalid_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.images_dir().join("..hidden")).unwrap();
-        fs::create_dir_all(cfg.images_dir().join("with space")).unwrap();
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap())).unwrap();
+        crate::test_support::create_private_dir_all(cfg.images_dir().join("..hidden")).unwrap();
+        crate::test_support::create_private_dir_all(cfg.images_dir().join("with space")).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap()))
+            .unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].name.as_str(), "ok");
@@ -6011,7 +6018,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_save_load_with_image() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         let inst = Instance {
             name: InstanceName::new("inst").unwrap(),
@@ -6026,7 +6033,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_load_missing_image_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         // Write old-format instance.json without image field
@@ -6040,7 +6047,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     /// silently used to construct paths.
     #[test]
     fn instance_load_rejects_invalid_image_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -6064,7 +6071,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_without_instance_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6080,7 +6087,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_with_corrupted_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6097,7 +6104,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_with_empty_instance_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6114,7 +6121,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_refuses_unknown_index_until_corrupt_dir_is_removed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // The malformed metadata may have held any valid index.
@@ -6135,7 +6142,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_save_overwrites_atomically() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
 
         // Save initial state
@@ -6235,7 +6242,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_host_only_defaults_to_workspace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
         assert_eq!(m.guest_path.to_string(), "/workspace");
@@ -6243,7 +6250,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_host_and_guest() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let spec = format!("{}:/data/project", tmp.path().display());
         let m = Mount::parse(&spec).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
@@ -6261,7 +6268,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_rejects_file_host() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let file = tmp.path().join("afile");
         fs::write(&file, "x").unwrap();
         let err = Mount::parse(file.to_str().unwrap()).unwrap_err();
@@ -6273,7 +6280,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_rejects_relative_guest_path() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let spec = format!("{}:relative/path", tmp.path().display());
         let err = Mount::parse(&spec).unwrap_err();
         assert!(
@@ -6284,7 +6291,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_host_is_git_repo_detects_git_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(m.host_is_git_repo());
@@ -6294,7 +6301,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     fn mount_host_is_git_repo_detects_worktree_git_file() {
         // Linked worktrees have `.git` as a file pointing at the main
         // repo's gitdir, not a directory. Both should count.
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(m.host_is_git_repo());
@@ -6302,7 +6309,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_host_is_git_repo_false_for_plain_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(!m.host_is_git_repo());
     }
@@ -6379,7 +6386,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_passes_with_existing_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
@@ -6387,7 +6394,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_passes_with_existing_codex_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.codex.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
@@ -6437,7 +6444,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[claude]\nconfig_dir = \"~/foo\"\n").unwrap();
 
@@ -6459,7 +6466,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_codex_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[codex]\nconfig_dir = \"~/foo\"\n").unwrap();
 
@@ -6481,7 +6488,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_data_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "data_dir = \"~/coop-data\"\n").unwrap();
 
@@ -6500,7 +6507,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_firecracker_bin() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "firecracker_bin = \"~/bin/firecracker\"\n").unwrap();
 
@@ -6514,7 +6521,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_kernel_path() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[vm]\nkernel_path = \"~/kernels/vmlinux\"\n").unwrap();
 
@@ -6554,7 +6561,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_profile_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(
             &path,
@@ -6624,7 +6631,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn unique_name_with_collision() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = make_instance(tmp.path(), "foo", idx(0));
         let name = unique_instance_name("foo", &[inst]).unwrap();
         assert_eq!(name, *"foo-2");
@@ -6632,7 +6639,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn unique_name_multiple_collisions() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let i1 = make_instance(tmp.path(), "foo", idx(0));
         let i2 = make_instance(tmp.path(), "foo-2", idx(1));
         let name = unique_instance_name("foo", &[i1, i2]).unwrap();
@@ -6641,7 +6648,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_with_workspace_derives_basename() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("my-app");
@@ -6655,7 +6662,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_with_workspace_collision_appends_suffix() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("dupe");
@@ -6676,7 +6683,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_explicit_name_overrides_workspace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("my-app");
@@ -6690,7 +6697,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_without_name_or_workspace_uses_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.name, *"0");
@@ -7231,7 +7238,7 @@ rsync = "/run/current-system/sw/bin/rsync"
         /// dir so the existence/is-dir invariants hold.
         #[test]
         fn mount_parse_roundtrips(guest in arb_guest_path()) {
-            let tmp = TempDir::new().unwrap();
+            let tmp = crate::test_support::private_tempdir().unwrap();
             let host = tmp.path().to_str().unwrap();
             let first = Mount::parse(&format!("{host}:{guest}")).unwrap();
             let second =

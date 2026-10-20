@@ -4205,7 +4205,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn start_rejects_unknown_pid_before_boot_mutation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
@@ -4234,7 +4234,7 @@ mod tests {
     #[test]
     fn lima_stop_reprobes_state_without_rebuilding_ssh_target() {
         let Ok(root) = std::env::var("COOP_TEST_LIMA_STOP_ROOT") else {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let script = root.path().join("limactl");
             std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_STOP_CALLS\"\ncase \"$1\" in\n list) echo '{\"name\":\"coop-test\",\"status\":\"Running\"}';;\n stop) exit 0;;\nesac\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4292,7 +4292,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stop_reprobes_after_acquiring_operation_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
@@ -4323,7 +4323,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stopped_probe_holds_lock_until_disk_mutation_finishes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
@@ -4551,7 +4551,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let data_dir = root.path().join("data");
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(&data_dir),
@@ -4829,14 +4829,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn detect_instance_repo_none_when_state_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(dir.path());
         assert!(detect_instance_repo(&inst).is_none());
     }
 
     #[test]
     fn detect_instance_repo_none_on_stale_format() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(dir.path());
         // Pre-#147 flat shape: `host_path` at the top level and a bare
         // `source` string. The current loader rejects this; detection must
@@ -4951,7 +4951,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_plugin_discovery_matches_native_identities() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         assert!(claude_skills_plugin_ids(src.path()).unwrap().is_empty());
         for (directory, name) in [
             ("directory", "manifest-name"),
@@ -4988,7 +4988,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_reports_unsupported_sync_and_invalid_manifests() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         claude_plugin_fixture(src.path(), "plugin", r#"{"name":"valid"}"#);
         std::fs::write(src.path().join("skills/manifest.json"), r#"{"skills":[]}"#).unwrap();
         assert!(
@@ -5012,7 +5012,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_selects_only_companion_preferences_and_exact_copied_ids() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         claude_plugin_fixture(
             src.path(),
             "directory",
@@ -5073,7 +5073,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_rejects_invalid_preferences_without_fallback_enablement() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let ids = ["identity@skills-dir".into()].into();
         for body in [
             "broken",
@@ -5103,7 +5103,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn claude_import_complete_bundles_and_exclusions() {
         use std::os::unix::fs::PermissionsExt;
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let files = [
             "CLAUDE.md",
             "keybindings.json",
@@ -5179,9 +5179,9 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_overlay_retains_deleted_files_and_follows_symlinks() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
+        let external = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("skills/example")).unwrap();
         std::fs::write(external.path().join("support"), "external-target").unwrap();
         std::os::unix::fs::symlink(external.path(), src.path().join("skills/example/support"))
@@ -5306,7 +5306,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_retains_original_entries() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("CLAUDE.md"), "# Config").unwrap();
         std::fs::create_dir(src.path().join("rules")).unwrap();
         std::fs::write(src.path().join("rules/a.md"), "rule a").unwrap();
@@ -5325,7 +5325,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_skips_non_allowlisted() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("CLAUDE.md"), "ok").unwrap();
         std::fs::write(src.path().join("settings.json"), "secret").unwrap();
         std::fs::create_dir(src.path().join("projects")).unwrap();
@@ -5339,7 +5339,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_copies_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "rules").unwrap();
         std::fs::write(src.path().join("config.toml"), "permission_mode = \"ask\"").unwrap();
@@ -5373,7 +5373,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_copies_hooks_agents_workflows_and_lsp() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir(src.path().join("hooks")).unwrap();
         std::fs::write(src.path().join("hooks/session-start.json"), "{}").unwrap();
         std::fs::create_dir(src.path().join("agents")).unwrap();
@@ -5400,8 +5400,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_directory_symlink() {
-        let src = tempfile::TempDir::new().unwrap();
-        let checkout = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let checkout = crate::test_support::private_tempdir().unwrap();
         std::fs::write(checkout.path().join("secret.txt"), "host-checkout").unwrap();
 
         let plugins = src.path().join("plugins");
@@ -5425,8 +5425,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_symlinked_plugins_dir() {
-        let src = tempfile::TempDir::new().unwrap();
-        let checkout = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let checkout = crate::test_support::private_tempdir().unwrap();
         std::fs::write(checkout.path().join("SKILL.md"), "from-link").unwrap();
         std::os::unix::fs::symlink(checkout.path(), src.path().join("plugins")).unwrap();
 
@@ -5445,7 +5445,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_host_only_dirs_under_skills() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let skill = src.path().join("skills/review");
         std::fs::create_dir_all(skill.join(".git/objects")).unwrap();
         std::fs::write(skill.join(".git/HEAD"), "ref").unwrap();
@@ -5485,7 +5485,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_keeps_plugin_manifest_dirs() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let plugin = src.path().join("plugins/custom");
         std::fs::create_dir_all(plugin.join(".grok-plugin")).unwrap();
         std::fs::write(
@@ -5542,7 +5542,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_empty_source() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let staging = stage_allowed_files(src.path()).unwrap();
         let count = std::fs::read_dir(staging.path()).unwrap().count();
         assert_eq!(count, 0);
@@ -5757,7 +5757,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_codex_files_merges_mcp_servers_into_config() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "Global instructions").unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
 
@@ -5791,7 +5791,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_codex_files_replaces_existing_mcp_servers_table() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "model = \"gpt-5\"\n\
@@ -5833,7 +5833,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_codex_files_copies_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         let staging = stage_codex_files(
@@ -5857,7 +5857,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     fn stage_codex_files_drops_auth_json_in_proxy_mode() {
         // Issue #411 §7: in proxy mode the refreshable OpenAI subscription
         // token must not land on the guest disk.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "hi").unwrap();
 
@@ -5882,7 +5882,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_codex_files_drops_auth_json_in_chatgpt_mode() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         let staging = stage_codex_files(
@@ -5907,7 +5907,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_codex_files_chatgpt_mode_writes_keyring_setting_first() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "approval_policy = \"never\"\ninstructions = \"\"\"\n[not-a-table]\n\"\"\"\n",
@@ -5975,7 +5975,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // that key into an `api_key` guest would make the wrapper demand a
         // keyring password the mode does not need, so the api_key path must
         // remove it rather than merely not add it.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "cli_auth_credentials_store = \"keyring\"\nmodel = \"gpt-5\"\n",
@@ -6036,7 +6036,7 @@ url = "https://example.com/m"
         // Host-side Codex state must not leak into the guest, but the guest's
         // own trust records must come back — the same rule the marketplaces
         // and plugins tables already follow.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "[projects.\"/host/secret\"]\ntrust_level = \"trusted\"\n",
@@ -6120,7 +6120,7 @@ url = "https://example.com/m"
 
     #[test]
     fn stage_codex_files_local_overrides_source_model() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
         let local =
             crate::model_state::codex_local_config("http://172.16.0.1:11434/v1/", "qwen-local");
@@ -6167,7 +6167,7 @@ url = "https://example.com/m"
 
     #[test]
     fn codex_bootstrap_needed_is_false_without_source_content_or_mcp() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         assert!(!codex_bootstrap_needed(
             Some(src.path()),
             &std::collections::HashMap::new(),
@@ -6184,7 +6184,7 @@ url = "https://example.com/m"
 
     #[test]
     fn codex_bootstrap_needed_is_true_with_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         assert!(codex_bootstrap_needed(
@@ -6252,7 +6252,7 @@ url = "https://example.com/m"
     fn stage_codex_files_preserves_guest_plugin_state() {
         // A host config.toml triggers a rewrite; the guest's installed
         // marketplace/plugin tables must survive it.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
         let preserved = extract_codex_plugin_state(
             "[marketplaces.codex-plugins]\nsource = \"trailofbits/codex-plugins\"\n\
@@ -6288,7 +6288,7 @@ url = "https://example.com/m"
         // Host config.toml carries its own marketplace/plugin tables (the user
         // runs Codex on the host too); with nothing preserved these must NOT
         // leak into the guest.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "model = \"gpt-5\"\n\
@@ -6344,7 +6344,7 @@ url = "https://example.com/m"
         // the template's codex_* lists, ignoring the Claude marketplaces/plugins
         // (backend.rs is mutation-excluded, so a copy-paste slip to a Claude
         // field would otherwise go uncaught).
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
@@ -6355,7 +6355,7 @@ url = "https://example.com/m"
 
         // Bake one of each Codex entry — plus decoy Claude entries that must be
         // ignored — into the on-disk template config.
-        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&image)).unwrap();
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
@@ -6380,7 +6380,7 @@ url = "https://example.com/m"
 
     #[test]
     fn compute_grok_plugin_delta_returns_unbaked_entries() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
@@ -6389,7 +6389,7 @@ url = "https://example.com/m"
         cfg.grok.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
         let image = ImageName::new("default").unwrap();
 
-        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&image)).unwrap();
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
@@ -6576,7 +6576,7 @@ url = "https://example.com/m"
             (GROK_CONFIG_READ_COMMAND, "config.toml"),
             (GROK_TRUSTED_FOLDERS_READ_COMMAND, "trusted_folders.toml"),
         ] {
-            let home = tempfile::TempDir::new().unwrap();
+            let home = crate::test_support::private_tempdir().unwrap();
             let grok_dir = home.path().join(".grok");
             std::fs::create_dir(&grok_dir).unwrap();
             let path = grok_dir.join(filename);
@@ -6675,11 +6675,11 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_nested() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("a/b")).unwrap();
         std::fs::write(src.path().join("a/b/c.txt"), "nested").unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path().join("a").as_path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(
@@ -6704,14 +6704,14 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_skips_hidden_and_git_dirs() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
         std::fs::create_dir_all(src.path().join(".venv/bin")).unwrap();
         std::fs::write(src.path().join(".venv/bin/python"), "py").unwrap();
         std::fs::create_dir_all(src.path().join("lore/lkml-19.git/objects")).unwrap();
         std::fs::write(src.path().join("lore/lkml-19.git/HEAD"), "ref").unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
@@ -6725,7 +6725,7 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_overwrites_readonly_file() {
-        let src1 = tempfile::TempDir::new().unwrap();
+        let src1 = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src1.path().join("pack"), b"v1").unwrap();
         let mut perms = std::fs::metadata(src1.path().join("pack"))
             .unwrap()
@@ -6733,11 +6733,11 @@ url = "https://example.com/m"
         perms.set_mode(0o444);
         std::fs::set_permissions(src1.path().join("pack"), perms).unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src1.path(), &target, TreeCopy::Follow).unwrap();
 
-        let src2 = tempfile::TempDir::new().unwrap();
+        let src2 = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src2.path().join("pack"), b"v2").unwrap();
         copy_dir_recursive(src2.path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(std::fs::read(target.join("pack")).unwrap(), b"v2");
@@ -6745,13 +6745,13 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_skips_directory_symlink() {
-        let src = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "host-checkout").unwrap();
         std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
         std::os::unix::fs::symlink(outside.path(), src.path().join("linked")).unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
@@ -7439,7 +7439,7 @@ url = "https://example.com/m"
         // The tempdir holds no `proxy.json`, so `effective_upstream` resolves
         // purely from the `[proxy]` config these fixtures build — the same
         // holds for the three tests below.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
         let state = crate::model_state::ModelState::default();
@@ -7457,7 +7457,7 @@ url = "https://example.com/m"
         // only survive a validated parse when it comes from a per-VM `coop
         // proxy --vm` override in `<inst.dir>/proxy.json`. Config `[proxy]` is
         // empty here, so only the on-disk override can trip the bail.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         crate::proxy_state::ProxyState {
             openai: Some(crate::config::ProxyUpstream {
@@ -7488,7 +7488,7 @@ url = "https://example.com/m"
     fn codex_remote_auth_allows_chatgpt_with_openai_upstream_in_local_mode() {
         // Local mode never starts the OpenAI proxy, so the pair is not a
         // conflict — this is the `model_state` term of the guard.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
         let state = crate::model_state::ModelState {
@@ -7506,7 +7506,7 @@ url = "https://example.com/m"
     fn codex_remote_auth_allows_api_key_with_openai_upstream() {
         // The `uses_chatgpt_account` term: API-key auth is exactly what the
         // OpenAI proxy is for.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ApiKey, true, false);
 
@@ -7524,7 +7524,7 @@ url = "https://example.com/m"
     #[test]
     fn codex_remote_auth_allows_chatgpt_with_anthropic_only_upstream() {
         // The provider argument: a Claude-only proxy says nothing about Codex.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, false, true);
 
