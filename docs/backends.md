@@ -200,7 +200,13 @@ Firecracker requires `sudo` for several operations:
 
 ## Cross-compilation
 
-coop supports cross-compiling from macOS (arm64) to Linux (x86_64) for the Firecracker backend. The project includes a Cargo config that sets the linker for `x86_64-unknown-linux-musl` to `x86_64-linux-musl-gcc`, provided by the `musl-cross` Homebrew package.
+coop supports cross-compiling from macOS to Linux for the Firecracker backend.
+The project includes Cargo linker configuration for both release targets:
+`x86_64-unknown-linux-musl` uses `x86_64-linux-musl-gcc`, and
+`aarch64-unknown-linux-musl` uses `aarch64-linux-musl-gcc`. The matching cross
+compiler must be installed and available on `PATH`; see
+[`RELEASING.md`](../RELEASING.md) for the target-scoped compiler and linker
+variables used by the release preflight.
 
 The integration test runner (`tests/run-integration.sh --remote`) automates this workflow: it cross-compiles a release build, copies the binary to the remote Linux host via scp, and runs the test suite there.
 

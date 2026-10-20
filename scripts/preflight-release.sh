@@ -224,6 +224,92 @@ run_fuzz() {
 # Release-build targets, matching the matrix in .github/workflows/release.yml.
 RELEASE_TARGETS=(aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 
+# A Rust std target is not enough to build coop-proxy: aws-lc-sys also invokes
+# a C compiler, and Cargo needs a linker for the target. Prefer explicit
+# target-scoped overrides, then fill both variables from the cross compiler
+# named in .cargo/config.toml when it is available. Never fall back to the host
+# compiler: that can make a macOS preflight reach Apple ld with Linux flags.
+configure_musl_toolchain() {
+  local target="$1" cc_var linker_var default_compiler native_compiler=""
+  local detected_compiler="" priority_cc_var priority_cc cc linker invalid=0
+  local priority_cc_set=0
+  case "$target" in
+    x86_64-unknown-linux-musl)
+      cc_var=CC_x86_64_unknown_linux_musl
+      linker_var=CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+      default_compiler=x86_64-linux-musl-gcc
+      ;;
+    aarch64-unknown-linux-musl)
+      cc_var=CC_aarch64_unknown_linux_musl
+      linker_var=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+      default_compiler=aarch64-linux-musl-gcc
+      ;;
+    *) return 0 ;;
+  esac
+
+  if [[ "$(uname -s)" == Linux ]]; then
+    case "$target:$(uname -m)" in
+      x86_64-unknown-linux-musl:x86_64 | aarch64-unknown-linux-musl:aarch64 | aarch64-unknown-linux-musl:arm64)
+        native_compiler=musl-gcc
+        ;;
+    esac
+  fi
+
+  if have "$default_compiler"; then
+    detected_compiler="$default_compiler"
+  elif [[ -n "$native_compiler" ]] && have "$native_compiler"; then
+    detected_compiler="$native_compiler"
+  fi
+
+  # cc-rs checks CC_<target> before the shell-friendly underscore form.
+  # Validate that effective override when a parent process supplied it.
+  priority_cc_var="CC_$target"
+  if priority_cc="$(printenv "$priority_cc_var" 2>/dev/null)"; then
+    priority_cc_set=1
+    cc_var="$priority_cc_var"
+    cc="$priority_cc"
+  else
+    cc="${!cc_var:-}"
+  fi
+  linker="${!linker_var:-}"
+  if [[ "$priority_cc_set" == 0 && -z "$cc" && -n "$detected_compiler" ]]; then
+    cc="$detected_compiler"
+    export "$cc_var=$cc"
+  fi
+  if [[ -z "$linker" && -n "$detected_compiler" ]]; then
+    linker="$detected_compiler"
+    export "$linker_var=$linker"
+  fi
+
+  if [[ -z "$cc" ]]; then
+    printf '%s C compiler is not configured. Install %s or set %s to an executable for that target.\n' \
+      "$target" "$default_compiler" "$cc_var"
+    [[ -z "$native_compiler" ]] || printf 'On native Linux, %s is also supported.\n' "$native_compiler"
+    invalid=1
+  elif ! have "$cc"; then
+    printf '%s=%s does not name an executable on PATH. Install %s or set %s to the correct executable.\n' \
+      "$cc_var" "$cc" "$default_compiler" "$cc_var"
+    invalid=1
+  fi
+
+  if [[ -z "$linker" ]]; then
+    printf '%s linker is not configured. Install %s or set %s to an executable for that target.\n' \
+      "$target" "$default_compiler" "$linker_var"
+    [[ -z "$native_compiler" ]] || printf 'On native Linux, %s is also supported.\n' "$native_compiler"
+    invalid=1
+  elif ! have "$linker"; then
+    printf '%s=%s does not name an executable on PATH. Install %s or set %s to the correct executable.\n' \
+      "$linker_var" "$linker" "$default_compiler" "$linker_var"
+    invalid=1
+  fi
+
+  if [[ "$invalid" == 0 ]]; then
+    printf 'MUSL toolchain for %s: %s=%s, %s=%s\n' \
+      "$target" "$cc_var" "$cc" "$linker_var" "$linker"
+  fi
+  return "$invalid"
+}
+
 # Report missing rustup targets and always explain how to install them.
 # `rustup target add` installs only the std library — cross-LINKING also needs
 # platform tools, so spell that out too. With --install-targets, run the
@@ -250,7 +336,7 @@ build_release_targets() {
     warn "rustup not found — release targets not built locally; release.yml builds them on the tag (a failure there burns the version)."
     return 0
   fi
-  local installed target built=0 missing=()
+  local installed target built=0 missing=() toolchain_invalid=0
   installed="$(rustup target list --installed 2>/dev/null || true)"
   for target in "${RELEASE_TARGETS[@]}"; do
     grep -qx "$target" <<<"$installed" || missing+=("$target")
@@ -258,6 +344,15 @@ build_release_targets() {
   if ((${#missing[@]})); then
     handle_missing_targets "${missing[@]}"
     installed="$(rustup target list --installed 2>/dev/null || true)"
+  fi
+  for target in "${RELEASE_TARGETS[@]}"; do
+    if grep -qx "$target" <<<"$installed"; then
+      configure_musl_toolchain "$target" || toolchain_invalid=1
+    fi
+  done
+  if [[ "$toolchain_invalid" == 1 ]]; then
+    printf 'Release target builds were not started because the installed MUSL targets are not fully configured.\n'
+    return 1
   fi
   for target in "${RELEASE_TARGETS[@]}"; do
     if grep -qx "$target" <<<"$installed"; then
