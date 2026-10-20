@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v0.9.0
+
+### Security
+
+- Warn before launching a host-side remote editor against a VM. A compromised
+  guest can use the editor's remote integration to execute commands on the
+  host, so only trusted guests should be opened this way.
+
+### New features
+
+- Add credential-proxy support for Codex workspace personal access tokens.
+  `proxy.openai.auth = "codex_access_token"` validates the token on the host,
+  keeps it out of the guest, and routes inference through the ChatGPT Codex
+  backend with the workspace identity and controls returned by validation.
+- Generate dynamic completion scripts for Bash, zsh, Fish, PowerShell, and
+  Elvish. Completions now include live instance, image, and profile names.
+
+### Changed
+
+- Use rsync for every workspace transfer and remove the tar fallback. The host
+  and guest must both provide rsync; coop images include it by default. Hard
+  links are copied as independent files.
+
+### Fixed
+
+- Load generated Bash completions portably on macOS's system Bash 3.2.
+
 ## v0.8.1
 
 ### Security
