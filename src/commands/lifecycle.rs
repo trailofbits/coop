@@ -1735,9 +1735,10 @@ pub(crate) fn cmd_list(
     instances.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
     let summaries: Vec<json::InstanceSummary<'_>> = instances
         .iter()
-        .map(|inst| json::InstanceSummary {
+        .zip(be.list_running(&instances))
+        .map(|(inst, running)| json::InstanceSummary {
             name: &inst.name,
-            state: json::InstanceState::from_running(be.is_running(inst)),
+            state: json::InstanceState::from_running(running),
         })
         .collect();
 

@@ -621,6 +621,42 @@ pub fn is_running(inst: &Instance) -> bool {
     matches!(lima_state(&inst.name), Ok(Some(LimaState::Running)))
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn list_running(instances: &[Instance]) -> Vec<bool> {
+    let mut inventory = None;
+    instances
+        .iter()
+        .map(|inst| {
+            let name = lima_name(inst);
+            if lima_home()
+                .and_then(|home| seal_instance_storage(&home.join(&name)))
+                .is_err()
+            {
+                return false;
+            }
+            let states = inventory.get_or_insert_with(|| {
+                let mut states = std::collections::HashMap::new();
+                let Ok(output) = limactl_list_output() else {
+                    return states;
+                };
+                for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                    // A per-instance probe stops at its first match or parse error.
+                    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                        break;
+                    };
+                    if let Some(name) = entry["name"].as_str() {
+                        states
+                            .entry(name.to_owned())
+                            .or_insert(entry["status"].as_str() == Some("Running"));
+                    }
+                }
+                states
+            });
+            states.get(&name).copied().unwrap_or(false)
+        })
+        .collect()
+}
+
 pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
     lima_state(&inst.name)
 }
@@ -2195,6 +2231,99 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn list_running_reuses_inventory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(root) = std::env::var("COOP_TEST_LIST_INVENTORY") else {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let shim = root.path().join("limactl");
+            fs::write(&shim, "#!/bin/sh\n[ \"$*\" = 'list --json' ] || exit 99\nprintf 'query\\n' >> \"$LIMA_HOME/count\"\n/bin/cat \"$LIMA_HOME/inventory\"\n[ ! -f \"$LIMA_HOME/fail\" ]\n").unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::list_running_reuses_inventory",
+                    "--nocapture",
+                ])
+                .env("COOP_TEST_LIST_INVENTORY", root.path())
+                .env("LIMA_HOME", root.path())
+                .env("PATH", root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = Path::new(&root);
+        let instances: Vec<_> = ["alpha", "beta", "missing"]
+            .into_iter()
+            .map(|name| Instance {
+                name: InstanceName::new(name).unwrap(),
+                index: crate::config::InstanceIndex::new(0).unwrap(),
+                dir: root.join(name),
+                image: ImageName::new("default").unwrap(),
+            })
+            .collect();
+        let cases = [
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+                vec![true, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\ninvalid\n{\"name\":\"coop-beta\",\"status\":\"Running\"}\n",
+                vec![true, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Broken\"}\n{\"name\":\"coop-beta\",\"status\":\"Unknown\"}\n",
+                vec![false, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\"}\n{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+                vec![false, false, false],
+            ),
+            ("", vec![false, false, false]),
+        ];
+        for (inventory, expected) in cases {
+            fs::write(root.join("inventory"), inventory).unwrap();
+            fs::write(root.join("count"), "").unwrap();
+            assert_eq!(list_running(&instances), expected);
+            assert_eq!(
+                fs::read_to_string(root.join("count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+        )
+        .unwrap();
+        fs::write(root.join("fail"), "").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert_eq!(list_running(&instances), vec![false; 3]);
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::remove_file(root.join("fail")).unwrap();
+        assert_eq!(list_running(&instances), vec![true, false, false]);
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Running\"}\n").unwrap();
+        // A rejected storage path affects only that instance, even with a shared inventory.
+        std::os::unix::fs::symlink(root.join("outside"), root.join("coop-alpha")).unwrap();
+        assert_eq!(list_running(&instances), vec![false, true, false]);
+        fs::remove_file(root.join("coop-alpha")).unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert!(list_running(&[]).is_empty());
+        assert_eq!(fs::read_to_string(root.join("count")).unwrap(), "");
+        fs::remove_file(root.join("limactl")).unwrap();
+        assert_eq!(list_running(&instances), vec![false; 3]);
+    }
 
     #[test]
     fn private_lima_child_creates_private_files_and_directories() {
