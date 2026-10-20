@@ -2,8 +2,10 @@
 """Exercise release preflight dispatch and version gates without building VMs."""
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -17,6 +19,11 @@ class PreflightTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         for directory in ('scripts', 'tests', 'bin'):
             (self.root / directory).mkdir()
+        for name in ('awk', 'bash', 'dirname', 'grep', 'printenv', 'sed'):
+            source = shutil.which(name)
+            self.assertIsNotNone(source)
+            (self.root / 'bin' / name).symlink_to(source)
+        (self.root / 'bin/python3').symlink_to(sys.executable)
         (self.root / 'scripts/preflight-release.sh').write_text(
             (ROOT / 'scripts/preflight-release.sh').read_text())
         (self.root / 'Cargo.toml').write_text(
@@ -73,7 +80,7 @@ printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
             args.append('--quick')
         if remote:
             args.extend(['--remote', remote])
-        env = {**os.environ, 'PATH': str(self.root / 'bin') + ':' + os.defpath,
+        env = {**os.environ, 'PATH': str(self.root / 'bin'),
                'PREFLIGHT_CALLS': str(self.log), 'PREFLIGHT_FAIL': fail}
         for name in ('CC_x86_64_unknown_linux_musl',
                      'CC_x86_64-unknown-linux-musl',
