@@ -322,7 +322,7 @@ fn open_copy_scratch(parent: &File, name: &CStr, uid: u32) -> Result<File> {
 
 fn size_bytes(size_gib: &str) -> Result<u64> {
     let gib: u64 = size_gib.parse().context("Invalid disk size")?;
-    gib.checked_mul(1024 * 1024 * 1024)
+    gib.checked_mul(crate::config::GIB_BYTES)
         .context("Disk size overflow")
 }
 

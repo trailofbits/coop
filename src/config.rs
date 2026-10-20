@@ -149,18 +149,21 @@ impl<T> fmt::Debug for Secret<T> {
 pub trait Unit: Copy + fmt::Debug + 'static {
     /// Human-readable suffix used in CLI/parser error messages.
     const SUFFIX: &'static str;
+    const LEGACY_SUFFIXES: &'static [&'static str];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MibUnit;
 impl Unit for MibUnit {
     const SUFFIX: &'static str = "MiB";
+    const LEGACY_SUFFIXES: &'static [&'static str] = &[];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GibUnit;
 impl Unit for GibUnit {
     const SUFFIX: &'static str = "GiB";
+    const LEGACY_SUFFIXES: &'static [&'static str] = &["G", "g"];
 }
 
 /// Non-zero byte-scaled quantity. The phantom unit parameter prevents
@@ -173,6 +176,8 @@ pub struct Quantity<U: Unit>(NonZeroU32, PhantomData<U>);
 pub type MiB = Quantity<MibUnit>;
 /// Disk/storage size in gibibytes.
 pub type GiB = Quantity<GibUnit>;
+
+pub const GIB_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl<U: Unit> Quantity<U> {
     /// Create from a runtime value. Returns `None` if zero.
@@ -188,9 +193,25 @@ impl<U: Unit> Quantity<U> {
         Self(value, PhantomData)
     }
 
-    /// Clap value parser: accept a positive integer string, reject zero.
+    /// Clap value parser: bare values use the declared binary unit. The
+    /// explicit IEC suffix and documented legacy aliases use the same unit.
     pub fn parse_cli(s: &str) -> Result<Self> {
-        let n: u32 = s
+        let number = s
+            .strip_suffix(U::SUFFIX)
+            .or_else(|| {
+                U::LEGACY_SUFFIXES
+                    .iter()
+                    .find_map(|suffix| s.strip_suffix(suffix))
+            })
+            .unwrap_or(s);
+        if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!(
+                "expected positive integer {} (optional {} suffix), got '{s}'",
+                U::SUFFIX,
+                U::SUFFIX
+            );
+        }
+        let n: u32 = number
             .parse()
             .with_context(|| format!("expected positive integer {}, got '{s}'", U::SUFFIX))?;
         Self::new(n).with_context(|| format!("{} must be > 0, got '{s}'", U::SUFFIX))
@@ -228,6 +249,30 @@ impl Quantity<MibUnit> {
     /// MiB → GiB as floating-point (1024 MiB = 1 GiB).
     pub fn as_gib_f64(self) -> f64 {
         f64::from(self.0.get()) / 1024.0
+    }
+}
+
+impl Quantity<GibUnit> {
+    pub fn as_bytes(self) -> u64 {
+        u64::from(self.as_u32()) * GIB_BYTES
+    }
+
+    /// Smallest whole-GiB size that can contain `bytes`.
+    pub fn from_bytes_ceil(bytes: u64) -> Result<Self> {
+        let gib = bytes.div_ceil(GIB_BYTES);
+        let value = u32::try_from(gib).context("Disk size exceeds supported GiB range")?;
+        Self::new(value).context("Disk is smaller than 1 byte")
+    }
+}
+
+/// Show the exact file length alongside its binary-unit context.
+pub fn format_disk_bytes(bytes: u64) -> String {
+    let whole = bytes / GIB_BYTES;
+    let remainder = bytes % GIB_BYTES;
+    if remainder == 0 {
+        format!("{whole} GiB ({bytes} bytes)")
+    } else {
+        format!("{whole} GiB + {remainder} bytes ({bytes} bytes)")
     }
 }
 
@@ -294,21 +339,14 @@ pub enum DiskSize {
 }
 
 impl DiskSize {
-    /// Parse from a CLI string like `"150"`, `"150G"`, `"+20"`, or `"+20G"`.
+    /// Parse whole GiB, with optional `G`/`g` or `GiB` suffix.
     pub fn parse(s: &str) -> Result<Self> {
         let (relative, rest) = if let Some(r) = s.strip_prefix('+') {
             (true, r)
         } else {
             (false, s)
         };
-        let numeric = rest
-            .strip_suffix('G')
-            .or_else(|| rest.strip_suffix('g'))
-            .unwrap_or(rest);
-        let value: u32 = numeric
-            .parse()
-            .with_context(|| format!("Invalid disk size: {s}"))?;
-        let gib = GiB::new(value).with_context(|| format!("Disk size must be > 0: {s}"))?;
+        let gib = GiB::parse_cli(rest).with_context(|| format!("Invalid disk size: {s}"))?;
         if relative {
             Ok(Self::Relative(gib))
         } else {
@@ -328,6 +366,15 @@ impl DiskSize {
                 .checked_add(gib.as_u32())
                 .map(GiB::from_nonzero)
                 .context("Disk size overflow"),
+        }
+    }
+
+    /// Resolve a relative request from an exact file length without dropping
+    /// a partial GiB. Absolute requests are already complete targets.
+    pub fn resolve_from_bytes(self, current_bytes: u64) -> Result<GiB> {
+        match self {
+            Self::Absolute(size) => Ok(size),
+            Self::Relative(_) => self.resolve(GiB::from_bytes_ceil(current_bytes)?),
         }
     }
 }
@@ -6188,6 +6235,54 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
+    fn cli_size_suffixes_are_binary_and_unambiguous() {
+        for spec in ["2", "2G", "2g", "2GiB"] {
+            assert_eq!(GiB::parse_cli(spec).unwrap(), GiB::new(2).unwrap());
+            assert_eq!(
+                DiskSize::parse(spec).unwrap(),
+                DiskSize::Absolute(GiB::new(2).unwrap())
+            );
+            assert_eq!(
+                DiskSize::parse(&format!("+{spec}")).unwrap(),
+                DiskSize::Relative(GiB::new(2).unwrap())
+            );
+        }
+        for spec in ["512", "512MiB"] {
+            assert_eq!(MiB::parse_cli(spec).unwrap(), MiB::new(512).unwrap());
+        }
+        for spec in [
+            "2GB",
+            "2MB",
+            "2M",
+            "2MiB",
+            "2Gi",
+            "2.5G",
+            "0",
+            "4294967296GiB",
+        ] {
+            assert!(GiB::parse_cli(spec).is_err(), "{spec}");
+            assert!(DiskSize::parse(spec).is_err(), "{spec}");
+        }
+        for spec in ["512MB", "512M", "512G", "512GiB", "0MiB"] {
+            assert!(MiB::parse_cli(spec).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn disk_byte_conversion_preserves_bounds_and_context() {
+        assert_eq!(GiB::new(1).unwrap().as_bytes(), GIB_BYTES);
+        assert_eq!(GiB::from_bytes_ceil(GIB_BYTES).unwrap().as_u32(), 1);
+        assert_eq!(GiB::from_bytes_ceil(GIB_BYTES + 4096).unwrap().as_u32(), 2);
+        assert_eq!(GiB::from_bytes_ceil(1).unwrap().as_u32(), 1);
+        assert!(GiB::from_bytes_ceil(0).is_err());
+        assert!(GiB::from_bytes_ceil(u64::MAX).is_err());
+        assert_eq!(
+            format_disk_bytes(GIB_BYTES + 4096),
+            "1 GiB + 4096 bytes (1073745920 bytes)"
+        );
+    }
+
+    #[test]
     fn disk_size_absolute_lowercase_suffix() {
         let ds = DiskSize::parse("150g").unwrap();
         assert_eq!(ds, DiskSize::Absolute(GiB::new(150).unwrap()));
@@ -6236,6 +6331,17 @@ rsync = "/run/current-system/sw/bin/rsync"
         let ds = DiskSize::Relative(GiB::new(u32::MAX).unwrap());
         let err = ds.resolve(GiB::new(1).unwrap()).unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn relative_resolution_rejects_unrepresentable_image_length() {
+        let relative = DiskSize::Relative(GiB::new(1).unwrap());
+        assert!(relative.resolve_from_bytes(u64::MAX).is_err());
+        let absolute = DiskSize::Absolute(GiB::new(1).unwrap());
+        assert_eq!(
+            absolute.resolve_from_bytes(u64::MAX).unwrap(),
+            GiB::new(1).unwrap()
+        );
     }
 
     // ── Mount parsing ───────────────────────────────────────────

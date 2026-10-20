@@ -200,15 +200,19 @@ pub fn create_instance(
     tracing::info!("Creating instance '{}' from template", inst.name);
     reflink_copy(&template, &rootfs).context("Failed to copy template to instance")?;
 
-    // Resize if requested and larger than template
+    // The image file, including committed images, is authoritative. Config
+    // describes the setup default and may differ from this image's length.
     if let Some(requested) = disk_gib {
-        let template_size = cfg.vm.template_size_gib;
-        if requested < template_size {
+        let template_bytes = std::fs::metadata(&rootfs)
+            .with_context(|| format!("Failed to stat {}", rootfs.display()))?
+            .len();
+        if requested.as_bytes() < template_bytes {
             tracing::warn!(
-                "Requested disk size ({requested} GiB) < template ({template_size} GiB), \
-                 using template size"
+                "Requested disk size ({}) < template image ({}), using image size",
+                crate::config::format_disk_bytes(requested.as_bytes()),
+                crate::config::format_disk_bytes(template_bytes),
             );
-        } else if requested > template_size {
+        } else if requested.as_bytes() > template_bytes {
             tracing::info!("Resizing instance to {requested} GiB");
             crate::privileged_disk::truncate_gib(&rootfs, requested.as_u32())?;
             crate::privileged_disk::fsck_fix(&rootfs)?;
@@ -227,8 +231,6 @@ pub fn resize_rootfs(
     stopped: &crate::backend::StoppedInstance,
     new_size: crate::config::GiB,
 ) -> Result<()> {
-    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
-
     let inst = stopped.instance();
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
@@ -238,19 +240,20 @@ pub fn resize_rootfs(
     let current_bytes = std::fs::metadata(&rootfs)
         .with_context(|| format!("Failed to stat {}", rootfs.display()))?
         .len();
-    let requested_bytes = u64::from(new_size.as_u32()) * GIB_BYTES;
+    let requested_bytes = new_size.as_bytes();
 
     if requested_bytes < current_bytes {
         bail!(
-            "Shrinking is not supported (current image: {current_bytes} bytes, \
-             requested: {requested_bytes} bytes)"
+            "Shrinking is not supported (current image: {}; requested: {})",
+            crate::config::format_disk_bytes(current_bytes),
+            crate::config::format_disk_bytes(requested_bytes),
         );
     }
     if requested_bytes > current_bytes {
         tracing::info!(
             "Resizing instance '{}' from {} to {new_size} GiB",
             inst.name,
-            current_bytes / GIB_BYTES
+            crate::config::format_disk_bytes(current_bytes)
         );
         crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
     }

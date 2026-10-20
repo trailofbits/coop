@@ -155,10 +155,10 @@ enum Commands {
         /// Number of vCPUs (overrides config when creating a new instance)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config when creating a new instance)
+        /// Memory in MiB, bare or with MiB suffix (overrides config for a new instance)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
-        /// Instance disk size in GiB (only used when creating a new instance)
+        /// Instance disk in GiB: bare, G/g, or GiB (new instances only)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
@@ -225,7 +225,7 @@ enum Commands {
         /// Number of vCPUs (overrides config)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config)
+        /// Memory in MiB, bare or with MiB suffix (overrides config)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// Force rebuild of template rootfs
@@ -244,7 +244,7 @@ enum Commands {
         /// Path to a post-install script to run in the chroot (Linux/Firecracker only)
         #[arg(long)]
         post_install: Option<String>,
-        /// Template rootfs size in GiB (default: 8)
+        /// Template rootfs size in GiB: bare, G/g, or GiB (default: 8)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         template_size: Option<config::GiB>,
         /// Named image to build (default: "default")
@@ -558,10 +558,10 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// New disk size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
+        /// New disk in GiB: absolute (150, 150G, 150GiB) or relative (+20, +20G, +20GiB)
         #[arg(long, value_parser = config::DiskSize::parse)]
         size: Option<config::DiskSize>,
-        /// New memory in MiB (minimum 128)
+        /// New memory in MiB, bare or with MiB suffix (minimum 128)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// New vCPU count

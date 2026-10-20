@@ -492,8 +492,10 @@ The same split applies in `src/commands/`. Kept helpers include
 `up_has_restart_only_inputs`, `restart_has_ignored_creation_flags`,
 `find_workspace_instance`, `find_git_repo_instance`,
 `no_stopped_instance_message`, `creation_options_rejected_message`, profile
-summary builders, `bytes_to_gib`, `format_dir_size`, `project_dir_to_str`, and
-`is_sensitive_workspace`. Their backend-driving wrappers remain excluded.
+summary builders, `reprovision_regrow_target`, `format_dir_size`,
+`project_dir_to_str`, and `is_sensitive_workspace`. Their backend-driving
+wrappers remain excluded. `GiB::from_bytes_ceil` is the shared byte-to-GiB
+conversion kernel in `config.rs`.
 
 The `coop model` feature follows the same split. `tools_needing_prompt`,
 `switch_report_lines`, `ModelState` resolution/default logic, and

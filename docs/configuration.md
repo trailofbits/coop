@@ -319,6 +319,25 @@ skip = ["trailofbits/big-repo"]
 
 VM resource allocation and boot configuration.
 
+### Size units
+
+Storage uses binary GiB (1 GiB = 1,073,741,824 bytes); memory uses binary
+MiB (1 MiB = 1,048,576 bytes). Config fields with `_gib` or `_mib` are bare
+positive integers in those units. CLI size flags accept bare integers or the
+matching `GiB`/`MiB` suffix; disk flags also accept legacy `G` and `g`, both
+meaning **GiB**. Decimal `GB`/`MB`, ambiguous `M`, fractions, and a unit from
+the other field are rejected. For example, `--disk 12GiB`, `--mem 4096MiB`,
+and `resize --size +2G` are valid; `--disk 12GB` is not.
+
+Absolute disk targets are exact whole GiB. Shrink checks compare exact image
+byte lengths, including any extra bytes beyond a GiB boundary. Relative resize
+rounds the current image length **up** to the next GiB before adding the
+requested increment. Reprovision preserves at least the previous byte length
+by rounding its target up; a nonaligned disk can therefore gain less than 1
+GiB. Lima rounds the base image length up when choosing a new instance's
+whole GiB disk size. Human image sizes are approximate display values; JSON
+`size_bytes` and resource fields ending in `_mib` keep their raw, named units.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `vcpu_count` | integer | `2` | Number of vCPUs for **new** instances. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. Change an existing instance with `coop resize --vcpus`. |

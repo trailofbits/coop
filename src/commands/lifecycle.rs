@@ -1870,8 +1870,12 @@ pub(crate) fn cmd_resize(
     let stopped = be.as_stopped(inst)?;
 
     if let Some(disk_size) = opts.disk {
-        let current = current_disk_gib(be, stopped.instance())?;
-        let new_size = disk_size.resolve(current)?;
+        let new_size = match disk_size {
+            config::DiskSize::Absolute(size) => size,
+            config::DiskSize::Relative(_) => {
+                disk_size.resolve_from_bytes(current_disk_bytes(be, stopped.instance())?)?
+            }
+        };
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
@@ -2156,9 +2160,10 @@ fn reprovision_instance(
     let reprovisioned_name = inst.name.clone();
     let stopped = be.as_stopped(inst)?;
 
-    // An image's disk is template-sized, so a `coop resize --disk` is lost in
-    // the swap. Record the size first and re-grow afterwards.
-    let previous_disk = current_disk_gib(be, stopped.instance())?;
+    // The replacement can be smaller than a previously resized disk. Record
+    // the exact old length before the swap so no partial GiB is lost.
+    let previous_disk_bytes = current_disk_bytes(be, stopped.instance())?;
+    let previous_disk = config::GiB::from_bytes_ceil(previous_disk_bytes)?;
 
     // Last chance to honour a Ctrl-C. `install_handlers` only sets a sticky
     // flag, so the SIGINT that arrived during the stop above is recorded but
@@ -2177,15 +2182,25 @@ fn reprovision_instance(
     // instance survives, its guest is only partly provisioned, and re-running
     // finishes the job. It also carries `previous_disk`, which only this
     // process knows: nothing persists an instance's disk size, so a re-run
-    // measures the replaced template-sized file and skips the re-grow.
-    let partial = || reprovision_partial_message(&reprovisioned_name, &image, previous_disk);
+    // measures the replacement image and skips the re-grow.
+    let partial = || {
+        reprovision_partial_message(
+            &reprovisioned_name,
+            &image,
+            previous_disk_bytes,
+            previous_disk,
+        )
+    };
 
     // Persist lineage only after replacement finishes.
     let mut inst = stopped.instance().clone();
     inst.set_image(image.clone()).with_context(partial)?;
 
-    if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        be.resize_disk(cfg, &stopped, previous_disk)
+    let replacement_bytes = current_disk_bytes(be, &inst).with_context(partial)?;
+    if let Some(target) =
+        reprovision_regrow_target(previous_disk_bytes, replacement_bytes, previous_disk)
+    {
+        be.resize_disk(cfg, &stopped, target)
             .with_context(partial)?;
     }
 
@@ -2351,15 +2366,17 @@ fn reprovision_workspace_inputs(
 fn reprovision_partial_message(
     name: &config::InstanceName,
     image: &config::ImageName,
+    previous_disk_bytes: u64,
     previous_disk: config::GiB,
 ) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
          Re-run `coop restore {name} --image {image} --reprovision` to finish.\n\
-         Its disk was {previous_disk} GiB before the reset. Nothing persists \
-         that, and a re-run measures the replaced (template-sized) disk, so \
+         Its disk was {} before the reset. Nothing persists \
+         that, and a re-run measures the replacement image, so \
          check `coop status {name}` and run `coop resize {name} --size \
-         {previous_disk}` if the re-grow did not complete."
+         {previous_disk}` if the re-grow did not complete.",
+        config::format_disk_bytes(previous_disk_bytes),
     )
 }
 
@@ -2395,22 +2412,23 @@ fn reprovision_confirmation(
     )
 }
 
-fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
+fn current_disk_bytes(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<u64> {
     let path = be.disk_path(inst)?;
-    let bytes = std::fs::metadata(&path)
+    Ok(std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
-        .len();
-    config::GiB::new(bytes_to_gib(bytes))
-        .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
+        .len())
 }
 
-/// Whole gibibytes in `bytes`, rounding down (1 GiB = 1024³ bytes).
-///
-/// The truncating `as u32` is safe for any disk size coop creates: the
-/// template caps well under 4 TiB (`u32::MAX` GiB), so the quotient fits.
-#[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
-fn bytes_to_gib(bytes: u64) -> u32 {
-    (bytes / (1024 * 1024 * 1024)) as u32
+fn reprovision_regrow_target(
+    previous_bytes: u64,
+    replacement_bytes: u64,
+    previous_disk: config::GiB,
+) -> Option<config::GiB> {
+    if replacement_bytes < previous_bytes {
+        Some(previous_disk)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -3443,7 +3461,7 @@ mod tests {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("rust").expect("valid image name");
         let disk = super::config::GiB::new(20).expect("20 is non-zero");
-        let msg = super::reprovision_partial_message(&name, &image, disk);
+        let msg = super::reprovision_partial_message(&name, &image, disk.as_bytes(), disk);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
@@ -3456,12 +3474,23 @@ mod tests {
             "{msg}"
         );
         // Nothing persists an instance's disk size, so a re-run measures the
-        // replaced template-sized file and skips the re-grow. The size this
+        // replacement image and skips the re-grow. The size this
         // process read before the swap is the only record of it, so the
         // message has to carry both the number and the command that reapplies
         // it — otherwise a prior `coop resize` is silently dropped.
         assert!(msg.contains("20 GiB"), "{msg}");
         assert!(msg.contains("coop resize myvm --size 20"), "{msg}");
+        let nonaligned = super::reprovision_partial_message(
+            &name,
+            &image,
+            super::config::GIB_BYTES + 4096,
+            super::config::GiB::new(2).unwrap(),
+        );
+        assert!(nonaligned.contains("1073745920 bytes"), "{nonaligned}");
+        assert!(
+            nonaligned.contains("coop resize myvm --size 2"),
+            "{nonaligned}"
+        );
     }
 
     #[test]
@@ -3893,19 +3922,53 @@ mod tests {
     }
 
     #[test]
-    fn bytes_to_gib_truncates_to_whole_gibibytes() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(super::bytes_to_gib(0), 0);
-        assert_eq!(super::bytes_to_gib(GIB), 1);
+    fn nonaligned_disk_rounds_up_for_relative_resize_and_reprovision() {
+        let base = super::config::GIB_BYTES + 4096;
+        let target = super::config::DiskSize::Relative(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(target.as_u32(), 3);
+        let absolute = super::config::DiskSize::Absolute(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(absolute.as_u32(), 1);
+        let preserved = super::config::GiB::from_bytes_ceil(base).unwrap();
         assert_eq!(
-            super::bytes_to_gib(GIB - 1),
-            0,
-            "just under 1 GiB rounds down"
+            super::reprovision_regrow_target(base, super::config::GIB_BYTES, preserved)
+                .unwrap()
+                .as_u32(),
+            2
+        );
+        assert!(
+            super::reprovision_regrow_target(base, 2 * super::config::GIB_BYTES, preserved)
+                .is_none()
+        );
+        assert!(super::reprovision_regrow_target(base, base, preserved).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firecracker_rejects_absolute_target_below_nonaligned_image() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = instance_named("size-boundary", root.path());
+        std::fs::create_dir_all(&inst.dir).unwrap();
+        let rootfs = inst.rootfs_path();
+        std::fs::File::create(&rootfs)
+            .unwrap()
+            .set_len(super::config::GIB_BYTES + 4096)
+            .unwrap();
+        let stopped = super::backend::FirecrackerBackend::new()
+            .as_stopped(inst)
+            .unwrap();
+        let error =
+            crate::setup::resize_rootfs(&stopped, super::config::GiB::new(1).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Shrinking is not supported (current image: 1 GiB + 4096 bytes (1073745920 bytes); requested: 1 GiB (1073741824 bytes))"
         );
         assert_eq!(
-            super::bytes_to_gib(2 * GIB + 512 * 1024 * 1024),
-            2,
-            "2.5 GiB truncates toward zero"
+            std::fs::metadata(rootfs).unwrap().len(),
+            super::config::GIB_BYTES + 4096
         );
     }
 

@@ -243,7 +243,7 @@ exclude_re = [
   # or resolving the cwd. Their decision logic is extracted into the pure
   # helpers kept in scope below (no_stopped_instance_message,
   # creation_options_rejected_message, restart_has_ignored_creation_flags,
-  # bytes_to_gib, …) or pinned by tests/integration.sh.
+  # reprovision_regrow_target, …) or pinned by tests/integration.sh.
   "\\bcreate_up_instance\\b",
   "\\bcreate_git_repo_instance\\b",
   "\\bensure_profile_image\\b",
@@ -272,9 +272,9 @@ exclude_re = [
   "\\bopen_ssh_session\\b",
   "\\bpreflight_start_target\\b",
   "\\bresolve_project_dir\\b",
-  # current_disk_gib stats the disk image; its `/ 1 GiB` arithmetic kernel
-  # is extracted into bytes_to_gib (kept in scope, unit-tested).
-  "\\bcurrent_disk_gib\\b",
+  # current_disk_bytes stats the disk image; GiB::from_bytes_ceil is the
+  # pure conversion kernel (kept in scope, unit-tested).
+  "\\bcurrent_disk_bytes\\b",
   # instance_status (#385) queries usage over SSH.
   "\\binstance_status\\b",
 

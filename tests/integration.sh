@@ -2996,6 +2996,20 @@ test_resize_status() {
     fi
     pass "status shows disk before resize (${old_disk} GiB)"
 
+    if coop resize "$INSTANCE" --size 1GB; then
+        fail "resize rejects decimal GB suffix" "accepted 1GB"
+    elif [[ "$HARNESS_ERR" == *"invalid value '1GB'"* ]]; then
+        pass "resize rejects decimal GB suffix"
+    else
+        fail "resize rejects decimal GB suffix" "wrong failure: $HARNESS_ERR"
+    fi
+    if coop resize "$INSTANCE" --size "${old_disk}GiB"; then
+        pass "resize accepts explicit GiB suffix"
+    else
+        fail "resize accepts explicit GiB suffix" "stderr: $HARNESS_ERR"
+        return
+    fi
+
     # Resize by +1G while stopped
     if coop resize "$INSTANCE" --size +1G; then
         pass "resize +1G exits 0"
@@ -3054,7 +3068,7 @@ test_resize_retry_firecracker() {
         return
     fi
 
-    if ! coop resize "$INSTANCE" --size "$target_gib"; then
+    if ! coop resize "$INSTANCE" --size "${target_gib}GiB"; then
         fail "same-size Firecracker resize retry exits 0" "stderr: $HARNESS_ERR"
         return
     fi
@@ -3782,7 +3796,7 @@ PYEOF
     fi
 
     # A `coop resize --size` must survive the wipe: the image the disk is
-    # restored from is template-sized, so the reprovision has to re-grow it.
+    # restored from may be smaller, so the reprovision may have to re-grow it.
     local disk_after=""
     if coop status "$INSTANCE" 2>/dev/null; then
         disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)

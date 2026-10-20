@@ -748,15 +748,20 @@ coop resize [NAME] [--size <SIZE>] [--mem <MIB>] [--vcpus <N>] [--start]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--size <size>` | New disk size. Absolute: `150` or `150G`. Relative: `+20` or `+20G`. |
+| `--size <size>` | New disk size in GiB. Absolute: `150`, `150G`, or `150GiB`. Relative: `+20`, `+20G`, or `+20GiB`. |
 | `--mem <mib>` | New memory in MiB (minimum 128). |
 | `--vcpus <n>` | New vCPU count (> 0). |
 | `--start` | Start the instance after applying the change instead of leaving it stopped. |
 
 Absolute disk values set the disk to that exact size; a `+` prefix adds to the
-current size. Memory and vCPU changes are written to the instance's backend
-config (the Firecracker per-instance JSON or the Lima `lima.yaml`), which is
-authoritative — the value survives restarts and is reported by `coop status`.
+current size rounded up to whole GiB. For example, `+1` on a 1 GiB + 4 KiB
+image targets 3 GiB. An absolute `1GiB` target for that image is rejected as
+a shrink, and the error includes both binary-unit context and exact bytes.
+See the [size-unit convention](configuration.md#size-units) for all accepted
+suffixes and the JSON unit contract. Memory and vCPU changes are written to
+the instance's backend config (the Firecracker per-instance JSON or the Lima
+`lima.yaml`). That config is authoritative: the value survives restarts and is
+reported by `coop status`.
 The global `[vm]` settings in `config.toml` only seed these values for *new*
 instances.
 
@@ -853,7 +858,7 @@ Kept across the wipe, because coop persists them host-side:
 |---------|----------------|
 | Name, index, guest IP | `instance.json` |
 | Image | `instance.json` (updated when `--image` is given) |
-| Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
+| Disk size | exact byte length read before the swap; if the replacement is smaller, it is re-grown to the previous size rounded up to GiB |
 | vCPUs and memory | backend VM config, which the swap does not touch |
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
