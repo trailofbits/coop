@@ -1015,7 +1015,7 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
-    let _image_lock = image_to_consume
+    let image_lock = image_to_consume
         .map(|image| setup::lock_image_publication(cfg, image))
         .transpose()?;
     if let Some(image) = image_to_consume {
@@ -1024,6 +1024,7 @@ fn start_instance(
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
     crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
+    drop(image_lock);
 
     provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
 }
@@ -2112,11 +2113,9 @@ fn reprovision_instance(
     ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
     drop(initial_image_lock);
 
-    // Ordering rule for the whole pre-swap half: anything that can fail
-    // cheaply runs before `restore_disk`, because a stopped instance can be
-    // started again and a wiped one cannot be un-wiped. Start with the
-    // host-side settings that have to survive the swap, so a malformed state
-    // file aborts with the guest still intact rather than half-reprovisioned.
+    // Load host-side settings before stopping the guest, so malformed state
+    // aborts while it is still running. The image-dependent payload is prepared
+    // under the image lock after the stop, before the disk is replaced.
     let workspace_state = workspace::WorkspaceState::try_load(&inst)?;
     let saved_forwards = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
@@ -2178,7 +2177,7 @@ fn reprovision_instance(
     // metadata validation and consumption.
     let image_lock = setup::lock_image_publication(cfg, &image)?;
     ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
-    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
+    let payload = prepare_reprovision_payload(be, cfg, &inst, &image, &ws_inputs.mounts, forwards)?;
 
     // The instance's own forward set is authoritative — it already folded in
     // `cfg.forward_ports` at creation; merging again picks up forwards added
@@ -2355,6 +2354,23 @@ struct ReprovisionWorkspaceInputs {
     git_repo: Option<String>,
     /// Host directories to re-mount (Lima) or re-sync (Firecracker).
     mounts: Vec<config::Mount>,
+}
+
+fn prepare_reprovision_payload(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    mounts: &[config::Mount],
+    forwards: Vec<config::PortForward>,
+) -> Result<BootPayload> {
+    BootPayload::prepare(be, cfg, image, mounts, forwards).with_context(|| {
+        format!(
+            "Instance '{}' is stopped and was not reprovisioned. Fix the host input, then \
+             re-run `coop restore {} --image {} --reprovision` or run `coop start {}` to bring it back as it was.",
+            inst.name, inst.name, image, inst.name
+        )
+    })
 }
 
 /// Rebuild the workspace-shaped `StartOpts` inputs from the association the

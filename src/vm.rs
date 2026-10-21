@@ -677,6 +677,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.path().to_path_buf(),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::write(inst.api_socket_path(), "keep").unwrap();
         let cfg = CoopConfig::default();

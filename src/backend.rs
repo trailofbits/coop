@@ -1259,7 +1259,8 @@ impl VmBackend for FirecrackerBackend {
         let metadata = crate::setup::TemplateConfig::load_for(cfg, image).with_context(|| {
             format!(
                 "Cannot verify that image '{image}' supports Firecracker vsock control. \
-                 Rebuild it with `coop setup --image {image} --rebuild`"
+                 A base image can be rebuilt with `coop setup --image {image} --rebuild`; \
+                 rebuilding a committed checkpoint discards its contents"
             )
         })?;
         if !metadata
@@ -1268,8 +1269,9 @@ impl VmBackend for FirecrackerBackend {
         {
             bail!(
                 "Image '{image}' does not contain the Firecracker vsock SSH listener required by \
-                 `[vm].firecracker_control = \"vsock\"`. Rebuild it with \
-                 `coop setup --image {image} --rebuild`"
+                 `[vm].firecracker_control = \"vsock\"`. A base image can be rebuilt with \
+                 `coop setup --image {image} --rebuild`; rebuilding a committed checkpoint \
+                 discards its contents"
             );
         }
         Ok(())
@@ -4890,7 +4892,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
                 .validate_image_control(&cfg, &image, mode)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("incomplete commit"), "{error}");
+            assert!(error.contains("incomplete publication"), "{error}");
         }
     }
 

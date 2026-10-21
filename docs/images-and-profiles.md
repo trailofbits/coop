@@ -152,7 +152,9 @@ coop setup --profile python --post-install ./my-setup.sh
 The script runs inside the template's chroot after all packages are installed.
 It has root access and network connectivity. coop hashes the script content for
 staleness detection; modifying the script causes the next `coop setup` to
-rebuild automatically. The Lima backend refuses `--post-install`.
+rebuild automatically for a current, complete template. An interrupted image
+publication or an older Firecracker image without the vsock listener capability
+requires an explicit `--rebuild`. The Lima backend refuses `--post-install`.
 
 ## Named images
 
@@ -222,7 +224,7 @@ coop records what went into each template in a `template-config.json` file along
 - **Marketplaces and plugins**: the marketplace sources and plugins that were baked into the template. On VM startup, coop compares this list against the current config and only installs the delta (marketplaces or plugins added since the template was built).
 - **Creation timestamp**: when the template was built.
 
-On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, the template is stale and coop rebuilds it. A missing config file (orphaned image) also triggers a rebuild.
+On every `coop setup`, coop computes the current recipe hash and compares it to the stored config. If the hashes differ, a current, complete template is stale and coop rebuilds it. A missing config file (orphaned image) also triggers a rebuild. Plain setup refuses an interrupted publication on either backend and an older Firecracker image whose metadata lacks the vsock listener capability, regardless of recipe hashes. For a base image, use `coop setup --image NAME --rebuild`; rebuilding a committed checkpoint discards its contents. An interrupted commit can instead be retried from its source instance with `coop commit --image NAME --force`.
 
 On Linux/Firecracker, when you omit `--profile` and `--extra-packages`, `coop
 setup` reuses the values from the existing template config. Running `coop setup`
@@ -237,7 +239,7 @@ coop setup --rebuild
 coop setup --rebuild --image py-dev
 ```
 
-The build is crash-safe. coop writes the new template to a staging path (`rootfs-template.ext4.new`), then swaps it into place with `mv`. If the build fails or is interrupted, the previous template stays intact.
+coop builds the new disk at a staging path, then replaces the live image. A staging failure leaves a previously complete image usable. Once publication begins, an interruption leaves an incomplete-publication marker; coop refuses the image until the interrupted commit is retried or the image is explicitly rebuilt.
 
 ## Instance creation from templates
 

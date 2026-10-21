@@ -278,6 +278,9 @@ exclude_re = [
   # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
   # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
   "\\breprovision_instance\\b",
+  # Resolves guest file staging through the backend and reads host paths after
+  # stop; a unit mutant cannot observe the VM lifecycle recovery context.
+  "\\bprepare_reprovision_payload\\b",
   "\\bprovision_first_boot\\b",
   "\\bwarn_on_live_git_mounts\\b",
   "\\bresolve_running\\b",

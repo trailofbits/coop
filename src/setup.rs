@@ -367,7 +367,7 @@ fn image_publication_marker(cfg: &CoopConfig, image: &ImageName) -> PathBuf {
 pub(crate) fn begin_image_publication(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
     crate::fs_util::atomic_write_with_mode(
         &image_publication_marker(cfg, image),
-        "commit publication in progress\n",
+        "image publication in progress\n",
         0o600,
     )
 }
@@ -384,8 +384,10 @@ pub(crate) fn finish_image_publication(cfg: &CoopConfig, image: &ImageName) -> R
 pub(crate) fn validate_image_publication(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
     if image_publication_marker(cfg, image).exists() {
         bail!(
-            "Image '{image}' has an incomplete commit. Retry `coop commit --image {image} \
-             --force`, or rebuild it with `coop setup --image {image} --rebuild`"
+            "Image '{image}' has an incomplete publication and cannot be used. If commit was \
+             interrupted, retry `coop commit --image {image} --force` from its source instance. \
+             If setup was interrupted, rerun `coop setup --image {image} --rebuild`. Rebuilding \
+             a committed checkpoint discards its contents"
         );
     }
     Ok(())
@@ -549,11 +551,10 @@ impl Drop for MountGuard {
 fn unmount_simple(disk: &Path, mount_path: &str) -> Result<()> {
     crate::privileged_disk::unmount(disk)
         .with_context(|| format!("Failed to unmount {mount_path}"))?;
-    Cmd::new("rmdir")
-        .arg(mount_path)
-        .sudo()
-        .run()
-        .with_context(|| format!("Failed to remove mount directory {mount_path}"))
+    if let Err(error) = Cmd::new("rmdir").arg(mount_path).sudo().run() {
+        tracing::warn!("Failed to remove mount directory {mount_path} (non-fatal): {error}");
+    }
+    Ok(())
 }
 
 /// Mount the instance rootfs and rewrite its network identity: the
@@ -683,13 +684,15 @@ pub(crate) fn patch_guest_vsock_listener_files(mount: &Path) -> Result<()> {
             .open(path)
     };
     let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
+    let mut guest_path = PathBuf::from("/");
     for component in ["etc", "systemd", "system"] {
+        guest_path.push(component);
         directory = open_directory(&PathBuf::from(format!(
             "/proc/self/fd/{}/{}",
             directory.as_raw_fd(),
             component
         )))
-        .with_context(|| format!("Guest /etc/systemd/system/{component} must be a directory"))?;
+        .with_context(|| format!("Guest {} must be a directory", guest_path.display()))?;
     }
     let system_dir = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     let wants_path = system_dir.join("sockets.target.wants");
@@ -1009,6 +1012,24 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let image = &opts.image;
     let template = cfg.template_path_for(image);
     let _image_lock = lock_image_publication(cfg, image)?;
+    if !opts.rebuild {
+        validate_image_publication(cfg, image)?;
+    }
+    // A legacy checkpoint must not be replaced implicitly, even when its
+    // recipe hashes differ from today's setup inputs.
+    if template.exists()
+        && !opts.rebuild
+        && let Ok(existing) = TemplateConfig::load_for(cfg, image)
+        && !existing
+            .capabilities
+            .contains(&ImageCapability::FirecrackerVsockSsh)
+    {
+        bail!(
+            "Image '{image}' lacks the Firecracker vsock SSH listener. A base image can be \
+             rebuilt with `coop setup --image {image} --rebuild`; rebuilding a committed \
+             checkpoint discards its contents"
+        );
+    }
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
     // Compose the install recipe and compute its hashes.
@@ -1072,13 +1093,24 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         return Err(e);
     }
 
-    // Swap staging into place — old template is replaced atomically
-    crate::privileged_disk::swap(&staging).context("Failed to swap staging template into place")?;
+    publish_template(cfg, image, &template_config, || {
+        crate::privileged_disk::swap(&staging).context("Failed to swap staging template into place")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_template(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+    swap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Keep consumers from using a replaced disk until its metadata is published.
+    begin_image_publication(cfg, image)?;
+    swap()?;
 
     // Write template config only after image swap succeeds.
-    // If we crash between swap and config write, staleness
-    // detection triggers a rebuild on next run (safe).
-    template_config.save_for(cfg, image)?;
+    metadata.save_for(cfg, image)?;
     finish_image_publication(cfg, image)?;
 
     Ok(())
@@ -1098,10 +1130,6 @@ fn needs_rebuild(
     current_hash: Sha256Hash,
     current_post_hash: Option<Sha256Hash>,
 ) -> bool {
-    if validate_image_publication(cfg, image).is_err() {
-        tracing::info!("Image publication is incomplete — treating template as stale");
-        return true;
-    }
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating template as stale");
         return true;
@@ -2010,10 +2038,8 @@ fn unmount_chroot(disk: &Path, mount_str: &str) -> Result<()> {
     if let Err(e) = crate::privileged_disk::unmount(disk) {
         first_error.get_or_insert_with(|| anyhow::anyhow!("Failed to unmount {mount_str}: {e}"));
     }
-    if let Err(e) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
-        first_error.get_or_insert_with(|| {
-            anyhow::anyhow!("Failed to remove mount directory {mount_str}: {e}")
-        });
+    if let Err(error) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
+        tracing::warn!("Failed to remove mount directory {mount_str} (non-fatal): {error}");
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -2474,6 +2500,115 @@ mod tests {
         let serialized = serde_json::to_value(&tc).unwrap();
         assert_eq!(serialized["version"], 1);
         assert!(serialized.get("oci_features").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_setup_refuses_interrupted_publication_even_when_metadata_hashes_match() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        let hash = Sha256Hash::of("matching recipe");
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: "2026-01-01T00:00:00Z".to_string(),
+            install_script_hash: hash,
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: GuestUser::default(),
+            capabilities: BTreeSet::from([ImageCapability::FirecrackerVsockSsh]),
+        };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(!needs_rebuild(&cfg, &image, hash, None));
+
+        let disk = cfg.template_path_for(&image);
+        let staging = disk.with_extension("ext4.new");
+        std::fs::write(&disk, b"old disk").unwrap();
+        std::fs::write(&staging, b"new disk").unwrap();
+        let error = publish_template(&cfg, &image, &metadata, || {
+            std::fs::rename(&staging, &disk)?;
+            bail!("injected interruption after swap")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(std::fs::read(&disk).unwrap(), b"new disk");
+
+        let mut opts = setup_options(&[], None);
+        opts.image = image.clone();
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete publication"), "{error}");
+        assert!(error.contains("--rebuild"), "{error}");
+        assert_eq!(std::fs::read(&disk).unwrap(), b"new disk");
+        assert!(image_publication_marker(&cfg, &image).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_setup_preserves_legacy_checkpoint_with_matching_or_stale_recipe() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let mut opts = setup_options(&[], None);
+        opts.image = ImageName::new("checkpoint").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&opts.image)).unwrap();
+        let disk = cfg.template_path_for(&opts.image);
+        std::fs::write(&disk, b"committed checkpoint").unwrap();
+        let mut metadata: TemplateConfig = serde_json::from_str(
+            r#"{"version":2,"created":"2026-01-01T00:00:00Z","install_script_hash":"0000000000000000000000000000000000000000000000000000000000000000","profiles":[],"extra_packages":[],"post_install_hash":null}"#,
+        )
+        .unwrap();
+        let (profiles, packages) = resolve_template_config(&cfg, &opts).unwrap();
+        metadata.install_script_hash =
+            Sha256Hash::of(compose_recipe(&profiles, &packages, &opts.guest_user));
+        metadata.save_for(&cfg, &opts.image).unwrap();
+
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lacks the Firecracker vsock SSH listener"),
+            "{error}"
+        );
+        assert!(error.contains("--rebuild"), "{error}");
+        assert!(error.contains("discards its contents"), "{error}");
+        assert_eq!(std::fs::read(&disk).unwrap(), b"committed checkpoint");
+        assert!(!image_publication_marker(&cfg, &opts.image).exists());
+
+        metadata.install_script_hash = Sha256Hash::of("stale recipe");
+        assert_ne!(
+            metadata.install_script_hash,
+            Sha256Hash::of(compose_recipe(&profiles, &packages, &opts.guest_user))
+        );
+        metadata.save_for(&cfg, &opts.image).unwrap();
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lacks the Firecracker vsock SSH listener"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&disk).unwrap(), b"committed checkpoint");
     }
 
     #[test]

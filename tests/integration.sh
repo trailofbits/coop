@@ -3038,8 +3038,46 @@ PYEOF
     local state_before
     state_before=$(cksum "$state")
 
+    # Old stopped Firecracker VMs retain root-owned API and base vsock socket
+    # entries after the PID file disappears. Recreate that directory state,
+    # rather than testing only an untagged freshly stopped VM.
+    local instance_dir="$HOME/.coop/instances/$INSTANCE"
+    local api_socket="$instance_dir/firecracker.socket"
+    local vsock_socket="$instance_dir/vsock.sock"
+    if ! sudo -n python3 - "$api_socket" "$vsock_socket" <<'PYEOF'
+import os, socket, sys
+os.umask(0o022)
+for path in sys.argv[1:]:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.close()
+PYEOF
+    then
+        fail "create root-owned stopped legacy socket fixture"
+        coop start "$INSTANCE" --no-agents >/dev/null 2>&1 || true
+        return
+    fi
+    if [[ ! -e "$instance_dir/firecracker.pid" \
+        && "$(stat -c '%U:%a' "$api_socket")" == root:755 \
+        && "$(stat -c '%U:%a' "$vsock_socket")" == root:755 ]]; then
+        pass "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
+    else
+        fail "stopped legacy fixture has root-owned mode-0755 sockets and no PID"
+    fi
+    if coop status && grep -qE "^${INSTANCE}[[:space:]]+stopped" <<<"$HARNESS_OUT"; then
+        pass "bare status reports old stopped VM with stale sockets"
+    else
+        fail "bare status reports old stopped VM with stale sockets" \
+            "stderr: $HARNESS_ERR"
+    fi
+
     if coop start "$INSTANCE" --no-agents; then
         pass "untagged Firecracker instance starts over legacy TCP"
+        if [[ ! -e "$api_socket" && -S "$vsock_socket" ]]; then
+            pass "start removes stale API socket and replaces stale base vsock socket"
+        else
+            fail "start removes stale API socket and replaces stale base vsock socket"
+        fi
     else
         fail "untagged Firecracker instance starts over legacy TCP" "stderr: $HARNESS_ERR"
     fi
@@ -3639,7 +3677,7 @@ test_commit_restore() {
         fi
         if [[ -f "$snap_metadata" && -f "$publication_marker" ]] \
             && coop_fails restore "$INSTANCE" --image "$snap" \
-            && grep -qi "incomplete commit" <<<"$HARNESS_ERR"; then
+            && grep -qi "incomplete publication" <<<"$HARNESS_ERR"; then
             pass "incomplete publication cannot consume stale metadata"
         else
             fail "incomplete publication cannot consume stale metadata" \

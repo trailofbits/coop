@@ -36,11 +36,15 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
+    let image = &opts.image;
+    let _image_lock = crate::setup::lock_image_publication(cfg, image)?;
+    if !opts.rebuild {
+        crate::setup::validate_image_publication(cfg, image)?;
+    }
+
     check_requirements()?;
     ensure_ssh_key(cfg)?;
 
-    let image = &opts.image;
-    let _image_lock = crate::setup::lock_image_publication(cfg, image)?;
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
@@ -995,19 +999,21 @@ fn build_golden_image(
         }
     };
 
-    // Swap staging into place — old image is replaced atomically
-    image_dir
-        .rename_child(
-            staging_name,
-            base_img.file_name().context("Base image has no name")?,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to swap staging image {} -> {}",
-                staging.display(),
-                base_img.display()
+    // Keep consumers from using a replaced disk until its metadata is published.
+    publish_lima_disk(cfg, image, || {
+        image_dir
+            .rename_child(
+                staging_name,
+                base_img.file_name().context("Base image has no name")?,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "Failed to swap staging image {} -> {}",
+                    staging.display(),
+                    base_img.display()
+                )
+            })
+    })?;
 
     #[expect(clippy::cast_precision_loss, reason = "file size fits in f64")]
     let size_gib = image_dir
@@ -1037,6 +1043,15 @@ fn build_golden_image(
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn publish_lima_disk(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    swap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::setup::begin_image_publication(cfg, image)?;
+    swap()
 }
 
 fn report_builder_inputs(profiles: &[ProfileDef]) {
@@ -2218,6 +2233,70 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn plain_setup_refuses_interrupted_publication_with_matching_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        let user = GuestUser::default();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        PrivateDir::create(&cfg.image_dir(&image)).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: "2026-01-01T00:00:00Z".to_string(),
+            install_script_hash: provision_script_hash(&cfg, &[], &user),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: user.clone(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(!needs_rebuild(&cfg, &image, &[], &user));
+
+        let disk = cfg.lima_base_path(&image);
+        let staging = disk.with_extension("img.new");
+        fs::write(&disk, b"old disk").unwrap();
+        fs::write(&staging, b"new disk").unwrap();
+        let error = publish_lima_disk(&cfg, &image, || {
+            fs::rename(&staging, &disk)?;
+            anyhow::bail!("injected interruption after rename")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install: None,
+            image: image.clone(),
+            guest_user: user,
+            builder_timeout: None,
+        };
+        let error = setup(&cfg, &opts).unwrap_err().to_string();
+        assert!(error.contains("incomplete publication"), "{error}");
+        assert!(error.contains("--rebuild"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+        assert!(
+            cfg.image_dir(&image)
+                .join(".publication-incomplete")
+                .exists()
+        );
+    }
 
     #[test]
     fn lima_start_disables_interactive_and_graphical_ui() {
