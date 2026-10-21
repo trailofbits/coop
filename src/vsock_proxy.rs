@@ -17,6 +17,27 @@ use socket2::{Domain, SockAddr, Socket, Type};
 
 const MAX_RESPONSE_LEN: usize = 64;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid Firecracker vsock handshake response")]
+struct InvalidHandshake;
+
+/// A missing or refusing socket can be transient while Firecracker starts;
+/// permission, invalid path structure, and protocol failures cannot be fixed
+/// by guest boot.
+pub(crate) fn permanent_readiness_error(error: &anyhow::Error) -> bool {
+    if error.is::<InvalidHandshake>() {
+        return true;
+    }
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG)
+            )
+        })
+    })
+}
+
 struct NonblockingFd {
     fd: std::os::fd::RawFd,
     original_flags: libc::c_int,
@@ -127,7 +148,7 @@ pub(crate) fn connect(
     }
 
     let response = read_response(&mut stream, deadline)?;
-    validate_response(&response)?;
+    validate_response(&response).context(InvalidHandshake)?;
 
     stream
         .set_nonblocking(false)
@@ -183,7 +204,9 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>> 
     let mut response = Vec::with_capacity(MAX_RESPONSE_LEN);
     loop {
         if response.len() == MAX_RESPONSE_LEN {
-            bail!("Firecracker vsock response exceeded {MAX_RESPONSE_LEN} bytes");
+            return Err(anyhow::Error::new(InvalidHandshake).context(format!(
+                "Firecracker vsock response exceeded {MAX_RESPONSE_LEN} bytes"
+            )));
         }
         wait_ready(stream, libc::POLLIN, deadline)?;
         let mut byte = [0_u8; 1];
@@ -460,18 +483,31 @@ mod tests {
     fn connect_rejects_malformed_response() {
         for response in [b"NO 1\n".to_vec(), b"OK 0\n".to_vec(), b"OK one\n".to_vec()] {
             let (_directory, path, server) = fixture(response);
-            assert!(connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1)).is_err());
+            let error =
+                connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1)).unwrap_err();
+            assert!(permanent_readiness_error(&error), "{error:#}");
             server.join().unwrap();
         }
     }
 
     #[test]
+    fn readiness_classifies_permission_failure_as_permanent() {
+        let error = anyhow::Error::new(io::Error::from_raw_os_error(libc::EACCES))
+            .context("Failed to connect to Firecracker vsock");
+        assert!(permanent_readiness_error(&error));
+
+        let error = anyhow::Error::new(io::Error::from_raw_os_error(libc::ENOENT))
+            .context("Failed to connect to Firecracker vsock");
+        assert!(!permanent_readiness_error(&error));
+    }
+
+    #[test]
     fn connect_rejects_response_without_bounded_newline() {
         let (_directory, path, server) = fixture(vec![b'1'; MAX_RESPONSE_LEN]);
-        let error = connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("exceeded"));
+        let error =
+            connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+        assert!(permanent_readiness_error(&error));
         server.join().unwrap();
     }
 

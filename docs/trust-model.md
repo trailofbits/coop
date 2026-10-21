@@ -321,11 +321,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   escape `%` tokens, and are POSIX-shell quoted before OpenSSH interprets the
   command. The helper accepts no command text from the guest: it sends one
   bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
-  and then relays bytes. The base socket lives inside the user-owned mode-0700
-  instance directory; Firecracker may create it mode 0666 so the unprivileged
-  coop process can connect without making it reachable through the directory
-  by other users. Stale runtime entries are unlinked through that pinned
-  private directory rather than a root shell command.
+  and then relays bytes. Firecracker's process umask makes both the base vsock
+  socket and its API socket mode 0666. Both live inside the user-owned mode-0700
+  instance directory, so other users cannot reach them through the directory.
+  Any process running as the invoking user can connect to the API socket and
+  control the live VM without `sudo`. Stale runtime entries are unlinked
+  through that pinned private directory rather than a root shell command.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

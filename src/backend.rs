@@ -552,6 +552,9 @@ impl SshTarget {
                 match crate::vsock_proxy::connect(&vsock.socket_path, vsock.guest_port, timeout) {
                     Ok(_) => Ok(true),
                     Err(error) => {
+                        if crate::vsock_proxy::permanent_readiness_error(&error) {
+                            return Err(error).context("Firecracker vsock readiness failed");
+                        }
                         tracing::debug!("Firecracker vsock is not reachable: {error:#}");
                         Ok(false)
                     }
@@ -4617,6 +4620,36 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             PathBuf::from("/tmp/test-key"),
             SshHostToolsConfig::default(),
         )
+    }
+
+    #[test]
+    fn vsock_readiness_retries_absent_socket_but_reports_invalid_parent() {
+        let directory = crate::test_support::private_tempdir().unwrap();
+        let parent = directory.path().join("file");
+        let target_for = |socket_path| {
+            SshTarget::firecracker_vsock_with_proxy(
+                socket_path,
+                NonZeroU32::new(22).unwrap(),
+                PathBuf::from("/usr/bin/coop"),
+                SshUser::new("ubuntu").unwrap(),
+                PathBuf::from("/tmp/test-key"),
+                SshHostToolsConfig::default(),
+            )
+        };
+
+        assert!(
+            !target_for(directory.path().join("missing.sock"))
+                .transport_is_reachable(Duration::from_millis(50))
+                .unwrap()
+        );
+        std::fs::write(&parent, "not a directory").unwrap();
+        let error = target_for(parent.join("vsock.sock"))
+            .transport_is_reachable(Duration::from_millis(50))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Not a directory"),
+            "{error:#}"
+        );
     }
 
     #[test]
