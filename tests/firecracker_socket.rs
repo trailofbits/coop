@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 
 #[test]
-fn stop_retains_proxy_for_full_socket_queue_and_cleans_after_close() {
+fn stop_retains_proxy_for_full_vsock_queue_and_cleans_after_close() {
     let root = tempfile::tempdir().unwrap();
     // The runner's umask may let tempfile create a group-writable directory.
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -68,7 +68,7 @@ fn stop_retains_proxy_for_full_socket_queue_and_cleans_after_close() {
     } else {
         None
     };
-    let socket = instance.join("firecracker.socket");
+    let socket = instance.join("vsock.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     // Linux permits backlog + 1 pending connections. With backlog zero,
     // one connected client fills the queue without relying on system defaults.

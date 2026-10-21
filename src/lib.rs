@@ -114,7 +114,7 @@ enum Commands {
         #[arg(long)]
         port: std::num::NonZeroU32,
     },
-    /// Internal privileged Firecracker API socket liveness probe.
+    /// Internal privileged Firecracker socket liveness probe.
     #[cfg(target_os = "linux")]
     #[command(name = "__probe-firecracker-socket", hide = true)]
     ProbeFirecrackerSocket { path: PathBuf },
@@ -962,7 +962,7 @@ pub fn run() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     if let Commands::ProbeFirecrackerSocket { ref path } = cli.command {
-        return config::probe_firecracker_api_socket(path);
+        return config::probe_firecracker_socket(path);
     }
 
     #[cfg(target_os = "linux")]

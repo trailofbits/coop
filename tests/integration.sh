@@ -2847,24 +2847,20 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker and its sockets run as root. They are mode 0666 so the
-        # unprivileged coop process can connect, but remain contained by the
-        # user-owned mode-0700 instance directory. Kill the VMM without its
-        # graceful cleanup so `coop stop` must recognize and remove both
-        # abandoned sockets without a privileged pathname unlink.
+        # Firecracker runs without an API socket. Its base vsock socket is
+        # mode 0666 so coop can connect through the user-owned mode-0700
+        # instance directory. Kill the VMM without graceful cleanup so
+        # `coop stop` must recognize and remove the abandoned socket.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
         instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
         vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
         directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
-        socket_metadata=$(stat -c '%U:%a' "$socket_path" 2>/dev/null || true)
         vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
-        if [[ -n "$fc_pid" && -S "$socket_path" \
-            && -S "$vsock_path" \
+        if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
             && "$directory_metadata" == "$(id -un):700" \
-            && "$socket_metadata" == "root:666" \
             && "$vsock_metadata" == "root:666" ]]; then
-            pass "Firecracker sockets are accessible only through the private instance directory"
+            pass "Firecracker has no API socket and contains vsock in the private instance directory"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -2873,18 +2869,18 @@ test_stop() {
                     fi
                     sleep 0.1
                 done
-                if [[ "$exited" -eq 1 && -S "$socket_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned API socket"
+                if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
+                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned API socket" \
-                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$socket_path" ]] && echo yes || echo no )"
+                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                        "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has private mode-0666 runtime sockets" \
-                "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=${socket_metadata:-missing} vsock=${vsock_metadata:-missing}"
+            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+                "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi
 

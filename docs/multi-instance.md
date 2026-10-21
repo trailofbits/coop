@@ -166,7 +166,7 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `instance.json` | Instance metadata (name, index, image) |
 | `rootfs.ext4` | Instance root filesystem (Firecracker) |
 | `firecracker.pid` | PID of the running Firecracker process |
-| `firecracker.socket` | Firecracker API socket |
+| `firecracker.socket` | Legacy Firecracker API socket (only for VMs started by older versions) |
 | `firecracker.log` | Serial console log |
 | `vm_config.json` | Firecracker VM configuration |
 | `workspace.json` | Workspace sync state (host path, guest path, source) |

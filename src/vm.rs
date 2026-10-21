@@ -227,24 +227,31 @@ impl<'a> FirecrackerVm<'a, Configured> {
     pub fn start(self) -> Result<FirecrackerVm<'a, Running>> {
         let config_path = self.inst.vm_config_path();
         let log_path = self.inst.log_path();
-        let socket_path = self.inst.api_socket_path();
+        let api_socket_path = self.inst.api_socket_path();
+        let vsock_path = self.inst.vsock_path();
 
         // Kill an orphaned Firecracker if the socket is present without a
         // PID file: a prior stale-PID cleanup or interrupted startup can leave
         // the socket behind while its process is still alive.
         let pid_path = self.inst.pid_file_path();
-        if socket_path.exists() && !pid_path.exists() {
-            tracing::warn!(
-                "Socket {} exists without PID file — killing orphaned process",
-                socket_path.display()
-            );
-            kill_process_on_socket(&socket_path);
+        if !pid_path.exists() {
+            // Older VMs can still have an API socket; new ones only have the
+            // base vsock socket. Check both before removing either pathname.
+            for socket_path in [&api_socket_path, &vsock_path] {
+                if socket_path.exists() {
+                    tracing::warn!(
+                        "Socket {} exists without PID file — killing orphaned process",
+                        socket_path.display()
+                    );
+                    kill_process_on_socket(socket_path);
+                }
+            }
         }
 
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without
         // following a substituted final component or invoking a shell as root.
-        for stale in [&socket_path, &self.inst.vsock_path(), &log_path, &pid_path] {
+        for stale in [&api_socket_path, &vsock_path, &log_path, &pid_path] {
             crate::fs_util::remove_private_if_exists(stale).with_context(|| {
                 format!(
                     "Failed to remove stale Firecracker path {}",
@@ -260,8 +267,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
             .args(["-c", PID_TRAMPOLINE, "sh"])
             .arg(&pid_path)
             .arg(&self.cfg.firecracker_bin)
-            .arg("--api-sock")
-            .arg(&socket_path)
+            .arg("--no-api")
             .arg("--config-file")
             .arg(&config_path)
             .arg("--log-path")
@@ -422,7 +428,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             target: crate::backend::legacy_firecracker_tcp_target(self.cfg, self.inst)?,
             env: crate::backend::EnvForward::default(),
         };
-        // Firecracker exits on guest reboot; its CtrlAltDel API is x86-only.
+        // Firecracker exits on guest reboot; the control API is disabled.
         session.command(&[], "sudo -n /sbin/reboot")
     }
 
@@ -589,10 +595,9 @@ const PID_TRAMPOLINE: &str = concat!(
     r#"chmod 644 "$pid_tmp" || exit 1; "#,
     r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
     r#"trap - EXIT HUP INT TERM; "#,
-    // Firecracker creates its API and base-vsock sockets as root. Their
-    // containing instance directory is user-owned mode 0700, so mode 0666
-    // grants the invoking user access without exposing either socket to other
-    // users. This also avoids a post-bind chmod race.
+    // Firecracker creates the base vsock socket as root. Its containing
+    // instance directory is user-owned mode 0700, so mode 0666 grants the
+    // invoking user access without exposing the socket to other users.
     r#"umask 0111 || exit 1; "#,
     r#"shift; exec "$@""#,
 );
