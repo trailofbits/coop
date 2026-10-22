@@ -382,6 +382,8 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It holds the loop mount busy to check that unmount fails and the mounted disk
+cannot be removed, then verifies the unmounted path is accepted.
 It also corrupts an ext4 inode reference count, checks that read-only verification
 rejects it, then retries `coop resize` at the already extended image size and
 checks the filesystem's block capacity. It also checks a completed no-op retry

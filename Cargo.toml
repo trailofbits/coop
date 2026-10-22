@@ -55,6 +55,9 @@ serde-saphyr = { version = "1.3.0", default-features = false, features = [
   "deserialize",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [lints]
 workspace = true
 

@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, bail};
+use rustix::fs::{AtFlags, StatxFlags, statx};
 
 use crate::cmd::Cmd;
 
@@ -208,6 +209,7 @@ impl DiskPath {
     }
 
     fn remove(&self, uid: u32) -> Result<()> {
+        ensure_unmounted(self)?;
         match self.file(false, uid) {
             Ok(_file) => {}
             Err(error)
@@ -253,6 +255,7 @@ fn is_root_owned_symlink(parent: &File, name: &CStr) -> bool {
 
 fn copy(src: &DiskPath, dst: &DiskPath, uid: u32) -> Result<()> {
     let source = src.file(false, uid)?;
+    ensure_unmounted(dst)?;
     // Refuse to replace a symlink, hardlink, foreign-owned file, or directory.
     if let Err(error) = dst.file(false, uid)
         && error
@@ -364,6 +367,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
+        "ensure-unmounted" if argument.is_none() => ensure_unmounted(&disk),
         "mount-proc" if argument.is_none() => mount_child(&disk, "proc"),
         "mount-sys" if argument.is_none() => mount_child(&disk, "sys"),
         "mount-dev" if argument.is_none() => mount_child(&disk, "dev"),
@@ -388,6 +392,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
                 name: final_name.to_owned(),
                 kind: disk.kind,
             };
+            ensure_unmounted(&final_disk)?;
             if let Err(error) = final_disk.file(false, uid)
                 && error
                     .downcast_ref::<io::Error>()
@@ -447,11 +452,41 @@ fn mount_directory(disk: &DiskPath, create: bool) -> Result<File> {
     Ok(directory)
 }
 
+fn mount_id(file: &File) -> Result<u64> {
+    let stat = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        bail!("Kernel did not report the mount ID");
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+fn ensure_unmounted(disk: &DiskPath) -> Result<()> {
+    let base = if disk.kind == DiskKind::Instance {
+        &disk.parent
+    } else {
+        &disk.root
+    };
+    let mount = match open_at(
+        base,
+        c"rootfs-mount",
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(mount) => mount,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if mount_id(&mount)? != mount_id(base)? {
+        bail!("Rootfs mount is still active; unmount it before changing the disk");
+    }
+    Ok(())
+}
+
 fn proc_fd(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
 }
 
 fn mount_disk(disk: &DiskPath, uid: u32) -> Result<()> {
+    ensure_unmounted(disk)?;
     let source = disk.file(true, uid)?;
     let target = mount_directory(disk, true)?;
     let control = fs::OpenOptions::new()
@@ -734,6 +769,9 @@ pub(crate) fn seal_existing(path: &Path) -> Result<()> {
 pub(crate) fn remove(path: &Path) -> Result<()> {
     invoke("remove", path, None)
 }
+pub(crate) fn ensure_disk_unmounted(path: &Path) -> Result<()> {
+    invoke("ensure-unmounted", path, None)
+}
 pub(crate) fn copy_disk(src: &Path, dst: &Path) -> Result<()> {
     invoke("copy", src, Some(dst.as_os_str()))
 }
@@ -824,6 +862,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mount_id_accepts_o_path_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("mount")).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let child = open_at(
+            &parent,
+            c"mount",
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(mount_id(&child).unwrap(), mount_id(&parent).unwrap());
     }
 
     struct TemporaryMount(CString);

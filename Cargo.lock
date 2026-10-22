@@ -266,6 +266,7 @@ dependencies = [
  "mutants",
  "percent-encoding",
  "proptest",
+ "rustix",
  "semver",
  "serde",
  "serde-saphyr",
