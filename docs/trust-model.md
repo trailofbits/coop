@@ -326,11 +326,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   0666 inside the user-owned mode-0700 instance directory; other users cannot
   reach it through the directory. This grants the invoking user access to the
   guest transport, not a Firecracker control API. A process started before
-  `--no-api` may retain an API socket until stopped. If its PID cannot be
-  verified, coop refuses to probe, kill, or remove that socket automatically;
-  it reports the path for manual inspection. Once a VM is confirmed stopped,
-  stale runtime entries are unlinked through the pinned private directory
-  rather than a root shell command.
+  `--no-api` may retain an API socket until stopped. Without a verified PID,
+  coop uses a privileged, nonblocking connection probe on the API and base
+  vsock socket entries. Only a refused or missing socket permits cleanup;
+  a live listener, non-socket entry, or uncertain result blocks it. Coop never
+  kills a process found through a socket lookup. Confirmed stale entries are
+  unlinked through the pinned private directory rather than a root shell command.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

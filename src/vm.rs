@@ -224,14 +224,16 @@ impl<'a> FirecrackerVm<'a, Configured> {
 
     /// Start the Firecracker process, consuming the `Configured`
     /// state and returning a `Running` VM.
+    #[cfg(not(target_os = "macos"))]
     pub fn start(self) -> Result<FirecrackerVm<'a, Running>> {
         let config_path = self.inst.vm_config_path();
         let log_path = self.inst.log_path();
+        let api_socket_path = self.inst.api_socket_path();
         let vsock_path = self.inst.vsock_path();
 
         // Do not remove a live socket or overwrite the PID of an orphaned VMM.
-        // The liveness probe refuses unverified legacy API sockets and live
-        // base vsock sockets before any per-run path is unlinked.
+        // The liveness probe refuses live or uncertain API and base vsock
+        // sockets before any per-run path is unlinked.
         let pid_path = self.inst.pid_file_path();
         if self.inst.probe_liveness()? {
             bail!("Instance '{}' is already running", self.inst.name);
@@ -240,7 +242,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without
         // following a substituted final component or invoking a shell as root.
-        for stale in [&vsock_path, &log_path, &pid_path] {
+        for stale in [&api_socket_path, &vsock_path, &log_path, &pid_path] {
             crate::fs_util::remove_private_if_exists(stale).with_context(|| {
                 format!(
                     "Failed to remove stale Firecracker path {}",
@@ -667,7 +669,8 @@ mod tests {
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
 
     #[test]
-    fn start_refuses_unverified_legacy_api_socket_without_unlinking_it() {
+    #[cfg(not(target_os = "macos"))]
+    fn start_refuses_non_socket_legacy_api_path_without_unlinking_it() {
         let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: InstanceName::new("test").unwrap(),
@@ -675,13 +678,13 @@ mod tests {
             dir: root.path().to_path_buf(),
             image: ImageName::new("default").unwrap(),
         };
-        let listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
-        drop(listener);
+        std::fs::write(inst.api_socket_path(), "keep").unwrap();
         let cfg = CoopConfig::default();
 
         let error = FirecrackerVm::new(&cfg, &inst).start().err().unwrap();
-        assert!(format!("{error:#}").contains("without a verified running PID"));
+        assert!(format!("{error:#}").contains("legacy API socket path is not a Unix socket"));
         assert!(inst.api_socket_path().exists());
+        assert_eq!(std::fs::read(inst.api_socket_path()).unwrap(), b"keep");
         assert!(!inst.pid_file_path().exists());
     }
 

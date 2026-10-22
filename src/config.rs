@@ -3068,9 +3068,21 @@ impl Instance {
             }
         }
 
-        // A process started before --no-api may have left an API socket. With
-        // no verified PID, do not infer that it is safe to remove or probe.
-        reject_unverified_api_socket(&self.api_socket_path())?;
+        // Older stopped VMs leave an API socket entry behind. Probe it with
+        // privilege before treating it as stale; a live or uncertain socket
+        // must never be unlinked during startup or cleanup.
+        ensure_firecracker_socket_stopped(&self.api_socket_path(), "legacy API").with_context(
+            || {
+                let path = self.api_socket_path();
+                let quoted = crate::shell::shell_escape(&path.display().to_string());
+                format!(
+                    "Cannot verify legacy Firecracker API socket at {} is stopped. \
+                     Inspect it with `sudo lsof -nP {quoted}`. Verify and stop any process holding \
+                     it before retrying",
+                    path.display()
+                )
+            },
+        )?;
         ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
@@ -3082,24 +3094,6 @@ impl Instance {
             );
         }
         Ok(false)
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn reject_unverified_api_socket(socket_path: &Path) -> Result<()> {
-    match fs::symlink_metadata(socket_path) {
-        Ok(_) => {
-            let quoted = crate::shell::shell_escape(&socket_path.display().to_string());
-            bail!(
-                "Legacy Firecracker API socket exists at {} without a verified running PID. \
-                 Refusing to remove it automatically. Inspect it with `sudo lsof -nP {quoted}`. \
-                 If a process holds it, verify and stop that process. If none does, remove the \
-                 stale socket with `rm -- {quoted}` and retry",
-                socket_path.display()
-            );
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("Failed to inspect legacy Firecracker API socket"),
     }
 }
 
@@ -3650,22 +3644,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn probe_liveness_rejects_stale_api_socket_with_recovery_guidance() {
-        let tmp = crate::test_support::private_tempdir().unwrap();
-        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
-        drop(listener);
-
-        let error = inst.probe_liveness().unwrap_err().to_string();
-        assert!(error.contains("without a verified running PID"), "{error}");
-        assert!(error.contains(&inst.api_socket_path().display().to_string()));
-        assert!(error.contains("sudo lsof -nP"));
-        assert!(error.contains("rm --"));
-        assert!(inst.api_socket_path().exists());
     }
 
     #[test]

@@ -93,9 +93,6 @@ exclude_re = [
   # Firecracker liveness invokes sudo and probes /proc plus a Unix socket;
   # Linux-only process tests cover it outside the unit mutation sweep.
   "\\bprobe_liveness\\b",
-  # Legacy API socket presence is a filesystem gate; Linux process tests
-  # cover its fail-closed result and preservation of the socket entry.
-  "\\breject_unverified_api_socket\\b",
   # Privileged socket wrapper/syscalls; the errno classifier remains in scope.
   # Host regressions cover the real helper and full accept queue.
   "\\bensure_firecracker_socket_stopped\\b",
