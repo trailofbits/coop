@@ -3068,10 +3068,9 @@ impl Instance {
             }
         }
 
-        // A VM started before --no-api may still have a live API socket. New
-        // VMs have only the base vsock socket. Neither may be unlinked while a
-        // Firecracker process is listening, even if its PID file is missing.
-        ensure_firecracker_socket_stopped(&self.api_socket_path(), "API")?;
+        // A process started before --no-api may have left an API socket. With
+        // no verified PID, do not infer that it is safe to remove or probe.
+        reject_unverified_api_socket(&self.api_socket_path())?;
         ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
@@ -3086,9 +3085,27 @@ impl Instance {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn reject_unverified_api_socket(socket_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(_) => {
+            let quoted = crate::shell::shell_escape(&socket_path.display().to_string());
+            bail!(
+                "Legacy Firecracker API socket exists at {} without a verified running PID. \
+                 Refusing to remove it automatically. Inspect it with `sudo lsof -nP {quoted}`. \
+                 If a process holds it, verify and stop that process. If none does, remove the \
+                 stale socket with `rm -- {quoted}` and retry",
+                socket_path.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("Failed to inspect legacy Firecracker API socket"),
+    }
+}
+
 /// Confirm that a root-owned Firecracker socket is no longer accepting
-/// connections. Pre-migration mode-0755 sockets yield `EACCES` to the
-/// unprivileged caller whether live or stale, so the probe remains privileged.
+/// connections. The privileged probe avoids permission denial masking a live
+/// root-owned socket.
 #[cfg(not(target_os = "macos"))]
 fn ensure_firecracker_socket_stopped(socket_path: &Path, kind: &str) -> Result<()> {
     match fs::symlink_metadata(socket_path) {
@@ -3637,12 +3654,29 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_rejects_non_socket_api_path() {
+    fn probe_liveness_rejects_stale_api_socket_with_recovery_guidance() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        drop(listener);
+
+        let error = inst.probe_liveness().unwrap_err().to_string();
+        assert!(error.contains("without a verified running PID"), "{error}");
+        assert!(error.contains(&inst.api_socket_path().display().to_string()));
+        assert!(error.contains("sudo lsof -nP"));
+        assert!(error.contains("rm --"));
+        assert!(inst.api_socket_path().exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_dangling_api_symlink() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        std::os::unix::fs::symlink("missing", inst.api_socket_path()).unwrap();
 
         assert!(inst.probe_liveness().is_err());
+        assert!(fs::symlink_metadata(inst.api_socket_path()).is_ok());
     }
 
     #[test]
@@ -3683,6 +3717,7 @@ mod tests {
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+        let _api = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
 
         let result = inst.probe_liveness();
         let _ = child.kill();

@@ -227,31 +227,20 @@ impl<'a> FirecrackerVm<'a, Configured> {
     pub fn start(self) -> Result<FirecrackerVm<'a, Running>> {
         let config_path = self.inst.vm_config_path();
         let log_path = self.inst.log_path();
-        let api_socket_path = self.inst.api_socket_path();
         let vsock_path = self.inst.vsock_path();
 
-        // Kill an orphaned Firecracker if the socket is present without a
-        // PID file: a prior stale-PID cleanup or interrupted startup can leave
-        // the socket behind while its process is still alive.
+        // Do not remove a live socket or overwrite the PID of an orphaned VMM.
+        // The liveness probe refuses unverified legacy API sockets and live
+        // base vsock sockets before any per-run path is unlinked.
         let pid_path = self.inst.pid_file_path();
-        if !pid_path.exists() {
-            // Older VMs can still have an API socket; new ones only have the
-            // base vsock socket. Check both before removing either pathname.
-            for socket_path in [&api_socket_path, &vsock_path] {
-                if socket_path.exists() {
-                    tracing::warn!(
-                        "Socket {} exists without PID file — killing orphaned process",
-                        socket_path.display()
-                    );
-                    kill_process_on_socket(socket_path);
-                }
-            }
+        if self.inst.probe_liveness()? {
+            bail!("Instance '{}' is already running", self.inst.name);
         }
 
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without
         // following a substituted final component or invoking a shell as root.
-        for stale in [&api_socket_path, &vsock_path, &log_path, &pid_path] {
+        for stale in [&vsock_path, &log_path, &pid_path] {
             crate::fs_util::remove_private_if_exists(stale).with_context(|| {
                 format!(
                     "Failed to remove stale Firecracker path {}",
@@ -554,26 +543,6 @@ pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()
     }
 }
 
-/// Find and kill any process holding the given Unix socket.
-///
-/// Uses `lsof` to find the PID, then sends SIGKILL. This handles
-/// orphaned Firecracker processes whose PID file was removed while
-/// the process still held the socket.
-fn kill_process_on_socket(socket_path: &std::path::Path) {
-    let Ok(stdout) = Cmd::new("lsof").arg("-t").arg(socket_path).sudo().capture() else {
-        return;
-    };
-    for pid_str in stdout.split_whitespace() {
-        tracing::info!(
-            "Killing orphaned process {pid_str} on {}",
-            socket_path.display()
-        );
-        if let Err(e) = Cmd::new("kill").args(["-9", pid_str]).sudo().run() {
-            tracing::debug!("Failed to kill PID {pid_str} (non-fatal): {e}");
-        }
-    }
-}
-
 /// Shell wrapper that makes the recorded PID Firecracker's own.
 ///
 /// `sudo` forks rather than execs when `use_pty` is on (its default since
@@ -696,6 +665,25 @@ mod tests {
         cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    fn start_refuses_unverified_legacy_api_socket_without_unlinking_it() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
+        drop(listener);
+        let cfg = CoopConfig::default();
+
+        let error = FirecrackerVm::new(&cfg, &inst).start().err().unwrap();
+        assert!(format!("{error:#}").contains("without a verified running PID"));
+        assert!(inst.api_socket_path().exists());
+        assert!(!inst.pid_file_path().exists());
+    }
 
     #[test]
     fn runtime_cleanup_attempts_every_path_after_an_error() {

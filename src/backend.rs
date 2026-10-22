@@ -1178,7 +1178,7 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-    if inst.probe_running()? {
+    if inst.probe_liveness()? {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
@@ -1224,7 +1224,7 @@ impl VmBackend for FirecrackerBackend {
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             bail!("Instance '{}' is already running", inst.name);
         }
         boot_preflight(cfg)?;
@@ -1268,7 +1268,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }

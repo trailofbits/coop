@@ -172,6 +172,12 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `workspace.json` | Workspace sync state (host path, guest path, source) |
 | `vsock.sock` | Firecracker base vsock socket (inside the private instance directory) |
 
+If coop reports a legacy API socket without a verified running PID, inspect
+the exact path in the error with `sudo lsof -nP <socket-path>`. If a process
+holds it, verify its identity and stop it before retrying. If no process holds
+the socket, remove that stale socket path and retry. Coop does not remove it
+while the process state is uncertain.
+
 On Lima, the directory structure differs because Lima manages its own VM state. `instance.json` and `workspace.json` are always present regardless of backend.
 
 ## Concurrent access and file locking

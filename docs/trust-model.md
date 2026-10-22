@@ -325,9 +325,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   VMs have no API socket. Its process umask makes the base vsock socket mode
   0666 inside the user-owned mode-0700 instance directory; other users cannot
   reach it through the directory. This grants the invoking user access to the
-  guest transport, not a Firecracker control API. Older running VMs may retain
-  an API socket until restarted. Stale runtime entries are unlinked through
-  the pinned private directory rather than a root shell command.
+  guest transport, not a Firecracker control API. A process started before
+  `--no-api` may retain an API socket until stopped. If its PID cannot be
+  verified, coop refuses to probe, kill, or remove that socket automatically;
+  it reports the path for manual inspection. Once a VM is confirmed stopped,
+  stale runtime entries are unlinked through the pinned private directory
+  rather than a root shell command.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
