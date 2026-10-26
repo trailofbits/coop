@@ -1548,7 +1548,7 @@ mod tests {
             );
         }
     }
-    
+
     #[test]
     fn web_editor_cli_accepts_instance_and_port() {
         let cli = parse(&["web-editor", "projects", "--port", "12345"]);
