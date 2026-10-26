@@ -5,7 +5,8 @@
 **Security warning:** The editor runs on your host and processes data from the
 guest. Connecting a host editor to the VM may allow a compromised guest to
 execute commands on your host. Only connect to guests you trust. `coop editor`
-prints this warning before launching VS Code or Zed.
+prints this warning before launching VS Code or Zed. For a safer browser-based
+editing inside the VM, use [`coop web-editor`](commands.md#web-editor).
 
 ## Quick start
 

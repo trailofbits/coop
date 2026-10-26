@@ -644,6 +644,22 @@ best-effort `.git` filters are not a guarantee that the result contains no Git
 administration aliases, and pull does not sanitize repositories created by an
 older vulnerable release.
 
+### `web-editor`
+
+Open `/workspace` in your browser. Choose a running VM; code-server installs
+inside it on first use.
+
+```sh
+coop web-editor [NAME] [--port PORT]
+```
+
+Open the URL printed in your terminal, then enter the displayed password to
+sign in. Use `--port` to choose the local port.
+
+Keep the terminal running while you edit. A second invocation joins the same
+session. Ctrl+C in either terminal stops the editor and its terminals while
+keeping the VM running. Settings and extensions persist in the guest.
+
 ### `editor`
 
 Open an editor (VS Code or Zed) connected to the guest VM over SSH remote.

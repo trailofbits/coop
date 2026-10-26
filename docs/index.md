@@ -16,6 +16,7 @@ short navigational entrypoint; durable detail lives here.
   `.cargo/mutants.toml` scoping and baselines), fuzzing, kani.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
+- [`web-editor-design.md`](web-editor-design.md) — in-browser file editor.
 
 ## For users
 

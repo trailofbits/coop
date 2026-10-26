@@ -481,6 +481,16 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
   with Seatbelt, with the stated caveats.
 
+## Browser editor transport
+
+`coop web-editor` runs code-server, extensions, and terminals inside the VM,
+reducing exposure through the native host-editor integrations used by `coop editor`.
+Browser vulnerabilities remain part of the attack surface.
+
+Code-server's password login restricts access to the editor, and the host 
+browser handles guest-controlled content under a fresh, session-specific
+`.localhost` origin.
+
 ## `coop update` trust chain
 
 Self-update (`update.rs`) must preserve, in order:

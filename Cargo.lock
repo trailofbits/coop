@@ -260,6 +260,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "getrandom 0.4.2",
  "hex",
  "indexmap",
  "libc",

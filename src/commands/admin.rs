@@ -158,6 +158,10 @@ pub(crate) fn cmd_uninstall(
             );
         }
     } else {
+        for inst in cfg.list_instances()? {
+            let _operation = backend::lock_instance_operation(&inst)?;
+            crate::web_editor::stop(&inst)?;
+        }
         if let Err(e) = workspace::remove_all_ssh_config() {
             tracing::debug!("SSH config cleanup failed (non-fatal): {e}");
         }

@@ -68,6 +68,7 @@ mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
 mod vsock_proxy;
+mod web_editor;
 mod workspace;
 
 use std::path::PathBuf;
@@ -533,6 +534,16 @@ enum Commands {
         /// Remove the SSH config entry for this instance and exit
         #[arg(long)]
         clean: bool,
+    },
+    /// Serve a browser editor inside a running VM (installs code-server on first use)
+    WebEditor {
+        /// Instance name (required if multiple instances exist)
+        #[arg(value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::running_instance_candidates))]
+        name: Option<config::InstanceName>,
+        /// Host loopback port (default: select a free port)
+        #[arg(long)]
+        port: Option<std::num::NonZeroU16>,
     },
     /// Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync
     SshConfig {
@@ -1322,6 +1333,7 @@ pub fn run() -> Result<()> {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::open_editor(&running, Some(&project), editor)
         }
+        Commands::WebEditor { name, port } => web_editor::run(&be, &cfg, name.as_ref(), port),
         Commands::SshConfig { name, clean } => {
             if clean {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1535,6 +1547,23 @@ mod tests {
                 "expected parse failure for {args:?}"
             );
         }
+    }
+    
+    #[test]
+    fn web_editor_cli_accepts_instance_and_port() {
+        let cli = parse(&["web-editor", "projects", "--port", "12345"]);
+        let crate::Commands::WebEditor { name, port } = cli.command else {
+            panic!("expected web editor")
+        };
+        assert_eq!(name.expect("instance name").as_str(), "projects");
+        assert_eq!(port.expect("host port").get(), 12345);
+        assert!(matches!(
+            parse(&["web-editor"]).command,
+            crate::Commands::WebEditor {
+                name: None,
+                port: None
+            }
+        ));
     }
 
     #[test]
