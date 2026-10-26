@@ -482,6 +482,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: directory.path().into(),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         assert!(super::load(&inst).unwrap().is_none());
         for id in [
@@ -596,6 +597,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: "/private/instance".into(),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         assert_eq!(
             super::metadata_path(&inst),
@@ -611,13 +613,13 @@ mod tests {
     #[test]
     fn ssh_binds_loopback_directly_to_the_guest_socket() {
         use crate::backend::{Hostname, SshTarget, SshUser};
-        let target = SshTarget {
-            host: Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: "/private/vm_key".into(),
-            host_tools: crate::config::SshHostToolsConfig::default(),
-        };
+        let target = SshTarget::tcp(
+            Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            "/private/vm_key".into(),
+            crate::config::SshHostToolsConfig::default(),
+        );
         let command =
             super::ssh_launch(&target, NonZeroU16::new(45678).unwrap(), &"a".repeat(32)).unwrap();
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
