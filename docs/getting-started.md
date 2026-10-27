@@ -54,6 +54,38 @@ Both paths require the release workflow at the selected tag (including its
 `gh` that does not support these flags fails verification; upgrade it before
 retrying.
 
+### Homebrew
+
+This repository also serves as a Homebrew tap:
+
+```sh
+brew tap trailofbits/coop https://github.com/trailofbits/coop
+brew install trailofbits/coop/coop
+```
+
+The formula builds `coop` and `coop-proxy` from release source, installs shell
+completions, and includes Lima on macOS. The host prerequisites above still
+apply, including Rosetta 2 for x86_64 guests on Apple Silicon. Run `coop setup`
+before first use.
+
+To upgrade:
+
+```sh
+brew update
+brew upgrade trailofbits/coop/coop
+```
+
+To uninstall, stop running VMs first. Homebrew preserves VM data and
+configuration. To delete the VMs too, run `coop destroy --all` with your usual
+configuration before removing the package:
+
+```sh
+brew uninstall trailofbits/coop/coop
+```
+
+Homebrew builds refuse `coop update` (including `--check`) and `coop uninstall`,
+and tell you to use the Homebrew commands above.
+
 ## Upgrading from v0.5.4
 
 Rerun the installer above when upgrading from v0.5.4 to a release that includes

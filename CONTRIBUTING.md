@@ -74,6 +74,17 @@ and must be run separately. The Nix package skips the invalid UTF-8 filename
 test on macOS because APFS rejects its fixture; it remains enabled on Linux.
 Format the flake with `nix fmt`.
 
+### Homebrew
+
+After publishing a release, update `url` and the source archive's `sha256` in
+[`Formula/coop.rb`](Formula/coop.rb). The Homebrew workflow builds and tests the
+formula on macOS whenever `Formula/` changes.
+
+Keep `COOP_PACKAGE_MANAGER=homebrew` to mark Homebrew ownership and
+`COOP_FORCE_BUILD_KIND=release` to avoid a `-dev` version in source-archive builds.
+The current formula backports the ownership guards to v0.9.1; remove `patch :DATA`
+and the patch after `__END__` once the pinned release includes them.
+
 ## Pre-commit hooks
 
 Install the hooks once, then let them run on every commit:

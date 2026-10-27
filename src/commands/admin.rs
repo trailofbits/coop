@@ -105,6 +105,16 @@ pub(crate) fn cmd_uninstall(
 ) -> Result<()> {
     use std::io::IsTerminal as _;
 
+    if update::is_homebrew_build() {
+        bail!(
+            "Cannot uninstall a Homebrew-managed binary with `coop uninstall`. \
+             No data has been removed.\n\
+             Use `brew uninstall coop` to remove the package. \
+             Homebrew preserves VM instances, images, and configuration. \
+             To delete the VMs too, first run `coop destroy --all` with your usual --config."
+        );
+    }
+
     let binary_path =
         std::env::current_exe().context("Failed to resolve current executable path for removal")?;
 
