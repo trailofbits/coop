@@ -188,8 +188,15 @@ pub(crate) fn run(
     let operation = crate::backend::lock_instance_operation(&inst)?;
     let previous = load(&inst)?;
     if let Some(session) = &previous
-        && control(session, &Control::Status).is_ok()
+        && let Ok(Some(status)) = control(session, &Control::Status)
     {
+        if let Some(requested) = port {
+            ensure!(
+                requested == status.port,
+                "Editor session already uses port {}; stop it before choosing another port",
+                status.port
+            );
+        }
         drop(operation);
         return wait_attached(&inst, session);
     }
