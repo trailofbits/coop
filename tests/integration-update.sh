@@ -6,7 +6,7 @@ set -euo pipefail
 # Serves a synthetic GitHub-shaped fixture from a local HTTP server and
 # verifies that the update flow downloads, checksums, and atomically
 # replaces the running binary and its proxy companion. Also verifies checksum
-# rollback, `--check` behaviour, and dev-build refusal.
+# rollback, `--check` behaviour, dev-build refusal, and Homebrew ownership.
 #
 # Run manually:   ./tests/integration-update.sh
 # Run in CI:      same (fast — no VM, no external network)
@@ -15,13 +15,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
-# (here, `update`'s confirmation) on stdin being a TTY. Every call below passes
+# (here, `update`'s confirmation) on stdin being a TTY. Direct update calls pass
 # --yes or --check so no prompt fires today, but a future prompt-bearing case
 # run from an interactive shell (the release preflight) would read real
 # keystrokes and block — under CI stdin is already not a TTY, so it would never
-# be caught there. Redirecting the whole script makes every coop subprocess see
-# a non-TTY stdin regardless of how the suite is invoked. The script itself
-# never reads stdin.
+# be caught there. Redirect the script's stdin regardless of how the suite is
+# invoked. The Homebrew regression fixture explicitly supplies a pseudo-terminal
+# to exercise interactive background checks. The script itself never reads stdin.
 exec </dev/null
 
 # ── Platform detection (matches install.sh / update::target_triple) ──────────
@@ -122,6 +122,7 @@ JSON
 # All `cargo build` invocations must run before HOME is redirected — cargo
 # uses $HOME for its registry and toolchain caches.
 
+unset COOP_PACKAGE_MANAGER
 echo "==> Building explicit test-source binary..."
 (
     cd "$PROJECT_DIR"
@@ -134,6 +135,16 @@ FIXTURE_BIN="$TMPDIR/bin/coop-test-source"
 cp "$PROJECT_DIR/target/release/coop" "$FIXTURE_BIN"
 cp "$FIXTURE_BIN" "$TMPDIR/bin/coop"
 export COOP_BIN="$TMPDIR/bin/coop"
+
+# Build this checkout, not the release archive/backport in Formula/coop.rb.
+# Keep the same test-source policy; only package ownership differs.
+echo "==> Building Homebrew test-source binary..."
+(
+    cd "$PROJECT_DIR"
+    COOP_FORCE_BUILD_KIND=test COOP_PACKAGE_MANAGER=homebrew cargo build --release --quiet
+)
+HOMEBREW_BIN="$TMPDIR/bin/coop-homebrew"
+cp "$PROJECT_DIR/target/release/coop" "$HOMEBREW_BIN"
 
 echo "==> Building official release-policy binary..."
 (
@@ -230,6 +241,10 @@ write_release_json \
     "$FIXTURE/repos/trailofbits/coop/releases/latest" \
     "$FAKE_TAG" \
     "$(full_assets_block)"
+
+echo "==> Homebrew ownership guards"
+python3 "$SCRIPT_DIR/homebrew-guards.py" "$FIXTURE_BIN" "$HOMEBREW_BIN"
+pass "Homebrew suppresses background updates and refuses self-update/uninstall"
 
 echo "==> Test 1: successful update replaces binary"
 if "$COOP_BIN" update --yes > "$TMPDIR/t1.log" 2>&1; then
