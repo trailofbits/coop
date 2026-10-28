@@ -2,8 +2,12 @@ name: Homebrew
 
 on:
   pull_request:
+    paths:
+      - "Formula/**"
   push:
     branches: [main]
+    paths:
+      - "Formula/**"
 
 permissions:
   contents: read
