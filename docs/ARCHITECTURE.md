@@ -32,6 +32,7 @@ coop/
 │   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
 │   ├── vsock_proxy.rs      # bounded Firecracker CONNECT handshake + byte relay
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
+│   ├── web_editor.rs       # on-demand editor sessions, private IPC and SSH orchestration
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
 │   ├── secret_store.rs     # pluggable secret backends (keychain/op/secret-tool/file)

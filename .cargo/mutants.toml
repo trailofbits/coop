@@ -70,6 +70,8 @@ exclude_re = [
   "src/vsock_proxy\\.rs:.*\\bread_response\\b",
   "src/vsock_proxy\\.rs:.*NonblockingFd::new",
   "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd>::drop",
+  # Web editor orchestration is exercised by direct SSH and real VM fixtures.
+  "src/web_editor\\.rs:.*\\b(control|control_request|load|stop|run|wait_attached|serve_session|show|ssh_launch|nonblocking_stdin|finish|drop)\\b",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
   # Creation-hook SSH execution and lifecycle orchestration require a guest.

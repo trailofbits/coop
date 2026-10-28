@@ -5885,6 +5885,10 @@ test_host_mount() {
         skip "live mount sync" "Firecracker uses one-time rsync sync"
     fi
 
+    # The editor uses the VM's existing filesystem access, including live
+    # Lima shares. Exercise the same lifecycle checks on a mounted workspace.
+    test_web_editor "$mount_instance"
+
     # `restore --reprovision` against a MOUNT-source instance. The main
     # reprovision phase only covers WorkspaceSource::Workspace (the copy
     # transport), so without this the Mount arm of
@@ -8275,6 +8279,18 @@ test_guest_user_alt() {
 
 # ── Main ──────────────────────────────────────────────────────
 
+test_web_editor() {
+    echo ""
+    echo "=== Phase: web editor ==="
+    local probe name="${1:-$INSTANCE}"
+    probe="$(dirname "$0")/integration-web-editor.py"
+    if python3 "$probe" --binary "$BINARY" --name "$name" --config "$SUITE_CONFIG"; then
+        pass "browser editor installation, authentication, restart and cleanup"
+    else
+        fail "browser editor installation, authentication, restart and cleanup"
+    fi
+}
+
 main() {
     echo "coop integration tests"
     echo "================================"
@@ -8326,6 +8342,7 @@ EOF
     test_ssh_alias
     test_ssh_config
     test_editor
+    test_web_editor
     test_exec
     test_claude_bin_path
     test_grok_bin_path

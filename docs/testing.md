@@ -125,6 +125,13 @@ Lifecycle and guest-visible changes still require both real backends:
 
 ## Integration tests
 
+The web-editor phase checks login and session cleanup, including mounted workspaces.
+For a focused run, use a disposable VM: this fixture stops and restarts it.
+
+```sh
+python3 tests/integration-web-editor.py --binary target/debug/coop --name TEST_VM --config TEST_CONFIG
+```
+
 Generated completion is checked without a VM by
 `cargo test --test shell_completion --test zsh_completion`.
 CI runs the generated Bash and zsh
