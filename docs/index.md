@@ -40,7 +40,5 @@ short navigational entrypoint; durable detail lives here.
 
 - [`.agents/skills/`](../.agents/skills/) — shared review, closeout, mutation,
   integration, and PR-shepherding workflows discovered by Codex.
-- [`.github/workflows/codex-review.yml`](../.github/workflows/codex-review.yml)
-  — trusted-user, on-demand `@codex` review in a read-only sandbox.
 - [`.claude/`](../.claude/) — compatibility commands, skill entrypoints, and
   local hooks/settings.
