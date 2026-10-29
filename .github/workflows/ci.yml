@@ -120,7 +120,7 @@ jobs:
         run: cargo kani setup
 
       - name: Verify all proofs
-        run: cargo kani --output-format terse
+        run: cargo kani --workspace --output-format terse
 
   deny:
     runs-on: ubuntu-latest
