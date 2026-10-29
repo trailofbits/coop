@@ -3064,7 +3064,9 @@ test_firecracker_isolated_network_mode() {
     local new_cfg="$tmpdir/isolated-new-config.toml"
     local new_ws="$tmpdir/isolated-new-workspace"
     local isolated_grok_config="$tmpdir/isolated-grok-config"
+    local workspace_marker="isolated-workspace-sync-$$"
     mkdir -p "$new_ws"
+    printf '%s\n' "$workspace_marker" > "$new_ws/host-sentinel.txt"
     mkdir -p "$isolated_grok_config"
     printf '%s\n' '{"access_token":"must-not-copy-while-isolated"}' \
         > "$isolated_grok_config/auth.json"
@@ -3142,6 +3144,13 @@ CFGEOF
         else
             fail "new configured isolated VM runs beside an open VM without its own TAP" \
                 "isolated tap=$new_tap; open tap=$tap"
+        fi
+        if coop --config "$new_cfg" exec "$new_name" -- \
+            grep -Fx "$workspace_marker" /workspace/host-sentinel.txt; then
+            pass "initial workspace sync reaches an isolated VM over vsock"
+        else
+            fail "initial workspace sync reaches an isolated VM over vsock" \
+                "stdout=$HARNESS_OUT stderr=$HARNESS_ERR"
         fi
         if coop --config "$new_cfg" network "$new_name" \
             && [[ "$HARNESS_OUT" == *"Network:  isolated"* ]] \
