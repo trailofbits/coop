@@ -1,9 +1,9 @@
 # Testing
 
-coop has four test layers: integration tests (the primary gate), unit tests,
-and three manual quality checks — mutation testing, fuzzing, and formal
-verification (kani). Only the integration and unit tests run in CI; the other
-three are manual, run when a change warrants them.
+coop has five test layers: integration tests (the primary gate), unit tests,
+formal verification (kani), and two manual quality checks — mutation testing
+and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
+fuzzing run manually when a change warrants them.
 
 ## Cross-platform compile and lint checks
 
@@ -616,24 +616,26 @@ fuzz run <target> <artifact-path>`.
 ## Formal verification (kani)
 
 [Kani](https://model-checking.github.io/kani/) is a bounded model checker that
-proves the *absence* of a property (here: arithmetic overflow / panics) over all
-inputs in a range, rather than sampling like proptest. It is a **narrow fit** —
-the type system already makes most illegal states unrepresentable, so kani earns
-its keep only on bounded integer/float arithmetic. A manual check, not a CI gate;
-it needs its own toolchain.
+checks assertions over every input admitted by a proof harness, rather than
+sampling like proptest. We use it for small arithmetic and byte-policy kernels.
+The `kani` CI job runs every workspace proof on PRs and pushes to `main`. It
+needs its own toolchain.
 
 Proofs live in a `#[cfg(kani)]` module so the normal build never compiles them.
-They run as one module in `src/config.rs`.
+They live beside their kernels in `src/config.rs`, `src/proxy.rs`,
+`src/privileged_disk.rs`, `src/commands/lifecycle.rs`, and
+`coop-proxy/src/proxy.rs`.
 
 **Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install
---locked kani-verifier && cargo kani setup`
+kani-verifier --version =0.67.0 --locked && cargo kani setup`. Keep the version
+in `.github/workflows/ci.yml` synchronized with `scripts/install-dev-tools.sh`.
 
 ```bash
-cargo kani                                            # run every proof harness (~5s)
-cargo kani --harness disk_relative_add_never_wraps    # one harness
+cargo kani --workspace --output-format terse          # run every proof harness
+cargo kani --workspace --harness disk_relative_add_never_wraps
 ```
 
-**Current proofs (`src/config.rs`, `mod proofs`):**
+**Current proofs:**
 
 - `disk_relative_add_never_wraps` — the arithmetic kernel of `DiskSize::resolve`'s
   relative branch (`current.checked_add(delta)`): for any two non-zero `u32`
@@ -643,6 +645,29 @@ cargo kani --harness disk_relative_add_never_wraps    # one harness
   strictly positive across the whole non-zero range.
 - `instance_index_octet_stays_in_range` — the guest IP/MAC last octet
   (`index + 2`) stays in `2..=254` for every valid `InstanceIndex` (`0..=252`).
+- `gib_ceil_conversion_never_wraps` — rounding any `u64` byte length up to GiB
+  preserves the quotient or rejects it when it exceeds `u32`.
+- `gib_as_bytes_is_exact` — every valid GiB quantity has an exact `u64` byte
+  representation with no remainder or overflow.
+- `privileged_disk_size_never_wraps` — the privileged disk helper's GiB-to-byte
+  multiplication preserves the size or rejects overflow.
+- `proxy_ports_are_exact_and_unique` — valid provider/instance pairs get their
+  exact base-plus-index port, and different pairs never collide.
+- `operation_policy_is_exact_allowlist` — for arbitrary bounded host/path bytes,
+  a request is allowed exactly for POST and the four allowed host/path pairs.
+  The production length guard denies inputs longer than the longest allowed
+  host or path. URI parsing and query handling remain covered by proxy unit tests.
+- `capability_token_comparison_matches_byte_equality` — every pair of 64-byte
+  tokens compares equal exactly when every byte matches; 63-byte and 65-byte
+  presented tokens reject. This is a functional proof; it does not prove
+  execution timing.
+- `relative_disk_target_preserves_exact_bytes` — a relative resize uses the
+  ceiling of the exact old byte length, then adds the requested GiB; a target
+  is returned exactly when the non-zero old length and sum are representable.
+- `reprovision_regrow_preserves_exact_old_length` — when the replacement is
+  shorter than the old disk, the regrow target holds every old byte; otherwise
+  no regrow is requested. The proof binds the old GiB size to the old byte
+  length using the same ceil conversion as the caller.
 
 A note on the disk proof: the harness verifies the `checked_add` kernel directly
 rather than calling `DiskSize::resolve`, because `resolve` wraps the overflow

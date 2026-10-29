@@ -259,10 +259,13 @@ impl Quantity<GibUnit> {
 
     /// Smallest whole-GiB size that can contain `bytes`.
     pub fn from_bytes_ceil(bytes: u64) -> Result<Self> {
-        let gib = bytes.div_ceil(GIB_BYTES);
-        let value = u32::try_from(gib).context("Disk size exceeds supported GiB range")?;
+        let value = gib_ceil_u32(bytes).context("Disk size exceeds supported GiB range")?;
         Self::new(value).context("Disk is smaller than 1 byte")
     }
+}
+
+fn gib_ceil_u32(bytes: u64) -> Option<u32> {
+    u32::try_from(bytes.div_ceil(GIB_BYTES)).ok()
 }
 
 /// Show the exact file length alongside its binary-unit context.
@@ -361,11 +364,7 @@ impl DiskSize {
     pub fn resolve(self, current: GiB) -> Result<GiB> {
         match self {
             Self::Absolute(gib) => Ok(gib),
-            Self::Relative(gib) => current
-                .as_nonzero()
-                .checked_add(gib.as_u32())
-                .map(GiB::from_nonzero)
-                .context("Disk size overflow"),
+            Self::Relative(gib) => relative_disk_target(current, gib).context("Disk size overflow"),
         }
     }
 
@@ -377,6 +376,13 @@ impl DiskSize {
             Self::Relative(_) => self.resolve(GiB::from_bytes_ceil(current_bytes)?),
         }
     }
+}
+
+fn relative_disk_target(current: GiB, delta: GiB) -> Option<GiB> {
+    current
+        .as_nonzero()
+        .checked_add(delta.as_u32())
+        .map(GiB::from_nonzero)
 }
 
 /// Instance index (0..=252), used to derive guest IP, TAP name, MAC, and vsock CID.
@@ -3313,24 +3319,45 @@ fn default_firecracker_bin() -> ConfigPath {
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
-/// `clippy` never compile them. Run manually with `cargo kani`; see the
+/// `clippy` never compile them. Run with `cargo kani`; see the
 /// "Formal verification (kani)" section in `docs/testing.md`.
 ///
-/// Kani is a narrow fit in a string-heavy CLI — the type system carries
-/// most invariants here. These proofs target the only genuine fit:
-/// bounded integer/float arithmetic where a wrap or overflow would panic.
+/// The type system carries most invariants here. These proofs target bounded
+/// integer/float arithmetic and exact-byte disk sizing.
 /// The `InstanceIndex` IP-derivation range is verified instead by the
 /// exhaustive `0..=252` unit test (`instance_network_derivations_over_full_range`),
 /// and `SubnetMask` carries no arithmetic to verify — it is stored and
 /// rendered as `/N`, with the `0..=32` bound enforced by its constructor.
 #[cfg(kani)]
 mod proofs {
-    use super::{GiB, InstanceIndex, MiB};
+    use super::{GIB_BYTES, GiB, InstanceIndex, MiB, gib_ceil_u32, relative_disk_target};
 
-    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch:
-    /// `current.checked_add(delta)`. Over every pair of non-zero `u32`
-    /// sizes it yields `Some(current + delta)` exactly when the sum fits,
-    /// and `None` otherwise — it never wraps and never panics.
+    /// Whole-GiB rounding preserves the quotient or rejects an out-of-range
+    /// value; it cannot narrow a large file length into a small disk size.
+    #[kani::proof]
+    fn gib_ceil_conversion_never_wraps() {
+        let bytes: u64 = kani::any();
+        let rounded = bytes.div_ceil(GIB_BYTES);
+        let converted = gib_ceil_u32(bytes);
+        assert_eq!(converted.is_some(), rounded <= u64::from(u32::MAX));
+        if let Some(gib) = converted {
+            assert_eq!(u64::from(gib), rounded);
+        }
+    }
+
+    /// Every valid GiB quantity converts to an exact byte count in `u64`.
+    #[kani::proof]
+    fn gib_as_bytes_is_exact() {
+        let raw: u32 = kani::any();
+        let Some(gib) = GiB::new(raw) else { return };
+        let bytes = gib.as_bytes();
+        assert_eq!(bytes / GIB_BYTES, u64::from(raw));
+        assert_eq!(bytes % GIB_BYTES, 0);
+    }
+
+    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch.
+    /// Over every pair of non-zero `u32` sizes it yields the exact sum
+    /// when it fits, and `None` otherwise.
     ///
     /// This proves the kernel directly rather than through `resolve`,
     /// because `resolve` wraps the `None` case with `anyhow`'s
@@ -3346,13 +3373,33 @@ mod proofs {
         let (Some(current), Some(delta)) = (GiB::new(current_raw), GiB::new(delta_raw)) else {
             return;
         };
-        match current
-            .as_nonzero()
-            .checked_add(delta.as_u32())
-            .map(GiB::from_nonzero)
-        {
+        match relative_disk_target(current, delta) {
             Some(sum) => assert_eq!(sum.as_u32(), current_raw + delta_raw),
             None => assert!(current_raw.checked_add(delta_raw).is_none()),
+        }
+    }
+
+    /// A relative increase is added to the ceiling of the exact old file
+    /// length. A successful target always holds that file plus the requested
+    /// increase; an unrepresentable old length or sum is rejected.
+    #[kani::proof]
+    fn relative_disk_target_preserves_exact_bytes() {
+        let bytes: u64 = kani::any();
+        let delta_raw: u32 = kani::any();
+        let Some(delta) = GiB::new(delta_raw) else {
+            return;
+        };
+        let current = gib_ceil_u32(bytes).and_then(GiB::new);
+        let target = current.and_then(|current| relative_disk_target(current, delta));
+        let needed = u128::from(bytes) + u128::from(delta_raw) * u128::from(GIB_BYTES);
+        let expected = u128::from(bytes.div_ceil(GIB_BYTES)) + u128::from(delta_raw);
+        assert_eq!(
+            target.is_some(),
+            bytes != 0 && expected <= u128::from(u32::MAX)
+        );
+        if let Some(target) = target {
+            assert_eq!(u128::from(target.as_u32()), expected);
+            assert!(u128::from(target.as_bytes()) >= needed);
         }
     }
 
@@ -6422,6 +6469,9 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert_eq!(GiB::from_bytes_ceil(GIB_BYTES + 4096).unwrap().as_u32(), 2);
         assert_eq!(GiB::from_bytes_ceil(1).unwrap().as_u32(), 1);
         assert!(GiB::from_bytes_ceil(0).is_err());
+        let largest = u64::from(u32::MAX) * GIB_BYTES;
+        assert_eq!(GiB::from_bytes_ceil(largest).unwrap().as_u32(), u32::MAX);
+        assert!(GiB::from_bytes_ceil(largest + 1).is_err());
         assert!(GiB::from_bytes_ceil(u64::MAX).is_err());
         assert_eq!(
             format_disk_bytes(GIB_BYTES + 4096),

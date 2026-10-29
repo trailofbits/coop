@@ -34,7 +34,9 @@ use serde::Serialize;
 
 use crate::backend::SshTarget;
 use crate::codex_token::CodexTokenMetadata;
-use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value};
+use crate::config::{
+    Instance, InstanceIndex, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value,
+};
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
@@ -100,7 +102,11 @@ impl Provider {
 
     /// Per-instance listen port: base + index.
     fn port(self, inst: &Instance) -> u16 {
-        self.base_port().saturating_add(inst.index.as_u16())
+        self.port_for_index(inst.index)
+    }
+
+    fn port_for_index(self, index: InstanceIndex) -> u16 {
+        self.base_port().saturating_add(index.as_u16())
     }
 
     /// Whether the capability token must be persisted host-side for later
@@ -111,6 +117,45 @@ impl Provider {
     /// its token stays in host memory only (unchanged from slice 1).
     fn persists_token(self) -> bool {
         matches!(self, Provider::Openai)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{InstanceIndex, Provider};
+
+    /// Every valid provider/instance pair gets an exact, unique host port.
+    #[kani::proof]
+    fn proxy_ports_are_exact_and_unique() {
+        let Some(first_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let Some(second_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let first = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let second = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let first_port = first.port_for_index(first_index);
+        let second_port = second.port_for_index(second_index);
+        assert_eq!(
+            u32::from(first_port),
+            u32::from(first.base_port()) + first_index.as_u32()
+        );
+        assert_eq!(
+            u32::from(second_port),
+            u32::from(second.base_port()) + second_index.as_u32()
+        );
+        if first != second || first_index != second_index {
+            assert_ne!(first_port, second_port);
+        }
     }
 }
 

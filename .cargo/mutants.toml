@@ -88,7 +88,7 @@ exclude_re = [
   "src/private_storage\\.rs:.*MigrationOutcome::report",
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
-  # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
+  # cfg(kani) proofs (each module's `mod proofs`): never compiled in a normal
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
