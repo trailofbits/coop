@@ -7,7 +7,7 @@
 
 use std::io::{self, Read as _, Write as _};
 use std::num::NonZeroU32;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -38,40 +38,81 @@ pub(crate) fn permanent_readiness_error(error: &anyhow::Error) -> bool {
     })
 }
 
-struct NonblockingFd {
-    fd: std::os::fd::RawFd,
-    original_flags: libc::c_int,
+struct NonblockingFd<'fd> {
+    fd: BorrowedFd<'fd>,
+    original_flags: Option<libc::c_int>,
 }
 
-impl NonblockingFd {
-    fn new(fd: std::os::fd::RawFd, description: &str) -> Result<Self> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    Reading,
+    Draining,
+    ShutDown,
+}
+
+impl<'fd> NonblockingFd<'fd> {
+    fn new(fd: BorrowedFd<'fd>, description: &str) -> Result<Self> {
         // SAFETY: fcntl only inspects flags for the live borrowed descriptor.
-        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let original_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         if original_flags == -1 {
             return Err(io::Error::last_os_error())
                 .with_context(|| format!("Failed to inspect {description} flags"));
         }
-        if original_flags & libc::O_NONBLOCK == 0 {
+        let changed = original_flags & libc::O_NONBLOCK == 0;
+        if changed {
             // SAFETY: fcntl updates flags for the same live descriptor.
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } == -1 {
+            if unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_SETFL,
+                    original_flags | libc::O_NONBLOCK,
+                )
+            } == -1
+            {
                 return Err(io::Error::last_os_error())
                     .with_context(|| format!("Failed to make {description} nonblocking"));
             }
         }
-        Ok(Self { fd, original_flags })
+        Ok(Self {
+            fd,
+            original_flags: changed.then_some(original_flags),
+        })
     }
 }
 
-impl Drop for NonblockingFd {
+impl Drop for NonblockingFd<'_> {
     fn drop(&mut self) {
-        // SAFETY: the relay only borrows standard I/O, which remains live
-        // until process exit. Restoration is best-effort during unwinding.
-        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.original_flags) } == -1 {
+        let Some(original_flags) = self.original_flags else {
+            return;
+        };
+        // SAFETY: BorrowedFd keeps the descriptor live for the guard's lifetime.
+        // Restoration is best-effort during unwinding.
+        if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, original_flags) } == -1 {
             tracing::debug!(
                 "Failed to restore ProxyCommand descriptor flags: {}",
                 io::Error::last_os_error()
             );
         }
+    }
+}
+
+fn read_fd(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: BorrowedFd is live, and the slice is writable for its length.
+    let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if read == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        usize::try_from(read).map_err(|_| io::Error::other("Invalid descriptor read count"))
+    }
+}
+
+fn write_fd(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<usize> {
+    // SAFETY: BorrowedFd is live, and the slice is readable for its length.
+    let written = unsafe { libc::write(fd.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
+    if written == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        usize::try_from(written).map_err(|_| io::Error::other("Invalid descriptor write count"))
     }
 }
 
@@ -102,7 +143,7 @@ pub(crate) fn connect(
     match socket.connect(&address) {
         Ok(()) => {}
         Err(error) if matches!(error.raw_os_error(), Some(libc::EINPROGRESS | libc::EAGAIN)) => {
-            let revents = wait_fd(socket.as_raw_fd(), libc::POLLOUT, deadline)?;
+            let revents = wait_fd(socket.as_fd(), libc::POLLOUT, deadline)?;
             if let Some(error) = socket
                 .take_error()
                 .context("Failed to inspect Firecracker vsock connection")?
@@ -157,7 +198,7 @@ pub(crate) fn connect(
 }
 
 fn wait_ready(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<()> {
-    let revents = wait_fd(stream.as_raw_fd(), events, deadline)?;
+    let revents = wait_fd(stream.as_fd(), events, deadline)?;
     if revents & (libc::POLLERR | libc::POLLNVAL) != 0
         || revents & libc::POLLHUP != 0 && revents & events == 0
     {
@@ -170,18 +211,14 @@ fn wait_ready(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> 
     Ok(())
 }
 
-fn wait_fd(
-    fd: std::os::fd::RawFd,
-    events: libc::c_short,
-    deadline: Instant,
-) -> Result<libc::c_short> {
+fn wait_fd(fd: BorrowedFd<'_>, events: libc::c_short, deadline: Instant) -> Result<libc::c_short> {
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .context("Timed out during Firecracker vsock CONNECT handshake")?;
         let milliseconds = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
         let mut poll_fd = libc::pollfd {
-            fd,
+            fd: fd.as_raw_fd(),
             events,
             revents: 0,
         };
@@ -253,174 +290,259 @@ pub(crate) fn run(socket_path: &Path, guest_port: NonZeroU32) -> Result<()> {
 /// The socket is nonblocking and `poll(2)` drives both directions. This avoids
 /// leaving a thread blocked on terminal input when the guest closes first and
 /// lets the `ProxyCommand` process exit promptly for OpenSSH to reap.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single bidirectional poll state machine is clearer kept together"
-)]
-fn relay(mut stream: UnixStream) -> Result<()> {
-    const BUFFER_LEN: usize = 64 * 1024;
-
-    let _stdin_flags = NonblockingFd::new(libc::STDIN_FILENO, "ProxyCommand stdin")?;
-    let _stdout_flags = NonblockingFd::new(libc::STDOUT_FILENO, "ProxyCommand stdout")?;
+fn relay(stream: UnixStream) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let _stdin_flags = NonblockingFd::new(stdin.as_fd(), "ProxyCommand stdin")?;
+    let _stdout_flags = NonblockingFd::new(stdout.as_fd(), "ProxyCommand stdout")?;
     stream
         .set_nonblocking(true)
         .context("Failed to make Firecracker vsock relay nonblocking")?;
-    let mut to_guest = Vec::with_capacity(BUFFER_LEN);
-    let mut to_host = Vec::with_capacity(BUFFER_LEN);
-    let mut read_buffer = vec![0_u8; BUFFER_LEN];
-    let mut stdin_eof = false;
-    let mut write_shutdown = false;
-    let mut guest_eof = false;
+    Relay::new(stream, stdin.as_fd(), stdout.as_fd()).run()
+}
 
-    while !guest_eof || !to_host.is_empty() {
-        let poll_stdin = !stdin_eof && to_guest.len() < BUFFER_LEN;
-        let poll_stream_read = !guest_eof && to_host.len() < BUFFER_LEN;
-        let poll_stream_write = !to_guest.is_empty();
-        let poll_stdout = !to_host.is_empty();
-        let mut poll_fds = [
-            poll_entry(libc::STDIN_FILENO, libc::POLLIN, poll_stdin),
-            poll_entry(
-                stream.as_raw_fd(),
-                (if poll_stream_read { libc::POLLIN } else { 0 })
-                    | (if poll_stream_write { libc::POLLOUT } else { 0 }),
-                poll_stream_read || poll_stream_write,
-            ),
-            poll_entry(libc::STDOUT_FILENO, libc::POLLOUT, poll_stdout),
-        ];
-        // SAFETY: poll_fds is a live, initialized array for this call.
-        let ready = unsafe {
-            libc::poll(
-                poll_fds.as_mut_ptr(),
-                poll_fds
-                    .len()
-                    .try_into()
-                    .context("Too many Firecracker vsock poll descriptors")?,
-                -1,
-            )
-        };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("Failed to poll Firecracker vsock relay");
+const BUFFER_LEN: usize = 65_536;
+
+/// Bytes waiting for one destination. Only `append` can grow this buffer, and
+/// callers read no more than `remaining` bytes into it.
+struct PendingBytes {
+    bytes: Vec<u8>,
+}
+
+impl PendingBytes {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(BUFFER_LEN),
         }
+    }
 
-        if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0
-            && !stdin_eof
-            && to_guest.len() < BUFFER_LEN
-        {
-            // SAFETY: read_buffer is writable for the supplied slice length;
-            // STDIN_FILENO remains borrowed rather than owned by the relay.
-            let read = unsafe {
-                libc::read(
-                    libc::STDIN_FILENO,
-                    read_buffer.as_mut_ptr().cast(),
-                    BUFFER_LEN - to_guest.len(),
+    fn remaining(&self) -> usize {
+        BUFFER_LEN - self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        debug_assert!(bytes.len() <= self.remaining());
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn consume(&mut self, written: usize) {
+        debug_assert!(written <= self.bytes.len());
+        self.bytes.drain(..written);
+    }
+}
+
+struct Readiness {
+    stdin: libc::c_short,
+    guest: libc::c_short,
+    stdout: libc::c_short,
+}
+
+struct Relay<'fd> {
+    stream: UnixStream,
+    stdin: BorrowedFd<'fd>,
+    stdout: BorrowedFd<'fd>,
+    to_guest: PendingBytes,
+    to_host: PendingBytes,
+    read_buffer: Vec<u8>,
+    input_state: InputState,
+    guest_eof: bool,
+}
+
+impl<'fd> Relay<'fd> {
+    fn new(stream: UnixStream, stdin: BorrowedFd<'fd>, stdout: BorrowedFd<'fd>) -> Self {
+        Self {
+            stream,
+            stdin,
+            stdout,
+            to_guest: PendingBytes::new(),
+            to_host: PendingBytes::new(),
+            read_buffer: vec![0_u8; BUFFER_LEN],
+            input_state: InputState::Reading,
+            guest_eof: false,
+        }
+    }
+
+    fn run(mut self) -> Result<()> {
+        // ProxyCommand treats guest read EOF as session end. Flush already-read
+        // guest output, then exit even if host stdin stays open.
+        while !self.guest_eof || !self.to_host.is_empty() {
+            let ready = self.poll()?;
+            self.read_stdin(ready.stdin)?;
+            self.write_guest(ready.guest)?;
+            self.read_guest(ready.guest)?;
+            self.check_guest_error(ready.guest)?;
+            self.write_stdout(ready.stdout)?;
+            self.check_stdio_errors(ready.stdin, ready.stdout)?;
+            self.finish_input()?;
+        }
+        Ok(())
+    }
+
+    fn poll(&self) -> Result<Readiness> {
+        let poll_stdin = self.input_state == InputState::Reading && self.to_guest.remaining() > 0;
+        let poll_guest_read = !self.guest_eof && self.to_host.remaining() > 0;
+        let poll_guest_write = !self.to_guest.is_empty();
+        let poll_stdout = !self.to_host.is_empty();
+        let mut poll_fds = [
+            poll_entry(self.stdin.as_raw_fd(), libc::POLLIN, poll_stdin),
+            poll_entry(
+                self.stream.as_raw_fd(),
+                (if poll_guest_read { libc::POLLIN } else { 0 })
+                    | (if poll_guest_write { libc::POLLOUT } else { 0 }),
+                poll_guest_read || poll_guest_write,
+            ),
+            poll_entry(self.stdout.as_raw_fd(), libc::POLLOUT, poll_stdout),
+        ];
+        loop {
+            // SAFETY: poll_fds is a live, initialized array for this call.
+            let ready = unsafe {
+                libc::poll(
+                    poll_fds.as_mut_ptr(),
+                    poll_fds
+                        .len()
+                        .try_into()
+                        .context("Too many Firecracker vsock poll descriptors")?,
+                    -1,
                 )
             };
-            match read {
-                0 => stdin_eof = true,
-                1.. => {
-                    let read = usize::try_from(read).context("Invalid ProxyCommand stdin read")?;
-                    to_guest.extend_from_slice(&read_buffer[..read]);
-                }
-                _ => {
-                    let error = io::Error::last_os_error();
-                    if !matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) {
-                        return Err(error).context("Failed to read ProxyCommand stdin");
-                    }
-                }
+            if ready >= 0 {
+                return Ok(Readiness {
+                    stdin: poll_fds[0].revents,
+                    guest: poll_fds[1].revents,
+                    stdout: poll_fds[2].revents,
+                });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error).context("Failed to poll Firecracker vsock relay");
+            }
+            for entry in &mut poll_fds {
+                entry.revents = 0;
             }
         }
+    }
 
-        if stdin_eof && to_guest.is_empty() && !write_shutdown {
-            stream
-                .shutdown(std::net::Shutdown::Write)
-                .context("Failed to close Firecracker vsock write side")?;
-            write_shutdown = true;
-        }
-
-        if poll_fds[1].revents & (libc::POLLOUT | libc::POLLHUP) != 0 && !to_guest.is_empty() {
-            match stream.write(&to_guest) {
-                Ok(0) => bail!("Firecracker vsock closed while writing"),
-                Ok(written) => {
-                    to_guest.drain(..written);
-                    if stdin_eof && to_guest.is_empty() {
-                        stream
-                            .shutdown(std::net::Shutdown::Write)
-                            .context("Failed to close Firecracker vsock write side")?;
-                        write_shutdown = true;
-                    }
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        && poll_fds[1].revents & libc::POLLHUP == 0 => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(error).context("Firecracker vsock hung up while writing");
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error).context("Failed to write Firecracker vsock"),
-            }
-        }
-
-        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0
-            && !guest_eof
-            && to_host.len() < BUFFER_LEN
+    fn read_stdin(&mut self, events: libc::c_short) -> Result<()> {
+        if events & (libc::POLLIN | libc::POLLHUP) == 0
+            || self.input_state != InputState::Reading
+            || self.to_guest.remaining() == 0
         {
-            match stream.read(&mut read_buffer[..BUFFER_LEN - to_host.len()]) {
-                Ok(0) => guest_eof = true,
-                Ok(read) => to_host.extend_from_slice(&read_buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error).context("Failed to read Firecracker vsock"),
-            }
+            return Ok(());
         }
+        let room = self.to_guest.remaining();
+        match read_fd(self.stdin, &mut self.read_buffer[..room]) {
+            Ok(0) => self.input_state = InputState::Draining,
+            Ok(read) => self.to_guest.append(&self.read_buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error).context("Failed to read ProxyCommand stdin"),
+        }
+        Ok(())
+    }
 
-        if poll_fds[1].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            let error = stream
+    fn write_guest(&mut self, events: libc::c_short) -> Result<()> {
+        if events & (libc::POLLOUT | libc::POLLHUP) == 0 || self.to_guest.is_empty() {
+            return Ok(());
+        }
+        match self.stream.write(self.to_guest.as_slice()) {
+            Ok(0) => bail!("Firecracker vsock closed while writing"),
+            Ok(written) => self.to_guest.consume(written),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && events & libc::POLLHUP == 0 => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(error).context("Firecracker vsock hung up while writing");
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("Failed to write Firecracker vsock"),
+        }
+        Ok(())
+    }
+
+    fn read_guest(&mut self, events: libc::c_short) -> Result<()> {
+        if events & (libc::POLLIN | libc::POLLHUP) == 0
+            || self.guest_eof
+            || self.to_host.remaining() == 0
+        {
+            return Ok(());
+        }
+        match self
+            .stream
+            .read(&mut self.read_buffer[..self.to_host.remaining()])
+        {
+            Ok(0) => self.guest_eof = true,
+            Ok(read) => self.to_host.append(&self.read_buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("Failed to read Firecracker vsock"),
+        }
+        Ok(())
+    }
+
+    fn check_guest_error(&self, events: libc::c_short) -> Result<()> {
+        if events & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            let error = self
+                .stream
                 .take_error()
                 .context("Failed to inspect Firecracker vsock relay error")?
                 .unwrap_or_else(|| io::Error::other("Firecracker vsock poll error"));
             return Err(error.into());
         }
+        Ok(())
+    }
 
-        if poll_fds[2].revents & libc::POLLOUT != 0 && !to_host.is_empty() {
-            // SAFETY: to_host is readable for its length; STDOUT_FILENO
-            // remains borrowed rather than owned by the relay.
-            let written =
-                unsafe { libc::write(libc::STDOUT_FILENO, to_host.as_ptr().cast(), to_host.len()) };
-            match written {
-                0 => bail!("ProxyCommand stdout closed while writing"),
-                1.. => {
-                    let written =
-                        usize::try_from(written).context("Invalid ProxyCommand stdout write")?;
-                    to_host.drain(..written);
-                }
-                _ => {
-                    let error = io::Error::last_os_error();
-                    if !matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) {
-                        return Err(error).context("Failed to write ProxyCommand stdout");
-                    }
-                }
-            }
+    fn write_stdout(&mut self, events: libc::c_short) -> Result<()> {
+        if events & libc::POLLOUT == 0 || self.to_host.is_empty() {
+            return Ok(());
         }
-        if poll_fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        match write_fd(self.stdout, self.to_host.as_slice()) {
+            Ok(0) => bail!("ProxyCommand stdout closed while writing"),
+            Ok(written) => self.to_host.consume(written),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error).context("Failed to write ProxyCommand stdout"),
+        }
+        Ok(())
+    }
+
+    fn check_stdio_errors(
+        &self,
+        stdin_events: libc::c_short,
+        stdout_events: libc::c_short,
+    ) -> Result<()> {
+        if stdin_events & (libc::POLLERR | libc::POLLNVAL) != 0 {
             bail!("ProxyCommand stdin poll error");
         }
-        if poll_fds[2].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-            && !to_host.is_empty()
+        if stdout_events & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            && !self.to_host.is_empty()
         {
             bail!("ProxyCommand stdout closed while writing");
         }
+        Ok(())
     }
-    Ok(())
+
+    fn finish_input(&mut self) -> Result<()> {
+        if self.input_state == InputState::Draining && self.to_guest.is_empty() {
+            self.stream
+                .shutdown(std::net::Shutdown::Write)
+                .context("Failed to close Firecracker vsock write side")?;
+            self.input_state = InputState::ShutDown;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +564,51 @@ mod tests {
         assert_eq!(active.fd, 42);
         assert_eq!(active.events, libc::POLLIN | libc::POLLOUT);
         assert_eq!(active.revents, 0);
+    }
+
+    #[test]
+    fn nonblocking_guard_restores_only_the_transition_it_made() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        {
+            let _guard = NonblockingFd::new(stream.as_fd(), "test stream").unwrap();
+            assert_ne!(descriptor_flags(&stream) & libc::O_NONBLOCK, 0);
+        }
+        assert_eq!(descriptor_flags(&stream) & libc::O_NONBLOCK, 0);
+
+        stream.set_nonblocking(true).unwrap();
+        {
+            let _guard = NonblockingFd::new(stream.as_fd(), "test stream").unwrap();
+            stream.set_nonblocking(false).unwrap();
+        }
+        assert_eq!(descriptor_flags(&stream) & libc::O_NONBLOCK, 0);
+    }
+
+    fn descriptor_flags(stream: &UnixStream) -> libc::c_int {
+        // SAFETY: the stream owns the descriptor throughout this call.
+        unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) }
+    }
+
+    #[test]
+    fn pending_bytes_preserves_order_and_reports_backpressure() {
+        let mut pending = PendingBytes::new();
+        assert!(pending.is_empty());
+        assert_eq!(pending.remaining(), BUFFER_LEN);
+
+        pending.append(&[1, 2, 3]);
+        assert_eq!(pending.as_slice(), &[1, 2, 3]);
+        assert_eq!(pending.remaining(), BUFFER_LEN - 3);
+        pending.consume(2);
+        assert_eq!(pending.as_slice(), &[3]);
+        assert!(!pending.is_empty());
+        pending.consume(1);
+        assert!(pending.is_empty());
+        assert_eq!(pending.remaining(), BUFFER_LEN);
+
+        pending.append(&vec![7; BUFFER_LEN]);
+        assert_eq!(pending.remaining(), 0);
+        pending.consume(BUFFER_LEN);
+        assert!(pending.is_empty());
     }
 
     fn fixture(
