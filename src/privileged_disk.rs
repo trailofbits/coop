@@ -325,8 +325,28 @@ fn open_copy_scratch(parent: &File, name: &CStr, uid: u32) -> Result<File> {
 
 fn size_bytes(size_gib: &str) -> Result<u64> {
     let gib: u64 = size_gib.parse().context("Invalid disk size")?;
+    size_bytes_gib(gib).context("Disk size overflow")
+}
+
+fn size_bytes_gib(gib: u64) -> Option<u64> {
     gib.checked_mul(crate::config::GIB_BYTES)
-        .context("Disk size overflow")
+}
+
+#[cfg(kani)]
+mod proofs {
+    /// A requested GiB count either converts exactly to bytes or reports
+    /// overflow before the privileged helper resizes a disk.
+    #[kani::proof]
+    fn privileged_disk_size_never_wraps() {
+        let gib: u64 = kani::any();
+        let converted = super::size_bytes_gib(gib);
+        let gib_bytes = crate::config::GIB_BYTES;
+        assert_eq!(converted.is_some(), gib <= u64::MAX / gib_bytes);
+        if let Some(bytes) = converted {
+            assert_eq!(bytes / gib_bytes, gib);
+            assert_eq!(bytes % gib_bytes, 0);
+        }
+    }
 }
 
 pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&str>) -> Result<()> {
@@ -802,6 +822,16 @@ mod tests {
         DiskTool::Resize,
         DiskTool::Format,
     ];
+
+    #[test]
+    fn size_bytes_rejects_overflow() {
+        let maximum = u64::MAX / crate::config::GIB_BYTES;
+        assert_eq!(
+            size_bytes(&maximum.to_string()).unwrap(),
+            maximum * crate::config::GIB_BYTES
+        );
+        assert!(size_bytes(&(maximum + 1).to_string()).is_err());
+    }
 
     #[test]
     fn disk_tools_accept_clean_status() {

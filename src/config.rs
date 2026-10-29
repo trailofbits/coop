@@ -259,10 +259,13 @@ impl Quantity<GibUnit> {
 
     /// Smallest whole-GiB size that can contain `bytes`.
     pub fn from_bytes_ceil(bytes: u64) -> Result<Self> {
-        let gib = bytes.div_ceil(GIB_BYTES);
-        let value = u32::try_from(gib).context("Disk size exceeds supported GiB range")?;
+        let value = gib_ceil_u32(bytes).context("Disk size exceeds supported GiB range")?;
         Self::new(value).context("Disk is smaller than 1 byte")
     }
+}
+
+fn gib_ceil_u32(bytes: u64) -> Option<u32> {
+    u32::try_from(bytes.div_ceil(GIB_BYTES)).ok()
 }
 
 /// Show the exact file length alongside its binary-unit context.
@@ -3313,19 +3316,41 @@ fn default_firecracker_bin() -> ConfigPath {
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
-/// `clippy` never compile them. Run manually with `cargo kani`; see the
+/// `clippy` never compile them. Run with `cargo kani`; see the
 /// "Formal verification (kani)" section in `docs/testing.md`.
 ///
 /// Kani is a narrow fit in a string-heavy CLI — the type system carries
-/// most invariants here. These proofs target the only genuine fit:
-/// bounded integer/float arithmetic where a wrap or overflow would panic.
+/// most invariants here. These proofs target bounded integer/float arithmetic.
 /// The `InstanceIndex` IP-derivation range is verified instead by the
 /// exhaustive `0..=252` unit test (`instance_network_derivations_over_full_range`),
 /// and `SubnetMask` carries no arithmetic to verify — it is stored and
 /// rendered as `/N`, with the `0..=32` bound enforced by its constructor.
 #[cfg(kani)]
 mod proofs {
-    use super::{GiB, InstanceIndex, MiB};
+    use super::{GIB_BYTES, GiB, InstanceIndex, MiB, gib_ceil_u32};
+
+    /// Whole-GiB rounding preserves the quotient or rejects an out-of-range
+    /// value; it cannot narrow a large file length into a small disk size.
+    #[kani::proof]
+    fn gib_ceil_conversion_never_wraps() {
+        let bytes: u64 = kani::any();
+        let rounded = bytes.div_ceil(GIB_BYTES);
+        let converted = gib_ceil_u32(bytes);
+        assert_eq!(converted.is_some(), rounded <= u64::from(u32::MAX));
+        if let Some(gib) = converted {
+            assert_eq!(u64::from(gib), rounded);
+        }
+    }
+
+    /// Every valid GiB quantity converts to an exact byte count in `u64`.
+    #[kani::proof]
+    fn gib_as_bytes_is_exact() {
+        let raw: u32 = kani::any();
+        let Some(gib) = GiB::new(raw) else { return };
+        let bytes = gib.as_bytes();
+        assert_eq!(bytes / GIB_BYTES, u64::from(raw));
+        assert_eq!(bytes % GIB_BYTES, 0);
+    }
 
     /// The arithmetic kernel of `DiskSize::resolve`'s relative branch:
     /// `current.checked_add(delta)`. Over every pair of non-zero `u32`
@@ -6422,6 +6447,9 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert_eq!(GiB::from_bytes_ceil(GIB_BYTES + 4096).unwrap().as_u32(), 2);
         assert_eq!(GiB::from_bytes_ceil(1).unwrap().as_u32(), 1);
         assert!(GiB::from_bytes_ceil(0).is_err());
+        let largest = u64::from(u32::MAX) * GIB_BYTES;
+        assert_eq!(GiB::from_bytes_ceil(largest).unwrap().as_u32(), u32::MAX);
+        assert!(GiB::from_bytes_ceil(largest + 1).is_err());
         assert!(GiB::from_bytes_ceil(u64::MAX).is_err());
         assert_eq!(
             format_disk_bytes(GIB_BYTES + 4096),

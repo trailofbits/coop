@@ -22,8 +22,8 @@ backend. The sections below note where that applies.
   ```
 
   The script pins the local dev-tool versions; bump a version there rather than
-  installing a floating `latest`. CI pins its own copies of taplo and cargo-deny
-  in `.github/workflows/ci.yml`, so keep those in sync when bumping.
+  installing a floating `latest`. CI pins its own copies of taplo, cargo-deny,
+  and Kani in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
     (`limactl` on your PATH).
@@ -135,11 +135,12 @@ new integration test phase.
 
 ### Optional deeper checks
 
-coop also carries mutation tests (`cargo-mutants`), fuzz targets
-(`cargo-fuzz`), and formal proofs (`kani`). These are manual quality checks,
-not required for every change. If you touch a logic-dense module — config
-parsing and the arithmetic kernels — see
-[docs/testing.md](docs/testing.md) for when and how to run them.
+coop also carries mutation tests (`cargo-mutants`) and fuzz targets
+(`cargo-fuzz`). These are manual quality checks, not required for every change.
+Kani proofs run in CI; run `cargo kani` locally when changing a proof or its
+kernel. If you touch a logic-dense module — config parsing and the arithmetic
+kernels — see [docs/testing.md](docs/testing.md) for when and how to run the
+manual checks.
 
 ## Code style
 

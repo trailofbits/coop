@@ -179,7 +179,7 @@ run_zizmor() {
 
 run_kani() {
   if ! have cargo-kani; then
-    warn "kani not installed — formal-verification proofs skipped (cargo install --locked kani-verifier && cargo kani setup)"
+    warn "kani not installed — formal-verification proofs skipped (cargo install kani-verifier --version =0.67.0 --locked && cargo kani setup)"
     return 0
   fi
   cargo kani

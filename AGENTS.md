@@ -71,7 +71,7 @@ see [`docs/testing.md`](docs/testing.md#cross-platform-compile-and-lint-checks).
 
 Install pinned local dev tools (prek, taplo, cargo-deny, cargo-mutants,
 cargo-fuzz, kani) with `./scripts/install-dev-tools.sh --all`, then `prek
-install`. CI pins its own taplo/cargo-deny versions in
+install`. CI pins its own taplo/cargo-deny/Kani versions in
 `.github/workflows/ci.yml`; keep those in sync with the installer.
 
 ## Before committing
