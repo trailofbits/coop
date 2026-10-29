@@ -31,13 +31,22 @@ pub(crate) fn trusted_test_tempdir() -> tempfile::TempDir {
 ///
 /// `trust_anchor` is the highest directory whose ownership this policy proves.
 /// Production policies anchor at `/`; tests may anchor a private fixture tree.
+#[derive(Clone)]
 pub(crate) struct TrustedToolPolicy {
     trust_anchor: PathBuf,
     allowed_roots: Vec<PathBuf>,
+    allowed_targets: Vec<PathBuf>,
     trusted_uids: Vec<u32>,
 }
 
 impl TrustedToolPolicy {
+    /// Permit one additional canonical target for a selected tool identity.
+    /// Path-chain ownership and mode checks still apply to every hop.
+    pub(crate) fn with_allowed_target_beneath_anchor(mut self, relative: &str) -> Self {
+        self.allowed_targets.push(self.trust_anchor.join(relative));
+        self
+    }
+
     #[cfg_attr(
         not(any(target_os = "linux", test)),
         expect(
@@ -53,6 +62,7 @@ impl TrustedToolPolicy {
         Self {
             trust_anchor: trust_anchor.into(),
             allowed_roots: allowed_roots.into_iter().collect(),
+            allowed_targets: Vec::new(),
             trusted_uids: vec![expected_uid],
         }
     }
@@ -72,6 +82,7 @@ impl TrustedToolPolicy {
         Self {
             trust_anchor: trust_anchor.into(),
             allowed_roots: allowed_roots.into_iter().collect(),
+            allowed_targets: Vec::new(),
             trusted_uids,
         }
     }
@@ -684,7 +695,7 @@ fn validate_candidate(
             Err(reason) => root_failures.push(format!("{}: {reason}", root.display())),
         }
     }
-    if !allowed {
+    if !allowed && !policy.allowed_targets.contains(&canonical_target) {
         let detail = if root_failures.is_empty() {
             String::new()
         } else {

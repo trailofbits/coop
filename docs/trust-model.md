@@ -125,8 +125,10 @@ The Linux network control-plane family is one narrow implementation of this
 contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
 from exact absolute paths. Unset fields use candidates under `/usr/bin`,
 `/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
-under those roots. The invocation-selected config can replace an identity with
-one exact path for non-FHS layouts; an override never falls back to built-ins.
+under those roots. The built-in `sudo` candidate may also resolve to the exact
+`/usr/lib/cargo/bin/sudo` target seen on Ubuntu 26.04 CI. The invocation-selected
+config can replace an identity with one exact path for non-FHS layouts; an
+override never falls back to built-ins.
 Both forms validate every actually traversed path component and symlink hop and
 require root ownership, a regular executable target, and no group/other write
 bits. Configured paths establish filesystem control only, not package, hash,
