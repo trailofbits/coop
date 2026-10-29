@@ -182,7 +182,7 @@ run_kani() {
     warn "kani not installed — formal-verification proofs skipped (cargo install kani-verifier --version =0.67.0 --locked && cargo kani setup)"
     return 0
   fi
-  cargo kani
+  cargo kani --workspace
 }
 
 run_mutants() {

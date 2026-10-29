@@ -2498,6 +2498,33 @@ fn reprovision_regrow_target(
     }
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::{config, reprovision_regrow_target};
+
+    /// The caller rounds the exact old byte length to GiB before choosing a
+    /// regrow target. If the replacement is shorter, the chosen target can
+    /// hold every byte of the old disk; otherwise no regrow is requested.
+    #[kani::proof]
+    fn reprovision_regrow_preserves_exact_old_length() {
+        let previous_bytes: u64 = kani::any();
+        let replacement_bytes: u64 = kani::any();
+        let rounded = previous_bytes.div_ceil(config::GIB_BYTES);
+        let Some(previous_disk) = u32::try_from(rounded).ok().and_then(config::GiB::new) else {
+            return;
+        };
+        let target = reprovision_regrow_target(previous_bytes, replacement_bytes, previous_disk);
+        if replacement_bytes < previous_bytes {
+            let target = target.expect("shorter replacement must regrow");
+            assert_eq!(u64::from(target.as_u32()), rounded);
+            assert!(u128::from(target.as_bytes()) >= u128::from(previous_bytes));
+        } else {
+            assert!(target.is_none());
+            assert!(replacement_bytes >= previous_bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]

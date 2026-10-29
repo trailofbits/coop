@@ -137,10 +137,10 @@ new integration test phase.
 
 coop also carries mutation tests (`cargo-mutants`) and fuzz targets
 (`cargo-fuzz`). These are manual quality checks, not required for every change.
-Kani proofs run in CI; run `cargo kani` locally when changing a proof or its
-kernel. If you touch a logic-dense module — config parsing and the arithmetic
-kernels — see [docs/testing.md](docs/testing.md) for when and how to run the
-manual checks.
+Kani proofs run in CI; run `cargo kani --workspace` locally when changing a
+proof or its kernel. If you touch a logic-dense module — config parsing and the
+arithmetic kernels — see [docs/testing.md](docs/testing.md) for when and how to
+run the manual checks.
 
 ## Code style
 
