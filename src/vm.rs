@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
-use crate::config::{CoopConfig, Instance, MiB};
+use crate::config::{CoopConfig, FirecrackerNetworkMode, Instance, MiB};
 
 // ── Typestate markers ─────────────────────────────────────────
 
@@ -98,11 +98,14 @@ fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
             vcpu_count: cfg.vm.vcpu_count.get(),
             mem_size_mib: cfg.vm.mem_size_mib.get().as_u32(),
         },
-        network_interfaces: vec![NetworkInterface {
-            iface_id: "eth0".to_string(),
-            guest_mac: inst.guest_mac(),
-            host_dev_name: inst.tap_device(),
-        }],
+        network_interfaces: match inst.firecracker_network() {
+            FirecrackerNetworkMode::Open => vec![NetworkInterface {
+                iface_id: "eth0".to_string(),
+                guest_mac: inst.guest_mac(),
+                host_dev_name: inst.tap_device(),
+            }],
+            FirecrackerNetworkMode::Isolated => Vec::new(),
+        },
         vsock: Some(VsockConfig {
             guest_cid: inst.vsock_cid(),
             uds_path: inst.vsock_path().display().to_string(),
@@ -437,14 +440,19 @@ impl<'a> FirecrackerVm<'a, Running> {
         });
 
         let target = crate::backend::firecracker_ssh_target(self.cfg, self.inst)?;
+        let guest_ip = match self.inst.firecracker_network() {
+            FirecrackerNetworkMode::Open => self.inst.guest_ip().to_string(),
+            FirecrackerNetworkMode::Isolated => "none (isolated)".to_string(),
+        };
         let mut out = format!(
             "Instance '{}' running (PID: {pid})\n  \
              vCPUs: {}\n  Memory: {} MiB\n  \
-             Guest IP: {}\n  SSH: {}",
+             Guest IP: {}\n  Network: {}\n  SSH: {}",
             self.inst.name,
             machine.vcpu_count,
             machine.mem_size_mib,
-            self.inst.guest_ip(),
+            guest_ip,
+            self.inst.firecracker_network(),
             target.connection_description(),
         );
 
@@ -664,9 +672,47 @@ fn terminate_firecracker(
 mod tests {
     use super::{
         Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
+        build_config, cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    fn isolated_config_has_no_network_interface_but_retains_vsock() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::Vsock,
+        };
+        inst.set_firecracker_network(crate::config::FirecrackerNetworkMode::Isolated)
+            .unwrap();
+
+        let config = build_config(&CoopConfig::default(), &inst);
+
+        assert!(config.network_interfaces.is_empty());
+        assert!(config.vsock.is_some());
+    }
+
+    #[test]
+    fn open_config_has_exactly_one_network_interface() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::Vsock,
+        };
+
+        assert_eq!(
+            build_config(&CoopConfig::default(), &inst)
+                .network_interfaces
+                .len(),
+            1
+        );
+    }
 
     #[test]
     #[cfg(not(target_os = "macos"))]
@@ -929,15 +975,18 @@ mod tests {
         cfg.guest_env
             .insert("PATH".parse().unwrap(), "/guest-only".into());
         let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
+        // The nested fixture competes with the full test suite for CPU; allow
+        // it to start before concluding that the reboot request stalled.
+        let graceful_timeout = Duration::from_secs(5);
         let started = Instant::now();
         let result = vm.stop_with_probe(
-            Duration::from_secs(1),
+            graceful_timeout,
             Duration::from_secs(1),
             Duration::from_secs(1),
             |_, timeout| probe_shutdown_fixture(&mut process, &root, &mode, timeout),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < graceful_timeout + Duration::from_secs(3),
             "unbounded shutdown"
         );
         assert_shutdown_result(result, &inst, &mut process, &mode);

@@ -342,7 +342,7 @@ test_completions() {
         _clap_complete_coop coop ""
         printf "%s\n" "${COMPREPLY[@]}"
     ' bash "$BINARY" 2>&1); then
-        for sub in shell claude destroy completions; do
+        for sub in shell claude destroy network completions; do
             if grep -Fxq "$sub" <<<"$dyn_out"; then
                 pass "generated bash completion offers \`$sub\`"
             else
@@ -357,7 +357,7 @@ test_completions() {
     # when called via the CompleteEnv protocol.
     if dyn_out=$(_CLAP_COMPLETE_INDEX=1 _CLAP_IFS=$'\013' \
                  COMPLETE=bash "$BINARY" -- coop "" 2>&1); then
-        for sub in shell claude destroy completions; do
+        for sub in shell claude destroy network completions; do
             if echo "$dyn_out" | tr $'\013' '\n' | grep -qx "$sub"; then
                 pass "dynamic completion offers \`$sub\`"
             else
@@ -395,6 +395,30 @@ test_running_vm_completions() {
         fi
     else
         fail "start completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=2 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop network "" 2>&1); then
+        if tr $'\013' '\n' <<<"$candidates" | grep -Fxq "$INSTANCE"; then
+            pass "network completion offers instance"
+        else
+            fail "network completion offers instance" "got: $candidates"
+        fi
+    else
+        fail "network instance completion exits 0" "exit code: $?, output: $candidates"
+    fi
+
+    if candidates=$(_CLAP_COMPLETE_INDEX=3 _CLAP_IFS=$'\013' \
+                    COMPLETE=bash "$BINARY" -- coop network "$INSTANCE" "" 2>&1); then
+        local completed
+        completed=$(tr $'\013' '\n' <<<"$candidates")
+        if grep -Fxq "open" <<<"$completed" && grep -Fxq "isolated" <<<"$completed"; then
+            pass "network mode completion offers the closed enum"
+        else
+            fail "network mode completion offers the closed enum" "got: $completed"
+        fi
+    else
+        fail "network mode completion exits 0" "exit code: $?, output: $candidates"
     fi
 }
 
@@ -859,7 +883,11 @@ test_list_running() {
         fail "list prints NAME/STATE header" "got: $HARNESS_OUT"
     fi
 
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running\$"; then
+    local expected_network="open"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        expected_network="n/a"
+    fi
+    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
         pass "list shows instance as running"
     else
         fail "list shows instance as running" "got: $HARNESS_OUT"
@@ -867,7 +895,7 @@ test_list_running() {
 
     # `ls` alias resolves to the same command.
     if coop ls; then
-        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running\$"; then
+        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
             pass "ls alias prints same output"
         else
             fail "ls alias prints same output" "got: $HARNESS_OUT"
@@ -2996,6 +3024,516 @@ PYEOF
     coop ssh-config "$INSTANCE" --clean >/dev/null 2>&1 || true
 }
 
+# Exercise the structural no-NIC mode and both restart-gated transition
+# directions. The suite config uses vsock control and --no-agents keeps this
+# phase independent of real provider credentials while proving the structural
+# no-NIC state and representative control/file-transfer paths over vsock.
+test_firecracker_isolated_network_mode() {
+    echo ""
+    echo "=== Phase: Firecracker isolated network mode ==="
+
+    if [[ "$(uname -s)" != Linux ]]; then
+        if coop network "$INSTANCE" \
+            && [[ "$HARNESS_OUT" == *"unsupported (Lima)"* ]]; then
+            pass "Lima reports Firecracker network mode as unsupported"
+        else
+            fail "Lima reports Firecracker network mode as unsupported" \
+                "stdout=$HARNESS_OUT stderr=$HARNESS_ERR"
+        fi
+        if coop network "$INSTANCE" isolated; then
+            fail "Lima refuses Firecracker network mode changes" \
+                "command unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"unsupported by the Lima backend"* ]]; then
+            pass "Lima refuses Firecracker network mode changes"
+        else
+            fail "Lima refuses Firecracker network mode changes" \
+                "stderr=$HARNESS_ERR"
+        fi
+        return
+    fi
+
+    local instance_dir="$HOME/.coop/instances/$INSTANCE"
+    local state="$instance_dir/instance.json"
+    local vm_config="$instance_dir/vm_config.json"
+    local tap_index tap marker output alias="coop-$INSTANCE"
+    tap_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$state")
+    tap="tap${tap_index}"
+    marker="isolated-mode-marker-$$"
+
+    local new_name="${INSTANCE}-isolated-new"
+    local new_cfg="$tmpdir/isolated-new-config.toml"
+    local new_ws="$tmpdir/isolated-new-workspace"
+    local isolated_grok_config="$tmpdir/isolated-grok-config"
+    mkdir -p "$new_ws"
+    mkdir -p "$isolated_grok_config"
+    printf '%s\n' '{"access_token":"must-not-copy-while-isolated"}' \
+        > "$isolated_grok_config/auth.json"
+    cat > "$new_cfg" <<'CFGEOF'
+[grok]
+config_dir = "__ISOLATED_GROK_CONFIG__"
+
+[claude]
+github = "off"
+api_key = "sk-ant-isolated-direct-auth-must-not-forward"
+marketplaces = ["owner/pending-remote-marketplace"]
+
+[codex]
+api_key = "sk-isolated-direct-auth-must-not-forward"
+
+[vm]
+firecracker_control = "vsock"
+firecracker_network = "isolated"
+CFGEOF
+    sed -i.bak "s|__ISOLATED_GROK_CONFIG__|$isolated_grok_config|" "$new_cfg"
+    local pending_name="${new_name}-pending"
+    local pending_ws="$tmpdir/${pending_name}-workspace"
+    mkdir -p "$pending_ws"
+    if coop --config "$new_cfg" up "$pending_ws" --name "$pending_name"; then
+        fail "isolated pending remote install fails before VMM/network setup" \
+            "startup unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"pending remote marketplace/plugin installation"* ]] \
+        && ! test -f "$HOME/.coop/instances/$pending_name/firecracker.pid"; then
+        local pending_tap=""
+        if test -f "$HOME/.coop/instances/$pending_name/instance.json"; then
+            local pending_index
+            pending_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' \
+                "$HOME/.coop/instances/$pending_name/instance.json")
+            pending_tap="tap${pending_index}"
+        fi
+        if [[ -z "$pending_tap" ]] || ! ip link show "$pending_tap" >/dev/null 2>&1; then
+            pass "isolated pending remote install fails before VMM/network setup"
+        else
+            fail "isolated pending remote install fails before VMM/network setup" \
+                "unexpected host link $pending_tap"
+        fi
+    else
+        fail "isolated pending remote install fails before VMM/network setup" \
+            "stderr=$HARNESS_ERR"
+    fi
+    coop --config "$new_cfg" destroy "$pending_name" >/dev/null 2>&1 || true
+
+    local git_name="${new_name}-git"
+    if coop --config "$new_cfg" up --git-repo https://example.com/owner/repo.git \
+        --name "$git_name" --no-agents --no-prompt; then
+        fail "isolated --git-repo fails before VMM/network setup" \
+            "startup unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"--git-repo requires guest network access"* ]] \
+        && ! test -f "$HOME/.coop/instances/$git_name/firecracker.pid"; then
+        pass "isolated --git-repo fails before VMM/network setup"
+    else
+        fail "isolated --git-repo fails before VMM/network setup" "stderr=$HARNESS_ERR"
+    fi
+    coop --config "$new_cfg" destroy "$git_name" >/dev/null 2>&1 || true
+
+    if coop --config "$new_cfg" up "$new_ws" --name "$new_name" --no-agents; then
+        STARTED_INSTANCES+=("$new_name")
+        local new_state="$HOME/.coop/instances/$new_name/instance.json"
+        local new_vm_config="$HOME/.coop/instances/$new_name/vm_config.json"
+        local new_index new_tap
+        new_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$new_state")
+        new_tap="tap${new_index}"
+        if grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["network-interfaces"] == []' "$new_vm_config" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1 \
+            && ip link show "$tap" >/dev/null 2>&1 \
+            && coop --config "$new_cfg" exec "$new_name" -- true \
+            && coop_exec true; then
+            pass "new configured isolated VM runs beside an open VM without its own TAP"
+        else
+            fail "new configured isolated VM runs beside an open VM without its own TAP" \
+                "isolated tap=$new_tap; open tap=$tap"
+        fi
+        if coop --config "$new_cfg" network "$new_name" \
+            && [[ "$HARNESS_OUT" == *"Network:  isolated"* ]] \
+            && [[ "$HARNESS_OUT" == *"State:    running"* ]]; then
+            pass "network query reports isolated selection and running state"
+        else
+            fail "network query reports isolated selection and running state" \
+                "stdout=$HARNESS_OUT stderr=$HARNESS_ERR"
+        fi
+        if coop --config "$new_cfg" exec "$new_name" -- env \
+            && ! echo "$HARNESS_OUT" | grep -Eq \
+                '^(ANTHROPIC_API_KEY|OPENAI_API_KEY|XAI_API_KEY|GITHUB_TOKEN|GH_TOKEN)=' \
+            && coop --config "$new_cfg" exec "$new_name" -- \
+                test ! -e /home/ubuntu/.grok/auth.json; then
+            pass "isolated direct-auth credentials and Grok auth are absent from the guest"
+        else
+            fail "isolated direct-auth credentials and Grok auth are absent from the guest" \
+                "guest env leaked a provider credential"
+        fi
+        if coop --config "$new_cfg" claude "$new_name" -- --version; then
+            fail "isolated Claude direct-auth launch requires a proxy" \
+                "launch unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"requires a configured anthropic credential proxy"* ]]; then
+            pass "isolated Claude direct-auth launch requires a proxy"
+        else
+            fail "isolated Claude direct-auth launch requires a proxy" "stderr=$HARNESS_ERR"
+        fi
+        if coop --config "$new_cfg" codex "$new_name" -- --version; then
+            fail "isolated Codex direct-auth launch requires a proxy" \
+                "launch unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"requires a configured openai credential proxy"* ]]; then
+            pass "isolated Codex direct-auth launch requires a proxy"
+        else
+            fail "isolated Codex direct-auth launch requires a proxy" "stderr=$HARNESS_ERR"
+        fi
+
+        local isolated_snapshot="${new_name}-snapshot"
+        if coop --config "$new_cfg" stop "$new_name" \
+            && coop --config "$new_cfg" commit "$new_name" --image "$isolated_snapshot" \
+            && grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && coop --config "$new_cfg" restore "$new_name" --image "$isolated_snapshot" \
+            && grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && coop --config "$new_cfg" restore "$new_name" --image "$isolated_snapshot" \
+                --reprovision --no-agents --no-prompt -y \
+            && grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1 \
+            && coop --config "$new_cfg" exec "$new_name" -- \
+                sh -c '! ip link show eth0 >/dev/null 2>&1'; then
+            pass "commit, restore, and reprovision preserve isolated instance state"
+        else
+            fail "commit, restore, and reprovision preserve isolated instance state" \
+                "state=$(cat "$new_state" 2>/dev/null); stderr=$HARNESS_ERR"
+        fi
+
+        local isolated_pid isolated_exited=0
+        isolated_pid=$(cat "$HOME/.coop/instances/$new_name/firecracker.pid" 2>/dev/null || true)
+        if [[ -n "$isolated_pid" ]] && sudo -n kill -9 "$isolated_pid"; then
+            for _ in {1..50}; do
+                if ! sudo -n kill -0 "$isolated_pid" 2>/dev/null; then
+                    isolated_exited=1
+                    break
+                fi
+                sleep 0.1
+            done
+        fi
+        if [[ "$isolated_exited" -eq 1 ]] \
+            && coop --config "$new_cfg" stop "$new_name" \
+            && coop --config "$new_cfg" start "$new_name" --no-agents \
+            && grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1 \
+            && coop --config "$new_cfg" exec "$new_name" -- true; then
+            pass "isolated state recovers after abrupt VMM loss and stale runtime cleanup"
+        else
+            fail "isolated state recovers after abrupt VMM loss and stale runtime cleanup" \
+                "pid=${isolated_pid:-missing} exited=$isolated_exited stderr=$HARNESS_ERR"
+        fi
+
+        local from_snapshot="${new_name}-from-snapshot"
+        local open_cfg="$tmpdir/isolated-snapshot-open-config.toml"
+        local from_snapshot_ws="$tmpdir/${from_snapshot}-workspace"
+        mkdir -p "$from_snapshot_ws"
+        sed 's/firecracker_network = "isolated"/firecracker_network = "open"/' \
+            "$new_cfg" > "$open_cfg"
+        if coop --config "$open_cfg" up "$from_snapshot_ws" --name "$from_snapshot" \
+            --image "$isolated_snapshot" --no-agents \
+            && grep -q '"firecracker_control": "vsock"' \
+                "$HOME/.coop/instances/$from_snapshot/instance.json"; then
+            STARTED_INSTANCES+=("$from_snapshot")
+            pass "committed image does not make a new instance intrinsically isolated"
+        else
+            fail "committed image does not make a new instance intrinsically isolated" \
+                "stderr=$HARNESS_ERR"
+        fi
+        coop --config "$open_cfg" destroy "$from_snapshot" >/dev/null 2>&1 || true
+        untrack_instance "$from_snapshot"
+
+        local cleanup_fail_cfg="$tmpdir/isolated-cleanup-fail-config.toml"
+        cp "$new_cfg" "$cleanup_fail_cfg"
+        cat >> "$cleanup_fail_cfg" <<'CFGEOF'
+
+[network.host_tools]
+sudo = "/bin/false"
+CFGEOF
+        if coop --config "$new_cfg" stop "$new_name" \
+            && sudo ip tuntap add dev "$new_tap" mode tap user "$(id -un)" \
+            && sudo ip link set "$new_tap" up \
+            && ! coop --config "$cleanup_fail_cfg" network "$new_name" open \
+            && grep -q '"firecracker_control": "vsock_isolated"' "$new_state" \
+            && ip link show "$new_tap" >/dev/null 2>&1; then
+            pass "cleanup failure preserves prior isolated mode and stale resource"
+        else
+            fail "cleanup failure preserves prior isolated mode and stale resource" \
+                "state=$(cat "$new_state" 2>/dev/null); stderr=$HARNESS_ERR"
+        fi
+        if coop --config "$new_cfg" stop "$new_name" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1 \
+            && coop --config "$new_cfg" start "$new_name" --no-agents; then
+            pass "retry recovers after transition cleanup failure"
+        else
+            fail "retry recovers after transition cleanup failure" "stderr=$HARNESS_ERR"
+        fi
+
+        local setup_fail_cfg="$tmpdir/isolated-setup-fail-config.toml"
+        cp "$new_cfg" "$setup_fail_cfg"
+        cat >> "$setup_fail_cfg" <<'CFGEOF'
+
+[network.host_tools]
+bridge = "/bin/false"
+CFGEOF
+        if coop --config "$setup_fail_cfg" network "$new_name" open --restart --no-agents; then
+            fail "target network setup failure leaves requested mode stopped" \
+                "transition unexpectedly succeeded"
+        elif grep -q '"firecracker_control": "vsock"' "$new_state" \
+            && ! test -f "$HOME/.coop/instances/$new_name/firecracker.pid"; then
+            pass "target network setup failure leaves requested mode stopped"
+        else
+            fail "target network setup failure leaves requested mode stopped" \
+                "state=$(cat "$new_state" 2>/dev/null); stderr=$HARNESS_ERR"
+        fi
+        coop --config "$new_cfg" stop "$new_name" >/dev/null 2>&1 || true
+        if coop --config "$new_cfg" network "$new_name" isolated \
+            && coop --config "$new_cfg" start "$new_name" --no-agents; then
+            pass "recover isolated VM after target setup failure"
+        else
+            fail "recover isolated VM after target setup failure" "stderr=$HARNESS_ERR"
+        fi
+
+        local boot_fail_cfg="$tmpdir/isolated-boot-fail-config.toml"
+        cp "$new_cfg" "$boot_fail_cfg"
+        sed -i.bak '1i\
+firecracker_bin = "/bin/false"\
+' "$boot_fail_cfg"
+        if coop --config "$boot_fail_cfg" network "$new_name" open --restart --no-agents; then
+            fail "target VMM boot failure leaves requested mode stopped and cleaned" \
+                "transition unexpectedly succeeded"
+        elif grep -q '"firecracker_control": "vsock"' "$new_state" \
+            && ! test -f "$HOME/.coop/instances/$new_name/firecracker.pid" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1; then
+            pass "target VMM boot failure leaves requested mode stopped and cleaned"
+        else
+            fail "target VMM boot failure leaves requested mode stopped and cleaned" \
+                "state=$(cat "$new_state" 2>/dev/null); stderr=$HARNESS_ERR"
+        fi
+        if coop --config "$new_cfg" network "$new_name" isolated \
+            && coop --config "$new_cfg" start "$new_name" --no-agents \
+            && coop --config "$new_cfg" exec "$new_name" -- \
+                sudo systemctl disable --now coop-vsock-ssh.socket; then
+            pass "prepare isolated vsock-readiness failure"
+        else
+            fail "prepare isolated vsock-readiness failure" "stderr=$HARNESS_ERR"
+        fi
+        if coop --config "$new_cfg" network "$new_name" open --restart --no-agents; then
+            fail "target vsock readiness failure leaves requested mode stopped and cleaned" \
+                "transition unexpectedly succeeded"
+        elif grep -q '"firecracker_control": "vsock"' "$new_state" \
+            && ! test -f "$HOME/.coop/instances/$new_name/firecracker.pid" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1; then
+            pass "target vsock readiness failure leaves requested mode stopped and cleaned"
+        else
+            fail "target vsock readiness failure leaves requested mode stopped and cleaned" \
+                "state=$(cat "$new_state" 2>/dev/null); stderr=$HARNESS_ERR"
+        fi
+        coop --config "$new_cfg" network "$new_name" isolated >/dev/null 2>&1 || true
+        coop --config "$new_cfg" destroy "$new_name" >/dev/null 2>&1 || true
+        if ! test -e "$HOME/.coop/instances/$new_name" \
+            && ! ip link show "$new_tap" >/dev/null 2>&1; then
+            pass "destroy cleans an instance whose persisted selection is isolated"
+        else
+            fail "destroy cleans an instance whose persisted selection is isolated" \
+                "instance directory or TAP remains"
+        fi
+        coop --config "$new_cfg" images --delete "$isolated_snapshot" >/dev/null 2>&1 || true
+    else
+        fail "new configured isolated VM runs beside an open VM without its own TAP" \
+            "stderr=$HARNESS_ERR"
+    fi
+
+    if coop network \
+        && [[ "$HARNESS_OUT" == *"Instance: $INSTANCE"* ]] \
+        && [[ "$HARNESS_OUT" == *"Network:  open"* ]] \
+        && [[ "$HARNESS_OUT" == *"State:    running"* ]]; then
+        pass "network query auto-resolves the sole open instance"
+    elif [[ "$HARNESS_ERR" == *"Multiple instances exist"* ]]; then
+        skip "network query auto-resolves the sole open instance" \
+            "other instances exist on the shared test host"
+    else
+        fail "network query auto-resolves the sole open instance" \
+            "stdout=$HARNESS_OUT stderr=$HARNESS_ERR"
+    fi
+
+    local restart_preflight_cfg="$tmpdir/isolated-restart-preflight-config.toml"
+    cat > "$restart_preflight_cfg" <<CFGEOF
+[grok]
+config_dir = "$tmpdir/does-not-exist-for-network-preflight"
+CFGEOF
+    if coop --config "$restart_preflight_cfg" network "$INSTANCE" isolated \
+        --restart --no-agents; then
+        fail "network restart boot preflight refuses before stopping the running VM" \
+            "transition unexpectedly succeeded"
+    elif grep -q '"firecracker_control": "vsock"' "$state" \
+        && guest_exec true; then
+        pass "network restart boot preflight refuses before stopping the running VM"
+    else
+        fail "network restart boot preflight refuses before stopping the running VM" \
+            "state=$(cat "$state" 2>/dev/null); stderr=$HARNESS_ERR"
+    fi
+
+    if guest_exec sh -c "printf '%s' '$marker' > ./isolated-mode-marker" \
+        && coop stop "$INSTANCE" \
+        && sudo ip tuntap add dev "$tap" mode tap user "$(id -un)" \
+        && sudo ip link set "$tap" up \
+        && coop network "$INSTANCE" isolated \
+        && ! ip link show "$tap" >/dev/null 2>&1 \
+        && coop start "$INSTANCE" --no-agents; then
+        pass "stopped transition needs no proxy and removes a stale prior-mode TAP"
+    else
+        fail "stopped transition needs no proxy and removes a stale prior-mode TAP" \
+            "coop stderr: $HARNESS_ERR; guest stderr: $(guest_stderr)"
+        sudo ip link del "$tap" >/dev/null 2>&1 || true
+        return
+    fi
+
+    if grep -q '"firecracker_control": "vsock_isolated"' "$state" \
+        && python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["network-interfaces"] == []' "$vm_config"; then
+        pass "isolated state is downgrade-rejecting and Firecracker config has no NIC"
+    else
+        fail "isolated state is downgrade-rejecting and Firecracker config has no NIC" \
+            "state=$(cat "$state" 2>/dev/null); config=$(cat "$vm_config" 2>/dev/null)"
+    fi
+
+    if ! ip link show "$tap" >/dev/null 2>&1; then
+        pass "isolated start creates no per-instance TAP"
+    else
+        fail "isolated start creates no per-instance TAP" "host link $tap exists"
+    fi
+
+    if guest_exec sh -c \
+        "ip link show lo >/dev/null && ! ip link show eth0 >/dev/null 2>&1 && ! ip route show default | grep -q ."; then
+        pass "isolated guest has loopback but no eth0 or default route"
+    else
+        fail "isolated guest has loopback but no eth0 or default route" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    if guest_exec sh -c \
+        "! timeout 5 curl -kfsS https://1.1.1.1 >/dev/null 2>&1 \
+         && ! getent hosts example.com >/dev/null 2>&1 \
+         && ! ip route get 172.16.0.1 >/dev/null 2>&1 \
+         && ! python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b\"x\", (\"1.1.1.1\", 53))' >/dev/null 2>&1"; then
+        pass "isolated guest public-IP, UDP, DNS, and host-address probes fail"
+    else
+        fail "isolated guest public-IP, UDP, DNS, and host-address probes fail" \
+            "stderr: $(guest_stderr)"
+    fi
+
+    if output=$(coop_exec printf isolated-exec-ok) && [[ "$output" == "isolated-exec-ok" ]] \
+        && output=$(guest_exec cat ./isolated-mode-marker) && [[ "$output" == "$marker" ]]; then
+        pass "exec and persistent disk state survive the isolated restart over vsock"
+    else
+        fail "exec and persistent disk state survive the isolated restart over vsock" \
+            "output=$output; stderr: $(guest_stderr)"
+    fi
+    printf 'isolated-rsync-ok\n' > "$tmpdir/isolated-rsync.txt"
+    if coop ssh-config "$INSTANCE" \
+        && _timeout 30 rsync -a "$tmpdir/isolated-rsync.txt" "$alias:./isolated-rsync.txt" \
+        2>"$tmpdir/isolated-rsync-stderr" \
+        && output=$(guest_exec cat ./isolated-rsync.txt) \
+        && [[ "$output" == "isolated-rsync-ok" ]]; then
+        pass "rsync works through the isolated vsock target"
+    else
+        fail "rsync works through the isolated vsock target" \
+            "output=$output; stderr=$(cat "$tmpdir/isolated-rsync-stderr" 2>/dev/null)"
+    fi
+
+    local guest_http_port=18767 host_forward_port local_forward_pid
+    host_forward_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    guest_exec sh -c "cat > /tmp/isolated-forward.py <<'PYEOF'
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $guest_http_port))
+s.listen(1)
+c, _ = s.accept()
+c.recv(65536)
+body = b'isolated-forward-ok'
+c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body))
+c.close()
+PYEOF
+nohup python3 /tmp/isolated-forward.py >/tmp/isolated-forward.log 2>&1 &" || true
+    ssh -N -o ExitOnForwardFailure=yes \
+        -L "127.0.0.1:${host_forward_port}:127.0.0.1:${guest_http_port}" \
+        "$alias" >"$tmpdir/isolated-forward-out" 2>&1 &
+    local_forward_pid=$!
+    sleep 1
+    if output=$(curl -fsS --max-time 5 "http://127.0.0.1:${host_forward_port}/") \
+        && [[ "$output" == "isolated-forward-ok" ]]; then
+        pass "local forwarding works through the isolated vsock target"
+    else
+        fail "local forwarding works through the isolated vsock target" \
+            "output=$output; ssh=$(cat "$tmpdir/isolated-forward-out" 2>/dev/null)"
+    fi
+    kill "$local_forward_pid" 2>/dev/null || true
+    wait "$local_forward_pid" 2>/dev/null || true
+
+    if coop ssh-config "$INSTANCE" \
+        && grep -A12 -F "# coop START $alias" "$HOME/.ssh/config" \
+            | grep -q 'ProxyCommand .*__vsock-proxy'; then
+        pass "isolated generated SSH config retains the vsock ProxyCommand"
+    else
+        fail "isolated generated SSH config retains the vsock ProxyCommand" \
+            "stderr: $HARNESS_ERR"
+    fi
+    printf 'isolated-scp-ok\n' > "$tmpdir/isolated-scp.txt"
+    if _timeout 30 scp "$tmpdir/isolated-scp.txt" "$alias:/tmp/isolated-scp.txt" \
+        2>"$tmpdir/isolated-scp-stderr" \
+        && output=$(guest_exec cat /tmp/isolated-scp.txt) \
+        && [[ "$output" == "isolated-scp-ok" ]]; then
+        pass "SCP works through the isolated vsock target"
+    else
+        fail "SCP works through the isolated vsock target" \
+            "output=$output; stderr=$(cat "$tmpdir/isolated-scp-stderr" 2>/dev/null)"
+    fi
+
+    if coop status "$INSTANCE" --json \
+        && grep -q '"network": "isolated"' <<<"$HARNESS_OUT" \
+        && coop list --json \
+        && grep -q '"network": "isolated"' <<<"$HARNESS_OUT"; then
+        pass "status and list JSON report the stable isolated enum"
+    else
+        fail "status and list JSON report the stable isolated enum" \
+            "stdout: $HARNESS_OUT; stderr: $HARNESS_ERR"
+    fi
+
+    if coop network "$INSTANCE" open; then
+        fail "running transition without --restart refuses before mutation" \
+            "command unexpectedly succeeded"
+    elif grep -q '"firecracker_control": "vsock_isolated"' "$state" \
+        && guest_exec true; then
+        pass "running transition without --restart refuses before mutation"
+    else
+        fail "running transition without --restart refuses before mutation" \
+            "state=$(cat "$state" 2>/dev/null); stderr=$HARNESS_ERR"
+    fi
+
+    if coop network "$INSTANCE" open --restart --no-agents \
+        && guest_exec sh -c "test \"\$(cat ./isolated-mode-marker)\" = '$marker'" \
+        && guest_exec curl -fsS --max-time 15 https://example.com >/dev/null; then
+        pass "transition to open preserves disk state and restores ordinary egress"
+    else
+        fail "transition to open preserves disk state and restores ordinary egress" \
+            "coop stderr: $HARNESS_ERR; guest stderr: $(guest_stderr)"
+    fi
+
+    if coop network "$INSTANCE" isolated --restart --no-agents \
+        && coop stop "$INSTANCE" \
+        && coop start "$INSTANCE" --no-agents \
+        && guest_exec sh -c "! ip link show eth0 >/dev/null 2>&1 && ! ip route show default | grep -q ."; then
+        pass "isolated selection persists across an independent stop/start"
+    else
+        fail "isolated selection persists across an independent stop/start" \
+            "coop stderr: $HARNESS_ERR; guest stderr: $(guest_stderr)"
+    fi
+
+    if coop network "$INSTANCE" open --restart --no-agents; then
+        pass "restore open networking for subsequent integration phases"
+    else
+        fail "restore open networking for subsequent integration phases" \
+            "stderr: $HARNESS_ERR"
+    fi
+    coop ssh-config "$INSTANCE" --clean >/dev/null 2>&1 || true
+}
+
 # Old instance.json files have no firecracker_control field and must continue
 # to select TCP without being rewritten merely because the instance was read.
 # Reuse the primary image/disk to keep this compatibility proof bounded.
@@ -3311,7 +3849,11 @@ test_list_stopped() {
         fail "list exits 0 after stop" "exit code: $?"
     fi
 
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +stopped\$"; then
+    local expected_network="open"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        expected_network="n/a"
+    fi
+    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +stopped +${expected_network}\$"; then
         pass "list shows instance as stopped"
     else
         fail "list shows instance as stopped" "got: $HARNESS_OUT"
@@ -7032,6 +7574,9 @@ test_proxy() {
 [claude]
 github = "off"
 
+[vm]
+firecracker_control = "vsock"
+
 [proxy.anthropic]
 credential = "$anthropic_secret"
 auth = "bearer"
@@ -7261,6 +7806,99 @@ STATEEOF
         fi
     else
         fail "locate openai proxy port" "no 127.0.0.1:<port> in codex config"
+    fi
+
+    if [[ "$(uname -s)" == Linux ]]; then
+        if px network "$inst_name" isolated --restart; then
+            pass "proxy-backed VM transitions to structural isolated mode"
+        else
+            fail "proxy-backed VM transitions to structural isolated mode" \
+                "stderr: $HARNESS_ERR"
+        fi
+
+        guest_env=$(px_exec env || true)
+        codex_cfg=$(px_exec cat ./.codex/config.toml || true)
+        settings=$(px_exec cat ./.claude/settings.json || true)
+        oai_port=$(echo "$codex_cfg" | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)
+        cap_token=$(echo "$guest_env" | grep '^COOP_LOCAL_API_KEY=' | cut -d= -f2- || true)
+        local anthropic_port anthropic_token
+        anthropic_port=$(python3 -c 'import json,sys,urllib.parse; print(urllib.parse.urlparse(json.load(sys.stdin)["env"]["ANTHROPIC_BASE_URL"]).port)' <<<"$settings")
+        anthropic_token=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["env"]["ANTHROPIC_AUTH_TOKEN"])' <<<"$settings")
+        if ! echo "$guest_env" | grep -Eq \
+            '^(OPENAI_API_KEY|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_AUTH_TOKEN)=' \
+            && px_exec sh -c \
+                '! ip route show default | grep -q . && ! getent hosts example.com >/dev/null 2>&1'; then
+            pass "isolated proxy boot has no raw provider credential or general route"
+        else
+            fail "isolated proxy boot has no raw provider credential or general route" \
+                "guest env or route violated isolation"
+        fi
+
+        local guest_proxy_status guest_proxy_body
+        guest_proxy_status=$(px_exec curl -sS --max-time 15 -X POST \
+            "http://127.0.0.1:$oai_port/v1/responses" \
+            -H "Authorization: Bearer $cap_token" -H "Content-Type: application/json" \
+            --data '{"model":"gpt-4.1","input":"isolated-ping"}' \
+            --output /tmp/isolated-proxy-body --write-out '%{http_code}' || true)
+        guest_proxy_body=$(px_exec cat /tmp/isolated-proxy-body 2>/dev/null || true)
+        if [[ "$guest_proxy_status" =~ ^[1-5][0-9][0-9]$ ]] \
+            && ! echo "$guest_proxy_body" | grep -Fqi \
+                'missing or invalid coop-proxy capability token' \
+            && ! echo "$guest_proxy_body" | grep -Fqi \
+                'operation is not allowed by coop-proxy'; then
+            pass "isolated guest reaches OpenAI only through the managed reverse proxy"
+        else
+            fail "isolated guest reaches OpenAI only through the managed reverse proxy" \
+                "status=$guest_proxy_status body=$guest_proxy_body"
+        fi
+
+        local anthropic_status anthropic_body
+        anthropic_status=$(px_exec curl -sS --max-time 15 -X POST \
+            "http://127.0.0.1:$anthropic_port/v1/messages" \
+            -H "x-api-key: $anthropic_token" -H "anthropic-version: 2023-06-01" \
+            -H "Content-Type: application/json" \
+            --data '{"model":"claude-sonnet-4-5","max_tokens":1,"messages":[{"role":"user","content":"isolated-ping"}]}' \
+            --output /tmp/isolated-anthropic-body --write-out '%{http_code}' || true)
+        anthropic_body=$(px_exec cat /tmp/isolated-anthropic-body 2>/dev/null || true)
+        if [[ "$anthropic_status" =~ ^[1-5][0-9][0-9]$ ]] \
+            && ! echo "$anthropic_body" | grep -Fqi \
+                'missing or invalid coop-proxy capability token' \
+            && ! echo "$anthropic_body" | grep -Fqi \
+                'operation is not allowed by coop-proxy'; then
+            pass "isolated guest reaches Anthropic only through the managed reverse proxy"
+        else
+            fail "isolated guest reaches Anthropic only through the managed reverse proxy" \
+                "status=$anthropic_status body=$anthropic_body"
+        fi
+
+        if px grok "$inst_name" -- --version; then
+            fail "isolated Grok launch fails locally" "launch unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Grok Build is unsupported in isolated network mode"* ]]; then
+            pass "isolated Grok launch fails locally"
+        else
+            fail "isolated Grok launch fails locally" "stderr: $HARNESS_ERR"
+        fi
+
+        local openai_token_file="$HOME/.coop/instances/$inst_name/proxy-openai.token"
+        if mv "$openai_token_file" "$openai_token_file.missing" \
+            && ! px codex "$inst_name" -- --version \
+            && [[ "$HARNESS_ERR" == *"capability token is missing or empty"* ]]; then
+            pass "isolated Codex launch fails locally when its capability token is missing"
+        else
+            fail "isolated Codex launch fails locally when its capability token is missing" \
+                "stderr: $HARNESS_ERR"
+        fi
+        mv "$openai_token_file.missing" "$openai_token_file" 2>/dev/null || true
+
+        local openai_tunnel_pid="$HOME/.coop/instances/$inst_name/proxy-openai-fwd.pid"
+        if kill "$(cat "$openai_tunnel_pid")" && sleep 1 \
+            && ! px codex "$inst_name" -- --version \
+            && [[ "$HARNESS_ERR" == *"proxy is unavailable in isolated network mode"* ]]; then
+            pass "isolated Codex launch fails locally after its tunnel terminates"
+        else
+            fail "isolated Codex launch fails locally after its tunnel terminates" \
+                "stderr: $HARNESS_ERR"
+        fi
     fi
 
     # ── The jail confines the host-side proxy (issue #411, slice 3) ──
@@ -8347,6 +8985,7 @@ EOF
     test_profiles
     test_guest_fingerprint
     test_vsock_control_without_guest_network
+    test_firecracker_isolated_network_mode
     test_legacy_firecracker_control_compatibility
 
     # Stop + restart + stopped-state verification

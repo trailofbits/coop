@@ -33,6 +33,8 @@ short navigational entrypoint; durable detail lives here.
 - [`credential-proxy.md`](credential-proxy.md) — the opt-in `[proxy]`
   credential-injecting proxy (issue #411): keeps the raw API key out of the
   guest.
+- [`firecracker-network-modes.md`](firecracker-network-modes.md) — restart-gated
+  open and no-NIC isolated networking on Linux/Firecracker.
 - [`json-output-design.md`](json-output-design.md) — the `--json` design
   (a good precedent for design-doc style).
 

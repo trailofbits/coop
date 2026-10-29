@@ -414,9 +414,10 @@ coop grok
 ```
 
 coop launches `grok --always-approve --trust --cwd /workspace`. For permission
-prompts, pass `--ask` (coop passes `--permission-mode default`). A host
-`~/.grok/auth.json` is copied into the guest on boot. If you have not signed
-in on the host, use device-code auth (there is no browser in the guest):
+prompts, pass `--ask` (coop passes `--permission-mode default`). In open mode,
+a host `~/.grok/auth.json` is copied into the guest on boot; isolated mode
+makes no new auth-file copy. If you have not signed in on the host, use
+device-code auth (there is no browser in the guest):
 
 ```
 coop grok -- login --device-auth

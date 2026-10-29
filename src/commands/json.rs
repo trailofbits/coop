@@ -90,6 +90,7 @@ pub(crate) struct InstanceStatus<'a> {
     pub state: InstanceState,
     pub image: &'a config::ImageName,
     pub backend: BackendKind,
+    pub network: Option<config::FirecrackerNetworkMode>,
     pub usage: Option<backend::ResourceUsage>,
 }
 
@@ -99,6 +100,7 @@ pub(crate) struct InstanceStatus<'a> {
 pub(crate) struct InstanceSummary<'a> {
     pub name: &'a config::InstanceName,
     pub state: InstanceState,
+    pub network: Option<config::FirecrackerNetworkMode>,
 }
 
 // ── images ───────────────────────────────────────────────────
@@ -187,6 +189,7 @@ mod tests {
             state: InstanceState::Running,
             image: &image,
             backend: BackendKind::of(&backend::PlatformBackend::new()),
+            network: Some(config::FirecrackerNetworkMode::Isolated),
             usage: Some(backend::ResourceUsage {
                 load_1m: 0.12,
                 mem_used_mib: 512,
@@ -202,6 +205,7 @@ mod tests {
                 "state": "running",
                 "image": "default",
                 "backend": platform_backend_token(),
+                "network": "isolated",
                 "usage": {
                     "load_1m": 0.12,
                     "mem_used_mib": 512,
@@ -222,6 +226,7 @@ mod tests {
             state: InstanceState::Stopped,
             image: &image,
             backend: BackendKind::of(&backend::PlatformBackend::new()),
+            network: None,
             usage: None,
         };
         assert_eq!(to_value(&view)["usage"], Value::Null);
@@ -234,10 +239,11 @@ mod tests {
         let view = InstanceSummary {
             name: &name,
             state: InstanceState::Running,
+            network: Some(config::FirecrackerNetworkMode::Open),
         };
         assert_eq!(
             to_value(&view),
-            json!({ "name": "web", "state": "running" })
+            json!({ "name": "web", "state": "running", "network": "open" })
         );
     }
 

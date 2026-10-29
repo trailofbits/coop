@@ -86,10 +86,12 @@ Every field is optional. An empty `[codex]` section (or omitting it entirely) ke
 
 ### API key forwarding
 
-The default auth mode is `auth = "api_key"`. In this mode, coop forwards
-`OPENAI_API_KEY` to the guest via SSH `SendEnv` on every session: `coop codex`,
-`coop shell`, and `coop exec` alike. The key is never written to disk inside
-the guest.
+The default auth mode is `auth = "api_key"`. With open networking and direct
+authentication, coop forwards `OPENAI_API_KEY` to the guest via SSH `SendEnv`
+on every session: `coop codex`, `coop shell`, and `coop exec` alike. The key is
+never written to disk inside the guest. [Isolated Firecracker
+mode](firecracker-network-modes.md) suppresses the raw key and requires the
+managed OpenAI/Codex proxy instead.
 
 Resolution order:
 
@@ -219,7 +221,7 @@ The default is `~/.codex`. Set to `false` to disable config file copying entirel
 
 ### Environment variable forwarding
 
-`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session, not just during bootstrap.
+`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session except for recognized raw credential names suppressed in isolated mode.
 
 `OPENAI_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms and do not need to appear here.
 
