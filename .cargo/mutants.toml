@@ -61,7 +61,7 @@ exclude_re = [
   # Unit fixtures cover successful, malformed, oversized, and timed-out
   # handshakes; tests/vsock_proxy.rs covers interactive subprocess relay, and
   # the Firecracker integration gate covers the real VMM. Keep the pure
-  # response grammar (`validate_response`) in mutation scope.
+  # response grammar and bounded pending-byte queue in mutation scope.
   "src/vsock_proxy\\.rs:.*\\brun\\b",
   "src/vsock_proxy\\.rs:.*\\brelay\\b",
   "src/vsock_proxy\\.rs:.*\\bconnect\\b",
@@ -69,7 +69,9 @@ exclude_re = [
   "src/vsock_proxy\\.rs:.*\\bwait_fd\\b",
   "src/vsock_proxy\\.rs:.*\\bread_response\\b",
   "src/vsock_proxy\\.rs:.*NonblockingFd::new",
-  "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd>::drop",
+  "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd",
+  "src/vsock_proxy\\.rs:.*\\b(read_fd|write_fd)\\b",
+  "src/vsock_proxy\\.rs:.*Relay<.*>::(run|poll|read_stdin|write_guest|read_guest|check_guest_error|write_stdout|check_stdio_errors|finish_input)\\b",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
   # Creation-hook SSH execution and lifecycle orchestration require a guest.
