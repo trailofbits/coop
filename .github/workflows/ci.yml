@@ -88,6 +88,40 @@ jobs:
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
 
+  kani:
+    runs-on: ubuntu-latest
+    # Keep in sync with KANI_VERSION in scripts/install-dev-tools.sh.
+    env:
+      KANI_VERSION: 0.67.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Kani setup installs its own pinned nightly Rust toolchain. Cache both
+      # that toolchain and the verifier so subsequent runs only check proofs.
+      - name: Cache Kani toolchain
+        id: cache-kani
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+            ~/.rustup/toolchains/nightly-*
+          key: ${{ runner.os }}-${{ runner.arch }}-kani-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Install Kani
+        if: steps.cache-kani.outputs.cache-hit != 'true'
+        run: cargo install kani-verifier --version "=${KANI_VERSION}" --locked
+
+      - name: Set up Kani
+        if: steps.cache-kani.outputs.cache-hit != 'true'
+        run: cargo kani setup
+
+      - name: Verify all proofs
+        run: cargo kani --output-format terse
+
   deny:
     runs-on: ubuntu-latest
     steps:
