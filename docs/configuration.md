@@ -374,8 +374,10 @@ sysctl = "/run/current-system/sw/bin/sysctl"
 These are NixOS's stable system-profile and privilege-wrapper paths; do not
 configure generation-specific `/nix/store` paths because garbage collection can
 remove them. Each field is optional. An unset field uses coop's built-in
-`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. A set field uses only
-the configured absolute path and never falls back.
+`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. The built-in `sudo`
+candidate also accepts the exact `/usr/lib/cargo/bin/sudo` target used by Ubuntu
+26.04 CI. A set field uses only the configured absolute path and never falls
+back.
 
 Configured paths cannot contain shell expansion, `.` or `..`. Immediately
 before use, coop follows the actual symlink chain and requires every traversed
