@@ -1007,6 +1007,13 @@ pub struct VmConfig {
     #[serde(default = "legacy_firecracker_control_mode")]
     pub firecracker_control: FirecrackerControlMode,
 
+    /// Network device policy assigned to newly created Firecracker instances.
+    ///
+    /// Lima ignores this setting. Existing instances retain their persisted
+    /// selection when this default changes.
+    #[serde(default)]
+    pub firecracker_network: FirecrackerNetworkMode,
+
     /// Number of vCPUs
     #[serde(default = "default_vcpus")]
     pub vcpu_count: NonZeroU8,
@@ -1667,7 +1674,9 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeConfig {
-    /// Anthropic API key (forwarded via `SendEnv`, never written to disk)
+    /// Anthropic API key (forwarded via `SendEnv` for open/direct-auth
+    /// sessions, suppressed for isolated/proxy-only sessions, never written
+    /// to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1731,7 +1740,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub auth: CodexAuthMode,
 
-    /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
+    /// `OpenAI` API key (forwarded via `SendEnv` for open/direct-auth sessions,
+    /// suppressed for isolated/proxy-only sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1763,7 +1773,8 @@ pub struct CodexConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GrokConfig {
-    /// xAI API key (forwarded via `SendEnv`, never written to disk)
+    /// xAI API key (forwarded via `SendEnv` for open sessions, suppressed for
+    /// isolated sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -2309,6 +2320,10 @@ impl CoopConfig {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
+        if let Err(error) = validate_firecracker_config(&self.vm) {
+            errors.push(error.to_string());
+        }
+
         // VM config value bounds are enforced by construction, not here:
         // `vcpu_count`/`template_size_gib`/`ssh_port` are NonZero types
         // (zero rejected at deserialization) and `mem_size_mib` is
@@ -2691,12 +2706,23 @@ impl CoopConfig {
 
         let dir = self.instances_dir().join(name.as_str());
         classify_instance_dir_probe(&name, fs::symlink_metadata(&dir).map(|_| ()))?;
+        validate_configured_firecracker_control(self.vm.firecracker_control)?;
+        #[cfg(target_os = "macos")]
+        let firecracker_control = self.vm.firecracker_control;
+        #[cfg(not(target_os = "macos"))]
+        let firecracker_control = if self.vm.firecracker_network == FirecrackerNetworkMode::Isolated
+        {
+            validate_firecracker_modes(self.vm.firecracker_control, self.vm.firecracker_network)?;
+            FirecrackerControlMode::VsockIsolated
+        } else {
+            self.vm.firecracker_control
+        };
         let instance = Instance {
             name,
             index,
             dir,
             image: image.clone(),
-            firecracker_control: self.vm.firecracker_control,
+            firecracker_control,
         };
         instance.save()?;
         Ok(instance)
@@ -2745,6 +2771,7 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             firecracker_control: legacy_firecracker_control_mode(),
+            firecracker_network: FirecrackerNetworkMode::default(),
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_mib(),
             kernel_path: default_kernel_path(),
@@ -2754,11 +2781,12 @@ impl Default for VmConfig {
     }
 }
 
-/// Durable control transport selected when a Firecracker instance is created.
+/// Durable Firecracker connectivity tag selected when an instance is created.
 ///
-/// The value records a mechanism, not a runtime endpoint. Hostnames, ports,
-/// and socket paths continue to be derived from trusted configuration and the
-/// instance directory when the target is constructed.
+/// The legacy values record only the control transport. `VsockIsolated` is a
+/// downgrade-rejecting persisted composite; runtime callers should use
+/// [`Instance::firecracker_control`] and [`Instance::firecracker_network`] to
+/// obtain its normalized dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FirecrackerControlMode {
@@ -2766,10 +2794,78 @@ pub enum FirecrackerControlMode {
     LegacyTcp,
     /// OpenSSH reaches the guest through Firecracker's base vsock socket.
     Vsock,
+    /// Persisted isolated connectivity. This composite value is deliberately
+    /// unknown to prior releases, which makes them reject isolated state
+    /// instead of silently regenerating an open-network VM configuration.
+    #[doc(hidden)]
+    VsockIsolated,
+}
+
+/// Durable Firecracker network-device policy.
+///
+/// `Isolated` is structural: Firecracker is started without a virtio network
+/// interface. Coop control remains available only through vsock-backed SSH.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum FirecrackerNetworkMode {
+    /// Configure the existing TAP-backed virtio network interface.
+    #[default]
+    Open,
+    /// Configure no network interface; only explicit SSH-over-vsock tunnels
+    /// cross the guest boundary.
+    Isolated,
+}
+
+impl FirecrackerNetworkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
+impl fmt::Display for FirecrackerNetworkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn legacy_firecracker_control_mode() -> FirecrackerControlMode {
     FirecrackerControlMode::LegacyTcp
+}
+
+/// Check the only cross-field Firecracker connectivity invariant.
+pub(crate) fn validate_firecracker_modes(
+    control: FirecrackerControlMode,
+    network: FirecrackerNetworkMode,
+) -> Result<()> {
+    validate_configured_firecracker_control(control)?;
+    if network == FirecrackerNetworkMode::Isolated && control != FirecrackerControlMode::Vsock {
+        bail!(
+            "Firecracker network mode 'isolated' requires vsock control; \
+             legacy TCP instances must be recreated explicitly with \
+             [vm].firecracker_control = \"vsock\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_configured_firecracker_control(control: FirecrackerControlMode) -> Result<()> {
+    if control == FirecrackerControlMode::VsockIsolated {
+        bail!(
+            "[vm].firecracker_control = \"vsock_isolated\" is reserved for persisted \
+             instance state; configure \"vsock\" with firecracker_network = \"isolated\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_firecracker_config(vm: &VmConfig) -> Result<()> {
+    validate_configured_firecracker_control(vm.firecracker_control)?;
+    #[cfg(not(target_os = "macos"))]
+    validate_firecracker_modes(vm.firecracker_control, vm.firecracker_network)?;
+    Ok(())
 }
 
 impl Default for NetworkConfig {
@@ -2860,7 +2956,8 @@ pub struct Instance {
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
     pub image: ImageName,
-    /// Firecracker control transport chosen at instance creation time.
+    /// Raw persisted Firecracker connectivity tag. Runtime policy should use
+    /// the normalized accessors instead of matching this field directly.
     pub firecracker_control: FirecrackerControlMode,
 }
 
@@ -2960,6 +3057,54 @@ impl Instance {
     pub(crate) fn set_image(&mut self, image: ImageName) -> Result<()> {
         self.image = image;
         self.save()
+    }
+
+    /// Persist a stopped instance's Firecracker network-device policy.
+    ///
+    /// The caller must hold the instance operation lock. This method validates
+    /// the control/network pair before changing memory or disk state.
+    pub(crate) fn set_firecracker_network(
+        &mut self,
+        network: FirecrackerNetworkMode,
+    ) -> Result<()> {
+        let previous = self.firecracker_control;
+        self.firecracker_control = match (previous, network) {
+            (FirecrackerControlMode::LegacyTcp, FirecrackerNetworkMode::Isolated) => {
+                bail!(
+                    "Firecracker network mode 'isolated' requires vsock control; legacy TCP \
+                     instances must be recreated explicitly"
+                )
+            }
+            (
+                FirecrackerControlMode::Vsock | FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Isolated,
+            ) => FirecrackerControlMode::VsockIsolated,
+            (FirecrackerControlMode::VsockIsolated, FirecrackerNetworkMode::Open) => {
+                FirecrackerControlMode::Vsock
+            }
+            (control, FirecrackerNetworkMode::Open) => control,
+        };
+        if let Err(error) = self.save() {
+            self.firecracker_control = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn firecracker_network(&self) -> FirecrackerNetworkMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerNetworkMode::Isolated,
+            FirecrackerControlMode::LegacyTcp | FirecrackerControlMode::Vsock => {
+                FirecrackerNetworkMode::Open
+            }
+        }
+    }
+
+    pub fn firecracker_control(&self) -> FirecrackerControlMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerControlMode::Vsock,
+            control => control,
+        }
     }
 
     fn load(dir: &Path) -> Result<Self> {
@@ -3630,6 +3775,71 @@ mod tests {
     }
 
     #[test]
+    fn isolated_instance_round_trips_and_prior_parser_rejects_it() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum PriorControlMode {
+            LegacyTcp,
+            Vsock,
+        }
+        #[derive(Deserialize)]
+        struct PriorInstanceMeta {
+            #[serde(rename = "firecracker_control")]
+            _control: PriorControlMode,
+        }
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("isolated");
+        let mut inst = test_inst("isolated", idx(4), dir.clone());
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+            .unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(
+            loaded.firecracker_network(),
+            FirecrackerNetworkMode::Isolated
+        );
+        assert_eq!(loaded.firecracker_control(), FirecrackerControlMode::Vsock);
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "vsock_isolated""#));
+        assert!(serde_json::from_str::<PriorInstanceMeta>(&json).is_err());
+    }
+
+    #[test]
+    fn isolated_transition_rejects_legacy_tcp_without_persisting() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("legacy");
+        let mut inst = test_inst("legacy", idx(5), dir.clone());
+        inst.save().unwrap();
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(
+            Instance::load(&dir).unwrap().firecracker_network(),
+            FirecrackerNetworkMode::Open
+        );
+    }
+
+    #[test]
+    fn isolated_transition_rolls_memory_back_when_publication_fails() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let not_a_directory = tmp.path().join("not-a-directory");
+        fs::write(&not_a_directory, "occupied").unwrap();
+        let mut inst = test_inst("failure", idx(6), not_a_directory);
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
     fn loading_legacy_instance_does_not_rewrite_its_state() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("legacy");
@@ -3645,6 +3855,7 @@ mod tests {
             FirecrackerControlMode::LegacyTcp
         );
         assert_eq!(fs::read(dir.join("instance.json")).unwrap(), original);
+        assert_eq!(loaded.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
@@ -3908,6 +4119,34 @@ mod tests {
             Instance::load(&inst.dir).unwrap().firecracker_control,
             FirecrackerControlMode::Vsock
         );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn allocation_persists_configured_isolated_network_mode() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Isolated);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn lima_allocation_ignores_the_firecracker_network_default() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::Vsock);
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
@@ -5783,6 +6022,55 @@ rsync = "/run/current-system/sw/bin/rsync"
         );
 
         assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_control = \"tcp\"\n").is_err());
+    }
+
+    #[test]
+    fn firecracker_network_mode_parses_and_defaults_open() {
+        let default_cfg: CoopConfig = toml::from_str("[vm]\n").unwrap();
+        assert_eq!(
+            default_cfg.vm.firecracker_network,
+            FirecrackerNetworkMode::Open
+        );
+        let isolated: CoopConfig =
+            toml::from_str("[vm]\nfirecracker_network = \"isolated\"\n").unwrap();
+        assert_eq!(
+            isolated.vm.firecracker_network,
+            FirecrackerNetworkMode::Isolated
+        );
+        assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_network = \"offline\"\n").is_err());
+        assert_eq!(FirecrackerNetworkMode::Open.as_str(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.as_str(), "isolated");
+        assert_eq!(FirecrackerNetworkMode::Open.to_string(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.to_string(), "isolated");
+    }
+
+    #[test]
+    fn isolated_network_requires_explicit_vsock_control() {
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::LegacyTcp,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::Vsock,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Open,
+            )
+            .is_err()
+        );
+        let mut cfg = CoopConfig::default();
+        cfg.vm.firecracker_control = FirecrackerControlMode::VsockIsolated;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("reserved for persisted instance state"));
     }
 
     #[test]

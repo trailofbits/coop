@@ -130,6 +130,14 @@ then used for readiness, shutdown, and every shared SSH consumer. Older state
 without the tag maps to `LegacyTcp` in memory without an eager rewrite. Lima
 remains TCP-based.
 
+Firecracker instances also persist an `open` or `isolated` network mode. The
+isolated representation uses the composite `vsock_isolated` value in the
+existing control field so supported prior releases reject it instead of
+ignoring a new field and booting with a NIC. In memory it normalizes to vsock
+control plus an isolated network policy. Firecracker config generation emits an
+empty `network-interfaces` list and backend startup skips TAP setup; every
+shared SSH consumer continues through the same vsock target.
+
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
 lock. Its file is a sibling of the instance directory, so directory removal

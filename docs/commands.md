@@ -331,9 +331,10 @@ Protocol servers load without a first-run question. Use `--ask` to restore
 permission prompts for that session (coop passes `--permission-mode default`,
 which overrides the guest `ui.permission_mode = "always-approve"`). The
 `login` and `logout` subcommands are launched without `--always-approve`.
-Host `~/.grok/auth.json` is copied into the guest on boot when `config_dir`
-is enabled and set to owner-only (`0600`). If there is no host file, sign
-in with `coop grok -- login --device-auth`.
+In open mode, host `~/.grok/auth.json` is copied into the guest on boot when
+`config_dir` is enabled and set to owner-only (`0600`). Isolated mode makes no
+new auth-file copy and does not remove a copy retained from an earlier open
+boot. If there is no host file, sign in with `coop grok -- login --device-auth`.
 
 Terminal status reports follow the same session lifecycle as `coop claude`.
 
@@ -418,7 +419,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state (`running` or `stopped`) and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list
@@ -429,11 +430,11 @@ Alias: `ls`.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit a JSON array (`[{ "name", "state" }, …]`) instead of the text table |
+| `--json` | Emit a JSON array (`[{ "name", "state", "network" }, …]`) instead of the text table; `network` is `open`/`isolated` for Firecracker and `null` for Lima |
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, lists every instance with its state, selected network mode, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
@@ -451,8 +452,9 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
-(raw MiB / load, or `null` when stopped or the query fails). The rich
+(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), `network`
+(`open`/`isolated` for Firecracker or `null` for Lima), and `usage` (raw MiB /
+load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
 
@@ -463,6 +465,7 @@ $ coop status my-project --json
   "state": "running",
   "image": "default",
   "backend": "firecracker",
+  "network": "isolated",
   "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
              "disk_used_mib": 8192, "disk_total_mib": 20480 }
 }
@@ -577,6 +580,29 @@ reference and the local-model sections of
 [docs/claude-integration.md](claude-integration.md) and
 [docs/codex-integration.md](codex-integration.md) for the resolution and
 materialization details.
+
+### `network`
+
+Show or change a Firecracker VM's persistent network-device policy.
+
+```text
+coop network [NAME] [open|isolated] [--restart] [--no-agents]
+```
+
+With no mode, the command prints the selected mode and current run state.
+The instance name may be omitted only for this query form when it resolves
+unambiguously; mode changes require an explicit instance name.
+Changing a stopped VM persists the target for its next start. A running VM
+refuses the change unless `--restart` is present; that flag stops the VM,
+persists the target, and starts it again. `--no-agents` requires `--restart` and
+permits a control-only isolated boot without credential proxies. Switching to
+`open` warns that every guest process receives general network access.
+
+`isolated` requires persisted vsock control and a compatible image. It creates
+no Firecracker NIC or TAP and never falls back to TCP/open networking. Lima
+reports changes as unsupported. See
+[Firecracker network modes](firecracker-network-modes.md) for guarantees,
+supported agent paths, maintenance, persistence, and limitations.
 
 ### `logs`
 

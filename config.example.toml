@@ -44,6 +44,7 @@
 
 # [vm]
 # firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances
+# firecracker_network = "open"     # Linux only: "open" or "isolated"; isolated requires vsock
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
 # mem_size_mib = 4096           # Memory in MiB (override: --mem)
 # template_size_gib = 8         # Template disk in GiB (override: --template-size)

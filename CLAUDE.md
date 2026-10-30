@@ -98,6 +98,12 @@ adding a runtime check.
 
 - **One PR = one logical change.** Refactors/renames first, then behavior —
   never mixed. Split if the description needs "and" / unrelated bullets.
+- Keep private information out of commits, PRs, issues, and other repository
+  artifacts; this repository is public. Report integration and release
+  preflight results by platform and outcome; omit irrelevant usernames,
+  hostnames, IP addresses, SSH targets, local paths, and identifying log output.
+  Redact pasted commands and logs. If a specific detail may be necessary to
+  explain or reproduce a result, ask before including it.
 - Run the gates before opening: `cargo fmt -- --check`, `cargo clippy … -D
   warnings`, `cargo test`, and the integration suite on both platforms for
   guest-visible or lifecycle changes.

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v0.9.2
+
+### Security
+
+- Harden the Firecracker control plane. Coop now starts Firecracker without
+  exposing its control API socket, safely handles stale sockets from older
+  versions, and offers an opt-in `vm.firecracker_control = "vsock"` mode that
+  keeps SSH control traffic off the guest network. Existing instances retain
+  their persisted transport, and older untagged instances remain on legacy
+  TCP.
+- Update Tokio to 1.54.1 to resolve RUSTSEC-2026-0386, and update the Rustls
+  certificate-validation dependencies.
+
+### Changed
+
+- Define storage and memory sizes in binary GiB and MiB. CLI inputs now accept
+  explicit `GiB` and `MiB` suffixes; legacy `G` and `g` disk suffixes continue
+  to mean GiB, while decimal and ambiguous suffixes are rejected.
+
+### Fixed
+
+- Preserve exact disk byte lengths when checking shrink operations and when
+  resizing or reprovisioning non-GiB-aligned images.
+- Recognize the trusted `sudo` installation path used by Ubuntu 26.04 CI while
+  retaining the existing ownership, permission, and executable checks.
+
 ## v0.9.1
 
 ### Fixed
