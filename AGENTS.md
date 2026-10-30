@@ -106,6 +106,13 @@ over adding a runtime check.
 
 - **One PR = one logical change.** Put refactors/renames before behavior, never
   in the same change. Split if the description needs unrelated bullets.
+- Keep private information out of commits, PR titles/descriptions/comments,
+  issues, and other repository artifacts; this repository is public.
+  When reporting integration or release preflight results, name the platform
+  and outcome without copying an irrelevant username, hostname, IP address,
+  SSH target, local path, or identifying log output. Redact such details from
+  pasted commands and logs. If a specific detail may be necessary to explain
+  or reproduce a result, ask before including it.
 - Run the gates before opening: format, clippy with zero warnings, unit tests,
   and both integration backends for guest-visible or lifecycle changes.
 - Keep cross-file representations in sync: CLI/config ↔ examples and docs;
