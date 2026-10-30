@@ -7,7 +7,7 @@ set -euo pipefail
 # version here, review the diff, and re-run, never a floating "latest". The
 # `=<version>` requirement pins the tool exactly; `--locked` additionally pins
 # each tool's transitive dependency tree to its published Cargo.lock, so an
-# install is reproducible. CI pins its own taplo and cargo-deny versions in
+# install is reproducible. CI pins its own taplo, cargo-deny, and Kani versions in
 # .github/workflows/ci.yml — keep them in sync when bumping here.
 #
 # Usage:
@@ -22,7 +22,7 @@ TAPLO_VERSION="0.10.0"         # TOML formatter (taplo format --check hook + CI)
 CARGO_DENY_VERSION="0.19.9"    # supply-chain: advisories, licenses, bans, sources
 CARGO_MUTANTS_VERSION="27.1.0" # mutation testing (manual, opt-in)
 CARGO_FUZZ_VERSION="0.13.2"    # fuzzing (manual, opt-in; run targets on nightly)
-KANI_VERSION="0.67.0"          # formal verification (manual, opt-in)
+KANI_VERSION="0.67.0"          # formal verification (CI and local)
 
 install_pinned() {
     local crate="$1" version="$2"

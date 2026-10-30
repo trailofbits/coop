@@ -76,7 +76,11 @@ Every field is optional. An empty `[claude]` section (or omitting it entirely) s
 
 ### API key forwarding
 
-coop forwards `ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session: `coop claude`, `coop shell`, and `coop exec` alike. The key is never written to disk inside the guest.
+With open networking and direct authentication, coop forwards
+`ANTHROPIC_API_KEY` to the guest via SSH `SendEnv` on every session: `coop
+claude`, `coop shell`, and `coop exec` alike. The key is never written to disk
+inside the guest. [Isolated Firecracker mode](firecracker-network-modes.md)
+suppresses the raw key and requires the managed Anthropic proxy instead.
 
 Resolution order:
 
@@ -190,7 +194,7 @@ hardening are outside this import contract.
 
 ### Environment variable forwarding
 
-`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session, not just during bootstrap.
+`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session except for recognized raw credential names suppressed in isolated mode.
 
 `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms (described above) and do not need to appear here.
 
@@ -277,11 +281,11 @@ coop up . --no-agents
 coop start --no-agents
 ```
 
-This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. You can still run `coop claude` afterward, and that session forwards `ANTHROPIC_API_KEY` and any `env_forward` variables via SSH. Plugins and MCP servers won't be available unless you configure them manually inside the guest.
+This skips the entire bootstrap sequence. The VM boots normally but gets no API key, no GitHub token, no plugins, and no MCP servers. With open networking, you can still run `coop claude` afterward and that session forwards `ANTHROPIC_API_KEY` and other `env_forward` variables via SSH. An [isolated-mode](firecracker-network-modes.md) `--no-agents` boot is control-only: after configuring the managed proxy, stop it and restart without `--no-agents` before launching Claude. Raw credential variables remain suppressed. Plugins and MCP servers won't be available unless you configure them manually inside the guest.
 
 ## Updating Claude Code
 
-Claude Code auto-updates in the background by default — it checks for a newer version on startup and periodically, and applies the update on the next launch. coop does not disable this and the guest has outbound network access, so Claude Code keeps itself current with no action from you.
+Claude Code auto-updates in the background by default — it checks for a newer version on startup and periodically, and applies the update on the next launch. coop does not disable this. An open-network guest can therefore keep itself current; an [isolated Firecracker guest](firecracker-network-modes.md) has no general egress, so prepare updates in an image or during an explicit open maintenance boot.
 
 To force an update immediately rather than waiting for the background updater:
 

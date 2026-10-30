@@ -868,23 +868,37 @@ fn restart_instance(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
-    tracing::info!("Restarting stopped instance '{}'", inst.name);
     let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
-    drop(be.as_stopped(inst.clone())?);
+    let stopped = be.as_stopped(inst.clone())?;
+    drop(restart_confirmed_instance(be, cfg, stopped, opts)?);
+    Ok(())
+}
+
+fn restart_confirmed_instance(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    stopped: backend::StoppedInstance,
+    opts: &StartOpts<'_>,
+) -> Result<backend::InstanceOperationGuard> {
+    let inst = stopped.instance().clone();
+    tracing::info!("Restarting stopped instance '{}'", inst.name);
+    preflight_isolated_bootstrap(cfg, &inst, opts.no_agents, backend::BootMode::Restart)?;
 
     let _guard = signal::install_handlers();
 
     // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
     // recorded workspace-state to recover the repo slug.
-    let repo = backend::detect_instance_repo(inst);
-    if crate::github_assignment::active(cfg, inst)?.is_none() {
+    let repo = backend::detect_instance_repo(&inst);
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, &inst)?.is_none()
+    {
         pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
     }
 
     // Re-apply the forward set the instance was last started with.
     // CLI `--forward-port` on a restart appends/overrides; otherwise the
     // saved set carries forward untouched.
-    let saved = port_forward::ForwardsState::try_load(inst)?
+    let saved = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
         .unwrap_or_default();
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
@@ -895,7 +909,7 @@ fn restart_instance(
     // translated from devcontainer `containerEnv`. New start-time entries on
     // restart override per-key; the merged result is what gets persisted (and
     // forwarded for this restart's bootstrap).
-    let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
+    let saved_guest_env = guest_env_state::GuestEnvState::try_load(&inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
     let mut merged_guest_env = saved_guest_env;
@@ -911,13 +925,15 @@ fn restart_instance(
         &backend::persisted_guest_user(cfg, &inst.image),
         &[],
     )?;
-    crate::github_assignment::active(cfg, inst)?;
-    crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Waiting)?;
-    be.start_existing(cfg, inst)?;
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
+        crate::github_assignment::active(cfg, &inst)?;
+    }
+    crate::creation_hooks::set_preparation(&inst, crate::creation_hooks::Preparation::Waiting)?;
+    let operation = be.start_confirmed_stopped(cfg, stopped)?;
 
     signal::check_shutdown()?;
 
-    let target = be.ssh_target(cfg, inst)?;
+    let target = be.ssh_target(cfg, &inst)?;
     target
         .wait_until_ready(std::time::Duration::from_secs(30))
         .context("Guest booted but SSH is not accepting connections")?;
@@ -927,40 +943,52 @@ fn restart_instance(
     // Keep an already-installed `coop-<name>` alias current. On Lima the
     // forwarded port changes across stop/start; this is a no-op rewrite on
     // Firecracker. Never installs a block the user didn't ask for.
-    if let Err(e) = workspace::refresh_ssh_config_if_present(&target, inst) {
+    if let Err(e) = workspace::refresh_ssh_config_if_present(&target, &inst) {
         tracing::warn!("Failed to refresh SSH config for '{}': {e}", inst.name);
     }
 
     port_forward::ForwardsState {
         forwards: forwards.clone(),
     }
-    .save(inst)?;
-    port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
+    .save(&inst)?;
+    port_forward::spawn_ssh_forwards(&inst, &target, &forwards)?;
 
     guest_env_state::GuestEnvState {
         entries: merged_guest_env,
     }
-    .save(inst)?;
+    .save(&inst)?;
 
     files.install(&target)?;
     bootstrap_on_boot(
         be,
         cfg,
-        inst,
+        &inst,
         &target,
         repo.as_ref(),
         opts,
         backend::BootMode::Restart,
     )?;
-    let command = creation_post_start(be, cfg, inst, opts)?;
-    run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
+    // User-supplied creation and post-start hooks are intentionally outside
+    // the lifecycle lock: they are unbounded guest commands, and holding the
+    // lock would prevent a concurrent stop/destroy from recovering a hung
+    // hook. Reacquire and revalidate before reporting restart success.
+    drop(operation);
+    let command = creation_post_start(be, cfg, &inst, opts)?;
+    run_configured_post_start(cfg, &inst, &target, repo.as_ref(), command.as_deref())?;
+
+    let operation = backend::InstanceOperationGuard::acquire(&inst)?;
+    anyhow::ensure!(
+        be.as_running(cfg, inst.clone())?.is_some(),
+        "Instance '{}' stopped while its post-start hooks were running",
+        inst.name
+    );
 
     tracing::info!(
         "Instance '{}' restarted — SSH: {}",
         inst.name,
         target.connection_description(),
     );
-    Ok(())
+    Ok(operation)
 }
 
 /// Best-effort GitHub repo resolution for `coop start`.
@@ -1001,11 +1029,22 @@ fn start_instance(
     opts: &StartOpts<'_>,
     image_to_consume: Option<&config::ImageName>,
 ) -> Result<()> {
+    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, backend::BootMode::FirstBoot)?;
+    if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated
+        && opts.git_repo.is_some()
+    {
+        bail!(
+            "--git-repo requires guest network access and is unavailable in isolated mode; \
+             clone on the host and use workspace copy, prepare the image, or switch to open"
+        );
+    }
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
     // forwarding works at bootstrap time.
     let repo = resolve_start_repo(opts)?;
-    if crate::github_assignment::active(cfg, inst)?.is_none() {
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, inst)?.is_none()
+    {
         pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
     }
 
@@ -1416,16 +1455,209 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentKind {
+    Claude,
+    Codex,
+    Grok,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedAgentPolicy {
+    Allowed,
+    GrokUnsupported,
+    LocalModelUnsupported,
+    ProxyRequired,
+}
+
+fn isolated_agent_policy(
+    network: config::FirecrackerNetworkMode,
+    agent: AgentKind,
+    model: model_state::ModelMode,
+    proxy_configured: bool,
+) -> IsolatedAgentPolicy {
+    if network != config::FirecrackerNetworkMode::Isolated {
+        return IsolatedAgentPolicy::Allowed;
+    }
+    if agent == AgentKind::Grok {
+        return IsolatedAgentPolicy::GrokUnsupported;
+    }
+    if model != model_state::ModelMode::Remote {
+        return IsolatedAgentPolicy::LocalModelUnsupported;
+    }
+    if !proxy_configured {
+        return IsolatedAgentPolicy::ProxyRequired;
+    }
+    IsolatedAgentPolicy::Allowed
+}
+
+#[derive(Clone, Copy)]
+enum ProxyReadiness<'a> {
+    Configured,
+    Running(&'a backend::SshTarget),
+}
+
 pub(crate) fn open_agent_session(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
+    agent: AgentKind,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     crate::creation_hooks::ensure_complete(running.instance())?;
+    ensure_isolated_agent_supported(
+        cfg,
+        running.instance(),
+        running.instance().firecracker_network(),
+        agent,
+        ProxyReadiness::Running(running.target()),
+    )?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+}
+
+fn ensure_isolated_agent_supported(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    network: config::FirecrackerNetworkMode,
+    agent: AgentKind,
+    readiness: ProxyReadiness<'_>,
+) -> Result<()> {
+    if network != config::FirecrackerNetworkMode::Isolated {
+        return Ok(());
+    }
+    let provider = match agent {
+        AgentKind::Claude => Some(proxy::Provider::Anthropic),
+        AgentKind::Codex => Some(proxy::Provider::Openai),
+        AgentKind::Grok => None,
+    };
+    let model = if provider.is_some() {
+        model_state::ModelState::load_or_default(inst)?.mode
+    } else {
+        model_state::ModelMode::Remote
+    };
+    let proxy_configured = match provider {
+        Some(provider) if model == model_state::ModelMode::Remote => {
+            proxy_state::effective_upstream(inst, provider, &cfg.proxy)?.is_some()
+        }
+        Some(_) | None => false,
+    };
+    match isolated_agent_policy(network, agent, model, proxy_configured) {
+        IsolatedAgentPolicy::Allowed => {}
+        IsolatedAgentPolicy::GrokUnsupported => bail!(
+            "Grok Build is unsupported in isolated network mode because it has no managed \
+             credential-proxy path; switch the stopped VM to open networking if needed"
+        ),
+        IsolatedAgentPolicy::LocalModelUnsupported => {
+            bail!("local model routing is unavailable in isolated network mode")
+        }
+        IsolatedAgentPolicy::ProxyRequired => {
+            let provider = provider.context("isolated agent proxy provider is missing")?;
+            bail!(
+                "{} requires a configured {} credential proxy in isolated network mode; \
+                 run `coop proxy setup{} --vm {}` before launching it",
+                match agent {
+                    AgentKind::Claude => "Claude",
+                    AgentKind::Codex => "Codex",
+                    AgentKind::Grok => "Grok Build",
+                },
+                provider.name(),
+                if matches!(provider, proxy::Provider::Openai) {
+                    " --openai"
+                } else {
+                    ""
+                },
+                inst.name,
+            );
+        }
+    }
+    if let (ProxyReadiness::Running(target), Some(provider)) = (readiness, provider) {
+        proxy::ensure_runtime_available(inst, provider, target).with_context(|| {
+            format!(
+                "{} proxy is unavailable in isolated network mode; restart the VM to restore \
+                 its managed proxy and reverse tunnel",
+                provider.name()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedBootstrapPolicy {
+    Skip,
+    AgentsOnly,
+    FirstBootAndAgents,
+}
+
+fn isolated_bootstrap_policy(
+    network: config::FirecrackerNetworkMode,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> IsolatedBootstrapPolicy {
+    if no_agents || network != config::FirecrackerNetworkMode::Isolated {
+        IsolatedBootstrapPolicy::Skip
+    } else if mode == backend::BootMode::FirstBoot {
+        IsolatedBootstrapPolicy::FirstBootAndAgents
+    } else {
+        IsolatedBootstrapPolicy::AgentsOnly
+    }
+}
+
+fn preflight_isolated_bootstrap(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> Result<()> {
+    preflight_isolated_bootstrap_for_network(
+        cfg,
+        inst,
+        &inst.image,
+        inst.firecracker_network(),
+        no_agents,
+        mode,
+    )
+}
+
+fn preflight_isolated_bootstrap_for_network(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    network: config::FirecrackerNetworkMode,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> Result<()> {
+    match isolated_bootstrap_policy(network, no_agents, mode) {
+        IsolatedBootstrapPolicy::Skip => return Ok(()),
+        IsolatedBootstrapPolicy::AgentsOnly => {}
+        IsolatedBootstrapPolicy::FirstBootAndAgents => {
+            backend::preflight_isolated_first_boot(cfg, image)?;
+        }
+    }
+    if model_state::ModelState::load_or_default(inst)?.mode != model_state::ModelMode::Remote {
+        bail!("local model routing is unavailable in isolated network mode");
+    }
+    let mut has_proxy = false;
+    for (agent, provider) in [
+        (AgentKind::Claude, proxy::Provider::Anthropic),
+        (AgentKind::Codex, proxy::Provider::Openai),
+    ] {
+        if proxy_state::effective_upstream(inst, provider, &cfg.proxy)?.is_some() {
+            has_proxy = true;
+            ensure_isolated_agent_supported(cfg, inst, network, agent, ProxyReadiness::Configured)?;
+        }
+    }
+    anyhow::ensure!(
+        has_proxy,
+        "isolated agent bootstrap requires at least one configured Anthropic or OpenAI \
+         credential proxy; configure one with `coop proxy setup --vm {}` or \
+         `coop proxy setup --openai --vm {}`, or use --no-agents for a control-only VM",
+        inst.name,
+        inst.name,
+    );
+    Ok(())
 }
 
 fn creation_post_start(
@@ -1483,6 +1715,7 @@ fn bootstrap_on_boot(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
+    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, mode)?;
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1509,7 +1742,9 @@ fn bootstrap_on_boot(
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
     if opts.no_agents {
-        if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
+        if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+            && let Some(assignment) = crate::github_assignment::active(cfg, inst)?
+        {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
@@ -1605,6 +1840,8 @@ pub(crate) fn prepare_session_from_target(
     let remote = model
         .as_ref()
         .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+    let isolated = inst
+        .is_some_and(|inst| inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated);
     let (proxy_anthropic, proxy_openai) = match inst {
         Some(inst) if remote => (
             proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
@@ -1614,7 +1851,8 @@ pub(crate) fn prepare_session_from_target(
         _ => (false, false),
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
-    let suppress_openai_key = proxy_openai || codex_account_auth;
+    let suppress_anthropic_key = proxy_anthropic || isolated;
+    let suppress_openai_key = proxy_openai || codex_account_auth || isolated;
     // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
     // auth even though `CoopConfig::validate` rejects that combination in the
     // config file. Warn here so the reason is visible on every session, and
@@ -1627,12 +1865,23 @@ pub(crate) fn prepare_session_from_target(
         tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
     }
 
-    let assignment = inst
-        .map(|inst| crate::github_assignment::active(cfg, inst))
-        .transpose()?
-        .flatten();
+    let assignment = if isolated {
+        None
+    } else {
+        inst.map(|inst| crate::github_assignment::active(cfg, inst))
+            .transpose()?
+            .flatten()
+    };
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, proxy_openai)?;
+    let mut env = backend::prepare_env_forwarding_for_network(
+        cfg,
+        repo,
+        suppress_anthropic_key,
+        suppress_openai_key,
+        inst.map_or(config::FirecrackerNetworkMode::Open, |inst| {
+            inst.firecracker_network()
+        }),
+    )?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
@@ -1642,11 +1891,19 @@ pub(crate) fn prepare_session_from_target(
                 // `codex.auth = "chatgpt"` forwarding it would let Codex
                 // silently fall back to API billing. Skip and warn, matching
                 // `prepare_env_forwarding`.
-                if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
+                if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
-                    || (proxy_openai && name.as_str() == "CODEX_ACCESS_TOKEN")
+                    || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
+                    || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
+                    || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
+                    || (isolated && name.as_str() == "XAI_API_KEY")
+                    || (isolated && name.as_str() == "GITHUB_TOKEN")
+                    || (isolated && name.as_str() == "GH_TOKEN")
+                    || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
                 {
-                    let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
+                    let reason = if isolated {
+                        "isolated network mode"
+                    } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
                     } else {
                         "proxy mode"
@@ -1663,7 +1920,8 @@ pub(crate) fn prepare_session_from_target(
         // the host). Claude's token rides in settings.json instead. The two
         // modes are mutually exclusive (mode is Local or Remote).
         if let Some(model) = &model {
-            if model.mode == model_state::ModelMode::Local
+            if !isolated
+                && model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
                 env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
@@ -1682,23 +1940,42 @@ pub(crate) fn cmd_stop(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
+    drop(stop_confirmed(be, cfg, inst, true)?.0);
+    Ok(())
+}
+
+/// Stop and clean up an instance while retaining its lifecycle lock for a
+/// caller that must perform a serialized stopped-only follow-up operation.
+fn stop_confirmed(
+    be: &impl backend::VmBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    allow_running: bool,
+) -> Result<(backend::StoppedInstance, backend::StopOutcome)> {
     tracing::info!("Stopping instance '{}'", inst.name);
     // `RunningInstance` records a point-in-time observation from this probe;
     // `be.stop` rechecks under the backend operation lock before mutating.
-    let stopped = if let Some(running) = be.as_running(cfg, inst.clone())? {
-        // Tear down forwards before shutting down the VM so the
-        // control master can exit cleanly while SSH is still
-        // reachable.
-        port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?
+    let (stopped, outcome) = if allow_running {
+        if let Some(running) = be.as_running(cfg, inst.clone())? {
+            // Tear down forwards before shutting down the VM so the
+            // control master can exit cleanly while SSH is still
+            // reachable.
+            port_forward::teardown_ssh_forwards(running.instance(), running.target());
+            be.stop(cfg, running)?
+        } else {
+            tracing::debug!("Instance '{}' is not running", inst.name);
+            let stopped = be.as_stopped(inst.clone())?;
+            if let Ok(target) = be.ssh_target(cfg, inst) {
+                port_forward::teardown_ssh_forwards(inst, &target);
+            }
+            (stopped, backend::StopOutcome::AlreadyStopped)
+        }
     } else {
-        tracing::debug!("Instance '{}' is not running", inst.name);
-        // Stale forwards may still exist even when the VM is gone.
+        let stopped = be.as_stopped(inst.clone())?;
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
-        // Reconfirm the stopped state while acquiring the operation lock.
-        be.as_stopped(inst.clone())?
+        (stopped, backend::StopOutcome::AlreadyStopped)
     };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
     // proxy mode was never on. Do this only after confirmed exit, but before
@@ -1709,6 +1986,174 @@ pub(crate) fn cmd_stop(
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
     // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
+    Ok((stopped, outcome))
+}
+
+/// Show or change a Firecracker instance's persisted network-device policy.
+///
+/// Changes are stopped-only. `restart` explicitly permits stopping a running
+/// guest, persisting the target mode, and starting it again; a failed target
+/// boot leaves the requested mode selected and the instance stopped.
+pub(crate) fn cmd_network(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    name: Option<&config::InstanceName>,
+    requested: Option<config::FirecrackerNetworkMode>,
+    restart: bool,
+    no_agents: bool,
+) -> Result<()> {
+    let inst = cfg.resolve_instance(name)?;
+    if !be.supports_firecracker_network_mode() {
+        if requested.is_some() {
+            bail!("Firecracker network modes are unsupported by the Lima backend");
+        }
+        writeln!(
+            std::io::stdout(),
+            "Instance: {}\nNetwork:  unsupported (Lima)",
+            inst.name
+        )?;
+        return Ok(());
+    }
+
+    let Some(target) = requested else {
+        return render_network_status(be, cfg, &inst);
+    };
+
+    if target == inst.firecracker_network() {
+        writeln!(
+            std::io::stdout(),
+            "Instance '{}' already uses network mode '{}'.",
+            inst.name,
+            target,
+        )?;
+        return Ok(());
+    }
+
+    config::validate_firecracker_modes(inst.firecracker_control(), target)?;
+    if target == config::FirecrackerNetworkMode::Isolated {
+        be.validate_image_control(cfg, &inst.image, inst.firecracker_control())?;
+    }
+
+    let was_running = be.as_running(cfg, inst.clone())?.is_some();
+    if was_running && !restart {
+        bail!(
+            "Instance '{}' is running. Changing its network mode requires a stop/start; \
+             re-run with `coop network {} {} --restart` to acknowledge terminating active \
+             guest processes and agent sessions.",
+            inst.name,
+            inst.name,
+            target,
+        );
+    }
+    if was_running {
+        backend::boot_preflight(cfg)?;
+    }
+    if was_running && target == config::FirecrackerNetworkMode::Isolated {
+        preflight_isolated_bootstrap_for_network(
+            cfg,
+            &inst,
+            &inst.image,
+            target,
+            no_agents,
+            backend::BootMode::Restart,
+        )?;
+    }
+
+    if target == config::FirecrackerNetworkMode::Open {
+        tracing::warn!(
+            "open networking grants general network access to every process in guest '{}'",
+            inst.name
+        );
+    }
+
+    let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
+    let (mut stopped, stop_outcome) = stop_confirmed(be, cfg, &inst, was_running)?;
+    let restart_after_change = restart_network_after_stop(stop_outcome);
+    stopped.instance_mut().set_firecracker_network(target)?;
+    let changed = stopped.instance().clone();
+
+    let operation = if restart_after_change {
+        let opts = network_restart_options(&changed.name, config_path, no_agents);
+        match restart_confirmed_instance(be, cfg, stopped, &opts) {
+            Ok(operation) => Some(operation),
+            Err(start_error) => {
+                let cleanup = cmd_stop(be, cfg, &changed);
+                return match cleanup {
+                    Ok(()) => Err(start_error.context(format!(
+                        "Failed to restart '{}' in network mode '{}'; the requested mode remains \
+                         selected and the instance was left stopped",
+                        changed.name, target
+                    ))),
+                    Err(cleanup_error) => Err(start_error.context(format!(
+                        "Failed to restart '{}' in network mode '{}'; cleanup also failed: \
+                         {cleanup_error:#}",
+                        changed.name, target
+                    ))),
+                };
+            }
+        }
+    } else {
+        drop(stopped);
+        None
+    };
+
+    writeln!(
+        std::io::stdout(),
+        "Instance '{}' network mode is now '{}'.{}",
+        changed.name,
+        target,
+        if restart_after_change {
+            " Restarted."
+        } else {
+            ""
+        },
+    )?;
+    drop(operation);
+    Ok(())
+}
+
+fn restart_network_after_stop(outcome: backend::StopOutcome) -> bool {
+    outcome == backend::StopOutcome::StoppedRunning
+}
+
+fn network_restart_options<'a>(
+    name: &'a config::InstanceName,
+    config_path: &'a Path,
+    no_agents: bool,
+) -> StartOpts<'a> {
+    StartOpts {
+        name: Some(name),
+        workspace_dir: None,
+        git_repo: None,
+        no_agents,
+        no_prompt: false,
+        disk: None,
+        mounts: Vec::new(),
+        exclude_git: false,
+        forward_ports: Vec::new(),
+        config_path,
+        post_start_override: None,
+        persisted_guest_env: std::collections::BTreeMap::new(),
+    }
+}
+
+fn render_network_status(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+) -> Result<()> {
+    let state = if be.as_running(cfg, inst.clone())?.is_some() {
+        "running"
+    } else {
+        "stopped"
+    };
+    writeln!(
+        std::io::stdout(),
+        "Instance: {}\nNetwork:  {}\nState:    {state}",
+        inst.name,
+        inst.firecracker_network(),
+    )?;
     Ok(())
 }
 
@@ -1756,6 +2201,9 @@ pub(crate) fn cmd_list(
         .map(|inst| json::InstanceSummary {
             name: &inst.name,
             state: json::InstanceState::from_running(be.is_running(inst)),
+            network: be
+                .supports_firecracker_network_mode()
+                .then_some(inst.firecracker_network()),
         })
         .collect();
 
@@ -1768,14 +2216,17 @@ pub(crate) fn cmd_list(
             .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
         return Ok(());
     }
-    writeln!(std::io::stdout(), "{:<16} STATE", "NAME")
+    writeln!(std::io::stdout(), "{:<16} {:<10} NETWORK", "NAME", "STATE")
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     for summary in &summaries {
         writeln!(
             std::io::stdout(),
-            "{:<16} {}",
+            "{:<16} {:<10} {}",
             summary.name.as_str(),
-            summary.state.label()
+            summary.state.label(),
+            summary
+                .network
+                .map_or("n/a", config::FirecrackerNetworkMode::as_str),
         )
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     }
@@ -1801,6 +2252,9 @@ fn instance_status<'a>(
         state,
         image: &inst.image,
         backend: json::BackendKind::of(be),
+        network: be
+            .supports_firecracker_network_mode()
+            .then_some(inst.firecracker_network()),
         usage,
     })
 }
@@ -1819,8 +2273,14 @@ pub(crate) fn cmd_status(
         let report = match be.as_running(cfg, inst.clone())? {
             Some(running) => be.status(cfg, &running)?,
             None => format!(
-                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}",
-                inst.name, inst.image,
+                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}\n  Network: {}",
+                inst.name,
+                inst.image,
+                if be.supports_firecracker_network_mode() {
+                    inst.firecracker_network().as_str()
+                } else {
+                    "n/a"
+                },
             ),
         };
         writeln!(std::io::stdout(), "{report}")
@@ -1851,10 +2311,15 @@ pub(crate) fn cmd_status(
             };
             writeln!(
                 std::io::stdout(),
-                "{:<16} {:<10} {:<10} {}{usage_str}",
+                "{:<16} {:<10} {:<10} {:<10} {}{usage_str}",
                 inst.name,
                 state,
                 inst.image,
+                if be.supports_firecracker_network_mode() {
+                    inst.firecracker_network().as_str()
+                } else {
+                    "n/a"
+                },
                 be,
             )
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
@@ -2056,7 +2521,7 @@ pub(crate) fn cmd_restore(
     let inst = cfg.resolve_instance(opts.name)?;
     let _image_lock = setup::lock_image_publication(cfg, image)?;
 
-    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control)?;
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control())?;
 
     let stopped = be.as_stopped(inst)?;
     crate::creation_hooks::restore_disk(
@@ -2109,9 +2574,7 @@ fn reprovision_instance(
     let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
     let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
-    let initial_image_lock = setup::lock_image_publication(cfg, &image)?;
-    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
-    drop(initial_image_lock);
+    preflight_reprovision_image(be, cfg, &inst, &image, opts.no_agents)?;
 
     // Load host-side settings before stopping the guest, so malformed state
     // aborts while it is still running. The image-dependent payload is prepared
@@ -2124,37 +2587,24 @@ fn reprovision_instance(
         .map(|s| s.entries)
         .unwrap_or_default();
 
-    check_reprovision_workspace_source(&inst.name, workspace_state.as_ref())?;
+    check_reprovision_workspace_source(
+        &inst.name,
+        inst.firecracker_network(),
+        workspace_state.as_ref(),
+    )?;
 
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
 
-    if !opts.yes
-        && !prompt::confirm(&reprovision_confirmation(
-            &inst.name,
-            &image,
-            workspace_state.as_ref(),
-        ))?
-    {
-        // `prompt::confirm` is also false off a TTY, so name the flag that
-        // makes a non-interactive reprovision possible.
-        bail!(
-            "Aborted — instance '{}' left untouched.\n\
-             Pass -y to reprovision without the prompt (required when stdin is \
-             not a TTY).",
-            inst.name,
-        );
-    }
+    let repo = confirm_reprovision(cfg, &inst, &image, workspace_state.as_ref(), opts)?;
 
-    // Fire the PAT auto-prompt before any destructive work, for the same
-    // reason `start_instance` fires it before any VM cost: an interactive
-    // wizard should not appear with the guest already wiped.
-    let repo = backend::detect_instance_repo(&inst);
-    if crate::github_assignment::active(cfg, &inst)?.is_none() {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
-    }
+    // Interactive work is complete. Snapshot the selected image contract and
+    // keep its publication lock through stop, copy, and lineage publication so
+    // a forced concurrent commit cannot invalidate either preflight.
+    let image_lock = setup::lock_image_publication(cfg, &image)?;
+    validate_reprovision_image(be, cfg, &inst, &image, opts.no_agents)?;
 
     // Installed before the stop, so a Ctrl-C during it is handled too.
     let _guard = signal::install_handlers();
@@ -2171,12 +2621,6 @@ fn reprovision_instance(
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
 
-    // Re-check and snapshot the image contract only after interactive work is
-    // over, then keep the publication lock through the disk copy and lineage
-    // update. A concurrent forced commit cannot swap the image between its
-    // metadata validation and consumption.
-    let image_lock = setup::lock_image_publication(cfg, &image)?;
-    ensure_restore_image_usable(be, cfg, &image, inst.firecracker_control)?;
     let payload = prepare_reprovision_payload(be, cfg, &inst, &image, &ws_inputs.mounts, forwards)?;
 
     // The instance's own forward set is authoritative — it already folded in
@@ -2290,6 +2734,68 @@ fn reprovision_instance(
     Ok(())
 }
 
+fn preflight_reprovision_image(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    no_agents: bool,
+) -> Result<()> {
+    let image_lock = setup::lock_image_publication(cfg, image)?;
+    validate_reprovision_image(be, cfg, inst, image, no_agents)?;
+    drop(image_lock);
+    Ok(())
+}
+
+fn validate_reprovision_image(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    no_agents: bool,
+) -> Result<()> {
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control())?;
+    preflight_isolated_bootstrap_for_network(
+        cfg,
+        inst,
+        image,
+        inst.firecracker_network(),
+        no_agents,
+        backend::BootMode::FirstBoot,
+    )
+}
+
+fn confirm_reprovision(
+    cfg: &mut config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    workspace_state: Option<&workspace::WorkspaceState>,
+    opts: &ReprovisionOpts<'_>,
+) -> Result<Option<github_repo::RepoSlug>> {
+    if !opts.yes
+        && !prompt::confirm(&reprovision_confirmation(
+            &inst.name,
+            image,
+            workspace_state,
+        ))?
+    {
+        bail!(
+            "Aborted — instance '{}' left untouched.\n\
+             Pass -y to reprovision without the prompt (required when stdin is \
+             not a TTY).",
+            inst.name,
+        );
+    }
+
+    let repo = backend::detect_instance_repo(inst);
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, inst)?.is_none()
+    {
+        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
+    }
+    Ok(repo)
+}
+
 /// Reject a recorded workspace association that a reprovision could not act
 /// on, while the guest is still intact.
 ///
@@ -2297,8 +2803,20 @@ fn reprovision_instance(
 /// `restore_disk` has already destroyed the disk.
 fn check_reprovision_workspace_source(
     name: &config::InstanceName,
+    network: config::FirecrackerNetworkMode,
     state: Option<&workspace::WorkspaceState>,
 ) -> Result<()> {
+    if network == config::FirecrackerNetworkMode::Isolated
+        && state.is_some_and(|state| {
+            matches!(&state.source, workspace::WorkspaceSource::GitRepo { .. })
+        })
+    {
+        bail!(
+            "Instance '{name}' records a git-repo workspace that must be cloned inside the guest, \
+             which is unavailable in isolated network mode. Switch the stopped VM to open before \
+             reprovisioning, or recreate it from a host workspace copy"
+        );
+    }
     let Some(host_path) = state.and_then(|s| s.source.host_path()) else {
         return Ok(());
     };
@@ -2498,11 +3016,215 @@ fn reprovision_regrow_target(
     }
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::{config, reprovision_regrow_target};
+
+    /// The caller rounds the exact old byte length to GiB before choosing a
+    /// regrow target. If the replacement is shorter, the chosen target can
+    /// hold every byte of the old disk; otherwise no regrow is requested.
+    #[kani::proof]
+    fn reprovision_regrow_preserves_exact_old_length() {
+        let previous_bytes: u64 = kani::any();
+        let replacement_bytes: u64 = kani::any();
+        let rounded = previous_bytes.div_ceil(config::GIB_BYTES);
+        let Some(previous_disk) = u32::try_from(rounded).ok().and_then(config::GiB::new) else {
+            return;
+        };
+        let target = reprovision_regrow_target(previous_bytes, replacement_bytes, previous_disk);
+        if replacement_bytes < previous_bytes {
+            let target = target.expect("shorter replacement must regrow");
+            assert_eq!(u64::from(target.as_u32()), rounded);
+            assert!(u128::from(target.as_bytes()) >= u128::from(previous_bytes));
+        } else {
+            assert!(target.is_none());
+            assert!(replacement_bytes >= previous_bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code — panics are assertions")]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use crate::backend::VmBackend as _;
+
+    #[test]
+    fn restore_image_preflight_distinguishes_a_missing_image() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = super::config::CoopConfig {
+            data_dir: super::config::ConfigPath::new(tmp.path()),
+            ..super::config::CoopConfig::default()
+        };
+        let image = super::config::ImageName::new("missing").unwrap();
+        let error = super::ensure_restore_image_usable(
+            &super::backend::PlatformBackend::new(),
+            &cfg,
+            &image,
+            super::config::FirecrackerControlMode::LegacyTcp,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("No image 'missing' found"), "{error}");
+    }
+
+    #[test]
+    fn isolated_agent_policy_covers_every_agent_and_prerequisite() {
+        use super::{AgentKind, IsolatedAgentPolicy, isolated_agent_policy};
+        use crate::config::FirecrackerNetworkMode;
+        use crate::model_state::ModelMode;
+
+        assert_eq!(
+            isolated_agent_policy(
+                FirecrackerNetworkMode::Open,
+                AgentKind::Grok,
+                ModelMode::Local,
+                false,
+            ),
+            IsolatedAgentPolicy::Allowed,
+        );
+        assert_eq!(
+            isolated_agent_policy(
+                FirecrackerNetworkMode::Isolated,
+                AgentKind::Grok,
+                ModelMode::Remote,
+                true,
+            ),
+            IsolatedAgentPolicy::GrokUnsupported,
+        );
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Local,
+                    true,
+                ),
+                IsolatedAgentPolicy::LocalModelUnsupported,
+            );
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Remote,
+                    false,
+                ),
+                IsolatedAgentPolicy::ProxyRequired,
+            );
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Remote,
+                    true,
+                ),
+                IsolatedAgentPolicy::Allowed,
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_bootstrap_policy_distinguishes_skip_first_boot_and_restart() {
+        use super::{IsolatedBootstrapPolicy, isolated_bootstrap_policy};
+        use crate::backend::BootMode;
+        use crate::config::FirecrackerNetworkMode;
+
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Open, false, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::Skip,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, true, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::Skip,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, false, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::FirstBootAndAgents,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, false, BootMode::Restart,),
+            IsolatedBootstrapPolicy::AgentsOnly,
+        );
+    }
+
+    #[test]
+    fn isolated_bootstrap_accepts_either_proxy_but_requires_one() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::VsockIsolated,
+        };
+        let mut cfg = super::config::CoopConfig::default();
+        let upstream = super::config::ProxyUpstream {
+            credential: super::config::Secret::new("test-credential".to_string()),
+            auth: super::config::ProxyAuthScheme::ApiKey,
+        };
+        let preflight = |cfg: &super::config::CoopConfig| {
+            super::preflight_isolated_bootstrap_for_network(
+                cfg,
+                &inst,
+                &inst.image,
+                super::config::FirecrackerNetworkMode::Isolated,
+                false,
+                crate::backend::BootMode::Restart,
+            )
+        };
+
+        let missing = preflight(&cfg).unwrap_err().to_string();
+        assert!(missing.contains("at least one configured"), "{missing}");
+        cfg.proxy.anthropic = Some(upstream.clone());
+        preflight(&cfg).unwrap();
+        cfg.proxy.anthropic = None;
+        cfg.proxy.openai = Some(upstream);
+        preflight(&cfg).unwrap();
+
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let local = preflight(&cfg).unwrap_err().to_string();
+        assert!(
+            local.contains("local model routing is unavailable"),
+            "{local}"
+        );
+    }
+
+    #[test]
+    fn network_restart_uses_the_lock_protected_stop_outcome() {
+        assert!(super::restart_network_after_stop(
+            crate::backend::StopOutcome::StoppedRunning
+        ));
+        assert!(!super::restart_network_after_stop(
+            crate::backend::StopOutcome::AlreadyStopped
+        ));
+    }
+
+    #[test]
+    fn network_restart_options_forward_only_restart_inputs() {
+        let name = crate::config::InstanceName::new("networked").unwrap();
+        let config_path = std::path::Path::new("/tmp/coop-network-config.toml");
+
+        for no_agents in [false, true] {
+            let opts = super::network_restart_options(&name, config_path, no_agents);
+            assert_eq!(opts.name, Some(&name));
+            assert_eq!(opts.config_path, config_path);
+            assert_eq!(opts.no_agents, no_agents);
+            assert!(opts.workspace_dir.is_none());
+            assert!(opts.git_repo.is_none());
+            assert!(!opts.no_prompt);
+            assert!(opts.disk.is_none());
+            assert!(opts.mounts.is_empty());
+            assert!(!opts.exclude_git);
+            assert!(opts.forward_ports.is_empty());
+            assert!(opts.post_start_override.is_none());
+            assert!(opts.persisted_guest_env.is_empty());
+        }
+    }
 
     fn check_stale_restart_preserves_creation_progress(root: &std::path::Path) {
         let mut cfg = cfg_with_data_dir(root.join("data"));
@@ -3451,6 +4173,111 @@ mod tests {
     }
 
     #[test]
+    fn prepare_session_suppresses_persisted_credentials_in_isolated_mode() {
+        use std::num::NonZeroU16;
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::VsockIsolated,
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        for (name, value) in [
+            ("ANTHROPIC_API_KEY", "anthropic-private"),
+            ("OPENAI_API_KEY", "openai-private"),
+            ("CODEX_ACCESS_TOKEN", "codex-private"),
+            ("ANTHROPIC_AUTH_TOKEN", "anthropic-auth-private"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-private"),
+            ("XAI_API_KEY", "xai-private"),
+            ("GITHUB_TOKEN", "github-private"),
+            ("GH_TOKEN", "gh-private"),
+            ("COOP_LOCAL_API_KEY", "saved-local-private"),
+            ("SAFE_VALUE", "visible"),
+        ] {
+            state.entries.insert(
+                super::guest_env_state::EnvVarName::new(name).unwrap(),
+                value.to_string(),
+            );
+        }
+        state.save(&inst).unwrap();
+
+        let mut cfg: super::config::CoopConfig = toml::from_str(
+            r#"
+            [grok]
+            api_key = "cmd:exit 42"
+
+            [github]
+            mode = "pat"
+            [github.pat."owner/repo"]
+            token = "cmd:exit 42"
+            "#,
+        )
+        .unwrap();
+        crate::github_assignment::Assignment {
+            repo: crate::github_repo::RepoSlug::new("owner/repo").unwrap(),
+        }
+        .save(&cfg, &inst)
+        .unwrap();
+        for (name, value) in [
+            ("GITHUB_TOKEN", "configured-github-private"),
+            ("GH_TOKEN", "configured-gh-private"),
+            ("COOP_LOCAL_API_KEY", "configured-local-private"),
+        ] {
+            cfg.guest_env.insert(
+                super::guest_env_state::EnvVarName::new(name).unwrap(),
+                value.to_string(),
+            );
+        }
+        cfg.codex.local_model = Some(
+            super::config::LocalModel::new(
+                url::Url::parse("http://127.0.0.1:11434").unwrap(),
+                "test-model".to_string(),
+                Some(super::config::Secret::new("model-secret".to_string())),
+            )
+            .unwrap(),
+        );
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
+        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "XAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "COOP_LOCAL_API_KEY",
+        ] {
+            assert!(!session.env.contains(name), "{name} must stay on the host");
+        }
+        assert_eq!(
+            session
+                .env
+                .guest_values()
+                .get("SAFE_VALUE")
+                .map(String::as_str),
+            Some("visible")
+        );
+    }
+
+    #[test]
     fn prepare_session_suppresses_openai_key_for_chatgpt_auth_without_proxy() {
         use std::num::NonZeroU16;
 
@@ -3630,7 +4457,14 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: tmp.path().to_path_buf(),
         });
-        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                Some(&state),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3641,9 +4475,30 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::GitRepo {
             url: super::github_repo::GitRepoUrl::new("https://github.com/trailofbits/coop.git"),
         });
-        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                Some(&state),
+            )
+            .is_ok()
+        );
+        let isolated = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Isolated,
+            Some(&state),
+        )
+        .expect_err("isolated reprovision must not replay an in-guest clone");
+        assert!(isolated.to_string().contains("git-repo workspace"));
         // Nor does an instance with no recorded association at all.
-        assert!(super::check_reprovision_workspace_source(&name, None).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3652,8 +4507,12 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: std::path::PathBuf::from("/nonexistent/coop/reprovision/workspace"),
         });
-        let err = super::check_reprovision_workspace_source(&name, Some(&state))
-            .expect_err("a missing host directory must be rejected before the wipe");
+        let err = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Open,
+            Some(&state),
+        )
+        .expect_err("a missing host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not a directory"), "{err}");
         // Both recoveries must be ones that actually work: put the directory
         // back at the recorded path, or destroy and re-create. Re-associating
@@ -3685,8 +4544,12 @@ mod tests {
         assert!(host_path.to_str().is_none(), "path must not be valid UTF-8");
 
         let state = ws_state(super::workspace::WorkspaceSource::Workspace { host_path });
-        let err = super::check_reprovision_workspace_source(&name, Some(&state))
-            .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
+        let err = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Open,
+            Some(&state),
+        )
+        .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
         // The only recovery that works. Moving the directory does not: nothing
         // re-points an existing instance's `workspace.json`, so the advice has

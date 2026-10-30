@@ -88,6 +88,40 @@ jobs:
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
 
+  kani:
+    runs-on: ubuntu-latest
+    # Keep in sync with KANI_VERSION in scripts/install-dev-tools.sh.
+    env:
+      KANI_VERSION: 0.67.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Kani setup installs its own pinned nightly Rust toolchain. Cache both
+      # that toolchain and the verifier so subsequent runs only check proofs.
+      - name: Cache Kani toolchain
+        id: cache-kani
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+            ~/.rustup/toolchains/nightly-*
+          key: ${{ runner.os }}-${{ runner.arch }}-kani-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      - name: Install Kani
+        if: steps.cache-kani.outputs.cache-hit != 'true'
+        run: cargo install kani-verifier --version "=${KANI_VERSION}" --locked
+
+      - name: Set up Kani
+        if: steps.cache-kani.outputs.cache-hit != 'true'
+        run: cargo kani setup
+
+      - name: Verify all proofs
+        run: cargo kani --workspace --output-format terse
+
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -96,7 +130,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@c06f6a0003f7c6165a00c89d1697731c9e8a5c72 # v1.25.2
+        uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
 
       # Pin to match CARGO_DENY_VERSION in scripts/install-dev-tools.sh so CI and
       # local installs run the same version.
@@ -148,6 +182,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
           advanced-security: false
