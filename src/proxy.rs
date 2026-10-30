@@ -325,17 +325,24 @@ pub(crate) fn ensure_runtime_available(
     let address = SocketAddr::from(([127, 0, 0, 1], provider.port(inst)));
     ensure_proxy_protocol(address, provider)?;
     let guest_url = format!("http://127.0.0.1:{}/", provider.port(inst));
-    let guest_reachable = target.exec_ok(
-        RemoteCommand::new()
-            .literal("curl --silent --show-error --max-time 3 --output /dev/null")
-            .arg(&guest_url),
-    )?;
+    let guest_reachable = target.exec_ok(guest_proxy_probe_command(&guest_url))?;
     anyhow::ensure!(
         guest_reachable,
-        "{} credential proxy reverse endpoint is unreachable from guest loopback",
+        "{} credential proxy reverse endpoint did not return the expected response on guest loopback",
         provider.name()
     );
     Ok(())
+}
+
+fn guest_proxy_probe_command(url: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal("response=$(curl -q --silent --show-error --noproxy '*' --max-time 3 --write-out ':%{http_code}' ")
+        .arg(url)
+        .literal(
+            ") || exit 1; case \"$response\" in \
+             *'missing or invalid coop-proxy capability token'*':401') exit 0 ;; \
+             *) exit 1 ;; esac",
+        )
 }
 
 fn ensure_proxy_protocol(address: SocketAddr, provider: Provider) -> Result<()> {
@@ -1460,5 +1467,70 @@ mod tests {
         let unrelated =
             serve_once(b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nunrelated listener");
         assert!(ensure_proxy_protocol(unrelated, Provider::Openai).is_err());
+    }
+
+    #[test]
+    fn guest_protocol_probe_requires_the_proxy_unauthorized_response() {
+        let curl_home = crate::test_support::private_tempdir().unwrap();
+        std::fs::write(curl_home.path().join(".curlrc"), "fail\n").unwrap();
+        let accepts = |status: &str, body: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                listener.set_nonblocking(true)?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "probe did not connect to the fixture",
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(4)))?;
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request)?;
+                stream.write_all(response.as_bytes())?;
+                Ok(())
+            });
+            let probe = super::guest_proxy_probe_command(&url).into_string();
+            let accepted = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&probe)
+                .env("CURL_HOME", curl_home.path())
+                .env("HOME", curl_home.path())
+                .status()
+                .unwrap()
+                .success();
+            server.join().unwrap().unwrap();
+            accepted
+        };
+        assert!(accepts(
+            "401",
+            "missing or invalid coop-proxy capability token"
+        ));
+        for (status, body) in [
+            ("502", "upstream request failed"),
+            ("401", "unrelated listener"),
+            ("500", "missing or invalid coop-proxy capability token"),
+            ("200", "missing or invalid coop-proxy capability token"),
+        ] {
+            assert!(
+                !accepts(status, body),
+                "unexpectedly accepted {status} {body}"
+            );
+        }
     }
 }

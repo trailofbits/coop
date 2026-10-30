@@ -1636,20 +1636,28 @@ fn preflight_isolated_bootstrap_for_network(
             backend::preflight_isolated_first_boot(cfg, image)?;
         }
     }
-    ensure_isolated_agent_supported(
-        cfg,
-        inst,
-        network,
-        AgentKind::Claude,
-        ProxyReadiness::Configured,
-    )?;
-    ensure_isolated_agent_supported(
-        cfg,
-        inst,
-        network,
-        AgentKind::Codex,
-        ProxyReadiness::Configured,
-    )
+    if model_state::ModelState::load_or_default(inst)?.mode != model_state::ModelMode::Remote {
+        bail!("local model routing is unavailable in isolated network mode");
+    }
+    let mut has_proxy = false;
+    for (agent, provider) in [
+        (AgentKind::Claude, proxy::Provider::Anthropic),
+        (AgentKind::Codex, proxy::Provider::Openai),
+    ] {
+        if proxy_state::effective_upstream(inst, provider, &cfg.proxy)?.is_some() {
+            has_proxy = true;
+            ensure_isolated_agent_supported(cfg, inst, network, agent, ProxyReadiness::Configured)?;
+        }
+    }
+    anyhow::ensure!(
+        has_proxy,
+        "isolated agent bootstrap requires at least one configured Anthropic or OpenAI \
+         credential proxy; configure one with `coop proxy setup --vm {}` or \
+         `coop proxy setup --openai --vm {}`, or use --no-agents for a control-only VM",
+        inst.name,
+        inst.name,
+    );
+    Ok(())
 }
 
 fn creation_post_start(
@@ -1891,6 +1899,7 @@ pub(crate) fn prepare_session_from_target(
                     || (isolated && name.as_str() == "XAI_API_KEY")
                     || (isolated && name.as_str() == "GITHUB_TOKEN")
                     || (isolated && name.as_str() == "GH_TOKEN")
+                    || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
                 {
                     let reason = if isolated {
                         "isolated network mode"
@@ -1911,7 +1920,8 @@ pub(crate) fn prepare_session_from_target(
         // the host). Claude's token rides in settings.json instead. The two
         // modes are mutually exclusive (mode is Local or Remote).
         if let Some(model) = &model {
-            if model.mode == model_state::ModelMode::Local
+            if !isolated
+                && model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
                 env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
@@ -3138,6 +3148,53 @@ mod tests {
     }
 
     #[test]
+    fn isolated_bootstrap_accepts_either_proxy_but_requires_one() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::VsockIsolated,
+        };
+        let mut cfg = super::config::CoopConfig::default();
+        let upstream = super::config::ProxyUpstream {
+            credential: super::config::Secret::new("test-credential".to_string()),
+            auth: super::config::ProxyAuthScheme::ApiKey,
+        };
+        let preflight = |cfg: &super::config::CoopConfig| {
+            super::preflight_isolated_bootstrap_for_network(
+                cfg,
+                &inst,
+                &inst.image,
+                super::config::FirecrackerNetworkMode::Isolated,
+                false,
+                crate::backend::BootMode::Restart,
+            )
+        };
+
+        let missing = preflight(&cfg).unwrap_err().to_string();
+        assert!(missing.contains("at least one configured"), "{missing}");
+        cfg.proxy.anthropic = Some(upstream.clone());
+        preflight(&cfg).unwrap();
+        cfg.proxy.anthropic = None;
+        cfg.proxy.openai = Some(upstream);
+        preflight(&cfg).unwrap();
+
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let local = preflight(&cfg).unwrap_err().to_string();
+        assert!(
+            local.contains("local model routing is unavailable"),
+            "{local}"
+        );
+    }
+
+    #[test]
     fn network_restart_uses_the_lock_protected_stop_outcome() {
         assert!(super::restart_network_after_stop(
             crate::backend::StopOutcome::StoppedRunning
@@ -4137,6 +4194,7 @@ mod tests {
             ("XAI_API_KEY", "xai-private"),
             ("GITHUB_TOKEN", "github-private"),
             ("GH_TOKEN", "gh-private"),
+            ("COOP_LOCAL_API_KEY", "saved-local-private"),
             ("SAFE_VALUE", "visible"),
         ] {
             state.entries.insert(
@@ -4166,12 +4224,27 @@ mod tests {
         for (name, value) in [
             ("GITHUB_TOKEN", "configured-github-private"),
             ("GH_TOKEN", "configured-gh-private"),
+            ("COOP_LOCAL_API_KEY", "configured-local-private"),
         ] {
             cfg.guest_env.insert(
                 super::guest_env_state::EnvVarName::new(name).unwrap(),
                 value.to_string(),
             );
         }
+        cfg.codex.local_model = Some(
+            super::config::LocalModel::new(
+                url::Url::parse("http://127.0.0.1:11434").unwrap(),
+                "test-model".to_string(),
+                Some(super::config::Secret::new("model-secret".to_string())),
+            )
+            .unwrap(),
+        );
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
         let target = super::backend::SshTarget::tcp(
             super::backend::Hostname::new("127.0.0.1").unwrap(),
             NonZeroU16::new(22).unwrap(),
@@ -4190,6 +4263,7 @@ mod tests {
             "XAI_API_KEY",
             "GITHUB_TOKEN",
             "GH_TOKEN",
+            "COOP_LOCAL_API_KEY",
         ] {
             assert!(!session.env.contains(name), "{name} must stay on the host");
         }

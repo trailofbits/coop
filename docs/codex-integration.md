@@ -340,9 +340,10 @@ In local mode coop injects three coop-owned keys into `~/.codex/config.toml`:
 `[model_providers.coop_local]` block pointing `base_url` at the guest-visible
 endpoint with `wire_api = "responses"`. The provider reads its API key from the
 `COOP_LOCAL_API_KEY` env var, which coop forwards with the configured (or dummy)
-token. These keys are coop-owned: they are written on a switch to local and
-removed on a switch back to remote, so they are not preserved across a mode
-change.
+token in open-network mode. Isolated sessions suppress that token because local
+model routing is unavailable. These keys are coop-owned: they are written on a
+switch to local and removed on a switch back to remote, so they are not
+preserved across a mode change.
 
 Switching takes effect without a VM restart: coop rewrites `config.toml` live
 over SSH on a running VM (or saves the selection to apply on the next start). A

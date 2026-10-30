@@ -7850,7 +7850,8 @@ STATEEOF
             --data '{"model":"gpt-4.1","input":"isolated-ping"}' \
             --output /tmp/isolated-proxy-body --write-out '%{http_code}' || true)
         guest_proxy_body=$(px_exec cat /tmp/isolated-proxy-body 2>/dev/null || true)
-        if [[ "$guest_proxy_status" =~ ^[1-5][0-9][0-9]$ ]] \
+        if [[ "$guest_proxy_status" == "401" ]] \
+            && echo "$guest_proxy_body" | grep -Fqi 'invalid_api_key' \
             && ! echo "$guest_proxy_body" | grep -Fqi \
                 'missing or invalid coop-proxy capability token' \
             && ! echo "$guest_proxy_body" | grep -Fqi \
@@ -7869,7 +7870,8 @@ STATEEOF
             --data '{"model":"claude-sonnet-4-5","max_tokens":1,"messages":[{"role":"user","content":"isolated-ping"}]}' \
             --output /tmp/isolated-anthropic-body --write-out '%{http_code}' || true)
         anthropic_body=$(px_exec cat /tmp/isolated-anthropic-body 2>/dev/null || true)
-        if [[ "$anthropic_status" =~ ^[1-5][0-9][0-9]$ ]] \
+        if [[ "$anthropic_status" == "401" ]] \
+            && echo "$anthropic_body" | grep -Fqi 'authentication_error' \
             && ! echo "$anthropic_body" | grep -Fqi \
                 'missing or invalid coop-proxy capability token' \
             && ! echo "$anthropic_body" | grep -Fqi \

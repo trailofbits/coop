@@ -1928,6 +1928,7 @@ impl CredentialForwardingPolicy {
                 "XAI_API_KEY",
                 "GITHUB_TOKEN",
                 "GH_TOKEN",
+                crate::model_state::CODEX_LOCAL_ENV_KEY,
             ]);
             names.sort_unstable();
             names.dedup();

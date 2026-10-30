@@ -28,8 +28,10 @@ credentials are not forwarded into an isolated guest.
 
 Claude and Codex require their corresponding managed proxy while isolated.
 Configure them with `coop proxy setup --vm NAME` and
-`coop proxy setup --openai --vm NAME`. Grok Build and local-model routing are
-unsupported because they have no equivalent fixed proxy path. A control-only VM
+`coop proxy setup --openai --vm NAME`. Configure only the provider you intend to
+use; an isolated boot with agent bootstrap requires at least one proxy. Grok
+Build and local-model routing are unsupported because they have no equivalent
+fixed proxy path. A control-only VM
 is valid with `--no-agents`; a network-mode restart can use
 `--restart --no-agents` for the same purpose. Direct provider auth never becomes
 a fallback.
