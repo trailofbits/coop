@@ -94,6 +94,11 @@ pub fn is_dev_build() -> bool {
     env!("COOP_BUILD_KIND") == "dev"
 }
 
+/// Distribution ownership is embedded at build time.
+pub(crate) const fn is_homebrew_build() -> bool {
+    cfg!(coop_homebrew)
+}
+
 // ── Platform + URL helpers ───────────────────────────────────────────────────
 
 pub fn target_triple() -> Result<&'static str> {
@@ -633,6 +638,9 @@ fn replace_sibling_proxy_at(extract_dir: &Path, current_exe: &Path) -> Result<()
 // ── Main update flow ─────────────────────────────────────────────────────────
 
 pub fn run(opts: &UpdateOpts) -> Result<()> {
+    if is_homebrew_build() {
+        bail!("This is a Homebrew-managed installation. Use `brew upgrade coop` to update it.");
+    }
     if is_dev_build() {
         bail!(
             "This is a dev build ({}); `coop update` only replaces release binaries.\n\
@@ -816,7 +824,7 @@ fn persist_state(tag: Option<&str>) {
 // ── Disable sources (env + TTY + dev) ────────────────────────────────────────
 
 fn background_check_disabled() -> bool {
-    if is_dev_build() {
+    if is_homebrew_build() || is_dev_build() {
         return true;
     }
     if env::var("COOP_NO_UPDATE_CHECK")
