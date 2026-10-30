@@ -210,8 +210,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
   its coop directories separately from `data_dir`. See
   [private host storage](configuration.md#private-host-storage). A host
-  `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
-  (`backend.rs:restrict_guest_grok_auth`).
+  `~/.grok/auth.json` copied into an open-mode guest is `chmod 0600` after
+  `scp` (`backend.rs:restrict_guest_grok_auth`). Isolated bootstrap makes no
+  new auth-file copy and does not sanitize a copy retained on the guest disk.
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
@@ -340,6 +341,13 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   that tag. Older untagged instances map to `legacy_tcp` for compatibility.
   This is control-plane independence, not host network isolation: the guest
   NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
+- A Firecracker instance in persisted `isolated` network mode is started with
+  no network interface and coop does not create its TAP. Control and managed
+  fixed-destination proxy forwards use SSH over vsock without a TCP fallback.
+  The composite persisted marker is rejected by prior releases. This prevents
+  guest Ethernet/IP egress through coop, but model request bodies still leave
+  through the selected host credential proxy and existing guest-disk secrets
+  are not sanitized by switching modes.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it

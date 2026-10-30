@@ -6,9 +6,12 @@ Lima.** Opt-in; off by default. Design:
 
 ## What it does
 
-Without proxy mode, coop forwards the raw `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
-into the guest as SSH `SendEnv` variables — a prompt-injected or rogue agent can
-read them from its own environment and, with egress open, exfiltrate them.
+With open networking and without proxy mode, coop forwards the raw
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` into the guest as SSH `SendEnv`
+variables — a prompt-injected or rogue agent can read them from its own
+environment and exfiltrate them. [Isolated Firecracker
+mode](firecracker-network-modes.md) suppresses direct credentials and requires
+the corresponding managed proxy for Claude or Codex.
 
 With proxy mode, the raw credential **never enters the guest**. coop runs a
 small host-side reverse proxy (`coop-proxy`) — one process per (VM, provider) —

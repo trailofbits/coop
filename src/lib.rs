@@ -79,13 +79,13 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts, ReprovisionOpts,
-    ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy,
-    cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
-    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
-    preflight_start_target, prepend_binary, resolve_running,
+    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
+    ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts,
+    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
+    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
+    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
+    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
+    open_agent_session, preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -414,7 +414,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// List instances by name and state
+    /// List instances by name, state, and network mode
     #[command(alias = "ls")]
     List {
         /// Emit machine-readable JSON instead of the text table
@@ -432,6 +432,24 @@ enum Commands {
         /// Emit machine-readable JSON instead of the text output
         #[arg(long)]
         json: bool,
+    },
+    /// Show or change a Firecracker VM's persisted network mode.
+    Network {
+        /// Instance name (required for mode changes or if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Target mode; omit to show the selected mode
+        #[arg(value_enum)]
+        mode: Option<config::FirecrackerNetworkMode>,
+        /// Stop a running VM, apply the mode, and start it again
+        #[arg(long, requires = "mode")]
+        restart: bool,
+        /// Restart without agent bootstrap (allows a control-only isolated VM)
+        #[arg(long, requires = "restart")]
+        no_agents: bool,
     },
     /// Manage the coding agents installed inside a VM
     Agent {
@@ -1211,7 +1229,7 @@ pub fn run() -> Result<()> {
             ask,
             mut args,
         } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -1222,13 +1240,13 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Codex)?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1246,7 +1264,7 @@ pub fn run() -> Result<()> {
             ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
         }
         Commands::Grok { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Grok)?;
             let args = grok_launch_args(ask, args);
             let grok_bin = guest::GuestUser::new(sess.target.user().as_ref())?.grok_bin();
             ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
@@ -1261,6 +1279,20 @@ pub fn run() -> Result<()> {
         }
         Commands::List { json } => cmd_list(&be, &cfg, json),
         Commands::Status { name, json } => cmd_status(&be, &cfg, name.as_ref(), json),
+        Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } => cmd_network(
+            &be,
+            &mut cfg,
+            &cli.config,
+            name.as_ref(),
+            mode,
+            restart,
+            no_agents,
+        ),
         Commands::Agent {
             action:
                 AgentAction::Update {
@@ -2359,6 +2391,44 @@ token = "test-pat"
             panic!("expected Status variant");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn network_query_and_transition_parse() {
+        let cli = parse(&["network", "vm"]);
+        let super::Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } = cli.command
+        else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("vm")
+        );
+        assert!(mode.is_none());
+        assert!(!restart);
+        assert!(!no_agents);
+
+        let cli = parse(&["network", "vm", "isolated", "--restart", "--no-agents"]);
+        let super::Commands::Network { mode, restart, .. } = cli.command else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(mode, Some(super::config::FirecrackerNetworkMode::Isolated));
+        assert!(restart);
+    }
+
+    #[test]
+    fn network_rejects_invalid_or_incomplete_transitions() {
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "offline"]).is_err());
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "--restart"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["coop", "network", "vm", "isolated", "--no-agents",])
+                .is_err()
+        );
     }
 
     #[test]

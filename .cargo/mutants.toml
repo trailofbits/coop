@@ -239,6 +239,12 @@ exclude_re = [
   "IsolationNetworkTools::resolve_production",
   "<impl BridgeToolset for IsolationNetworkTools>::bridge",
 
+  # The Firecracker-only allocation arm is compiled out on macOS. Native
+  # Linux allocation tests pin the isolated comparison; the macOS test pins
+  # that Lima ignores the Firecracker network default. A Darwin mutation run
+  # cannot observe this operator even though cargo-mutants discovers it.
+  "src/config\\.rs:.*replace == with != in CoopConfig::allocate_instance",
+
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into
   # src/commands/. Apply the SAME surgical treatment the flat shell-out
@@ -266,6 +272,7 @@ exclude_re = [
   "\\bapply_vm_overrides\\b",
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
+  "\\brestart_confirmed_instance\\b",
   "\\bstart_instance\\b",
   # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
   # the ordering is covered by a filesystem-backed lifecycle unit test.
@@ -280,6 +287,12 @@ exclude_re = [
   # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
   # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
   "\\breprovision_instance\\b",
+  # Image publication locks, backend metadata checks, interactive confirmation,
+  # and PAT prompting are IO wrappers around the mutation-scoped workspace and
+  # network policy helpers.
+  "\\bpreflight_reprovision_image\\b",
+  "\\bvalidate_reprovision_image\\b",
+  "\\bconfirm_reprovision\\b",
   # Resolves guest file staging through the backend and reads host paths after
   # stop; a unit mutant cannot observe the VM lifecycle recovery context.
   "\\bprepare_reprovision_payload\\b",
@@ -295,6 +308,13 @@ exclude_re = [
   "\\bcurrent_disk_bytes\\b",
   # instance_status (#385) queries usage over SSH.
   "\\binstance_status\\b",
+  # Network-mode lifecycle wrappers hold backend locks, drive cleanup/start,
+  # or write stdout. Their extracted policy enums remain mutation-scoped.
+  "\\bensure_isolated_agent_supported\\b",
+  "\\bpreflight_isolated_bootstrap\\b",
+  "\\bpreflight_isolated_bootstrap_for_network\\b",
+  "\\bstop_confirmed\\b",
+  "\\brender_network_status\\b",
 
   # ---- src/commands/json.rs (#385): --json output ----
   # render_json is the single stdout JSON writer; a `--lib` test cannot
@@ -448,5 +468,7 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bpid_path\\b",
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
+  "src/proxy\\.rs:.*\\bensure_runtime_available\\b",
+  "src/proxy\\.rs:.*\\bensure_pid_file_live\\b",
 
 ]
