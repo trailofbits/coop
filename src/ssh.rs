@@ -111,6 +111,14 @@ fn write_program_status(
     out.flush()
 }
 
+fn agent_exit_state(result: &std::io::Result<std::process::ExitStatus>) -> &'static str {
+    match result {
+        Ok(status) if status.success() => "done",
+        Ok(status) if status.code() == Some(130) => "idle",
+        _ => "error",
+    }
+}
+
 /// Run a command interactively over SSH with a PTY.
 ///
 /// Empty `command` opens a bare interactive shell. Otherwise the
@@ -149,12 +157,7 @@ fn run_interactive_impl(
     }
     let result = ssh_command.status();
     if let Some(program) = program {
-        let state = match &result {
-            Ok(status) if status.success() => "done",
-            Ok(status) if status.code() == Some(130) => "idle",
-            _ => "error",
-        };
-        report_program_status(program, state);
+        report_program_status(program, agent_exit_state(&result));
     }
     let status = result.context("Failed to launch SSH — is the ssh client installed?")?;
 
@@ -220,6 +223,13 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 #[expect(clippy::expect_used, reason = "tests construct known-valid SSH values")]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    #[test]
+    fn interrupted_agent_is_idle() {
+        let interrupted = std::process::ExitStatus::from_raw(130 << 8);
+        assert_eq!(agent_exit_state(&Ok(interrupted)), "idle");
+    }
 
     #[test]
     fn program_status_uses_osc_7501_and_st() {
