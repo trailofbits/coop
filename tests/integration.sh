@@ -1901,6 +1901,56 @@ test_codex_sandbox_bypass() {
     fi
 }
 
+test_program_status() {
+    echo ""
+    echo "=== Phase: agent program status ==="
+
+    if _timeout 90 python3 - "$BINARY" "$SUITE_CONFIG" "$INSTANCE" \
+        2>"$tmpdir/program-status-stderr" <<'PYSTATUS'
+import errno
+import os
+import pty
+import sys
+
+binary, config, instance = sys.argv[1:]
+for agent, app, args, final in (
+    ("claude", "claude-code", ["--help"], "done"),
+    ("codex", "codex", ["--help"], "done"),
+    ("grok", "grok-build", ["--help"], "done"),
+    ("codex", "codex", ["--not-a-real-flag"], "error"),
+):
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execv(binary, [binary, "--config", config, agent, instance, "--", *args])
+    output = bytearray()
+    try:
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 1_048_576:
+                raise RuntimeError(f"{agent} produced too much output")
+    finally:
+        os.close(master)
+    os.waitpid(pid, 0)
+    start = f"\x1b]7501;state=working:app={app}\x1b\\".encode()
+    end = f"\x1b]7501;state={final}:app={app}\x1b\\".encode()
+    if start not in output or end not in output or output.index(start) >= output.index(end):
+        raise AssertionError(f"{agent} {args}: missing or unordered OSC 7501 reports")
+PYSTATUS
+    then
+        pass "Claude, Codex, and Grok report agent session status through a PTY"
+    else
+        fail "agent session status through a PTY" "$(cat "$tmpdir/program-status-stderr")"
+    fi
+}
+
 seed_codex_update_config() {
     # shellcheck disable=SC2016 # Keep the config and its snapshot inside the guest.
     guest_exec sh -c '
@@ -6347,7 +6397,7 @@ CFGEOF
     # Verify `coop claude --help` invokes the binary at CLAUDE_BIN path.
     # The stub claude will log the args, so we can verify it was called.
     guest_exec truncate -s 0 /tmp/claude-calls.log || true
-    # coop claude uses run_interactive which needs a PTY — use exec instead
+    # coop claude uses run_agent_interactive which needs a PTY — use exec instead
     # to verify the binary path is correct by invoking it directly.
     env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY RUST_LOG=off \
         "$BINARY" --config "$cfg_file" exec "$mp_instance" -- \
@@ -8336,6 +8386,7 @@ EOF
     test_codex_account_auth_support
     test_codex_chatgpt_mode
     test_codex_sandbox_bypass
+    test_program_status
     test_agent_update
     test_github_token_forwarding
     test_term_handling

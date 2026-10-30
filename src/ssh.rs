@@ -76,11 +76,63 @@ fn restore_terminal() {
     let _ = Command::new("stty").arg("sane").status();
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AgentProgram {
+    Claude,
+    Codex,
+    Grok,
+}
+
+impl AgentProgram {
+    const fn app(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::Codex => "codex",
+            Self::Grok => "grok-build",
+        }
+    }
+}
+
+/// Report the launcher state to terminals that support OSC 7501. Keep escape
+/// sequences out of redirected output and leave display choices to the terminal.
+fn report_program_status(program: AgentProgram, state: &str) {
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        let _ = write_program_status(&mut stdout, program, state);
+    }
+}
+
+fn write_program_status(
+    out: &mut impl std::io::Write,
+    program: AgentProgram,
+    state: &str,
+) -> std::io::Result<()> {
+    write!(out, "\x1b]7501;state={state}:app={}\x1b\\", program.app())?;
+    out.flush()
+}
+
 /// Run a command interactively over SSH with a PTY.
 ///
 /// Empty `command` opens a bare interactive shell. Otherwise the
 /// arguments are shell-escaped and run inside the user's login shell.
 pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
+    run_interactive_impl(session, command, None)
+}
+
+/// Run an agent over SSH and report its coarse lifecycle to the terminal.
+pub(crate) fn run_agent_interactive(
+    session: &SshSession,
+    command: &[String],
+    program: AgentProgram,
+) -> Result<()> {
+    run_interactive_impl(session, command, Some(program))
+}
+
+fn run_interactive_impl(
+    session: &SshSession,
+    command: &[String],
+    program: Option<AgentProgram>,
+) -> Result<()> {
     let remote_cmd = render_remote(command);
 
     tracing::info!(
@@ -91,9 +143,20 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
         "If the remote session stops responding, type Enter, then ~. to disconnect; run `stty sane` if your terminal remains broken.",
     );
 
-    let status = interactive_ssh_command(session, &remote_cmd)?
-        .status()
-        .context("Failed to launch SSH — is the ssh client installed?")?;
+    let mut ssh_command = interactive_ssh_command(session, &remote_cmd)?;
+    if let Some(program) = program {
+        report_program_status(program, "working");
+    }
+    let result = ssh_command.status();
+    if let Some(program) = program {
+        let state = match &result {
+            Ok(status) if status.success() => "done",
+            Ok(status) if status.code() == Some(130) => "idle",
+            _ => "error",
+        };
+        report_program_status(program, state);
+    }
+    let status = result.context("Failed to launch SSH — is the ssh client installed?")?;
 
     if !status.success() {
         tracing::warn!("SSH session exited with status: {status}");
@@ -157,6 +220,18 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 #[expect(clippy::expect_used, reason = "tests construct known-valid SSH values")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_status_uses_osc_7501_and_st() {
+        let mut output = Vec::new();
+        write_program_status(&mut output, AgentProgram::Claude, "working").expect("write status");
+        write_program_status(&mut output, AgentProgram::Codex, "done").expect("write status");
+        write_program_status(&mut output, AgentProgram::Grok, "error").expect("write status");
+        assert_eq!(
+            output,
+            b"\x1b]7501;state=working:app=claude-code\x1b\\\x1b]7501;state=done:app=codex\x1b\\\x1b]7501;state=error:app=grok-build\x1b\\"
+        );
+    }
 
     #[test]
     fn empty_command_renders_interactive_shell() {

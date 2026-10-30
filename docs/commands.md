@@ -256,6 +256,8 @@ coop shell my-project -- cat /etc/os-release
 
 Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
 
+On a terminal, coop reports `working` while the session runs and `done`, `error`, or `idle` when it exits using the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status). Internal approval prompts are not reported.
+
 ```
 coop claude [NAME] [FLAGS] [ARGS...]
 ```
@@ -300,6 +302,8 @@ coop ca my-project -- --cwd /workspace
 
 Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag: they never start an agent session, so there is nothing to sandbox.
 
+Terminal status reports follow the same session lifecycle as `coop claude`.
+
 ```
 coop codex [NAME] [FLAGS] [ARGS...]
 ```
@@ -330,6 +334,8 @@ which overrides the guest `ui.permission_mode = "always-approve"`). The
 Host `~/.grok/auth.json` is copied into the guest on boot when `config_dir`
 is enabled and set to owner-only (`0600`). If there is no host file, sign
 in with `coop grok -- login --device-auth`.
+
+Terminal status reports follow the same session lifecycle as `coop claude`.
 
 ```
 coop grok [NAME] [FLAGS] [ARGS...]
