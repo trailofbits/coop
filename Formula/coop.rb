@@ -1,8 +1,8 @@
 class Coop < Formula
   desc "Isolated VM environments for coding agents"
   homepage "https://github.com/trailofbits/coop"
-  url "https://github.com/trailofbits/coop/archive/refs/tags/v0.9.1.tar.gz"
-  sha256 "aaa52ac23150be99ac1d82b83999f4dd993d46b876e5d4dfa360eb924aaead7d"
+  url "https://github.com/trailofbits/coop/archive/refs/tags/v0.9.2.tar.gz"
+  sha256 "c53f0c3ae539a3d5d6ecbaf11dfd1b23446daead71fb3dda8b0d67cb672b27f0"
   license "Apache-2.0"
 
   depends_on "cmake" => :build
@@ -13,7 +13,7 @@ class Coop < Formula
     depends_on "lima"
   end
 
-  # v0.9.1 does not handle COOP_PACKAGE_MANAGER or guard self-update/uninstall.
+  # v0.9.2 does not handle COOP_PACKAGE_MANAGER or guard self-update/uninstall.
   # Backport both so the installed binary delegates package management to brew.
   # Remove patch :DATA and the patch below __END__ when the pinned release includes them.
   patch :DATA

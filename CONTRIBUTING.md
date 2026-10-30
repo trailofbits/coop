@@ -82,7 +82,7 @@ formula on macOS whenever `Formula/` changes.
 
 Keep `COOP_PACKAGE_MANAGER=homebrew` to mark Homebrew ownership and
 `COOP_FORCE_BUILD_KIND=release` to avoid a `-dev` version in source-archive builds.
-The current formula backports the ownership guards to v0.9.1; remove `patch :DATA`
+The current formula backports the ownership guards to v0.9.2; remove `patch :DATA`
 and the patch after `__END__` once the pinned release includes them.
 
 ## Pre-commit hooks
