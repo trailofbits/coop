@@ -34,12 +34,15 @@ def check_guards(ordinary, homebrew):
         )
         sentinel = config.parent / "sentinel"
         sentinel.write_text("preserve user data\n")
-        state_root = (
-            root / "Library" / "Application Support"
-            if sys.platform == "darwin" else Path(env["XDG_STATE_HOME"])
-        )
+        if sys.platform == "darwin":
+            (root / "Library").mkdir(mode=0o700)
+            state_root = root / "Library" / "Application Support"
+        else:
+            state_root = Path(env["XDG_STATE_HOME"])
+        state_root.mkdir(mode=0o700)
         state = state_root / "coop" / "update-check.json"
-        state.parent.mkdir(parents=True)
+        # PrivateDir rejects writable ancestors under a permissive CI umask.
+        state.parent.mkdir(mode=0o700)
         initial = b'{"last_checked_at": 0, "latest_known_version": "v9999.0.0"}\n'
         binary = root / "coop"
 

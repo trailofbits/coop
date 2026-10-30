@@ -180,6 +180,7 @@ export HOME="$TMPDIR/home"
 export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_DATA_HOME="$HOME/.local/share"
 mkdir -p "$XDG_STATE_HOME" "$XDG_DATA_HOME"
+chmod 700 "$HOME" "$HOME/.local" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 
 # ── Fabricate a "newer" release tarball ──────────────────────────────────────
 
