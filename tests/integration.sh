@@ -685,6 +685,17 @@ EOF
     fi
     assert_lima_headless "after creation"
 
+    if [[ "$(uname -s)" == Darwin ]]; then
+        local guest_os=""
+        if guest_os=$(guest_exec /bin/sh -c '. /etc/os-release; printf "%s:%s" "$ID" "$VERSION_ID"') \
+            && [[ "$guest_os" == "ubuntu:26.04" ]]; then
+            pass "new Lima instance boots Ubuntu 26.04"
+        else
+            fail "new Lima instance boots Ubuntu 26.04" \
+                "guest OS: $guest_os; stderr: $(guest_stderr)"
+        fi
+    fi
+
     if [[ "$(uname -s)" == Linux ]]; then
         local instance_state="$HOME/.coop/instances/$INSTANCE/instance.json"
         if grep -q '"firecracker_control": "vsock"' "$instance_state"; then

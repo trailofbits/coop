@@ -24,6 +24,8 @@ use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
+const UBUNTU_ARM64_IMAGE: &str = "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img";
+const UBUNTU_AMD64_IMAGE: &str = "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-amd64.img";
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -863,7 +865,7 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
     Ok(())
 }
 
-fn provision_script_hash(
+fn image_recipe_hash(
     cfg: &CoopConfig,
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
@@ -871,7 +873,9 @@ fn provision_script_hash(
     let pubkey_path = cfg.ssh_key_path().with_extension("pub");
     let pubkey = read_public_key(&pubkey_path).unwrap_or_default();
     let script = compose_provision_script(pubkey.trim(), profiles, guest_user);
-    Sha256Hash::of(&script)
+    Sha256Hash::of(format!(
+        "{UBUNTU_ARM64_IMAGE}\n{UBUNTU_AMD64_IMAGE}\n{script}"
+    ))
 }
 
 fn read_public_key(path: &Path) -> Result<String> {
@@ -886,7 +890,7 @@ fn read_public_key(path: &Path) -> Result<String> {
 /// Returns `true` if the golden image needs rebuilding.
 ///
 /// A rebuild is needed when the config file is missing (orphaned
-/// image), the provision-script hash has changed, the persisted guest
+/// image), the source-image or provision-script hash has changed, the persisted guest
 /// user differs from the requested one, or the baked marketplace/plugin
 /// lists have changed.
 fn needs_rebuild(
@@ -895,7 +899,7 @@ fn needs_rebuild(
     profiles: &[ProfileDef],
     guest_user: &GuestUser,
 ) -> bool {
-    let current_hash = provision_script_hash(cfg, profiles, guest_user);
+    let current_hash = image_recipe_hash(cfg, profiles, guest_user);
     let Ok(existing) = TemplateConfig::load_for(cfg, image) else {
         tracing::info!("Template config missing — treating golden image as stale");
         return true;
@@ -1027,7 +1031,7 @@ fn build_golden_image(
     let template_config = TemplateConfig {
         version: TEMPLATE_VERSION,
         created: utc_timestamp(),
-        install_script_hash: provision_script_hash(cfg, profiles, guest_user),
+        install_script_hash: image_recipe_hash(cfg, profiles, guest_user),
         profiles: profiles.iter().map(|p| p.name.clone()).collect(),
         extra_packages: Vec::new(),
         post_install_hash: None,
@@ -1589,6 +1593,9 @@ containerd:
   system: false
   user: false
 
+param:
+  internal_netplanOptional: "true"
+
 video:
   display: "none"
 "#,
@@ -1653,11 +1660,11 @@ fn compose_template_yaml(cfg: &CoopConfig, provision_script: &str) -> Result<Str
         "rosetta": { "enabled": true, "binfmt": true },
         "images": [
             {
-                "location": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img",
+                "location": UBUNTU_ARM64_IMAGE,
                 "arch": "aarch64",
             },
             {
-                "location": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img",
+                "location": UBUNTU_AMD64_IMAGE,
                 "arch": "x86_64",
             },
         ],
@@ -1667,6 +1674,7 @@ fn compose_template_yaml(cfg: &CoopConfig, provision_script: &str) -> Result<Str
         "mountType": "virtiofs",
         "mounts": [],
         "containerd": { "system": false, "user": false },
+        "param": { "internal_netplanOptional": "true" },
         "provision": [{ "mode": "system", "script": provision_script }],
     });
     let yaml = serde_saphyr::to_string(&template).context("Failed to serialize Lima template")?;
@@ -2246,10 +2254,10 @@ mod tests {
         PrivateDir::create(&cfg.data_dir).unwrap();
         PrivateDir::create(&cfg.images_dir()).unwrap();
         PrivateDir::create(&cfg.image_dir(&image)).unwrap();
-        let metadata = TemplateConfig {
+        let mut metadata = TemplateConfig {
             version: TEMPLATE_VERSION,
             created: "2026-01-01T00:00:00Z".to_string(),
-            install_script_hash: provision_script_hash(&cfg, &[], &user),
+            install_script_hash: Sha256Hash::of(compose_provision_script("", &[], &user)),
             profiles: Vec::new(),
             extra_packages: Vec::new(),
             post_install_hash: None,
@@ -2262,6 +2270,9 @@ mod tests {
             guest_user: user.clone(),
             capabilities: std::collections::BTreeSet::new(),
         };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(needs_rebuild(&cfg, &image, &[], &user));
+        metadata.install_script_hash = image_recipe_hash(&cfg, &[], &user);
         metadata.save_for(&cfg, &image).unwrap();
         assert!(!needs_rebuild(&cfg, &image, &[], &user));
 
@@ -2734,7 +2745,7 @@ mod tests {
 
         let generated = compose_template_yaml(&cfg, script).unwrap();
         let parsed: serde_json::Value = serde_saphyr::from_str(&generated).unwrap();
-        assert_eq!(parsed.as_object().unwrap().len(), 10, "{generated}");
+        assert_eq!(parsed.as_object().unwrap().len(), 11, "{generated}");
         assert_eq!(
             parsed["provision"].as_array().unwrap().len(),
             1,
@@ -2754,9 +2765,38 @@ mod tests {
         assert!(parsed["memory"].is_string(), "{generated}");
         assert!(parsed["disk"].is_string(), "{generated}");
         assert_eq!(parsed["images"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            parsed["images"][0]["location"],
+            "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-arm64.img"
+        );
+        assert_eq!(
+            parsed["images"][1]["location"],
+            "https://cloud-images.ubuntu.com/releases/resolute/release/ubuntu-26.04-server-cloudimg-amd64.img"
+        );
+        assert_eq!(parsed["param"]["internal_netplanOptional"], "true");
         assert_eq!(parsed["mounts"].as_array().unwrap().len(), 0);
 
         assert_eq!(parsed["provision"][0]["script"].as_str(), Some(script));
+    }
+
+    #[test]
+    fn fast_start_template_keeps_ubuntu_netplan_optional() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("default").unwrap();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        PrivateDir::create(&cfg.image_dir(&image)).unwrap();
+        fs::write(cfg.lima_base_path(&image), b"image").unwrap();
+
+        generate_start_template(&cfg, &image).unwrap();
+        let generated = fs::read_to_string(cfg.lima_template_path(&image)).unwrap();
+        let parsed: serde_json::Value = serde_saphyr::from_str(&generated).unwrap();
+        assert_eq!(parsed["param"]["internal_netplanOptional"], "true");
+        assert_eq!(parsed["images"].as_array().unwrap().len(), 1);
     }
 
     #[test]
