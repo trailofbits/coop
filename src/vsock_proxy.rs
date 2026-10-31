@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 const MAX_RESPONSE_LEN: usize = 64;
+const MAX_VALID_RESPONSE_LEN: usize = b"OK 4294967295\n".len();
 
 #[derive(Debug, thiserror::Error)]
 #[error("Invalid Firecracker vsock handshake response")]
@@ -189,7 +190,7 @@ pub(crate) fn connect(
     }
 
     let response = read_response(&mut stream, deadline)?;
-    validate_response(&response).context(InvalidHandshake)?;
+    parse_response_port(&response).context(InvalidHandshake)?;
 
     stream
         .set_nonblocking(false)
@@ -262,21 +263,64 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>> 
     }
 }
 
-fn validate_response(response: &[u8]) -> Result<()> {
-    let Some(port) = response
+/// Parse Firecracker's complete acknowledgement without constructing an error.
+/// Keeping the grammar separate from I/O lets Kani check arbitrary response bytes.
+fn parse_response_port(response: &[u8]) -> Option<NonZeroU32> {
+    if response.len() > MAX_VALID_RESPONSE_LEN {
+        return None;
+    }
+    let port = response
         .strip_prefix(b"OK ")
-        .and_then(|value| value.strip_suffix(b"\n"))
-    else {
-        bail!(
-            "Invalid Firecracker vsock response: {}",
-            String::from_utf8_lossy(response).escape_default()
+        .and_then(|value| value.strip_suffix(b"\n"))?;
+    if port.is_empty() {
+        return None;
+    }
+    let mut value = 0_u32;
+    for &byte in port {
+        let digit = byte.checked_sub(b'0')?;
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(digit))?;
+    }
+    NonZeroU32::new(value)
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{MAX_VALID_RESPONSE_LEN, parse_response_port};
+
+    /// Every response up to the longest canonical `OK <u32>\n` has exactly the
+    /// documented grammar, a nonzero port, and no arithmetic truncation.
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn firecracker_acknowledgement_matches_decimal_grammar() {
+        let bytes: [u8; MAX_VALID_RESPONSE_LEN] = kani::any();
+        let length: usize = kani::any();
+        kani::assume(length <= bytes.len());
+        let response = &bytes[..length];
+
+        let expected = response
+            .strip_prefix(b"OK ")
+            .and_then(|port| port.strip_suffix(b"\n"))
+            .and_then(|port| {
+                let mut value = 0_u64;
+                if port.is_empty() {
+                    return None;
+                }
+                for &byte in port {
+                    if !byte.is_ascii_digit() {
+                        return None;
+                    }
+                    value = value * 10 + u64::from(byte - b'0');
+                }
+                (value > 0 && value <= u64::from(u32::MAX)).then_some(value as u32)
+            });
+        assert_eq!(
+            parse_response_port(response).map(|port| port.get()),
+            expected
         );
-    };
-    std::str::from_utf8(port)
-        .context("Firecracker vsock response port is not UTF-8")?
-        .parse::<NonZeroU32>()
-        .context("Firecracker vsock response port is not a non-zero u32")?;
-    Ok(())
+    }
 }
 
 /// Run the hidden OpenSSH `ProxyCommand` entrypoint.
@@ -647,8 +691,34 @@ mod tests {
     }
 
     #[test]
+    fn response_parser_accepts_maximum_u32_and_rejects_overflow() {
+        assert_eq!(
+            parse_response_port(b"OK 4294967295\n"),
+            NonZeroU32::new(u32::MAX)
+        );
+        assert_eq!(parse_response_port(b"OK 4294967296\n"), None);
+    }
+
+    #[test]
+    fn connect_preserves_guest_bytes_after_acknowledgement() {
+        let (_directory, path, server) = fixture(b"OK 1073741824\nSSH-2.0-fixture\r\n".to_vec());
+        let mut stream =
+            connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1)).unwrap();
+        let mut banner = [0_u8; b"SSH-2.0-fixture\r\n".len()];
+        stream.read_exact(&mut banner).unwrap();
+        assert_eq!(&banner, b"SSH-2.0-fixture\r\n");
+        assert_eq!(server.join().unwrap(), b"CONNECT 22\n");
+    }
+
+    #[test]
     fn connect_rejects_malformed_response() {
-        for response in [b"NO 1\n".to_vec(), b"OK 0\n".to_vec(), b"OK one\n".to_vec()] {
+        for response in [
+            b"NO 1\n".to_vec(),
+            b"OK 0\n".to_vec(),
+            b"OK one\n".to_vec(),
+            b"OK +1\n".to_vec(),
+            b"OK 00000000001\n".to_vec(),
+        ] {
             let (_directory, path, server) = fixture(response);
             let error =
                 connect(&path, NonZeroU32::new(22).unwrap(), Duration::from_secs(1)).unwrap_err();
