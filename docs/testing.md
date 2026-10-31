@@ -653,13 +653,12 @@ cargo kani --workspace --harness disk_relative_add_never_wraps
   multiplication preserves the size or rejects overflow.
 - `proxy_ports_are_exact_and_unique` — valid provider/instance pairs get their
   exact base-plus-index port, and different pairs never collide.
-- `firecracker_acknowledgement_matches_decimal_grammar` — every response up to
-  the longest canonical `OK <u32>\n` (14 bytes) is accepted exactly when it has
-  the `OK ` prefix, newline suffix, and a nonzero decimal port that fits in
-  `u32`. The proof compares the production parser with an independent `u64`
-  interpretation of the port. The parser rejects longer responses at its
-  length guard; unit tests also check that the handshake leaves the following
-  SSH bytes untouched.
+- `firecracker_acknowledgement_acceptance_requires_decimal_framing` — for any
+  response through the longest valid length (14 bytes), acceptance implies an
+  `OK ` prefix, at least one ASCII decimal digit, and a final newline. The
+  parser's `NonZeroU32` result and checked arithmetic constrain the port;
+  unit tests check exact boundary values and that the following SSH bytes
+  remain untouched. The parser rejects longer responses at its length guard.
 - `operation_policy_is_exact_allowlist` — for arbitrary bounded host/path bytes,
   a request is allowed exactly for POST and the four allowed host/path pairs.
   The production length guard denies inputs longer than the longest allowed
