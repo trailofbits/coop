@@ -623,7 +623,7 @@ needs its own toolchain.
 
 Proofs live in a `#[cfg(kani)]` module so the normal build never compiles them.
 They live beside their kernels in `src/config.rs`, `src/proxy.rs`,
-`src/privileged_disk.rs`, `src/commands/lifecycle.rs`, and
+`src/privileged_disk.rs`, `src/vsock_proxy.rs`, `src/commands/lifecycle.rs`, and
 `coop-proxy/src/proxy.rs`.
 
 **Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install
@@ -653,6 +653,13 @@ cargo kani --workspace --harness disk_relative_add_never_wraps
   multiplication preserves the size or rejects overflow.
 - `proxy_ports_are_exact_and_unique` — valid provider/instance pairs get their
   exact base-plus-index port, and different pairs never collide.
+- `firecracker_acknowledgement_matches_decimal_grammar` — every response up to
+  the longest canonical `OK <u32>\n` (14 bytes) is accepted exactly when it has
+  the `OK ` prefix, newline suffix, and a nonzero decimal port that fits in
+  `u32`. The proof compares the production parser with an independent `u64`
+  interpretation of the port. The parser rejects longer responses at its
+  length guard; unit tests also check that the handshake leaves the following
+  SSH bytes untouched.
 - `operation_policy_is_exact_allowlist` — for arbitrary bounded host/path bytes,
   a request is allowed exactly for POST and the four allowed host/path pairs.
   The production length guard denies inputs longer than the longest allowed
