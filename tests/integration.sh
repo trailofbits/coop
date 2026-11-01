@@ -5037,7 +5037,12 @@ test_quickstart() {
     echo ""
     echo "=== Phase: quickstart ==="
 
-    if ! "$BINARY" exec --help >/dev/null 2>&1; then
+    local quickstart_config=()
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        quickstart_config=(--config "$SUITE_CONFIG")
+    fi
+
+    if ! "$BINARY" "${quickstart_config[@]}" exec --help >/dev/null 2>&1; then
         skip "quickstart" "binary missing exec subcommand"
         return
     fi
@@ -5053,7 +5058,7 @@ test_quickstart() {
     # First invocation: image is already built (from test_setup) and no
     # instance for this workspace exists, so quickstart must allocate fresh.
     local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" "${quickstart_config[@]}" quickstart \
         </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -5078,7 +5083,7 @@ test_quickstart() {
             "stderr: $(cat "$tmpdir/qs1_err")"
     fi
 
-    if "$BINARY" status "$qs_inst_name" >/dev/null 2>&1; then
+    if "$BINARY" "${quickstart_config[@]}" status "$qs_inst_name" >/dev/null 2>&1; then
         pass "quickstart created and started instance '$qs_inst_name'"
     else
         fail "quickstart created and started instance" "no instance '$qs_inst_name'"
@@ -5089,10 +5094,10 @@ test_quickstart() {
     # Second invocation in the same cwd: must reconnect — same name, no new
     # instance allocated.
     local pre_list post_list
-    pre_list=$("$BINARY" list 2>/dev/null | sort)
+    pre_list=$("$BINARY" "${quickstart_config[@]}" list 2>/dev/null | sort)
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" "${quickstart_config[@]}" quickstart \
         </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -5108,7 +5113,7 @@ test_quickstart() {
             "stderr: $(cat "$tmpdir/qs2_err")"
     fi
 
-    post_list=$("$BINARY" list 2>/dev/null | sort)
+    post_list=$("$BINARY" "${quickstart_config[@]}" list 2>/dev/null | sort)
     if [[ "$pre_list" == "$post_list" ]]; then
         pass "second quickstart reuses existing instance for cwd"
     else
@@ -5117,13 +5122,17 @@ test_quickstart() {
     fi
 
     # Stop and re-invoke: must restart the same stopped instance.
-    if ! coop stop "$qs_inst_name"; then
-        fail "stop quickstart instance before restart test" "exit code: $?"
+    if coop stop "$qs_inst_name"; then
+        pass "stop quickstart instance before restart test"
+    else
+        local stop_rc=$?
+        fail "stop quickstart instance before restart test" \
+            "exit code: $stop_rc stderr: $HARNESS_ERR"
         return
     fi
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout 180 "$BINARY" "${quickstart_config[@]}" quickstart \
         </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -5139,11 +5148,12 @@ test_quickstart() {
             "stderr: $(cat "$tmpdir/qs3_err")"
     fi
 
-    if "$BINARY" status "$qs_inst_name" 2>/dev/null | grep -q -i running; then
+    if "$BINARY" "${quickstart_config[@]}" status "$qs_inst_name" 2>/dev/null \
+        | grep -q -i running; then
         pass "quickstart restarted stopped instance '$qs_inst_name'"
     else
         fail "quickstart restarted stopped instance" \
-            "status: $("$BINARY" status "$qs_inst_name" 2>&1)"
+            "status: $("$BINARY" "${quickstart_config[@]}" status "$qs_inst_name" 2>&1)"
     fi
 
     # Cleanup
@@ -7566,11 +7576,14 @@ CFGEOF
 # ── Credential-injecting proxy test (issue #411, --full only) ─────────
 #
 # Brings a VM up in proxy mode (remote model mode + `[proxy.*]` configured) and
-# asserts the non-exposure property end-to-end on both backends. There is no
-# mock upstream: the proxy pins TLS to the real hosts (a security property), so
-# a local mock cannot present a trusted cert. Instead the checks are hermetic
-# and need no upstream — the injection-into-the-header logic and capability
-# gate are covered by the `coop-proxy` unit tests. Here we assert what only a
+# asserts the non-exposure property end-to-end on Linux. macOS runs only the
+# Seatbelt self-test until an authenticated helper supervisor can provide
+# race-free teardown; launching the lifecycle fixture there would create a
+# helper the harness intentionally cannot signal safely. There is no mock
+# upstream: the proxy pins TLS to the real hosts (a security property), so a
+# local mock cannot present a trusted cert. Instead the checks are hermetic and
+# need no upstream — the injection-into-the-header logic and capability gate
+# are covered by the `coop-proxy` unit tests. On Linux we assert what only a
 # live VM can:
 #   - the guest is wired at the proxy (Codex `config.toml`, Claude
 #     `settings.json`) and holds only the capability token;
@@ -7595,6 +7608,126 @@ seatbelt_profile_path() {
     return 1
 }
 
+test_proxy_jail_selftest() {
+    local proxy_bin selftest_out selftest_rc=0
+    proxy_bin="$(dirname "$BINARY")/coop-proxy"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local sb_profile
+        if sb_profile=$(seatbelt_profile_path "$(dirname "${BASH_SOURCE[0]}")" "$BINARY"); then
+            local proxy_bin_abs
+            proxy_bin_abs="$(cd "$(dirname "$proxy_bin")" && pwd -P)/$(basename "$proxy_bin")"
+            selftest_out=$(sandbox-exec -D "PROXY_BIN=$proxy_bin_abs" \
+                -p "$(cat "$sb_profile")" "$proxy_bin_abs" --jail-selftest 2>&1) \
+                || selftest_rc=$?
+            if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
+                pass "proxy jail confines coop-proxy (Seatbelt: no fs-write/exec/off-list egress)"
+            else
+                fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
+            fi
+        elif [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
+            fail "proxy jail self-test" "Seatbelt profile not found beside source or binary"
+        else
+            skip "proxy jail self-test (Seatbelt profile not found beside source or binary)"
+        fi
+    else
+        selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
+        if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
+            pass "proxy jail confines coop-proxy (Landlock: no fs-write/exec/off-list egress)"
+        else
+            fail "proxy jail confines coop-proxy (Landlock)" "rc=$selftest_rc out: $selftest_out"
+        fi
+    fi
+}
+
+# Terminate a fixture-owned helper group through the same stable Linux pidfd
+# authority used by production teardown. Opening the pidfd before re-observing
+# the complete saved identity closes the PID-reuse race; the group flag keeps
+# both SIGKILL and the final absence probe bound to that original authority.
+kill_saved_helper_group() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ctypes
+import errno
+import json
+import os
+import signal
+import sys
+import time
+
+state_path, expected_role, expected_provider = sys.argv[1:]
+with open(state_path, "rb") as source:
+    encoded = source.read(16 * 1024 + 1)
+if len(encoded) > 16 * 1024:
+    raise SystemExit("helper state exceeds the production size limit")
+state = json.loads(encoded)
+if state.get("schema") != 1:
+    raise SystemExit("unexpected helper state schema")
+if state.get("role") != expected_role or state.get("provider") != expected_provider:
+    raise SystemExit("helper state role/provider mismatch")
+
+pid = state.get("pid")
+pgid = state.get("pgid")
+if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or pgid != pid:
+    raise SystemExit("invalid helper PID/process group")
+
+pidfd = os.pidfd_open(pid)
+try:
+    proc_dir = f"/proc/{pid}"
+    metadata = os.stat(proc_dir)
+    with open(f"{proc_dir}/stat", encoding="utf-8") as source:
+        stat = source.read()
+    closing_paren = stat.rfind(")")
+    fields = stat[closing_paren + 2:].split()
+    if closing_paren < 0 or len(fields) < 20:
+        raise SystemExit("malformed proc stat record")
+    observed = {
+        "pid": int(stat.split(" ", 1)[0]),
+        "pgid": int(fields[2]),
+        "uid": metadata.st_uid,
+        "start_id": f"linux:{fields[19]}",
+        "executable_hex": os.fsencode(os.readlink(f"{proc_dir}/exe")).hex(),
+    }
+    saved = {key: state.get(key) for key in observed}
+    if observed != saved:
+        raise SystemExit("helper identity changed before stable authority was acquired")
+
+    machine = os.uname().machine
+    if machine not in {"x86_64", "aarch64"}:
+        raise SystemExit(f"unsupported pidfd syscall architecture: {machine}")
+    # pidfd_send_signal is syscall 424 on both Linux architectures supported
+    # by run-integration.sh. Use the raw syscall like production so the test
+    # does not depend on the wrapper added only in glibc 2.36.
+    syscall = ctypes.CDLL(None, use_errno=True).syscall
+    syscall.restype = ctypes.c_long
+    sys_pidfd_send_signal = 424
+    group_flag = 1 << 2
+
+    def send(sig):
+        ctypes.set_errno(0)
+        result = syscall(
+            ctypes.c_long(sys_pidfd_send_signal),
+            ctypes.c_int(pidfd),
+            ctypes.c_int(sig),
+            ctypes.c_void_p(),
+            ctypes.c_uint(group_flag),
+        )
+        if result == 0:
+            return True
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return False
+        raise OSError(error, os.strerror(error))
+
+    send(signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while send(0):
+        if time.monotonic() >= deadline:
+            raise SystemExit("helper process group did not exit")
+        time.sleep(0.02)
+finally:
+    os.close(pidfd)
+PY
+}
+
 test_proxy() {
     echo ""
     echo "=== Phase: credential-injecting proxy (--full) ==="
@@ -7617,6 +7750,15 @@ test_proxy() {
         else
             skip "credential-proxy test (coop-proxy not built alongside coop)"
         fi
+        return
+    fi
+
+    # macOS has no race-free persistent-helper signal authority. Exercise the
+    # Seatbelt jail, but do not launch a lifecycle fixture that `coop stop`
+    # must intentionally retain and that the harness could not safely reap.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        test_proxy_jail_selftest
+        skip "credential-proxy lifecycle integration (awaiting authenticated macOS helper supervisor)"
         return
     fi
 
@@ -7953,13 +8095,28 @@ STATEEOF
         mv "$openai_token_file.missing" "$openai_token_file" 2>/dev/null || true
 
         local openai_tunnel_pid="$HOME/.coop/instances/$inst_name/proxy-openai-fwd.pid"
-        if kill "$(cat "$openai_tunnel_pid")" && sleep 1 \
-            && ! px codex "$inst_name" -- --version \
-            && [[ "$HARNESS_ERR" == *"proxy is unavailable in isolated network mode"* ]]; then
-            pass "isolated Codex launch fails locally after its tunnel terminates"
+        # The stable helper authority confirms the complete group is absent;
+        # only then may this fixture remove the deliberately-stale record.
+        local tunnel_group_absent=0
+        if kill_saved_helper_group "$openai_tunnel_pid" reverse_tunnel openai; then
+            tunnel_group_absent=1
+            if ! px codex "$inst_name" -- --version \
+                && [[ "$HARNESS_ERR" == *"proxy is unavailable in isolated network mode"* ]]; then
+                pass "isolated Codex launch fails locally after its tunnel terminates"
+            else
+                fail "isolated Codex launch fails locally after its tunnel terminates" \
+                    "stderr: $HARNESS_ERR"
+            fi
         else
-            fail "isolated Codex launch fails locally after its tunnel terminates" \
-                "stderr: $HARNESS_ERR"
+            fail "stable tunnel recovery confirms the test-owned group exited"
+        fi
+        if [[ "$tunnel_group_absent" == 1 ]] && rm "$openai_tunnel_pid"; then
+            pass "manual tunnel recovery clears stale state after group exit"
+        elif [[ "$tunnel_group_absent" != 1 ]]; then
+            fail "manual tunnel recovery preserves state without stable absence authority"
+        else
+            fail "manual tunnel recovery clears stale state after group exit" \
+                "could not remove $openai_tunnel_pid"
         fi
     fi
 
@@ -7972,43 +8129,14 @@ STATEEOF
     # applies the same Seatbelt profile coop uses, via `sandbox-exec` — and
     # exits 0 with "=> PASS" only if all four hold. This is the host-side
     # analog of the guest-side non-exposure checks above.
-    local proxy_bin selftest_out selftest_rc=0
-    proxy_bin="$(dirname "$BINARY")/coop-proxy"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        local sb_profile
-        if sb_profile=$(seatbelt_profile_path "$(dirname "${BASH_SOURCE[0]}")" "$BINARY"); then
-            # Pass the profile inline with -p (as coop's launcher does), not -f,
-            # and bind PROXY_BIN to the proxy's absolute path (as the launcher
-            # does), so the smoke test exercises the same code path production
-            # uses. `pwd -P` resolves the dir the way the kernel does at exec.
-            local proxy_bin_abs
-            proxy_bin_abs="$(cd "$(dirname "$proxy_bin")" && pwd -P)/$(basename "$proxy_bin")"
-            selftest_out=$(sandbox-exec -D "PROXY_BIN=$proxy_bin_abs" \
-                -p "$(cat "$sb_profile")" "$proxy_bin_abs" --jail-selftest 2>&1) \
-                || selftest_rc=$?
-            if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
-                pass "proxy jail confines coop-proxy (Seatbelt: no fs-write/exec/off-list egress)"
-            else
-                fail "proxy jail confines coop-proxy (Seatbelt)" "rc=$selftest_rc out: $selftest_out"
-            fi
-        else
-            if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 ]]; then
-                fail "proxy jail self-test" "Seatbelt profile not found beside source or binary"
-            else
-                skip "proxy jail self-test (Seatbelt profile not found beside source or binary)"
-            fi
-        fi
-    else
-        selftest_out=$("$proxy_bin" --jail-selftest 2>&1) || selftest_rc=$?
-        if [[ $selftest_rc -eq 0 ]] && echo "$selftest_out" | grep -q "=> PASS"; then
-            pass "proxy jail confines coop-proxy (Landlock: no fs-write/exec/off-list egress)"
-        else
-            fail "proxy jail confines coop-proxy (Landlock)" "rc=$selftest_rc out: $selftest_out"
-        fi
-    fi
+    test_proxy_jail_selftest
 
     # ── Teardown tears the proxy down ──
-    px stop "$inst_name" >/dev/null 2>&1 || true
+    if px stop "$inst_name" >/dev/null; then
+        pass "stop succeeds after explicit stale-tunnel recovery"
+    else
+        fail "stop succeeds after explicit stale-tunnel recovery" "stderr: $HARNESS_ERR"
+    fi
     if [[ -n "$oai_port" ]]; then
         if curl -s --max-time 3 -o /dev/null "http://127.0.0.1:$oai_port/v1/models"; then
             fail "stop tears the proxy down" "proxy still answering on 127.0.0.1:$oai_port"
@@ -8017,10 +8145,14 @@ STATEEOF
         fi
     fi
 
-    px destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-    rm -r "$px_dir"
-    proxy_phase_ran=1
+    if px destroy "$inst_name"; then
+        pass "destroy succeeds after proxy teardown"
+        untrack_instance "$inst_name"
+        rm -r "$px_dir"
+        proxy_phase_ran=1
+    else
+        fail "destroy succeeds after proxy teardown" "stderr: $HARNESS_ERR"
+    fi
 }
 
 # ── Interrupted setup test (--full only) ──────────────────────
@@ -9141,7 +9273,8 @@ EOF
         fi
     fi
 
-    if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$proxy_phase_ran" != 1 ]]; then
+    if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 \
+        && "$(uname -s)" != "Darwin" && "$proxy_phase_ran" != 1 ]]; then
         fail "credential-proxy phase ran" "required release phase did not complete"
     fi
     summary

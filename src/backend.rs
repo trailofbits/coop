@@ -201,6 +201,17 @@ pub struct StoppedInstance {
     _lock: FileLock,
 }
 
+/// Run idempotent host-helper cleanup on both sides of guest destruction.
+/// The caller holds the instance operation lock for this complete sequence.
+fn destroy_guest_with_helper_cleanup(
+    cleanup: &mut dyn FnMut() -> Result<()>,
+    destroy_guest: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    cleanup()?;
+    destroy_guest()?;
+    cleanup()
+}
+
 /// State observed after acquiring the lifecycle lock for a stop request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopOutcome {
@@ -1089,7 +1100,7 @@ pub trait VmBackend: std::fmt::Display {
         inst: &Instance,
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
-    ) -> Result<()>;
+    ) -> Result<InstanceOperationGuard>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
     /// Start an instance while retaining the operation lock represented by
     /// `stopped`. This is used by compound stopped-only transitions so no
@@ -1103,18 +1114,48 @@ pub trait VmBackend: std::fmt::Display {
     /// with the operation lock held once the backend confirms it has exited.
     /// The outcome reports whether the lock-protected probe still found it
     /// running, so compound transitions do not act on the stale first probe.
+    /// Stop a running instance while `cleanup` is serialized by the same
+    /// operation lock. Cleanup runs before guest shutdown so SSH-backed
+    /// helpers retain live signal authority; callers may safely reconcile it
+    /// again after this method returns a [`StoppedInstance`].
+    fn stop_with_cleanup(
+        &self,
+        cfg: &CoopConfig,
+        running: RunningInstance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<(StoppedInstance, StopOutcome)>;
+
+    #[cfg(test)]
     fn stop(
         &self,
         cfg: &CoopConfig,
         running: RunningInstance,
-    ) -> Result<(StoppedInstance, StopOutcome)>;
+    ) -> Result<(StoppedInstance, StopOutcome)> {
+        self.stop_with_cleanup(cfg, running, &mut || Ok(()))
+    }
     /// Finish backend cleanup for a confirmed-stopped instance.
     /// Lima has no host TAP; Firecracker deletes it while the operation lock
     /// carried by `stopped` prevents a concurrent restart.
     fn cleanup_stopped(&self, _cfg: &CoopConfig, _stopped: &StoppedInstance) -> Result<()> {
         Ok(())
     }
-    fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
+    /// Destroy an instance while running `cleanup` under the same operation
+    /// lock before guest shutdown and again before authoritative host state is
+    /// removed. The first call preserves SSH-backed helper authority; the
+    /// second is idempotent reconciliation. This prevents a concurrent restart
+    /// from publishing a helper between cleanup and instance-directory
+    /// deletion.
+    fn destroy_instance_with_cleanup(
+        &self,
+        cfg: &CoopConfig,
+        inst: &Instance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()>;
+
+    #[cfg(test)]
+    fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+        self.destroy_instance_with_cleanup(cfg, inst, &mut || Ok(()))
+    }
     fn destroy_shared(&self, cfg: &CoopConfig);
     fn destroy_image(&self, cfg: &CoopConfig, image: &ImageName) -> Result<()>;
     /// Resize a stopped instance's disk. The [`StoppedInstance`] holds the
@@ -1347,8 +1388,8 @@ impl VmBackend for FirecrackerBackend {
         inst: &Instance,
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
-    ) -> Result<()> {
-        let _operation = lock_instance_operation(inst)?;
+    ) -> Result<InstanceOperationGuard> {
+        let operation = lock_instance_operation(inst)?;
         if inst.probe_liveness()? {
             bail!("Instance '{}' is already running", inst.name);
         }
@@ -1368,7 +1409,8 @@ impl VmBackend for FirecrackerBackend {
             crate::network::setup_tap(&cfg.network, inst)?;
         }
         let running = vm.start()?;
-        running.wait_for_boot()
+        running.wait_for_boot()?;
+        Ok(InstanceOperationGuard { _lock: operation })
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1396,13 +1438,15 @@ impl VmBackend for FirecrackerBackend {
         Ok(stopped.into_operation_guard())
     }
 
-    fn stop(
+    fn stop_with_cleanup(
         &self,
         cfg: &CoopConfig,
         running: RunningInstance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        cleanup()?;
         let outcome = if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
             vm.stop()?;
@@ -1425,12 +1469,20 @@ impl VmBackend for FirecrackerBackend {
         }
     }
 
-    fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    fn destroy_instance_with_cleanup(
+        &self,
+        cfg: &CoopConfig,
+        inst: &Instance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        if inst.probe_liveness()? {
-            let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
-            vm.stop()?;
-        }
+        destroy_guest_with_helper_cleanup(cleanup, || {
+            if inst.probe_liveness()? {
+                let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
+                vm.stop()?;
+            }
+            Ok(())
+        })?;
         crate::network::teardown_tap(&cfg.network, inst)?;
         if inst.dir.exists()
             && let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&inst.dir).sudo().run()
@@ -1637,10 +1689,11 @@ impl VmBackend for LimaBackend {
         inst: &Instance,
         disk_gib: Option<crate::config::GiB>,
         mounts: &[crate::config::Mount],
-    ) -> Result<()> {
-        let _operation = lock_instance_operation(inst)?;
+    ) -> Result<InstanceOperationGuard> {
+        let operation = lock_instance_operation(inst)?;
         boot_preflight(cfg)?;
-        crate::lima::create_and_start(cfg, inst, disk_gib, mounts)
+        crate::lima::create_and_start(cfg, inst, disk_gib, mounts)?;
+        Ok(InstanceOperationGuard { _lock: operation })
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1659,13 +1712,15 @@ impl VmBackend for LimaBackend {
         Ok(stopped.into_operation_guard())
     }
 
-    fn stop(
+    fn stop_with_cleanup(
         &self,
         _cfg: &CoopConfig,
         running: RunningInstance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        cleanup()?;
         let outcome = match crate::lima::probe_state(&inst)? {
             Some(crate::lima::LimaState::Running) => {
                 crate::lima::stop_running(&inst)?;
@@ -1678,9 +1733,14 @@ impl VmBackend for LimaBackend {
         Ok((StoppedInstance::new(inst, operation), outcome))
     }
 
-    fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    fn destroy_instance_with_cleanup(
+        &self,
+        _cfg: &CoopConfig,
+        inst: &Instance,
+        cleanup: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        crate::lima::destroy(inst)?;
+        destroy_guest_with_helper_cleanup(cleanup, || crate::lima::destroy(inst))?;
         if inst.dir.exists()
             && let Err(e) = fs::remove_dir_all(&inst.dir)
         {
@@ -2204,8 +2264,8 @@ fn bootstrap_claude(
         tracing::info!("Claude Code bootstrap complete");
         Ok(())
     })();
-    if result.is_err() && proxy.is_some() {
-        crate::proxy::stop_provider(inst, crate::proxy::Provider::Anthropic);
+    if proxy.is_some() {
+        return finish_with_proxy_cleanup(result, inst, crate::proxy::Provider::Anthropic);
     }
     result
 }
@@ -2347,8 +2407,8 @@ fn bootstrap_codex(
 
         Ok(())
     })();
-    if result.is_err() && proxy.is_some() {
-        crate::proxy::stop_provider(inst, crate::proxy::Provider::Openai);
+    if proxy.is_some() {
+        return finish_with_proxy_cleanup(result, inst, crate::proxy::Provider::Openai);
     }
     result
 }
@@ -3735,12 +3795,29 @@ fn start_agent_proxy(
         // Not in proxy mode for this provider: ensure no proxy from a previous
         // boot (e.g. before a switch to local mode, or after the config was
         // removed) keeps running against this instance.
-        crate::proxy::stop_provider(inst, provider);
+        crate::proxy::stop_provider(inst, provider)?;
         return Ok(None);
     };
     Ok(Some(crate::proxy::start_provider(
         inst, provider, &upstream, target,
     )?))
+}
+
+fn finish_with_proxy_cleanup(
+    result: Result<()>,
+    inst: &crate::config::Instance,
+    provider: crate::proxy::Provider,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match crate::proxy::stop_provider(inst, provider) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error).context(format!(
+                "Guest bootstrap failed and {} helper cleanup also failed: {cleanup:#}",
+                provider.name()
+            )),
+        },
+    }
 }
 
 /// The Codex `config.toml` provider keys for this VM: the local-model block in
@@ -4839,7 +4916,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn stop_reprobes_after_acquiring_operation_lock() {
+    fn stop_reprobes_and_cleans_helpers_after_acquiring_operation_lock() {
         let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
@@ -4853,21 +4930,101 @@ mod tests {
         let backend = FirecrackerBackend::new();
         let target = backend.ssh_target(&cfg, &inst).unwrap();
         let lock = lock_instance_operation(&inst).unwrap();
-        let stale_running = RunningInstance::new(inst, target);
+        let marker = inst.dir.join("proxy-openai.pid");
+        let stale_running = RunningInstance::new(inst.clone(), target);
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            done_tx.send(backend.stop(&cfg, stale_running)).unwrap();
+            let mut cleanup = || {
+                cleanup_tx
+                    .send(std::fs::read_to_string(&marker).unwrap())
+                    .unwrap();
+                std::fs::remove_file(&marker).unwrap();
+                Ok(())
+            };
+            done_tx
+                .send(backend.stop_with_cleanup(&cfg, stale_running, &mut cleanup))
+                .unwrap();
         });
 
-        // Another stop completed before this token reached the operation lock.
+        // Another stop/restart transaction publishes new helper authority
+        // before this stale running token reaches the operation lock.
         assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(cleanup_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        std::fs::write(inst.dir.join("proxy-openai.pid"), "new identity").unwrap();
         drop(lock);
+        assert_eq!(
+            cleanup_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "new identity"
+        );
         let (_, outcome) = done_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
         assert_eq!(outcome, StopOutcome::AlreadyStopped);
+        assert!(!inst.dir.join("proxy-openai.pid").exists());
         thread.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn destroy_runs_helper_cleanup_under_lock_before_state_removal() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let lock = lock_instance_operation(&inst).unwrap();
+        let marker = inst.dir.join("proxy-openai.pid");
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let thread_inst = inst.clone();
+        let thread = std::thread::spawn(move || {
+            let mut cleanup = || {
+                cleanup_tx
+                    .send(std::fs::read_to_string(&marker).unwrap())
+                    .unwrap();
+                Err(anyhow::anyhow!("helper cleanup failed"))
+            };
+            FirecrackerBackend::new().destroy_instance_with_cleanup(
+                &CoopConfig::default(),
+                &thread_inst,
+                &mut cleanup,
+            )
+        });
+
+        // Model a restart publishing helper authority while it owns the same
+        // operation lock. Destroy must observe it only after that lock drops.
+        assert!(cleanup_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        std::fs::write(inst.dir.join("proxy-openai.pid"), "identity").unwrap();
+        drop(lock);
+        assert_eq!(
+            cleanup_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "identity"
+        );
+        let error = thread.join().unwrap().unwrap_err().to_string();
+        assert_eq!(error, "helper cleanup failed");
+        assert!(inst.dir.exists(), "failed cleanup removed instance state");
+    }
+
+    #[test]
+    fn destroy_sequence_cleans_helpers_before_and_after_guest_destruction() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut cleanup = || {
+            events.borrow_mut().push("cleanup");
+            Ok(())
+        };
+
+        destroy_guest_with_helper_cleanup(&mut cleanup, || {
+            events.borrow_mut().push("destroy guest");
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(events.into_inner(), ["cleanup", "destroy guest", "cleanup"]);
     }
 
     #[cfg(not(target_os = "macos"))]

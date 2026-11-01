@@ -444,6 +444,33 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   bounded, preventing a configurable peer from turning error capture into
   unbounded host allocation or pipe backpressure.
 
+  Persistent helper teardown does not treat a positive PID as authority.
+  `process_identity.rs` writes an atomic owner-only record for each proxy and
+  reverse tunnel containing its role/provider, PID and process group, uid,
+  native start identity, and executable. Readiness and initial TERM authority
+  require an exact live match. Malformed, legacy, unreadable, mismatched, or
+  already-dead leader state signals nothing and is retained with an actionable
+  error. After that match, TERM, any later KILL after leader exit, and the final
+  absence probe all use the same retained stable authority rather than
+  re-resolving a numeric PID or PGID. Capability tokens are deleted only after
+  both helpers are confirmed gone. A running VM's helpers are stopped before
+  guest shutdown so loss of the SSH transport cannot make the reverse-tunnel
+  leader disappear before coop acquires that authority; an authority failure
+  leaves the VM running.
+
+  Linux uses `pidfd_open` and the kernel's stable
+  `PIDFD_SIGNAL_PROCESS_GROUP` operation (uapi bit 2). A kernel without that
+  operation is not downgraded to `kill(-pgid, ...)`: the check-then-signal gap
+  could target a recycled process group, so coop signals nothing and retains
+  state for manual recovery. macOS uses `PROC_PIDTBSDINFO` and `proc_pidpath`
+  for identity observation, but exposes no equivalent race-free signal or
+  absence authority. A live or already-exited macOS helper is therefore
+  retained for manual cleanup; an already-exited Linux leader is also retained
+  because coop cannot acquire the pidfd authority after the fact.
+  `--force` must never override an identity or authority failure. An
+  authenticated supervisor/control channel is the planned way to restore
+  automatic macOS teardown without weakening this invariant.
+
 - **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
   the real credential and terminates connections the untrusted guest
   originates, so it is the feature's new attack surface; the jail bounds the

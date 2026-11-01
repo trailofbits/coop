@@ -37,6 +37,7 @@ use crate::codex_token::CodexTokenMetadata;
 use crate::config::{
     Instance, InstanceIndex, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value,
 };
+use crate::process_identity::HelperRole;
 use crate::remote_command::RemoteCommand;
 
 /// The proxy binary name, expected next to the `coop` binary.
@@ -211,7 +212,7 @@ fn start_provider_with(
 ) -> Result<ProxyHandle> {
     ensure_auth_supported(provider, upstream.auth)?;
     // A failed replacement must not leave the previous credential usable.
-    stop_provider(inst, provider);
+    stop_provider(inst, provider)?;
     let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
         format!(
             "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
@@ -249,13 +250,21 @@ fn start_provider_with(
     if provider.persists_token()
         && let Err(e) = write_token_file(inst, provider, &token)
     {
-        stop_provider(inst, provider);
+        if let Err(cleanup) = stop_provider(inst, provider) {
+            return Err(e).context(format!(
+                "Proxy token persistence failed and helper cleanup also failed: {cleanup:#}"
+            ));
+        }
         return Err(e);
     }
     // Expose the loopback proxy into the guest. If the tunnel fails, tear the
     // proxy back down so we don't leave it orphaned (fail closed).
     if let Err(e) = launch_tunnel(port) {
-        stop_provider(inst, provider);
+        if let Err(cleanup) = stop_provider(inst, provider) {
+            return Err(e).context(format!(
+                "Reverse-tunnel startup failed and helper cleanup also failed: {cleanup:#}"
+            ));
+        }
         return Err(e);
     }
     tracing::info!(
@@ -270,26 +279,49 @@ fn start_provider_with(
 }
 
 /// Tear down the proxy process, tunnel, and token file for one `provider`.
-/// Best-effort, safe to call when none were started.
-pub fn stop_provider(inst: &Instance, provider: Provider) {
+/// Missing state is already stopped; unverifiable identity fails closed and
+/// retains state and token material for a safe retry.
+pub fn stop_provider(inst: &Instance, provider: Provider) -> Result<()> {
     let name = provider.name();
-    kill_pid_file(&pid_path(inst, name), "proxy");
-    kill_pid_file(&fwd_pid_path(inst, name), "proxy tunnel");
-    let token = token_path(inst, name);
-    if token.exists()
-        && let Err(e) = fs::remove_file(&token)
-    {
-        tracing::debug!(
-            "Failed to remove proxy token file {} (non-fatal): {e}",
-            token.display()
-        );
+    let proxy =
+        crate::process_identity::stop(&pid_path(inst, name), HelperRole::CredentialProxy, name);
+    let tunnel =
+        crate::process_identity::stop(&fwd_pid_path(inst, name), HelperRole::ReverseTunnel, name);
+    match (proxy, tunnel) {
+        (Ok(()), Ok(())) => {}
+        (Err(proxy), Ok(())) => return Err(proxy),
+        (Ok(()), Err(tunnel)) => return Err(tunnel),
+        (Err(proxy), Err(tunnel)) => {
+            return Err(proxy).context(format!(
+                "Both {} helper cleanups failed; tunnel cleanup: {tunnel:#}",
+                provider.name()
+            ));
+        }
     }
+    let token = token_path(inst, name);
+    match fs::remove_file(&token) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to remove proxy token {}", token.display()));
+        }
+    }
+    Ok(())
 }
 
-/// Tear down every provider's proxy for `inst` (stop/destroy). Best-effort.
-pub fn stop(inst: &Instance) {
+/// Tear down every provider's proxy for `inst` (stop/destroy).
+pub fn stop(inst: &Instance) -> Result<()> {
+    let mut failures = Vec::new();
     for provider in Provider::ALL {
-        stop_provider(inst, provider);
+        if let Err(error) = stop_provider(inst, provider) {
+            failures.push(format!("{}: {error:#}", provider.name()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("Credential proxy cleanup failed:\n{}", failures.join("\n"))
     }
 }
 
@@ -312,10 +344,15 @@ pub(crate) fn ensure_runtime_available(
     provider: Provider,
     target: &SshTarget,
 ) -> Result<()> {
-    ensure_pid_file_live(&pid_path(inst, provider.name()), "credential proxy")?;
-    ensure_pid_file_live(
+    crate::process_identity::ensure_live(
+        &pid_path(inst, provider.name()),
+        HelperRole::CredentialProxy,
+        provider.name(),
+    )?;
+    crate::process_identity::ensure_live(
         &fwd_pid_path(inst, provider.name()),
-        "credential proxy reverse tunnel",
+        HelperRole::ReverseTunnel,
+        provider.name(),
     )?;
     if provider.persists_token() {
         read_capability_token(inst, provider).with_context(|| {
@@ -371,36 +408,12 @@ fn ensure_proxy_protocol(address: SocketAddr, provider: Provider) -> Result<()> 
     Ok(())
 }
 
-fn ensure_pid_file_live(path: &Path, label: &str) -> Result<()> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("{label} state is missing at {}", path.display()))?;
-    let pid = contents
-        .trim()
-        .parse::<i32>()
-        .with_context(|| format!("{label} state is malformed at {}", path.display()))?;
-    anyhow::ensure!(
-        pid > 0,
-        "{label} state has an invalid PID at {}",
-        path.display()
-    );
-    // SAFETY: signal 0 performs a liveness/permission probe without changing
-    // the parsed positive process ID's state.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EPERM) {
-        return Ok(());
-    }
-    Err(error).with_context(|| format!("{label} process {pid} is not running"))
-}
-
 // ── process supervision ──────────────────────────────────────
 
 fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> Result<()> {
     // A previous run may have crashed without stop cleanup; kill any leftover
     // before binding so we don't race it for the same port.
-    kill_pid_file(&pid_path(inst, name), "stale proxy");
+    crate::process_identity::stop(&pid_path(inst, name), HelperRole::CredentialProxy, name)?;
 
     let bin = locate_proxy_binary()?;
     let log_path = inst.dir.join(format!("proxy-{name}.log"));
@@ -433,21 +446,20 @@ fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> R
     // and the launch aborts — a credential proxy that could not be jailed never
     // reaches a serving state. Kill the child on failure so it is not orphaned.
     if let Err(e) = await_proxy_ready(&mut child, listen, &log_path) {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_spawned_group(&mut child);
         return Err(e);
     }
 
     let pid = child.id();
     let pid_path = pid_path(inst, name);
-    if let Err(e) = fs::write(&pid_path, pid.to_string()) {
-        // Without a pid file `stop_provider` can never reap this proxy, and the
-        // std `Child` destructor does not kill it — so a running proxy holding
-        // the real credential would be orphaned. Kill it before failing.
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Err(e) =
+        crate::process_identity::write_state(&pid_path, HelperRole::CredentialProxy, name, pid)
+    {
+        // Without identity state `stop_provider` can never safely authorize
+        // teardown. Kill the freshly spawned group before failing.
+        kill_spawned_group(&mut child);
         return Err(e)
-            .with_context(|| format!("Failed to write proxy pid file {}", pid_path.display()));
+            .with_context(|| format!("Failed to write proxy state {}", pid_path.display()));
     }
     // Deliberately do not wait past this point: the proxy runs for the VM's
     // lifetime, and the std `Child` destructor does not kill it.
@@ -464,16 +476,16 @@ fn await_proxy_ready(
 ) -> Result<()> {
     let deadline = Instant::now() + PROXY_READY_GRACE;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        match child_exited_without_reaping(child) {
+            Ok(true) => {
                 let log = bounded_log_excerpt(log_path);
                 bail!(
-                    "credential proxy exited before it began serving ({status}) — its \
+                    "credential proxy exited before it began serving — its \
                      confinement or bind failed; refusing to start the VM (fail-closed).\n{}",
                     log.trim()
                 );
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => return Err(e).context("Failed to poll the credential proxy process"),
         }
         if std::net::TcpStream::connect_timeout(&listen, Duration::from_millis(200)).is_ok() {
@@ -569,11 +581,11 @@ fn reverse_forward_request_args(
 
 /// Establish a per-instance reverse SSH tunnel so the guest reaches the
 /// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
-/// and tracked by a PID file like the proxy process, so teardown needs no SSH
-/// target. An acknowledged forwarding request makes a bind clash on the guest
-/// a startup failure rather than a silently dead tunnel.
+/// and tracked by an identity-bound state record like the proxy process, so
+/// teardown needs no SSH target. An acknowledged forwarding request makes a
+/// bind clash on the guest a startup failure rather than a silently dead tunnel.
 fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: u16) -> Result<()> {
-    kill_pid_file(&fwd_pid_path(inst, name), "stale proxy tunnel");
+    crate::process_identity::stop(&fwd_pid_path(inst, name), HelperRole::ReverseTunnel, name)?;
 
     let control_dir = create_tunnel_control_dir()?;
     let control_path = control_dir.path().join("ssh.sock");
@@ -601,10 +613,8 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         let deadline = Instant::now() + TUNNEL_READY_TIMEOUT;
         loop {
             crate::signal::check_shutdown()?;
-            if let Some(status) = child.try_wait().context("Failed to poll proxy tunnel")? {
-                bail!(
-                    "reverse SSH tunnel exited before its control socket became ready ({status})"
-                );
+            if child_exited_without_reaping(&child).context("Failed to poll proxy tunnel")? {
+                bail!("reverse SSH tunnel exited before its control socket became ready");
             }
             if control_path.exists() {
                 break;
@@ -618,7 +628,8 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         // A live SSH process or control socket does not prove the guest has
         // accepted a reverse forward. -O forward waits for that acknowledgment
         // and returns nonzero for a rejected bind. The master stays the direct
-        // child, so its existing PID-file teardown remains authoritative.
+        // child so coop can persist its complete identity record after the
+        // request succeeds.
         let forward_args = reverse_forward_request_args(&control_path, target, port)?;
         let request = target
             .ssh_forward_command()?
@@ -631,20 +642,20 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         await_forwarding_ack(request, deadline)?;
 
         let path = fwd_pid_path(inst, name);
-        fs::write(&path, child.id().to_string())
-            .with_context(|| format!("Failed to write proxy tunnel pid file {}", path.display()))?;
+        crate::process_identity::write_state(&path, HelperRole::ReverseTunnel, name, child.id())
+            .with_context(|| format!("Failed to write proxy tunnel state {}", path.display()))?;
         Ok(())
     })();
     if let Err(e) = setup {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_spawned_group(&mut child);
         let log = bounded_log_excerpt(&log_path);
         return Err(e).context(format!(
             "Failed to establish the credential proxy's reverse SSH tunnel.\n{}",
             log.trim()
         ));
     }
-    // The master no longer needs a control socket: later teardown uses its PID.
+    // The master no longer needs a control socket: later teardown uses its
+    // persisted identity and stable process authority.
     Ok(())
 }
 
@@ -706,28 +717,41 @@ fn await_forwarding_ack(mut request: std::process::Child, deadline: Instant) -> 
     result
 }
 
-/// SIGTERM the process named by a PID file and remove the file. Best-effort;
-/// safe when the file is absent or malformed.
-fn kill_pid_file(path: &Path, label: &str) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
+fn kill_spawned_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // Readiness polling uses waitid(WNOWAIT), so this direct child has not
+        // been reaped: a live process or zombie still reserves its PID/PGID.
+        // The numeric group cannot be recycled before the wait below.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    // The unreaped direct-child invariant also makes this numeric PID stable.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn child_exited_without_reaping(child: &std::process::Child) -> Result<bool> {
+    // SAFETY: siginfo_t is a C output structure initialized before use.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // WNOWAIT observes exit without releasing the PID/PGID authority required
+    // by startup rollback. P_PID limits the query to this direct child.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            std::ptr::addr_of_mut!(info),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
     };
-    match contents.trim().parse::<i32>() {
-        Ok(pid) if pid > 0 => {
-            // Safety: `kill` with a parsed positive pid and a constant signal.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            tracing::debug!("Sent SIGTERM to {label} (pid {pid})");
-        }
-        _ => tracing::debug!("Ignoring malformed pid file {}", path.display()),
+    if waitid_failed(result) {
+        return Err(std::io::Error::last_os_error()).context("Failed to observe child process");
     }
-    if let Err(e) = fs::remove_file(path) {
-        tracing::debug!(
-            "Failed to remove pid file {} (non-fatal): {e}",
-            path.display()
-        );
-    }
+    // SAFETY: waitid initialized siginfo; si_pid is zero for WNOHANG with no
+    // state change and the child's PID after an observed exit.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn waitid_failed(result: libc::c_int) -> bool {
+    result == -1
 }
 
 /// Persist the capability token owner-only (0600). It is worthless off the
@@ -1072,6 +1096,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn invalid_codex_token_fails_before_proxy_or_tunnel_startup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1106,20 +1131,24 @@ mod tests {
 
     impl StaleProvider {
         fn seed(inst: &Instance) -> Self {
-            let children = [
-                Command::new("sleep").arg("30").spawn().unwrap(),
-                Command::new("sleep").arg("30").spawn().unwrap(),
-            ];
-            for (path, child) in [pid_path(inst, "openai"), fwd_pid_path(inst, "openai")]
-                .iter()
-                .zip(&children)
+            let children = std::array::from_fn(|_| {
+                let mut command = Command::new("sleep");
+                command.arg("30").process_group(0).spawn().unwrap()
+            });
+            for ((path, role), child) in [
+                (pid_path(inst, "openai"), HelperRole::CredentialProxy),
+                (fwd_pid_path(inst, "openai"), HelperRole::ReverseTunnel),
+            ]
+            .iter()
+            .zip(&children)
             {
-                fs::write(path, child.id().to_string()).unwrap();
+                crate::process_identity::write_state(path, *role, "openai", child.id()).unwrap();
             }
             write_token_file(inst, Provider::Openai, "stale-capability").unwrap();
             Self { children }
         }
 
+        #[cfg(target_os = "linux")]
         fn assert_stopped(&mut self, inst: &Instance) {
             for path in [
                 pid_path(inst, "openai"),
@@ -1129,11 +1158,30 @@ mod tests {
                 assert!(!path.exists(), "stale state remains: {}", path.display());
             }
             let deadline = Instant::now() + Duration::from_secs(5);
-            for child in &mut self.children {
-                while child.try_wait().unwrap().is_none() {
+            for child in &self.children {
+                let pid = i32::try_from(child.id()).unwrap();
+                while unsafe { libc::kill(pid, 0) } == 0 {
                     assert!(Instant::now() < deadline, "stale process still running");
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn assert_retained(&mut self, inst: &Instance) {
+            for path in [
+                pid_path(inst, "openai"),
+                fwd_pid_path(inst, "openai"),
+                token_path(inst, "openai"),
+            ] {
+                assert!(path.exists(), "stale state was removed: {}", path.display());
+            }
+            for child in &mut self.children {
+                assert!(child.try_wait().unwrap().is_none());
             }
         }
     }
@@ -1148,6 +1196,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_codex_start_clears_previous_provider_state() {
         use std::cell::Cell;
@@ -1193,6 +1242,30 @@ mod tests {
             assert_eq!(processes_started.get(), 0);
             stale.assert_stopped(&inst);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacement_refuses_live_helpers_without_stable_signal_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let mut stale = StaleProvider::seed(&inst);
+        let upstream = ProxyUpstream {
+            credential: Secret::new("at-test".to_string()),
+            auth: ProxyAuthScheme::CodexAccessToken,
+        };
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("unused_key"),
+            crate::config::CoopConfig::default().ssh.host_tools,
+        );
+
+        let error = start_provider(&inst, Provider::Openai, &upstream, &target).unwrap_err();
+        assert!(format!("{error:#}").contains("race-free helper signal authority"));
+        stale.assert_retained(&inst);
     }
 
     #[test]
@@ -1283,7 +1356,75 @@ mod tests {
             msg.contains("exited before it began serving"),
             "unexpected error: {msg}"
         );
-        let _ = child.wait();
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(7), "exit observation must not reap");
+    }
+
+    #[test]
+    fn child_exit_probe_distinguishes_live_process_without_reaping() {
+        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!child_exited_without_reaping(&live).unwrap());
+        live.kill().unwrap();
+        live.wait().unwrap();
+
+        let mut exited = Command::new("sh").args(["-c", "exit 9"]).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_exited_without_reaping(&exited).unwrap() {
+            assert!(Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(exited.wait().unwrap().code(), Some(9));
+    }
+
+    #[test]
+    fn waitid_failure_classifier_distinguishes_error_from_success() {
+        assert!(waitid_failed(-1));
+        assert!(!waitid_failed(0));
+    }
+
+    #[test]
+    fn startup_rollback_kills_and_reaps_the_reserved_group_leader() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let descendant_state = temp.path().join("descendant-pid");
+        let mut command = Command::new("sh");
+        let mut child = command
+            .args([
+                "-c",
+                "sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & wait",
+                "coop-test",
+                descendant_state.to_str().unwrap(),
+            ])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !descendant_state.exists() {
+            assert!(Instant::now() < deadline, "descendant did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant = fs::read_to_string(&descendant_state)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert!(!child_exited_without_reaping(&child).unwrap());
+
+        kill_spawned_group(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let leader_alive = unsafe { libc::kill(pid, 0) } == 0;
+        let descendant_alive = unsafe { libc::kill(descendant, 0) } == 0;
+        if leader_alive || descendant_alive {
+            // Cleanup also runs if a deliberate mutation removes rollback.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(!leader_alive, "rollback left the group leader alive");
+        assert!(!descendant_alive, "rollback left a group descendant alive");
     }
 
     #[test]
@@ -1365,7 +1506,12 @@ mod tests {
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
         // Also clean up the old implementation when deliberately regressed.
-        kill_pid_file(&fwd_pid_path(&inst, "test"), "test tunnel");
+        crate::process_identity::stop(
+            &fwd_pid_path(&inst, "test"),
+            HelperRole::ReverseTunnel,
+            "test",
+        )
+        .unwrap();
         assert!(accepted, "SSH must have reached the stalled peer");
         let error = result.unwrap_err();
         assert!(format!("{error:#}").contains("before its control socket became ready"));
@@ -1412,10 +1558,9 @@ mod tests {
             "ambient SSH configuration added an unexpected remote forward"
         );
         let pid = forward_master_pid(&fixture);
-        assert_eq!(
-            fs::read_to_string(fwd_pid_path(&inst, "test")).unwrap(),
-            pid.to_string()
-        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(fwd_pid_path(&inst, "test")).unwrap()).unwrap();
+        assert_eq!(state["pid"], pid);
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
 
         // Send through the guest listener and receive at the host destination.
@@ -1446,8 +1591,13 @@ mod tests {
         assert_eq!(&payload, b"forwarded");
         connection.write_all(b"ok").unwrap();
         assert!(sender.wait().unwrap().success());
-        kill_pid_file(&fwd_pid_path(&inst, "test"), "test tunnel");
-        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) }, pid);
+        crate::process_identity::stop(
+            &fwd_pid_path(&inst, "test"),
+            HelperRole::ReverseTunnel,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
 
         // Occupy exactly the guest loopback port. Authentication still works;
         // only the subsequent reverse-forward bind must be refused.
@@ -1498,8 +1648,45 @@ mod tests {
         // Other providers are independent.
         assert_eq!(read_capability_token(&inst, Provider::Anthropic), None);
 
-        stop_provider(&inst, Provider::Openai);
+        stop_provider(&inst, Provider::Openai).unwrap();
         assert_eq!(read_capability_token(&inst, Provider::Openai), None);
+    }
+
+    #[test]
+    fn identity_mismatch_retains_token_and_helper_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let mut command = Command::new("sleep");
+        let mut child = command.arg("30").process_group(0).spawn().unwrap();
+        let state_path = pid_path(&inst, "openai");
+        crate::process_identity::write_state(
+            &state_path,
+            HelperRole::CredentialProxy,
+            "openai",
+            child.id(),
+        )
+        .unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["start_id"] = serde_json::Value::String("recycled".to_string());
+        crate::fs_util::atomic_write_with_mode(
+            &state_path,
+            &serde_json::to_string(&state).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        write_token_file(&inst, Provider::Openai, "cap-123").unwrap();
+
+        assert!(stop_provider(&inst, Provider::Openai).is_err());
+        assert!(state_path.exists());
+        assert_eq!(
+            read_capability_token(&inst, Provider::Openai),
+            Some("cap-123".to_string())
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
