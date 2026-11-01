@@ -9,7 +9,7 @@
     reason = "auto-prompt is interactive CLI — stderr is user communication"
 )]
 
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use anyhow::Result;
@@ -123,12 +123,12 @@ pub fn maybe_prompt(
     );
     eprintln!("Pushes and private-repo operations from the guest will fail.");
     eprintln!();
-    eprint!("Set up a scoped fine-grained PAT now? [y/N/never] ");
-    std::io::stderr().flush().ok();
-
-    let mut buf = String::new();
-    std::io::stdin().lock().read_line(&mut buf)?;
-    match buf.trim().to_ascii_lowercase().as_str() {
+    let answer = crate::prompt::read_line(
+        "Set up a scoped fine-grained PAT now? [y/N/never]",
+        crate::prompt::CONFIRM_MAX_BYTES,
+    )?
+    .unwrap_or_default();
+    match answer.to_ascii_lowercase().as_str() {
         "y" | "yes" => {
             run_wizard_or_recover(cfg, config_path, slug)?;
             refresh_github_from_disk(cfg, config_path)?;
@@ -165,11 +165,12 @@ fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) 
         Err(e) => {
             explain_probe_failure(&e);
             tracing::warn!("PAT setup failed ({e}); falling back to unauthenticated start");
-            eprint!("continue without GitHub auth? [y/N] ");
-            std::io::stderr().flush().ok();
-            let mut buf = String::new();
-            std::io::stdin().lock().read_line(&mut buf)?;
-            if matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            let answer = crate::prompt::read_line(
+                "continue without GitHub auth? [y/N]",
+                crate::prompt::CONFIRM_MAX_BYTES,
+            )?
+            .unwrap_or_default();
+            if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
                 Ok(())
             } else {
                 Err(e)

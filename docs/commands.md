@@ -563,6 +563,11 @@ instance. (A non-interactive run declines the prompt.) If no tool ends up with
 an endpoint, the command fails. Claude and Codex are independent: you can put
 one on a local model and leave the other on cloud.
 
+Interactive input is bounded: model names accept up to 1 KiB, URLs up to 8
+KiB, and tokens up to 64 KiB. Token input is not echoed. The endpoint workflow
+requires a terminal because its confirmation, URL, and model prompts are
+interactive.
+
 `coop model NAME remote` switches back to cloud defaults for both tools. Saved
 endpoints are kept, so a later `local` does not re-prompt.
 
@@ -1066,6 +1071,10 @@ coop github <subcommand>
 | `status [--vm NAME] [--probe] [--json]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. Pass `--json` for machine-readable output. |
 | `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
 
+Pasted tokens are read without terminal echo and are limited to 64 KiB.
+Confirmation and storage-choice replies are limited to 64 bytes. Redirected
+token input remains supported and receives the same bound.
+
 ```
 coop github setup-pat --repo trailofbits/coop
 coop github status
@@ -1100,6 +1109,10 @@ remote model mode (`coop model <vm> remote`); local mode takes precedence. See
 the [credential proxy guide](credential-proxy.md) and the
 [`proxy` configuration reference](configuration.md#proxy-section) for the data
 model.
+
+Pasted proxy credentials are read without terminal echo and are limited to 64
+KiB. Redirected credential-plus-storage-choice input remains supported; menu
+replies are limited to 64 bytes.
 
 | Subcommand | Effect |
 |------------|--------|
