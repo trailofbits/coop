@@ -41,6 +41,9 @@ use crate::remote_command::RemoteCommand;
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
+/// Wire contract mirrored by coop-proxy's bounded startup reader.
+const STARTUP_CONFIG_MAX_BYTES: usize = 65_536;
+const DIAGNOSTIC_MAX_BYTES: usize = 16_384;
 
 /// Maximum time for SSH authentication and the guest's forwarding acknowledgment.
 const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -463,7 +466,7 @@ fn await_proxy_ready(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let log = fs::read_to_string(log_path).unwrap_or_default();
+                let log = bounded_log_excerpt(log_path);
                 bail!(
                     "credential proxy exited before it began serving ({status}) — its \
                      confinement or bind failed; refusing to start the VM (fail-closed).\n{}",
@@ -477,7 +480,7 @@ fn await_proxy_ready(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let log = fs::read_to_string(log_path).unwrap_or_default();
+            let log = bounded_log_excerpt(log_path);
             bail!(
                 "credential proxy did not begin serving on {listen} within \
                  {PROXY_READY_GRACE:?} — refusing to start the VM (fail-closed).\n{}",
@@ -635,7 +638,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
     if let Err(e) = setup {
         let _ = child.kill();
         let _ = child.wait();
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let log = bounded_log_excerpt(&log_path);
         return Err(e).context(format!(
             "Failed to establish the credential proxy's reverse SSH tunnel.\n{}",
             log.trim()
@@ -643,6 +646,27 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
     }
     // The master no longer needs a control socket: later teardown uses its PID.
     Ok(())
+}
+
+fn bounded_log_excerpt(path: &Path) -> String {
+    let Ok(file) = File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(DIAGNOSTIC_MAX_BYTES + 1);
+    if file
+        .take((DIAGNOSTIC_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return String::new();
+    }
+    let truncated = bytes.len() > DIAGNOSTIC_MAX_BYTES;
+    bytes.truncate(DIAGNOSTIC_MAX_BYTES);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("\n[diagnostic truncated at 16384 bytes]");
+    }
+    text
 }
 
 /// Use a short, private path even when TMPDIR or the instance path is long.
@@ -815,7 +839,12 @@ fn wire_config_json(
         upstream_host,
         injection,
     };
-    serde_json::to_string(&wire).context("Failed to serialize proxy startup config")
+    let json = serde_json::to_string(&wire).context("Failed to serialize proxy startup config")?;
+    anyhow::ensure!(
+        json.len() <= STARTUP_CONFIG_MAX_BYTES,
+        "credential proxy startup config exceeds the {STARTUP_CONFIG_MAX_BYTES}-byte limit"
+    );
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -942,6 +971,58 @@ mod tests {
         assert_eq!(v["upstream_host"], "api.anthropic.com");
         assert_eq!(v["injection"]["scheme"], "x_api_key");
         assert_eq!(v["injection"]["credential"], "sk-real");
+    }
+
+    #[test]
+    fn wire_json_accepts_exact_limit_and_rejects_one_byte_over() {
+        let listen: SocketAddr = "127.0.0.1:8788".parse().unwrap();
+        let empty = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            "",
+            None,
+        )
+        .unwrap();
+        let exact_credential = "x".repeat(STARTUP_CONFIG_MAX_BYTES - empty.len());
+        let exact = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            &exact_credential,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), STARTUP_CONFIG_MAX_BYTES);
+
+        let oversized_credential = format!("{exact_credential}x");
+        let error = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            &oversized_credential,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("byte limit"));
+    }
+
+    #[test]
+    fn proxy_log_excerpt_is_bounded_and_marks_truncation() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let path = temp.path().join("proxy.log");
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_MAX_BYTES]).unwrap();
+        let exact = bounded_log_excerpt(&path);
+        assert_eq!(exact, "x".repeat(DIAGNOSTIC_MAX_BYTES));
+
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_MAX_BYTES + 1]).unwrap();
+        let excerpt = bounded_log_excerpt(&path);
+        assert!(excerpt.starts_with(&"x".repeat(DIAGNOSTIC_MAX_BYTES)));
+        assert!(excerpt.ends_with("[diagnostic truncated at 16384 bytes]"));
+        assert!(excerpt.len() < DIAGNOSTIC_MAX_BYTES + 64);
     }
 
     #[test]
