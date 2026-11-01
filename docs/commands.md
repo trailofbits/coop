@@ -247,7 +247,12 @@ coop shell [NAME] [FLAGS] [-- COMMAND...]
 | `NAME` | Instance name (required if multiple instances exist) |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
-Without a trailing command, `shell` drops you into an interactive shell at `/workspace`. With a trailing command, it executes the command and returns its exit code.
+Without a trailing command, `shell` drops you into an interactive shell at
+`/workspace`. With a trailing command, it executes the command, forwards coop's
+stdin to it, and returns its exit code. This makes normal pipelines work, for
+example `printf 'input' | coop shell my-project -- cat`. Other non-interactive
+coop subprocesses receive closed stdin unless their command contract explicitly
+documents a stream.
 
 ```
 coop shell
