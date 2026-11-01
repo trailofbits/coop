@@ -30,6 +30,7 @@ mod port_forward;
 mod private_storage;
 #[cfg(target_os = "linux")]
 mod privileged_disk;
+mod process_output;
 mod proxy;
 mod proxy_state;
 mod remote_command;

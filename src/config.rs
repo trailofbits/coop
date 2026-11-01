@@ -10,8 +10,8 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ pub const DEFAULT_IMAGE: &str = "default";
 // ── Command substitution for secrets ─────────────────────────
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+const CMD_OUTPUT_MAX: usize = 64 * 1024;
 
 /// Resolve a config value that may use `cmd:` prefix for secret
 /// manager integration.
@@ -47,63 +48,38 @@ pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
 
     tracing::debug!("Resolving secret via command");
 
-    let mut child = Command::new("sh")
-        .args(["-c", cmd_str])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to spawn secret command: {cmd_str}"))?;
+    let mut command = Command::new("sh");
+    command.args(["-c", cmd_str]);
+    let output = crate::process_output::run_bounded(
+        &mut command,
+        crate::process_output::CapturePolicy {
+            stdout_max: CMD_OUTPUT_MAX,
+            stderr_max: CMD_OUTPUT_MAX,
+            timeout: CMD_TIMEOUT,
+        },
+    )
+    .context("Secret command output was not accepted")?;
 
-    let start = Instant::now();
-
-    loop {
-        if child
-            .try_wait()
-            .context("Failed to check command status")?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .with_context(|| format!("Failed to read output: {cmd_str}"))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let code = output
-                    .status
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |c| c.to_string());
-                bail!(
-                    "Secret command failed (exit {code}): {cmd_str}\n\
-                     stderr: {stderr}"
-                );
-            }
-
-            let stdout = String::from_utf8(output.stdout)
-                .context("Secret command output is not valid UTF-8")?;
-            let resolved = stdout.trim().to_string();
-
-            if resolved.is_empty() {
-                bail!(
-                    "Secret command produced empty output: {cmd_str}\n\
-                     The command succeeded but stdout was empty after trimming."
-                );
-            }
-
-            return Ok(resolved);
-        }
-
-        if start.elapsed() >= CMD_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "Secret command timed out after {}s: {cmd_str}\n\
-                 Ensure the command runs non-interactively.",
-                CMD_TIMEOUT.as_secs(),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!("Secret command failed (exit {code}); bounded stderr: {stderr}");
     }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("Secret command output is not valid UTF-8")?;
+    let resolved = stdout.trim().to_string();
+
+    if resolved.is_empty() {
+        bail!(
+            "Secret command produced empty output; the command succeeded but stdout was empty after trimming."
+        );
+    }
+
+    Ok(resolved)
 }
 
 // ── Secret wrapper ───────────────────────────────────────────
@@ -7356,6 +7332,32 @@ rsync = "/run/current-system/sw/bin/rsync"
         let err = resolve_cmd_value("cmd:echo oops 1>&2; exit 1").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("oops"), "expected stderr in error, got: {msg}");
+    }
+
+    #[test]
+    fn resolve_cmd_value_drains_both_streams_without_deadlock() {
+        let resolved =
+            resolve_cmd_value("cmd:(head -c 60000 /dev/zero >&2) & head -c 60000 /dev/zero; wait")
+                .unwrap();
+        assert_eq!(resolved.len(), 60_000);
+    }
+
+    #[test]
+    fn resolve_cmd_value_rejects_each_output_limit() {
+        let stdout = resolve_cmd_value("cmd:head -c 65537 /dev/zero").unwrap_err();
+        assert!(format!("{stdout:#}").contains("stdout exceeded"));
+
+        let stderr = resolve_cmd_value("cmd:head -c 65537 /dev/zero >&2").unwrap_err();
+        assert!(format!("{stderr:#}").contains("stderr exceeded"));
+    }
+
+    #[test]
+    fn resolve_cmd_value_rejects_invalid_utf8_and_does_not_echo_the_command() {
+        let invalid = resolve_cmd_value("cmd:printf '\\377'").unwrap_err();
+        assert!(format!("{invalid:#}").contains("not valid UTF-8"));
+
+        let error = resolve_cmd_value("cmd:false # private-command-sentinel").unwrap_err();
+        assert!(!format!("{error:#}").contains("private-command-sentinel"));
     }
 
     #[test]

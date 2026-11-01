@@ -437,6 +437,13 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   request bodies opaquely, so this does not isolate provider objects referenced
   by ID within an allowed request.
 
+  Its stdin startup document is capped at 64 KiB by both producer and consumer.
+  Host `cmd:` credential resolvers concurrently drain independently capped
+  stdout/stderr, have a fixed deadline, and are killed as a transient process
+  group on timeout or overflow. Proxy and tunnel startup diagnostics are also
+  bounded, preventing a configurable peer from turning error capture into
+  unbounded host allocation or pipe backpressure.
+
 - **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
   the real credential and terminates connections the untrusted guest
   originates, so it is the feature's new attack surface; the jail bounds the

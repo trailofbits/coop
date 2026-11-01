@@ -234,6 +234,12 @@ token = "cmd:vault read -field=token secret/coop/github/trailofbits-coop"
 token = "cmd:op item get 'coop-github-pat (trailofbits-coop-plugins)' --fields credential --reveal"
 ```
 
+Every `cmd:` resolver has a ten-second deadline and independently limits
+stdout and stderr to 64 KiB while draining both concurrently. Timeout or
+overflow kills the resolver's complete transient process group and returns an
+error. The command text is not repeated in resolver errors; nonzero failures
+include only the bounded stderr diagnostic.
+
 The 1Password wizard creates **API Credential** items and stores the token in
 the `credential` field. Existing **Login** items with `--fields password`
 retrieval commands remain supported. Rotating a token creates an API Credential
@@ -627,6 +633,11 @@ stores it in a secret manager (Keychain / Secret Service / 1Password / a `0600`
 file) and fills in the `cmd:` reference. See the
 [credential proxy guide](credential-proxy.md) and
 [`coop proxy`](commands.md#proxy) for the workflow.
+
+The serialized credential-proxy startup document is limited to 64 KiB at both
+the coop producer and proxy consumer. Oversized credentials therefore fail VM
+startup instead of being passed to the proxy. Proxy and SSH-forward startup
+diagnostics are bounded and mark truncation or overflow explicitly.
 
 ## `profiles` section
 

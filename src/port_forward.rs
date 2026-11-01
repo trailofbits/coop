@@ -19,6 +19,7 @@ use std::num::NonZeroU16;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -219,13 +220,17 @@ pub fn spawn_ssh_forwards(
 
     tracing::info!("Establishing SSH port forwards: {}", spec_log.join(", "));
 
-    let output = target
-        .ssh_forward_command()?
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("Failed to launch ssh -L for port forwards")?;
+    let mut command = target.ssh_forward_command()?;
+    command.args(&args);
+    let output = crate::process_output::run_bounded(
+        &mut command,
+        crate::process_output::CapturePolicy {
+            stdout_max: 1024,
+            stderr_max: 16_384,
+            timeout: Duration::from_secs(30),
+        },
+    )
+    .context("Failed to launch bounded ssh -L setup for port forwards")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
