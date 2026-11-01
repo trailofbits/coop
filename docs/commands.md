@@ -974,6 +974,9 @@ coop update [FLAGS]
 
 If coop is installed in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to self-update; use `install.sh` to replace them.
 
+Homebrew builds refuse `coop update`, including `--check`. Use
+`brew upgrade trailofbits/coop/coop` instead.
+
 ```
 coop update --check
 coop update
@@ -1000,6 +1003,12 @@ coop uninstall [FLAGS]
 
 Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
 
+Homebrew binaries are refused before any data or SSH configuration is changed,
+including with `--yes`, `--purge`, or `--keep-data`. Use `brew uninstall coop`.
+This preserves VM data and configuration; stop VMs before removing the package.
+If you intend to delete the VMs, run `coop destroy --all` with your usual
+configuration before uninstalling.
+
 Nix-store binaries are refused before any data or SSH configuration is changed,
 including with `--yes` or `--purge`. Use `nix profile remove coop` for a profile
 installation, or remove the package from your NixOS/Home Manager configuration
@@ -1007,7 +1016,7 @@ and rebuild. Package removal preserves data; follow the explicit
 [Nix data-cleanup procedure](getting-started.md#removing-a-nix-installation)
 before removing the package if you want to delete that data too.
 
-For a non-Nix binary in a protected directory (e.g. `/usr/local/bin`), run with
+For a standalone binary in a protected directory (e.g. `/usr/local/bin`), run with
 `sudo`. A config file outside the data directory is left in place and a note is
 printed.
 
