@@ -3468,8 +3468,6 @@ fn write_managed_claude_settings(
     target: &SshTarget,
     local_env: &BTreeMap<String, String>,
 ) -> Result<()> {
-    target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
-
     // Read and merge as one fallible step so a read failure falls back to
     // managed defaults rather than aborting boot. `capture` decodes the file as
     // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
@@ -3490,7 +3488,7 @@ fn write_managed_claude_settings(
     target
         .exec_with_stdin(
             RemoteCommand::new().literal(
-                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
+                "mkdir -p ~/.claude && t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
             merged.as_bytes(),
