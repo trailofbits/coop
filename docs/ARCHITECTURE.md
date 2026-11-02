@@ -25,11 +25,12 @@ coop/
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
-│   ├── workspace.rs        # workspace sync (rsync/tar) + ~/.ssh/config injection
+│   ├── workspace.rs        # workspace sync (rsync) + ~/.ssh/config injection
 │   ├── guest.rs            # guest profiles, required binaries, baked package lists
 │   ├── guest_env_state.rs  # persisted guest env vars
 │   ├── host_tool.rs        # typed trusted host-tool resolution + launch context
 │   ├── openssh.rs          # isolated coop-managed SSH/SCP/rsync boundary
+│   ├── vsock_proxy.rs      # bounded Firecracker CONNECT handshake + byte relay
 │   ├── proxy.rs            # host proxy processes and per-provider SSH reverse tunnels
 │   ├── proxy_state.rs      # persisted per-instance credential overrides
 │   ├── model_state.rs      # per-instance local/remote model routing
@@ -93,9 +94,10 @@ code, it must hold for **both** backends. Known intentional divergences:
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|
 | `guest_host_address` | TAP gateway (`network.host_ip`) | `host.lima.internal` |
-| `mounts_are_live` | `false` (one-time rsync/tar sync) | `true` (virtiofs) |
-| `ssh_target` | built from `guest_ip` + `ssh_port` | queried from `limactl` (per-boot forwarded port) |
-| workspace/mounts | rsync or tar-pipe over SSH | live mounts |
+| `mounts_are_live` | `false` (one-time rsync sync) | `true` (virtiofs) |
+| `ssh_target` | legacy TCP from `guest_ip` + `ssh_port`, or persisted vsock socket + guest port | queried from `limactl` (per-boot forwarded port) |
+| copied workspace (`--copy`) | one-time rsync over SSH | one-time rsync over SSH |
+| project and extra mounts | one-time rsync over SSH | live virtiofs mounts |
 
 ### Typestate invariants
 
@@ -116,6 +118,25 @@ flags — this is a load-bearing design choice (see
   check at the backend boundary. `boot_preflight(cfg)` then runs
   `cfg.validate()` before backend setup or boot work, so no VM starts on an
   invalid config.
+
+`backend::SshTarget` keeps backend identity separate from its closed transport
+choice. TCP targets carry a validated hostname and port. The Firecracker-vsock
+variant carries the trusted per-instance Unix-socket path and guest port, and
+renders the same Rust `__vsock-proxy` helper for SSH, SCP, rsync, forwarding,
+and generated SSH configuration. The helper bounds and validates Firecracker's
+text `CONNECT` handshake before relaying raw bytes. New Firecracker instances
+persist the configured `FirecrackerControlMode`; the opt-in `vsock` mode is
+then used for readiness, shutdown, and every shared SSH consumer. Older state
+without the tag maps to `LegacyTcp` in memory without an eager rewrite. Lima
+remains TCP-based.
+
+Firecracker instances also persist an `open` or `isolated` network mode. The
+isolated representation uses the composite `vsock_isolated` value in the
+existing control field so supported prior releases reject it instead of
+ignoring a new field and booting with a NIC. In memory it normalizes to vsock
+control plus an isolated network policy. Firecracker config generation emits an
+empty `network-interfaces` list and backend startup skips TAP setup; every
+shared SSH consumer continues through the same vsock target.
 
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
@@ -171,7 +192,7 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    allowlisted config files and a managed `settings.json`, and on first boot
    install the *delta* of marketplaces/plugins/MCP servers not already baked
    into the golden image.
-6. **Workspace** — `--workspace` copies via tar-pipe; `--git-repo` clones inside
+6. **Workspace** — `--workspace` copies via rsync; `--git-repo` clones inside
    the guest; mounts are live on Lima and rsync'd on Firecracker. Persist
    `WorkspaceState`.
 7. **Creation hooks** — select a recipe before first boot and persist it in

@@ -1,0 +1,40 @@
+name: Homebrew
+
+on:
+  pull_request:
+    paths:
+      - "Formula/**"
+  push:
+    branches: [main]
+    paths:
+      - "Formula/**"
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    name: Build and test formula (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare local tap
+        run: |
+          test "$(uname -m)" = arm64
+          brew update
+          brew tap-new --no-git coop-ci/test
+          cp Formula/coop.rb "$(brew --repository coop-ci/test)/Formula/coop.rb"
+          brew trust --formula coop-ci/test/coop
+
+      - name: Build from source
+        run: brew install --build-from-source --skip-link coop-ci/test/coop
+
+      - name: Test installed package
+        run: brew test --force coop-ci/test/coop

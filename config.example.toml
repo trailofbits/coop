@@ -4,7 +4,7 @@
 # Run `coop validate` to check your config.
 
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
-# ssh_port = 22                 # Guest SSH port
+# ssh_port = 22                 # Legacy TCP guest SSH port (vsock proxies fixed port 22)
 # firecracker_bin = "~/.coop/firecracker"  # Linux only
 # post_create = "sudo apt-get update && sudo apt-get install -y htop"
 # Creation commands run once per VM creation, after workspace setup.
@@ -43,6 +43,8 @@
 # prompt_for_pat = true           # auto-prompt to set up a PAT at `coop start`
 
 # [vm]
+# firecracker_control = "legacy_tcp" # Linux only: "legacy_tcp" or opt-in "vsock" for new instances
+# firecracker_network = "open"     # Linux only: "open" or "isolated"; isolated requires vsock
 # vcpu_count = 2                # vCPUs per VM (override: --vcpus)
 # mem_size_mib = 4096           # Memory in MiB (override: --mem)
 # template_size_gib = 8         # Template disk in GiB (override: --template-size)
@@ -195,9 +197,13 @@
 # [proxy.openai]                    # Codex. OpenAI keys are always Bearer.
 # credential = "cmd:op read op://Private/OpenAI/credential"
 # auth = "bearer"                   # OpenAI keys inject as Authorization: Bearer.
+#                                   # For subscription/workspace Codex usage:
+#                                   # `coop proxy setup --openai --codex-access-token`
+#                                   # stores a Codex-scoped PAT (at-...). Set
+#                                   # auth = "codex_access_token" for that mode.
 #                                   # Cannot be combined with
-#                                   # [codex] auth = "chatgpt"; proxy mode uses
-#                                   # an API key.
+#                                   # [codex] auth = "chatgpt"; proxy mode holds
+#                                   # its credential on the host.
 
 # [profiles.my-tools]
 # apt_packages = ["ripgrep", "fd-find", "jq"]

@@ -149,18 +149,21 @@ impl<T> fmt::Debug for Secret<T> {
 pub trait Unit: Copy + fmt::Debug + 'static {
     /// Human-readable suffix used in CLI/parser error messages.
     const SUFFIX: &'static str;
+    const LEGACY_SUFFIXES: &'static [&'static str];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MibUnit;
 impl Unit for MibUnit {
     const SUFFIX: &'static str = "MiB";
+    const LEGACY_SUFFIXES: &'static [&'static str] = &[];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GibUnit;
 impl Unit for GibUnit {
     const SUFFIX: &'static str = "GiB";
+    const LEGACY_SUFFIXES: &'static [&'static str] = &["G", "g"];
 }
 
 /// Non-zero byte-scaled quantity. The phantom unit parameter prevents
@@ -173,6 +176,8 @@ pub struct Quantity<U: Unit>(NonZeroU32, PhantomData<U>);
 pub type MiB = Quantity<MibUnit>;
 /// Disk/storage size in gibibytes.
 pub type GiB = Quantity<GibUnit>;
+
+pub const GIB_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl<U: Unit> Quantity<U> {
     /// Create from a runtime value. Returns `None` if zero.
@@ -188,9 +193,25 @@ impl<U: Unit> Quantity<U> {
         Self(value, PhantomData)
     }
 
-    /// Clap value parser: accept a positive integer string, reject zero.
+    /// Clap value parser: bare values use the declared binary unit. The
+    /// explicit IEC suffix and documented legacy aliases use the same unit.
     pub fn parse_cli(s: &str) -> Result<Self> {
-        let n: u32 = s
+        let number = s
+            .strip_suffix(U::SUFFIX)
+            .or_else(|| {
+                U::LEGACY_SUFFIXES
+                    .iter()
+                    .find_map(|suffix| s.strip_suffix(suffix))
+            })
+            .unwrap_or(s);
+        if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!(
+                "expected positive integer {} (optional {} suffix), got '{s}'",
+                U::SUFFIX,
+                U::SUFFIX
+            );
+        }
+        let n: u32 = number
             .parse()
             .with_context(|| format!("expected positive integer {}, got '{s}'", U::SUFFIX))?;
         Self::new(n).with_context(|| format!("{} must be > 0, got '{s}'", U::SUFFIX))
@@ -228,6 +249,33 @@ impl Quantity<MibUnit> {
     /// MiB → GiB as floating-point (1024 MiB = 1 GiB).
     pub fn as_gib_f64(self) -> f64 {
         f64::from(self.0.get()) / 1024.0
+    }
+}
+
+impl Quantity<GibUnit> {
+    pub fn as_bytes(self) -> u64 {
+        u64::from(self.as_u32()) * GIB_BYTES
+    }
+
+    /// Smallest whole-GiB size that can contain `bytes`.
+    pub fn from_bytes_ceil(bytes: u64) -> Result<Self> {
+        let value = gib_ceil_u32(bytes).context("Disk size exceeds supported GiB range")?;
+        Self::new(value).context("Disk is smaller than 1 byte")
+    }
+}
+
+fn gib_ceil_u32(bytes: u64) -> Option<u32> {
+    u32::try_from(bytes.div_ceil(GIB_BYTES)).ok()
+}
+
+/// Show the exact file length alongside its binary-unit context.
+pub fn format_disk_bytes(bytes: u64) -> String {
+    let whole = bytes / GIB_BYTES;
+    let remainder = bytes % GIB_BYTES;
+    if remainder == 0 {
+        format!("{whole} GiB ({bytes} bytes)")
+    } else {
+        format!("{whole} GiB + {remainder} bytes ({bytes} bytes)")
     }
 }
 
@@ -294,21 +342,14 @@ pub enum DiskSize {
 }
 
 impl DiskSize {
-    /// Parse from a CLI string like `"150"`, `"150G"`, `"+20"`, or `"+20G"`.
+    /// Parse whole GiB, with optional `G`/`g` or `GiB` suffix.
     pub fn parse(s: &str) -> Result<Self> {
         let (relative, rest) = if let Some(r) = s.strip_prefix('+') {
             (true, r)
         } else {
             (false, s)
         };
-        let numeric = rest
-            .strip_suffix('G')
-            .or_else(|| rest.strip_suffix('g'))
-            .unwrap_or(rest);
-        let value: u32 = numeric
-            .parse()
-            .with_context(|| format!("Invalid disk size: {s}"))?;
-        let gib = GiB::new(value).with_context(|| format!("Disk size must be > 0: {s}"))?;
+        let gib = GiB::parse_cli(rest).with_context(|| format!("Invalid disk size: {s}"))?;
         if relative {
             Ok(Self::Relative(gib))
         } else {
@@ -323,13 +364,25 @@ impl DiskSize {
     pub fn resolve(self, current: GiB) -> Result<GiB> {
         match self {
             Self::Absolute(gib) => Ok(gib),
-            Self::Relative(gib) => current
-                .as_nonzero()
-                .checked_add(gib.as_u32())
-                .map(GiB::from_nonzero)
-                .context("Disk size overflow"),
+            Self::Relative(gib) => relative_disk_target(current, gib).context("Disk size overflow"),
         }
     }
+
+    /// Resolve a relative request from an exact file length without dropping
+    /// a partial GiB. Absolute requests are already complete targets.
+    pub fn resolve_from_bytes(self, current_bytes: u64) -> Result<GiB> {
+        match self {
+            Self::Absolute(size) => Ok(size),
+            Self::Relative(_) => self.resolve(GiB::from_bytes_ceil(current_bytes)?),
+        }
+    }
+}
+
+fn relative_disk_target(current: GiB, delta: GiB) -> Option<GiB> {
+    current
+        .as_nonzero()
+        .checked_add(delta.as_u32())
+        .map(GiB::from_nonzero)
 }
 
 /// Instance index (0..=252), used to derive guest IP, TAP name, MAC, and vsock CID.
@@ -948,6 +1001,19 @@ pub struct CustomProfile {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmConfig {
+    /// Control transport assigned to newly created Firecracker instances.
+    ///
+    /// Lima ignores this setting and continues to use its TCP transport.
+    #[serde(default = "legacy_firecracker_control_mode")]
+    pub firecracker_control: FirecrackerControlMode,
+
+    /// Network device policy assigned to newly created Firecracker instances.
+    ///
+    /// Lima ignores this setting. Existing instances retain their persisted
+    /// selection when this default changes.
+    #[serde(default)]
+    pub firecracker_network: FirecrackerNetworkMode,
+
     /// Number of vCPUs
     #[serde(default = "default_vcpus")]
     pub vcpu_count: NonZeroU8,
@@ -1608,7 +1674,9 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeConfig {
-    /// Anthropic API key (forwarded via `SendEnv`, never written to disk)
+    /// Anthropic API key (forwarded via `SendEnv` for open/direct-auth
+    /// sessions, suppressed for isolated/proxy-only sessions, never written
+    /// to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1672,7 +1740,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub auth: CodexAuthMode,
 
-    /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
+    /// `OpenAI` API key (forwarded via `SendEnv` for open/direct-auth sessions,
+    /// suppressed for isolated/proxy-only sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1704,7 +1773,8 @@ pub struct CodexConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GrokConfig {
-    /// xAI API key (forwarded via `SendEnv`, never written to disk)
+    /// xAI API key (forwarded via `SendEnv` for open sessions, suppressed for
+    /// isolated sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1789,8 +1859,8 @@ pub struct ProxyConfig {
     pub anthropic: Option<ProxyUpstream>,
 
     /// `OpenAI` (Codex) upstream. Its presence enables proxy mode for Codex
-    /// when the VM is in remote model mode. `OpenAI` API keys are injected as
-    /// `Authorization: Bearer`.
+    /// when the VM is in remote model mode. Accepts bearer API keys, or
+    /// `codex_access_token` for workspace PATs and Codex plan entitlements.
     ///
     /// Proxy mode is resolved per provider and per VM (a per-VM override can
     /// enable it even when this default is absent) by
@@ -1802,26 +1872,30 @@ pub struct ProxyConfig {
 /// A single proxied upstream: the real credential and how to inject it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyUpstream {
-    /// The real credential (an API key or a Claude `setup-token`), a plain
-    /// value or a `cmd:` indirection resolved via [`resolve_cmd_value`] at
-    /// proxy start — never written to disk, never forwarded into the guest.
+    /// The real credential (an API key, Claude `setup-token`, or Codex access token), either
+    /// stored directly in the configuration file or provided through a `cmd:` indirection
+    /// resolved via [`resolve_cmd_value`] at proxy start. It is never forwarded into the guest.
     pub credential: Secret<String>,
 
-    /// How the proxy injects the credential upstream. Defaults to `api_key`
-    /// (`x-api-key`); use `bearer` for a Claude `setup-token`.
+    /// How the proxy authenticates upstream. Defaults to `api_key`
+    /// (`x-api-key`); use `bearer` for API keys/Claude setup tokens or
+    /// OpenAI-only `codex_access_token` for workspace PATs.
     #[serde(default)]
     pub auth: ProxyAuthScheme,
 }
 
-/// The header form the proxy injects the real credential as.
+/// The credential profile: header injection plus Codex-specific routing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyAuthScheme {
     /// `x-api-key: <credential>` — the Anthropic API-key form.
     #[default]
     ApiKey,
-    /// `authorization: Bearer <credential>` — a Claude `setup-token`.
+    /// `authorization: Bearer <credential>` — an API key or Claude `setup-token`.
     Bearer,
+    /// Codex workspace personal access token: bearer auth to the Codex backend,
+    /// with account metadata validated on the host before starting the proxy.
+    CodexAccessToken,
 }
 
 /// A local (host-side) model endpoint that `coop model <vm> local`
@@ -2141,6 +2215,23 @@ fn expand_marketplaces(entries: &mut [String]) {
     }
 }
 
+fn check_proxy_auth(proxy: &ProxyConfig, codex_auth: CodexAuthMode, errors: &mut Vec<String>) {
+    if codex_auth.uses_chatgpt_account() && proxy.openai.is_some() {
+        errors.push(
+            "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
+             guest account login and host proxy credentials are separate auth paths"
+                .to_string(),
+        );
+    }
+    if proxy
+        .anthropic
+        .as_ref()
+        .is_some_and(|upstream| upstream.auth == ProxyAuthScheme::CodexAccessToken)
+    {
+        errors.push("codex_access_token auth is supported only by [proxy.openai]".to_string());
+    }
+}
+
 /// Push a validation error for each marketplace entry that looks like a
 /// local (absolute) path but does not exist. `field` is the config key
 /// prefix (e.g. `"claude.marketplaces"`) used in the message.
@@ -2228,6 +2319,10 @@ impl CoopConfig {
     pub fn validate(&self) -> Result<Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+
+        if let Err(error) = validate_firecracker_config(&self.vm) {
+            errors.push(error.to_string());
+        }
 
         // VM config value bounds are enforced by construction, not here:
         // `vcpu_count`/`template_size_gib`/`ssh_port` are NonZero types
@@ -2330,14 +2425,7 @@ impl CoopConfig {
             ));
         }
 
-        if self.codex.auth.uses_chatgpt_account() && self.proxy.openai.is_some() {
-            errors.push(
-                "codex.auth = \"chatgpt\" conflicts with [proxy.openai]; \
-                 Codex account auth uses ChatGPT workspace credentials, while \
-                 the OpenAI proxy uses an API key"
-                    .to_string(),
-            );
-        }
+        check_proxy_auth(&self.proxy, self.codex.auth, &mut errors);
 
         check_local_marketplaces(
             "claude.marketplaces",
@@ -2618,11 +2706,23 @@ impl CoopConfig {
 
         let dir = self.instances_dir().join(name.as_str());
         classify_instance_dir_probe(&name, fs::symlink_metadata(&dir).map(|_| ()))?;
+        validate_configured_firecracker_control(self.vm.firecracker_control)?;
+        #[cfg(target_os = "macos")]
+        let firecracker_control = self.vm.firecracker_control;
+        #[cfg(not(target_os = "macos"))]
+        let firecracker_control = if self.vm.firecracker_network == FirecrackerNetworkMode::Isolated
+        {
+            validate_firecracker_modes(self.vm.firecracker_control, self.vm.firecracker_network)?;
+            FirecrackerControlMode::VsockIsolated
+        } else {
+            self.vm.firecracker_control
+        };
         let instance = Instance {
             name,
             index,
             dir,
             image: image.clone(),
+            firecracker_control,
         };
         instance.save()?;
         Ok(instance)
@@ -2670,6 +2770,8 @@ impl Default for CoopConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
+            firecracker_control: legacy_firecracker_control_mode(),
+            firecracker_network: FirecrackerNetworkMode::default(),
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_mib(),
             kernel_path: default_kernel_path(),
@@ -2677,6 +2779,93 @@ impl Default for VmConfig {
             template_size_gib: default_template_size_gib(),
         }
     }
+}
+
+/// Durable Firecracker connectivity tag selected when an instance is created.
+///
+/// The legacy values record only the control transport. `VsockIsolated` is a
+/// downgrade-rejecting persisted composite; runtime callers should use
+/// [`Instance::firecracker_control`] and [`Instance::firecracker_network`] to
+/// obtain its normalized dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirecrackerControlMode {
+    /// Compatibility mode for instances created before vsock selection.
+    LegacyTcp,
+    /// OpenSSH reaches the guest through Firecracker's base vsock socket.
+    Vsock,
+    /// Persisted isolated connectivity. This composite value is deliberately
+    /// unknown to prior releases, which makes them reject isolated state
+    /// instead of silently regenerating an open-network VM configuration.
+    #[doc(hidden)]
+    VsockIsolated,
+}
+
+/// Durable Firecracker network-device policy.
+///
+/// `Isolated` is structural: Firecracker is started without a virtio network
+/// interface. Coop control remains available only through vsock-backed SSH.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum FirecrackerNetworkMode {
+    /// Configure the existing TAP-backed virtio network interface.
+    #[default]
+    Open,
+    /// Configure no network interface; only explicit SSH-over-vsock tunnels
+    /// cross the guest boundary.
+    Isolated,
+}
+
+impl FirecrackerNetworkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
+impl fmt::Display for FirecrackerNetworkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn legacy_firecracker_control_mode() -> FirecrackerControlMode {
+    FirecrackerControlMode::LegacyTcp
+}
+
+/// Check the only cross-field Firecracker connectivity invariant.
+pub(crate) fn validate_firecracker_modes(
+    control: FirecrackerControlMode,
+    network: FirecrackerNetworkMode,
+) -> Result<()> {
+    validate_configured_firecracker_control(control)?;
+    if network == FirecrackerNetworkMode::Isolated && control != FirecrackerControlMode::Vsock {
+        bail!(
+            "Firecracker network mode 'isolated' requires vsock control; \
+             legacy TCP instances must be recreated explicitly with \
+             [vm].firecracker_control = \"vsock\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_configured_firecracker_control(control: FirecrackerControlMode) -> Result<()> {
+    if control == FirecrackerControlMode::VsockIsolated {
+        bail!(
+            "[vm].firecracker_control = \"vsock_isolated\" is reserved for persisted \
+             instance state; configure \"vsock\" with firecracker_network = \"isolated\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_firecracker_config(vm: &VmConfig) -> Result<()> {
+    validate_configured_firecracker_control(vm.firecracker_control)?;
+    #[cfg(not(target_os = "macos"))]
+    validate_firecracker_modes(vm.firecracker_control, vm.firecracker_network)?;
+    Ok(())
 }
 
 impl Default for NetworkConfig {
@@ -2749,6 +2938,8 @@ struct InstanceMeta {
     index: InstanceIndex,
     #[serde(default = "default_image_name")]
     image: ImageName,
+    #[serde(default = "legacy_firecracker_control_mode")]
+    firecracker_control: FirecrackerControlMode,
 }
 
 /// Returns the [`ImageName`] for [`DEFAULT_IMAGE`]. Direct field
@@ -2765,6 +2956,9 @@ pub struct Instance {
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
     pub image: ImageName,
+    /// Raw persisted Firecracker connectivity tag. Runtime policy should use
+    /// the normalized accessors instead of matching this field directly.
+    pub firecracker_control: FirecrackerControlMode,
 }
 
 impl Instance {
@@ -2846,6 +3040,7 @@ impl Instance {
             name: self.name.clone(),
             index: self.index,
             image: self.image.clone(),
+            firecracker_control: self.firecracker_control,
         };
         let json =
             serde_json::to_string_pretty(&meta).context("Failed to serialize instance metadata")?;
@@ -2862,6 +3057,54 @@ impl Instance {
     pub(crate) fn set_image(&mut self, image: ImageName) -> Result<()> {
         self.image = image;
         self.save()
+    }
+
+    /// Persist a stopped instance's Firecracker network-device policy.
+    ///
+    /// The caller must hold the instance operation lock. This method validates
+    /// the control/network pair before changing memory or disk state.
+    pub(crate) fn set_firecracker_network(
+        &mut self,
+        network: FirecrackerNetworkMode,
+    ) -> Result<()> {
+        let previous = self.firecracker_control;
+        self.firecracker_control = match (previous, network) {
+            (FirecrackerControlMode::LegacyTcp, FirecrackerNetworkMode::Isolated) => {
+                bail!(
+                    "Firecracker network mode 'isolated' requires vsock control; legacy TCP \
+                     instances must be recreated explicitly"
+                )
+            }
+            (
+                FirecrackerControlMode::Vsock | FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Isolated,
+            ) => FirecrackerControlMode::VsockIsolated,
+            (FirecrackerControlMode::VsockIsolated, FirecrackerNetworkMode::Open) => {
+                FirecrackerControlMode::Vsock
+            }
+            (control, FirecrackerNetworkMode::Open) => control,
+        };
+        if let Err(error) = self.save() {
+            self.firecracker_control = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn firecracker_network(&self) -> FirecrackerNetworkMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerNetworkMode::Isolated,
+            FirecrackerControlMode::LegacyTcp | FirecrackerControlMode::Vsock => {
+                FirecrackerNetworkMode::Open
+            }
+        }
+    }
+
+    pub fn firecracker_control(&self) -> FirecrackerControlMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerControlMode::Vsock,
+            control => control,
+        }
     }
 
     fn load(dir: &Path) -> Result<Self> {
@@ -2883,6 +3126,7 @@ impl Instance {
             index: meta.index,
             dir: dir.to_path_buf(),
             image: meta.image,
+            firecracker_control: meta.firecracker_control,
         })
     }
 
@@ -2964,7 +3208,7 @@ impl Instance {
     }
 
     /// Probe Firecracker liveness without treating an uncertain probe
-    /// or an orphaned API socket as a confirmed exit.
+    /// or an orphaned Firecracker socket as a confirmed exit.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn probe_liveness(&self) -> Result<bool> {
         let pid_path = self.pid_file_path();
@@ -3007,7 +3251,22 @@ impl Instance {
             }
         }
 
-        ensure_firecracker_api_socket_stopped(&self.api_socket_path())?;
+        // Older stopped VMs leave an API socket entry behind. Probe it with
+        // privilege before treating it as stale; a live or uncertain socket
+        // must never be unlinked during startup or cleanup.
+        ensure_firecracker_socket_stopped(&self.api_socket_path(), "legacy API").with_context(
+            || {
+                let path = self.api_socket_path();
+                let quoted = crate::shell::shell_escape(&path.display().to_string());
+                format!(
+                    "Cannot verify legacy Firecracker API socket at {} is stopped. \
+                     Inspect it with `sudo lsof -nP {quoted}`. Verify and stop any process holding \
+                     it before retrying",
+                    path.display()
+                )
+            },
+        )?;
+        ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -3021,19 +3280,21 @@ impl Instance {
     }
 }
 
-/// Confirm that the root-owned Firecracker API socket is no longer accepting
-/// connections. An unprivileged connect sees `EACCES` for both live and stale
-/// mode-0755 sockets, so it cannot safely distinguish those states.
+/// Confirm that a root-owned Firecracker socket is no longer accepting
+/// connections. The privileged probe avoids permission denial masking a live
+/// root-owned socket.
 #[cfg(not(target_os = "macos"))]
-fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
+fn ensure_firecracker_socket_stopped(socket_path: &Path, kind: &str) -> Result<()> {
     match fs::symlink_metadata(socket_path) {
         Ok(metadata) if metadata.file_type().is_socket() => {}
         Ok(_) => bail!(
-            "Firecracker API socket path is not a Unix socket: {}",
+            "Firecracker {kind} socket path is not a Unix socket: {}",
             socket_path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("Failed to inspect Firecracker API socket"),
+        Err(error) => {
+            return Err(error).context(format!("Failed to inspect Firecracker {kind} socket"));
+        }
     }
 
     let output = Cmd::new(crate::privileged_disk::running_executable_path())
@@ -3041,10 +3302,10 @@ fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
         .arg(socket_path)
         .sudo()
         .output()
-        .context("Failed to run privileged Firecracker API socket probe")?;
+        .with_context(|| format!("Failed to run privileged Firecracker {kind} socket probe"))?;
     if !output.status.success() {
         bail!(
-            "Privileged Firecracker API socket probe failed ({}): {}",
+            "Privileged Firecracker {kind} socket probe failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -3054,12 +3315,12 @@ fn ensure_firecracker_api_socket_stopped(socket_path: &Path) -> Result<()> {
 
 /// Run in the privileged helper so permission denial cannot mask a listener.
 #[cfg(target_os = "linux")]
-pub(crate) fn probe_firecracker_api_socket(socket_path: &Path) -> Result<()> {
-    classify_firecracker_socket_probe(connect_firecracker_api_socket(socket_path))
+pub(crate) fn probe_firecracker_socket(socket_path: &Path) -> Result<()> {
+    classify_firecracker_socket_probe(connect_firecracker_socket(socket_path))
 }
 
 #[cfg(target_os = "linux")]
-fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
+fn connect_firecracker_socket(socket_path: &Path) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -3071,7 +3332,7 @@ fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
     if path.as_bytes_with_nul().len() > address.sun_path.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Firecracker API socket path is too long",
+            "Firecracker socket path is too long",
         ));
     }
     // SAFETY: the checked destination holds the entire NUL-terminated path.
@@ -3118,7 +3379,7 @@ fn connect_firecracker_api_socket(socket_path: &Path) -> std::io::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<()> {
     match connection {
-        Ok(()) => bail!("Firecracker API socket is accepting connections without a valid PID"),
+        Ok(()) => bail!("Firecracker socket is accepting connections without a valid PID"),
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -3127,7 +3388,7 @@ fn classify_firecracker_socket_probe(connection: std::io::Result<()>) -> Result<
         {
             Ok(())
         }
-        Err(error) => Err(error).context("Firecracker API socket liveness is uncertain"),
+        Err(error) => Err(error).context("Firecracker socket liveness is uncertain"),
     }
 }
 
@@ -3203,24 +3464,45 @@ fn default_firecracker_bin() -> ConfigPath {
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
-/// `clippy` never compile them. Run manually with `cargo kani`; see the
+/// `clippy` never compile them. Run with `cargo kani`; see the
 /// "Formal verification (kani)" section in `docs/testing.md`.
 ///
-/// Kani is a narrow fit in a string-heavy CLI — the type system carries
-/// most invariants here. These proofs target the only genuine fit:
-/// bounded integer/float arithmetic where a wrap or overflow would panic.
+/// The type system carries most invariants here. These proofs target bounded
+/// integer/float arithmetic and exact-byte disk sizing.
 /// The `InstanceIndex` IP-derivation range is verified instead by the
 /// exhaustive `0..=252` unit test (`instance_network_derivations_over_full_range`),
 /// and `SubnetMask` carries no arithmetic to verify — it is stored and
 /// rendered as `/N`, with the `0..=32` bound enforced by its constructor.
 #[cfg(kani)]
 mod proofs {
-    use super::{GiB, InstanceIndex, MiB};
+    use super::{GIB_BYTES, GiB, InstanceIndex, MiB, gib_ceil_u32, relative_disk_target};
 
-    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch:
-    /// `current.checked_add(delta)`. Over every pair of non-zero `u32`
-    /// sizes it yields `Some(current + delta)` exactly when the sum fits,
-    /// and `None` otherwise — it never wraps and never panics.
+    /// Whole-GiB rounding preserves the quotient or rejects an out-of-range
+    /// value; it cannot narrow a large file length into a small disk size.
+    #[kani::proof]
+    fn gib_ceil_conversion_never_wraps() {
+        let bytes: u64 = kani::any();
+        let rounded = bytes.div_ceil(GIB_BYTES);
+        let converted = gib_ceil_u32(bytes);
+        assert_eq!(converted.is_some(), rounded <= u64::from(u32::MAX));
+        if let Some(gib) = converted {
+            assert_eq!(u64::from(gib), rounded);
+        }
+    }
+
+    /// Every valid GiB quantity converts to an exact byte count in `u64`.
+    #[kani::proof]
+    fn gib_as_bytes_is_exact() {
+        let raw: u32 = kani::any();
+        let Some(gib) = GiB::new(raw) else { return };
+        let bytes = gib.as_bytes();
+        assert_eq!(bytes / GIB_BYTES, u64::from(raw));
+        assert_eq!(bytes % GIB_BYTES, 0);
+    }
+
+    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch.
+    /// Over every pair of non-zero `u32` sizes it yields the exact sum
+    /// when it fits, and `None` otherwise.
     ///
     /// This proves the kernel directly rather than through `resolve`,
     /// because `resolve` wraps the `None` case with `anyhow`'s
@@ -3236,13 +3518,33 @@ mod proofs {
         let (Some(current), Some(delta)) = (GiB::new(current_raw), GiB::new(delta_raw)) else {
             return;
         };
-        match current
-            .as_nonzero()
-            .checked_add(delta.as_u32())
-            .map(GiB::from_nonzero)
-        {
+        match relative_disk_target(current, delta) {
             Some(sum) => assert_eq!(sum.as_u32(), current_raw + delta_raw),
             None => assert!(current_raw.checked_add(delta_raw).is_none()),
+        }
+    }
+
+    /// A relative increase is added to the ceiling of the exact old file
+    /// length. A successful target always holds that file plus the requested
+    /// increase; an unrepresentable old length or sum is rejected.
+    #[kani::proof]
+    fn relative_disk_target_preserves_exact_bytes() {
+        let bytes: u64 = kani::any();
+        let delta_raw: u32 = kani::any();
+        let Some(delta) = GiB::new(delta_raw) else {
+            return;
+        };
+        let current = gib_ceil_u32(bytes).and_then(GiB::new);
+        let target = current.and_then(|current| relative_disk_target(current, delta));
+        let needed = u128::from(bytes) + u128::from(delta_raw) * u128::from(GIB_BYTES);
+        let expected = u128::from(bytes.div_ceil(GIB_BYTES)) + u128::from(delta_raw);
+        assert_eq!(
+            target.is_some(),
+            bytes != 0 && expected <= u128::from(u32::MAX)
+        );
+        if let Some(target) = target {
+            assert_eq!(u128::from(target.as_u32()), expected);
+            assert!(u128::from(target.as_bytes()) >= needed);
         }
     }
 
@@ -3289,7 +3591,7 @@ mod tests {
 
     #[test]
     fn validate_unique_guest_paths_rejects_duplicates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         std::fs::create_dir(&a).unwrap();
@@ -3304,7 +3606,7 @@ mod tests {
 
     #[test]
     fn validate_unique_guest_paths_accepts_distinct() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
         std::fs::create_dir(&a).unwrap();
@@ -3336,6 +3638,7 @@ mod tests {
             index,
             dir: dir.join("instances").join(name),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
         inst
@@ -3347,6 +3650,7 @@ mod tests {
             index,
             dir,
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         }
     }
 
@@ -3383,7 +3687,7 @@ mod tests {
 
     #[test]
     fn instance_load_rejects_out_of_range_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -3440,7 +3744,7 @@ mod tests {
 
     #[test]
     fn instance_save_load_roundtrip() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("myinst");
         let inst = test_inst("myinst", idx(42), dir.clone());
         inst.save().unwrap();
@@ -3450,11 +3754,113 @@ mod tests {
         assert_eq!(loaded.index.as_u16(), 42);
         assert_eq!(loaded.dir, dir);
         assert_eq!(loaded.image.as_str(), DEFAULT_IMAGE);
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+    }
+
+    #[test]
+    fn instance_save_load_roundtrip_preserves_vsock_control() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("myinst");
+        let mut inst = test_inst("myinst", idx(42), dir.clone());
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        inst.save().unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(loaded.firecracker_control, FirecrackerControlMode::Vsock);
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "vsock""#));
+    }
+
+    #[test]
+    fn isolated_instance_round_trips_and_prior_parser_rejects_it() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum PriorControlMode {
+            LegacyTcp,
+            Vsock,
+        }
+        #[derive(Deserialize)]
+        struct PriorInstanceMeta {
+            #[serde(rename = "firecracker_control")]
+            _control: PriorControlMode,
+        }
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("isolated");
+        let mut inst = test_inst("isolated", idx(4), dir.clone());
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+            .unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(
+            loaded.firecracker_network(),
+            FirecrackerNetworkMode::Isolated
+        );
+        assert_eq!(loaded.firecracker_control(), FirecrackerControlMode::Vsock);
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "vsock_isolated""#));
+        assert!(serde_json::from_str::<PriorInstanceMeta>(&json).is_err());
+    }
+
+    #[test]
+    fn isolated_transition_rejects_legacy_tcp_without_persisting() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("legacy");
+        let mut inst = test_inst("legacy", idx(5), dir.clone());
+        inst.save().unwrap();
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(
+            Instance::load(&dir).unwrap().firecracker_network(),
+            FirecrackerNetworkMode::Open
+        );
+    }
+
+    #[test]
+    fn isolated_transition_rolls_memory_back_when_publication_fails() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let not_a_directory = tmp.path().join("not-a-directory");
+        fs::write(&not_a_directory, "occupied").unwrap();
+        let mut inst = test_inst("failure", idx(6), not_a_directory);
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
+    fn loading_legacy_instance_does_not_rewrite_its_state() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("legacy");
+        crate::test_support::create_private_dir_all(&dir).unwrap();
+        let original =
+            b"{\n  \"name\": \"legacy\",\n  \"index\": 3,\n  \"image\": \"default\"\n}\n";
+        fs::write(dir.join("instance.json"), original).unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+        assert_eq!(fs::read(dir.join("instance.json")).unwrap(), original);
+        assert_eq!(loaded.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
     fn set_image_updates_field_and_persists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("myinst");
         let mut inst = test_inst("myinst", idx(7), dir.clone());
         inst.save().unwrap();
@@ -3468,6 +3874,12 @@ mod tests {
         // lookup and `coop status` lineage survive a reload).
         let loaded = Instance::load(&dir).unwrap();
         assert_eq!(loaded.image.as_str(), "safe-point");
+        assert_eq!(
+            loaded.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "legacy_tcp""#));
     }
 
     // ── Instance::is_running / is_firecracker_process ────────
@@ -3530,7 +3942,7 @@ mod tests {
 
     #[test]
     fn is_running_false_when_pid_file_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         assert!(!inst.pid_file_path().exists());
         assert!(!inst.is_running());
@@ -3539,10 +3951,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn firecracker_socket_probe_rejects_live_socket() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let _listener = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
-        assert!(probe_firecracker_api_socket(&inst.api_socket_path()).is_err());
+        for socket_path in [inst.api_socket_path(), inst.vsock_path()] {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            assert!(probe_firecracker_socket(&socket_path).is_err());
+            drop(listener);
+        }
     }
 
     #[test]
@@ -3567,18 +3982,30 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_rejects_non_socket_api_path() {
-        let tmp = TempDir::new().unwrap();
+    fn probe_liveness_rejects_dangling_api_symlink() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        fs::write(inst.api_socket_path(), "not a socket").unwrap();
+        std::os::unix::fs::symlink("missing", inst.api_socket_path()).unwrap();
 
         assert!(inst.probe_liveness().is_err());
+        assert!(fs::symlink_metadata(inst.api_socket_path()).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_liveness_rejects_non_socket_vsock_path() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        fs::write(inst.vsock_path(), "not a socket").unwrap();
+
+        let error = inst.probe_liveness().unwrap_err();
+        assert!(format!("{error:#}").contains("base vsock socket path is not a Unix socket"));
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_confirms_exited_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
         assert!(!inst.probe_liveness().unwrap());
@@ -3588,7 +4015,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_rejects_invalid_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), "invalid").unwrap();
         assert!(inst.probe_liveness().is_err());
@@ -3597,11 +4024,12 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn probe_liveness_recognizes_running_firecracker() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+        let _api = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
 
         let result = inst.probe_liveness();
         let _ = child.kill();
@@ -3612,7 +4040,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_false_for_dead_pid_and_removes_pid_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         fs::write(inst.pid_file_path(), DEAD_PID.to_string()).unwrap();
 
@@ -3626,7 +4054,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_false_for_live_non_firecracker_pid_and_removes_pid_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_sleep();
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
@@ -3645,7 +4073,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_running_true_for_live_firecracker_like_pid() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
         let mut child = spawn_firecracker_like();
         wait_for_firecracker_cmdline(child.id());
@@ -3670,16 +4098,60 @@ mod tests {
 
     #[test]
     fn allocate_first_instance_gets_index_zero() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.index.as_u16(), 0);
         assert_eq!(inst.name, *"0");
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::LegacyTcp);
+    }
+
+    #[test]
+    fn allocation_persists_configured_firecracker_control_mode() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::Vsock);
+        assert_eq!(
+            Instance::load(&inst.dir).unwrap().firecracker_control,
+            FirecrackerControlMode::Vsock
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn allocation_persists_configured_isolated_network_mode() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Isolated);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn lima_allocation_ignores_the_firecracker_network_default() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::Vsock);
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
     fn allocate_rejects_corrupt_instance_directory_without_touching_its_disk() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let healthy = cfg
             .allocate_instance(Some(&iname("healthy")), &default_img(), None)
@@ -3715,7 +4187,7 @@ mod tests {
 
     #[test]
     fn allocate_sequential_instances() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let a = cfg.allocate_instance(None, &default_img(), None).unwrap();
@@ -3729,7 +4201,7 @@ mod tests {
 
     #[test]
     fn allocate_with_custom_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let inst = cfg
@@ -3741,7 +4213,7 @@ mod tests {
 
     #[test]
     fn allocate_rejects_duplicate_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         cfg.allocate_instance(Some(&iname("dupe")), &default_img(), None)
@@ -3778,7 +4250,7 @@ mod tests {
 
     #[test]
     fn allocate_continues_after_highest() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // Create instance at index 0, then remove it, then create at 1
@@ -3803,7 +4275,7 @@ mod tests {
 
     #[test]
     fn allocate_fills_gap_when_at_ceiling() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // Create instance at index 252 (max)
@@ -3906,7 +4378,7 @@ mod tests {
 
     #[test]
     fn list_empty_returns_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let instances = cfg.list_instances().unwrap();
         assert!(instances.is_empty());
@@ -3914,7 +4386,7 @@ mod tests {
 
     #[test]
     fn list_returns_sorted_by_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "high", idx(10));
@@ -3928,7 +4400,7 @@ mod tests {
 
     #[test]
     fn list_rejects_metadata_for_a_different_instance_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let mut instance = make_instance(tmp.path(), "alias", idx(1));
         instance.name = iname("other");
@@ -3942,7 +4414,7 @@ mod tests {
 
     #[test]
     fn resolve_auto_selects_single() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "only", idx(0));
@@ -3953,7 +4425,7 @@ mod tests {
 
     #[test]
     fn resolve_errors_when_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let err = cfg.resolve_instance(None).unwrap_err();
@@ -3962,7 +4434,7 @@ mod tests {
 
     #[test]
     fn resolve_errors_when_ambiguous() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "a", idx(0));
@@ -3974,7 +4446,7 @@ mod tests {
 
     #[test]
     fn resolve_by_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "alpha", idx(0));
@@ -3987,7 +4459,7 @@ mod tests {
 
     #[test]
     fn resolve_unknown_name_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "real", idx(0));
@@ -4000,7 +4472,7 @@ mod tests {
 
     #[test]
     fn resolve_unknown_name_with_no_instances_lists_none() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let err = cfg.resolve_instance(Some(&iname("ghost"))).unwrap_err();
@@ -4016,7 +4488,7 @@ mod tests {
     fn resolve_ignores_stale_fast_path_dir() {
         // A mismatched metadata name must be rejected by both the fast path
         // and the fallback directory listing.
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let instances = tmp.path().join("instances");
 
@@ -4025,6 +4497,7 @@ mod tests {
             index: idx(0),
             dir: instances.join("wanted"),
             image: default_img(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         stale.save().unwrap();
 
@@ -4034,14 +4507,14 @@ mod tests {
 
     #[test]
     fn format_instance_list_or_none_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         assert_eq!(cfg.format_instance_list_or_none(), "No instances exist.");
     }
 
     #[test]
     fn format_instance_list_or_none_lists_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         make_instance(tmp.path(), "alpha", idx(0));
         make_instance(tmp.path(), "beta", idx(1));
@@ -4268,6 +4741,33 @@ auth = "bearer"
         let up = cfg.proxy.openai.unwrap();
         assert_eq!(up.credential.expose(), "cmd:op read op://x");
         assert_eq!(up.auth, ProxyAuthScheme::Bearer);
+    }
+
+    #[test]
+    fn codex_token_proxy_config_preserves_the_credential_reference() {
+        let cfg: CoopConfig = toml::from_str(
+            "[proxy.openai]\ncredential = 'cmd:token-store'\nauth = 'codex_access_token'\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let upstream = cfg.proxy.openai.unwrap();
+        assert_eq!(upstream.auth, ProxyAuthScheme::CodexAccessToken);
+        assert_eq!(upstream.credential.expose(), "cmd:token-store");
+        assert_eq!(cfg.codex.auth, CodexAuthMode::ApiKey);
+    }
+
+    #[test]
+    fn codex_token_auth_is_rejected_for_anthropic() {
+        let cfg: CoopConfig = toml::from_str(
+            "[proxy.anthropic]\ncredential = 'cmd:token-store'\nauth = 'codex_access_token'\n",
+        )
+        .unwrap();
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("supported only by [proxy.openai]")
+        );
     }
 
     #[test]
@@ -4972,7 +5472,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_accepts_subnet_mask_string_and_integer() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
 
         let with_slash = tmp.path().join("slash.toml");
         fs::write(&with_slash, "[network]\nsubnet_mask = \"/16\"\n").unwrap();
@@ -4992,7 +5492,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_rejects_invalid_subnet_mask() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nsubnet_mask = \"/33\"\n").unwrap();
         assert!(CoopConfig::load(&path).is_err());
@@ -5078,7 +5578,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn config_load_rejects_typo_host_iface() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         // " auto" with a leading space — the bug the enum exists to prevent.
         fs::write(&path, "[network]\nhost_iface = \" auto\"\n").unwrap();
@@ -5087,7 +5587,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_valid_toml_parses() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "ssh_port = 2222\n\n[vm]\nvcpu_count = 4\n").unwrap();
 
@@ -5101,7 +5601,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_invalid_toml_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "not valid toml [[[").unwrap();
 
@@ -5114,7 +5614,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_empty_toml_uses_all_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "").unwrap();
 
@@ -5131,7 +5631,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_partial_vm_config_fills_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[vm]\nmem_size_mib = 8192\n").unwrap();
 
@@ -5143,7 +5643,7 @@ skip = ["not-a-slug"]
 
     #[test]
     fn load_partial_network_config_fills_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nhost_iface = \"eth0\"\n").unwrap();
 
@@ -5350,7 +5850,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_unknown_fields_ignored() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "ssh_port = 2222\nunknown_field = true\n").unwrap();
 
@@ -5362,7 +5862,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_json_backward_compat() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("coop.json");
         fs::write(&path, r#"{"ssh_port": 2222, "vm": {"vcpu_count": 4}}"#).unwrap();
 
@@ -5507,8 +6007,75 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
+    fn firecracker_control_mode_is_explicit_and_opt_in() {
+        let default_cfg: CoopConfig = toml::from_str("[vm]\n").unwrap();
+        assert_eq!(
+            default_cfg.vm.firecracker_control,
+            FirecrackerControlMode::LegacyTcp
+        );
+
+        let vsock_cfg: CoopConfig =
+            toml::from_str("[vm]\nfirecracker_control = \"vsock\"\n").unwrap();
+        assert_eq!(
+            vsock_cfg.vm.firecracker_control,
+            FirecrackerControlMode::Vsock
+        );
+
+        assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_control = \"tcp\"\n").is_err());
+    }
+
+    #[test]
+    fn firecracker_network_mode_parses_and_defaults_open() {
+        let default_cfg: CoopConfig = toml::from_str("[vm]\n").unwrap();
+        assert_eq!(
+            default_cfg.vm.firecracker_network,
+            FirecrackerNetworkMode::Open
+        );
+        let isolated: CoopConfig =
+            toml::from_str("[vm]\nfirecracker_network = \"isolated\"\n").unwrap();
+        assert_eq!(
+            isolated.vm.firecracker_network,
+            FirecrackerNetworkMode::Isolated
+        );
+        assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_network = \"offline\"\n").is_err());
+        assert_eq!(FirecrackerNetworkMode::Open.as_str(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.as_str(), "isolated");
+        assert_eq!(FirecrackerNetworkMode::Open.to_string(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.to_string(), "isolated");
+    }
+
+    #[test]
+    fn isolated_network_requires_explicit_vsock_control() {
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::LegacyTcp,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::Vsock,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Open,
+            )
+            .is_err()
+        );
+        let mut cfg = CoopConfig::default();
+        cfg.vm.firecracker_control = FirecrackerControlMode::VsockIsolated;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("reserved for persisted instance state"));
+    }
+
+    #[test]
     fn deserialize_rejects_invalid_host_ip() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[network]\nhost_ip = \"not-an-ip\"\n").unwrap();
         let err = CoopConfig::load(&path).unwrap_err();
@@ -5545,7 +6112,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_accepts_existing_local_marketplace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("my-skills");
         fs::create_dir(&dir).unwrap();
 
@@ -5556,7 +6123,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[claude]\nmarketplaces = [\"~/my-skills\"]\n").unwrap();
 
@@ -5571,7 +6138,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_preserves_url_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         let url = "https://github.com/anthropics/plugins";
         fs::write(&path, format!("[claude]\nmarketplaces = [\"{url}\"]\n")).unwrap();
@@ -5593,7 +6160,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_codex_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[codex]\nmarketplaces = [\"~/codex-plugins\"]\n").unwrap();
 
@@ -5608,7 +6175,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_and_warn_preserves_validation_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir =
             ConfigDir::Custom(ConfigPath::new(tmp.path().join("missing-config")));
@@ -5663,7 +6230,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // with a non-empty, non-existent parent, the warning must fire.
     #[test]
     fn validate_warns_when_data_dir_parent_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("absent").join("coop");
         let cfg = validate_fixture(&data_dir);
         let warnings = cfg.validate().unwrap();
@@ -5679,7 +6246,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // must NOT fire (catches the negation being deleted).
     #[test]
     fn validate_no_data_dir_warning_when_parent_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("coop");
         let cfg = validate_fixture(&data_dir);
         let warnings = cfg.validate().unwrap();
@@ -5693,7 +6260,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // the template is present and the kernel is absent, warn.
     #[test]
     fn validate_warns_kernel_missing_when_template_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
@@ -5714,7 +6281,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // the kernel is present, no warning even with the template built.
     #[test]
     fn validate_no_kernel_warning_when_kernel_exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let image_dir = data_dir.join("images").join(DEFAULT_IMAGE);
@@ -5736,7 +6303,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // template is absent, the kernel check is skipped entirely.
     #[test]
     fn validate_no_kernel_warning_when_template_missing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5751,7 +6318,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(target_os = "linux")]
     fn validate_warns_firecracker_missing_on_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5770,7 +6337,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(target_os = "linux")]
     fn validate_no_firecracker_warning_when_present_on_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let firecracker = data_dir.join("firecracker");
@@ -5790,7 +6357,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn validate_no_firecracker_warning_on_non_linux() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
@@ -5843,7 +6410,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     // one of the two names.
     #[test]
     fn validate_collects_all_marketplace_errors() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = validate_fixture(tmp.path());
         cfg.claude.marketplaces = vec![
             "/nonexistent/marketplace-a".to_string(),
@@ -5890,7 +6457,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn post_start_deserializes() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "post_start = \"touch /tmp/booted\"\n").unwrap();
 
@@ -5934,7 +6501,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_images_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let images = cfg.list_images().unwrap();
         assert!(images.is_empty());
@@ -5942,10 +6509,16 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_images_finds_dirs() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("alpha").unwrap())).unwrap();
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("beta").unwrap())).unwrap();
+        crate::test_support::create_private_dir_all(
+            cfg.image_dir(&ImageName::new("alpha").unwrap()),
+        )
+        .unwrap();
+        crate::test_support::create_private_dir_all(
+            cfg.image_dir(&ImageName::new("beta").unwrap()),
+        )
+        .unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].name.as_str(), "alpha");
@@ -5958,11 +6531,12 @@ rsync = "/run/current-system/sw/bin/rsync"
     /// `list_instances` for corrupted instance dirs.
     #[test]
     fn list_images_skips_invalid_names() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
-        fs::create_dir_all(cfg.images_dir().join("..hidden")).unwrap();
-        fs::create_dir_all(cfg.images_dir().join("with space")).unwrap();
-        fs::create_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap())).unwrap();
+        crate::test_support::create_private_dir_all(cfg.images_dir().join("..hidden")).unwrap();
+        crate::test_support::create_private_dir_all(cfg.images_dir().join("with space")).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&ImageName::new("ok").unwrap()))
+            .unwrap();
         let images = cfg.list_images().unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].name.as_str(), "ok");
@@ -5970,13 +6544,14 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_save_load_with_image() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         let inst = Instance {
             name: InstanceName::new("inst").unwrap(),
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("python-dev").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
         let loaded = Instance::load(&dir).unwrap();
@@ -5985,7 +6560,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_load_missing_image_defaults() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         // Write old-format instance.json without image field
@@ -5999,7 +6574,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     /// silently used to construct paths.
     #[test]
     fn instance_load_rejects_invalid_image_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
@@ -6023,7 +6598,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_without_instance_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6039,7 +6614,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_with_corrupted_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6056,7 +6631,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn list_skips_dir_with_empty_instance_json() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         make_instance(tmp.path(), "good", idx(0));
@@ -6073,7 +6648,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_refuses_unknown_index_until_corrupt_dir_is_removed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         // The malformed metadata may have held any valid index.
@@ -6094,7 +6669,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn instance_save_overwrites_atomically() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("inst");
 
         // Save initial state
@@ -6103,6 +6678,7 @@ rsync = "/run/current-system/sw/bin/rsync"
             index: InstanceIndex::new(0).unwrap(),
             dir: dir.clone(),
             image: ImageName::new(DEFAULT_IMAGE).unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst.save().unwrap();
 
@@ -6112,6 +6688,7 @@ rsync = "/run/current-system/sw/bin/rsync"
             index: InstanceIndex::new(5).unwrap(),
             dir: dir.clone(),
             image: ImageName::new("custom").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         inst2.save().unwrap();
 
@@ -6137,6 +6714,57 @@ rsync = "/run/current-system/sw/bin/rsync"
     fn disk_size_absolute_with_suffix() {
         let ds = DiskSize::parse("150G").unwrap();
         assert_eq!(ds, DiskSize::Absolute(GiB::new(150).unwrap()));
+    }
+
+    #[test]
+    fn cli_size_suffixes_are_binary_and_unambiguous() {
+        for spec in ["2", "2G", "2g", "2GiB"] {
+            assert_eq!(GiB::parse_cli(spec).unwrap(), GiB::new(2).unwrap());
+            assert_eq!(
+                DiskSize::parse(spec).unwrap(),
+                DiskSize::Absolute(GiB::new(2).unwrap())
+            );
+            assert_eq!(
+                DiskSize::parse(&format!("+{spec}")).unwrap(),
+                DiskSize::Relative(GiB::new(2).unwrap())
+            );
+        }
+        for spec in ["512", "512MiB"] {
+            assert_eq!(MiB::parse_cli(spec).unwrap(), MiB::new(512).unwrap());
+        }
+        for spec in [
+            "2GB",
+            "2MB",
+            "2M",
+            "2MiB",
+            "2Gi",
+            "2.5G",
+            "0",
+            "4294967296GiB",
+        ] {
+            assert!(GiB::parse_cli(spec).is_err(), "{spec}");
+            assert!(DiskSize::parse(spec).is_err(), "{spec}");
+        }
+        for spec in ["512MB", "512M", "512G", "512GiB", "0MiB"] {
+            assert!(MiB::parse_cli(spec).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn disk_byte_conversion_preserves_bounds_and_context() {
+        assert_eq!(GiB::new(1).unwrap().as_bytes(), GIB_BYTES);
+        assert_eq!(GiB::from_bytes_ceil(GIB_BYTES).unwrap().as_u32(), 1);
+        assert_eq!(GiB::from_bytes_ceil(GIB_BYTES + 4096).unwrap().as_u32(), 2);
+        assert_eq!(GiB::from_bytes_ceil(1).unwrap().as_u32(), 1);
+        assert!(GiB::from_bytes_ceil(0).is_err());
+        let largest = u64::from(u32::MAX) * GIB_BYTES;
+        assert_eq!(GiB::from_bytes_ceil(largest).unwrap().as_u32(), u32::MAX);
+        assert!(GiB::from_bytes_ceil(largest + 1).is_err());
+        assert!(GiB::from_bytes_ceil(u64::MAX).is_err());
+        assert_eq!(
+            format_disk_bytes(GIB_BYTES + 4096),
+            "1 GiB + 4096 bytes (1073745920 bytes)"
+        );
     }
 
     #[test]
@@ -6190,11 +6818,22 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert!(err.to_string().contains("overflow"), "{err}");
     }
 
+    #[test]
+    fn relative_resolution_rejects_unrepresentable_image_length() {
+        let relative = DiskSize::Relative(GiB::new(1).unwrap());
+        assert!(relative.resolve_from_bytes(u64::MAX).is_err());
+        let absolute = DiskSize::Absolute(GiB::new(1).unwrap());
+        assert_eq!(
+            absolute.resolve_from_bytes(u64::MAX).unwrap(),
+            GiB::new(1).unwrap()
+        );
+    }
+
     // ── Mount parsing ───────────────────────────────────────────
 
     #[test]
     fn mount_parse_host_only_defaults_to_workspace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
         assert_eq!(m.guest_path.to_string(), "/workspace");
@@ -6202,7 +6841,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_host_and_guest() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let spec = format!("{}:/data/project", tmp.path().display());
         let m = Mount::parse(&spec).unwrap();
         assert_eq!(m.host_path, tmp.path().canonicalize().unwrap());
@@ -6220,7 +6859,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_rejects_file_host() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let file = tmp.path().join("afile");
         fs::write(&file, "x").unwrap();
         let err = Mount::parse(file.to_str().unwrap()).unwrap_err();
@@ -6232,7 +6871,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_parse_rejects_relative_guest_path() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let spec = format!("{}:relative/path", tmp.path().display());
         let err = Mount::parse(&spec).unwrap_err();
         assert!(
@@ -6243,7 +6882,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_host_is_git_repo_detects_git_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(m.host_is_git_repo());
@@ -6253,7 +6892,7 @@ rsync = "/run/current-system/sw/bin/rsync"
     fn mount_host_is_git_repo_detects_worktree_git_file() {
         // Linked worktrees have `.git` as a file pointing at the main
         // repo's gitdir, not a directory. Both should count.
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         fs::write(tmp.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(m.host_is_git_repo());
@@ -6261,7 +6900,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn mount_host_is_git_repo_false_for_plain_directory() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let m = Mount::parse(tmp.path().to_str().unwrap()).unwrap();
         assert!(!m.host_is_git_repo());
     }
@@ -6338,7 +6977,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_passes_with_existing_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.claude.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
@@ -6346,7 +6985,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn validate_passes_with_existing_codex_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig::default();
         cfg.codex.config_dir = ConfigDir::Custom(ConfigPath::new(tmp.path()));
         assert!(cfg.validate().is_ok());
@@ -6396,7 +7035,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[claude]\nconfig_dir = \"~/foo\"\n").unwrap();
 
@@ -6418,7 +7057,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_codex_config_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[codex]\nconfig_dir = \"~/foo\"\n").unwrap();
 
@@ -6440,7 +7079,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_data_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "data_dir = \"~/coop-data\"\n").unwrap();
 
@@ -6459,7 +7098,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_firecracker_bin() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "firecracker_bin = \"~/bin/firecracker\"\n").unwrap();
 
@@ -6473,7 +7112,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_kernel_path() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(&path, "[vm]\nkernel_path = \"~/kernels/vmlinux\"\n").unwrap();
 
@@ -6513,7 +7152,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn load_expands_tilde_in_profile_marketplaces() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         fs::write(
             &path,
@@ -6583,7 +7222,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn unique_name_with_collision() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = make_instance(tmp.path(), "foo", idx(0));
         let name = unique_instance_name("foo", &[inst]).unwrap();
         assert_eq!(name, *"foo-2");
@@ -6591,7 +7230,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn unique_name_multiple_collisions() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let i1 = make_instance(tmp.path(), "foo", idx(0));
         let i2 = make_instance(tmp.path(), "foo-2", idx(1));
         let name = unique_instance_name("foo", &[i1, i2]).unwrap();
@@ -6600,7 +7239,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_with_workspace_derives_basename() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("my-app");
@@ -6614,7 +7253,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_with_workspace_collision_appends_suffix() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("dupe");
@@ -6635,7 +7274,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_explicit_name_overrides_workspace() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
 
         let ws = tmp.path().join("my-app");
@@ -6649,7 +7288,7 @@ rsync = "/run/current-system/sw/bin/rsync"
 
     #[test]
     fn allocate_without_name_or_workspace_uses_index() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let cfg = test_config(&tmp);
         let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
         assert_eq!(inst.name, *"0");
@@ -7190,7 +7829,7 @@ rsync = "/run/current-system/sw/bin/rsync"
         /// dir so the existence/is-dir invariants hold.
         #[test]
         fn mount_parse_roundtrips(guest in arb_guest_path()) {
-            let tmp = TempDir::new().unwrap();
+            let tmp = crate::test_support::private_tempdir().unwrap();
             let host = tmp.path().to_str().unwrap();
             let first = Mount::parse(&format!("{host}:{guest}")).unwrap();
             let second =

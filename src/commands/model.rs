@@ -82,6 +82,12 @@ fn set_local(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
+    if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated {
+        bail!(
+            "Local model routing is unavailable in isolated network mode because the guest has \
+             no route to the host endpoint; switch the stopped VM to open networking first"
+        );
+    }
     let mut state = ModelState::load_or_default(inst)?;
     state.mode = ModelMode::Local;
 

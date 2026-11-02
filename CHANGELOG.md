@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## v0.9.2
+
+### Security
+
+- Harden the Firecracker control plane. Coop now starts Firecracker without
+  exposing its control API socket, safely handles stale sockets from older
+  versions, and offers an opt-in `vm.firecracker_control = "vsock"` mode that
+  keeps SSH control traffic off the guest network. Existing instances retain
+  their persisted transport, and older untagged instances remain on legacy
+  TCP.
+- Update Tokio to 1.54.1 to resolve RUSTSEC-2026-0386, and update the Rustls
+  certificate-validation dependencies.
+
+### Changed
+
+- Define storage and memory sizes in binary GiB and MiB. CLI inputs now accept
+  explicit `GiB` and `MiB` suffixes; legacy `G` and `g` disk suffixes continue
+  to mean GiB, while decimal and ambiguous suffixes are rejected.
+
+### Fixed
+
+- Preserve exact disk byte lengths when checking shrink operations and when
+  resizing or reprovisioning non-GiB-aligned images.
+- Recognize the trusted `sudo` installation path used by Ubuntu 26.04 CI while
+  retaining the existing ownership, permission, and executable checks.
+
+## v0.9.1
+
+### Fixed
+
+- Keep Lima VM starts headless, including restarts of existing instances whose
+  persisted configuration enables a graphical display.
+
+## v0.9.0
+
+### Security
+
+- Warn before launching a host-side remote editor against a VM. A compromised
+  guest can use the editor's remote integration to execute commands on the
+  host, so only trusted guests should be opened this way.
+
+### New features
+
+- Add credential-proxy support for Codex workspace personal access tokens.
+  `proxy.openai.auth = "codex_access_token"` validates the token on the host,
+  keeps it out of the guest, and routes inference through the ChatGPT Codex
+  backend with the workspace identity and controls returned by validation.
+- Generate dynamic completion scripts for Bash, zsh, Fish, PowerShell, and
+  Elvish. Completions now include live instance, image, and profile names.
+
+### Changed
+
+- Use rsync for every workspace transfer and remove the tar fallback. The host
+  and guest must both provide rsync; coop images include it by default. Hard
+  links are copied as independent files.
+
+### Fixed
+
+- Load generated Bash completions portably on macOS's system Bash 3.2.
+
 ## v0.8.1
 
 ### Security

@@ -40,6 +40,12 @@ pub enum Injection {
     /// Bearer token (e.g. a Claude `setup-token`) →
     /// `authorization: Bearer <credential>`.
     Bearer { credential: Secret },
+    /// Codex workspace PAT, with host-validated workspace routing metadata.
+    CodexAccessToken {
+        credential: Secret,
+        account_id: String,
+        is_fedramp: bool,
+    },
 }
 
 /// The full startup blob. One `coop-proxy` process serves exactly one
@@ -80,6 +86,30 @@ impl ProxyConfig {
         if cfg.capability_token.expose().is_empty() {
             anyhow::bail!("capability_token must not be empty");
         }
+        if let Injection::CodexAccessToken {
+            credential,
+            account_id,
+            ..
+        } = &cfg.injection
+        {
+            if cfg.upstream_host != "chatgpt.com"
+                || !credential.expose().starts_with("at-")
+                || credential.expose().len() <= 3
+                || !credential
+                    .expose()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
+                || account_id.is_empty()
+                || account_id.len() > 256
+                || !account_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            {
+                anyhow::bail!("invalid Codex access-token proxy configuration");
+            }
+        } else if cfg.upstream_host == "chatgpt.com" {
+            anyhow::bail!("the Codex backend requires codex_access_token injection");
+        }
         Ok(cfg)
     }
 }
@@ -107,7 +137,7 @@ mod tests {
         assert_eq!(cfg.capability_token.expose(), "cap-token-abc");
         match &cfg.injection {
             Injection::XApiKey { credential } => assert_eq!(credential.expose(), "sk-secret"),
-            Injection::Bearer { .. } => panic!("expected x_api_key"),
+            _ => panic!("expected x_api_key"),
         }
     }
 
@@ -122,8 +152,55 @@ mod tests {
         let cfg = ProxyConfig::from_json(json).unwrap();
         match &cfg.injection {
             Injection::Bearer { credential } => assert_eq!(credential.expose(), "setup-tok"),
-            Injection::XApiKey { .. } => panic!("expected bearer"),
+            _ => panic!("expected bearer"),
         }
+    }
+
+    fn codex_config() -> serde_json::Value {
+        serde_json::json!({
+            "listen": "127.0.0.1:9788",
+            "capability_token": "cap-private",
+            "upstream_host": "chatgpt.com",
+            "injection": { "scheme": "codex_access_token", "credential": "at-private", "account_id": "workspace-123", "is_fedramp": false }
+        })
+    }
+
+    #[test]
+    fn codex_configuration_requires_its_fixed_backend_and_valid_headers() {
+        let valid = codex_config();
+        let cfg = ProxyConfig::from_json(&valid.to_string()).unwrap();
+        assert!(!format!("{cfg:?}").contains("at-private"));
+        for (len, accepted) in [(256, true), (257, false)] {
+            let mut boundary = valid.clone();
+            boundary["injection"]["account_id"] = "a".repeat(len).into();
+            assert_eq!(
+                ProxyConfig::from_json(&boundary.to_string()).is_ok(),
+                accepted,
+                "length {len}"
+            );
+        }
+        for (key, value) in [
+            ("account_id", ""),
+            ("account_id", "workspace\r\nsecret"),
+            ("credential", "at-private\nsecret"),
+            ("credential", "sk-private"),
+            ("credential", "at-"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["injection"][key] = value.into();
+            let err = ProxyConfig::from_json(&invalid.to_string())
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("secret"));
+        }
+        for host in ["api.openai.com", "attacker.invalid"] {
+            let mut invalid = valid.clone();
+            invalid["upstream_host"] = host.into();
+            assert!(ProxyConfig::from_json(&invalid.to_string()).is_err());
+        }
+        let mut invalid = valid;
+        invalid["injection"]["scheme"] = "bearer".into();
+        assert!(ProxyConfig::from_json(&invalid.to_string()).is_err());
     }
 
     #[test]

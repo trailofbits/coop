@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 #[cfg(any(target_os = "macos", test))]
 use std::fs;
-use std::num::{NonZeroU8, NonZeroU16};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,9 +13,11 @@ use toml::Value as TomlValue;
 
 #[cfg(target_os = "linux")]
 use crate::cmd::Cmd;
+#[cfg(not(target_os = "macos"))]
+use crate::config::FirecrackerNetworkMode;
 use crate::config::{
-    CodexAuthMode, ConfigDir, CoopConfig, GitHubAuth, ImageName, Instance, LocalModel,
-    McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
+    CodexAuthMode, ConfigDir, CoopConfig, FirecrackerControlMode, GitHubAuth, ImageName, Instance,
+    LocalModel, McpServerDef, NetworkConfig, SshHostToolsConfig, VmMemory,
 };
 use crate::fs_util::{FileLock, lock_sibling_bounded};
 use crate::model_state::ModelState;
@@ -199,6 +201,30 @@ pub struct StoppedInstance {
     _lock: FileLock,
 }
 
+/// State observed after acquiring the lifecycle lock for a stop request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    AlreadyStopped,
+    StoppedRunning,
+}
+
+/// Operation lock retained after a compound transition has started the VM.
+/// Keeping this guard alive serializes target readiness and bootstrap with
+/// stop, destroy, and other lifecycle mutations.
+pub struct InstanceOperationGuard {
+    _lock: FileLock,
+}
+
+impl InstanceOperationGuard {
+    /// Reacquire lifecycle serialization after running an arbitrary guest hook
+    /// without the lock, then let the caller revalidate the resulting state.
+    pub(crate) fn acquire(inst: &Instance) -> Result<Self> {
+        Ok(Self {
+            _lock: lock_instance_operation(inst)?,
+        })
+    }
+}
+
 impl StoppedInstance {
     /// Mint a `StoppedInstance` after the backend confirms the instance stopped.
     ///
@@ -209,6 +235,15 @@ impl StoppedInstance {
 
     pub fn instance(&self) -> &Instance {
         &self.inst
+    }
+
+    pub(crate) fn instance_mut(&mut self) -> &mut Instance {
+        &mut self.inst
+    }
+
+    fn into_operation_guard(self) -> InstanceOperationGuard {
+        let Self { _lock: lock, .. } = self;
+        InstanceOperationGuard { _lock: lock }
     }
 }
 
@@ -338,11 +373,59 @@ impl AsRef<str> for SshUser {
 /// SSH connection details for reaching a guest VM.
 #[derive(Debug, Clone)]
 pub struct SshTarget {
-    pub host: Hostname,
-    pub port: NonZeroU16,
-    pub user: SshUser,
-    pub key_path: PathBuf,
-    pub(crate) host_tools: SshHostToolsConfig,
+    transport: SshTransport,
+    user: SshUser,
+    key_path: PathBuf,
+    host_tools: SshHostToolsConfig,
+}
+
+/// Closed set of transports OpenSSH can use to reach a guest.
+#[derive(Debug, Clone)]
+enum SshTransport {
+    Tcp(TcpSshTransport),
+    Vsock(FirecrackerVsockTransport),
+}
+
+/// TCP endpoint for an SSH transport.
+#[derive(Debug, Clone)]
+struct TcpSshTransport {
+    host: Hostname,
+    port: NonZeroU16,
+}
+
+/// Firecracker host-initiated vsock endpoint used by OpenSSH's `ProxyCommand`.
+#[derive(Debug, Clone)]
+struct FirecrackerVsockTransport {
+    socket_path: PathBuf,
+    guest_port: NonZeroU32,
+    proxy_executable: PathBuf,
+}
+
+impl FirecrackerVsockTransport {
+    fn proxy_command(&self) -> Result<String> {
+        fn word(path: &Path, description: &str) -> Result<String> {
+            let literal = crate::openssh::literal_path(path, description)?;
+            Ok(crate::shell::shell_escape(&literal))
+        }
+
+        Ok(format!(
+            "{} __vsock-proxy --socket {} --port {}",
+            word(&self.proxy_executable, "coop vsock proxy executable")?,
+            word(&self.socket_path, "Firecracker vsock socket path")?,
+            self.guest_port,
+        ))
+    }
+}
+
+/// OpenSSH client whose transport arguments are being rendered.
+///
+/// SSH and rsync's SSH transport spell the port option `-p`; SCP spells it
+/// `-P`. Keeping that choice typed prevents a caller from selecting the wrong
+/// spelling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SshTransportClient {
+    Ssh,
+    Scp,
 }
 
 // ── SSH session ───────────────────────────────────────────────
@@ -357,6 +440,160 @@ pub struct SshSession {
 }
 
 impl SshTarget {
+    /// Construct a target reached directly over TCP.
+    pub fn tcp(
+        host: Hostname,
+        port: NonZeroU16,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Self {
+        Self {
+            transport: SshTransport::Tcp(TcpSshTransport { host, port }),
+            user,
+            key_path,
+            host_tools,
+        }
+    }
+
+    /// Construct a target reached through Firecracker's base vsock socket.
+    pub(crate) fn firecracker_vsock(
+        socket_path: PathBuf,
+        guest_port: NonZeroU32,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Result<Self> {
+        let proxy_executable = std::env::current_exe()
+            .context("Failed to resolve coop executable for Firecracker vsock ProxyCommand")?;
+        Ok(Self {
+            transport: SshTransport::Vsock(FirecrackerVsockTransport {
+                socket_path,
+                guest_port,
+                proxy_executable,
+            }),
+            user,
+            key_path,
+            host_tools,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn firecracker_vsock_with_proxy(
+        socket_path: PathBuf,
+        guest_port: NonZeroU32,
+        proxy_executable: PathBuf,
+        user: SshUser,
+        key_path: PathBuf,
+        host_tools: SshHostToolsConfig,
+    ) -> Self {
+        Self {
+            transport: SshTransport::Vsock(FirecrackerVsockTransport {
+                socket_path,
+                guest_port,
+                proxy_executable,
+            }),
+            user,
+            key_path,
+            host_tools,
+        }
+    }
+
+    pub(crate) fn user(&self) -> &SshUser {
+        &self.user
+    }
+
+    pub(crate) fn key_path(&self) -> &Path {
+        &self.key_path
+    }
+
+    pub(crate) fn host_tools(&self) -> &SshHostToolsConfig {
+        &self.host_tools
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_key_path(mut self, key_path: PathBuf) -> Self {
+        self.key_path = key_path;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_host_tools(mut self, host_tools: SshHostToolsConfig) -> Self {
+        self.host_tools = host_tools;
+        self
+    }
+
+    /// Options that select how an OpenSSH client reaches the guest.
+    pub(crate) fn transport_options(&self, client: SshTransportClient) -> Vec<String> {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => vec![
+                match client {
+                    SshTransportClient::Ssh => "-p",
+                    SshTransportClient::Scp => "-P",
+                }
+                .to_string(),
+                tcp.port.to_string(),
+            ],
+            SshTransport::Vsock(_) => Vec::new(),
+        }
+    }
+
+    /// Proxy option for the selected transport.
+    pub(crate) fn proxy_command_option(&self) -> Result<String> {
+        match &self.transport {
+            SshTransport::Tcp(_) => Ok("ProxyCommand=none".to_string()),
+            SshTransport::Vsock(vsock) => Ok(format!("ProxyCommand={}", vsock.proxy_command()?)),
+        }
+    }
+
+    /// Transport-specific lines for a user-facing SSH config block.
+    pub(crate) fn ssh_config_transport(&self) -> Result<String> {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => Ok(format!(
+                "    HostName {}\n    Port {}\n",
+                tcp.host, tcp.port
+            )),
+            SshTransport::Vsock(vsock) => Ok(format!(
+                "    HostName coop-vsock\n    ProxyCommand {}\n",
+                vsock.proxy_command()?
+            )),
+        }
+    }
+
+    /// Human-readable endpoint used in lifecycle and interactive diagnostics.
+    pub(crate) fn connection_description(&self) -> String {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => format!("{}:{}", tcp.host, tcp.port),
+            SshTransport::Vsock(vsock) => {
+                format!("vsock:{}:{}", vsock.socket_path.display(), vsock.guest_port)
+            }
+        }
+    }
+
+    /// Check whether the selected transport accepts a connection.
+    pub(crate) fn transport_is_reachable(&self, timeout: Duration) -> Result<bool> {
+        match &self.transport {
+            SshTransport::Tcp(tcp) => {
+                let address = format!("{}:{}", tcp.host, tcp.port)
+                    .parse()
+                    .context("Invalid guest address")?;
+                Ok(std::net::TcpStream::connect_timeout(&address, timeout).is_ok())
+            }
+            SshTransport::Vsock(vsock) => {
+                match crate::vsock_proxy::connect(&vsock.socket_path, vsock.guest_port, timeout) {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        if crate::vsock_proxy::permanent_readiness_error(&error) {
+                            return Err(error).context("Firecracker vsock readiness failed");
+                        }
+                        tracing::debug!("Firecracker vsock is not reachable: {error:#}");
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
     /// Control socket path for SSH connection multiplexing.
     ///
     /// Uses `XDG_RUNTIME_DIR` (per-user, 0700 on Linux) when available,
@@ -370,11 +607,21 @@ impl SshTarget {
     fn control_path(&self) -> PathBuf {
         let dir =
             std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        // Hash host:port to keep the filename short and predictable.
+        // Hash the transport identity to keep the filename short and predictable.
         // 8 hex chars (32 bits) is enough to avoid collisions across
         // the handful of concurrent instances this tool manages.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(&self.host, self.port), &mut hasher);
+        match &self.transport {
+            SshTransport::Tcp(tcp) => {
+                std::hash::Hash::hash(&(&tcp.host, tcp.port), &mut hasher);
+            }
+            SshTransport::Vsock(vsock) => {
+                std::hash::Hash::hash(
+                    &("firecracker-vsock", &vsock.socket_path, vsock.guest_port),
+                    &mut hasher,
+                );
+            }
+        }
         let hash = std::hash::Hasher::finish(&hasher);
         // Truncation to 32 bits is intentional — we only need enough
         // uniqueness to distinguish a handful of concurrent instances.
@@ -405,6 +652,16 @@ impl SshTarget {
         Ok(command)
     }
 
+    fn mux_teardown_command(&self, socket: &Path) -> Result<Command> {
+        let mut ssh = self.ssh_command()?;
+        let control_arg = format!(
+            "ControlPath={}",
+            crate::openssh::config_path(socket, "SSH control socket path")?
+        );
+        ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()]);
+        Ok(ssh)
+    }
+
     pub(crate) fn ssh_command(&self) -> Result<Command> {
         crate::openssh::ssh_command(self, crate::openssh::Forwarding::Disabled)
     }
@@ -419,7 +676,10 @@ impl SshTarget {
 
     /// user@host address string.
     pub fn addr(&self) -> String {
-        format!("{}@{}", self.user, self.host)
+        match &self.transport {
+            SshTransport::Tcp(tcp) => format!("{}@{}", self.user, tcp.host),
+            SshTransport::Vsock(_) => format!("{}@coop-vsock", self.user),
+        }
     }
 
     /// Run a command on the guest via SSH.
@@ -505,7 +765,7 @@ impl SshTarget {
 
     /// Wait until SSH is ready, retrying with exponential backoff.
     ///
-    /// TCP reachability (checked by `wait_for_boot`) does not guarantee
+    /// Transport reachability (checked by `wait_for_boot`) does not guarantee
     /// sshd is accepting authentication. This probe retries a trivial
     /// command until it succeeds or the timeout expires.
     ///
@@ -603,13 +863,8 @@ impl SshTarget {
             return;
         }
         tracing::debug!("Closing SSH control master at {}", sock.display());
-        let result = self.ssh_command().and_then(|mut ssh| {
-            let control_arg = format!(
-                "ControlPath={}",
-                crate::openssh::config_path(&sock, "SSH control socket path")?
-            );
-            ssh.args(["-O", "exit", "-o", &control_arg, &self.addr()])
-                .stdout(std::process::Stdio::null())
+        let result = self.mux_teardown_command(&sock).and_then(|mut ssh| {
+            ssh.stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .context("Failed to launch SSH control request")
@@ -812,7 +1067,22 @@ fn setup_preflight(
 /// The `PlatformBackend` type alias selects the correct one at compile
 /// time via `#[cfg]`.
 pub trait VmBackend: std::fmt::Display {
+    /// Whether this backend can enforce Firecracker's persisted network mode.
+    fn supports_firecracker_network_mode(&self) -> bool {
+        false
+    }
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()>;
+    /// Reject an image that cannot satisfy the control transport which would
+    /// be persisted for a new or restored instance. Backends without an
+    /// image-level control dependency need no additional validation.
+    fn validate_image_control(
+        &self,
+        cfg: &CoopConfig,
+        image: &ImageName,
+        _mode: FirecrackerControlMode,
+    ) -> Result<()> {
+        crate::setup::validate_image_publication(cfg, image)
+    }
     fn create_and_start(
         &self,
         cfg: &CoopConfig,
@@ -821,9 +1091,23 @@ pub trait VmBackend: std::fmt::Display {
         mounts: &[crate::config::Mount],
     ) -> Result<()>;
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()>;
+    /// Start an instance while retaining the operation lock represented by
+    /// `stopped`. This is used by compound stopped-only transitions so no
+    /// concurrent lifecycle command can enter between persistence and boot.
+    fn start_confirmed_stopped(
+        &self,
+        cfg: &CoopConfig,
+        stopped: StoppedInstance,
+    ) -> Result<InstanceOperationGuard>;
     /// Stop an instance observed running at the preceding probe and return it
     /// with the operation lock held once the backend confirms it has exited.
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance>;
+    /// The outcome reports whether the lock-protected probe still found it
+    /// running, so compound transitions do not act on the stale first probe.
+    fn stop(
+        &self,
+        cfg: &CoopConfig,
+        running: RunningInstance,
+    ) -> Result<(StoppedInstance, StopOutcome)>;
     /// Finish backend cleanup for a confirmed-stopped instance.
     /// Lima has no host TAP; Firecracker deletes it while the operation lock
     /// carried by `stopped` prevents a concurrent restart.
@@ -861,17 +1145,20 @@ pub trait VmBackend: std::fmt::Display {
         vcpus: Option<NonZeroU8>,
         start_after: bool,
     ) -> Result<()>;
-    /// Save a stopped instance's filesystem as image `image` (the
-    /// backend-specific disk artifacts only — the caller carries over
-    /// the shared `template-config.json`). Takes a [`StoppedInstance`]
-    /// observation and lock through the filesystem copy. Overwriting an
-    /// existing image is the caller's decision, gated before this call.
+    /// Save a stopped instance's filesystem and matching metadata as image
+    /// `image`. Takes a [`StoppedInstance`] observation and lock through
+    /// publication. Overwriting an existing image is the caller's decision,
+    /// gated before this call.
     fn commit_disk(
         &self,
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()>;
+    /// Record capabilities that this backend re-established in the committed
+    /// disk before its metadata is published.
+    fn prepare_committed_image_metadata(&self, _metadata: &mut crate::setup::TemplateConfig) {}
     /// Replace a stopped instance's disk with image `image`'s template,
     /// leaving the instance otherwise intact. The dual of
     /// [`Self::commit_disk`]; like it, gated on a [`StoppedInstance`].
@@ -954,22 +1241,99 @@ impl std::fmt::Display for FirecrackerBackend {
 
 #[cfg(not(target_os = "macos"))]
 fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-    if inst.probe_running()? {
+    if inst.probe_liveness()? {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
-    crate::network::setup_tap(&cfg.network, inst)?;
+    if inst.firecracker_network() == FirecrackerNetworkMode::Open {
+        crate::network::setup_tap(&cfg.network, inst)?;
+    }
     let running = vm.start()?;
     running.wait_for_boot()
 }
 
+/// Build the legacy Linux/Firecracker TCP control transport.
+///
+/// This serves untagged and `legacy_tcp` Firecracker instances and can be
+/// removed when the supported compatibility window excludes both forms. Lima
+/// continues through its own TCP constructor because its host, port, and
+/// lifecycle assumptions differ.
+pub(crate) fn legacy_firecracker_tcp_target(
+    cfg: &CoopConfig,
+    inst: &Instance,
+) -> Result<SshTarget> {
+    let guest_user = persisted_guest_user(cfg, &inst.image);
+    Ok(SshTarget::tcp(
+        Hostname::from(inst.guest_ip()),
+        cfg.ssh_port,
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
+}
+
+/// Derive the runtime SSH target from an instance's persisted control mode.
+pub(crate) fn firecracker_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
+    match inst.firecracker_control() {
+        FirecrackerControlMode::LegacyTcp => legacy_firecracker_tcp_target(cfg, inst),
+        FirecrackerControlMode::Vsock | FirecrackerControlMode::VsockIsolated => {
+            let guest_user = persisted_guest_user(cfg, &inst.image);
+            let guest_port =
+                NonZeroU32::new(22).context("fixed SSH vsock port must be non-zero")?;
+            SshTarget::firecracker_vsock(
+                inst.vsock_path(),
+                guest_port,
+                SshUser::new(guest_user.as_str())?,
+                std::path::absolute(cfg.ssh_key_path())?,
+                cfg.ssh.host_tools.clone(),
+            )
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 impl VmBackend for FirecrackerBackend {
+    fn supports_firecracker_network_mode(&self) -> bool {
+        true
+    }
+
     fn setup(&self, cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         setup_preflight(cfg, opts, ExplicitSetupInputSupport::Supported)?;
         crate::setup::run(cfg, opts)
+    }
+
+    fn validate_image_control(
+        &self,
+        cfg: &CoopConfig,
+        image: &ImageName,
+        mode: FirecrackerControlMode,
+    ) -> Result<()> {
+        crate::setup::validate_image_publication(cfg, image)?;
+        if mode == FirecrackerControlMode::LegacyTcp {
+            return Ok(());
+        }
+
+        let metadata = crate::setup::TemplateConfig::load_for(cfg, image).with_context(|| {
+            format!(
+                "Cannot verify that image '{image}' supports Firecracker vsock control. \
+                 A base image can be rebuilt with `coop setup --image {image} --rebuild`; \
+                 rebuilding a committed checkpoint discards its contents"
+            )
+        })?;
+        if !metadata
+            .capabilities
+            .contains(&crate::setup::ImageCapability::FirecrackerVsockSsh)
+        {
+            bail!(
+                "Image '{image}' does not contain the Firecracker vsock SSH listener required by \
+                 `[vm].firecracker_control = \"vsock\"`. A base image can be rebuilt with \
+                 `coop setup --image {image} --rebuild`; rebuilding a committed checkpoint \
+                 discards its contents"
+            );
+        }
+        Ok(())
     }
 
     fn create_and_start(
@@ -980,43 +1344,85 @@ impl VmBackend for FirecrackerBackend {
         mounts: &[crate::config::Mount],
     ) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             bail!("Instance '{}' is already running", inst.name);
         }
         boot_preflight(cfg)?;
+        crate::config::validate_firecracker_modes(
+            inst.firecracker_control(),
+            inst.firecracker_network(),
+        )?;
+        self.validate_image_control(cfg, &inst.image, inst.firecracker_control())?;
         // Mounts are handled after boot via rsync (not virtiofs).
         // Validation already happened in Mount::parse().
         let _ = mounts;
         crate::setup::create_instance(cfg, inst, disk_gib)?;
         let vm = crate::vm::FirecrackerVm::new(cfg, inst);
         vm.configure()?;
-        crate::network::setup_tap(&cfg.network, inst)?;
+        if inst.firecracker_network() == FirecrackerNetworkMode::Open {
+            crate::network::setup_tap(&cfg.network, inst)?;
+        }
         let running = vm.start()?;
         running.wait_for_boot()
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        crate::config::validate_firecracker_modes(
+            inst.firecracker_control(),
+            inst.firecracker_network(),
+        )?;
+        self.validate_image_control(cfg, &inst.image, inst.firecracker_control())?;
         start_firecracker_existing(cfg, inst)
     }
 
-    fn stop(&self, cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
+    fn start_confirmed_stopped(
+        &self,
+        cfg: &CoopConfig,
+        stopped: StoppedInstance,
+    ) -> Result<InstanceOperationGuard> {
+        let inst = stopped.instance();
+        crate::config::validate_firecracker_modes(
+            inst.firecracker_control(),
+            inst.firecracker_network(),
+        )?;
+        self.validate_image_control(cfg, &inst.image, inst.firecracker_control())?;
+        start_firecracker_existing(cfg, inst)?;
+        Ok(stopped.into_operation_guard())
+    }
+
+    fn stop(
+        &self,
+        cfg: &CoopConfig,
+        running: RunningInstance,
+    ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
-        if inst.probe_liveness()? {
+        let outcome = if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
             vm.stop()?;
-        }
-        Ok(StoppedInstance::new(inst, operation))
+            StopOutcome::StoppedRunning
+        } else {
+            StopOutcome::AlreadyStopped
+        };
+        Ok((StoppedInstance::new(inst, operation), outcome))
     }
 
     fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
-        crate::network::teardown_tap(&cfg.network, stopped.instance())
+        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance());
+        let network = crate::network::teardown_tap(&cfg.network, stopped.instance());
+        match (runtime, network) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(runtime), Err(network)) => Err(runtime.context(format!(
+                "Firecracker network teardown also failed: {network:#}"
+            ))),
+        }
     }
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
-        if inst.probe_running()? {
+        if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
@@ -1112,8 +1518,15 @@ impl VmBackend for FirecrackerBackend {
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()> {
-        crate::setup::commit_instance_rootfs(cfg, stopped.instance(), image)
+        crate::setup::commit_instance_rootfs(cfg, stopped.instance(), image, metadata)
+    }
+
+    fn prepare_committed_image_metadata(&self, metadata: &mut crate::setup::TemplateConfig) {
+        metadata
+            .capabilities
+            .insert(crate::setup::ImageCapability::FirecrackerVsockSsh);
     }
 
     fn restore_disk(
@@ -1166,14 +1579,7 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
-        let guest_user = persisted_guest_user(cfg, &inst.image);
-        Ok(SshTarget {
-            host: Hostname::from(inst.guest_ip()),
-            port: cfg.ssh_port,
-            user: SshUser::new(guest_user.as_str())?,
-            key_path: std::path::absolute(cfg.ssh_key_path())?,
-            host_tools: cfg.ssh.host_tools.clone(),
-        })
+        firecracker_ssh_target(cfg, inst)
     }
 
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf> {
@@ -1238,16 +1644,33 @@ impl VmBackend for LimaBackend {
         crate::lima::start_existing(cfg, inst)
     }
 
-    fn stop(&self, _cfg: &CoopConfig, running: RunningInstance) -> Result<StoppedInstance> {
+    fn start_confirmed_stopped(
+        &self,
+        cfg: &CoopConfig,
+        stopped: StoppedInstance,
+    ) -> Result<InstanceOperationGuard> {
+        boot_preflight(cfg)?;
+        crate::lima::start_existing(cfg, stopped.instance())?;
+        Ok(stopped.into_operation_guard())
+    }
+
+    fn stop(
+        &self,
+        _cfg: &CoopConfig,
+        running: RunningInstance,
+    ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
-        match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => crate::lima::stop_running(&inst)?,
-            Some(crate::lima::LimaState::Stopped) => {}
+        let outcome = match crate::lima::probe_state(&inst)? {
+            Some(crate::lima::LimaState::Running) => {
+                crate::lima::stop_running(&inst)?;
+                StopOutcome::StoppedRunning
+            }
+            Some(crate::lima::LimaState::Stopped) => StopOutcome::AlreadyStopped,
             Some(state) => bail!("Lima instance '{}' is {state}; cannot stop", inst.name),
             None => bail!("Lima instance '{}' is absent", inst.name),
-        }
-        Ok(StoppedInstance::new(inst, operation))
+        };
+        Ok((StoppedInstance::new(inst, operation), outcome))
     }
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1315,8 +1738,9 @@ impl VmBackend for LimaBackend {
         cfg: &CoopConfig,
         stopped: &StoppedInstance,
         image: &ImageName,
+        metadata: &crate::setup::TemplateConfig,
     ) -> Result<()> {
-        crate::lima::commit_disk(cfg, stopped.instance(), image)
+        crate::lima::commit_disk(cfg, stopped.instance(), image, metadata)
     }
 
     fn restore_disk(
@@ -1437,42 +1861,91 @@ pub fn detect_instance_repo(
 /// Collects values from config and the process environment into an
 /// `EnvForward` struct. No process-global env mutation.
 ///
-/// `claude.api_key` values that use the `cmd:` prefix are resolved
-/// here (at VM start time, not config parse time) so that secret
-/// manager calls only happen when actually needed.
+/// Direct credential values that use the `cmd:` prefix are resolved here (at
+/// VM start time, not config parse time) only when the selected network/auth
+/// policy can forward them. Isolated-only suppressed credentials are never
+/// resolved.
 ///
 /// When `github = "pat"`, `repo` selects the matching entry under
 /// `[github.pat]`. Pass the slug resolved from `--git-repo` or
 /// `git remote get-url origin` of the workspace. Pass `None` when no
 /// repo context is available; pat-mode then yields no token (the start
 /// flow surfaces a clearer error elsewhere).
+#[cfg(test)]
 pub fn prepare_env_forwarding(
     cfg: &CoopConfig,
     repo: Option<&crate::github_repo::RepoSlug>,
     suppress_anthropic_key: bool,
     suppress_openai_key: bool,
 ) -> Result<EnvForward> {
-    let claude = &cfg.claude;
-    let codex = &cfg.codex;
-    let grok = &cfg.grok;
-    let codex_account_auth = codex.auth.uses_chatgpt_account();
-    let suppress_openai_key = suppress_openai_key || codex_account_auth;
-    // Only ever read under `suppress_openai_key`, so there is no "not
-    // suppressed" case to name.
-    let openai_suppression_reason = if codex_account_auth {
-        "codex.auth = \"chatgpt\""
-    } else {
-        "proxy mode"
-    };
-    let mut env = EnvForward::default();
+    prepare_env_forwarding_for_network(
+        cfg,
+        repo,
+        suppress_anthropic_key,
+        suppress_openai_key,
+        crate::config::FirecrackerNetworkMode::Open,
+    )
+}
 
-    // ANTHROPIC_API_KEY: prefer config, fall back to process env.
-    // In proxy mode (issue #411) the raw key must never enter the guest —
-    // the host-side proxy holds it and injects it upstream, so we forward
-    // only the per-instance capability token via settings.json instead.
-    if suppress_anthropic_key {
+#[derive(Clone, Copy)]
+struct CredentialForwardingPolicy {
+    suppress_anthropic_key: bool,
+    suppress_openai_key: bool,
+    codex_proxy_active: bool,
+    openai_suppression_reason: &'static str,
+    network: crate::config::FirecrackerNetworkMode,
+}
+
+impl CredentialForwardingPolicy {
+    fn suppression_reason(self, name: &str) -> &'static str {
+        if self.network == crate::config::FirecrackerNetworkMode::Isolated {
+            "isolated network mode"
+        } else if name == "OPENAI_API_KEY" {
+            self.openai_suppression_reason
+        } else {
+            "proxy mode"
+        }
+    }
+
+    fn suppressed_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.suppress_anthropic_key {
+            names.push("ANTHROPIC_API_KEY");
+        }
+        if self.suppress_openai_key {
+            names.push("OPENAI_API_KEY");
+        }
+        if self.codex_proxy_active {
+            names.push("CODEX_ACCESS_TOKEN");
+        }
+        if self.network == crate::config::FirecrackerNetworkMode::Isolated {
+            names.extend([
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "CODEX_ACCESS_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "XAI_API_KEY",
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                crate::model_state::CODEX_LOCAL_ENV_KEY,
+            ]);
+            names.sort_unstable();
+            names.dedup();
+        }
+        names
+    }
+}
+
+fn populate_builtin_credentials(
+    cfg: &CoopConfig,
+    repo: Option<&crate::github_repo::RepoSlug>,
+    policy: CredentialForwardingPolicy,
+    env: &mut EnvForward,
+) -> Result<()> {
+    if policy.suppress_anthropic_key {
         tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
-    } else if let Some(key) = &claude.api_key {
+    } else if let Some(key) = &cfg.claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve claude.api_key")?;
         env.set("ANTHROPIC_API_KEY", resolved)?;
@@ -1480,16 +1953,12 @@ pub fn prepare_env_forwarding(
         env.set("ANTHROPIC_API_KEY", key)?;
     }
 
-    // OPENAI_API_KEY: prefer config, fall back to process env. In proxy mode
-    // the raw key stays on the host (injected upstream); Codex authenticates
-    // to the proxy with the capability token via the provider `env_key`. In
-    // ChatGPT account mode, forwarding is suppressed so Codex cannot silently
-    // switch to API billing.
-    if suppress_openai_key {
+    if policy.suppress_openai_key {
         tracing::debug!(
-            "{openai_suppression_reason}: not forwarding OPENAI_API_KEY into the guest"
+            "{}: not forwarding OPENAI_API_KEY into the guest",
+            policy.suppression_reason("OPENAI_API_KEY")
         );
-    } else if let Some(key) = &codex.api_key {
+    } else if let Some(key) = &cfg.codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
         env.set("OPENAI_API_KEY", resolved)?;
@@ -1497,41 +1966,53 @@ pub fn prepare_env_forwarding(
         env.set("OPENAI_API_KEY", key)?;
     }
 
-    // XAI_API_KEY: prefer config, fall back to process env. Never written
-    // to guest disk — forwarded via SSH SendEnv on every session.
-    if let Some(key) = &grok.api_key {
-        let resolved = crate::config::resolve_cmd_value(key.expose())
-            .context("Failed to resolve grok.api_key")?;
-        env.set("XAI_API_KEY", resolved)?;
-    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        env.set("XAI_API_KEY", key)?;
-    }
-
-    // GITHUB_TOKEN: resolve via configured strategy
-    if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
-        env.set("GITHUB_TOKEN", token)?;
+    if policy.network == crate::config::FirecrackerNetworkMode::Isolated {
+        tracing::debug!("isolated network mode: not resolving or forwarding XAI_API_KEY");
+        tracing::debug!("isolated network mode: not resolving or forwarding GITHUB_TOKEN");
     } else {
-        tracing::debug!("no GITHUB_TOKEN forwarded to guest");
+        if let Some(key) = &cfg.grok.api_key {
+            let resolved = crate::config::resolve_cmd_value(key.expose())
+                .context("Failed to resolve grok.api_key")?;
+            env.set("XAI_API_KEY", resolved)?;
+        } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+            env.set("XAI_API_KEY", key)?;
+        }
+        if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
+            env.set("GITHUB_TOKEN", token)?;
+        } else {
+            tracing::debug!("no GITHUB_TOKEN forwarded to guest");
+        }
     }
+    Ok(())
+}
 
-    // In proxy mode the raw provider key must never reach the guest by ANY
-    // path — not just the config/process-env fallback above, but also an
-    // explicit `env_forward` or `guest_env` entry. Collect the suppressed
-    // names so the loops below skip and loudly warn on such an entry.
-    let mut suppressed: Vec<&str> = Vec::new();
-    if suppress_anthropic_key {
-        suppressed.push("ANTHROPIC_API_KEY");
-    }
-    if suppress_openai_key {
-        suppressed.push("OPENAI_API_KEY");
-    }
-    let suppression_reason = |name: &str| {
-        if name == "OPENAI_API_KEY" {
-            openai_suppression_reason
+pub(crate) fn prepare_env_forwarding_for_network(
+    cfg: &CoopConfig,
+    repo: Option<&crate::github_repo::RepoSlug>,
+    suppress_anthropic_key: bool,
+    suppress_openai_key: bool,
+    network: crate::config::FirecrackerNetworkMode,
+) -> Result<EnvForward> {
+    let claude = &cfg.claude;
+    let codex = &cfg.codex;
+    let grok = &cfg.grok;
+    let codex_account_auth = codex.auth.uses_chatgpt_account();
+    let policy = CredentialForwardingPolicy {
+        suppress_anthropic_key,
+        suppress_openai_key: suppress_openai_key || codex_account_auth,
+        codex_proxy_active: suppress_openai_key,
+        openai_suppression_reason: if codex_account_auth {
+            "codex.auth = \"chatgpt\""
         } else {
             "proxy mode"
-        }
+        },
+        network,
     };
+    let mut env = EnvForward::default();
+    populate_builtin_credentials(cfg, repo, policy, &mut env)?;
+    let suppressed = policy.suppressed_names();
+
+    let suppression_reason = |name: &str| policy.suppression_reason(name);
 
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
@@ -1611,7 +2092,7 @@ pub fn bootstrap_agents(
 
     bootstrap_claude(session, cfg, inst, mode, guest_host)?;
     bootstrap_codex(session, cfg, inst, mode, guest_host)?;
-    bootstrap_grok(session, cfg, inst, mode)?;
+    bootstrap_grok(session, cfg, inst, mode, inst.firecracker_network())?;
 
     Ok(())
 }
@@ -1627,8 +2108,8 @@ pub fn bootstrap_agents(
 ///
 /// Claude auth is NOT handled here — the user authenticates
 /// when they first run `claude` interactively in the guest.
-/// `ANTHROPIC_API_KEY` (if set) is forwarded via `SendEnv`
-/// on every SSH session automatically.
+/// Open/direct-auth sessions forward `ANTHROPIC_API_KEY` via `SendEnv`;
+/// isolated sessions suppress it and require the managed proxy.
 fn bootstrap_claude(
     session: &SshSession,
     cfg: &CoopConfig,
@@ -1874,6 +2355,7 @@ fn bootstrap_grok(
     cfg: &CoopConfig,
     inst: &crate::config::Instance,
     mode: BootMode,
+    network: crate::config::FirecrackerNetworkMode,
 ) -> Result<()> {
     let grok = &cfg.grok;
     let grok_bin = persisted_guest_user(cfg, &inst.image).grok_bin();
@@ -1897,7 +2379,7 @@ fn bootstrap_grok(
         }
     }
 
-    copy_grok_config(&session.target, &grok.config_dir)?;
+    copy_grok_config(&session.target, &grok.config_dir, network)?;
     write_managed_grok_config(&session.target, &grok.config_dir, &grok.mcp_servers)?;
     write_workspace_folder_trust(&session.target)?;
 
@@ -1928,8 +2410,9 @@ fn codex_missing_guest_cli_message() -> &'static str {
 
 pub fn codex_chatgpt_proxy_conflict_message() -> &'static str {
     "codex.auth = \"chatgpt\" conflicts with the effective OpenAI proxy for \
-     this VM; Codex account auth uses ChatGPT workspace credentials, while \
-     the OpenAI proxy uses an API key"
+     this VM; guest account login and host proxy credentials are separate auth paths. \
+     For a workspace token through the proxy, set [proxy.openai] auth = \"codex_access_token\" \
+     and leave [codex] auth at its default"
 }
 
 /// Reject the one Codex remote-auth combination `CoopConfig::validate` cannot
@@ -2102,6 +2585,48 @@ fn compute_grok_plugin_delta(cfg: &CoopConfig, image: &ImageName) -> (Vec<String
     )
 }
 
+/// Reject first-boot agent work that would require guest IP egress before an
+/// isolated Firecracker VM is started. Prepared images and local marketplace
+/// directories remain usable; pending remote installs fail with recovery
+/// guidance instead of hanging in a guest that has no network device.
+pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    let tool_deltas = [
+        (
+            "Claude",
+            compute_plugin_delta(cfg, image),
+            &cfg.claude.marketplaces,
+        ),
+        (
+            "Codex",
+            compute_codex_plugin_delta(cfg, image),
+            &cfg.codex.marketplaces,
+        ),
+        (
+            "Grok Build",
+            compute_grok_plugin_delta(cfg, image),
+            &cfg.grok.marketplaces,
+        ),
+    ];
+    for (tool, (marketplaces, plugins), configured_marketplaces) in tool_deltas {
+        let remote_marketplace = marketplaces
+            .iter()
+            .any(|entry| !Path::new(entry).is_absolute());
+        let plugin_needs_remote_source = !plugins.is_empty()
+            && (configured_marketplaces.is_empty()
+                || configured_marketplaces
+                    .iter()
+                    .any(|entry| !Path::new(entry).is_absolute()));
+        if remote_marketplace || plugin_needs_remote_source {
+            bail!(
+                "{tool} has pending remote marketplace/plugin installation, which is unavailable \
+                 in isolated network mode. Prepare the image while networking is open, use a \
+                 local absolute-path marketplace, or switch the stopped VM to open networking"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a GitHub token for the guest given the configured auth strategy
 /// and the resolved target repo (when known).
 ///
@@ -2219,22 +2744,24 @@ fn prepare_claude_config_import(
     Ok(Some(staged))
 }
 
-fn copy_grok_config(target: &SshTarget, config_dir: &ConfigDir) -> Result<()> {
+fn copy_grok_config(
+    target: &SshTarget,
+    config_dir: &ConfigDir,
+    network: crate::config::FirecrackerNetworkMode,
+) -> Result<()> {
     let Some(source_dir) = resolve_config_source_dir(config_dir, ".grok", "grok.config_dir") else {
         return Ok(());
     };
 
     // `config.toml` is merged into the guest file by
     // `write_managed_grok_config`, not overwritten via scp.
-    let staged = stage_selected_files(
-        &source_dir,
-        GROK_ALLOWED_FILES,
-        GROK_ALLOWED_DIRS,
-        TreeCopy::SkipHostTrees,
-    )
-    .context("Failed to stage Grok Build config files")?;
+    let staged = stage_grok_files(&source_dir, network)
+        .context("Failed to stage Grok Build config files")?;
     copy_staged_to_guest(target, &staged, ".grok", "Grok Build")?;
-    restrict_guest_grok_auth(target)
+    if network == crate::config::FirecrackerNetworkMode::Open {
+        restrict_guest_grok_auth(target)?;
+    }
+    Ok(())
 }
 
 /// Owner-only mode for a copied host `~/.grok/auth.json`. `scp` without `-p`
@@ -2249,6 +2776,7 @@ fn restrict_guest_grok_auth(target: &SshTarget) -> Result<()> {
 }
 
 const GROK_ALLOWED_FILES: &[&str] = &["AGENTS.md", "auth.json", "lsp.json"];
+const GROK_ISOLATED_ALLOWED_FILES: &[&str] = &["AGENTS.md", "lsp.json"];
 const GROK_ALLOWED_DIRS: &[&str] = &[
     "rules",
     "skills",
@@ -2258,6 +2786,21 @@ const GROK_ALLOWED_DIRS: &[&str] = &[
     "agents",
     "workflows",
 ];
+
+fn stage_grok_files(
+    source_dir: &Path,
+    network: crate::config::FirecrackerNetworkMode,
+) -> Result<tempfile::TempDir> {
+    stage_selected_files(
+        source_dir,
+        match network {
+            crate::config::FirecrackerNetworkMode::Open => GROK_ALLOWED_FILES,
+            crate::config::FirecrackerNetworkMode::Isolated => GROK_ISOLATED_ALLOWED_FILES,
+        },
+        GROK_ALLOWED_DIRS,
+        TreeCopy::SkipHostTrees,
+    )
+}
 
 const GROK_CONFIG_READ_COMMAND: &str = concat!(
     "test -x ~/.grok || exit 1; ",
@@ -4198,12 +4741,13 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn start_rejects_unknown_pid_before_boot_mutation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
@@ -4227,7 +4771,7 @@ mod tests {
     #[test]
     fn lima_stop_reprobes_state_without_rebuilding_ssh_target() {
         let Ok(root) = std::env::var("COOP_TEST_LIMA_STOP_ROOT") else {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let script = root.path().join("limactl");
             std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COOP_TEST_LIMA_STOP_CALLS\"\ncase \"$1\" in\n list) echo '{\"name\":\"coop-test\",\"status\":\"Running\"}';;\n stop) exit 0;;\nesac\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4268,29 +4812,32 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
-        let target = SshTarget {
-            host: Hostname::new("localhost").unwrap(),
-            port: NonZeroU16::new(22).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: root.join("key"),
-            host_tools: SshHostToolsConfig::default(),
-        };
-        LimaBackend::new()
+        let target = SshTarget::tcp(
+            Hostname::new("localhost").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            root.join("key"),
+            SshHostToolsConfig::default(),
+        );
+        let (_, outcome) = LimaBackend::new()
             .stop(&CoopConfig::default(), RunningInstance::new(inst, target))
             .unwrap();
+        assert_eq!(outcome, StopOutcome::StoppedRunning);
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stop_reprobes_after_acquiring_operation_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let cfg = CoopConfig::default();
@@ -4306,22 +4853,24 @@ mod tests {
         // Another stop completed before this token reached the operation lock.
         assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
         drop(lock);
-        done_rx
+        let (_, outcome) = done_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
+        assert_eq!(outcome, StopOutcome::AlreadyStopped);
         thread.join().unwrap();
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stopped_probe_holds_lock_until_disk_mutation_finishes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let inst = Instance {
             name: crate::config::InstanceName::new("test").unwrap(),
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let disk = inst.dir.join("rootfs.ext4");
@@ -4361,13 +4910,237 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 ";
 
     fn ssh_test_target() -> SshTarget {
-        SshTarget {
-            host: Hostname::new("192.0.2.1").unwrap(),
-            port: NonZeroU16::new(22).unwrap(),
-            user: SshUser::new("ubuntu").unwrap(),
-            key_path: PathBuf::from("/tmp/test-key"),
-            host_tools: SshHostToolsConfig::default(),
+        SshTarget::tcp(
+            Hostname::new("192.0.2.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/test-key"),
+            SshHostToolsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn vsock_readiness_retries_absent_socket_but_reports_invalid_parent() {
+        let directory = crate::test_support::private_tempdir().unwrap();
+        let parent = directory.path().join("file");
+        let target_for = |socket_path| {
+            SshTarget::firecracker_vsock_with_proxy(
+                socket_path,
+                NonZeroU32::new(22).unwrap(),
+                PathBuf::from("/usr/bin/coop"),
+                SshUser::new("ubuntu").unwrap(),
+                PathBuf::from("/tmp/test-key"),
+                SshHostToolsConfig::default(),
+            )
+        };
+
+        assert!(
+            !target_for(directory.path().join("missing.sock"))
+                .transport_is_reachable(Duration::from_millis(50))
+                .unwrap()
+        );
+        std::fs::write(&parent, "not a directory").unwrap();
+        let error = target_for(parent.join("vsock.sock"))
+            .transport_is_reachable(Duration::from_millis(50))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Not a directory"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn firecracker_and_lima_style_tcp_targets_preserve_identity() {
+        let firecracker = ssh_test_target();
+        let lima = SshTarget::tcp(
+            Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(60022).unwrap(),
+            SshUser::new("lima").unwrap(),
+            PathBuf::from("/tmp/lima-key"),
+            SshHostToolsConfig::default(),
+        );
+
+        assert_eq!(firecracker.addr(), "ubuntu@192.0.2.1");
+        assert_eq!(firecracker.connection_description(), "192.0.2.1:22");
+        assert_eq!(lima.addr(), "lima@127.0.0.1");
+        assert_eq!(lima.connection_description(), "127.0.0.1:60022");
+        assert_ne!(firecracker.control_path(), lima.control_path());
+        assert_eq!(
+            firecracker.control_path(),
+            firecracker.clone().control_path()
+        );
+        let mut old_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(
+                Hostname::new("192.0.2.1").unwrap(),
+                NonZeroU16::new(22).unwrap(),
+            ),
+            &mut old_hasher,
+        );
+        #[expect(clippy::cast_possible_truncation)]
+        let old_short = std::hash::Hasher::finish(&old_hasher) as u32;
+        assert_eq!(
+            firecracker
+                .control_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("coop-{old_short:08x}.sock")
+        );
+    }
+
+    #[test]
+    fn persisted_firecracker_control_mode_selects_one_transport_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let mut inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+
+        let tcp = firecracker_ssh_target(&cfg, &inst).unwrap();
+        assert_eq!(tcp.connection_description(), "172.16.0.2:22");
+        assert_eq!(tcp.proxy_command_option().unwrap(), "ProxyCommand=none");
+
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        let vsock = firecracker_ssh_target(&cfg, &inst).unwrap();
+        assert_eq!(
+            vsock.connection_description(),
+            format!("vsock:{}:22", inst.vsock_path().display())
+        );
+        assert!(
+            vsock
+                .proxy_command_option()
+                .unwrap()
+                .contains("__vsock-proxy")
+        );
+        assert!(!vsock.transport_is_reachable(Duration::ZERO).unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn firecracker_vsock_control_rejects_legacy_image_metadata() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("legacy").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        std::fs::write(
+            cfg.template_config_path_for(&image),
+            r#"{
+                "version": 2,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null
+            }"#,
+        )
+        .unwrap();
+
+        let backend = FirecrackerBackend::new();
+        backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::LegacyTcp)
+            .unwrap();
+        let error = backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not contain"), "{error}");
+        assert!(
+            error.contains("coop setup --image legacy --rebuild"),
+            "{error}"
+        );
+
+        let mut metadata = crate::setup::TemplateConfig::load_for(&cfg, &image).unwrap();
+        metadata
+            .capabilities
+            .insert(crate::setup::ImageCapability::FirecrackerVsockSsh);
+        metadata.save_for(&cfg, &image).unwrap();
+        backend
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn firecracker_vsock_validation_does_not_create_a_missing_image() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("missing").unwrap();
+
+        FirecrackerBackend::new()
+            .validate_image_control(&cfg, &image, FirecrackerControlMode::Vsock)
+            .unwrap_err();
+        assert!(!cfg.image_dir(&image).exists());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn incomplete_publication_rejects_every_firecracker_control_mode() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        crate::setup::begin_image_publication(&cfg, &image).unwrap();
+
+        let backend = FirecrackerBackend::new();
+        for mode in [
+            FirecrackerControlMode::LegacyTcp,
+            FirecrackerControlMode::Vsock,
+        ] {
+            let error = backend
+                .validate_image_control(&cfg, &image, mode)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("incomplete publication"), "{error}");
         }
+    }
+
+    #[test]
+    fn multiplexing_and_teardown_keep_tcp_transport_arguments() {
+        let target = ssh_test_target();
+        let mux = command_args(&target.ssh_mux_command().unwrap());
+        assert!(mux.windows(2).any(|args| args == ["-p", "22"]));
+        assert!(mux.iter().any(|arg| arg == "ControlMaster=auto"));
+        assert!(mux.iter().any(|arg| arg == "ControlPersist=60"));
+
+        let socket = Path::new("/tmp/coop-test-control.sock");
+        let teardown = command_args(&target.mux_teardown_command(socket).unwrap());
+        assert!(teardown.windows(2).any(|args| args == ["-p", "22"]));
+        assert_eq!(
+            &teardown[teardown.len() - 5..],
+            [
+                "-O",
+                "exit",
+                "-o",
+                "ControlPath=/tmp/coop-test-control.sock",
+                "ubuntu@192.0.2.1",
+            ]
+        );
     }
 
     fn command_args(command: &Command) -> Vec<String> {
@@ -4436,13 +5209,14 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn readiness_preserves_host_tool_resolution_failures() {
         let fixture = crate::host_tool::trusted_test_tempdir();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(
-            Some(&fixture.path().join("missing-ssh")),
-            None,
-            None,
-        )
-        .unwrap();
+        let target = ssh_test_target().with_host_tools(
+            SshHostToolsConfig::with_exact_paths(
+                Some(&fixture.path().join("missing-ssh")),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
 
         let error = target.wait_until_ready(Duration::ZERO).unwrap_err();
         let message = format!("{error:#}");
@@ -4458,8 +5232,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         let ssh = fixture.path().join("ssh");
         fs::write(&ssh, "#!/definitely/missing/coop-test-interpreter\n").unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        let target = ssh_test_target()
+            .with_host_tools(SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap());
 
         let error = target
             .exec_ok(RemoteCommand::new().literal("true"))
@@ -4486,8 +5260,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         )
         .unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut target = ssh_test_target();
-        target.host_tools = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+        let target = ssh_test_target()
+            .with_host_tools(SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap());
 
         let error = target
             .exec_with_stdin(
@@ -4544,7 +5318,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn lima_setup_rejects_explicit_inputs_before_boot_preflight_or_mutation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let data_dir = root.path().join("data");
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(&data_dir),
@@ -4817,19 +5591,20 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: dir.to_path_buf(),
             image: crate::config::ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
     #[test]
     fn detect_instance_repo_none_when_state_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(dir.path());
         assert!(detect_instance_repo(&inst).is_none());
     }
 
     #[test]
     fn detect_instance_repo_none_on_stale_format() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(dir.path());
         // Pre-#147 flat shape: `host_path` at the top level and a bare
         // `source` string. The current loader rejects this; detection must
@@ -4944,7 +5719,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_plugin_discovery_matches_native_identities() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         assert!(claude_skills_plugin_ids(src.path()).unwrap().is_empty());
         for (directory, name) in [
             ("directory", "manifest-name"),
@@ -4981,7 +5756,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_reports_unsupported_sync_and_invalid_manifests() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         claude_plugin_fixture(src.path(), "plugin", r#"{"name":"valid"}"#);
         std::fs::write(src.path().join("skills/manifest.json"), r#"{"skills":[]}"#).unwrap();
         assert!(
@@ -5005,7 +5780,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_selects_only_companion_preferences_and_exact_copied_ids() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         claude_plugin_fixture(
             src.path(),
             "directory",
@@ -5066,7 +5841,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_rejects_invalid_preferences_without_fallback_enablement() {
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let ids = ["identity@skills-dir".into()].into();
         for body in [
             "broken",
@@ -5096,7 +5871,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
     #[test]
     fn claude_import_complete_bundles_and_exclusions() {
         use std::os::unix::fs::PermissionsExt;
-        let src = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let files = [
             "CLAUDE.md",
             "keybindings.json",
@@ -5172,9 +5947,9 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn claude_import_overlay_retains_deleted_files_and_follows_symlinks() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
+        let external = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("skills/example")).unwrap();
         std::fs::write(external.path().join("support"), "external-target").unwrap();
         std::os::unix::fs::symlink(external.path(), src.path().join("skills/example/support"))
@@ -5299,7 +6074,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_retains_original_entries() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("CLAUDE.md"), "# Config").unwrap();
         std::fs::create_dir(src.path().join("rules")).unwrap();
         std::fs::write(src.path().join("rules/a.md"), "rule a").unwrap();
@@ -5318,7 +6093,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_skips_non_allowlisted() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("CLAUDE.md"), "ok").unwrap();
         std::fs::write(src.path().join("settings.json"), "secret").unwrap();
         std::fs::create_dir(src.path().join("projects")).unwrap();
@@ -5332,7 +6107,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_copies_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "rules").unwrap();
         std::fs::write(src.path().join("config.toml"), "permission_mode = \"ask\"").unwrap();
@@ -5341,13 +6116,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         std::fs::create_dir(src.path().join("installed-plugins")).unwrap();
         std::fs::write(src.path().join("installed-plugins/registry.json"), "{}").unwrap();
 
-        let staging = stage_selected_files(
-            src.path(),
-            GROK_ALLOWED_FILES,
-            GROK_ALLOWED_DIRS,
-            TreeCopy::SkipHostTrees,
-        )
-        .unwrap();
+        let staging =
+            stage_grok_files(src.path(), crate::config::FirecrackerNetworkMode::Open).unwrap();
         assert_eq!(
             std::fs::read_to_string(staging.path().join("auth.json")).unwrap(),
             "{\"access_token\":\"test\"}"
@@ -5362,11 +6132,17 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             !staging.path().join("installed-plugins").exists(),
             "installed-plugins is a host-path registry and must not be copied"
         );
+
+        let isolated =
+            stage_grok_files(src.path(), crate::config::FirecrackerNetworkMode::Isolated).unwrap();
+        assert!(!isolated.path().join("auth.json").exists());
+        assert!(isolated.path().join("AGENTS.md").is_file());
+        assert!(isolated.path().join("plugins/SKILL.md").is_file());
     }
 
     #[test]
     fn stage_grok_files_copies_hooks_agents_workflows_and_lsp() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir(src.path().join("hooks")).unwrap();
         std::fs::write(src.path().join("hooks/session-start.json"), "{}").unwrap();
         std::fs::create_dir(src.path().join("agents")).unwrap();
@@ -5393,8 +6169,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_directory_symlink() {
-        let src = tempfile::TempDir::new().unwrap();
-        let checkout = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let checkout = crate::test_support::private_tempdir().unwrap();
         std::fs::write(checkout.path().join("secret.txt"), "host-checkout").unwrap();
 
         let plugins = src.path().join("plugins");
@@ -5418,8 +6194,8 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_symlinked_plugins_dir() {
-        let src = tempfile::TempDir::new().unwrap();
-        let checkout = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let checkout = crate::test_support::private_tempdir().unwrap();
         std::fs::write(checkout.path().join("SKILL.md"), "from-link").unwrap();
         std::os::unix::fs::symlink(checkout.path(), src.path().join("plugins")).unwrap();
 
@@ -5438,7 +6214,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_skips_host_only_dirs_under_skills() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let skill = src.path().join("skills/review");
         std::fs::create_dir_all(skill.join(".git/objects")).unwrap();
         std::fs::write(skill.join(".git/HEAD"), "ref").unwrap();
@@ -5478,7 +6254,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_grok_files_keeps_plugin_manifest_dirs() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let plugin = src.path().join("plugins/custom");
         std::fs::create_dir_all(plugin.join(".grok-plugin")).unwrap();
         std::fs::write(
@@ -5535,7 +6311,7 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
 
     #[test]
     fn stage_allowed_files_empty_source() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         let staging = stage_allowed_files(src.path()).unwrap();
         let count = std::fs::read_dir(staging.path()).unwrap().count();
         assert_eq!(count, 0);
@@ -5884,7 +6660,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
 
     #[test]
     fn stage_codex_files_merges_mcp_servers_into_config() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "Global instructions").unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
 
@@ -5918,7 +6694,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
 
     #[test]
     fn stage_codex_files_replaces_existing_mcp_servers_table() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "model = \"gpt-5\"\n\
@@ -5960,7 +6736,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
 
     #[test]
     fn stage_codex_files_copies_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         let staging = stage_codex_files(
@@ -5984,7 +6760,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
     fn stage_codex_files_drops_auth_json_in_proxy_mode() {
         // Issue #411 §7: in proxy mode the refreshable OpenAI subscription
         // token must not land on the guest disk.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
         std::fs::write(src.path().join("AGENTS.md"), "hi").unwrap();
 
@@ -6009,7 +6785,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
 
     #[test]
     fn stage_codex_files_drops_auth_json_in_chatgpt_mode() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         let staging = stage_codex_files(
@@ -6034,7 +6810,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
 
     #[test]
     fn stage_codex_files_chatgpt_mode_writes_keyring_setting_first() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "approval_policy = \"never\"\ninstructions = \"\"\"\n[not-a-table]\n\"\"\"\n",
@@ -6102,7 +6878,7 @@ exec env HOME={root} /bin/sh -c "$prefix$command"
         // that key into an `api_key` guest would make the wrapper demand a
         // keyring password the mode does not need, so the api_key path must
         // remove it rather than merely not add it.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "cli_auth_credentials_store = \"keyring\"\nmodel = \"gpt-5\"\n",
@@ -6163,7 +6939,7 @@ url = "https://example.com/m"
         // Host-side Codex state must not leak into the guest, but the guest's
         // own trust records must come back — the same rule the marketplaces
         // and plugins tables already follow.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "[projects.\"/host/secret\"]\ntrust_level = \"trusted\"\n",
@@ -6247,7 +7023,7 @@ url = "https://example.com/m"
 
     #[test]
     fn stage_codex_files_local_overrides_source_model() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
         let local =
             crate::model_state::codex_local_config("http://172.16.0.1:11434/v1/", "qwen-local");
@@ -6294,7 +7070,7 @@ url = "https://example.com/m"
 
     #[test]
     fn codex_bootstrap_needed_is_false_without_source_content_or_mcp() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         assert!(!codex_bootstrap_needed(
             Some(src.path()),
             &std::collections::HashMap::new(),
@@ -6311,7 +7087,7 @@ url = "https://example.com/m"
 
     #[test]
     fn codex_bootstrap_needed_is_true_with_auth_json() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("auth.json"), "{\"access_token\":\"test\"}").unwrap();
 
         assert!(codex_bootstrap_needed(
@@ -6379,7 +7155,7 @@ url = "https://example.com/m"
     fn stage_codex_files_preserves_guest_plugin_state() {
         // A host config.toml triggers a rewrite; the guest's installed
         // marketplace/plugin tables must survive it.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
         let preserved = extract_codex_plugin_state(
             "[marketplaces.codex-plugins]\nsource = \"trailofbits/codex-plugins\"\n\
@@ -6415,7 +7191,7 @@ url = "https://example.com/m"
         // Host config.toml carries its own marketplace/plugin tables (the user
         // runs Codex on the host too); with nothing preserved these must NOT
         // leak into the guest.
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(
             src.path().join("config.toml"),
             "model = \"gpt-5\"\n\
@@ -6471,7 +7247,7 @@ url = "https://example.com/m"
         // the template's codex_* lists, ignoring the Claude marketplaces/plugins
         // (backend.rs is mutation-excluded, so a copy-paste slip to a Claude
         // field would otherwise go uncaught).
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
@@ -6482,7 +7258,7 @@ url = "https://example.com/m"
 
         // Bake one of each Codex entry — plus decoy Claude entries that must be
         // ignored — into the on-disk template config.
-        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&image)).unwrap();
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
@@ -6507,7 +7283,7 @@ url = "https://example.com/m"
 
     #[test]
     fn compute_grok_plugin_delta_returns_unbaked_entries() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let mut cfg = CoopConfig {
             data_dir: crate::config::ConfigPath::new(tmp.path()),
             ..CoopConfig::default()
@@ -6516,7 +7292,7 @@ url = "https://example.com/m"
         cfg.grok.plugins = vec!["p-baked@m".into(), "p-new@m".into()];
         let image = ImageName::new("default").unwrap();
 
-        std::fs::create_dir_all(cfg.image_dir(&image)).unwrap();
+        crate::test_support::create_private_dir_all(cfg.image_dir(&image)).unwrap();
         let json = r#"{
             "version": 1,
             "created": "2026-01-01T00:00:00Z",
@@ -6532,6 +7308,45 @@ url = "https://example.com/m"
         let (missing_m, missing_p) = compute_grok_plugin_delta(&cfg, &image);
         assert_eq!(missing_m, vec!["m-new".to_string()]);
         assert_eq!(missing_p, vec!["p-new@m".to_string()]);
+    }
+
+    #[test]
+    fn isolated_first_boot_rejects_each_pending_remote_agent_install() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let image = ImageName::new("default").unwrap();
+
+        for tool in ["Claude", "Codex", "Grok Build"] {
+            let mut cfg = CoopConfig {
+                data_dir: crate::config::ConfigPath::new(tmp.path()),
+                ..CoopConfig::default()
+            };
+            match tool {
+                "Claude" => cfg.claude.marketplaces.push("owner/claude-market".into()),
+                "Codex" => cfg.codex.plugins.push("plugin@remote".into()),
+                "Grok Build" => cfg.grok.marketplaces.push("owner/grok-market".into()),
+                _ => unreachable!(),
+            }
+
+            let error = preflight_isolated_first_boot(&cfg, &image)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(tool), "{error}");
+            assert!(
+                error.contains("pending remote marketplace/plugin"),
+                "{error}"
+            );
+        }
+
+        let mut local = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(tmp.path()),
+            ..CoopConfig::default()
+        };
+        local
+            .claude
+            .marketplaces
+            .push("/prepared/local-market".into());
+        local.claude.plugins.push("plugin@local-market".into());
+        preflight_isolated_first_boot(&local, &image).unwrap();
     }
 
     #[test]
@@ -6703,7 +7518,7 @@ url = "https://example.com/m"
             (GROK_CONFIG_READ_COMMAND, "config.toml"),
             (GROK_TRUSTED_FOLDERS_READ_COMMAND, "trusted_folders.toml"),
         ] {
-            let home = tempfile::TempDir::new().unwrap();
+            let home = crate::test_support::private_tempdir().unwrap();
             let grok_dir = home.path().join(".grok");
             std::fs::create_dir(&grok_dir).unwrap();
             let path = grok_dir.join(filename);
@@ -6802,11 +7617,11 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_nested() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("a/b")).unwrap();
         std::fs::write(src.path().join("a/b/c.txt"), "nested").unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path().join("a").as_path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(
@@ -6831,14 +7646,14 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_skips_hidden_and_git_dirs() {
-        let src = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
         std::fs::create_dir_all(src.path().join(".venv/bin")).unwrap();
         std::fs::write(src.path().join(".venv/bin/python"), "py").unwrap();
         std::fs::create_dir_all(src.path().join("lore/lkml-19.git/objects")).unwrap();
         std::fs::write(src.path().join("lore/lkml-19.git/HEAD"), "ref").unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
@@ -6852,7 +7667,7 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_overwrites_readonly_file() {
-        let src1 = tempfile::TempDir::new().unwrap();
+        let src1 = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src1.path().join("pack"), b"v1").unwrap();
         let mut perms = std::fs::metadata(src1.path().join("pack"))
             .unwrap()
@@ -6860,11 +7675,11 @@ url = "https://example.com/m"
         perms.set_mode(0o444);
         std::fs::set_permissions(src1.path().join("pack"), perms).unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src1.path(), &target, TreeCopy::Follow).unwrap();
 
-        let src2 = tempfile::TempDir::new().unwrap();
+        let src2 = crate::test_support::private_tempdir().unwrap();
         std::fs::write(src2.path().join("pack"), b"v2").unwrap();
         copy_dir_recursive(src2.path(), &target, TreeCopy::Follow).unwrap();
         assert_eq!(std::fs::read(target.join("pack")).unwrap(), b"v2");
@@ -6872,13 +7687,13 @@ url = "https://example.com/m"
 
     #[test]
     fn copy_dir_recursive_skips_directory_symlink() {
-        let src = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
+        let src = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "host-checkout").unwrap();
         std::fs::write(src.path().join("keep.txt"), "ok").unwrap();
         std::os::unix::fs::symlink(outside.path(), src.path().join("linked")).unwrap();
 
-        let dst = tempfile::TempDir::new().unwrap();
+        let dst = crate::test_support::private_tempdir().unwrap();
         let target = dst.path().join("out");
         copy_dir_recursive(src.path(), &target, TreeCopy::SkipHostTrees).unwrap();
         assert_eq!(
@@ -7098,13 +7913,13 @@ url = "https://example.com/m"
             env.set(*name, *value).unwrap();
         }
         SshSession {
-            target: SshTarget {
-                host: Hostname::new("127.0.0.1").unwrap(),
-                port: NonZeroU16::new(22).unwrap(),
-                user: SshUser::new("ubuntu").unwrap(),
-                key_path: "/unused-test-key".into(),
-                host_tools: SshHostToolsConfig::default(),
-            },
+            target: SshTarget::tcp(
+                Hostname::new("127.0.0.1").unwrap(),
+                NonZeroU16::new(22).unwrap(),
+                SshUser::new("ubuntu").unwrap(),
+                "/unused-test-key".into(),
+                SshHostToolsConfig::default(),
+            ),
             env,
         }
     }
@@ -7237,18 +8052,18 @@ url = "https://example.com/m"
             ("COOP_SSH_ENV_0", "guest-alias-collision"),
         ];
         let mut session = forwarding_session(&entries);
-        session.target = SshTarget {
-            host: Hostname::new("192.0.2.2").unwrap(),
-            port: NonZeroU16::new(2222).unwrap(),
-            user: SshUser::new("root").unwrap(),
-            key_path: fixture.join("client"),
-            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+        session.target = SshTarget::tcp(
+            Hostname::new("192.0.2.2").unwrap(),
+            NonZeroU16::new(2222).unwrap(),
+            SshUser::new("root").unwrap(),
+            fixture.join("client"),
+            crate::config::SshHostToolsConfig::with_exact_paths(
                 Some(&fixture.join("bin/ssh")),
                 None,
                 None,
             )
             .unwrap(),
-        };
+        );
         let output = session
             .command(&[], "/usr/bin/env -0")
             .unwrap()
@@ -7566,7 +8381,7 @@ url = "https://example.com/m"
         // The tempdir holds no `proxy.json`, so `effective_upstream` resolves
         // purely from the `[proxy]` config these fixtures build — the same
         // holds for the three tests below.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
         let state = crate::model_state::ModelState::default();
@@ -7584,7 +8399,7 @@ url = "https://example.com/m"
         // only survive a validated parse when it comes from a per-VM `coop
         // proxy --vm` override in `<inst.dir>/proxy.json`. Config `[proxy]` is
         // empty here, so only the on-disk override can trip the bail.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         crate::proxy_state::ProxyState {
             openai: Some(crate::config::ProxyUpstream {
@@ -7615,7 +8430,7 @@ url = "https://example.com/m"
     fn codex_remote_auth_allows_chatgpt_with_openai_upstream_in_local_mode() {
         // Local mode never starts the OpenAI proxy, so the pair is not a
         // conflict — this is the `model_state` term of the guard.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, true, false);
         let state = crate::model_state::ModelState {
@@ -7633,7 +8448,7 @@ url = "https://example.com/m"
     fn codex_remote_auth_allows_api_key_with_openai_upstream() {
         // The `uses_chatgpt_account` term: API-key auth is exactly what the
         // OpenAI proxy is for.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ApiKey, true, false);
 
@@ -7651,7 +8466,7 @@ url = "https://example.com/m"
     #[test]
     fn codex_remote_auth_allows_chatgpt_with_anthropic_only_upstream() {
         // The provider argument: a Claude-only proxy says nothing about Codex.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = temp_instance(tmp.path());
         let cfg = auth_check_cfg(CodexAuthMode::ChatGpt, false, true);
 
@@ -7771,6 +8586,21 @@ url = "https://example.com/m"
                 .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("sk-openai-realkey")
+        );
+    }
+
+    #[test]
+    fn proxy_mode_suppresses_codex_access_token_from_guest_env() {
+        let cfg = cfg_with_guest_env(&[("CODEX_ACCESS_TOKEN", "at-private")]);
+        let suppressed = prepare_env_forwarding(&cfg, None, false, true).unwrap();
+        assert!(!suppressed.contains("CODEX_ACCESS_TOKEN"));
+        let direct = prepare_env_forwarding(&cfg, None, false, false).unwrap();
+        assert_eq!(
+            direct
+                .guest_values()
+                .get("CODEX_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("at-private")
         );
     }
 

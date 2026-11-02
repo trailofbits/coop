@@ -63,7 +63,7 @@ Instead of saving a script, add one of these lines to your shell rc. This runs c
 
 ```sh
 # bash (~/.bashrc)
-source <(coop completions bash)
+source /dev/stdin <<<"$(coop completions bash)"
 
 # zsh (~/.zshrc, after compinit)
 source <(coop completions zsh)

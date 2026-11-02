@@ -300,7 +300,7 @@ fn update_one(session: &SshSession, agent: Agent) -> Result<UpdateOutcome> {
 /// Re-run an embedded installer script as root with the force flag set,
 /// piping the script over stdin so it never lands on argv.
 fn reinstall_as_root(session: &SshSession, script: &str) -> Result<()> {
-    let user = guest::GuestUser::new(session.target.user.as_ref())?;
+    let user = guest::GuestUser::new(session.target.user().as_ref())?;
     session.target.exec_with_stdin(
         RemoteCommand::new()
             .literal("sudo env GUEST_USER=")
@@ -436,9 +436,9 @@ fn check_line(row: &CheckRow) -> String {
 /// under the guest user's home; Codex uses its system compatibility link.
 fn agent_binary(session: &SshSession, agent: Agent) -> Result<GuestPath> {
     Ok(match agent {
-        Agent::Claude => guest::GuestUser::new(session.target.user.as_ref())?.claude_bin(),
+        Agent::Claude => guest::GuestUser::new(session.target.user().as_ref())?.claude_bin(),
         Agent::Codex => guest::codex_bin(),
-        Agent::Grok => guest::GuestUser::new(session.target.user.as_ref())?.grok_bin(),
+        Agent::Grok => guest::GuestUser::new(session.target.user().as_ref())?.grok_bin(),
     })
 }
 

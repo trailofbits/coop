@@ -256,6 +256,8 @@ coop shell my-project -- cat /etc/os-release
 
 Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
 
+On a terminal, coop reports `working` while the session runs and `done`, `error`, or `idle` when it exits using the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status). Internal approval prompts are not reported.
+
 ```
 coop claude [NAME] [FLAGS] [ARGS...]
 ```
@@ -300,6 +302,8 @@ coop ca my-project -- --cwd /workspace
 
 Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag: they never start an agent session, so there is nothing to sandbox.
 
+Terminal status reports follow the same session lifecycle as `coop claude`.
+
 ```
 coop codex [NAME] [FLAGS] [ARGS...]
 ```
@@ -327,9 +331,12 @@ Protocol servers load without a first-run question. Use `--ask` to restore
 permission prompts for that session (coop passes `--permission-mode default`,
 which overrides the guest `ui.permission_mode = "always-approve"`). The
 `login` and `logout` subcommands are launched without `--always-approve`.
-Host `~/.grok/auth.json` is copied into the guest on boot when `config_dir`
-is enabled and set to owner-only (`0600`). If there is no host file, sign
-in with `coop grok -- login --device-auth`.
+In open mode, host `~/.grok/auth.json` is copied into the guest on boot when
+`config_dir` is enabled and set to owner-only (`0600`). Isolated mode makes no
+new auth-file copy and does not remove a copy retained from an earlier open
+boot. If there is no host file, sign in with `coop grok -- login --device-auth`.
+
+Terminal status reports follow the same session lifecycle as `coop claude`.
 
 ```
 coop grok [NAME] [FLAGS] [ARGS...]
@@ -412,7 +419,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state (`running` or `stopped`) and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list
@@ -423,11 +430,11 @@ Alias: `ls`.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit a JSON array (`[{ "name", "state" }, …]`) instead of the text table |
+| `--json` | Emit a JSON array (`[{ "name", "state", "network" }, …]`) instead of the text table; `network` is `open`/`isolated` for Firecracker and `null` for Lima |
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, lists every instance with its state, selected network mode, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
@@ -445,8 +452,9 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
-(raw MiB / load, or `null` when stopped or the query fails). The rich
+(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), `network`
+(`open`/`isolated` for Firecracker or `null` for Lima), and `usage` (raw MiB /
+load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
 
@@ -457,6 +465,7 @@ $ coop status my-project --json
   "state": "running",
   "image": "default",
   "backend": "firecracker",
+  "network": "isolated",
   "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
              "disk_used_mib": 8192, "disk_total_mib": 20480 }
 }
@@ -571,6 +580,29 @@ reference and the local-model sections of
 [docs/claude-integration.md](claude-integration.md) and
 [docs/codex-integration.md](codex-integration.md) for the resolution and
 materialization details.
+
+### `network`
+
+Show or change a Firecracker VM's persistent network-device policy.
+
+```text
+coop network [NAME] [open|isolated] [--restart] [--no-agents]
+```
+
+With no mode, the command prints the selected mode and current run state.
+The instance name may be omitted only for this query form when it resolves
+unambiguously; mode changes require an explicit instance name.
+Changing a stopped VM persists the target for its next start. A running VM
+refuses the change unless `--restart` is present; that flag stops the VM,
+persists the target, and starts it again. `--no-agents` requires `--restart` and
+permits a control-only isolated boot without credential proxies. Switching to
+`open` warns that every guest process receives general network access.
+
+`isolated` requires persisted vsock control and a compatible image. It creates
+no Firecracker NIC or TAP and never falls back to TCP/open networking. Lima
+reports changes as unsupported. See
+[Firecracker network modes](firecracker-network-modes.md) for guarantees,
+supported agent paths, maintenance, persistence, and limitations.
 
 ### `logs`
 
@@ -748,15 +780,20 @@ coop resize [NAME] [--size <SIZE>] [--mem <MIB>] [--vcpus <N>] [--start]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--size <size>` | New disk size. Absolute: `150` or `150G`. Relative: `+20` or `+20G`. |
+| `--size <size>` | New disk size in GiB. Absolute: `150`, `150G`, or `150GiB`. Relative: `+20`, `+20G`, or `+20GiB`. |
 | `--mem <mib>` | New memory in MiB (minimum 128). |
 | `--vcpus <n>` | New vCPU count (> 0). |
 | `--start` | Start the instance after applying the change instead of leaving it stopped. |
 
 Absolute disk values set the disk to that exact size; a `+` prefix adds to the
-current size. Memory and vCPU changes are written to the instance's backend
-config (the Firecracker per-instance JSON or the Lima `lima.yaml`), which is
-authoritative — the value survives restarts and is reported by `coop status`.
+current size rounded up to whole GiB. For example, `+1` on a 1 GiB + 4 KiB
+image targets 3 GiB. An absolute `1GiB` target for that image is rejected as
+a shrink, and the error includes both binary-unit context and exact bytes.
+See the [size-unit convention](configuration.md#size-units) for all accepted
+suffixes and the JSON unit contract. Memory and vCPU changes are written to
+the instance's backend config (the Firecracker per-instance JSON or the Lima
+`lima.yaml`). That config is authoritative: the value survives restarts and is
+reported by `coop status`.
 The global `[vm]` settings in `config.toml` only seed these values for *new*
 instances.
 
@@ -853,7 +890,7 @@ Kept across the wipe, because coop persists them host-side:
 |---------|----------------|
 | Name, index, guest IP | `instance.json` |
 | Image | `instance.json` (updated when `--image` is given) |
-| Disk size | read before the swap and re-grown after it, since the image's disk is template-sized |
+| Disk size | exact byte length read before the swap; if the replacement is smaller, it is re-grown to the previous size rounded up to GiB |
 | vCPUs and memory | backend VM config, which the swap does not touch |
 | Workspace association (copy, git clone, or mount) | `workspace.json` |
 | Port forwards | `forwards.json` |
@@ -937,6 +974,9 @@ coop update [FLAGS]
 
 If coop is installed in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to self-update; use `install.sh` to replace them.
 
+Homebrew builds refuse `coop update`, including `--check`. Use
+`brew upgrade trailofbits/coop/coop` instead.
+
 ```
 coop update --check
 coop update
@@ -963,6 +1003,12 @@ coop uninstall [FLAGS]
 
 Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
 
+Homebrew binaries are refused before any data or SSH configuration is changed,
+including with `--yes`, `--purge`, or `--keep-data`. Use `brew uninstall coop`.
+This preserves VM data and configuration; stop VMs before removing the package.
+If you intend to delete the VMs, run `coop destroy --all` with your usual
+configuration before uninstalling.
+
 Nix-store binaries are refused before any data or SSH configuration is changed,
 including with `--yes` or `--purge`. Use `nix profile remove coop` for a profile
 installation, or remove the package from your NixOS/Home Manager configuration
@@ -970,7 +1016,7 @@ and rebuild. Package removal preserves data; follow the explicit
 [Nix data-cleanup procedure](getting-started.md#removing-a-nix-installation)
 before removing the package if you want to delete that data too.
 
-For a non-Nix binary in a protected directory (e.g. `/usr/local/bin`), run with
+For a standalone binary in a protected directory (e.g. `/usr/local/bin`), run with
 `sudo`. A config file outside the data directory is left in place and a note is
 printed.
 
@@ -1045,7 +1091,7 @@ for precedence, opt-out, conflicts, rotation, and bootstrap timing.
 Manage the host-side credential-injecting proxy. When a `[proxy.<provider>]`
 upstream is configured, coop runs a `coop-proxy` process on the host for the
 lifetime of each remote-mode VM: the guest is pointed at the proxy and holds
-only a per-instance capability token, while the real API key stays on the host
+only a per-instance capability token, while the real credential stays on the host
 and is injected onto outbound requests the guest never sees. Applies only in
 remote model mode (`coop model <vm> remote`); local mode takes precedence. See
 the [credential proxy guide](credential-proxy.md) and the
@@ -1054,12 +1100,13 @@ model.
 
 | Subcommand | Effect |
 |------------|--------|
-| `setup [--anthropic] [--openai] [--vm <name>] [--api-key]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic (Claude) is the default provider; pass `--openai` for Codex. `--vm <name>` stores the credential as a per-VM override in that instance's state instead of the global default. Anthropic only: `--api-key` stores an API key (`x-api-key`) instead of a Claude `setup-token`; ignored for `--openai`, whose keys are always injected as `Authorization: Bearer`. |
+| `setup [--anthropic] [--openai] [--vm <name>] [--api-key] [--codex-access-token]` | Store a provider credential in a secret backend and wire it into `[proxy.<provider>]` (the default) or a per-VM override. Anthropic is the default; `--api-key` stores an API key instead of a Claude setup token. `--openai` stores a Platform API key, or add `--codex-access-token` to validate and store a Codex workspace PAT (`at-...`) using workspace entitlements. `--codex-access-token` requires `--openai` and conflicts with `--api-key`. `--vm <name>` selects a per-VM override. |
 | `status [--vm <name>]` | Show what each VM's agents resolve to (per-VM override → default → off), with credentials redacted. Pass `--vm <name>` for the effective resolution of a single VM instead of all. |
 
 ```
 coop proxy setup
 coop proxy setup --openai
+coop proxy setup --openai --codex-access-token
 coop proxy setup --vm my-project
 coop proxy setup --api-key
 coop proxy status

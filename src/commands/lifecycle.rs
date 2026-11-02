@@ -715,11 +715,24 @@ pub(super) fn allocate_and_start(
     workspace_path: Option<&Path>,
     opts: &StartOpts<'_>,
 ) -> Result<config::Instance> {
+    {
+        let _image_lock = setup::lock_image_publication(cfg, image)?;
+        // Validate before persisting an instance: old Firecracker images do not
+        // necessarily contain the guest listener required by vsock control.
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let inst = cfg.allocate_instance(name, image, workspace_path)?;
     tracing::info!("Starting instance '{}' (index {})", inst.name, inst.index);
 
     let _guard = signal::install_handlers();
-    let result = start_instance(be, &mut *cfg, &inst, opts);
+    // Keep the global lock order consistent with reprovisioning: an instance's
+    // provisioning lock is always acquired before its image publication lock.
+    // Re-lock and revalidate the image immediately before the backend consumes
+    // it, since a commit could have replaced it after the pre-allocation check.
+    let result = (|| {
+        let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
+        start_instance(be, &mut *cfg, &inst, opts, Some(image))
+    })();
 
     if let Err(error) = &result
         && error.is::<crate::creation_hooks::CreationIncomplete>()
@@ -855,23 +868,37 @@ fn restart_instance(
     inst: &config::Instance,
     opts: &StartOpts<'_>,
 ) -> Result<()> {
-    tracing::info!("Restarting stopped instance '{}'", inst.name);
     let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
-    drop(be.as_stopped(inst.clone())?);
+    let stopped = be.as_stopped(inst.clone())?;
+    drop(restart_confirmed_instance(be, cfg, stopped, opts)?);
+    Ok(())
+}
+
+fn restart_confirmed_instance(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    stopped: backend::StoppedInstance,
+    opts: &StartOpts<'_>,
+) -> Result<backend::InstanceOperationGuard> {
+    let inst = stopped.instance().clone();
+    tracing::info!("Restarting stopped instance '{}'", inst.name);
+    preflight_isolated_bootstrap(cfg, &inst, opts.no_agents, backend::BootMode::Restart)?;
 
     let _guard = signal::install_handlers();
 
     // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
     // recorded workspace-state to recover the repo slug.
-    let repo = backend::detect_instance_repo(inst);
-    if crate::github_assignment::active(cfg, inst)?.is_none() {
+    let repo = backend::detect_instance_repo(&inst);
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, &inst)?.is_none()
+    {
         pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
     }
 
     // Re-apply the forward set the instance was last started with.
     // CLI `--forward-port` on a restart appends/overrides; otherwise the
     // saved set carries forward untouched.
-    let saved = port_forward::ForwardsState::try_load(inst)?
+    let saved = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
         .unwrap_or_default();
     let forwards = config::merge_forward_ports(&saved, &opts.forward_ports);
@@ -882,7 +909,7 @@ fn restart_instance(
     // translated from devcontainer `containerEnv`. New start-time entries on
     // restart override per-key; the merged result is what gets persisted (and
     // forwarded for this restart's bootstrap).
-    let saved_guest_env = guest_env_state::GuestEnvState::try_load(inst)?
+    let saved_guest_env = guest_env_state::GuestEnvState::try_load(&inst)?
         .map(|s| s.entries)
         .unwrap_or_default();
     let mut merged_guest_env = saved_guest_env;
@@ -898,13 +925,15 @@ fn restart_instance(
         &backend::persisted_guest_user(cfg, &inst.image),
         &[],
     )?;
-    crate::github_assignment::active(cfg, inst)?;
-    crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Waiting)?;
-    be.start_existing(cfg, inst)?;
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
+        crate::github_assignment::active(cfg, &inst)?;
+    }
+    crate::creation_hooks::set_preparation(&inst, crate::creation_hooks::Preparation::Waiting)?;
+    let operation = be.start_confirmed_stopped(cfg, stopped)?;
 
     signal::check_shutdown()?;
 
-    let target = be.ssh_target(cfg, inst)?;
+    let target = be.ssh_target(cfg, &inst)?;
     target
         .wait_until_ready(std::time::Duration::from_secs(30))
         .context("Guest booted but SSH is not accepting connections")?;
@@ -914,41 +943,52 @@ fn restart_instance(
     // Keep an already-installed `coop-<name>` alias current. On Lima the
     // forwarded port changes across stop/start; this is a no-op rewrite on
     // Firecracker. Never installs a block the user didn't ask for.
-    if let Err(e) = workspace::refresh_ssh_config_if_present(&target, inst) {
+    if let Err(e) = workspace::refresh_ssh_config_if_present(&target, &inst) {
         tracing::warn!("Failed to refresh SSH config for '{}': {e}", inst.name);
     }
 
     port_forward::ForwardsState {
         forwards: forwards.clone(),
     }
-    .save(inst)?;
-    port_forward::spawn_ssh_forwards(inst, &target, &forwards)?;
+    .save(&inst)?;
+    port_forward::spawn_ssh_forwards(&inst, &target, &forwards)?;
 
     guest_env_state::GuestEnvState {
         entries: merged_guest_env,
     }
-    .save(inst)?;
+    .save(&inst)?;
 
     files.install(&target)?;
     bootstrap_on_boot(
         be,
         cfg,
-        inst,
+        &inst,
         &target,
         repo.as_ref(),
         opts,
         backend::BootMode::Restart,
     )?;
-    let command = creation_post_start(be, cfg, inst, opts)?;
-    run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
+    // User-supplied creation and post-start hooks are intentionally outside
+    // the lifecycle lock: they are unbounded guest commands, and holding the
+    // lock would prevent a concurrent stop/destroy from recovering a hung
+    // hook. Reacquire and revalidate before reporting restart success.
+    drop(operation);
+    let command = creation_post_start(be, cfg, &inst, opts)?;
+    run_configured_post_start(cfg, &inst, &target, repo.as_ref(), command.as_deref())?;
+
+    let operation = backend::InstanceOperationGuard::acquire(&inst)?;
+    anyhow::ensure!(
+        be.as_running(cfg, inst.clone())?.is_some(),
+        "Instance '{}' stopped while its post-start hooks were running",
+        inst.name
+    );
 
     tracing::info!(
-        "Instance '{}' restarted — SSH: {}:{}",
+        "Instance '{}' restarted — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
-    Ok(())
+    Ok(operation)
 }
 
 /// Best-effort GitHub repo resolution for `coop start`.
@@ -987,12 +1027,24 @@ fn start_instance(
     cfg: &mut config::CoopConfig,
     inst: &config::Instance,
     opts: &StartOpts<'_>,
+    image_to_consume: Option<&config::ImageName>,
 ) -> Result<()> {
+    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, backend::BootMode::FirstBoot)?;
+    if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated
+        && opts.git_repo.is_some()
+    {
+        bail!(
+            "--git-repo requires guest network access and is unavailable in isolated mode; \
+             clone on the host and use workspace copy, prepare the image, or switch to open"
+        );
+    }
     // Derive the GitHub repo slug as early as possible so the auto-prompt
     // can fire before any VM cost is incurred, and so pat-mode token
     // forwarding works at bootstrap time.
     let repo = resolve_start_repo(opts)?;
-    if crate::github_assignment::active(cfg, inst)?.is_none() {
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, inst)?.is_none()
+    {
         pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
     }
 
@@ -1002,10 +1054,16 @@ fn start_instance(
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &opts.forward_ports);
     port_forward::check_host_port_collisions(&forwards)?;
 
+    let image_lock = image_to_consume
+        .map(|image| setup::lock_image_publication(cfg, image))
+        .transpose()?;
+    if let Some(image) = image_to_consume {
+        be.validate_image_control(cfg, image, cfg.vm.firecracker_control)?;
+    }
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
-    let _provisioning = crate::creation_hooks::lock_provisioning(inst)?;
     crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
+    drop(image_lock);
 
     provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
 }
@@ -1101,7 +1159,6 @@ fn provision_first_boot(
 
     signal::check_shutdown()?;
 
-    // Workspace sync: tar-pipe for --workspace, git clone for --git-repo.
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
@@ -1116,7 +1173,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::tar_pipe_transfer(&target, &abs_path, opts.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, opts.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1174,10 +1231,9 @@ fn provision_first_boot(
     run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
-        "Instance '{}' started — SSH: {}:{}",
+        "Instance '{}' started — SSH: {}",
         inst.name,
-        target.host,
-        target.port,
+        target.connection_description(),
     );
     Ok(())
 }
@@ -1399,16 +1455,209 @@ pub(crate) fn open_ssh_session(
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentKind {
+    Claude,
+    Codex,
+    Grok,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedAgentPolicy {
+    Allowed,
+    GrokUnsupported,
+    LocalModelUnsupported,
+    ProxyRequired,
+}
+
+fn isolated_agent_policy(
+    network: config::FirecrackerNetworkMode,
+    agent: AgentKind,
+    model: model_state::ModelMode,
+    proxy_configured: bool,
+) -> IsolatedAgentPolicy {
+    if network != config::FirecrackerNetworkMode::Isolated {
+        return IsolatedAgentPolicy::Allowed;
+    }
+    if agent == AgentKind::Grok {
+        return IsolatedAgentPolicy::GrokUnsupported;
+    }
+    if model != model_state::ModelMode::Remote {
+        return IsolatedAgentPolicy::LocalModelUnsupported;
+    }
+    if !proxy_configured {
+        return IsolatedAgentPolicy::ProxyRequired;
+    }
+    IsolatedAgentPolicy::Allowed
+}
+
+#[derive(Clone, Copy)]
+enum ProxyReadiness<'a> {
+    Configured,
+    Running(&'a backend::SshTarget),
+}
+
 pub(crate) fn open_agent_session(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     name: Option<&config::InstanceName>,
+    agent: AgentKind,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
     crate::creation_hooks::ensure_complete(running.instance())?;
+    ensure_isolated_agent_supported(
+        cfg,
+        running.instance(),
+        running.instance().firecracker_network(),
+        agent,
+        ProxyReadiness::Running(running.target()),
+    )?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
     prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+}
+
+fn ensure_isolated_agent_supported(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    network: config::FirecrackerNetworkMode,
+    agent: AgentKind,
+    readiness: ProxyReadiness<'_>,
+) -> Result<()> {
+    if network != config::FirecrackerNetworkMode::Isolated {
+        return Ok(());
+    }
+    let provider = match agent {
+        AgentKind::Claude => Some(proxy::Provider::Anthropic),
+        AgentKind::Codex => Some(proxy::Provider::Openai),
+        AgentKind::Grok => None,
+    };
+    let model = if provider.is_some() {
+        model_state::ModelState::load_or_default(inst)?.mode
+    } else {
+        model_state::ModelMode::Remote
+    };
+    let proxy_configured = match provider {
+        Some(provider) if model == model_state::ModelMode::Remote => {
+            proxy_state::effective_upstream(inst, provider, &cfg.proxy)?.is_some()
+        }
+        Some(_) | None => false,
+    };
+    match isolated_agent_policy(network, agent, model, proxy_configured) {
+        IsolatedAgentPolicy::Allowed => {}
+        IsolatedAgentPolicy::GrokUnsupported => bail!(
+            "Grok Build is unsupported in isolated network mode because it has no managed \
+             credential-proxy path; switch the stopped VM to open networking if needed"
+        ),
+        IsolatedAgentPolicy::LocalModelUnsupported => {
+            bail!("local model routing is unavailable in isolated network mode")
+        }
+        IsolatedAgentPolicy::ProxyRequired => {
+            let provider = provider.context("isolated agent proxy provider is missing")?;
+            bail!(
+                "{} requires a configured {} credential proxy in isolated network mode; \
+                 run `coop proxy setup{} --vm {}` before launching it",
+                match agent {
+                    AgentKind::Claude => "Claude",
+                    AgentKind::Codex => "Codex",
+                    AgentKind::Grok => "Grok Build",
+                },
+                provider.name(),
+                if matches!(provider, proxy::Provider::Openai) {
+                    " --openai"
+                } else {
+                    ""
+                },
+                inst.name,
+            );
+        }
+    }
+    if let (ProxyReadiness::Running(target), Some(provider)) = (readiness, provider) {
+        proxy::ensure_runtime_available(inst, provider, target).with_context(|| {
+            format!(
+                "{} proxy is unavailable in isolated network mode; restart the VM to restore \
+                 its managed proxy and reverse tunnel",
+                provider.name()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolatedBootstrapPolicy {
+    Skip,
+    AgentsOnly,
+    FirstBootAndAgents,
+}
+
+fn isolated_bootstrap_policy(
+    network: config::FirecrackerNetworkMode,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> IsolatedBootstrapPolicy {
+    if no_agents || network != config::FirecrackerNetworkMode::Isolated {
+        IsolatedBootstrapPolicy::Skip
+    } else if mode == backend::BootMode::FirstBoot {
+        IsolatedBootstrapPolicy::FirstBootAndAgents
+    } else {
+        IsolatedBootstrapPolicy::AgentsOnly
+    }
+}
+
+fn preflight_isolated_bootstrap(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> Result<()> {
+    preflight_isolated_bootstrap_for_network(
+        cfg,
+        inst,
+        &inst.image,
+        inst.firecracker_network(),
+        no_agents,
+        mode,
+    )
+}
+
+fn preflight_isolated_bootstrap_for_network(
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    network: config::FirecrackerNetworkMode,
+    no_agents: bool,
+    mode: backend::BootMode,
+) -> Result<()> {
+    match isolated_bootstrap_policy(network, no_agents, mode) {
+        IsolatedBootstrapPolicy::Skip => return Ok(()),
+        IsolatedBootstrapPolicy::AgentsOnly => {}
+        IsolatedBootstrapPolicy::FirstBootAndAgents => {
+            backend::preflight_isolated_first_boot(cfg, image)?;
+        }
+    }
+    if model_state::ModelState::load_or_default(inst)?.mode != model_state::ModelMode::Remote {
+        bail!("local model routing is unavailable in isolated network mode");
+    }
+    let mut has_proxy = false;
+    for (agent, provider) in [
+        (AgentKind::Claude, proxy::Provider::Anthropic),
+        (AgentKind::Codex, proxy::Provider::Openai),
+    ] {
+        if proxy_state::effective_upstream(inst, provider, &cfg.proxy)?.is_some() {
+            has_proxy = true;
+            ensure_isolated_agent_supported(cfg, inst, network, agent, ProxyReadiness::Configured)?;
+        }
+    }
+    anyhow::ensure!(
+        has_proxy,
+        "isolated agent bootstrap requires at least one configured Anthropic or OpenAI \
+         credential proxy; configure one with `coop proxy setup --vm {}` or \
+         `coop proxy setup --openai --vm {}`, or use --no-agents for a control-only VM",
+        inst.name,
+        inst.name,
+    );
+    Ok(())
 }
 
 fn creation_post_start(
@@ -1466,6 +1715,7 @@ fn bootstrap_on_boot(
     opts: &StartOpts<'_>,
     mode: backend::BootMode,
 ) -> Result<()> {
+    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, mode)?;
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
@@ -1492,7 +1742,9 @@ fn bootstrap_on_boot(
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
     if opts.no_agents {
-        if let Some(assignment) = crate::github_assignment::active(cfg, inst)? {
+        if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+            && let Some(assignment) = crate::github_assignment::active(cfg, inst)?
+        {
             backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
         }
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
@@ -1588,6 +1840,8 @@ pub(crate) fn prepare_session_from_target(
     let remote = model
         .as_ref()
         .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
+    let isolated = inst
+        .is_some_and(|inst| inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated);
     let (proxy_anthropic, proxy_openai) = match inst {
         Some(inst) if remote => (
             proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
@@ -1597,7 +1851,8 @@ pub(crate) fn prepare_session_from_target(
         _ => (false, false),
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
-    let suppress_openai_key = proxy_openai || codex_account_auth;
+    let suppress_anthropic_key = proxy_anthropic || isolated;
+    let suppress_openai_key = proxy_openai || codex_account_auth || isolated;
     // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
     // auth even though `CoopConfig::validate` rejects that combination in the
     // config file. Warn here so the reason is visible on every session, and
@@ -1610,12 +1865,23 @@ pub(crate) fn prepare_session_from_target(
         tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
     }
 
-    let assignment = inst
-        .map(|inst| crate::github_assignment::active(cfg, inst))
-        .transpose()?
-        .flatten();
+    let assignment = if isolated {
+        None
+    } else {
+        inst.map(|inst| crate::github_assignment::active(cfg, inst))
+            .transpose()?
+            .flatten()
+    };
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding(cfg, repo, proxy_anthropic, suppress_openai_key)?;
+    let mut env = backend::prepare_env_forwarding_for_network(
+        cfg,
+        repo,
+        suppress_anthropic_key,
+        suppress_openai_key,
+        inst.map_or(config::FirecrackerNetworkMode::Open, |inst| {
+            inst.firecracker_network()
+        }),
+    )?;
     if let Some(inst) = inst {
         if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
             for (name, value) in &state.entries {
@@ -1625,10 +1891,19 @@ pub(crate) fn prepare_session_from_target(
                 // `codex.auth = "chatgpt"` forwarding it would let Codex
                 // silently fall back to API billing. Skip and warn, matching
                 // `prepare_env_forwarding`.
-                if (proxy_anthropic && name.as_str() == "ANTHROPIC_API_KEY")
+                if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
                     || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
+                    || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
+                    || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
+                    || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
+                    || (isolated && name.as_str() == "XAI_API_KEY")
+                    || (isolated && name.as_str() == "GITHUB_TOKEN")
+                    || (isolated && name.as_str() == "GH_TOKEN")
+                    || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
                 {
-                    let reason = if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
+                    let reason = if isolated {
+                        "isolated network mode"
+                    } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
                         "codex.auth = \"chatgpt\""
                     } else {
                         "proxy mode"
@@ -1645,7 +1920,8 @@ pub(crate) fn prepare_session_from_target(
         // the host). Claude's token rides in settings.json instead. The two
         // modes are mutually exclusive (mode is Local or Remote).
         if let Some(model) = &model {
-            if model.mode == model_state::ModelMode::Local
+            if !isolated
+                && model.mode == model_state::ModelMode::Local
                 && let Some(ep) = model.resolved_codex(&cfg.codex)
             {
                 env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
@@ -1664,23 +1940,42 @@ pub(crate) fn cmd_stop(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
+    drop(stop_confirmed(be, cfg, inst, true)?.0);
+    Ok(())
+}
+
+/// Stop and clean up an instance while retaining its lifecycle lock for a
+/// caller that must perform a serialized stopped-only follow-up operation.
+fn stop_confirmed(
+    be: &impl backend::VmBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    allow_running: bool,
+) -> Result<(backend::StoppedInstance, backend::StopOutcome)> {
     tracing::info!("Stopping instance '{}'", inst.name);
     // `RunningInstance` records a point-in-time observation from this probe;
     // `be.stop` rechecks under the backend operation lock before mutating.
-    let stopped = if let Some(running) = be.as_running(cfg, inst.clone())? {
-        // Tear down forwards before shutting down the VM so the
-        // control master can exit cleanly while SSH is still
-        // reachable.
-        port_forward::teardown_ssh_forwards(running.instance(), running.target());
-        be.stop(cfg, running)?
+    let (stopped, outcome) = if allow_running {
+        if let Some(running) = be.as_running(cfg, inst.clone())? {
+            // Tear down forwards before shutting down the VM so the
+            // control master can exit cleanly while SSH is still
+            // reachable.
+            port_forward::teardown_ssh_forwards(running.instance(), running.target());
+            be.stop(cfg, running)?
+        } else {
+            tracing::debug!("Instance '{}' is not running", inst.name);
+            let stopped = be.as_stopped(inst.clone())?;
+            if let Ok(target) = be.ssh_target(cfg, inst) {
+                port_forward::teardown_ssh_forwards(inst, &target);
+            }
+            (stopped, backend::StopOutcome::AlreadyStopped)
+        }
     } else {
-        tracing::debug!("Instance '{}' is not running", inst.name);
-        // Stale forwards may still exist even when the VM is gone.
+        let stopped = be.as_stopped(inst.clone())?;
         if let Ok(target) = be.ssh_target(cfg, inst) {
             port_forward::teardown_ssh_forwards(inst, &target);
         }
-        // Reconfirm the stopped state while acquiring the operation lock.
-        be.as_stopped(inst.clone())?
+        (stopped, backend::StopOutcome::AlreadyStopped)
     };
     // Tear down the credential proxy (issue #411) — best-effort, no-op when
     // proxy mode was never on. Do this only after confirmed exit, but before
@@ -1691,6 +1986,174 @@ pub(crate) fn cmd_stop(
     // it (the Lima port changes per boot). `destroy`/`ssh-config --clean`
     // remove it.
     tracing::info!("Instance '{}' stopped", inst.name);
+    Ok((stopped, outcome))
+}
+
+/// Show or change a Firecracker instance's persisted network-device policy.
+///
+/// Changes are stopped-only. `restart` explicitly permits stopping a running
+/// guest, persisting the target mode, and starting it again; a failed target
+/// boot leaves the requested mode selected and the instance stopped.
+pub(crate) fn cmd_network(
+    be: &backend::PlatformBackend,
+    cfg: &mut config::CoopConfig,
+    config_path: &Path,
+    name: Option<&config::InstanceName>,
+    requested: Option<config::FirecrackerNetworkMode>,
+    restart: bool,
+    no_agents: bool,
+) -> Result<()> {
+    let inst = cfg.resolve_instance(name)?;
+    if !be.supports_firecracker_network_mode() {
+        if requested.is_some() {
+            bail!("Firecracker network modes are unsupported by the Lima backend");
+        }
+        writeln!(
+            std::io::stdout(),
+            "Instance: {}\nNetwork:  unsupported (Lima)",
+            inst.name
+        )?;
+        return Ok(());
+    }
+
+    let Some(target) = requested else {
+        return render_network_status(be, cfg, &inst);
+    };
+
+    if target == inst.firecracker_network() {
+        writeln!(
+            std::io::stdout(),
+            "Instance '{}' already uses network mode '{}'.",
+            inst.name,
+            target,
+        )?;
+        return Ok(());
+    }
+
+    config::validate_firecracker_modes(inst.firecracker_control(), target)?;
+    if target == config::FirecrackerNetworkMode::Isolated {
+        be.validate_image_control(cfg, &inst.image, inst.firecracker_control())?;
+    }
+
+    let was_running = be.as_running(cfg, inst.clone())?.is_some();
+    if was_running && !restart {
+        bail!(
+            "Instance '{}' is running. Changing its network mode requires a stop/start; \
+             re-run with `coop network {} {} --restart` to acknowledge terminating active \
+             guest processes and agent sessions.",
+            inst.name,
+            inst.name,
+            target,
+        );
+    }
+    if was_running {
+        backend::boot_preflight(cfg)?;
+    }
+    if was_running && target == config::FirecrackerNetworkMode::Isolated {
+        preflight_isolated_bootstrap_for_network(
+            cfg,
+            &inst,
+            &inst.image,
+            target,
+            no_agents,
+            backend::BootMode::Restart,
+        )?;
+    }
+
+    if target == config::FirecrackerNetworkMode::Open {
+        tracing::warn!(
+            "open networking grants general network access to every process in guest '{}'",
+            inst.name
+        );
+    }
+
+    let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
+    let (mut stopped, stop_outcome) = stop_confirmed(be, cfg, &inst, was_running)?;
+    let restart_after_change = restart_network_after_stop(stop_outcome);
+    stopped.instance_mut().set_firecracker_network(target)?;
+    let changed = stopped.instance().clone();
+
+    let operation = if restart_after_change {
+        let opts = network_restart_options(&changed.name, config_path, no_agents);
+        match restart_confirmed_instance(be, cfg, stopped, &opts) {
+            Ok(operation) => Some(operation),
+            Err(start_error) => {
+                let cleanup = cmd_stop(be, cfg, &changed);
+                return match cleanup {
+                    Ok(()) => Err(start_error.context(format!(
+                        "Failed to restart '{}' in network mode '{}'; the requested mode remains \
+                         selected and the instance was left stopped",
+                        changed.name, target
+                    ))),
+                    Err(cleanup_error) => Err(start_error.context(format!(
+                        "Failed to restart '{}' in network mode '{}'; cleanup also failed: \
+                         {cleanup_error:#}",
+                        changed.name, target
+                    ))),
+                };
+            }
+        }
+    } else {
+        drop(stopped);
+        None
+    };
+
+    writeln!(
+        std::io::stdout(),
+        "Instance '{}' network mode is now '{}'.{}",
+        changed.name,
+        target,
+        if restart_after_change {
+            " Restarted."
+        } else {
+            ""
+        },
+    )?;
+    drop(operation);
+    Ok(())
+}
+
+fn restart_network_after_stop(outcome: backend::StopOutcome) -> bool {
+    outcome == backend::StopOutcome::StoppedRunning
+}
+
+fn network_restart_options<'a>(
+    name: &'a config::InstanceName,
+    config_path: &'a Path,
+    no_agents: bool,
+) -> StartOpts<'a> {
+    StartOpts {
+        name: Some(name),
+        workspace_dir: None,
+        git_repo: None,
+        no_agents,
+        no_prompt: false,
+        disk: None,
+        mounts: Vec::new(),
+        exclude_git: false,
+        forward_ports: Vec::new(),
+        config_path,
+        post_start_override: None,
+        persisted_guest_env: std::collections::BTreeMap::new(),
+    }
+}
+
+fn render_network_status(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+) -> Result<()> {
+    let state = if be.as_running(cfg, inst.clone())?.is_some() {
+        "running"
+    } else {
+        "stopped"
+    };
+    writeln!(
+        std::io::stdout(),
+        "Instance: {}\nNetwork:  {}\nState:    {state}",
+        inst.name,
+        inst.firecracker_network(),
+    )?;
     Ok(())
 }
 
@@ -1738,6 +2201,9 @@ pub(crate) fn cmd_list(
         .map(|inst| json::InstanceSummary {
             name: &inst.name,
             state: json::InstanceState::from_running(be.is_running(inst)),
+            network: be
+                .supports_firecracker_network_mode()
+                .then_some(inst.firecracker_network()),
         })
         .collect();
 
@@ -1750,14 +2216,17 @@ pub(crate) fn cmd_list(
             .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
         return Ok(());
     }
-    writeln!(std::io::stdout(), "{:<16} STATE", "NAME")
+    writeln!(std::io::stdout(), "{:<16} {:<10} NETWORK", "NAME", "STATE")
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     for summary in &summaries {
         writeln!(
             std::io::stdout(),
-            "{:<16} {}",
+            "{:<16} {:<10} {}",
             summary.name.as_str(),
-            summary.state.label()
+            summary.state.label(),
+            summary
+                .network
+                .map_or("n/a", config::FirecrackerNetworkMode::as_str),
         )
         .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
     }
@@ -1783,6 +2252,9 @@ fn instance_status<'a>(
         state,
         image: &inst.image,
         backend: json::BackendKind::of(be),
+        network: be
+            .supports_firecracker_network_mode()
+            .then_some(inst.firecracker_network()),
         usage,
     })
 }
@@ -1801,8 +2273,14 @@ pub(crate) fn cmd_status(
         let report = match be.as_running(cfg, inst.clone())? {
             Some(running) => be.status(cfg, &running)?,
             None => format!(
-                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}",
-                inst.name, inst.image,
+                "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}\n  Network: {}",
+                inst.name,
+                inst.image,
+                if be.supports_firecracker_network_mode() {
+                    inst.firecracker_network().as_str()
+                } else {
+                    "n/a"
+                },
             ),
         };
         writeln!(std::io::stdout(), "{report}")
@@ -1833,10 +2311,15 @@ pub(crate) fn cmd_status(
             };
             writeln!(
                 std::io::stdout(),
-                "{:<16} {:<10} {:<10} {}{usage_str}",
+                "{:<16} {:<10} {:<10} {:<10} {}{usage_str}",
                 inst.name,
                 state,
                 inst.image,
+                if be.supports_firecracker_network_mode() {
+                    inst.firecracker_network().as_str()
+                } else {
+                    "n/a"
+                },
                 be,
             )
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
@@ -1870,8 +2353,12 @@ pub(crate) fn cmd_resize(
     let stopped = be.as_stopped(inst)?;
 
     if let Some(disk_size) = opts.disk {
-        let current = current_disk_gib(be, stopped.instance())?;
-        let new_size = disk_size.resolve(current)?;
+        let new_size = match disk_size {
+            config::DiskSize::Absolute(size) => size,
+            config::DiskSize::Relative(_) => {
+                disk_size.resolve_from_bytes(current_disk_bytes(be, stopped.instance())?)?
+            }
+        };
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
@@ -1904,6 +2391,12 @@ pub(crate) fn cmd_commit(
     let inst = cfg.resolve_instance(name)?;
     let source_image = inst.image.clone();
 
+    // Serialize disk/template/metadata publication as one image operation.
+    // Firecracker setup uses the same sibling lock, so it cannot reuse the
+    // fixed staging name while commit is repairing it.
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
+    let destination_existed = cfg.image_dir(image).exists();
+
     // Refuse to clobber an existing image unless asked. Checked before
     // gating on stopped state so a typo'd or already-taken name fails fast.
     if be.image_is_built(cfg, image) && !force {
@@ -1922,10 +2415,19 @@ pub(crate) fn cmd_commit(
             format!("Failed to load template config for source image '{source_image}'")
         })?;
 
-    be.commit_disk(cfg, &stopped, image)?;
-
     template_config.created = setup::utc_timestamp();
-    template_config.save_for(cfg, image)?;
+    template_config.capabilities.clear();
+    be.prepare_committed_image_metadata(&mut template_config);
+    if let Err(error) = be.commit_disk(cfg, &stopped, image, &template_config) {
+        // A pre-publication failure for a new image may leave only the empty
+        // private directory created for staging. Remove it so `coop images`
+        // cannot report a phantom; a marker/disk from an interrupted
+        // publication makes this intentionally fail with DirectoryNotEmpty.
+        if !destination_existed {
+            setup::cleanup_unpublished_image_dir(cfg, image);
+        }
+        return Err(error);
+    }
 
     tracing::info!(
         "Committed instance '{}' to image '{image}'. \
@@ -1992,6 +2494,18 @@ pub(crate) struct ReprovisionOpts<'a> {
 /// leave them alone. [`RestoreMode::Reprovision`] is the other case — a base
 /// image, with nothing on the new disk to preserve — and routes to
 /// [`reprovision_instance`] instead.
+fn ensure_restore_image_usable(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    image: &config::ImageName,
+    control: config::FirecrackerControlMode,
+) -> Result<()> {
+    if !be.image_is_built(cfg, image) {
+        bail!("No image '{image}' found. Run `coop images` to list available images.");
+    }
+    be.validate_image_control(cfg, image, control)
+}
+
 pub(crate) fn cmd_restore(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
@@ -2005,10 +2519,9 @@ pub(crate) fn cmd_restore(
     };
 
     let inst = cfg.resolve_instance(opts.name)?;
+    let _image_lock = setup::lock_image_publication(cfg, image)?;
 
-    if !be.image_is_built(cfg, image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control())?;
 
     let stopped = be.as_stopped(inst)?;
     crate::creation_hooks::restore_disk(
@@ -2061,15 +2574,11 @@ fn reprovision_instance(
     let _provisioning = crate::creation_hooks::lock_provisioning(&inst)?;
     let image = opts.image.cloned().unwrap_or_else(|| inst.image.clone());
 
-    if !be.image_is_built(cfg, &image) {
-        bail!("No image '{image}' found. Run `coop images` to list available images.");
-    }
+    preflight_reprovision_image(be, cfg, &inst, &image, opts.no_agents)?;
 
-    // Ordering rule for the whole pre-swap half: anything that can fail
-    // cheaply runs before `restore_disk`, because a stopped instance can be
-    // started again and a wiped one cannot be un-wiped. Start with the
-    // host-side settings that have to survive the swap, so a malformed state
-    // file aborts with the guest still intact rather than half-reprovisioned.
+    // Load host-side settings before stopping the guest, so malformed state
+    // aborts while it is still running. The image-dependent payload is prepared
+    // under the image lock after the stop, before the disk is replaced.
     let workspace_state = workspace::WorkspaceState::try_load(&inst)?;
     let saved_forwards = port_forward::ForwardsState::try_load(&inst)?
         .map(|s| s.forwards)
@@ -2078,38 +2587,24 @@ fn reprovision_instance(
         .map(|s| s.entries)
         .unwrap_or_default();
 
-    check_reprovision_workspace_source(&inst.name, workspace_state.as_ref())?;
+    check_reprovision_workspace_source(
+        &inst.name,
+        inst.firecracker_network(),
+        workspace_state.as_ref(),
+    )?;
 
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
-    let payload = BootPayload::prepare(be, cfg, &image, &ws_inputs.mounts, forwards)?;
 
-    if !opts.yes
-        && !prompt::confirm(&reprovision_confirmation(
-            &inst.name,
-            &image,
-            workspace_state.as_ref(),
-        ))?
-    {
-        // `prompt::confirm` is also false off a TTY, so name the flag that
-        // makes a non-interactive reprovision possible.
-        bail!(
-            "Aborted — instance '{}' left untouched.\n\
-             Pass -y to reprovision without the prompt (required when stdin is \
-             not a TTY).",
-            inst.name,
-        );
-    }
+    let repo = confirm_reprovision(cfg, &inst, &image, workspace_state.as_ref(), opts)?;
 
-    // Fire the PAT auto-prompt before any destructive work, for the same
-    // reason `start_instance` fires it before any VM cost: an interactive
-    // wizard should not appear with the guest already wiped.
-    let repo = backend::detect_instance_repo(&inst);
-    if crate::github_assignment::active(cfg, &inst)?.is_none() {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
-    }
+    // Interactive work is complete. Snapshot the selected image contract and
+    // keep its publication lock through stop, copy, and lineage publication so
+    // a forced concurrent commit cannot invalidate either preflight.
+    let image_lock = setup::lock_image_publication(cfg, &image)?;
+    validate_reprovision_image(be, cfg, &inst, &image, opts.no_agents)?;
 
     // Installed before the stop, so a Ctrl-C during it is handled too.
     let _guard = signal::install_handlers();
@@ -2125,6 +2620,8 @@ fn reprovision_instance(
     // It swallows a failed `as_running` probe, which is fine here: the
     // `as_stopped` proof below is what actually gates the disk swap.
     cmd_stop(be, cfg, &inst)?;
+
+    let payload = prepare_reprovision_payload(be, cfg, &inst, &image, &ws_inputs.mounts, forwards)?;
 
     // The instance's own forward set is authoritative — it already folded in
     // `cfg.forward_ports` at creation; merging again picks up forwards added
@@ -2156,9 +2653,10 @@ fn reprovision_instance(
     let reprovisioned_name = inst.name.clone();
     let stopped = be.as_stopped(inst)?;
 
-    // An image's disk is template-sized, so a `coop resize --disk` is lost in
-    // the swap. Record the size first and re-grow afterwards.
-    let previous_disk = current_disk_gib(be, stopped.instance())?;
+    // The replacement can be smaller than a previously resized disk. Record
+    // the exact old length before the swap so no partial GiB is lost.
+    let previous_disk_bytes = current_disk_bytes(be, stopped.instance())?;
+    let previous_disk = config::GiB::from_bytes_ceil(previous_disk_bytes)?;
 
     // Last chance to honour a Ctrl-C. `install_handlers` only sets a sticky
     // flag, so the SIGINT that arrived during the stop above is recorded but
@@ -2177,15 +2675,26 @@ fn reprovision_instance(
     // instance survives, its guest is only partly provisioned, and re-running
     // finishes the job. It also carries `previous_disk`, which only this
     // process knows: nothing persists an instance's disk size, so a re-run
-    // measures the replaced template-sized file and skips the re-grow.
-    let partial = || reprovision_partial_message(&reprovisioned_name, &image, previous_disk);
+    // measures the replacement image and skips the re-grow.
+    let partial = || {
+        reprovision_partial_message(
+            &reprovisioned_name,
+            &image,
+            previous_disk_bytes,
+            previous_disk,
+        )
+    };
 
     // Persist lineage only after replacement finishes.
     let mut inst = stopped.instance().clone();
     inst.set_image(image.clone()).with_context(partial)?;
+    drop(image_lock);
 
-    if previous_disk > current_disk_gib(be, &inst).with_context(partial)? {
-        be.resize_disk(cfg, &stopped, previous_disk)
+    let replacement_bytes = current_disk_bytes(be, &inst).with_context(partial)?;
+    if let Some(target) =
+        reprovision_regrow_target(previous_disk_bytes, replacement_bytes, previous_disk)
+    {
+        be.resize_disk(cfg, &stopped, target)
             .with_context(partial)?;
     }
 
@@ -2225,6 +2734,68 @@ fn reprovision_instance(
     Ok(())
 }
 
+fn preflight_reprovision_image(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    no_agents: bool,
+) -> Result<()> {
+    let image_lock = setup::lock_image_publication(cfg, image)?;
+    validate_reprovision_image(be, cfg, inst, image, no_agents)?;
+    drop(image_lock);
+    Ok(())
+}
+
+fn validate_reprovision_image(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    no_agents: bool,
+) -> Result<()> {
+    ensure_restore_image_usable(be, cfg, image, inst.firecracker_control())?;
+    preflight_isolated_bootstrap_for_network(
+        cfg,
+        inst,
+        image,
+        inst.firecracker_network(),
+        no_agents,
+        backend::BootMode::FirstBoot,
+    )
+}
+
+fn confirm_reprovision(
+    cfg: &mut config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    workspace_state: Option<&workspace::WorkspaceState>,
+    opts: &ReprovisionOpts<'_>,
+) -> Result<Option<github_repo::RepoSlug>> {
+    if !opts.yes
+        && !prompt::confirm(&reprovision_confirmation(
+            &inst.name,
+            image,
+            workspace_state,
+        ))?
+    {
+        bail!(
+            "Aborted — instance '{}' left untouched.\n\
+             Pass -y to reprovision without the prompt (required when stdin is \
+             not a TTY).",
+            inst.name,
+        );
+    }
+
+    let repo = backend::detect_instance_repo(inst);
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
+        && crate::github_assignment::active(cfg, inst)?.is_none()
+    {
+        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
+    }
+    Ok(repo)
+}
+
 /// Reject a recorded workspace association that a reprovision could not act
 /// on, while the guest is still intact.
 ///
@@ -2232,8 +2803,20 @@ fn reprovision_instance(
 /// `restore_disk` has already destroyed the disk.
 fn check_reprovision_workspace_source(
     name: &config::InstanceName,
+    network: config::FirecrackerNetworkMode,
     state: Option<&workspace::WorkspaceState>,
 ) -> Result<()> {
+    if network == config::FirecrackerNetworkMode::Isolated
+        && state.is_some_and(|state| {
+            matches!(&state.source, workspace::WorkspaceSource::GitRepo { .. })
+        })
+    {
+        bail!(
+            "Instance '{name}' records a git-repo workspace that must be cloned inside the guest, \
+             which is unavailable in isolated network mode. Switch the stopped VM to open before \
+             reprovisioning, or recreate it from a host workspace copy"
+        );
+    }
     let Some(host_path) = state.and_then(|s| s.source.host_path()) else {
         return Ok(());
     };
@@ -2289,6 +2872,23 @@ struct ReprovisionWorkspaceInputs {
     git_repo: Option<String>,
     /// Host directories to re-mount (Lima) or re-sync (Firecracker).
     mounts: Vec<config::Mount>,
+}
+
+fn prepare_reprovision_payload(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+    image: &config::ImageName,
+    mounts: &[config::Mount],
+    forwards: Vec<config::PortForward>,
+) -> Result<BootPayload> {
+    BootPayload::prepare(be, cfg, image, mounts, forwards).with_context(|| {
+        format!(
+            "Instance '{}' is stopped and was not reprovisioned. Fix the host input, then \
+             re-run `coop restore {} --image {} --reprovision` or run `coop start {}` to bring it back as it was.",
+            inst.name, inst.name, image, inst.name
+        )
+    })
 }
 
 /// Rebuild the workspace-shaped `StartOpts` inputs from the association the
@@ -2351,15 +2951,17 @@ fn reprovision_workspace_inputs(
 fn reprovision_partial_message(
     name: &config::InstanceName,
     image: &config::ImageName,
+    previous_disk_bytes: u64,
     previous_disk: config::GiB,
 ) -> String {
     format!(
         "Instance '{name}' was reset but not fully provisioned. \
          Re-run `coop restore {name} --image {image} --reprovision` to finish.\n\
-         Its disk was {previous_disk} GiB before the reset. Nothing persists \
-         that, and a re-run measures the replaced (template-sized) disk, so \
+         Its disk was {} before the reset. Nothing persists \
+         that, and a re-run measures the replacement image, so \
          check `coop status {name}` and run `coop resize {name} --size \
-         {previous_disk}` if the re-grow did not complete."
+         {previous_disk}` if the re-grow did not complete.",
+        config::format_disk_bytes(previous_disk_bytes),
     )
 }
 
@@ -2395,22 +2997,50 @@ fn reprovision_confirmation(
     )
 }
 
-fn current_disk_gib(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<config::GiB> {
+fn current_disk_bytes(be: &backend::PlatformBackend, inst: &config::Instance) -> Result<u64> {
     let path = be.disk_path(inst)?;
-    let bytes = std::fs::metadata(&path)
+    Ok(std::fs::metadata(&path)
         .with_context(|| format!("Failed to stat {}", path.display()))?
-        .len();
-    config::GiB::new(bytes_to_gib(bytes))
-        .with_context(|| format!("Disk at {} is smaller than 1 GiB", path.display()))
+        .len())
 }
 
-/// Whole gibibytes in `bytes`, rounding down (1 GiB = 1024³ bytes).
-///
-/// The truncating `as u32` is safe for any disk size coop creates: the
-/// template caps well under 4 TiB (`u32::MAX` GiB), so the quotient fits.
-#[expect(clippy::cast_possible_truncation, reason = "disk GiB fits in u32")]
-fn bytes_to_gib(bytes: u64) -> u32 {
-    (bytes / (1024 * 1024 * 1024)) as u32
+fn reprovision_regrow_target(
+    previous_bytes: u64,
+    replacement_bytes: u64,
+    previous_disk: config::GiB,
+) -> Option<config::GiB> {
+    if replacement_bytes < previous_bytes {
+        Some(previous_disk)
+    } else {
+        None
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{config, reprovision_regrow_target};
+
+    /// The caller rounds the exact old byte length to GiB before choosing a
+    /// regrow target. If the replacement is shorter, the chosen target can
+    /// hold every byte of the old disk; otherwise no regrow is requested.
+    #[kani::proof]
+    fn reprovision_regrow_preserves_exact_old_length() {
+        let previous_bytes: u64 = kani::any();
+        let replacement_bytes: u64 = kani::any();
+        let rounded = previous_bytes.div_ceil(config::GIB_BYTES);
+        let Some(previous_disk) = u32::try_from(rounded).ok().and_then(config::GiB::new) else {
+            return;
+        };
+        let target = reprovision_regrow_target(previous_bytes, replacement_bytes, previous_disk);
+        if replacement_bytes < previous_bytes {
+            let target = target.expect("shorter replacement must regrow");
+            assert_eq!(u64::from(target.as_u32()), rounded);
+            assert!(u128::from(target.as_bytes()) >= u128::from(previous_bytes));
+        } else {
+            assert!(target.is_none());
+            assert!(replacement_bytes >= previous_bytes);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2418,6 +3048,183 @@ fn bytes_to_gib(bytes: u64) -> u32 {
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use crate::backend::VmBackend as _;
+
+    #[test]
+    fn restore_image_preflight_distinguishes_a_missing_image() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = super::config::CoopConfig {
+            data_dir: super::config::ConfigPath::new(tmp.path()),
+            ..super::config::CoopConfig::default()
+        };
+        let image = super::config::ImageName::new("missing").unwrap();
+        let error = super::ensure_restore_image_usable(
+            &super::backend::PlatformBackend::new(),
+            &cfg,
+            &image,
+            super::config::FirecrackerControlMode::LegacyTcp,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("No image 'missing' found"), "{error}");
+    }
+
+    #[test]
+    fn isolated_agent_policy_covers_every_agent_and_prerequisite() {
+        use super::{AgentKind, IsolatedAgentPolicy, isolated_agent_policy};
+        use crate::config::FirecrackerNetworkMode;
+        use crate::model_state::ModelMode;
+
+        assert_eq!(
+            isolated_agent_policy(
+                FirecrackerNetworkMode::Open,
+                AgentKind::Grok,
+                ModelMode::Local,
+                false,
+            ),
+            IsolatedAgentPolicy::Allowed,
+        );
+        assert_eq!(
+            isolated_agent_policy(
+                FirecrackerNetworkMode::Isolated,
+                AgentKind::Grok,
+                ModelMode::Remote,
+                true,
+            ),
+            IsolatedAgentPolicy::GrokUnsupported,
+        );
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Local,
+                    true,
+                ),
+                IsolatedAgentPolicy::LocalModelUnsupported,
+            );
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Remote,
+                    false,
+                ),
+                IsolatedAgentPolicy::ProxyRequired,
+            );
+            assert_eq!(
+                isolated_agent_policy(
+                    FirecrackerNetworkMode::Isolated,
+                    agent,
+                    ModelMode::Remote,
+                    true,
+                ),
+                IsolatedAgentPolicy::Allowed,
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_bootstrap_policy_distinguishes_skip_first_boot_and_restart() {
+        use super::{IsolatedBootstrapPolicy, isolated_bootstrap_policy};
+        use crate::backend::BootMode;
+        use crate::config::FirecrackerNetworkMode;
+
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Open, false, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::Skip,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, true, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::Skip,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, false, BootMode::FirstBoot,),
+            IsolatedBootstrapPolicy::FirstBootAndAgents,
+        );
+        assert_eq!(
+            isolated_bootstrap_policy(FirecrackerNetworkMode::Isolated, false, BootMode::Restart,),
+            IsolatedBootstrapPolicy::AgentsOnly,
+        );
+    }
+
+    #[test]
+    fn isolated_bootstrap_accepts_either_proxy_but_requires_one() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::VsockIsolated,
+        };
+        let mut cfg = super::config::CoopConfig::default();
+        let upstream = super::config::ProxyUpstream {
+            credential: super::config::Secret::new("test-credential".to_string()),
+            auth: super::config::ProxyAuthScheme::ApiKey,
+        };
+        let preflight = |cfg: &super::config::CoopConfig| {
+            super::preflight_isolated_bootstrap_for_network(
+                cfg,
+                &inst,
+                &inst.image,
+                super::config::FirecrackerNetworkMode::Isolated,
+                false,
+                crate::backend::BootMode::Restart,
+            )
+        };
+
+        let missing = preflight(&cfg).unwrap_err().to_string();
+        assert!(missing.contains("at least one configured"), "{missing}");
+        cfg.proxy.anthropic = Some(upstream.clone());
+        preflight(&cfg).unwrap();
+        cfg.proxy.anthropic = None;
+        cfg.proxy.openai = Some(upstream);
+        preflight(&cfg).unwrap();
+
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let local = preflight(&cfg).unwrap_err().to_string();
+        assert!(
+            local.contains("local model routing is unavailable"),
+            "{local}"
+        );
+    }
+
+    #[test]
+    fn network_restart_uses_the_lock_protected_stop_outcome() {
+        assert!(super::restart_network_after_stop(
+            crate::backend::StopOutcome::StoppedRunning
+        ));
+        assert!(!super::restart_network_after_stop(
+            crate::backend::StopOutcome::AlreadyStopped
+        ));
+    }
+
+    #[test]
+    fn network_restart_options_forward_only_restart_inputs() {
+        let name = crate::config::InstanceName::new("networked").unwrap();
+        let config_path = std::path::Path::new("/tmp/coop-network-config.toml");
+
+        for no_agents in [false, true] {
+            let opts = super::network_restart_options(&name, config_path, no_agents);
+            assert_eq!(opts.name, Some(&name));
+            assert_eq!(opts.config_path, config_path);
+            assert_eq!(opts.no_agents, no_agents);
+            assert!(opts.workspace_dir.is_none());
+            assert!(opts.git_repo.is_none());
+            assert!(!opts.no_prompt);
+            assert!(opts.disk.is_none());
+            assert!(opts.mounts.is_empty());
+            assert!(!opts.exclude_git);
+            assert!(opts.forward_ports.is_empty());
+            assert!(opts.post_start_override.is_none());
+            assert!(opts.persisted_guest_env.is_empty());
+        }
+    }
 
     fn check_stale_restart_preserves_creation_progress(root: &std::path::Path) {
         let mut cfg = cfg_with_data_dir(root.join("data"));
@@ -2427,6 +3234,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: crate::config::ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         crate::creation_hooks::CreationState::select(&cfg, None)
             .unwrap()
@@ -2474,7 +3282,7 @@ mod tests {
             check_stale_restart_preserves_creation_progress(std::path::Path::new(&root));
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let controller = root.path().join("limactl");
         std::fs::write(
             &controller,
@@ -2507,12 +3315,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_reports_unknown_process_state_and_preserves_pid_file() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         std::fs::write(inst.pid_file_path(), "invalid-pid").expect("pid file");
@@ -2550,12 +3359,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_stop_removes_proxy_before_cleanup_error() {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("name"),
             index: super::config::InstanceIndex::new(0).expect("index"),
             dir: root.path().join("instance"),
             image: super::config::ImageName::new("default").expect("image"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).expect("instance dir");
         let proxy_token = inst.dir.join("proxy-openai.token");
@@ -2581,6 +3391,171 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_legacy_firecracker_image(
+        cfg: &super::config::CoopConfig,
+        image: &super::config::ImageName,
+    ) {
+        crate::fs_util::private_dir(&cfg.image_dir(image)).unwrap();
+        std::fs::write(cfg.template_path_for(image), b"legacy disk sentinel").unwrap();
+        std::fs::write(
+            cfg.template_config_path_for(image),
+            r#"{
+                "version": 2,
+                "created": "2026-01-01T00:00:00Z",
+                "install_script_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "profiles": [],
+                "extra_packages": [],
+                "post_install_hash": null
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_creation_rejects_legacy_image_before_allocating_state() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("must-not-exist").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_creation_cleans_up_when_provisioning_lock_cannot_open() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let image = super::config::ImageName::new("legacy").unwrap();
+        let name = super::config::InstanceName::new("lock-failure").unwrap();
+        write_legacy_firecracker_image(&cfg, &image);
+
+        crate::fs_util::private_dir(&cfg.instances_dir()).unwrap();
+        let lock_path = cfg
+            .instances_dir()
+            .join(format!("..{name}.provisioning.operation.lock"));
+        std::os::unix::fs::symlink(cfg.instances_dir(), &lock_path).unwrap();
+
+        let config_path = root.path().join("config.toml");
+        let opts = start_opts(Vec::new(), &config_path);
+        let error = super::allocate_and_start(
+            &super::backend::FirecrackerBackend::new(),
+            &mut cfg,
+            Some(&name),
+            &image,
+            None,
+            &opts,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Failed to open operation lock"), "{error}");
+        assert!(!cfg.instances_dir().join(name.as_str()).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vsock_instance_with_disk(
+        cfg: &mut super::config::CoopConfig,
+        name: &super::config::InstanceName,
+    ) -> super::config::Instance {
+        let image = super::config::default_image_name();
+        cfg.vm.firecracker_control = super::config::FirecrackerControlMode::Vsock;
+        let inst = cfg.allocate_instance(Some(name), &image, None).unwrap();
+        std::fs::write(inst.rootfs_path(), b"original instance disk").unwrap();
+        inst
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_restore_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("restore-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::DiskOnly { image: &target },
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_reprovision_rejects_legacy_image_before_disk_or_state_mutation() {
+        let root = private_test_root();
+        let mut cfg = cfg_with_data_dir(root.path().join("data"));
+        let name = super::config::InstanceName::new("reprovision-proof").unwrap();
+        let inst = vsock_instance_with_disk(&mut cfg, &name);
+        let target = super::config::ImageName::new("legacy").unwrap();
+        write_legacy_firecracker_image(&cfg, &target);
+        let state_before = std::fs::read(inst.dir.join("instance.json")).unwrap();
+        let disk_before = std::fs::read(inst.rootfs_path()).unwrap();
+        let config_path = root.path().join("config.toml");
+        let opts = super::RestoreOpts {
+            name: Some(&name),
+            mode: super::RestoreMode::Reprovision(super::ReprovisionOpts {
+                image: Some(&target),
+                yes: true,
+                no_agents: true,
+                no_prompt: true,
+                config_path: &config_path,
+            }),
+        };
+
+        let error = super::cmd_restore(&super::backend::FirecrackerBackend::new(), &mut cfg, &opts)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not contain"), "{error}");
+        assert_eq!(std::fs::read(inst.rootfs_path()).unwrap(), disk_before);
+        assert_eq!(
+            std::fs::read(inst.dir.join("instance.json")).unwrap(),
+            state_before
+        );
     }
 
     #[test]
@@ -2610,18 +3585,18 @@ mod tests {
     }
 
     fn assert_interrupted_post_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = instance_named("test", tmp.path());
         std::fs::create_dir(inst.model_state_path()).unwrap();
         let mut cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         cfg.post_start = Some("true".to_string());
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(22).unwrap(),
-            user: super::backend::SshUser::new("ubuntu").unwrap(),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
         let error =
             super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
                 .unwrap_err();
@@ -2894,13 +3869,14 @@ mod tests {
     fn prepare_session_overlays_persisted_guest_env() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2921,13 +3897,13 @@ mod tests {
             "cfg-value".to_string(),
         );
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -2974,13 +3950,14 @@ mod tests {
     fn prepare_session_suppresses_persisted_proxy_key() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -2999,13 +3976,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::ApiKey,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3026,13 +4003,14 @@ mod tests {
     fn prepare_session_suppresses_persisted_openai_key_for_chatgpt_auth() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
         let mut state = super::guest_env_state::GuestEnvState::default();
         state.entries.insert(
@@ -3048,13 +4026,13 @@ mod tests {
         let mut cfg = super::config::CoopConfig::default();
         cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
@@ -3075,13 +4053,14 @@ mod tests {
     fn prepare_session_survives_chatgpt_auth_with_openai_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         let mut cfg = super::config::CoopConfig::default();
@@ -3091,13 +4070,13 @@ mod tests {
             auth: super::config::ProxyAuthScheme::Bearer,
         });
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         // The conflict makes Codex unusable, not the VM: a shell/exec/claude
         // session on the same instance must still come up. `coop codex` and
@@ -3113,16 +4092,203 @@ mod tests {
     }
 
     #[test]
+    fn prepare_session_suppresses_persisted_codex_token_for_effective_proxy() {
+        use std::num::NonZeroU16;
+
+        for per_vm in [false, true] {
+            for auth in [
+                super::config::ProxyAuthScheme::Bearer,
+                super::config::ProxyAuthScheme::CodexAccessToken,
+            ] {
+                let tmp = crate::test_support::private_tempdir().unwrap();
+                let inst = super::config::Instance {
+                    name: super::config::InstanceName::new("test").unwrap(),
+                    index: super::config::InstanceIndex::new(0).unwrap(),
+                    dir: tmp.path().to_path_buf(),
+                    image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+                    firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
+                };
+                let mut state = super::guest_env_state::GuestEnvState::default();
+                for (name, value) in [
+                    ("CODEX_ACCESS_TOKEN", "at-private"),
+                    ("FROM_CLI", "saved-value"),
+                ] {
+                    state.entries.insert(
+                        super::guest_env_state::EnvVarName::new(name).unwrap(),
+                        value.to_string(),
+                    );
+                }
+                state.save(&inst).unwrap();
+                let mut cfg = super::config::CoopConfig::default();
+                let upstream = super::config::ProxyUpstream {
+                    credential: super::config::Secret::new("cmd:false".to_string()),
+                    auth,
+                };
+                if per_vm {
+                    super::proxy_state::ProxyState {
+                        openai: Some(upstream),
+                        ..Default::default()
+                    }
+                    .save(&inst)
+                    .unwrap();
+                } else {
+                    cfg.proxy.openai = Some(upstream);
+                }
+                let target = super::backend::SshTarget::tcp(
+                    super::backend::Hostname::new("127.0.0.1").unwrap(),
+                    NonZeroU16::new(22).unwrap(),
+                    super::backend::SshUser::new("ubuntu").unwrap(),
+                    tmp.path().join("id_test"),
+                    cfg.ssh.host_tools.clone(),
+                );
+                let session =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
+                        .unwrap();
+                assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
+                assert_eq!(
+                    session
+                        .env
+                        .guest_values()
+                        .get("FROM_CLI")
+                        .map(String::as_str),
+                    Some("saved-value")
+                );
+                let model = super::model_state::ModelState {
+                    mode: super::model_state::ModelMode::Local,
+                    ..Default::default()
+                };
+                model.save(&inst).unwrap();
+                let local =
+                    super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+                assert_eq!(
+                    local
+                        .env
+                        .guest_values()
+                        .get("CODEX_ACCESS_TOKEN")
+                        .map(String::as_str),
+                    Some("at-private")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_session_suppresses_persisted_credentials_in_isolated_mode() {
+        use std::num::NonZeroU16;
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::VsockIsolated,
+        };
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        for (name, value) in [
+            ("ANTHROPIC_API_KEY", "anthropic-private"),
+            ("OPENAI_API_KEY", "openai-private"),
+            ("CODEX_ACCESS_TOKEN", "codex-private"),
+            ("ANTHROPIC_AUTH_TOKEN", "anthropic-auth-private"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-private"),
+            ("XAI_API_KEY", "xai-private"),
+            ("GITHUB_TOKEN", "github-private"),
+            ("GH_TOKEN", "gh-private"),
+            ("COOP_LOCAL_API_KEY", "saved-local-private"),
+            ("SAFE_VALUE", "visible"),
+        ] {
+            state.entries.insert(
+                super::guest_env_state::EnvVarName::new(name).unwrap(),
+                value.to_string(),
+            );
+        }
+        state.save(&inst).unwrap();
+
+        let mut cfg: super::config::CoopConfig = toml::from_str(
+            r#"
+            [grok]
+            api_key = "cmd:exit 42"
+
+            [github]
+            mode = "pat"
+            [github.pat."owner/repo"]
+            token = "cmd:exit 42"
+            "#,
+        )
+        .unwrap();
+        crate::github_assignment::Assignment {
+            repo: crate::github_repo::RepoSlug::new("owner/repo").unwrap(),
+        }
+        .save(&cfg, &inst)
+        .unwrap();
+        for (name, value) in [
+            ("GITHUB_TOKEN", "configured-github-private"),
+            ("GH_TOKEN", "configured-gh-private"),
+            ("COOP_LOCAL_API_KEY", "configured-local-private"),
+        ] {
+            cfg.guest_env.insert(
+                super::guest_env_state::EnvVarName::new(name).unwrap(),
+                value.to_string(),
+            );
+        }
+        cfg.codex.local_model = Some(
+            super::config::LocalModel::new(
+                url::Url::parse("http://127.0.0.1:11434").unwrap(),
+                "test-model".to_string(),
+                Some(super::config::Secret::new("model-secret".to_string())),
+            )
+            .unwrap(),
+        );
+        crate::model_state::ModelState {
+            mode: crate::model_state::ModelMode::Local,
+            ..Default::default()
+        }
+        .save(&inst)
+        .unwrap();
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
+        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "XAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "COOP_LOCAL_API_KEY",
+        ] {
+            assert!(!session.env.contains(name), "{name} must stay on the host");
+        }
+        assert_eq!(
+            session
+                .env
+                .guest_values()
+                .get("SAFE_VALUE")
+                .map(String::as_str),
+            Some("visible")
+        );
+    }
+
+    #[test]
     fn prepare_session_suppresses_openai_key_for_chatgpt_auth_without_proxy() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = super::config::Instance {
             name: super::config::InstanceName::new("test").expect("valid name"),
             index: super::config::InstanceIndex::new(0).expect("0 is in range"),
             dir: tmp.path().to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         };
 
         // No `[proxy.openai]`, so ChatGPT account auth is the *only* reason
@@ -3139,13 +4305,13 @@ mod tests {
         );
         assert!(cfg.proxy.openai.is_none(), "fixture must have no proxy");
 
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
             .expect("ChatGPT account auth must not break session preparation");
@@ -3168,15 +4334,15 @@ mod tests {
     fn prepare_session_skips_overlay_without_instance() {
         use std::num::NonZeroU16;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = super::config::CoopConfig::default();
-        let target = super::backend::SshTarget {
-            host: super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            port: NonZeroU16::new(22).expect("non-zero"),
-            user: super::backend::SshUser::new("ubuntu").expect("valid user"),
-            key_path: tmp.path().join("id_test"),
-            host_tools: cfg.ssh.host_tools.clone(),
-        };
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
+            NonZeroU16::new(22).expect("non-zero"),
+            super::backend::SshUser::new("ubuntu").expect("valid user"),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
 
         let session =
             super::prepare_session_from_target(&cfg, None, target, None).expect("session");
@@ -3240,7 +4406,7 @@ mod tests {
         // at `/workspace` on a reprovision would be a silent relocation.
         // A real directory: `Mount::from_parts` canonicalizes and rejects a
         // host path that is not one.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let host = tmp.path().canonicalize().expect("canonical tempdir");
         let state = ws_state_at(
             super::workspace::WorkspaceSource::Mount {
@@ -3266,7 +4432,7 @@ mod tests {
         // reaches `rsync`, which parses its own source argument. Routing it
         // through `Mount::from_parts` is what rejects it, and doing so before
         // the disk swap is what keeps the instance recoverable.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let not_a_dir = tmp.path().join("regular-file");
         std::fs::write(&not_a_dir, b"x").expect("write file");
 
@@ -3287,11 +4453,18 @@ mod tests {
     #[test]
     fn check_reprovision_workspace_source_accepts_a_live_host_directory() {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: tmp.path().to_path_buf(),
         });
-        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                Some(&state),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3302,9 +4475,30 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::GitRepo {
             url: super::github_repo::GitRepoUrl::new("https://github.com/trailofbits/coop.git"),
         });
-        assert!(super::check_reprovision_workspace_source(&name, Some(&state)).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                Some(&state),
+            )
+            .is_ok()
+        );
+        let isolated = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Isolated,
+            Some(&state),
+        )
+        .expect_err("isolated reprovision must not replay an in-guest clone");
+        assert!(isolated.to_string().contains("git-repo workspace"));
         // Nor does an instance with no recorded association at all.
-        assert!(super::check_reprovision_workspace_source(&name, None).is_ok());
+        assert!(
+            super::check_reprovision_workspace_source(
+                &name,
+                super::config::FirecrackerNetworkMode::Open,
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3313,8 +4507,12 @@ mod tests {
         let state = ws_state(super::workspace::WorkspaceSource::Workspace {
             host_path: std::path::PathBuf::from("/nonexistent/coop/reprovision/workspace"),
         });
-        let err = super::check_reprovision_workspace_source(&name, Some(&state))
-            .expect_err("a missing host directory must be rejected before the wipe");
+        let err = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Open,
+            Some(&state),
+        )
+        .expect_err("a missing host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not a directory"), "{err}");
         // Both recoveries must be ones that actually work: put the directory
         // back at the recorded path, or destroy and re-create. Re-associating
@@ -3335,7 +4533,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
 
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         // 0xFF is not valid UTF-8 in any position.
         let host_path = tmp.path().join(std::ffi::OsStr::from_bytes(b"proj-\xff"));
         std::fs::create_dir(&host_path).expect("create non-UTF-8 dir");
@@ -3346,8 +4544,12 @@ mod tests {
         assert!(host_path.to_str().is_none(), "path must not be valid UTF-8");
 
         let state = ws_state(super::workspace::WorkspaceSource::Workspace { host_path });
-        let err = super::check_reprovision_workspace_source(&name, Some(&state))
-            .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
+        let err = super::check_reprovision_workspace_source(
+            &name,
+            super::config::FirecrackerNetworkMode::Open,
+            Some(&state),
+        )
+        .expect_err("a non-UTF-8 host directory must be rejected before the wipe");
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
         // The only recovery that works. Moving the directory does not: nothing
         // re-points an existing instance's `workspace.json`, so the advice has
@@ -3363,7 +4565,7 @@ mod tests {
         let name = super::config::InstanceName::new("myvm").expect("valid instance name");
         let image = super::config::ImageName::new("rust").expect("valid image name");
         let disk = super::config::GiB::new(20).expect("20 is non-zero");
-        let msg = super::reprovision_partial_message(&name, &image, disk);
+        let msg = super::reprovision_partial_message(&name, &image, disk.as_bytes(), disk);
         // Attached to every failure after the disk is gone, so it has to say
         // both that the instance survived and how to finish the job.
         assert!(msg.contains("myvm"), "{msg}");
@@ -3376,12 +4578,23 @@ mod tests {
             "{msg}"
         );
         // Nothing persists an instance's disk size, so a re-run measures the
-        // replaced template-sized file and skips the re-grow. The size this
+        // replacement image and skips the re-grow. The size this
         // process read before the swap is the only record of it, so the
         // message has to carry both the number and the command that reapplies
         // it — otherwise a prior `coop resize` is silently dropped.
         assert!(msg.contains("20 GiB"), "{msg}");
         assert!(msg.contains("coop resize myvm --size 20"), "{msg}");
+        let nonaligned = super::reprovision_partial_message(
+            &name,
+            &image,
+            super::config::GIB_BYTES + 4096,
+            super::config::GiB::new(2).unwrap(),
+        );
+        assert!(nonaligned.contains("1073745920 bytes"), "{nonaligned}");
+        assert!(
+            nonaligned.contains("coop resize myvm --size 2"),
+            "{nonaligned}"
+        );
     }
 
     #[test]
@@ -3459,7 +4672,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_uses_first_mount_origin() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3485,7 +4698,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_non_github_mount() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         run_git(tmp.path(), &["init", "-q"]);
         run_git(
             tmp.path(),
@@ -3503,7 +4716,7 @@ mod tests {
 
     #[test]
     fn resolve_start_repo_returns_none_for_no_mounts() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let slug = super::resolve_start_repo(&opts).expect("ok");
@@ -3512,7 +4725,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_allows_workspace_affinity_key() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let mut opts = start_opts(Vec::new(), &cfg_path);
         opts.workspace_dir = Some("/some/workspace");
@@ -3521,7 +4734,7 @@ mod tests {
 
     #[test]
     fn restart_ignored_flags_rejects_workspace_with_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let name = super::config::InstanceName::new("explicit").expect("valid name");
         let mut opts = start_opts(Vec::new(), &cfg_path);
@@ -3532,7 +4745,7 @@ mod tests {
 
     #[test]
     fn no_stopped_instance_message_points_creation_to_up() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg_path = tmp.path().join("config.toml");
         let opts = start_opts(Vec::new(), &cfg_path);
         let msg = super::no_stopped_instance_message(&opts, None);
@@ -3541,7 +4754,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_returns_none_when_unmatched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let found = super::find_git_repo_instance(&cfg, "https://example.com/org/absent.git")
             .expect("lookup");
@@ -3550,7 +4763,7 @@ mod tests {
 
     #[test]
     fn find_git_repo_instance_errors_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3570,7 +4783,7 @@ mod tests {
 
     #[test]
     fn ensure_up_git_repo_name_matches_rejects_mismatch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let inst = cfg.allocate_instance(None, &img, None).expect("inst");
@@ -3587,7 +4800,7 @@ mod tests {
 
     #[test]
     fn up_copy_rejects_extra_mount_at_workspace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
@@ -3618,7 +4831,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3640,7 +4853,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_profile_target() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3667,7 +4880,7 @@ mod tests {
 
     #[test]
     fn up_existing_rejects_mismatched_explicit_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3686,7 +4899,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_creation_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let repo_url = "https://github.com/trailofbits/coop.git";
@@ -3715,7 +4928,7 @@ mod tests {
 
     #[test]
     fn up_running_rejects_restart_only_inputs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3733,7 +4946,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_returns_none_when_no_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let ws = tmp.path().join("project");
         std::fs::create_dir(&ws).expect("create_dir");
@@ -3743,7 +4956,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_finds_single_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3762,7 +4975,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_bails_on_multiple_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws = tmp.path().join("project");
@@ -3794,7 +5007,7 @@ mod tests {
 
     #[test]
     fn find_workspace_instance_ignores_unrelated_workspaces() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let ws_a = tmp.path().join("a");
@@ -3813,19 +5026,53 @@ mod tests {
     }
 
     #[test]
-    fn bytes_to_gib_truncates_to_whole_gibibytes() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(super::bytes_to_gib(0), 0);
-        assert_eq!(super::bytes_to_gib(GIB), 1);
+    fn nonaligned_disk_rounds_up_for_relative_resize_and_reprovision() {
+        let base = super::config::GIB_BYTES + 4096;
+        let target = super::config::DiskSize::Relative(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(target.as_u32(), 3);
+        let absolute = super::config::DiskSize::Absolute(super::config::GiB::new(1).unwrap())
+            .resolve_from_bytes(base)
+            .unwrap();
+        assert_eq!(absolute.as_u32(), 1);
+        let preserved = super::config::GiB::from_bytes_ceil(base).unwrap();
         assert_eq!(
-            super::bytes_to_gib(GIB - 1),
-            0,
-            "just under 1 GiB rounds down"
+            super::reprovision_regrow_target(base, super::config::GIB_BYTES, preserved)
+                .unwrap()
+                .as_u32(),
+            2
+        );
+        assert!(
+            super::reprovision_regrow_target(base, 2 * super::config::GIB_BYTES, preserved)
+                .is_none()
+        );
+        assert!(super::reprovision_regrow_target(base, base, preserved).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firecracker_rejects_absolute_target_below_nonaligned_image() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = instance_named("size-boundary", root.path());
+        std::fs::create_dir_all(&inst.dir).unwrap();
+        let rootfs = inst.rootfs_path();
+        std::fs::File::create(&rootfs)
+            .unwrap()
+            .set_len(super::config::GIB_BYTES + 4096)
+            .unwrap();
+        let stopped = super::backend::FirecrackerBackend::new()
+            .as_stopped(inst)
+            .unwrap();
+        let error =
+            crate::setup::resize_rootfs(&stopped, super::config::GiB::new(1).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Shrinking is not supported (current image: 1 GiB + 4096 bytes (1073745920 bytes); requested: 1 GiB (1073741824 bytes))"
         );
         assert_eq!(
-            super::bytes_to_gib(2 * GIB + 512 * 1024 * 1024),
-            2,
-            "2.5 GiB truncates toward zero"
+            std::fs::metadata(rootfs).unwrap().len(),
+            super::config::GIB_BYTES + 4096
         );
     }
 
@@ -3843,12 +5090,13 @@ mod tests {
             dir: dir.to_path_buf(),
             image: super::config::ImageName::new(super::config::DEFAULT_IMAGE)
                 .expect("DEFAULT_IMAGE is valid"),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
     #[test]
     fn creation_options_rejected_message_names_instance_and_recovery() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let inst = instance_named("demo", tmp.path());
         let msg = super::creation_options_rejected_message(&inst);
         assert!(msg.contains("demo"), "{msg}");
@@ -3861,7 +5109,7 @@ mod tests {
     /// *different* image). Pins the `!=` comparison at the image check.
     #[test]
     fn up_existing_accepts_matching_image() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3889,7 +5137,7 @@ mod tests {
     /// `extra_mount` emptiness test.
     #[test]
     fn up_existing_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3932,7 +5180,7 @@ mod tests {
     /// a matching transport).
     #[test]
     fn up_existing_accepts_matching_transport() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let img = super::config::default_image_name();
         let project = tmp.path().join("project");
@@ -3954,7 +5202,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_accepts_matching_image_and_profile() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
 
         // Matching --image is compatible.
@@ -3983,7 +5231,7 @@ mod tests {
 
     #[test]
     fn up_existing_git_repo_rejects_each_creation_flag_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
         let inst = cfg
             .allocate_instance(None, &super::config::default_image_name(), None)
