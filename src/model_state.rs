@@ -32,8 +32,8 @@ use crate::config::{ClaudeConfig, CodexConfig, Instance, LocalModel};
 pub const CODEX_LOCAL_PROVIDER: &str = "coop_local";
 
 /// Env var Codex reads the local provider's API key from (`env_key`).
-/// Forwarded to the guest with the configured (or dummy) token whenever
-/// the VM is in local mode.
+/// Forwarded with the configured (or dummy) token in open-network local-mode
+/// sessions. Isolated sessions suppress it because local routing is unavailable.
 pub const CODEX_LOCAL_ENV_KEY: &str = "COOP_LOCAL_API_KEY";
 
 /// Whether a VM's agents target the cloud or a host-side local server.
@@ -255,10 +255,10 @@ pub fn codex_local_config(base_url: &str, model: &str) -> toml::Table {
 /// injecting the real credential upstream.
 ///
 /// The `base_url` gets an `/v1` suffix: Codex forms the request URL as
-/// `{base_url}/responses`, and the proxy forwards the path verbatim to
-/// `api.openai.com`, so the guest must produce `/v1/responses` (`OpenAI`'s
-/// Responses endpoint) — mirroring `OpenAI`'s own `https://api.openai.com/v1`
-/// provider base.
+/// `{base_url}/responses`, so the guest must produce `/v1/responses` in both
+/// auth modes. The proxy forwards that path verbatim to `api.openai.com` for
+/// Platform API keys, or translates it to `/backend-api/codex/responses` at
+/// `chatgpt.com` for workspace PATs.
 pub fn codex_proxy_config(base_url: &str) -> toml::Table {
     let mut provider = toml::Table::new();
     provider.insert(
@@ -272,6 +272,16 @@ pub fn codex_proxy_config(base_url: &str) -> toml::Table {
     provider.insert(
         "wire_api".to_string(),
         toml::Value::String("responses".to_string()),
+    );
+    // The guest authenticates only with its capability token. This proxy
+    // supports streaming HTTP, so no first-party login or WS is needed.
+    provider.insert(
+        "requires_openai_auth".to_string(),
+        toml::Value::Boolean(false),
+    );
+    provider.insert(
+        "supports_websockets".to_string(),
+        toml::Value::Boolean(false),
     );
     provider.insert(
         "env_key".to_string(),
@@ -328,6 +338,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir,
             image: ImageName::new("test.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
@@ -635,6 +646,8 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str().unwrap(), "responses");
         assert_eq!(provider["env_key"].as_str().unwrap(), CODEX_LOCAL_ENV_KEY);
         assert_eq!(provider["name"].as_str().unwrap(), "coop credential proxy");
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
     }
 
     #[test]

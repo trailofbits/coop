@@ -34,13 +34,19 @@ pub(crate) fn cmd_proxy(cfg: &CoopConfig, config_path: &Path, action: &ProxyActi
             anthropic: _,
             vm,
             api_key,
+            codex_access_token,
         } => {
             let provider = if *openai {
                 Provider::Openai
             } else {
                 Provider::Anthropic
             };
-            run_setup(cfg, config_path, provider, vm.as_deref(), *api_key)
+            let auth = if *codex_access_token {
+                ProxyAuthScheme::CodexAccessToken
+            } else {
+                auth_for(provider, *api_key)
+            };
+            run_setup(cfg, config_path, provider, vm.as_deref(), auth)
         }
         ProxyAction::Status { vm } => run_status(cfg, vm.as_deref()),
     }
@@ -53,7 +59,7 @@ fn run_setup(
     config_path: &Path,
     provider: Provider,
     vm: Option<&str>,
-    api_key: bool,
+    auth: ProxyAuthScheme,
 ) -> Result<()> {
     // Validate the target VM (name + existence) up front, before the raw `--vm`
     // string reaches the secret-store filesystem path or a secret is written:
@@ -68,10 +74,12 @@ fn run_setup(
         None => None,
     };
 
-    let auth = auth_for(provider, api_key);
     print_setup_guidance(provider, auth);
 
     let token = read_token_no_echo()?;
+    if auth == ProxyAuthScheme::CodexAccessToken {
+        crate::codex_token::load_metadata(&token)?;
+    }
     let backend = pick_backend()?;
 
     let service = service_for(provider, inst.as_ref().map(|i| i.name.as_str()));
@@ -107,10 +115,15 @@ fn auth_for(provider: Provider, api_key: bool) -> ProxyAuthScheme {
 
 fn print_setup_guidance(provider: Provider, auth: ProxyAuthScheme) {
     match provider {
+        Provider::Openai if auth == ProxyAuthScheme::CodexAccessToken => eprintln!(
+            "Paste a Codex-scoped access token (at-...) from ChatGPT Admin > Access tokens. \
+             It uses your workspace's Codex entitlements. The token stays on the host; \
+             guest processes receive only a local proxy capability token."
+        ),
         Provider::Openai => eprintln!(
             "Paste your OpenAI API key (sk-...). It is stored in your chosen secret backend, \
              never as plaintext in the config, and injected as Authorization: Bearer upstream. \
-             Codex subscription (auth.json) is not supported in proxy mode — use an API key."
+             For a workspace Codex access token, use --openai --codex-access-token."
         ),
         Provider::Anthropic if auth == ProxyAuthScheme::ApiKey => eprintln!(
             "Paste your Anthropic API key (sk-ant-...). It is stored in your chosen secret \
@@ -190,6 +203,7 @@ fn auth_str(auth: ProxyAuthScheme) -> &'static str {
     match auth {
         ProxyAuthScheme::ApiKey => "api_key",
         ProxyAuthScheme::Bearer => "bearer",
+        ProxyAuthScheme::CodexAccessToken => "codex_access_token",
     }
 }
 
@@ -404,7 +418,11 @@ mod tests {
     #[test]
     fn auth_str_matches_serde_encoding() {
         // Guard against drift from ProxyAuthScheme's serde rename.
-        for scheme in [ProxyAuthScheme::ApiKey, ProxyAuthScheme::Bearer] {
+        for scheme in [
+            ProxyAuthScheme::ApiKey,
+            ProxyAuthScheme::Bearer,
+            ProxyAuthScheme::CodexAccessToken,
+        ] {
             let serde_str = toml::Value::try_from(scheme).unwrap();
             assert_eq!(serde_str.as_str(), Some(auth_str(scheme)));
         }
@@ -419,6 +437,45 @@ mod tests {
             auth_for(Provider::Anthropic, false),
             ProxyAuthScheme::Bearer
         );
+    }
+
+    #[test]
+    fn setup_persists_codex_token_mode_for_defaults_and_vm_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::fs_util::private_dir(dir.path()).unwrap();
+        let path = config_at(dir.path(), "ssh_port = 2222\n");
+        upsert_proxy_entry(
+            &path,
+            Provider::Openai,
+            "cmd:token-store",
+            ProxyAuthScheme::CodexAccessToken,
+        )
+        .unwrap();
+        let cfg: CoopConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.proxy.openai.unwrap().auth,
+            ProxyAuthScheme::CodexAccessToken
+        );
+        let inst = crate::config::Instance {
+            name: crate::config::InstanceName::new("token-vm").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: dir.path().join("token-vm"),
+            image: crate::config::ImageName::new("base.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        store_vm_override(
+            &inst,
+            Provider::Openai,
+            "cmd:vm-token-store",
+            ProxyAuthScheme::CodexAccessToken,
+        )
+        .unwrap();
+        let state = ProxyState::load_or_default(&inst).unwrap();
+        let upstream = state.openai.unwrap();
+        assert_eq!(upstream.auth, ProxyAuthScheme::CodexAccessToken);
+        assert_eq!(upstream.credential.expose(), "cmd:vm-token-store");
     }
 
     #[test]

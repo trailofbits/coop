@@ -47,7 +47,7 @@
 (allow network-inbound (local ip "localhost:*"))
 
 ;; Egress allowlist: connect out only to the upstream HTTPS port and DNS.
-;; This is port-scoped, not host-scoped — the two upstreams' identity is
+;; This is port-scoped, not host-scoped — the fixed upstreams' identity is
 ;; enforced at the TLS layer in the proxy, and the guest cannot retarget them.
 (allow network-outbound (remote tcp "*:443"))
 (allow network-outbound (remote tcp "*:53"))

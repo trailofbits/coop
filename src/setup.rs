@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
@@ -123,11 +124,41 @@ pub struct TemplateConfig {
     pub grok_plugins: Vec<String>,
     #[serde(default)]
     pub guest_user: GuestUser,
+    /// Guest facilities that host-side lifecycle features may depend on.
+    /// Missing on older images, which must conservatively mean unsupported.
+    #[serde(default)]
+    pub capabilities: BTreeSet<ImageCapability>,
+}
+
+const FIRECRACKER_VSOCK_SOCKET_UNIT: &str = "[Unit]\n\
+Description=coop SSH over Firecracker vsock\n\n\
+[Socket]\n\
+ListenStream=vsock::22\n\n\
+[Install]\n\
+WantedBy=sockets.target\n";
+
+const FIRECRACKER_VSOCK_SERVICE_UNIT: &str = "[Unit]\n\
+Description=Forward coop Firecracker vsock connections to SSH\n\
+Requires=ssh.service\n\
+After=ssh.service\n\n\
+[Service]\n\
+Type=notify\n\
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:22\n\
+PrivateTmp=yes\n\
+PrivateNetwork=no\n";
+
+/// A durable promise made by an image's guest filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageCapability {
+    /// The canonical enabled `AF_VSOCK` SSH listener and its direct packaged
+    /// dependencies are present. Runtime health is still proved by SSH
+    /// readiness when the VM boots.
+    FirecrackerVsockSsh,
 }
 
 impl TemplateConfig {
     pub fn load_for(cfg: &CoopConfig, image: &ImageName) -> Result<Self> {
-        crate::private_storage::prepare_directory(&cfg.image_dir(image))?;
         let path = cfg.template_config_path_for(image);
         let directory = crate::fs_util::PrivateDir::open_existing(&cfg.image_dir(image))?;
         let content = directory
@@ -200,15 +231,19 @@ pub fn create_instance(
     tracing::info!("Creating instance '{}' from template", inst.name);
     reflink_copy(&template, &rootfs).context("Failed to copy template to instance")?;
 
-    // Resize if requested and larger than template
+    // The image file, including committed images, is authoritative. Config
+    // describes the setup default and may differ from this image's length.
     if let Some(requested) = disk_gib {
-        let template_size = cfg.vm.template_size_gib;
-        if requested < template_size {
+        let template_bytes = std::fs::metadata(&rootfs)
+            .with_context(|| format!("Failed to stat {}", rootfs.display()))?
+            .len();
+        if requested.as_bytes() < template_bytes {
             tracing::warn!(
-                "Requested disk size ({requested} GiB) < template ({template_size} GiB), \
-                 using template size"
+                "Requested disk size ({}) < template image ({}), using image size",
+                crate::config::format_disk_bytes(requested.as_bytes()),
+                crate::config::format_disk_bytes(template_bytes),
             );
-        } else if requested > template_size {
+        } else if requested.as_bytes() > template_bytes {
             tracing::info!("Resizing instance to {requested} GiB");
             crate::privileged_disk::truncate_gib(&rootfs, requested.as_u32())?;
             crate::privileged_disk::fsck_fix(&rootfs)?;
@@ -227,8 +262,6 @@ pub fn resize_rootfs(
     stopped: &crate::backend::StoppedInstance,
     new_size: crate::config::GiB,
 ) -> Result<()> {
-    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
-
     let inst = stopped.instance();
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
@@ -238,19 +271,20 @@ pub fn resize_rootfs(
     let current_bytes = std::fs::metadata(&rootfs)
         .with_context(|| format!("Failed to stat {}", rootfs.display()))?
         .len();
-    let requested_bytes = u64::from(new_size.as_u32()) * GIB_BYTES;
+    let requested_bytes = new_size.as_bytes();
 
     if requested_bytes < current_bytes {
         bail!(
-            "Shrinking is not supported (current image: {current_bytes} bytes, \
-             requested: {requested_bytes} bytes)"
+            "Shrinking is not supported (current image: {}; requested: {})",
+            crate::config::format_disk_bytes(current_bytes),
+            crate::config::format_disk_bytes(requested_bytes),
         );
     }
     if requested_bytes > current_bytes {
         tracing::info!(
             "Resizing instance '{}' from {} to {new_size} GiB",
             inst.name,
-            current_bytes / GIB_BYTES
+            crate::config::format_disk_bytes(current_bytes)
         );
         crate::privileged_disk::truncate_gib(&rootfs, new_size.as_u32())?;
     }
@@ -281,7 +315,12 @@ fn reflink_copy(src: &Path, dst: &Path) -> Result<()> {
 /// already gated on the instance being stopped (filesystem consistency)
 /// and decided whether overwriting an existing image is allowed.
 #[cfg(target_os = "linux")]
-pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+pub fn commit_instance_rootfs(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+) -> Result<()> {
     let rootfs = inst.rootfs_path();
     if !rootfs.exists() {
         bail!("Instance rootfs not found at {}", rootfs.display());
@@ -292,12 +331,116 @@ pub fn commit_instance_rootfs(cfg: &CoopConfig, inst: &Instance, image: &ImageNa
         .with_context(|| format!("Failed to create image dir {}", image_dir.display()))?;
 
     let template = cfg.template_path_for(image);
-    // Remove an existing (root-owned) template so the copy is a clean
-    // overwrite rather than appending to or failing on the old file.
-    crate::privileged_disk::remove(&template)?;
-
+    let staging = template.with_extension("ext4.new");
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
-    reflink_copy(&rootfs, &template)
+    // Repair a private staging disk before publishing it. The existing image
+    // and its metadata remain a matched pair if copying, repair, or unmounting
+    // fails; swap is the only operation that replaces the live disk.
+    if let Err(error) = crate::privileged_disk::remove(&staging) {
+        tracing::debug!("Failed to remove stale commit staging disk (non-fatal): {error}");
+    }
+    let result = (|| {
+        reflink_copy(&rootfs, &staging)?;
+        patch_image_vsock_listener(&staging, &cfg.data_dir.join("rootfs-mount"))?;
+        begin_image_publication(cfg, image)?;
+        crate::privileged_disk::swap(&staging).context("Failed to publish committed image disk")?;
+        if std::env::var_os("COOP_TEST_INJECT_COMMIT_METADATA_FAILURE").is_some() {
+            bail!("Injected commit metadata failure");
+        }
+        metadata.save_for(cfg, image)?;
+        finish_image_publication(cfg, image)
+    })();
+    if result.is_err()
+        && let Err(error) = crate::privileged_disk::remove(&staging)
+    {
+        tracing::debug!("Failed to remove commit staging disk (non-fatal): {error}");
+    }
+    result
+}
+
+const IMAGE_PUBLICATION_MARKER: &str = ".publication-incomplete";
+
+fn image_publication_marker(cfg: &CoopConfig, image: &ImageName) -> PathBuf {
+    cfg.image_dir(image).join(IMAGE_PUBLICATION_MARKER)
+}
+
+pub(crate) fn begin_image_publication(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    crate::fs_util::atomic_write_with_mode(
+        &image_publication_marker(cfg, image),
+        "image publication in progress\n",
+        0o600,
+    )
+}
+
+pub(crate) fn finish_image_publication(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    let marker = image_publication_marker(cfg, image);
+    match fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to remove {}", marker.display())),
+    }
+}
+
+pub(crate) fn validate_image_publication(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
+    if image_publication_marker(cfg, image).exists() {
+        bail!(
+            "Image '{image}' has an incomplete publication and cannot be used. If commit was \
+             interrupted, retry `coop commit --image {image} --force` from its source instance. \
+             If setup was interrupted, rerun `coop setup --image {image} --rebuild`. Rebuilding \
+             a committed checkpoint discards its contents"
+        );
+    }
+    Ok(())
+}
+
+/// Serialize an image's metadata and backend artifacts as one contract.
+pub(crate) fn lock_image_publication(
+    cfg: &CoopConfig,
+    image: &ImageName,
+) -> Result<crate::fs_util::FileLock> {
+    crate::fs_util::private_dir(&cfg.images_dir())?;
+    crate::fs_util::lock_sibling(&cfg.image_dir(image))
+}
+
+/// Best-effort removal of a directory created for a new image whose commit
+/// failed before publication. Only known bounded scratch names are removed;
+/// a published disk, metadata, or incomplete marker keeps the directory.
+pub(crate) fn cleanup_unpublished_image_dir(cfg: &CoopConfig, image: &ImageName) {
+    let image_dir = cfg.image_dir(image);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = crate::privileged_disk::cleanup_copy_scratch(&image_dir) {
+        tracing::debug!("Failed to remove image copy scratch files: {error}");
+    }
+    if let Err(error) = fs::remove_dir(&image_dir)
+        && error.kind() != io::ErrorKind::NotFound
+        && error.kind() != io::ErrorKind::DirectoryNotEmpty
+    {
+        tracing::debug!(
+            "Failed to remove unpublished image directory {}: {error}",
+            image_dir.display()
+        );
+    }
+}
+
+/// Re-establish coop's host-control listener in an untrusted guest snapshot.
+///
+/// A stopped instance can have guest-authored changes, so its source image's
+/// capability metadata cannot be inherited as proof. Patch the copied disk
+/// with canonical units before the caller publishes fresh metadata.
+#[cfg(target_os = "linux")]
+fn patch_image_vsock_listener(rootfs: &Path, mount_dir: &Path) -> Result<()> {
+    let rootfs_str = rootfs.display().to_string();
+    let mount_str = mount_dir.display().to_string();
+    let guard = MountGuard::simple(&rootfs_str, &mount_str)?;
+    Cmd::new(crate::privileged_disk::running_executable_path())
+        .arg("__patch-guest-vsock-listener")
+        .arg(&mount_str)
+        .sudo()
+        .run()
+        .context("Failed to restore Firecracker vsock listener in image")?;
+    guard
+        .finish()
+        .context("Failed to unmount repaired Firecracker image")
 }
 
 /// Replace a stopped instance's rootfs with image `image`'s template.
@@ -341,48 +484,51 @@ struct MountGuard {
     disk_path: PathBuf,
     kind: MountKind,
     mounted: bool,
+    _mount_lock: crate::fs_util::FileLock,
 }
 
 #[cfg(target_os = "linux")]
 impl MountGuard {
     /// Simple loop mount: mount `rootfs` at `mount_path`.
     fn simple(rootfs: &str, mount_path: &str) -> Result<Self> {
+        let mount_lock = crate::fs_util::lock_sibling(Path::new(mount_path))?;
         crate::privileged_disk::mount(Path::new(rootfs)).context("Failed to mount rootfs")?;
         Ok(Self {
             mount_path: mount_path.to_string(),
             disk_path: PathBuf::from(rootfs),
             kind: MountKind::Simple,
             mounted: true,
+            _mount_lock: mount_lock,
         })
     }
 
     /// Full chroot mount: rootfs + proc/sys/dev/devpts/tmp.
     fn chroot(rootfs: &str, mount_path: &str) -> Result<Self> {
+        let mount_lock = crate::fs_util::lock_sibling(Path::new(mount_path))?;
         mount_chroot(rootfs, mount_path)?;
         Ok(Self {
             mount_path: mount_path.to_string(),
             disk_path: PathBuf::from(rootfs),
             kind: MountKind::Chroot,
             mounted: true,
+            _mount_lock: mount_lock,
         })
     }
 
-    fn unmount_simple_with(&mut self, unmount: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-        unmount(&self.disk_path)?;
-        self.mounted = false;
-        Ok(())
+    /// Tear down the mount while errors can still abort publication.
+    fn finish(mut self) -> Result<()> {
+        match self.kind {
+            MountKind::Chroot => self.unmount_with(unmount_chroot),
+            MountKind::Simple => self.unmount_with(unmount_simple),
+        }
     }
 
-    fn finish_simple_with(&mut self, unmount: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-        self.unmount_simple_with(unmount)
-            .with_context(|| format!("Failed to unmount {}", self.mount_path))?;
-        if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
-            tracing::warn!(
-                "Failed to remove mount dir {} (non-fatal): {e}",
-                self.mount_path
-            );
+    fn unmount_with(&mut self, unmount: impl FnOnce(&Path, &str) -> Result<()>) -> Result<()> {
+        let result = unmount(&self.disk_path, &self.mount_path);
+        if result.is_ok() {
+            self.mounted = false;
         }
-        Ok(())
+        result
     }
 }
 
@@ -392,21 +538,27 @@ impl Drop for MountGuard {
         if !self.mounted {
             return;
         }
-        match self.kind {
+        let result = match self.kind {
             MountKind::Chroot => unmount_chroot(&self.disk_path, &self.mount_path),
-            MountKind::Simple => {
-                if let Err(e) = crate::privileged_disk::unmount(&self.disk_path) {
-                    tracing::warn!("Failed to unmount {} (non-fatal): {e}", self.mount_path);
-                }
-                if let Err(e) = Cmd::new("rmdir").arg(&self.mount_path).sudo().run() {
-                    tracing::warn!(
-                        "Failed to remove mount dir {} (non-fatal): {e}",
-                        self.mount_path
-                    );
-                }
-            }
+            MountKind::Simple => unmount_simple(&self.disk_path, &self.mount_path),
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                "Failed to clean up mount {} (non-fatal during error recovery): {error}",
+                self.mount_path
+            );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_simple(disk: &Path, mount_path: &str) -> Result<()> {
+    crate::privileged_disk::unmount(disk)
+        .with_context(|| format!("Failed to unmount {mount_path}"))?;
+    if let Err(error) = Cmd::new("rmdir").arg(mount_path).sudo().run() {
+        tracing::warn!("Failed to remove mount directory {mount_path} (non-fatal): {error}");
+    }
+    Ok(())
 }
 
 /// Mount the instance rootfs and rewrite its network identity: the
@@ -424,34 +576,18 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         inst.guest_ip()
     );
 
-    let mut guard = MountGuard::simple(&rootfs_str, &mount_str)?;
-    patch_guest_network_mounted(
-        &mut guard,
-        || {
-            Cmd::new(crate::privileged_disk::running_executable_path())
-                .arg("__patch-guest-network")
-                .arg(&mount_str)
-                .arg(&hostname)
-                .arg(inst.guest_ip().to_string())
-                .sudo()
-                .run()
-                .context("Failed to patch guest network and identity")
-        },
-        crate::privileged_disk::unmount,
-    )
-}
+    let guard = MountGuard::simple(&rootfs_str, &mount_str)?;
 
-#[cfg(target_os = "linux")]
-fn patch_guest_network_mounted(
-    guard: &mut MountGuard,
-    patch: impl FnOnce() -> Result<()>,
-    unmount: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
-    let patch_result = patch();
-    // A failed unmount must prevent Firecracker from opening this disk. Drop
-    // makes one more cleanup attempt if the explicit unmount fails.
-    guard.finish_simple_with(unmount)?;
-    patch_result
+    Cmd::new(crate::privileged_disk::running_executable_path())
+        .arg("__patch-guest-network")
+        .arg(&mount_str)
+        .arg(&hostname)
+        .arg(inst.guest_ip().to_string())
+        .sudo()
+        .run()
+        .context("Failed to patch guest network and identity")?;
+
+    guard.finish()
 }
 
 /// Debian/Ubuntu convention: the machine's own name lives on a `127.0.1.1`
@@ -518,6 +654,208 @@ pub(crate) fn patch_guest_network_files(
     )
     .context("Failed to write guest hostname")?;
     patch_guest_hosts(mount, hostname).context("Failed to patch guest hosts file")
+}
+
+/// Install the canonical Firecracker vsock SSH units and enable the socket.
+///
+/// Every guest path is traversed through pinned, no-follow directory
+/// descriptors. The final unit files and enablement link are replaced rather
+/// than followed, because all existing entries are guest-authored.
+#[cfg(target_os = "linux")]
+pub(crate) fn patch_guest_vsock_listener_files(mount: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, symlink};
+
+    replace_guest_file(
+        mount,
+        &["etc", "systemd", "system"],
+        "coop-vsock-ssh.socket",
+        FIRECRACKER_VSOCK_SOCKET_UNIT.as_bytes(),
+    )
+    .context("Failed to write guest vsock socket unit")?;
+    replace_guest_file(
+        mount,
+        &["etc", "systemd", "system"],
+        "coop-vsock-ssh.service",
+        FIRECRACKER_VSOCK_SERVICE_UNIT.as_bytes(),
+    )
+    .context("Failed to write guest vsock service unit")?;
+
+    let open_directory = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
+    let mut guest_path = PathBuf::from("/");
+    for component in ["etc", "systemd", "system"] {
+        guest_path.push(component);
+        directory = open_directory(&PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            directory.as_raw_fd(),
+            component
+        )))
+        .with_context(|| format!("Guest {} must be a directory", guest_path.display()))?;
+    }
+    let system_dir = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let wants_path = system_dir.join("sockets.target.wants");
+    match fs::DirBuilder::new().mode(0o755).create(&wants_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("Failed to create guest sockets.target.wants"),
+    }
+    let wants = open_directory(&wants_path)
+        .context("Guest sockets.target.wants must be a real directory")?;
+    let wants_dir = PathBuf::from(format!("/proc/self/fd/{}", wants.as_raw_fd()));
+    let staging_name = format!(".coop-vsock-ssh.socket.{}.new", std::process::id());
+    let staging = wants_dir.join(&staging_name);
+    if let Err(error) = fs::remove_file(&staging)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error).context("Failed to remove stale vsock enablement staging link");
+    }
+    symlink("../coop-vsock-ssh.socket", &staging)
+        .context("Failed to stage guest vsock socket enablement")?;
+    let enabled = wants_dir.join("coop-vsock-ssh.socket");
+    let result = fs::rename(&staging, &enabled)
+        .context("Failed to enable guest vsock socket with an atomic rename");
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result?;
+
+    verify_guest_regular_file(
+        mount,
+        &["usr", "lib", "systemd"],
+        "systemd-socket-proxyd",
+        true,
+    )
+    .context("Guest systemd-socket-proxyd is unavailable")?;
+    verify_guest_regular_file(mount, &["usr", "sbin"], "sshd", true)
+        .context("Guest sshd is unavailable")?;
+    verify_guest_regular_file(
+        mount,
+        &["usr", "lib", "systemd", "system"],
+        "ssh.service",
+        false,
+    )
+    .context("Guest vendor ssh.service is unavailable")?;
+    reject_masked_guest_unit(mount, "ssh.service")
+}
+
+#[cfg(target_os = "linux")]
+fn reject_masked_guest_unit(mount: &Path, unit: &str) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let open_directory = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
+    for component in ["etc", "systemd", "system"] {
+        directory = open_directory(&PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            directory.as_raw_fd(),
+            component
+        )))
+        .context("Guest /etc/systemd/system must be a real directory")?;
+    }
+    let path = PathBuf::from(format!("/proc/self/fd/{}/{}", directory.as_raw_fd(), unit));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::read_link(&path)?;
+            if guest_unit_target_is_dev_null(&target) {
+                bail!("Guest {unit} is masked");
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("Failed to inspect guest {unit}")),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn guest_unit_target_is_dev_null(target: &Path) -> bool {
+    use std::path::Component;
+
+    let mut resolved = if target.is_absolute() {
+        Vec::new()
+    } else {
+        vec!["etc", "systemd", "system"]
+    };
+    for component in target.components() {
+        match component {
+            Component::RootDir => resolved.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(component) => {
+                let Some(component) = component.to_str() else {
+                    return false;
+                };
+                resolved.push(component);
+            }
+            Component::Prefix(_) => return false,
+        }
+    }
+    resolved == ["dev", "null"]
+}
+
+/// Verify a packaged guest file through pinned, no-follow descriptors.
+///
+/// Commit input is guest-authored, so validation must not execute guest
+/// binaries or let a symlink escape the mounted image.
+#[cfg(target_os = "linux")]
+fn verify_guest_regular_file(
+    mount: &Path,
+    parents: &[&str],
+    name: &str,
+    executable: bool,
+) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let open_directory = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut directory = open_directory(mount).context("Failed to open mounted rootfs")?;
+    for component in parents {
+        directory = open_directory(&PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            directory.as_raw_fd(),
+            component
+        )))
+        .with_context(|| format!("Guest /{} must be a real directory", parents.join("/")))?;
+    }
+    let entry = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            directory.as_raw_fd(),
+            name
+        )))?;
+    let metadata = entry.metadata()?;
+    if !metadata.is_file() {
+        bail!(
+            "Guest /{}/{} is not a regular file",
+            parents.join("/"),
+            name
+        );
+    }
+    if executable && metadata.permissions().mode() & 0o111 == 0 {
+        bail!("Guest /{}/{} is not executable", parents.join("/"), name);
+    }
+    Ok(())
 }
 
 /// Replace a guest file without following any guest-authored path component.
@@ -677,6 +1015,25 @@ fn hosts_with_hostname(contents: &str, hostname: &str) -> String {
 fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     let image = &opts.image;
     let template = cfg.template_path_for(image);
+    let _image_lock = lock_image_publication(cfg, image)?;
+    if !opts.rebuild {
+        validate_image_publication(cfg, image)?;
+    }
+    // A legacy checkpoint must not be replaced implicitly, even when its
+    // recipe hashes differ from today's setup inputs.
+    if template.exists()
+        && !opts.rebuild
+        && let Ok(existing) = TemplateConfig::load_for(cfg, image)
+        && !existing
+            .capabilities
+            .contains(&ImageCapability::FirecrackerVsockSsh)
+    {
+        bail!(
+            "Image '{image}' lacks the Firecracker vsock SSH listener. A base image can be \
+             rebuilt with `coop setup --image {image} --rebuild`; rebuilding a committed \
+             checkpoint discards its contents"
+        );
+    }
     let (profiles, extra_packages) = resolve_template_config(cfg, opts)?;
 
     // Compose the install recipe and compute its hashes.
@@ -727,6 +1084,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         grok_marketplaces: Vec::new(),
         grok_plugins: Vec::new(),
         guest_user: opts.guest_user.clone(),
+        capabilities: BTreeSet::from([ImageCapability::FirecrackerVsockSsh]),
     };
 
     let result = build_template(cfg, opts, image, &recipe, &template_config, &staging);
@@ -739,13 +1097,25 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
         return Err(e);
     }
 
-    // Swap staging into place — old template is replaced atomically
-    crate::privileged_disk::swap(&staging).context("Failed to swap staging template into place")?;
+    publish_template(cfg, image, &template_config, || {
+        crate::privileged_disk::swap(&staging).context("Failed to swap staging template into place")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_template(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+    swap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Keep consumers from using a replaced disk until its metadata is published.
+    begin_image_publication(cfg, image)?;
+    swap()?;
 
     // Write template config only after image swap succeeds.
-    // If we crash between swap and config write, staleness
-    // detection triggers a rebuild on next run (safe).
-    template_config.save_for(cfg, image)?;
+    metadata.save_for(cfg, image)?;
+    finish_image_publication(cfg, image)?;
 
     Ok(())
 }
@@ -756,8 +1126,8 @@ fn profile_names(profiles: &[ProfileDef]) -> Vec<String> {
 
 /// Returns `true` if the template needs rebuilding.
 ///
-/// A rebuild is needed when the config file is missing (orphaned
-/// template image) or the install-script hash has changed.
+/// A rebuild is needed when metadata is missing, recipe inputs changed, or an
+/// image predates the required Firecracker control-plane capability.
 fn needs_rebuild(
     cfg: &CoopConfig,
     image: &ImageName,
@@ -768,7 +1138,19 @@ fn needs_rebuild(
         tracing::info!("Template config missing — treating template as stale");
         return true;
     };
-    existing.install_script_hash != current_hash || existing.post_install_hash != current_post_hash
+    template_config_needs_rebuild(&existing, current_hash, current_post_hash)
+}
+
+fn template_config_needs_rebuild(
+    existing: &TemplateConfig,
+    current_hash: Sha256Hash,
+    current_post_hash: Option<Sha256Hash>,
+) -> bool {
+    existing.install_script_hash != current_hash
+        || existing.post_install_hash != current_post_hash
+        || !existing
+            .capabilities
+            .contains(&ImageCapability::FirecrackerVsockSsh)
 }
 
 /// The recipe inputs for a template build: the composed install script,
@@ -845,6 +1227,10 @@ fn build_template(
         &opts.guest_user,
         opts.builder_timeout,
     )?;
+    // A root post-install script can replace or disable the control listener.
+    // Re-establish the canonical files only after all guest-authored setup has
+    // completed, then verify that unmounting succeeds before publication.
+    patch_image_vsock_listener(output_path, &cfg.data_dir.join("rootfs-mount"))?;
 
     // Clean up intermediate files
     eprintln!("  Cleaning up...");
@@ -1585,7 +1971,7 @@ fn install_guest_packages(
     let mount_dir = cfg.data_dir.join("rootfs-mount");
     let mount_str = mount_dir.display().to_string();
 
-    let _guard = MountGuard::chroot(&template_str, &mount_str)?;
+    let guard = MountGuard::chroot(&template_str, &mount_str)?;
 
     let mut command = Cmd::new("chroot").arg(&mount_str);
     if let Some(timeout) = builder_timeout {
@@ -1600,8 +1986,7 @@ fn install_guest_packages(
 
     verify_chroot_binaries(&mount_str, guest_user)?;
 
-    // _guard dropped here → unmount_chroot runs regardless of status
-    Ok(())
+    guard.finish()
 }
 
 /// Verify critical binaries exist in the chroot after provisioning.
@@ -1639,24 +2024,28 @@ fn mount_chroot(rootfs: &str, mount_str: &str) -> Result<()> {
         Ok(())
     })();
     if result.is_err() {
-        unmount_chroot(disk, mount_str);
+        let _ = unmount_chroot(disk, mount_str);
     }
     result
 }
 
 #[cfg(target_os = "linux")]
-fn unmount_chroot(disk: &Path, mount_str: &str) {
+fn unmount_chroot(disk: &Path, mount_str: &str) -> Result<()> {
+    let mut first_error = None;
     for child in ["tmp", "devpts", "dev", "sys", "proc"] {
         if let Err(e) = crate::privileged_disk::unmount_sub(disk, child) {
-            tracing::debug!("Failed to unmount {child} (non-fatal): {e}");
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("Failed to unmount {mount_str}/{child}: {e}")
+            });
         }
     }
     if let Err(e) = crate::privileged_disk::unmount(disk) {
-        tracing::warn!("Failed to unmount {mount_str} (non-fatal): {e}");
+        first_error.get_or_insert_with(|| anyhow::anyhow!("Failed to unmount {mount_str}: {e}"));
     }
-    if let Err(e) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
-        tracing::warn!("Failed to remove mount dir {mount_str} (non-fatal): {e}");
+    if let Err(error) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
+        tracing::warn!("Failed to remove mount directory {mount_str} (non-fatal): {error}");
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── General helpers ───────────────────────────────────────────
@@ -1821,25 +2210,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn busy_network_patch_unmount_returns_error_before_start() {
+        let root = tempfile::tempdir().unwrap();
+        let mount_path = root.path().join("rootfs-mount");
         let mut guard = MountGuard {
-            mount_path: "unused".to_string(),
-            disk_path: PathBuf::from("/unused/rootfs.ext4"),
+            mount_path: mount_path.display().to_string(),
+            disk_path: root.path().join("rootfs.ext4"),
             kind: MountKind::Simple,
             mounted: true,
+            _mount_lock: crate::fs_util::lock_sibling(&mount_path).unwrap(),
         };
-        let error = patch_guest_network_mounted(
-            &mut guard,
-            || Ok(()),
-            |_| Err(io::Error::from_raw_os_error(libc::EBUSY).into()),
-        )
-        .unwrap_err();
+        let result =
+            guard.unmount_with(|_, _| Err(io::Error::from_raw_os_error(libc::EBUSY).into()));
+        let still_mounted = guard.mounted;
+        // Disarm the synthetic guard before assertions so a regression cannot
+        // invoke real privileged cleanup while the test is unwinding.
+        guard.unmount_with(|_, _| Ok(())).unwrap();
+        let error = result.unwrap_err();
         assert_eq!(
             error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
             Some(libc::EBUSY)
         );
-        assert!(guard.mounted);
-
-        guard.unmount_simple_with(|_| Ok(())).unwrap();
+        assert!(still_mounted);
         assert!(!guard.mounted);
     }
 
@@ -1922,7 +2313,7 @@ mod tests {
 
     #[test]
     fn firecracker_accepts_and_consumes_explicit_setup_inputs() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let post_install = root.path().join("setup.sh");
         fs::write(&post_install, "touch /firecracker-input-witness\n").unwrap();
         let opts = setup_options(&["ripgrep", "fd-find"], Some(post_install));
@@ -2121,10 +2512,141 @@ mod tests {
         assert!(tc.codex_plugins.is_empty());
         assert!(tc.grok_marketplaces.is_empty());
         assert!(tc.grok_plugins.is_empty());
+        assert!(tc.capabilities.is_empty());
+        assert!(
+            template_config_needs_rebuild(&tc, tc.install_script_hash, tc.post_install_hash),
+            "matching legacy hashes must not bypass the missing capability"
+        );
+
+        let mut upgraded = tc.clone();
+        upgraded
+            .capabilities
+            .insert(ImageCapability::FirecrackerVsockSsh);
+        assert!(!template_config_needs_rebuild(
+            &upgraded,
+            upgraded.install_script_hash,
+            upgraded.post_install_hash
+        ));
 
         let serialized = serde_json::to_value(&tc).unwrap();
         assert_eq!(serialized["version"], 1);
         assert!(serialized.get("oci_features").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_setup_refuses_interrupted_publication_even_when_metadata_hashes_match() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&image)).unwrap();
+        let hash = Sha256Hash::of("matching recipe");
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: "2026-01-01T00:00:00Z".to_string(),
+            install_script_hash: hash,
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: GuestUser::default(),
+            capabilities: BTreeSet::from([ImageCapability::FirecrackerVsockSsh]),
+        };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(!needs_rebuild(&cfg, &image, hash, None));
+
+        let disk = cfg.template_path_for(&image);
+        let staging = disk.with_extension("ext4.new");
+        std::fs::write(&disk, b"old disk").unwrap();
+        std::fs::write(&staging, b"new disk").unwrap();
+        let error = publish_template(&cfg, &image, &metadata, || {
+            std::fs::rename(&staging, &disk)?;
+            bail!("injected interruption after swap")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(std::fs::read(&disk).unwrap(), b"new disk");
+
+        let mut opts = setup_options(&[], None);
+        opts.image = image.clone();
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incomplete publication"), "{error}");
+        assert!(error.contains("--rebuild"), "{error}");
+        assert_eq!(std::fs::read(&disk).unwrap(), b"new disk");
+        assert!(image_publication_marker(&cfg, &image).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_setup_preserves_legacy_checkpoint_with_matching_or_stale_recipe() {
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let mut opts = setup_options(&[], None);
+        opts.image = ImageName::new("checkpoint").unwrap();
+        crate::fs_util::private_dir(&cfg.image_dir(&opts.image)).unwrap();
+        let disk = cfg.template_path_for(&opts.image);
+        std::fs::write(&disk, b"committed checkpoint").unwrap();
+        let mut metadata: TemplateConfig = serde_json::from_str(
+            r#"{"version":2,"created":"2026-01-01T00:00:00Z","install_script_hash":"0000000000000000000000000000000000000000000000000000000000000000","profiles":[],"extra_packages":[],"post_install_hash":null}"#,
+        )
+        .unwrap();
+        let (profiles, packages) = resolve_template_config(&cfg, &opts).unwrap();
+        metadata.install_script_hash =
+            Sha256Hash::of(compose_recipe(&profiles, &packages, &opts.guest_user));
+        metadata.save_for(&cfg, &opts.image).unwrap();
+
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lacks the Firecracker vsock SSH listener"),
+            "{error}"
+        );
+        assert!(error.contains("--rebuild"), "{error}");
+        assert!(error.contains("discards its contents"), "{error}");
+        assert_eq!(std::fs::read(&disk).unwrap(), b"committed checkpoint");
+        assert!(!image_publication_marker(&cfg, &opts.image).exists());
+
+        metadata.install_script_hash = Sha256Hash::of("stale recipe");
+        assert_ne!(
+            metadata.install_script_hash,
+            Sha256Hash::of(compose_recipe(&profiles, &packages, &opts.guest_user))
+        );
+        metadata.save_for(&cfg, &opts.image).unwrap();
+        let error = build_or_check_template(&cfg, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lacks the Firecracker vsock SSH listener"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&disk).unwrap(), b"committed checkpoint");
+    }
+
+    #[test]
+    fn canonical_vsock_units_match_the_template_install_script() {
+        let script = include_str!("../scripts/guest/guest-config.sh");
+        assert!(script.contains(FIRECRACKER_VSOCK_SOCKET_UNIT.trim()));
+        assert!(script.contains(FIRECRACKER_VSOCK_SERVICE_UNIT.trim()));
     }
 
     #[test]
@@ -2542,7 +3064,7 @@ mod tests {
     fn patch_guest_hosts_replaces_regular_file_without_modifying_hardlinks() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let etc = root.path().join("etc");
         fs::create_dir(&etc).unwrap();
         let original = "127.0.0.1 localhost\n127.0.1.1 old\n10.0.0.5 registry\n";
@@ -2583,8 +3105,8 @@ mod tests {
     fn patch_guest_network_files_replaces_symlinks_without_writing_outside_rootfs() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         let etc = root.path().join("etc");
         fs::create_dir_all(etc.join("systemd/network")).unwrap();
         fs::write(etc.join("hosts"), "127.0.0.1 localhost\n").unwrap();
@@ -2613,11 +3135,140 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn patch_guest_network_files_rejects_symlinked_parent() {
+    fn patch_guest_vsock_listener_reestablishes_units_and_enablement() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let system = root.path().join("etc/systemd/system");
+        fs::create_dir_all(system.join("sockets.target.wants")).unwrap();
+        let systemd = root.path().join("usr/lib/systemd");
+        fs::create_dir_all(systemd.join("system")).unwrap();
+        fs::create_dir_all(root.path().join("usr/sbin")).unwrap();
+        fs::write(systemd.join("systemd-socket-proxyd"), "fixture").unwrap();
+        fs::set_permissions(
+            systemd.join("systemd-socket-proxyd"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(root.path().join("usr/sbin/sshd"), "fixture").unwrap();
+        fs::set_permissions(
+            root.path().join("usr/sbin/sshd"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(systemd.join("system/ssh.service"), "fixture").unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "untouched").unwrap();
+        symlink(&sentinel, system.join("coop-vsock-ssh.socket")).unwrap();
+        symlink(&sentinel, system.join("coop-vsock-ssh.service")).unwrap();
+
+        patch_guest_vsock_listener_files(root.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "untouched");
+        assert_eq!(
+            fs::read_to_string(system.join("coop-vsock-ssh.socket")).unwrap(),
+            FIRECRACKER_VSOCK_SOCKET_UNIT
+        );
+        assert_eq!(
+            fs::read_to_string(system.join("coop-vsock-ssh.service")).unwrap(),
+            FIRECRACKER_VSOCK_SERVICE_UNIT
+        );
+        assert_eq!(
+            fs::read_link(
+                system
+                    .join("sockets.target.wants")
+                    .join("coop-vsock-ssh.socket")
+            )
+            .unwrap(),
+            PathBuf::from("../coop-vsock-ssh.socket")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_vsock_listener_rejects_missing_proxy_dependency() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("etc/systemd/system")).unwrap();
+        fs::create_dir_all(root.path().join("usr/lib/systemd/system")).unwrap();
+        fs::create_dir_all(root.path().join("usr/sbin")).unwrap();
+        fs::write(
+            root.path().join("usr/lib/systemd/system/ssh.service"),
+            "fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("usr/sbin/sshd"), "fixture").unwrap();
+        fs::set_permissions(
+            root.path().join("usr/sbin/sshd"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let error = patch_guest_vsock_listener_files(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("systemd-socket-proxyd"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_listener_dependency_check_rejects_masked_ssh_service() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("etc/systemd/system");
+        fs::create_dir_all(&system).unwrap();
+        symlink("/dev/null", system.join("ssh.service")).unwrap();
+
+        let error = reject_masked_guest_unit(root.path(), "ssh.service")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("masked"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vsock_listener_dependency_check_rejects_relative_mask() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("etc/systemd/system");
+        fs::create_dir_all(&system).unwrap();
+        symlink("../../../dev/null", system.join("ssh.service")).unwrap();
+
+        let error = reject_masked_guest_unit(root.path(), "ssh.service")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("masked"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_vsock_listener_rejects_symlinked_enablement_directory() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let system = root.path().join("etc/systemd/system");
+        fs::create_dir_all(&system).unwrap();
+        symlink(outside.path(), system.join("sockets.target.wants")).unwrap();
+
+        let error = patch_guest_vsock_listener_files(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("real directory"), "{error}");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn patch_guest_network_files_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let outside = crate::test_support::private_tempdir().unwrap();
         fs::create_dir_all(root.path().join("etc/systemd")).unwrap();
         fs::create_dir(outside.path().join("network")).unwrap();
         let sentinel = outside.path().join("network/10-eth0.network");
@@ -2641,7 +3292,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         for kind in ["missing", "symlink", "fifo", "oversized", "non-utf8"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = crate::test_support::private_tempdir().unwrap();
             let etc = root.path().join("etc");
             fs::create_dir(&etc).unwrap();
             let hosts = etc.join("hosts");
@@ -2681,8 +3332,8 @@ mod tests {
     fn patch_guest_hosts_rejects_symlinked_etc_and_directory_hosts() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let other = crate::test_support::private_tempdir().unwrap();
         symlink(other.path(), root.path().join("etc")).unwrap();
         assert!(patch_guest_hosts(root.path(), "claude-a").is_err());
         assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);

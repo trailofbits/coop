@@ -26,11 +26,10 @@
 - **Subscription auth splits by vendor, and it collapses to "inject a static
   token" — no OAuth-refresh code (§7).** Claude ships an official one-year
   `setup-token`, so the proxy injects it like any bearer (this is also #62's
-  non-exposure answer). Codex ships *no* long-lived token — only a client-refreshed
-  `auth.json` that OpenAI itself steers away from for automation — so Codex
-  subscription is out of scope for the proxy and routes to API-key mode. Both
-  agents get full non-exposure via API keys; only Codex-subscription would have
-  required refresh logic, and it is deliberately not built. v1 also **stops staging
+  non-exposure answer). Codex workspace PATs now offer a static credential
+  using workspace entitlements. Cached ChatGPT `auth.json` sessions still need
+  client-side refresh and remain outside the proxy. Both agents get credential
+  non-exposure without a proxy-owned OAuth refresh loop. v1 also **stops staging
   `~/.codex/auth.json` onto the guest disk** (`backend.rs:2326`) when proxy mode is
   on, closing an existing at-rest exposure.
 - **Ship order:** Anthropic first (the `ANTHROPIC_BASE_URL` rewrite seam already
@@ -182,7 +181,7 @@ generates.
 | Point at proxy | `ANTHROPIC_BASE_URL` in managed `settings.json` (`claude_env_block`) | `[model_providers.coop].base_url` in `~/.codex/config.toml` (`codex_local_config`) |
 | Guest-held credential | per-instance capability token in `ANTHROPIC_AUTH_TOKEN` | per-instance capability token via `env_key = "COOP_LOCAL_API_KEY"`, sent as `Authorization: Bearer` |
 | Wire protocol | Messages API + SSE + tool-use round-trips | Responses API (`wire_api = "responses"`) + SSE |
-| Proxy injects upstream | real key → `Authorization`/`x-api-key` → `api.anthropic.com` | real key → `Authorization: Bearer` → `api.openai.com` |
+| Proxy injects upstream | real key → `Authorization`/`x-api-key` → `api.anthropic.com` | Platform API key → `Authorization: Bearer` → `api.openai.com`; workspace PAT → Bearer + workspace headers → `chatgpt.com` |
 
 Two facts from the Codex docs make this work and are worth pinning:
 
@@ -221,9 +220,9 @@ exists). The proxy is the only shared new component.
 - **Guest→proxy hop:** plain HTTP over the private host-guest link. No TLS, no CA.
   The link is already private; #2's "no route out" can make it the *only* link.
 - **Proxy→upstream hop:** normal outbound HTTPS to the pinned upstream
-  (`api.anthropic.com` / `api.openai.com`), with the real credential injected as
-  the upstream's expected header. The upstream host is fixed per route, not taken
-  from the guest — so the guest cannot retarget the injected key at an
+  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), with the real
+  credential injected as the upstream's expected header. The upstream host is
+  fixed per route, not taken from the guest — so the guest cannot retarget the injected key at an
   attacker-controlled host.
 - **Streaming:** must stream request and response bodies (SSE, tool-use
   round-trips) rather than buffer — a hard requirement for both agents. A mature
@@ -290,8 +289,14 @@ is *smaller* attack surface here than adopting a general framework, not larger.
 
 ## 7. Auth modes: login flow, renewal, and official support
 
-The spike in §11.1 is resolved. The key result: **for every path except Codex
-subscription, the proxy holds a *static, long-lived* credential and injects it —
+The current implementation also supports OpenAI's Codex workspace personal
+access tokens (`at-...`), introduced after the original v1 design. These are
+static, explicitly rotated credentials using workspace Codex entitlements;
+see [the credential proxy guide](../credential-proxy.md). They are distinct
+from cached ChatGPT OAuth sessions and legacy agent-identity JWTs.
+
+The spike in §11.1 is resolved. The key result: **for every path except cached Codex
+OAuth sessions, the proxy holds a *static, long-lived* credential and injects it —
 there is no OAuth-refresh logic to write.** That is the security win, and it comes
 from vendor-official mechanisms, not reverse engineering.
 
@@ -299,7 +304,8 @@ from vendor-official mechanisms, not reverse engineering.
 |---|---|---|---|---|
 | **API key** (both agents) | none — supply the key via `cmd:` (Keychain / 1Password / 0600 file), exactly as coop resolves secrets today | never (until the user rotates the key) | n/a — no expiry | **Yes, fully.** Anthropic documents proxy routing via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` ("routing through an LLM gateway or proxy"); Codex documents custom `[model_providers.*]` with a Bearer `env_key` |
 | **Claude subscription** | run `claude setup-token` **once** on the host → stash the printed 1-year token → reference via `cmd:` | once a year (re-run `setup-token`) | no, but the token lives one year | **Yes** — `setup-token` is the documented headless path; the token is "scoped to inference only" |
-| **Codex subscription** | `codex login` on the host, then coop must hold the refreshable `~/.codex/auth.json` | session goes stale after **~8 days** without a refresh | yes, but **client-side only** (Codex refreshes on use / on 401 and writes back to `auth.json`) | **Discouraged** — OpenAI: "API keys are still the recommended option for most CI/CD jobs"; there is **no long-lived headless token**, and the refresh endpoints are internal |
+| **Codex workspace PAT** | Create a Codex-scoped token in ChatGPT Admin; store with `coop proxy setup --openai --codex-access-token` | User/workspace-selected expiration | No; rotate and restart | Documented by OpenAI for trusted local automation; coop mirrors its metadata lookup, bearer authentication, and Codex backend routing |
+| **Codex cached OAuth session** | `codex login` on the host, then hold the refreshable `~/.codex/auth.json` | Client-managed expiry/refresh | Yes, client-side | Supported by Codex itself; not implemented in coop proxy |
 
 **Consequences for the proxy:**
 
@@ -311,24 +317,22 @@ from vendor-official mechanisms, not reverse engineering.
   once-a-year manual `setup-token`. No refresh loop, no undocumented endpoints.
   This also finally gives #62 a non-exposure answer (the token never enters the
   guest).
-- **Codex subscription is the one path the proxy should *not* try to serve**, and
-  the blocker is OpenAI's design, not coop's: there is no long-lived token, and the
-  only credential is a refreshable `auth.json` whose refresh is a *client-side*
-  loop against internal endpoints that writes state back to the file. To keep the
-  guest from holding it, the proxy would have to reimplement that undocumented
-  refresh and own the rotating token — exactly the fragile, security-critical
-  machinery a security product should not build against an unstable contract.
-  OpenAI itself steers automation to API keys. **So: Codex subscription → use
-  API-key mode.** This is not a parity regression coop introduces; both agents get
-  full non-exposure via API keys, and Claude can *additionally* offer subscription
-  non-exposure only because Anthropic ships the token for it.
+- **Codex workspace PATs support subscription/workspace entitlements without
+  OAuth refresh.** The host validates metadata before proxy startup, supplies
+  the workspace headers, and pins the inference endpoint. Expired/revoked
+  credentials fail authentication rather than falling back to API billing.
+  Cached `auth.json` sessions still require a client-side refresh lifecycle
+  and remain outside the proxy's scope.
 
 **The `auth.json` exposure, closed in v1.** coop copies `~/.codex/auth.json` onto
 the guest disk today (`backend.rs:2326`) — a refreshable token at rest, the worst
 case #411 names. When proxy mode is on, **stop staging `auth.json`** (drop it from
-the effective `CODEX_ALLOWED_FILES` for that instance). A user who wants Codex
-subscription billing opts out of proxy mode explicitly and accepts the
-disk-resident token — a documented, deliberate trade, not a silent one.
+the effective `CODEX_ALLOWED_FILES` for that instance). Platform API keys and
+workspace PATs both keep the real credential on the host in proxy mode; PATs
+use workspace Codex entitlements without a cached OAuth session. A user who
+chooses interactive ChatGPT OAuth login instead opts out of proxy mode and
+accepts persistent guest credentials (the managed `[codex] auth = "chatgpt"`
+mode uses the guest keyring; see [the trust model](../trust-model.md)).
 
 **On `apiKeyHelper` (Claude) as an alternative — and why it is not one.** Claude
 Code documents `apiKeyHelper`, a guest-side script it calls to fetch a token
@@ -399,8 +403,9 @@ Ordered, independently shippable:
    `codex_proxy_config` block with `base_url` = proxy and `env_key =
    "COOP_LOCAL_API_KEY"` carrying the capability token. Stop staging `auth.json`
    when proxy mode is on (§7).
-   Delivers Claude↔Codex parity at the API-key tier. Codex subscription is out of
-   scope by vendor design (§7).
+   Delivers Claude↔Codex parity at the API-key tier. A later Codex workspace-PAT
+   profile adds the fixed ChatGPT backend and host-validated workspace headers;
+   cached OAuth sessions remain outside the proxy (§7).
 3. **Jailing (shipped).** Bound a proxy-exploit blast radius by confining
    `coop-proxy`. **Implemented with tiered Landlock, not the uid+netns jailer
    sketched in §3/§11.3.** The settled architecture binds the listener on host
@@ -468,8 +473,8 @@ Each slice is gated behind explicit config (proxy mode is opt-in), per coop's
   Rejected: the refresh loops run against internal, undocumented endpoints and
   rotate state a security product should not own against an unstable contract. Use
   the static-token paths (API key everywhere; Claude `setup-token` for Claude
-  subscription) and route Codex subscription to API-key mode per OpenAI's own
-  guidance (§7).
+  subscription; Codex workspace PATs for Codex entitlements). Cached Codex
+  OAuth sessions remain outside the proxy's scope (§7).
 
 ---
 
@@ -477,11 +482,9 @@ Each slice is gated behind explicit config (proxy mode is opt-in), per coop's
 
 1. ~~**Subscription endpoint semantics.**~~ **Resolved (§7).** Claude ships an
    official one-year `setup-token` (a static inference-scoped bearer) → proxy
-   injects it, no refresh. Codex ships *no* long-lived token; its only subscription
-   credential is a client-refreshed `auth.json`, and OpenAI recommends API keys for
-   automation → Codex subscription is out of scope for the proxy, API-key mode is
-   the answer. Net: only Codex-subscription would have needed refresh logic, and it
-   is deliberately not built.
+   injects it, no refresh. Codex workspace PATs now provide a static credential
+   using workspace entitlements. Only cached Codex OAuth sessions need refresh
+   logic, which remains deliberately outside the proxy.
 2. **One proxy process vs. per-instance.** Per-instance is simpler to reason about
    and matches the existing socket-lifecycle pattern; a shared process is fewer
    moving parts but needs per-instance routing. Decide in slice 1.
@@ -698,7 +701,8 @@ If any of these fails, the mechanism changes before anything else is built.
   host nor scheme; only the path is forwarded to the pinned host. Closes SSRF.
 - **TLS verification is correct and cannot regress.** Verify the upstream cert
   against the pinned `webpki-roots`; a bug that disables verification MITMs the real
-  key. Consider pinning the two upstreams. Add a test that a bad cert is rejected.
+  key. Consider certificate pinning for the fixed upstreams. Add a test that a bad
+  cert is rejected.
 - **Fail closed.** If `cmd:` secret resolution fails at proxy start, the VM does
   not come up in a state where the agent silently has no or wrong credentials —
   clear error, no fallback to a raw-key path.
@@ -765,9 +769,11 @@ real caveat, and all VZ-driver-specific and needing a spike shared with #2's mac
 networking work:
 
 - **Jail the proxy with Seatbelt (`sandbox-exec`).** A profile confining
-  `coop-proxy` to: no filesystem writes, `connect` only to the two upstream
-  hosts:443, `bind` only its one listener, no `exec`. The sandbox inherits to
-  children and cannot be removed from inside — the macOS analog of the Linux
+  `coop-proxy` to: no filesystem writes, outbound HTTPS (`:443`) and DNS (`:53`),
+  loopback listening, and execution restricted to the proxy binary. Egress is
+  port-scoped; the proxy's fixed hosts and TLS verification enforce upstream
+  identity. The sandbox inherits to children and cannot be removed from inside
+  — the macOS analog of the Linux
   netns/uid jail, and close to it in strength. **Caveat:** `sandbox-exec` is
   officially deprecated (still functional and widely used — Chromium, agent
   harnesses — and Apple has shipped no clean CLI successor), so it is a pragmatic

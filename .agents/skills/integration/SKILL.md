@@ -14,4 +14,7 @@ backend; never describe one backend as proving both. Run the suite with output
 redirected to a file, narrate progress during the long run, inspect the complete
 output, and report pass/fail per phase. Do not declare success unless the runner
 exits zero. Quote the failing phase, clean up the output file, and state any
-backend that was not run.
+backend that was not run. Follow the repository privacy rule when reporting:
+omit the remote username, hostname, IP address, and identifying log details
+unless they are needed to explain the result; ask before including an uncertain
+detail in a commit, PR, or issue.

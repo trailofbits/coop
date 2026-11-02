@@ -38,7 +38,7 @@
 //!
 //! **Limitations, stated honestly** (see `docs/trust-model.md`): the network
 //! rules are port-scoped, not host-scoped — a fully compromised proxy could
-//! still reach *some other* host on `:443` (the two upstreams' identity is
+//! still reach *some other* host on `:443` (the fixed upstreams' identity is
 //! enforced at the TLS layer in [`crate::proxy`], and the guest still cannot
 //! retarget them). Landlock's network rules cover TCP only, so UDP egress
 //! (including DNS) is not restricted. And on kernels 5.13–6.6 the TCP tier is

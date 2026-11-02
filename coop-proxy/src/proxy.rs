@@ -96,11 +96,18 @@ fn x_api_key() -> HeaderName {
     HeaderName::from_static("x-api-key")
 }
 
+// Only unit tests can replace the TLS transport after request preparation.
+#[cfg(test)]
+type TestBackend =
+    fn(Request<Incoming>) -> Pin<Box<dyn std::future::Future<Output = Response<ProxyBody>> + Send>>;
+
 /// Shared, cheaply-cloneable per-connection state.
 #[derive(Clone)]
 struct Ctx {
     cfg: Arc<ProxyConfig>,
     connector: TlsConnector,
+    #[cfg(test)]
+    test_backend: Option<TestBackend>,
     permits: Arc<Semaphore>,
     connections: Arc<Semaphore>,
 }
@@ -111,6 +118,8 @@ impl Ctx {
         Ok(Self {
             cfg: Arc::new(cfg),
             connector,
+            #[cfg(test)]
+            test_backend: None,
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             connections: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
@@ -241,7 +250,7 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
                 status: StatusCode::BAD_REQUEST,
                 msg: "request headers could not be rewritten",
             })?;
-    parts.uri = origin_form(&parts.uri).map_err(|_| Refusal {
+    parts.uri = upstream_uri(&parts.uri, &ctx.cfg.upstream_host).map_err(|_| Refusal {
         status: StatusCode::BAD_REQUEST,
         msg: "invalid request target",
     })?;
@@ -261,18 +270,25 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
 /// `coop credential proxy`, not `OpenAI`, so its OpenAI-specific
 /// `POST /v1/responses/compact` behavior does not apply.
 fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
-    if method != Method::POST {
-        return false;
-    }
-
-    matches!(
-        (upstream_host, uri.path()),
-        ("api.openai.com", "/v1/responses")
-            | (
-                "api.anthropic.com",
-                "/v1/messages" | "/v1/messages/count_tokens"
-            )
+    operation_allowed_bytes(
+        method == Method::POST,
+        upstream_host.as_bytes(),
+        uri.path().as_bytes(),
     )
+}
+
+const MAX_ALLOWED_HOST_BYTES: usize = b"api.anthropic.com".len();
+const MAX_ALLOWED_PATH_BYTES: usize = b"/v1/messages/count_tokens".len();
+
+fn operation_allowed_bytes(is_post: bool, host: &[u8], path: &[u8]) -> bool {
+    is_post
+        && host.len() <= MAX_ALLOWED_HOST_BYTES
+        && path.len() <= MAX_ALLOWED_PATH_BYTES
+        && match host {
+            b"api.openai.com" | b"chatgpt.com" => path == b"/v1/responses",
+            b"api.anthropic.com" => path == b"/v1/messages" || path == b"/v1/messages/count_tokens",
+            _ => false,
+        }
 }
 
 async fn forward(
@@ -280,6 +296,17 @@ async fn forward(
     ctx: &Ctx,
     permit: OwnedSemaphorePermit,
 ) -> Result<Response<ProxyBody>, Refusal> {
+    #[cfg(test)]
+    if let Some(backend) = ctx.test_backend {
+        return Ok(backend(req).await.map(|body| {
+            GuardedBody {
+                inner: body,
+                _permit: permit,
+            }
+            .boxed()
+        }));
+    }
+
     let host = ctx.cfg.upstream_host.as_str();
     let server_name = ServerName::try_from(host.to_owned()).map_err(|_| Refusal {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -372,6 +399,84 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::{
+        MAX_ALLOWED_HOST_BYTES, MAX_ALLOWED_PATH_BYTES, constant_time_eq, operation_allowed_bytes,
+    };
+
+    // Arbitrary bytes include every valid HTTP host/path spelling and also
+    // malformed spellings. Longer inputs cannot equal any allowed literal.
+    #[kani::proof]
+    fn operation_policy_is_exact_allowlist() {
+        let host: [u8; MAX_ALLOWED_HOST_BYTES] = kani::any();
+        let path: [u8; MAX_ALLOWED_PATH_BYTES] = kani::any();
+        let host_len: usize = kani::any();
+        let path_len: usize = kani::any();
+        let is_post: bool = kani::any();
+        kani::assume(host_len <= host.len() && path_len <= path.len());
+        let host = &host[..host_len];
+        let path = &path[..path_len];
+
+        let allowed = operation_allowed_bytes(is_post, host, path);
+        let openai_host = host == b"api.openai.com" || host == b"chatgpt.com";
+        let anthropic_host = host == b"api.anthropic.com";
+        let response = path == b"/v1/responses";
+        let message = path == b"/v1/messages";
+        let count = path == b"/v1/messages/count_tokens";
+        assert_eq!(
+            allowed,
+            is_post && ((openai_host && response) || (anthropic_host && (message || count)))
+        );
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.openai.com",
+            b"/v1/responses"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"chatgpt.com",
+            b"/v1/responses"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.anthropic.com",
+            b"/v1/messages"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.anthropic.com",
+            b"/v1/messages/count_tokens"
+        ));
+        let overlong_host: [u8; MAX_ALLOWED_HOST_BYTES + 1] = kani::any();
+        let overlong_path: [u8; MAX_ALLOWED_PATH_BYTES + 1] = kani::any();
+        assert!(!operation_allowed_bytes(
+            true,
+            &overlong_host,
+            b"/v1/responses"
+        ));
+        assert!(!operation_allowed_bytes(
+            true,
+            b"api.openai.com",
+            &overlong_path
+        ));
+    }
+
+    #[kani::proof]
+    fn capability_token_comparison_matches_byte_equality() {
+        let presented: [u8; 64] = kani::any();
+        let expected: [u8; 64] = kani::any();
+        let mut equal = true;
+        for index in 0..64 {
+            equal &= presented[index] == expected[index];
+        }
+        assert_eq!(constant_time_eq(&presented, &expected), equal);
+        assert!(!constant_time_eq(&presented[..63], &expected));
+        let longer: [u8; 65] = kani::any();
+        assert!(!constant_time_eq(&longer, &expected));
+    }
+}
+
 /// Build the header set sent upstream: drop hop-by-hop headers, drop the
 /// guest's `Host` and credential slots, pin the upstream `Host`, and inject
 /// the real credential (marked sensitive so hyper never logs it).
@@ -382,7 +487,15 @@ fn build_upstream_headers(
 ) -> Result<HeaderMap> {
     let mut out = HeaderMap::with_capacity(incoming.len() + 1);
     for (name, value) in incoming {
-        if is_hop_by_hop(name) || name == HOST || is_credential_header(name) {
+        if is_hop_by_hop(name)
+            || name == HOST
+            || is_credential_header(name)
+            || (matches!(injection, Injection::CodexAccessToken { .. })
+                && matches!(
+                    name.as_str(),
+                    "chatgpt-account-id" | "x-openai-fedramp" | "x-openai-actor-authorization"
+                ))
+        {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -401,11 +514,26 @@ fn build_upstream_headers(
             value.set_sensitive(true);
             out.insert(x_api_key(), value);
         }
-        Injection::Bearer { credential } => {
+        Injection::Bearer { credential } | Injection::CodexAccessToken { credential, .. } => {
             let mut value = HeaderValue::from_str(&format!("Bearer {}", credential.expose()))
                 .context("credential is not a valid header value")?;
             value.set_sensitive(true);
             out.insert(AUTHORIZATION, value);
+        }
+    }
+
+    if let Injection::CodexAccessToken {
+        account_id,
+        is_fedramp,
+        ..
+    } = injection
+    {
+        out.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_str(account_id).context("invalid Codex workspace header")?,
+        );
+        if *is_fedramp {
+            out.insert("x-openai-fedramp", HeaderValue::from_static("true"));
         }
     }
 
@@ -439,6 +567,22 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 fn origin_form(uri: &Uri) -> Result<Uri> {
     let pq = uri.path_and_query().map_or("/", |p| p.as_str());
     pq.parse::<Uri>().context("invalid path-and-query")
+}
+
+/// The guest uses the same Responses provider in both proxy modes. Only the
+/// host-selected Codex profile translates its allowed inference operation;
+/// no guest-supplied backend URL or workspace header controls the destination.
+fn upstream_uri(uri: &Uri, upstream_host: &str) -> Result<Uri> {
+    if upstream_host == "chatgpt.com" {
+        anyhow::ensure!(uri.path() == "/v1/responses", "unsupported Codex operation");
+        let mut path = "/backend-api/codex/responses".to_string();
+        if let Some(query) = uri.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        return path.parse().context("invalid Codex request target");
+    }
+    origin_form(uri)
 }
 
 fn error_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody> {
@@ -556,6 +700,78 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn accepted_codex_request_is_forwarded_with_host_identity() {
+        let cfg = ProxyConfig::from_json(
+            r#"{
+            "listen": "127.0.0.1:0",
+            "capability_token": "guest-capability",
+            "upstream_host": "chatgpt.com",
+            "injection": { "scheme": "codex_access_token", "credential": "at-host-only",
+                "account_id": "host-workspace", "is_fedramp": true }
+        }"#,
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(cfg).unwrap();
+        ctx.test_backend = Some(|req| {
+            Box::pin(async move {
+                assert_eq!(req.method(), Method::POST);
+                assert_eq!(req.uri(), "/backend-api/codex/responses");
+                let headers = req.headers();
+                assert_eq!(headers[HOST], "chatgpt.com");
+                assert_eq!(headers[AUTHORIZATION], "Bearer at-host-only");
+                assert_eq!(headers["chatgpt-account-id"], "host-workspace");
+                assert_eq!(headers["x-openai-fedramp"], "true");
+                assert!(!headers.contains_key("x-openai-actor-authorization"));
+                assert!(!headers.contains_key("x-api-key"));
+                assert_eq!(
+                    req.into_body().collect().await.unwrap().to_bytes(),
+                    "{\"input\":\"hello\"}"
+                );
+                Response::new(
+                    Full::new(Bytes::from_static(b"canned Codex response"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+            })
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(accept_loop(ctx, listener, async {
+            let _ = stopped.await;
+        }));
+        timeout(Duration::from_secs(5), async {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let connection = tokio::spawn(connection);
+            let req = Request::post("/v1/responses")
+                .header(HOST, "guest.invalid")
+                .header(AUTHORIZATION, "Bearer guest-capability")
+                .header("x-api-key", "guest-key")
+                .header("chatgpt-account-id", "guest-workspace")
+                .header("x-openai-fedramp", "false")
+                .header("x-openai-actor-authorization", "guest-actor")
+                .body(Full::new(Bytes::from_static(b"{\"input\":\"hello\"}")))
+                .unwrap();
+            let response = sender.send_request(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "canned Codex response"
+            );
+            drop(sender);
+            connection.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     // ── capability token ─────────────────────────────────────
 
     #[test]
@@ -619,6 +835,80 @@ mod tests {
             &create_with_query,
             "api.openai.com"
         ));
+    }
+
+    #[test]
+    fn codex_profile_allows_only_inference_and_pins_the_backend_path() {
+        for path in [
+            "/v1/responses",
+            "/v1/responses?foo=bar",
+            "https://attacker.invalid/v1/responses?foo=bar",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(operation_allowed(&Method::POST, &uri, "chatgpt.com"));
+            let expected = if uri.query().is_some() {
+                "/backend-api/codex/responses?foo=bar"
+            } else {
+                "/backend-api/codex/responses"
+            };
+            assert_eq!(
+                upstream_uri(&uri, "chatgpt.com").unwrap().to_string(),
+                expected
+            );
+            assert_eq!(
+                upstream_uri(&uri, "api.openai.com").unwrap(),
+                origin_form(&uri).unwrap()
+            );
+            for method in [Method::GET, Method::DELETE, Method::HEAD, Method::CONNECT] {
+                assert!(!operation_allowed(&method, &uri, "chatgpt.com"));
+            }
+        }
+        for path in [
+            "/backend-api/codex/responses",
+            "/v1/responses/compact",
+            "/v1/responses/resp_1",
+            "/v1/models",
+            "/backend-api/me",
+            "/v1/messages",
+            "/v1/responses/",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(!operation_allowed(&Method::POST, &uri, "chatgpt.com"));
+            assert!(upstream_uri(&uri, "chatgpt.com").is_err());
+        }
+    }
+
+    #[test]
+    fn codex_headers_replace_guest_identity_and_preserve_stream_metadata() {
+        let mut incoming = HeaderMap::new();
+        for (key, value) in [
+            ("authorization", "Bearer cap-private"),
+            ("x-api-key", "cap-private"),
+            ("host", "attacker.invalid"),
+            ("chatgpt-account-id", "attacker-workspace"),
+            ("x-openai-fedramp", "true"),
+            ("x-openai-actor-authorization", "attacker-identity"),
+            ("content-type", "application/json"),
+            ("originator", "codex_cli_rs"),
+        ] {
+            incoming.insert(HeaderName::from_bytes(key.as_bytes()).unwrap(), hv(value));
+        }
+        for is_fedramp in [false, true] {
+            let injection: Injection = serde_json::from_value(serde_json::json!({ "scheme": "codex_access_token", "credential": "at-private", "account_id": "workspace-123", "is_fedramp": is_fedramp })).unwrap();
+            let out = build_upstream_headers(&incoming, "chatgpt.com", &injection).unwrap();
+            assert_eq!(out[AUTHORIZATION], "Bearer at-private");
+            assert!(out[AUTHORIZATION].is_sensitive());
+            assert_eq!(out[HOST], "chatgpt.com");
+            assert_eq!(out["chatgpt-account-id"], "workspace-123");
+            assert!(out.get("x-api-key").is_none());
+            assert!(out.get("x-openai-actor-authorization").is_none());
+            assert_eq!(out.get("x-openai-fedramp").is_some(), is_fedramp);
+            if is_fedramp {
+                assert_eq!(out["x-openai-fedramp"], "true");
+            }
+            assert_eq!(out["originator"], "codex_cli_rs");
+            assert_eq!(out["content-type"], "application/json");
+        }
     }
 
     #[test]

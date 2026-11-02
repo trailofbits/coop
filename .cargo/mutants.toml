@@ -57,6 +57,21 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # vsock_proxy.rs: Unix-socket readiness and stdio relay are syscall adapters.
+  # Unit fixtures cover successful, malformed, oversized, and timed-out
+  # handshakes; tests/vsock_proxy.rs covers interactive subprocess relay, and
+  # the Firecracker integration gate covers the real VMM. Keep the pure
+  # response grammar and bounded pending-byte queue in mutation scope.
+  "src/vsock_proxy\\.rs:.*\\brun\\b",
+  "src/vsock_proxy\\.rs:.*\\brelay\\b",
+  "src/vsock_proxy\\.rs:.*\\bconnect\\b",
+  "src/vsock_proxy\\.rs:.*\\bwait_ready\\b",
+  "src/vsock_proxy\\.rs:.*\\bwait_fd\\b",
+  "src/vsock_proxy\\.rs:.*\\bread_response\\b",
+  "src/vsock_proxy\\.rs:.*NonblockingFd::new",
+  "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd",
+  "src/vsock_proxy\\.rs:.*\\b(read_fd|write_fd)\\b",
+  "src/vsock_proxy\\.rs:.*Relay<.*>::(run|poll|read_stdin|write_guest|read_guest|check_guest_error|write_stdout|check_stdio_errors|finish_input)\\b",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
   # Creation-hook SSH execution and lifecycle orchestration require a guest.
@@ -73,7 +88,7 @@ exclude_re = [
   "src/private_storage\\.rs:.*MigrationOutcome::report",
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
-  # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
+  # cfg(kani) proofs (each module's `mod proofs`): never compiled in a normal
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
@@ -82,9 +97,9 @@ exclude_re = [
   "\\bprobe_liveness\\b",
   # Privileged socket wrapper/syscalls; the errno classifier remains in scope.
   # Host regressions cover the real helper and full accept queue.
-  "\\bensure_firecracker_api_socket_stopped\\b",
-  "\\bprobe_firecracker_api_socket\\b",
-  "\\bconnect_firecracker_api_socket\\b",
+  "\\bensure_firecracker_socket_stopped\\b",
+  "\\bprobe_firecracker_socket\\b",
+  "\\bconnect_firecracker_socket\\b",
 
   # github_pat.rs — external process (curl/gh/git), browser, terminal echo.
   "\\brun_setup_pat\\b",
@@ -129,21 +144,18 @@ exclude_re = [
   # (equivalent: human label; the serde token is the tested contract).
   "\\bbuild_status\\b",
 
-  # workspace.rs — tar/rsync pipes, SSH-config IO, editor launch.
-  "\\btar_pipe_transfer\\b",
-  "\\btar_pipe_transfer_to\\b",
-  "\\btar_push_fallback\\b",
-  "\\btar_pipe_pull\\b",
-  "\\btar_pipe_pull_staged\\b",
+  # workspace.rs — rsync transfers, SSH-config IO, editor launch.
   # Shells out to rsync; install_staged_pull_args remains in scope and pins the
   # security-relevant source, destination, and Git-metadata exclusion.
   "\\binstall_staged_pull\\b",
-  "\\bjoin_drainer\\b",
   "\\bsync_mounts\\b",
   "\\bsync_mount_contents\\b",
   "\\bopen_editor\\b",
   "\\blaunch_editor\\b",
   "\\brsync_push\\b",
+  "\\brsync_to_guest\\b",
+  "\\brequire_guest_rsync\\b",
+  "\\bcopy_workspace\\b",
   "\\brsync_pull\\b",
   "\\bcheck_guest_dirty\\b",
   "\\batomic_write\\b",
@@ -227,6 +239,12 @@ exclude_re = [
   "IsolationNetworkTools::resolve_production",
   "<impl BridgeToolset for IsolationNetworkTools>::bridge",
 
+  # The Firecracker-only allocation arm is compiled out on macOS. Native
+  # Linux allocation tests pin the isolated comparison; the macOS test pins
+  # that Lima ignores the Firecracker network default. A Darwin mutation run
+  # cannot observe this operator even though cargo-mutants discovers it.
+  "src/config\\.rs:.*replace == with != in CoopConfig::allocate_instance",
+
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into
   # src/commands/. Apply the SAME surgical treatment the flat shell-out
@@ -246,7 +264,7 @@ exclude_re = [
   # or resolving the cwd. Their decision logic is extracted into the pure
   # helpers kept in scope below (no_stopped_instance_message,
   # creation_options_rejected_message, restart_has_ignored_creation_flags,
-  # bytes_to_gib, …) or pinned by tests/integration.sh.
+  # reprovision_regrow_target, …) or pinned by tests/integration.sh.
   "\\bcreate_up_instance\\b",
   "\\bcreate_git_repo_instance\\b",
   "\\bensure_profile_image\\b",
@@ -254,13 +272,14 @@ exclude_re = [
   "\\bapply_vm_overrides\\b",
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
+  "\\brestart_confirmed_instance\\b",
   "\\bstart_instance\\b",
   # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
   # the ordering is covered by a filesystem-backed lifecycle unit test.
   "\\bcleanup_confirmed_stop\\b",
   # provision_first_boot (#432): the post-boot half start_instance was split
   # into so `coop restore --reprovision` can reuse it. Waits on SSH, spawns forwards,
-  # bootstraps agents and tar-pipes the workspace — none `--lib`-observable.
+  # bootstraps agents and syncs the workspace — none `--lib`-observable.
   # The pure helpers `--reprovision` adds — check_reprovision_workspace_source,
   # reprovision_workspace_inputs, reprovision_confirmation and
   # reprovision_partial_message — stay IN scope and are unit-tested.
@@ -268,6 +287,15 @@ exclude_re = [
   # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
   # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
   "\\breprovision_instance\\b",
+  # Image publication locks, backend metadata checks, interactive confirmation,
+  # and PAT prompting are IO wrappers around the mutation-scoped workspace and
+  # network policy helpers.
+  "\\bpreflight_reprovision_image\\b",
+  "\\bvalidate_reprovision_image\\b",
+  "\\bconfirm_reprovision\\b",
+  # Resolves guest file staging through the backend and reads host paths after
+  # stop; a unit mutant cannot observe the VM lifecycle recovery context.
+  "\\bprepare_reprovision_payload\\b",
   "\\bprovision_first_boot\\b",
   "\\bwarn_on_live_git_mounts\\b",
   "\\bresolve_running\\b",
@@ -275,11 +303,18 @@ exclude_re = [
   "\\bopen_ssh_session\\b",
   "\\bpreflight_start_target\\b",
   "\\bresolve_project_dir\\b",
-  # current_disk_gib stats the disk image; its `/ 1 GiB` arithmetic kernel
-  # is extracted into bytes_to_gib (kept in scope, unit-tested).
-  "\\bcurrent_disk_gib\\b",
+  # current_disk_bytes stats the disk image; GiB::from_bytes_ceil is the
+  # pure conversion kernel (kept in scope, unit-tested).
+  "\\bcurrent_disk_bytes\\b",
   # instance_status (#385) queries usage over SSH.
   "\\binstance_status\\b",
+  # Network-mode lifecycle wrappers hold backend locks, drive cleanup/start,
+  # or write stdout. Their extracted policy enums remain mutation-scoped.
+  "\\bensure_isolated_agent_supported\\b",
+  "\\bpreflight_isolated_bootstrap\\b",
+  "\\bpreflight_isolated_bootstrap_for_network\\b",
+  "\\bstop_confirmed\\b",
+  "\\brender_network_status\\b",
 
   # ---- src/commands/json.rs (#385): --json output ----
   # render_json is the single stdout JSON writer; a `--lib` test cannot
@@ -403,6 +438,9 @@ exclude_re = [
   # those is a real gap. File-anchored so the generic `start`/`stop` names don't
   # scope out same-named functions elsewhere.
   "src/proxy\\.rs:.*\\bstart_provider\\b",
+  # Startup composition keeps real cleanup/resolution; injected metadata and
+  # process boundaries have focused regression and deliberate-mutation tests.
+  "src/proxy\\.rs:.*\\bstart_provider_with\\b",
   "src/proxy\\.rs:.*\\bstop\\b",
   "src/proxy\\.rs:.*\\bstop_provider\\b",
   "src/proxy\\.rs:.*\\bkill_pid_file\\b",
@@ -423,8 +461,14 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bconfined_command\\b",
   "src/proxy\\.rs:.*\\bwrite_token_file\\b",
   "src/proxy\\.rs:.*\\blocate_proxy_binary\\b",
+  # Codex PAT metadata lookup performs a bounded HTTPS curl request. Its
+  # token/metadata parsers and fixed command construction remain in scope.
+  "src/codex_token\\.rs:.*\\bload_metadata\\b",
+  "src/codex_token\\.rs:.*\\bload_metadata_with_command\\b",
   "src/proxy\\.rs:.*\\bpid_path\\b",
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
+  "src/proxy\\.rs:.*\\bensure_runtime_available\\b",
+  "src/proxy\\.rs:.*\\bensure_pid_file_live\\b",
 
 ]

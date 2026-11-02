@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 
 #[test]
-fn stop_retains_proxy_for_full_socket_queue_and_cleans_after_close() {
+fn stop_retains_proxy_for_full_vsock_queue_and_cleans_after_close() {
     let root = tempfile::tempdir().unwrap();
     // The runner's umask may let tempfile create a group-writable directory.
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -68,7 +68,7 @@ fn stop_retains_proxy_for_full_socket_queue_and_cleans_after_close() {
     } else {
         None
     };
-    let socket = instance.join("firecracker.socket");
+    let socket = instance.join("vsock.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     // Linux permits backlog + 1 pending connections. With backlog zero,
     // one connected client fills the queue without relying on system defaults.
@@ -161,4 +161,68 @@ fn socket_helper_distinguishes_live_abandoned_and_missing_sockets() {
     drop(listener);
     assert!(socket.exists());
     assert!(probe().status.success());
+}
+
+#[test]
+fn old_stopped_vm_sockets_allow_status_and_cleanup_but_live_api_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let data = root.path().join("data");
+    let instance = data.join("instances/old");
+    fs::create_dir_all(&instance).unwrap();
+    fs::write(
+        instance.join("instance.json"),
+        r#"{"name":"old","index":0}"#,
+    )
+    .unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("data_dir = {data:?}\n[network.host_tools]\nip = '/bin/false'\n"),
+    )
+    .unwrap();
+    let api = instance.join("firecracker.socket");
+    let vsock = instance.join("vsock.sock");
+    for path in [&api, &vsock] {
+        let listener = UnixListener::bind(path).unwrap();
+        drop(listener);
+    }
+    let coop = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_coop"))
+            .args(["--config"])
+            .arg(&config)
+            .args(args)
+            .env("HOME", root.path())
+            .output()
+            .unwrap()
+    };
+
+    let status = coop(&["status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("old"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("stopped"));
+    assert!(api.exists() && vsock.exists());
+
+    let stop = coop(&["stop", "old"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(!api.exists() && !vsock.exists());
+
+    let _live_api = UnixListener::bind(&api).unwrap();
+    let refused = coop(&["status"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("Cannot verify legacy Firecracker API socket"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(api.exists());
 }

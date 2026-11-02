@@ -7,6 +7,7 @@
 
 mod backend;
 mod cmd;
+mod codex_token;
 mod commands;
 mod completions;
 pub mod config;
@@ -60,10 +61,13 @@ mod signal;
 mod setup;
 mod shell;
 mod ssh;
+#[cfg(test)]
+mod test_support;
 mod update;
 mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
+mod vsock_proxy;
 mod workspace;
 
 use std::path::PathBuf;
@@ -75,13 +79,13 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts, ReprovisionOpts,
-    ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy,
-    cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
-    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
-    preflight_start_target, prepend_binary, resolve_running,
+    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
+    ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts,
+    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
+    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
+    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
+    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
+    open_agent_session, preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -102,7 +106,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Internal privileged Firecracker API socket liveness probe.
+    /// Internal OpenSSH `ProxyCommand` for Firecracker vsock.
+    #[command(name = "__vsock-proxy", hide = true)]
+    VsockProxy {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        port: std::num::NonZeroU32,
+    },
+    /// Internal privileged Firecracker socket liveness probe.
     #[cfg(target_os = "linux")]
     #[command(name = "__probe-firecracker-socket", hide = true)]
     ProbeFirecrackerSocket { path: PathBuf },
@@ -123,6 +135,10 @@ enum Commands {
         hostname: String,
         ip: std::net::Ipv4Addr,
     },
+    /// Internal privileged repair for a committed Firecracker rootfs.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__patch-guest-vsock-listener", hide = true)]
+    PatchGuestVsockListener { mount: PathBuf },
 
     /// Ensure an environment for a project directory exists and is running.
     ///
@@ -152,10 +168,10 @@ enum Commands {
         /// Number of vCPUs (overrides config when creating a new instance)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config when creating a new instance)
+        /// Memory in MiB, bare or with MiB suffix (overrides config for a new instance)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
-        /// Instance disk size in GiB (only used when creating a new instance)
+        /// Instance disk in GiB: bare, G/g, or GiB (new instances only)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         disk: Option<config::GiB>,
         /// Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM
@@ -222,7 +238,7 @@ enum Commands {
         /// Number of vCPUs (overrides config)
         #[arg(long)]
         vcpus: Option<u8>,
-        /// Memory in MiB (overrides config)
+        /// Memory in MiB, bare or with MiB suffix (overrides config)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// Force rebuild of template rootfs
@@ -241,7 +257,7 @@ enum Commands {
         /// Path to a post-install script to run in the chroot (Linux/Firecracker only)
         #[arg(long)]
         post_install: Option<String>,
-        /// Template rootfs size in GiB (default: 8)
+        /// Template rootfs size in GiB: bare, G/g, or GiB (default: 8)
         #[arg(long, value_parser = config::GiB::parse_cli)]
         template_size: Option<config::GiB>,
         /// Named image to build (default: "default")
@@ -398,7 +414,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// List instances by name and state
+    /// List instances by name, state, and network mode
     #[command(alias = "ls")]
     List {
         /// Emit machine-readable JSON instead of the text table
@@ -416,6 +432,24 @@ enum Commands {
         /// Emit machine-readable JSON instead of the text output
         #[arg(long)]
         json: bool,
+    },
+    /// Show or change a Firecracker VM's persisted network mode.
+    Network {
+        /// Instance name (required for mode changes or if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Target mode; omit to show the selected mode
+        #[arg(value_enum)]
+        mode: Option<config::FirecrackerNetworkMode>,
+        /// Stop a running VM, apply the mode, and start it again
+        #[arg(long, requires = "mode")]
+        restart: bool,
+        /// Restart without agent bootstrap (allows a control-only isolated VM)
+        #[arg(long, requires = "restart")]
+        no_agents: bool,
     },
     /// Manage the coding agents installed inside a VM
     Agent {
@@ -555,10 +589,10 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// New disk size: absolute GiB (e.g. 150, 150G) or relative (e.g. +20, +20G)
+        /// New disk in GiB: absolute (150, 150G, 150GiB) or relative (+20, +20G, +20GiB)
         #[arg(long, value_parser = config::DiskSize::parse)]
         size: Option<config::DiskSize>,
-        /// New memory in MiB (minimum 128)
+        /// New memory in MiB, bare or with MiB suffix (minimum 128)
         #[arg(long, value_parser = config::VmMemory::parse_cli)]
         mem: Option<config::VmMemory>,
         /// New vCPU count
@@ -700,7 +734,7 @@ Examples:
 All scripts include live instance / image / profile names. Regenerate saved
 scripts after upgrading coop. Alternatively, generate them on shell startup:
 
-  bash:  source <(coop completions bash)
+  bash:  source /dev/stdin <<<\"$(coop completions bash)\"
   zsh:   source <(coop completions zsh)  # after compinit
   fish:  coop completions fish | source
 ";
@@ -857,6 +891,10 @@ enum ProxyAction {
         /// `setup-token`. Ignored for `--openai` (always Bearer).
         #[arg(long)]
         api_key: bool,
+        /// `OpenAI` only: use a Codex-scoped workspace access token and its
+        /// `ChatGPT` plan entitlements instead of a Platform API key.
+        #[arg(long, requires = "openai", conflicts_with_all = ["api_key", "anthropic"])]
+        codex_access_token: bool,
     },
     /// Show what each VM's agents resolve to (per-VM override → default → off),
     /// with credentials redacted.
@@ -940,9 +978,13 @@ pub fn run() -> Result<()> {
     validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
+    if let Commands::VsockProxy { ref socket, port } = cli.command {
+        return vsock_proxy::run(socket, port);
+    }
+
     #[cfg(target_os = "linux")]
     if let Commands::ProbeFirecrackerSocket { ref path } = cli.command {
-        return config::probe_firecracker_api_socket(path);
+        return config::probe_firecracker_socket(path);
     }
 
     #[cfg(target_os = "linux")]
@@ -964,6 +1006,11 @@ pub fn run() -> Result<()> {
     } = cli.command
     {
         return setup::patch_guest_network_files(mount, hostname, ip);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Commands::PatchGuestVsockListener { ref mount } = cli.command {
+        return setup::patch_guest_vsock_listener_files(mount);
     }
 
     if let Commands::Completions { shell } = cli.command {
@@ -1033,12 +1080,17 @@ pub fn run() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().collect();
     match cli.command {
+        Commands::VsockProxy { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::ProbeFirecrackerSocket { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::DiskOp { .. } => unreachable!("handled before config loading"),
         #[cfg(target_os = "linux")]
         Commands::PatchGuestNetwork { .. } => unreachable!("handled before config loading"),
+        #[cfg(target_os = "linux")]
+        Commands::PatchGuestVsockListener { .. } => {
+            unreachable!("handled before config loading")
+        }
         Commands::Up {
             dir,
             name,
@@ -1177,24 +1229,28 @@ pub fn run() -> Result<()> {
             ask,
             mut args,
         } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
                 args.insert(0, "default".to_string());
                 args.insert(0, "--permission-mode".to_string());
             }
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(claude_bin.as_ref(), args),
+                ssh::AgentProgram::Claude,
+            )
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             args.insert(0, "agents".to_string());
-            let claude_bin = guest::GuestUser::new(sess.target.user.as_ref())?.claude_bin();
+            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Codex)?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1209,13 +1265,21 @@ pub fn run() -> Result<()> {
             } else {
                 guest::codex_bin()
             };
-            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(codex_bin.as_ref(), args),
+                ssh::AgentProgram::Codex,
+            )
         }
         Commands::Grok { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Grok)?;
             let args = grok_launch_args(ask, args);
-            let grok_bin = guest::GuestUser::new(sess.target.user.as_ref())?.grok_bin();
-            ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
+            let grok_bin = guest::GuestUser::new(sess.target.user().as_ref())?.grok_bin();
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(grok_bin.as_ref(), args),
+                ssh::AgentProgram::Grok,
+            )
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1227,6 +1291,20 @@ pub fn run() -> Result<()> {
         }
         Commands::List { json } => cmd_list(&be, &cfg, json),
         Commands::Status { name, json } => cmd_status(&be, &cfg, name.as_ref(), json),
+        Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } => cmd_network(
+            &be,
+            &mut cfg,
+            &cli.config,
+            name.as_ref(),
+            mode,
+            restart,
+            no_agents,
+        ),
         Commands::Agent {
             action:
                 AgentAction::Update {
@@ -1437,10 +1515,69 @@ mod tests {
         Cli::parse_from(std::iter::once("coop").chain(args.iter().copied()))
     }
 
+    #[test]
+    fn parses_internal_vsock_proxy_command() {
+        let cli = parse(&[
+            "__vsock-proxy",
+            "--socket",
+            "/tmp/vsock.sock",
+            "--port",
+            "22",
+        ]);
+        let super::Commands::VsockProxy { socket, port } = cli.command else {
+            panic!("expected vsock proxy command");
+        };
+        assert_eq!(socket, std::path::PathBuf::from("/tmp/vsock.sock"));
+        assert_eq!(port.get(), 22);
+    }
+
     fn parse_err(args: &[&str]) -> clap::Error {
         match Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())) {
             Err(e) => e,
             Ok(_) => panic!("expected parse failure"),
+        }
+    }
+
+    #[test]
+    fn codex_proxy_token_flag_requires_openai_and_excludes_api_key() {
+        let cli = parse(&[
+            "proxy",
+            "setup",
+            "--openai",
+            "--codex-access-token",
+            "--vm",
+            "my-vm",
+        ]);
+        let super::Commands::Proxy {
+            action:
+                super::ProxyAction::Setup {
+                    openai,
+                    codex_access_token,
+                    vm,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected proxy setup");
+        };
+        assert!(openai);
+        assert!(codex_access_token);
+        assert_eq!(vm.as_deref(), Some("my-vm"));
+        for args in [
+            &["proxy", "setup", "--codex-access-token"][..],
+            &["proxy", "setup", "--anthropic", "--codex-access-token"][..],
+            &[
+                "proxy",
+                "setup",
+                "--openai",
+                "--codex-access-token",
+                "--api-key",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())).is_err(),
+                "expected parse failure for {args:?}"
+            );
         }
     }
 
@@ -2266,6 +2403,44 @@ token = "test-pat"
             panic!("expected Status variant");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn network_query_and_transition_parse() {
+        let cli = parse(&["network", "vm"]);
+        let super::Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } = cli.command
+        else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("vm")
+        );
+        assert!(mode.is_none());
+        assert!(!restart);
+        assert!(!no_agents);
+
+        let cli = parse(&["network", "vm", "isolated", "--restart", "--no-agents"]);
+        let super::Commands::Network { mode, restart, .. } = cli.command else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(mode, Some(super::config::FirecrackerNetworkMode::Isolated));
+        assert!(restart);
+    }
+
+    #[test]
+    fn network_rejects_invalid_or_incomplete_transitions() {
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "offline"]).is_err());
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "--restart"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["coop", "network", "vm", "isolated", "--no-agents",])
+                .is_err()
+        );
     }
 
     #[test]

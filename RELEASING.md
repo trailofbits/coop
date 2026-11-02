@@ -24,20 +24,20 @@ push succeeds and ships something correct.
 
 ## What runs where
 
-| Check | CI (on PR + on tag) | `preflight-release.sh` | Manual judgement |
+| Check | CI workflows | `preflight-release.sh` | Manual judgement |
 |-------|:---:|:---:|:---:|
 | fmt / clippy / unit tests | ✓ | ✓ | |
 | `cargo deny --workspace`, `zizmor`, `taplo` | ✓ | ✓ (if installed) | |
 | Host-only integration and preflight/probe regression suites | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
-| Formal verification (`cargo kani`) | | ✓ (if installed) | |
+| Formal verification (`cargo kani`) | ✓ (PR/main) | ✓ (if installed) | |
 | Full VM integration, both platforms | | ✓ (local + 1 remote) | pick remote host |
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
 | Fuzzing (`--fuzz`) | | opt-in | when a parser changed |
 
-CI can't run the full VM integration suite or the extra-toolchain checks
-(kani/mutants/fuzz); those are the preflight's job.
+CI can't run the full VM integration suite or the mutation/fuzzing checks;
+those remain the preflight's job.
 
 ## Release checklist
 
@@ -138,8 +138,21 @@ native macOS ARM64, Linux x86_64, and Linux ARM64 runners; Linux needs
 `musl-tools` and `cmake` for the proxy's `aws-lc-sys` dependency, with `musl-gcc`
 as its C compiler and Rust linker (see `release.yml`). Cross-building locally
 also needs a C toolchain and linker configured for each target; installing the
-Rust target alone is insufficient. Check any targets skipped by the preflight
-on matching hosts before tagging.
+Rust target alone is insufficient. The preflight uses
+`x86_64-linux-musl-gcc` or `aarch64-linux-musl-gcc` automatically when the
+matching executable is on `PATH`; for the matching architecture on native
+Linux it also recognizes `musl-gcc`. If a toolchain uses another name,
+configure both target-scoped variables before running it:
+
+```bash
+export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
+export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+```
+
+Each value must name an executable on `PATH` (or an executable absolute path).
+Check any targets skipped by the preflight on matching hosts before tagging.
 
 Do **not** attempt `git push origin :refs/tags/vX.Y.Z` to delete and reuse a
 tag — immutable releases reject it, and reusing a spent version is not allowed.

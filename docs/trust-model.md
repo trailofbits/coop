@@ -50,15 +50,15 @@ user launched it.
 ## Taint sources (treat as untrusted)
 
 - **Guest filesystem content pulled to the host.** `workspace.rs` `pull` /
-  `tar_pipe_pull` / `rsync_pull` bring guest-authored file contents, filenames,
+  `rsync_pull` bring guest-authored file contents, filenames,
   and symlinks onto the host filesystem. This is the **widest guest→host
   channel** and the primary place a path-traversal or symlink escape could land.
   Files retain their untrusted origin after transfer, including when a host tool
   discovers them implicitly or consumes them during a later operation.
   Pull never invokes host Git to inspect its destination. It refuses a nonempty
   destination unless the user supplies `--force`, which authorizes overwriting
-  matching files but does not change their trust level. The transports attempt
-  to omit common ASCII-case `.git` paths, and both pull transports write into
+  matching files but does not change their trust level. Pull attempts
+  to omit common ASCII-case `.git` paths, and pull writes into
   an empty staging directory before a trusted host-side filtered installation.
   The staging boundary is a host-owned `0700` outer directory under private
   coop storage; transfer tools write only into its child. Pulls sharing a coop
@@ -125,8 +125,10 @@ The Linux network control-plane family is one narrow implementation of this
 contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
 from exact absolute paths. Unset fields use candidates under `/usr/bin`,
 `/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
-under those roots. The invocation-selected config can replace an identity with
-one exact path for non-FHS layouts; an override never falls back to built-ins.
+under those roots. The built-in `sudo` candidate may also resolve to the exact
+`/usr/lib/cargo/bin/sudo` target seen on Ubuntu 26.04 CI. The invocation-selected
+config can replace an identity with one exact path for non-FHS layouts; an
+override never falls back to built-ins.
 Both forms validate every actually traversed path component and symlink hop and
 require root ownership, a regular executable target, and no group/other write
 bits. Configured paths establish filesystem control only, not package, hash,
@@ -210,8 +212,9 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
   its coop directories separately from `data_dir`. See
   [private host storage](configuration.md#private-host-storage). A host
-  `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
-  (`backend.rs:restrict_guest_grok_auth`).
+  `~/.grok/auth.json` copied into an open-mode guest is `chmod 0600` after
+  `scp` (`backend.rs:restrict_guest_grok_auth`). Isolated bootstrap makes no
+  new auth-file copy and does not sanitize a copy retained on the guest disk.
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
@@ -240,12 +243,28 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   Codex via the `coop_local` provider's bearer `env_key`). In proxy mode Codex's
   `~/.codex/auth.json` is also **not** staged onto the guest disk (it holds a
   refreshable subscription token). Each credential is resolved on the host and
-  handed to `coop-proxy` over **stdin**, never argv or disk; a resolution failure
-  fails the boot closed. A per-VM override
+  handed to `coop-proxy` over **stdin**, never argv or a transport file. Literal
+  credentials are persisted in host configuration; `cmd:` indirections resolve
+  them at startup. A resolution failure fails the boot closed. A per-VM override
   (`proxy_state.rs`, `<inst.dir>/proxy.json`) selects a different host-side
   credential for one VM — resolution is override → default → off — without
   changing the proxy binary or the capability token. See
   [`credential-proxy.md`](credential-proxy.md).
+- **Codex access-token proxy auth stays on the host.** With `[proxy.openai]
+  auth = "codex_access_token"`, coop validates a Codex workspace PAT (`at-...`)
+  through a fixed, bounded HTTPS lookup at `auth.openai.com` before starting
+  the proxy. The token goes to curl and the proxy on stdin, never argv. Only
+  the workspace ID and FedRAMP routing flag are retained from the metadata
+  response; malformed metadata fails closed without echoing the response.
+  The proxy pins `chatgpt.com`, translates only the allowed Responses creation
+  operation to `/backend-api/codex/responses`, reconstructs the workspace and
+  FedRAMP headers from host-validated metadata, and strips guest-supplied
+  actor authorization. Both `OPENAI_API_KEY`
+  and `CODEX_ACCESS_TOKEN` are suppressed from managed guest forwarding in
+  OpenAI proxy mode. Cached OAuth tokens and legacy agent-identity JWTs are
+  unsupported; there is no refresh or API-key fallback. Token rotation takes
+  effect on VM restart. The guest's capability still authorizes inference
+  using the token creator's workspace entitlements; it is not a usage budget.
 - **Codex ChatGPT account auth is persistent guest state.** With
   `[codex] auth = "chatgpt"`, coop suppresses `OPENAI_API_KEY` across config,
   process env, `env_forward`, and persisted `--env` overlays, writes
@@ -301,6 +320,36 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   to a VM the host itself owns. Coop-owned transports disable host agent use
   and forwarding; generated SSH config blocks set the same options for aliases,
   subject to OpenSSH configuration precedence for the user-owned file.
+- The Firecracker-vsock transport renders `ProxyCommand` only from the running
+  coop executable, a trusted per-instance socket path, and a non-zero numeric
+  guest port. Paths reject OpenSSH expansion characters and control bytes,
+  escape `%` tokens, and are POSIX-shell quoted before OpenSSH interprets the
+  command. The helper accepts no command text from the guest: it sends one
+  bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
+  and then relays bytes. Firecracker starts with `--no-api`, so newly started
+  VMs have no API socket. Its process umask makes the base vsock socket mode
+  0666 inside the user-owned mode-0700 instance directory; other users cannot
+  reach it through the directory. This grants the invoking user access to the
+  guest transport, not a Firecracker control API. A process started before
+  `--no-api` may retain an API socket until stopped. Without a verified PID,
+  coop uses a privileged, nonblocking connection probe on the API and base
+  vsock socket entries. Only a refused or missing socket permits cleanup;
+  a live listener, non-socket entry, or uncertain result blocks it. Coop never
+  kills a process found through a socket lookup. Confirmed stale entries are
+  unlinked through the pinned private directory rather than a root shell command.
+- A Firecracker instance's control mode is persisted at creation. `vsock`
+  mode never silently retries TCP: readiness, shutdown, shell, file transfer,
+  forwarding, and generated SSH configuration all derive the same target from
+  that tag. Older untagged instances map to `legacy_tcp` for compatibility.
+  This is control-plane independence, not host network isolation: the guest
+  NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
+- A Firecracker instance in persisted `isolated` network mode is started with
+  no network interface and coop does not create its TAP. Control and managed
+  fixed-destination proxy forwards use SSH over vsock without a TCP fallback.
+  The composite persisted marker is rejected by prior releases. This prevents
+  guest Ethernet/IP egress through coop, but model request bodies still leave
+  through the selected host credential proxy and existing guest-disk secrets
+  are not sanitized by switching modes.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
@@ -382,8 +431,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   reachable by exactly one guest, identically on both backends. It is guarded
   by a per-instance capability token and forwards only its documented
   provider-specific operations to a fixed per-provider upstream
-  (`api.anthropic.com` / `api.openai.com`), never a guest-supplied host — one
-  proxy process and one tunnel per (VM, provider). Its own TLS-verifying
+  (`api.anthropic.com` / `api.openai.com` / `chatgpt.com`), never a
+  guest-supplied host — one proxy process and one tunnel per (VM, provider). Its own TLS-verifying
   outbound HTTPS is the intended egress; a change that lets the guest influence
   the upstream host, widens the operation policy without security review, or
   binds anything wider than loopback, is a finding. The proxy streams allowed
@@ -417,7 +466,7 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   flag a change that *widens* them):
   - **Port-scoped, not host-scoped.** Both Landlock and Seatbelt filter by
     port, not hostname/IP. A *fully compromised* proxy could still open a TCP
-    connection to some other host on `:443`; the two upstreams' identity is
+    connection to some other host on `:443`; the fixed upstreams' identity is
     enforced one layer up, at the proxy's TLS verification + pinned `Host`, and
     the guest still cannot retarget them. Host-scoped egress would need IP
     pinning (fragile against CDN rotation) or an L7 egress proxy — out of scope
