@@ -60,11 +60,7 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
     let instances = cfg.list_instances()?;
     for inst in &instances {
         tracing::info!("Destroying instance '{}'", inst.name);
-        if let Ok(target) = be.ssh_target(cfg, inst) {
-            port_forward::teardown_ssh_forwards(inst, &target);
-        }
-        crate::proxy::stop(inst);
-        be.destroy_instance(cfg, inst)?;
+        destroy_instance_with_host_cleanup(be, cfg, inst)?;
         workspace::remove_ssh_config(inst)?;
     }
 
@@ -94,6 +90,24 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
 
     workspace::remove_all_ssh_config()?;
     Ok(())
+}
+
+/// Serialize host-helper cleanup with backend destruction. The backend invokes
+/// the callback before stopping the guest and again before removing instance
+/// state, while still holding the per-instance operation lock.
+fn destroy_instance_with_host_cleanup(
+    be: &backend::PlatformBackend,
+    cfg: &config::CoopConfig,
+    inst: &config::Instance,
+) -> Result<()> {
+    let target = be.ssh_target(cfg, inst).ok();
+    let mut cleanup = || {
+        if let Some(target) = &target {
+            port_forward::teardown_ssh_forwards(inst, target);
+        }
+        crate::proxy::stop(inst)
+    };
+    be.destroy_instance_with_cleanup(cfg, inst, &mut cleanup)
 }
 
 #[cfg(test)]

@@ -152,9 +152,12 @@ Run on **both platforms** before every commit:
 ./tests/run-integration.sh --profile python,node --name my-test
 ```
 
-Release preflight runs `--full --require-proxy` on each selected host. Use the
-same flags to require the proxy build, host curl, the macOS Seatbelt profile,
-and completion of the credential-proxy phase:
+Release preflight runs `--full --require-proxy` on each selected host. On
+Linux, these flags require the proxy build, host curl, and completion of the
+full credential-proxy lifecycle/non-exposure phase. On macOS they require the
+proxy binary and Seatbelt profile/self-test, but skip the lifecycle fixture
+before helper launch because current fail-closed teardown cannot safely reap
+it. Use the same flags locally:
 
 ```bash
 ./tests/run-integration.sh --full --require-proxy
@@ -454,6 +457,11 @@ parsing, or state composition:
   fixtures cover exact bounds, asymmetric pipe closure, ordinary descendants,
   and a deliberately detached pipe holder, so this module remains fully in
   mutation scope despite owning host IO.
+- `src/process_identity.rs` — persisted helper identity parsing/comparison,
+  owner-only state, native observation, TERM/KILL group cleanup, and
+  remove-only-after-confirmed-absence behavior. Native fixtures deliberately
+  alter start/role/provider identity and exercise graceful and escalated exits;
+  Linux-specific pidfd behavior must also run through `run-linux-unit.sh`.
 - `src/update_policy.rs` — updater source, tag, and release-asset identity
   policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,

@@ -211,9 +211,21 @@ and accepted limitations.
 
 ## Platform support
 
-**Firecracker (Linux) and Lima (macOS).** The proxy binds `127.0.0.1` on the
-host and is exposed into the guest with a per-instance `ssh -R` reverse tunnel,
-so it works identically on both backends (each already keeps an SSH channel to
-its guest). The host-side proxy process is jailed on both — Landlock on Linux
-(enabled on the host; kernel ≥5.13, with TCP scoping from ≥6.7), Seatbelt via
+**Firecracker (Linux) and Lima (macOS).** The proxy data plane binds
+`127.0.0.1` on the host and is exposed into the guest with a per-instance
+`ssh -R` reverse tunnel on both backends. The host-side proxy is jailed with
+Landlock on Linux (kernel ≥5.13, with TCP scoping from ≥6.7) and Seatbelt via
 `sandbox-exec` on macOS. GitHub credentials are not supported.
+
+Lifecycle support is currently asymmetric. A supporting Linux kernel supplies
+stable pidfd process-group authority, so coop can safely stop and confirm the
+proxy and tunnel. For a running VM, coop tears these helpers down before guest
+shutdown so the SSH tunnel leader remains available to that stable authority;
+an authority failure leaves the VM running for inspected recovery. macOS
+exposes no equivalent authority: after proxy use,
+`stop`, `destroy`, reprovision, replacement, and provider-mode transitions fail
+closed and require inspected manual helper cleanup. `--force` does not bypass
+this protection. An authenticated supervisor/control channel is planned to
+restore automatic macOS teardown without a PID-reuse race; see
+[`configuration.md`](configuration.md#proxy-section) for the operational
+details.

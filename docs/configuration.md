@@ -639,6 +639,34 @@ the coop producer and proxy consumer. Oversized credentials therefore fail VM
 startup instead of being passed to the proxy. Proxy and SSH-forward startup
 diagnostics are bounded and mark truncation or overflow explicitly.
 
+Proxy and reverse-tunnel lifecycle files under the instance directory are
+owner-only JSON identity records, despite retaining the historical `.pid`
+suffix. Coop binds each helper's role/provider, PID and process group, uid,
+native start identity, and executable before using the record for readiness or
+shutdown. A plain numeric file from an older coop release is deliberately not
+accepted as signal authority: start, stop, or destroy fails with manual cleanup
+guidance and retains the file. `--force` does not bypass an identity mismatch,
+because the numeric PID may now belong to an unrelated host process.
+
+On Linux kernels that support stable pidfd process-group signaling, verified
+shutdown tears helpers down before stopping a running VM so its reverse-tunnel
+leader remains live long enough to acquire stable authority. Coop verifies the
+leader, acquires a pidfd, sends TERM to its helper group, and waits briefly. If
+descendants remain after the leader exits, KILL
+and the final absence probe use that same retained pidfd authority without
+re-resolving the numeric leader. State and capability tokens are removed only
+after that authority confirms the group absent. If the recorded leader exits
+before coop acquires the authority,
+its state is retained for manual inspection even when no process is apparent.
+Older Linux kernels and macOS do not provide the required race-free group
+authority, so coop refuses to signal a live helper and reports manual cleanup guidance.
+In particular, stop, destroy, reprovision, and a provider-mode transition can
+fail after proxy use on macOS until the recorded helpers are inspected and
+cleaned up manually. `--force` does not override this failure. This is an
+intentional fail-closed compatibility cost pending an authenticated helper
+supervisor/control channel; a userspace identity recheck followed by `killpg`
+would still be vulnerable to PID/process-group reuse.
+
 ## `profiles` section
 
 Custom installation profiles for `coop setup --profile <name>`. Each profile declares packages and scripts that run during rootfs template creation.
