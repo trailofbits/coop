@@ -163,16 +163,30 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 
 | File | Purpose |
 |------|---------|
-| `instance.json` | Instance metadata (name, index, image) |
+| `instance.json` | Instance metadata (name, index, image, persisted Firecracker control mode) |
 | `rootfs.ext4` | Instance root filesystem (Firecracker) |
 | `firecracker.pid` | PID of the running Firecracker process |
-| `firecracker.socket` | Firecracker API socket |
+| `firecracker.socket` | Legacy Firecracker API socket (only for VMs started by older versions) |
 | `firecracker.log` | Serial console log |
 | `vm_config.json` | Firecracker VM configuration |
 | `workspace.json` | Workspace sync state (host path, guest path, source) |
-| `vsock.sock` | Vsock socket for host-guest communication |
+| `vsock.sock` | Firecracker base vsock socket (inside the private instance directory) |
+
+Older stopped Firecracker VMs can retain root-owned API and base vsock socket
+entries after their PID file is removed. Coop checks both with a privileged,
+nonblocking connection probe. It removes them on the next start or stopped-VM
+cleanup only when neither socket is listening. A live listener, a non-socket
+entry, or an uncertain probe blocks the operation. In that case, inspect the
+path from the error with `sudo lsof -nP <socket-path>` and verify and stop any
+process holding it before retrying.
 
 On Lima, the directory structure differs because Lima manages its own VM state. `instance.json` and `workspace.json` are always present regardless of backend.
+
+Older `instance.json` files without a Firecracker control field load as
+`legacy_tcp` and are not rewritten merely by being read. The configured mode
+applies only when a new instance is allocated; changing the global setting
+does not migrate existing instances. An ordinary metadata update may materialize
+the explicit legacy tag while preserving the instance's behavior.
 
 ## Concurrent access and file locking
 

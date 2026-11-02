@@ -2,8 +2,10 @@
 """Exercise release preflight dispatch and version gates without building VMs."""
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -17,6 +19,11 @@ class PreflightTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         for directory in ('scripts', 'tests', 'bin'):
             (self.root / directory).mkdir()
+        for name in ('awk', 'bash', 'dirname', 'grep', 'printenv', 'sed'):
+            source = shutil.which(name)
+            self.assertIsNotNone(source)
+            (self.root / 'bin' / name).symlink_to(source)
+        (self.root / 'bin/python3').symlink_to(sys.executable)
         (self.root / 'scripts/preflight-release.sh').write_text(
             (ROOT / 'scripts/preflight-release.sh').read_text())
         (self.root / 'Cargo.toml').write_text(
@@ -28,9 +35,16 @@ class PreflightTests(unittest.TestCase):
         for name in ('cargo', 'cargo-deny', 'taplo', 'zizmor', 'cargo-kani'):
             self.executable('bin/' + name, '''#!/bin/bash
 printf '%s %s\n' "${0##*/}" "$*" >> "$PREFLIGHT_CALLS"
+if [[ "${0##*/} $*" == "cargo build --release --workspace --target aarch64-unknown-linux-musl" ]]; then
+  printf 'aarch64-musl-env %s %s\n' "${CC_aarch64_unknown_linux_musl:-}" "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}" >> "$PREFLIGHT_CALLS"
+fi
+if [[ "${0##*/} $*" == "cargo build --release --workspace --target x86_64-unknown-linux-musl" ]]; then
+  printf 'x86_64-musl-env %s %s\n' "${CC_x86_64_unknown_linux_musl:-}" "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-}" >> "$PREFLIGHT_CALLS"
+fi
 if [[ "${0##*/} $*" == "${PREFLIGHT_FAIL:-}" ]]; then exit 1; fi
 ''')
         self.executable('bin/rustup', '#!/bin/bash\necho aarch64-unknown-linux-gnu\necho aarch64-unknown-linux-musl\n')
+        self.executable('bin/aarch64-linux-musl-gcc', '#!/bin/bash\nexit 0\n')
         self.executable('bin/uname', '#!/bin/bash\necho Linux\n')
         self.executable('bin/git', '''#!/bin/bash
 if [[ "$1" == rev-parse ]]; then exit 1; fi
@@ -60,16 +74,26 @@ printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
             '[[package]]\nname = "coop"\nversion = "9.8.7"\n'
             f'[[package]]\nname = "coop-proxy"\nversion = "{proxy}"\n')
 
-    def run_preflight(self, fail='', quick=True, remote=None):
+    def run_preflight(self, fail='', quick=True, remote=None, extra_env=None):
         args = ['bash', str(self.root / 'scripts/preflight-release.sh')]
         if quick:
             args.append('--quick')
         if remote:
             args.extend(['--remote', remote])
+        env = {**os.environ, 'PATH': str(self.root / 'bin'),
+               'PREFLIGHT_CALLS': str(self.log), 'PREFLIGHT_FAIL': fail}
+        for name in ('CC_x86_64_unknown_linux_musl',
+                     'CC_x86_64-unknown-linux-musl',
+                     'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER',
+                     'CC_aarch64_unknown_linux_musl',
+                     'CC_aarch64-unknown-linux-musl',
+                     'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER'):
+            env.pop(name, None)
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             args,
-            env={**os.environ, 'PATH': str(self.root / 'bin') + ':' + os.environ['PATH'],
-                 'PREFLIGHT_CALLS': str(self.log), 'PREFLIGHT_FAIL': fail},
+            env=env,
             capture_output=True, text=True, timeout=20)
 
     def test_workspace_version_and_gates(self):
@@ -112,6 +136,132 @@ printf 'run-integration.sh %s\n' "$*" >> "$PREFLIGHT_CALLS"
         result = self.run_preflight(fail='cargo test --workspace')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('FAIL: Unit tests', result.stdout)
+
+    def test_installed_musl_target_without_cross_toolchain_fails_before_build(self):
+        (self.root / 'bin/aarch64-linux-musl-gcc').unlink()
+        result = self.run_preflight()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'Install aarch64-linux-musl-gcc or set '
+            'CC_aarch64_unknown_linux_musl', result.stdout)
+        self.assertIn(
+            'Install aarch64-linux-musl-gcc or set '
+            'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER', result.stdout)
+        self.assertNotIn(
+            'cargo build --release --workspace --target '
+            'aarch64-unknown-linux-musl', self.log.read_text().splitlines())
+
+    def test_configured_musl_compiler_and_linker_are_used(self):
+        (self.root / 'bin/aarch64-linux-musl-gcc').unlink()
+        self.executable('bin/custom-musl-cc', '#!/bin/bash\nexit 0\n')
+        result = self.run_preflight(extra_env={
+            'CC_aarch64_unknown_linux_musl': 'custom-musl-cc',
+            'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER': 'custom-musl-cc',
+        })
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            'CC_aarch64_unknown_linux_musl=custom-musl-cc, '
+            'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=custom-musl-cc',
+            result.stdout)
+        self.assertIn(
+            'cargo build --release --workspace --target '
+            'aarch64-unknown-linux-musl', self.log.read_text().splitlines())
+        self.assertIn(
+            'aarch64-musl-env custom-musl-cc custom-musl-cc',
+            self.log.read_text().splitlines())
+
+    def test_configured_missing_musl_tools_fail_before_build(self):
+        result = self.run_preflight(extra_env={
+            'CC_aarch64_unknown_linux_musl': 'missing-musl-cc',
+            'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER':
+                'missing-musl-linker',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'CC_aarch64_unknown_linux_musl=missing-musl-cc does not name an '
+            'executable on PATH', result.stdout)
+        self.assertIn(
+            'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER='
+            'missing-musl-linker does not name an executable on PATH',
+            result.stdout)
+        self.assertNotIn(
+            'cargo build --release --workspace --target '
+            'aarch64-unknown-linux-musl', self.log.read_text().splitlines())
+
+    def test_hyphenated_cc_override_takes_precedence(self):
+        result = self.run_preflight(extra_env={
+            'CC_aarch64-unknown-linux-musl': 'missing-priority-musl-cc',
+            'CC_aarch64_unknown_linux_musl': 'aarch64-linux-musl-gcc',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'CC_aarch64-unknown-linux-musl=missing-priority-musl-cc does not '
+            'name an executable on PATH', result.stdout)
+        self.assertNotIn(
+            'cargo build --release --workspace --target '
+            'aarch64-unknown-linux-musl', self.log.read_text().splitlines())
+
+    def test_empty_hyphenated_cc_override_fails_before_build(self):
+        result = self.run_preflight(extra_env={
+            'CC_aarch64-unknown-linux-musl': '',
+            'CC_aarch64_unknown_linux_musl': 'aarch64-linux-musl-gcc',
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'set CC_aarch64-unknown-linux-musl to an executable for that '
+            'target', result.stdout)
+        self.assertNotIn(
+            'cargo build --release --workspace --target '
+            'aarch64-unknown-linux-musl', self.log.read_text().splitlines())
+
+    def test_native_linux_musl_gcc_is_auto_configured(self):
+        self.executable(
+            'bin/rustup',
+            '#!/bin/bash\necho x86_64-unknown-linux-musl\n')
+        self.executable('bin/musl-gcc', '#!/bin/bash\nexit 0\n')
+        self.executable('bin/uname', '''#!/bin/bash
+if [[ "$1" == -m ]]; then echo x86_64; else echo Linux; fi
+''')
+        result = self.run_preflight()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            'CC_x86_64_unknown_linux_musl=musl-gcc, '
+            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc',
+            result.stdout)
+        self.assertIn(
+            'cargo build --release --workspace --target '
+            'x86_64-unknown-linux-musl', self.log.read_text().splitlines())
+        self.assertIn(
+            'x86_64-musl-env musl-gcc musl-gcc',
+            self.log.read_text().splitlines())
+
+    def test_native_arm64_linux_musl_gcc_is_auto_configured(self):
+        (self.root / 'bin/aarch64-linux-musl-gcc').unlink()
+        self.executable('bin/musl-gcc', '#!/bin/bash\nexit 0\n')
+        for arch in ('aarch64', 'arm64'):
+            with self.subTest(arch=arch):
+                if self.log.exists():
+                    self.log.unlink()
+                self.executable('bin/uname', f'''#!/bin/bash
+if [[ "$1" == -m ]]; then echo {arch}; else echo Linux; fi
+''')
+                result = self.run_preflight()
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(
+                    'CC_aarch64_unknown_linux_musl=musl-gcc, '
+                    'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc',
+                    result.stdout)
+                self.assertIn(
+                    'aarch64-musl-env musl-gcc musl-gcc',
+                    self.log.read_text().splitlines())
+
+    def test_cargo_config_names_both_musl_linkers(self):
+        config = (ROOT / '.cargo/config.toml').read_text()
+        self.assertIn('[target.x86_64-unknown-linux-musl]\n'
+                      'linker = "x86_64-linux-musl-gcc"', config)
+        self.assertIn('[target.aarch64-unknown-linux-musl]\n'
+                      'linker = "aarch64-linux-musl-gcc"', config)
 
     def test_nonquick_runs_full_required_proxy_suite_on_both_platforms(self):
         result = self.run_preflight(quick=False, remote='tester@other')

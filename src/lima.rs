@@ -36,10 +36,15 @@ pub const HOST_GATEWAY: &str = "host.lima.internal";
 pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     crate::fs_util::private_dir(&cfg.data_dir).context("Failed to create data directory")?;
 
+    let image = &opts.image;
+    let _image_lock = crate::setup::lock_image_publication(cfg, image)?;
+    if !opts.rebuild {
+        crate::setup::validate_image_publication(cfg, image)?;
+    }
+
     check_requirements()?;
     ensure_ssh_key(cfg)?;
 
-    let image = &opts.image;
     let base_img = cfg.lima_base_path(image);
     if base_img.exists()
         && !opts.rebuild
@@ -63,6 +68,7 @@ pub fn setup(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     }
 
     generate_start_template(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)?;
 
     eprintln!("\nSetup complete.");
     eprintln!("Run `coop up` in a project directory to launch a VM.");
@@ -96,6 +102,17 @@ pub fn create_and_start(
 
     let effective_template = instance_template(inst, mounts, &mut template_file, &template_path)?;
 
+    let base_file =
+        image_dir.open_regular(base_img.file_name().context("Base image has no name")?)?;
+    // Lima clones the base image, so a smaller requested disk cannot start.
+    let base_disk = base_image_size_gib(&base_file)?;
+    let disk = choose_instance_disk_size(base_disk, disk_gib);
+    if let Some(requested) = disk_gib.filter(|requested| *requested < base_disk) {
+        tracing::warn!(
+            "Requested disk size ({requested} GiB) < base image ({base_disk} GiB), using base image size"
+        );
+    }
+
     // Clean up leftover Lima instance from a previous failed start
     if let Some(state) = lima_state(&inst.name)? {
         if matches!(state, LimaState::Unknown(_)) {
@@ -116,24 +133,13 @@ pub fn create_and_start(
 
     tracing::info!("Creating Lima instance '{name}'");
 
-    let base_file =
-        image_dir.open_regular(base_img.file_name().context("Base image has no name")?)?;
-    let disk = disk_gib.unwrap_or_else(|| {
-        // Default to the base image size (rounded up to GiB) so the
-        // instance disk is never smaller than the golden image it was
-        // cloned from.  Fall back to template_size_gib if the file
-        // size can't be read.
-        base_image_size_gib(&base_file).unwrap_or(cfg.vm.template_size_gib)
-    });
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
-    let mut child = private_limactl()
-        .arg("start")
+    let mut child = headless_limactl_start()
         .arg(&effective_template)
         .arg(format!("--name={name}"))
         .arg(format!("--cpus={}", cfg.vm.vcpu_count))
         .arg(format!("--memory={mem_gib}"))
         .arg(format!("--disk={disk}"))
-        .arg("--tty=false")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -212,8 +218,8 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
-    let mut child = private_limactl()
-        .args(["start", &name])
+    let mut child = headless_limactl_start()
+        .arg(&name)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -317,23 +323,24 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::GiB) -> Result<()> {
     let (_disk_dir, disk, disk_file) = open_instance_disk(inst, DiskAccess::Update)?;
     let current_bytes = disk_file.metadata()?.len();
-    let current_gib = current_bytes / (1024 * 1024 * 1024);
-    let new_gib = u64::from(new_size.as_u32());
+    let requested_bytes = new_size.as_bytes();
 
-    if new_gib < current_gib {
+    if requested_bytes < current_bytes {
         bail!(
-            "Shrinking is not supported (current: {current_gib} GiB, \
-             requested: {new_gib} GiB)"
+            "Shrinking is not supported (current image: {}; requested: {})",
+            crate::config::format_disk_bytes(current_bytes),
+            crate::config::format_disk_bytes(requested_bytes),
         );
     }
-    if new_gib == current_gib {
-        tracing::info!("Disk is already {current_gib} GiB — nothing to do");
+    if requested_bytes == current_bytes {
+        tracing::info!("Disk is already {new_size} GiB — nothing to do");
         return Ok(());
     }
 
     tracing::info!(
-        "Resizing instance '{}' from {current_gib} to {new_gib} GiB",
+        "Resizing instance '{}' from {} to {new_size} GiB",
         inst.name,
+        crate::config::format_disk_bytes(current_bytes),
     );
 
     // Lima re-reads `disk:` from lima.yaml on start. Growing the file
@@ -358,7 +365,7 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
         }
     };
 
-    if let Err(error) = disk_file.set_len(new_gib * 1024 * 1024 * 1024) {
+    if let Err(error) = disk_file.set_len(requested_bytes) {
         restore_yaml();
         return Err(error).with_context(|| format!("Failed to resize {}", disk.display()));
     }
@@ -461,7 +468,12 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 /// the image's `lima-base.img` and regenerates the fast-start template
 /// so it points at the new base. The caller has gated on the instance
 /// being stopped and decided whether overwriting is allowed.
-pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Result<()> {
+pub fn commit_disk(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    image: &ImageName,
+    metadata: &TemplateConfig,
+) -> Result<()> {
     let (_disk_dir, src, source) = open_instance_disk(inst, DiskAccess::Read)?;
 
     let image_dir = cfg.image_dir(image);
@@ -470,6 +482,7 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
 
     let base_img = cfg.lima_base_path(image);
     tracing::info!("Committing instance '{}' to image '{image}'", inst.name);
+    crate::setup::begin_image_publication(cfg, image)?;
     image_dir_handle
         .copy_atomic_sparse(
             base_img.file_name().context("Base image has no name")?,
@@ -477,7 +490,9 @@ pub fn commit_disk(cfg: &CoopConfig, inst: &Instance, image: &ImageName) -> Resu
             0o600,
         )
         .with_context(|| format!("Failed to copy {} -> {}", src.display(), base_img.display()))?;
-    generate_start_template(cfg, image)
+    generate_start_template(cfg, image)?;
+    metadata.save_for(cfg, image)?;
+    crate::setup::finish_image_publication(cfg, image)
 }
 
 /// Replace a stopped instance's disk with image `image`'s base image.
@@ -712,12 +727,10 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     let cpus = info["cpus"].as_u64().unwrap_or(0);
     let memory_bytes = info["memory"].as_u64().unwrap_or(0);
     let memory_mib = memory_bytes / (1024 * 1024);
-    let disk_gib = open_instance_disk(inst, DiskAccess::Read)
+    let disk_bytes = open_instance_disk(inst, DiskAccess::Read)
         .and_then(|(_, _, file)| file.metadata().map_err(Into::into))
-        .map_or_else(
-            |_| info["disk"].as_u64().unwrap_or(0) / (1024 * 1024 * 1024),
-            |m| m.len() / (1024 * 1024 * 1024),
-        );
+        .map_or_else(|_| info["disk"].as_u64().unwrap_or(0), |m| m.len());
+    let disk_size = crate::config::format_disk_bytes(disk_bytes);
     let ssh_port = info["sshLocalPort"].as_u64().unwrap_or(0);
 
     let mut out = format!(
@@ -726,7 +739,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
          \x20 Arch: {arch}\n\
          \x20 vCPUs: {cpus}\n\
          \x20 Memory: {memory_mib} MiB\n\
-         \x20 Disk: {disk_gib} GiB\n\
+         \x20 Disk: {disk_size}\n\
          \x20 SSH: localhost:{ssh_port} (key: {})",
         inst.name,
         cfg.ssh_key_path().display(),
@@ -828,13 +841,13 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
 
     let guest_user = crate::backend::persisted_guest_user(cfg, &inst.image);
 
-    Ok(SshTarget {
-        host: Hostname::new("127.0.0.1")?,
+    Ok(SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    })
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
 }
 
 // ── Setup helpers ─────────────────────────────────────────────
@@ -1022,25 +1035,27 @@ fn build_golden_image(
         }
     };
 
-    // Swap staging into place — old image is replaced atomically
-    image_dir
-        .rename_child(
-            staging_name,
-            base_img.file_name().context("Base image has no name")?,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to swap staging image {} -> {}",
-                staging.display(),
-                base_img.display()
+    // Keep consumers from using a replaced disk until its metadata is published.
+    publish_lima_disk(cfg, image, || {
+        image_dir
+            .rename_child(
+                staging_name,
+                base_img.file_name().context("Base image has no name")?,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "Failed to swap staging image {} -> {}",
+                    staging.display(),
+                    base_img.display()
+                )
+            })
+    })?;
 
     #[expect(clippy::cast_precision_loss, reason = "file size fits in f64")]
     let size_gib = image_dir
         .open_regular(base_img.file_name().context("Base image has no name")?)
         .and_then(|file| file.metadata().map_err(Into::into))
-        .map(|m| m.len() as f64 / (1024.0 * 1024.0 * 1024.0))
+        .map(|m| m.len() as f64 / crate::config::GIB_BYTES as f64)
         .unwrap_or(0.0);
     eprintln!("  Golden image: {} ({size_gib:.1} GiB)", base_img.display());
 
@@ -1059,10 +1074,20 @@ fn build_golden_image(
         grok_marketplaces: baked.grok_marketplaces,
         grok_plugins: baked.grok_plugins,
         guest_user: guest_user.clone(),
+        capabilities: std::collections::BTreeSet::new(),
     };
     template_config.save_for(cfg, image)?;
 
     Ok(())
+}
+
+fn publish_lima_disk(
+    cfg: &CoopConfig,
+    image: &ImageName,
+    swap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::setup::begin_image_publication(cfg, image)?;
+    swap()
 }
 
 fn report_builder_inputs(profiles: &[ProfileDef]) {
@@ -1114,8 +1139,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
-    let mut command = private_limactl();
-    command.arg("start");
+    let mut command = headless_limactl_start();
     if let Some(timeout) = builder_timeout {
         command
             .arg("--timeout")
@@ -1124,7 +1148,6 @@ fn run_builder_vm(
     let status = command
         .arg(builder_template)
         .arg(format!("--name={BUILDER_NAME}"))
-        .arg("--tty=false")
         .status()
         .context("Failed to run limactl start for builder")?;
 
@@ -1223,13 +1246,13 @@ fn builder_ssh_target(cfg: &CoopConfig, guest_user: &GuestUser) -> Result<SshTar
         .context("Builder VM has no sshLocalPort")?;
     let port = u16::try_from(port).context("SSH port out of range")?;
     let port = std::num::NonZeroU16::new(port).context("Builder SSH port is 0")?;
-    Ok(SshTarget {
-        host: Hostname::new("127.0.0.1")?,
+    Ok(SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
         port,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    })
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    ))
 }
 
 /// Marketplace/plugin lists baked into a golden image, recorded in
@@ -1601,6 +1624,9 @@ mounts: []
 containerd:
   system: false
   user: false
+
+video:
+  display: "none"
 "#,
         image_path = image_path,
         arch = arch,
@@ -1945,13 +1971,13 @@ fn wait_for_lima_ssh(
     // TCP connects to Lima's proxy port immediately, but the guest
     // sshd isn't ready for several seconds. Auth probing detects
     // true readiness so the caller's wait_until_ready is instant.
-    let target = SshTarget {
-        host: Hostname::new("127.0.0.1")?,
-        port: std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
-        user: SshUser::new(guest_user.as_str())?,
-        key_path: std::path::absolute(cfg.ssh_key_path())?,
-        host_tools: cfg.ssh.host_tools.clone(),
-    };
+    let target = SshTarget::tcp(
+        Hostname::new("127.0.0.1")?,
+        std::num::NonZeroU16::new(port).context("Lima assigned SSH port 0")?,
+        SshUser::new(guest_user.as_str())?,
+        std::path::absolute(cfg.ssh_key_path())?,
+        cfg.ssh.host_tools.clone(),
+    );
     let mut delay = Duration::from_millis(500);
 
     loop {
@@ -2029,11 +2055,12 @@ fn reap_in_background(child: std::process::Child) {
 // ── Lima helpers ──────────────────────────────────────────────
 
 /// Read a raw disk image's file size and convert to GiB (rounded up).
-fn base_image_size_gib(file: &File) -> Option<GiB> {
-    let bytes = file.metadata().ok()?.len();
-    let gib = bytes.div_ceil(1024 * 1024 * 1024);
-    #[expect(clippy::cast_possible_truncation, reason = "disk images < 4 TiB")]
-    GiB::new(gib as u32)
+fn base_image_size_gib(file: &File) -> Result<GiB> {
+    GiB::from_bytes_ceil(file.metadata()?.len())
+}
+
+fn choose_instance_disk_size(base: GiB, requested: Option<GiB>) -> GiB {
+    requested.map_or(base, |size| size.max(base))
 }
 
 /// Extract the most useful error line(s) from Lima's stderr output.
@@ -2098,6 +2125,17 @@ fn private_limactl() -> Command {
             Ok(())
         });
     }
+    command
+}
+
+/// Start Lima without any interactive or graphical UI.
+///
+/// The explicit video override also repairs existing instances whose persisted
+/// `lima.yaml` enables a display, while the generated template keeps new
+/// instances headless from creation.
+fn headless_limactl_start() -> Command {
+    let mut command = private_limactl();
+    command.args(["start", "--tty=false", "--set", ".video.display=\"none\""]);
     command
 }
 
@@ -2233,6 +2271,83 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn plain_setup_refuses_interrupted_publication_with_matching_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.path()),
+            ..CoopConfig::default()
+        };
+        let image = ImageName::new("interrupted").unwrap();
+        let user = GuestUser::default();
+        PrivateDir::create(&cfg.data_dir).unwrap();
+        PrivateDir::create(&cfg.images_dir()).unwrap();
+        PrivateDir::create(&cfg.image_dir(&image)).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: "2026-01-01T00:00:00Z".to_string(),
+            install_script_hash: provision_script_hash(&cfg, &[], &user),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: user.clone(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        metadata.save_for(&cfg, &image).unwrap();
+        assert!(!needs_rebuild(&cfg, &image, &[], &user));
+
+        let disk = cfg.lima_base_path(&image);
+        let staging = disk.with_extension("img.new");
+        fs::write(&disk, b"old disk").unwrap();
+        fs::write(&staging, b"new disk").unwrap();
+        let error = publish_lima_disk(&cfg, &image, || {
+            fs::rename(&staging, &disk)?;
+            anyhow::bail!("injected interruption after rename")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+
+        let opts = SetupOptions {
+            skip_confirm: true,
+            rebuild: false,
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install: None,
+            image: image.clone(),
+            guest_user: user,
+            builder_timeout: None,
+        };
+        let error = setup(&cfg, &opts).unwrap_err().to_string();
+        assert!(error.contains("incomplete publication"), "{error}");
+        assert!(error.contains("--rebuild"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), b"new disk");
+        assert!(
+            cfg.image_dir(&image)
+                .join(".publication-incomplete")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn lima_start_disables_interactive_and_graphical_ui() {
+        let command = headless_limactl_start();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["start", "--tty=false", "--set", ".video.display=\"none\""]
+        );
+    }
+
+    #[test]
     fn list_running_reuses_inventory() {
         use std::os::unix::fs::PermissionsExt as _;
         let Ok(root) = std::env::var("COOP_TEST_LIST_INVENTORY") else {
@@ -2263,6 +2378,7 @@ mod tests {
                 index: crate::config::InstanceIndex::new(0).unwrap(),
                 dir: root.join(name),
                 image: ImageName::new("default").unwrap(),
+                firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
             })
             .collect();
         let cases = [
@@ -2455,6 +2571,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let metadata = inst.dir.join("instance.json");
@@ -2474,6 +2591,23 @@ mod tests {
                 .resize_disk(&cfg, &stopped, crate::config::GiB::new(1).unwrap())
                 .unwrap();
             assert_eq!(std::fs::metadata(&disk).unwrap().len(), 1024 * 1024 * 1024);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&disk)
+                .unwrap()
+                .set_len(crate::config::GIB_BYTES + 4096)
+                .unwrap();
+            let error = backend
+                .resize_disk(&cfg, &stopped, crate::config::GiB::new(1).unwrap())
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Shrinking is not supported (current image: 1 GiB + 4096 bytes (1073745920 bytes); requested: 1 GiB (1073741824 bytes))"
+            );
+            assert_eq!(
+                std::fs::metadata(&disk).unwrap().len(),
+                crate::config::GIB_BYTES + 4096
+            );
         } else {
             assert!(stopped.is_err(), "{mode} minted StoppedInstance");
             assert_eq!(std::fs::read_to_string(&disk).unwrap(), "disk sentinel");
@@ -2629,6 +2763,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root_path.to_path_buf(),
             image: ImageName::new("test.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let inst_dir = root_path.join(lima_name(&inst));
         fs::create_dir_all(&inst_dir).unwrap();
@@ -3039,6 +3174,7 @@ mod tests {
         let parsed: serde_json::Value = serde_saphyr::from_str(&generated).unwrap();
         assert_eq!(parsed["images"][0]["location"].as_str(), disk.to_str());
         assert_eq!(parsed["mounts"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["video"]["display"].as_str(), Some("none"));
     }
 
     #[test]
@@ -3084,6 +3220,7 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let mounts = [crate::config::Mount {
             host_path: root.path().into(),
@@ -3131,8 +3268,25 @@ mod tests {
             index: crate::config::InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: image.clone(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
-        commit_disk(&cfg, &inst, &image).unwrap();
+        let metadata = TemplateConfig {
+            version: TEMPLATE_VERSION,
+            created: utc_timestamp(),
+            install_script_hash: Sha256Hash::of("fixture"),
+            profiles: Vec::new(),
+            extra_packages: Vec::new(),
+            post_install_hash: None,
+            marketplaces: Vec::new(),
+            plugins: Vec::new(),
+            codex_marketplaces: Vec::new(),
+            codex_plugins: Vec::new(),
+            grok_marketplaces: Vec::new(),
+            grok_plugins: Vec::new(),
+            guest_user: GuestUser::default(),
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        commit_disk(&cfg, &inst, &image, &metadata).unwrap();
         let copied = fs::metadata(cfg.lima_base_path(&image)).unwrap();
         assert_eq!(copied.len(), 64 * 1024 * 1024);
         assert!(
@@ -3195,8 +3349,18 @@ time="..." level=fatal msg="disk too small: 1G < 20G"
         let dir = tempfile::TempDir::new().unwrap();
         let img = dir.path().join("empty.img");
         let file = std::fs::File::create(&img).unwrap();
-        // 0 bytes → GiB::new(0) returns None
-        assert!(super::base_image_size_gib(&file).is_none());
+        assert!(super::base_image_size_gib(&file).is_err());
+    }
+
+    #[test]
+    fn requested_instance_disk_never_underallocates_base_image() {
+        let base = GiB::new(21).unwrap();
+        assert_eq!(super::choose_instance_disk_size(base, None), base);
+        assert_eq!(super::choose_instance_disk_size(base, GiB::new(20)), base);
+        assert_eq!(
+            super::choose_instance_disk_size(base, GiB::new(22)),
+            GiB::new(22).unwrap()
+        );
     }
 
     // ── parse_ssh_config_port ───────────────────────────────────

@@ -22,7 +22,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,11 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::backend::SshTarget;
-use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value};
+use crate::codex_token::CodexTokenMetadata;
+use crate::config::{
+    Instance, InstanceIndex, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value,
+};
+use crate::remote_command::RemoteCommand;
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
@@ -60,7 +64,7 @@ const PROXY_READY_GRACE: Duration = Duration::from_secs(5);
 pub enum Provider {
     /// Anthropic (Claude Code) → `api.anthropic.com`.
     Anthropic,
-    /// `OpenAI` (Codex) → `api.openai.com`.
+    /// `OpenAI` (Codex) → `api.openai.com`, or `chatgpt.com` for workspace PATs.
     Openai,
 }
 
@@ -76,8 +80,8 @@ impl Provider {
         }
     }
 
-    /// The fixed upstream host. The guest cannot influence this — only the
-    /// request path is forwarded (closes SSRF).
+    /// The default fixed upstream. Workspace PAT startup selects `chatgpt.com`
+    /// instead; neither destination is guest-controlled (closes SSRF).
     fn upstream_host(self) -> &'static str {
         match self {
             Provider::Anthropic => "api.anthropic.com",
@@ -99,7 +103,11 @@ impl Provider {
 
     /// Per-instance listen port: base + index.
     fn port(self, inst: &Instance) -> u16 {
-        self.base_port().saturating_add(inst.index.as_u16())
+        self.port_for_index(inst.index)
+    }
+
+    fn port_for_index(self, index: InstanceIndex) -> u16 {
+        self.base_port().saturating_add(index.as_u16())
     }
 
     /// Whether the capability token must be persisted host-side for later
@@ -110,6 +118,45 @@ impl Provider {
     /// its token stays in host memory only (unchanged from slice 1).
     fn persists_token(self) -> bool {
         matches!(self, Provider::Openai)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{InstanceIndex, Provider};
+
+    /// Every valid provider/instance pair gets an exact, unique host port.
+    #[kani::proof]
+    fn proxy_ports_are_exact_and_unique() {
+        let Some(first_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let Some(second_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let first = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let second = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let first_port = first.port_for_index(first_index);
+        let second_port = second.port_for_index(second_index);
+        assert_eq!(
+            u32::from(first_port),
+            u32::from(first.base_port()) + first_index.as_u32()
+        );
+        assert_eq!(
+            u32::from(second_port),
+            u32::from(second.base_port()) + second_index.as_u32()
+        );
+        if first != second || first_index != second_index {
+            assert_ne!(first_port, second_port);
+        }
     }
 }
 
@@ -139,6 +186,29 @@ pub fn start_provider(
     upstream: &ProxyUpstream,
     target: &SshTarget,
 ) -> Result<ProxyHandle> {
+    start_provider_with(
+        inst,
+        provider,
+        upstream,
+        crate::codex_token::load_metadata,
+        |listen, json| spawn_proxy(inst, provider.name(), listen, json),
+        |port| spawn_reverse_forward(inst, provider.name(), target, port),
+    )
+}
+
+// Keep startup composition shared while tests replace only external metadata
+// and process boundaries; credential resolution and state cleanup stay real.
+fn start_provider_with(
+    inst: &Instance,
+    provider: Provider,
+    upstream: &ProxyUpstream,
+    load_metadata: impl FnOnce(&str) -> Result<CodexTokenMetadata>,
+    launch_proxy: impl FnOnce(SocketAddr, &str) -> Result<()>,
+    launch_tunnel: impl FnOnce(u16) -> Result<()>,
+) -> Result<ProxyHandle> {
+    ensure_auth_supported(provider, upstream.auth)?;
+    // A failed replacement must not leave the previous credential usable.
+    stop_provider(inst, provider);
     let credential = resolve_cmd_value(upstream.credential.expose()).with_context(|| {
         format!(
             "Failed to resolve the {} proxy credential — aborting VM start (fail-closed); \
@@ -147,18 +217,28 @@ pub fn start_provider(
         )
     })?;
 
+    let metadata = if upstream.auth == ProxyAuthScheme::CodexAccessToken {
+        Some(load_metadata(&credential)?)
+    } else {
+        None
+    };
     let token = mint_capability_token()?;
     let port = provider.port(inst);
     let listen = SocketAddr::from(([127, 0, 0, 1], port));
     let json = wire_config_json(
         &listen,
         &token,
-        provider.upstream_host(),
+        if metadata.is_some() {
+            "chatgpt.com"
+        } else {
+            provider.upstream_host()
+        },
         upstream.auth,
         &credential,
+        metadata.as_ref(),
     )?;
 
-    spawn_proxy(inst, provider.name(), listen, &json)?;
+    launch_proxy(listen, &json)?;
     // Persist the capability token for providers that forward it via env on
     // later sessions (Codex); Claude reads its token from the returned handle
     // (settings.json) and keeps it out of host disk. Written after spawn so a
@@ -171,7 +251,7 @@ pub fn start_provider(
     }
     // Expose the loopback proxy into the guest. If the tunnel fails, tear the
     // proxy back down so we don't leave it orphaned (fail closed).
-    if let Err(e) = spawn_reverse_forward(inst, provider.name(), target, port) {
+    if let Err(e) = launch_tunnel(port) {
         stop_provider(inst, provider);
         return Err(e);
     }
@@ -217,6 +297,99 @@ pub fn read_capability_token(inst: &Instance, provider: Provider) -> Option<Stri
     let token = fs::read_to_string(token_path(inst, provider.name())).ok()?;
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Confirm that a configured provider's host proxy and reverse SSH tunnel are
+/// still available before launching an agent that has no public-network
+/// fallback. PID checks catch terminated children, the host-loopback connect
+/// checks the fixed proxy endpoint, and a guest-loopback request checks the
+/// reverse-forward path over the instance's persisted SSH transport.
+pub(crate) fn ensure_runtime_available(
+    inst: &Instance,
+    provider: Provider,
+    target: &SshTarget,
+) -> Result<()> {
+    ensure_pid_file_live(&pid_path(inst, provider.name()), "credential proxy")?;
+    ensure_pid_file_live(
+        &fwd_pid_path(inst, provider.name()),
+        "credential proxy reverse tunnel",
+    )?;
+    if provider.persists_token() {
+        read_capability_token(inst, provider).with_context(|| {
+            format!(
+                "{} credential proxy capability token is missing or empty",
+                provider.name()
+            )
+        })?;
+    }
+    let address = SocketAddr::from(([127, 0, 0, 1], provider.port(inst)));
+    ensure_proxy_protocol(address, provider)?;
+    let guest_url = format!("http://127.0.0.1:{}/", provider.port(inst));
+    let guest_reachable = target.exec_ok(guest_proxy_probe_command(&guest_url))?;
+    anyhow::ensure!(
+        guest_reachable,
+        "{} credential proxy reverse endpoint did not return the expected response on guest loopback",
+        provider.name()
+    );
+    Ok(())
+}
+
+fn guest_proxy_probe_command(url: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal("response=$(curl -q --silent --show-error --noproxy '*' --max-time 3 --write-out ':%{http_code}' ")
+        .arg(url)
+        .literal(
+            ") || exit 1; case \"$response\" in \
+             *'missing or invalid coop-proxy capability token'*':401') exit 0 ;; \
+             *) exit 1 ;; esac",
+        )
+}
+
+fn ensure_proxy_protocol(address: SocketAddr, provider: Provider) -> Result<()> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .with_context(|| {
+            format!(
+                "{} credential proxy is not accepting connections on host loopback at {address}",
+                provider.name()
+            )
+        })?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    stream.take(4096).read_to_string(&mut response)?;
+    anyhow::ensure!(
+        response.starts_with("HTTP/1.1 401 ")
+            && response.contains("missing or invalid coop-proxy capability token"),
+        "{} credential proxy endpoint returned an unexpected protocol response",
+        provider.name()
+    );
+    Ok(())
+}
+
+fn ensure_pid_file_live(path: &Path, label: &str) -> Result<()> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("{label} state is missing at {}", path.display()))?;
+    let pid = contents
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("{label} state is malformed at {}", path.display()))?;
+    anyhow::ensure!(
+        pid > 0,
+        "{label} state has an invalid PID at {}",
+        path.display()
+    );
+    // SAFETY: signal 0 performs a liveness/permission probe without changing
+    // the parsed positive process ID's state.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("{label} process {pid} is not running"))
 }
 
 // ── process supervision ──────────────────────────────────────
@@ -359,6 +532,38 @@ fn confined_command(bin: &Path) -> Command {
 #[cfg(target_os = "macos")]
 const SEATBELT_PROFILE: &str = include_str!("seatbelt-proxy.sb");
 
+fn reverse_forward_master_args(control_path: &Path, target: &SshTarget) -> Result<Vec<String>> {
+    Ok(vec![
+        "-N".into(),
+        "-T".into(),
+        "-o".into(),
+        "ControlMaster=yes".into(),
+        "-o".into(),
+        "ControlPersist=no".into(),
+        "-o".into(),
+        "ForkAfterAuthentication=no".into(),
+        "-S".into(),
+        crate::openssh::literal_path(control_path, "proxy SSH control socket path")?,
+        target.addr(),
+    ])
+}
+
+fn reverse_forward_request_args(
+    control_path: &Path,
+    target: &SshTarget,
+    port: u16,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        "-S".into(),
+        crate::openssh::literal_path(control_path, "proxy SSH control socket path")?,
+        "-O".into(),
+        "forward".into(),
+        "-R".into(),
+        format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+        target.addr(),
+    ])
+}
+
 /// Establish a per-instance reverse SSH tunnel so the guest reaches the
 /// host-loopback proxy at `127.0.0.1:{port}` (`ssh -R guest → host`). Detached
 /// and tracked by a PID file like the proxy process, so teardown needs no SSH
@@ -376,20 +581,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         .try_clone()
         .context("Failed to clone proxy tunnel log")?;
 
-    let mut args = Vec::new();
-    args.extend([
-        "-N".into(),
-        "-T".into(),
-        "-o".into(),
-        "ControlMaster=yes".into(),
-        "-o".into(),
-        "ControlPersist=no".into(),
-        "-o".into(),
-        "ForkAfterAuthentication=no".into(),
-        "-S".into(),
-        crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
-    ]);
-    args.push(target.addr());
+    let args = reverse_forward_master_args(&control_path, target)?;
 
     let mut child = target
         .ssh_forward_command()?
@@ -424,16 +616,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
         // accepted a reverse forward. -O forward waits for that acknowledgment
         // and returns nonzero for a rejected bind. The master stays the direct
         // child, so its existing PID-file teardown remains authoritative.
-        let mut forward_args = Vec::new();
-        forward_args.extend([
-            "-S".into(),
-            crate::openssh::literal_path(&control_path, "proxy SSH control socket path")?,
-            "-O".into(),
-            "forward".into(),
-            "-R".into(),
-            format!("127.0.0.1:{port}:127.0.0.1:{port}"),
-        ]);
-        forward_args.push(target.addr());
+        let forward_args = reverse_forward_request_args(&control_path, target, port)?;
         let request = target
             .ssh_forward_command()?
             .args(&forward_args)
@@ -586,8 +769,24 @@ struct WireConfig<'a> {
 #[derive(Serialize)]
 #[serde(tag = "scheme", rename_all = "snake_case")]
 enum WireInjection<'a> {
-    XApiKey { credential: &'a str },
-    Bearer { credential: &'a str },
+    XApiKey {
+        credential: &'a str,
+    },
+    Bearer {
+        credential: &'a str,
+    },
+    CodexAccessToken {
+        credential: &'a str,
+        account_id: &'a str,
+        is_fedramp: bool,
+    },
+}
+
+fn ensure_auth_supported(provider: Provider, auth: ProxyAuthScheme) -> Result<()> {
+    if provider != Provider::Openai && auth == ProxyAuthScheme::CodexAccessToken {
+        bail!("codex_access_token auth is supported only by [proxy.openai]");
+    }
+    Ok(())
 }
 
 fn wire_config_json(
@@ -596,10 +795,19 @@ fn wire_config_json(
     upstream_host: &str,
     auth: ProxyAuthScheme,
     credential: &str,
+    metadata: Option<&CodexTokenMetadata>,
 ) -> Result<String> {
     let injection = match auth {
         ProxyAuthScheme::ApiKey => WireInjection::XApiKey { credential },
         ProxyAuthScheme::Bearer => WireInjection::Bearer { credential },
+        ProxyAuthScheme::CodexAccessToken => {
+            let metadata = metadata.context("Codex proxy requires validated workspace metadata")?;
+            WireInjection::CodexAccessToken {
+                credential,
+                account_id: &metadata.chatgpt_account_id,
+                is_fedramp: metadata.chatgpt_account_is_fedramp,
+            }
+        }
     };
     let wire = WireConfig {
         listen: listen.to_string(),
@@ -622,6 +830,7 @@ mod tests {
             index: InstanceIndex::new(index).unwrap(),
             dir: PathBuf::from("/tmp/coop-test"),
             image: ImageName::new("t.img").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
     }
 
@@ -640,6 +849,47 @@ mod tests {
         assert_eq!(Provider::Anthropic.port(&inst_with_index(5)), 8793);
         assert_eq!(Provider::Openai.port(&inst_with_index(0)), 9788);
         assert_eq!(Provider::Openai.port(&inst_with_index(5)), 9793);
+    }
+
+    #[test]
+    fn reverse_forward_arguments_preserve_tcp_target_and_loopback_binding() {
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("192.0.2.2").unwrap(),
+            std::num::NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            PathBuf::from("/tmp/key"),
+            crate::config::SshHostToolsConfig::default(),
+        );
+        let socket = Path::new("/tmp/proxy-control.sock");
+
+        assert_eq!(
+            reverse_forward_master_args(socket, &target).unwrap(),
+            [
+                "-N",
+                "-T",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                "ControlPersist=no",
+                "-o",
+                "ForkAfterAuthentication=no",
+                "-S",
+                "/tmp/proxy-control.sock",
+                "ubuntu@192.0.2.2",
+            ]
+        );
+        assert_eq!(
+            reverse_forward_request_args(socket, &target, 8788).unwrap(),
+            [
+                "-S",
+                "/tmp/proxy-control.sock",
+                "-O",
+                "forward",
+                "-R",
+                "127.0.0.1:8788:127.0.0.1:8788",
+                "ubuntu@192.0.2.2",
+            ]
+        );
     }
 
     #[test]
@@ -683,6 +933,7 @@ mod tests {
             "api.anthropic.com",
             ProxyAuthScheme::ApiKey,
             "sk-real",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -694,6 +945,229 @@ mod tests {
     }
 
     #[test]
+    fn wire_json_codex_token_carries_host_validated_metadata() {
+        let metadata = CodexTokenMetadata {
+            chatgpt_account_id: "workspace-123".to_string(),
+            chatgpt_account_is_fedramp: true,
+        };
+        let listen = "127.0.0.1:9788".parse().unwrap();
+        let json = wire_config_json(
+            &listen,
+            "cap",
+            "chatgpt.com",
+            ProxyAuthScheme::CodexAccessToken,
+            "at-private",
+            Some(&metadata),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["upstream_host"], "chatgpt.com");
+        assert_eq!(value["injection"]["scheme"], "codex_access_token");
+        assert_eq!(value["injection"]["credential"], "at-private");
+        assert_eq!(value["injection"]["account_id"], "workspace-123");
+        assert_eq!(value["injection"]["is_fedramp"], true);
+        assert!(
+            wire_config_json(
+                &listen,
+                "cap",
+                "chatgpt.com",
+                ProxyAuthScheme::CodexAccessToken,
+                "at-private",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_token_auth_is_openai_only_including_vm_overrides() {
+        assert!(ensure_auth_supported(Provider::Openai, ProxyAuthScheme::CodexAccessToken).is_ok());
+        assert!(
+            ensure_auth_supported(Provider::Anthropic, ProxyAuthScheme::CodexAccessToken).is_err()
+        );
+        for auth in [ProxyAuthScheme::ApiKey, ProxyAuthScheme::Bearer] {
+            assert!(ensure_auth_supported(Provider::Anthropic, auth).is_ok());
+            assert!(ensure_auth_supported(Provider::Openai, auth).is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_codex_token_fails_before_proxy_or_tunnel_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inst = inst_with_index(0);
+        inst.dir = tmp.path().to_path_buf();
+        let upstream = ProxyUpstream {
+            credential: Secret::new("sk-wrong-type".to_string()),
+            auth: ProxyAuthScheme::CodexAccessToken,
+        };
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(22).unwrap(),
+            crate::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("unused_key"),
+            crate::config::CoopConfig::default().ssh.host_tools,
+        );
+        let mut stale = StaleProvider::seed(&inst);
+        let error = start_provider(&inst, Provider::Openai, &upstream, &target).unwrap_err();
+        stale.assert_stopped(&inst);
+        assert!(
+            error
+                .to_string()
+                .contains("Expected a Codex personal access token")
+        );
+        assert!(!format!("{error:#}").contains("sk-wrong-type"));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    struct StaleProvider {
+        children: [std::process::Child; 2],
+    }
+
+    impl StaleProvider {
+        fn seed(inst: &Instance) -> Self {
+            let children = [
+                Command::new("sleep").arg("30").spawn().unwrap(),
+                Command::new("sleep").arg("30").spawn().unwrap(),
+            ];
+            for (path, child) in [pid_path(inst, "openai"), fwd_pid_path(inst, "openai")]
+                .iter()
+                .zip(&children)
+            {
+                fs::write(path, child.id().to_string()).unwrap();
+            }
+            write_token_file(inst, Provider::Openai, "stale-capability").unwrap();
+            Self { children }
+        }
+
+        fn assert_stopped(&mut self, inst: &Instance) {
+            for path in [
+                pid_path(inst, "openai"),
+                fwd_pid_path(inst, "openai"),
+                token_path(inst, "openai"),
+            ] {
+                assert!(!path.exists(), "stale state remains: {}", path.display());
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for child in &mut self.children {
+                while child.try_wait().unwrap().is_none() {
+                    assert!(Instant::now() < deadline, "stale process still running");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    impl Drop for StaleProvider {
+        fn drop(&mut self) {
+            // Also clean up if a deliberate regression makes an assertion fail.
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_codex_start_clears_previous_provider_state() {
+        use std::cell::Cell;
+
+        for credential in ["cmd:exit 7", "at-test"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut inst = inst_with_index(0);
+            inst.dir = tmp.path().to_path_buf();
+            let mut stale = StaleProvider::seed(&inst);
+            let upstream = ProxyUpstream {
+                credential: Secret::new(credential.to_string()),
+                auth: ProxyAuthScheme::CodexAccessToken,
+            };
+            let metadata_called = Cell::new(false);
+            let processes_started = Cell::new(0);
+            let error = start_provider_with(
+                &inst,
+                Provider::Openai,
+                &upstream,
+                |token| {
+                    metadata_called.set(true);
+                    assert_eq!(token, "at-test");
+                    // Cleanup must already have happened before the lookup.
+                    stale.assert_stopped(&inst);
+                    bail!("metadata lookup failed")
+                },
+                |_, _| {
+                    processes_started.set(processes_started.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    processes_started.set(processes_started.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(metadata_called.get(), credential == "at-test");
+            if metadata_called.get() {
+                assert_eq!(error.to_string(), "metadata lookup failed");
+            } else {
+                assert!(error.to_string().contains("Failed to resolve"));
+            }
+            assert_eq!(processes_started.get(), 0);
+            stale.assert_stopped(&inst);
+        }
+    }
+
+    #[test]
+    fn codex_start_selects_metadata_upstream_and_persists_capability() {
+        use std::cell::{Cell, RefCell};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut inst = inst_with_index(3);
+        inst.dir = tmp.path().to_path_buf();
+        let upstream = ProxyUpstream {
+            credential: Secret::new("cmd:printf at-test".to_string()),
+            auth: ProxyAuthScheme::CodexAccessToken,
+        };
+        let captured = RefCell::new(None);
+        let tunnel_started = Cell::new(false);
+        let handle = start_provider_with(
+            &inst,
+            Provider::Openai,
+            &upstream,
+            |token| {
+                assert_eq!(token, "at-test");
+                Ok(CodexTokenMetadata {
+                    chatgpt_account_id: "workspace-test".to_string(),
+                    chatgpt_account_is_fedramp: true,
+                })
+            },
+            |listen, json| {
+                assert_eq!(listen, "127.0.0.1:9791".parse::<SocketAddr>().unwrap());
+                let config: serde_json::Value = serde_json::from_str(json).unwrap();
+                assert_eq!(config["listen"], listen.to_string());
+                assert_eq!(config["upstream_host"], "chatgpt.com");
+                assert_eq!(config["injection"]["scheme"], "codex_access_token");
+                assert_eq!(config["injection"]["credential"], "at-test");
+                assert_eq!(config["injection"]["account_id"], "workspace-test");
+                assert_eq!(config["injection"]["is_fedramp"], true);
+                *captured.borrow_mut() = Some(config);
+                Ok(())
+            },
+            |port| {
+                assert_eq!(port, 9791);
+                assert!(captured.borrow().is_some());
+                assert!(read_capability_token(&inst, Provider::Openai).is_some());
+                tunnel_started.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(tunnel_started.get());
+        assert_eq!(handle.base_url, "http://127.0.0.1:9791");
+        let token = read_capability_token(&inst, Provider::Openai).unwrap();
+        assert_eq!(&token, handle.capability_token.expose());
+        assert_eq!(token.len(), 64);
+        assert_eq!(captured.into_inner().unwrap()["capability_token"], token);
+    }
+
+    #[test]
     fn wire_json_bearer_shape() {
         let listen: SocketAddr = "172.16.0.1:8900".parse().unwrap();
         let json = wire_config_json(
@@ -702,6 +1176,7 @@ mod tests {
             "api.openai.com",
             ProxyAuthScheme::Bearer,
             "sk-openai",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -799,13 +1274,13 @@ mod tests {
                 }
             }
         });
-        let target = SshTarget {
-            host: crate::backend::Hostname::new("127.0.0.1").unwrap(),
-            port: std::num::NonZeroU16::new(port).unwrap(),
-            user: crate::backend::SshUser::new("coop").unwrap(),
-            key_path: tmp.path().join("unused-key"),
-            host_tools: crate::config::SshHostToolsConfig::default(),
-        };
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("127.0.0.1").unwrap(),
+            std::num::NonZeroU16::new(port).unwrap(),
+            crate::backend::SshUser::new("coop").unwrap(),
+            tmp.path().join("unused-key"),
+            crate::config::SshHostToolsConfig::default(),
+        );
         let result = spawn_reverse_forward(&inst, "test", &target, 8788);
         let accepted = peer.join().unwrap().unwrap();
         // Also clean up the old implementation when deliberately regressed.
@@ -829,18 +1304,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut inst = inst_with_index(0);
         inst.dir = tmp.path().to_path_buf();
-        let target = SshTarget {
-            host: crate::backend::Hostname::new("192.0.2.2").unwrap(),
-            port: std::num::NonZeroU16::new(2222).unwrap(),
-            user: crate::backend::SshUser::new("root").unwrap(),
-            key_path: fixture.join("client"),
-            host_tools: crate::config::SshHostToolsConfig::with_exact_paths(
+        let target = SshTarget::tcp(
+            crate::backend::Hostname::new("192.0.2.2").unwrap(),
+            std::num::NonZeroU16::new(2222).unwrap(),
+            crate::backend::SshUser::new("root").unwrap(),
+            fixture.join("client"),
+            crate::config::SshHostToolsConfig::with_exact_paths(
                 Some(&fixture.join("bin/ssh")),
                 None,
                 None,
             )
             .unwrap(),
-        };
+        );
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
         let port = destination.local_addr().unwrap().port();
@@ -968,5 +1443,94 @@ mod tests {
             read_capability_token(&inst, Provider::Openai),
             Some("cap-123".to_string())
         );
+    }
+
+    #[test]
+    fn protocol_probe_requires_the_proxy_unauthorized_response() {
+        fn serve_once(response: &'static [u8]) -> SocketAddr {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response).unwrap();
+            });
+            address
+        }
+
+        let expected = serve_once(
+            b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nmissing or invalid coop-proxy capability token",
+        );
+        ensure_proxy_protocol(expected, Provider::Openai).unwrap();
+
+        let unrelated =
+            serve_once(b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nunrelated listener");
+        assert!(ensure_proxy_protocol(unrelated, Provider::Openai).is_err());
+    }
+
+    #[test]
+    fn guest_protocol_probe_requires_the_proxy_unauthorized_response() {
+        let curl_home = crate::test_support::private_tempdir().unwrap();
+        std::fs::write(curl_home.path().join(".curlrc"), "fail\n").unwrap();
+        let accepts = |status: &str, body: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                listener.set_nonblocking(true)?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "probe did not connect to the fixture",
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(4)))?;
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request)?;
+                stream.write_all(response.as_bytes())?;
+                Ok(())
+            });
+            let probe = super::guest_proxy_probe_command(&url).into_string();
+            let accepted = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&probe)
+                .env("CURL_HOME", curl_home.path())
+                .env("HOME", curl_home.path())
+                .status()
+                .unwrap()
+                .success();
+            server.join().unwrap().unwrap();
+            accepted
+        };
+        assert!(accepts(
+            "401",
+            "missing or invalid coop-proxy capability token"
+        ));
+        for (status, body) in [
+            ("502", "upstream request failed"),
+            ("401", "unrelated listener"),
+            ("500", "missing or invalid coop-proxy capability token"),
+            ("200", "missing or invalid coop-proxy capability token"),
+        ] {
+            assert!(
+                !accepts(status, body),
+                "unexpectedly accepted {status} {body}"
+            );
+        }
     }
 }

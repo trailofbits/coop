@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn file_backend_separates_services_for_the_same_account() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let account = AccountName::new("same-account").unwrap();
         let services = [
             (SERVICE, "github-pat", "github-token"),
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn file_backend_round_trip() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         let cmd = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
         assert!(cmd.to_string().starts_with("cmd:cat "));
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn file_backend_appends_single_trailing_newline() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         // A token without a trailing newline gets exactly one appended.
         store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn file_backend_does_not_double_newline() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         // A token already newline-terminated is stored verbatim, not doubled.
         store_file(SERVICE, &acc, "tok\n", tmp.path()).unwrap();
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn file_backend_dir_mode_is_0700() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         store_file(SERVICE, &acc, "tok", tmp.path()).unwrap();
         let dir = tmp.path().join(secret_subdir(SERVICE));
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn file_backend_delete_removes_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("x/y");
         let _ = store_file(SERVICE, &acc, "token", tmp.path()).unwrap();
         delete_secret(Backend::File, SERVICE, &acc, tmp.path()).unwrap();
@@ -959,7 +959,7 @@ mod tests {
         }
 
         // Change PATH only in a child so parallel tests keep their real tools.
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         std::os::unix::fs::symlink("/bin/sh", root.path().join("sh")).unwrap();
         let op = root.path().join("op");
         std::fs::write(
@@ -1059,7 +1059,7 @@ esac
     fn store_outputs_round_trip_through_parse() {
         // The cmd string a backend actually writes must parse back to the
         // backend that wrote it — this is the divergence the type prevents.
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         let token = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
         let rendered = token.to_string();

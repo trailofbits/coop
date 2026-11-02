@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn snapshots_copy_dotfiles_materialize_links_and_make_files_writable() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         fs::write(root.path().join(".config"), "original").unwrap();
         fs::set_permissions(
             root.path().join(".config"),
@@ -416,8 +416,8 @@ mod tests {
 
     #[test]
     fn source_links_can_only_cross_to_another_declared_root() {
-        let root = tempfile::tempdir().unwrap();
-        let external = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
+        let external = crate::test_support::private_tempdir().unwrap();
         fs::write(external.path().join("secret"), "explicit").unwrap();
         symlink(external.path().join("secret"), root.path().join("link")).unwrap();
         let mut files = vec![mapping(root.path(), "~/config")];
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn cycles_dangling_links_and_special_files_fail_before_boot() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let files = [mapping(root.path(), "~/config")];
         symlink(".", root.path().join("cycle")).unwrap();
         let error = StagedFiles::prepare(&files, &GuestUser::default(), &[])
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn missing_sources_and_mount_collisions_fail_before_boot() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let files = [mapping(&root.path().join("missing"), "~/config")];
         assert!(StagedFiles::prepare(&files, &GuestUser::default(), &[]).is_err());
         let mount = crate::config::Mount::from_parts(
@@ -510,7 +510,7 @@ mod tests {
             assert!(fs::read_dir(root).unwrap().next().is_none());
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -529,7 +529,7 @@ mod tests {
         use std::process::Command;
         const MARKER: &str = "COOP_TEST_STAGING_ACL";
         if std::env::var_os(MARKER).is_some() {
-            let source = tempfile::tempdir().unwrap();
+            let source = crate::test_support::private_tempdir().unwrap();
             fs::write(source.path().join("canary"), "private snapshot").unwrap();
             let staged = StagedFiles::prepare(
                 &[mapping(source.path(), "~/copy")],
@@ -550,7 +550,7 @@ mod tests {
             );
             return;
         }
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         assert!(
             Command::new("chmod")
                 .arg("+a")
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn replaced_source_components_cannot_redirect_copying() {
         use std::io::Read;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         fs::create_dir(root.join("source")).unwrap();
         fs::write(root.join("source/file"), "allowed").unwrap();
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn source_descriptors_are_nonblocking_and_close_on_exec() {
         use std::os::fd::AsRawFd;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::private_tempdir().unwrap();
         fs::write(root.path().join("source"), "data").unwrap();
         let file = open_source(&root.path().join("source").canonicalize().unwrap()).unwrap();
         // SAFETY: these read-only fcntl operations use a live owned descriptor.

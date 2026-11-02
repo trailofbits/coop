@@ -47,19 +47,32 @@ fn list_and_ls_share_sorted_output_and_one_inventory() {
             assert!(output.status.success(), "{output:?}");
             if json {
                 let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(
-                    value,
-                    serde_json::json!([
-                        {"name": "alpha", "state": alpha_state},
-                        {"name": "beta", "state": "stopped"},
-                    ])
-                );
+                let mut expected = serde_json::json!([
+                    {"name": "alpha", "state": alpha_state, "network": null},
+                    {"name": "beta", "state": "stopped", "network": null},
+                ]);
+                if cfg!(target_os = "linux") {
+                    for entry in expected.as_array_mut().unwrap() {
+                        entry["network"] = serde_json::json!("open");
+                    }
+                }
+                assert_eq!(value, expected);
             } else {
                 assert_eq!(
                     String::from_utf8(output.stdout).unwrap(),
                     format!(
-                        "{:<16} STATE\n{:<16} {alpha_state}\n{:<16} stopped\n",
-                        "NAME", "alpha", "beta"
+                        "{:<16} {:<10} NETWORK\n{:<16} {:<10} {network}\n{:<16} {:<10} {network}\n",
+                        "NAME",
+                        "STATE",
+                        "alpha",
+                        alpha_state,
+                        "beta",
+                        "stopped",
+                        network = if cfg!(target_os = "linux") {
+                            "open"
+                        } else {
+                            "n/a"
+                        },
                     ),
                 );
             }

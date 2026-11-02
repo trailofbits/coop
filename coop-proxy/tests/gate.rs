@@ -114,10 +114,14 @@ async fn free_loopback_addr() -> SocketAddr {
 /// and the child then exits with `EADDRINUSE`. Retrying on a fresh port is what
 /// keeps that from flaking.
 async fn spawn_serving() -> (SocketAddr, Child) {
+    spawn_serving_with_config(config_json).await
+}
+
+async fn spawn_serving_with_config(config: fn(&str) -> String) -> (SocketAddr, Child) {
     let mut last_stderr = String::new();
     for _ in 0..PORT_ATTEMPTS {
         let addr = free_loopback_addr().await;
-        let mut child = spawn_proxy(addr).await;
+        let mut child = spawn_proxy_with_config(&config(&addr.to_string())).await;
         match wait_until_serving(&mut child, addr).await {
             Startup::Serving => return (addr, child),
             Startup::Unresponsive => {
@@ -138,6 +142,10 @@ async fn spawn_serving() -> (SocketAddr, Child) {
 }
 
 async fn spawn_proxy(addr: SocketAddr) -> Child {
+    spawn_proxy_with_config(&config_json(&addr.to_string())).await
+}
+
+async fn spawn_proxy_with_config(config: &str) -> Child {
     // `--no-jail`: this test drives the gate logic, not the jail, and runs on
     // CI hosts that may lack Landlock (where the fail-closed jail would abort
     // startup). coop never passes this flag; the jail is asserted separately by
@@ -155,12 +163,59 @@ async fn spawn_proxy(addr: SocketAddr) -> Child {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(config_json(&addr.to_string()).as_bytes())
-        .await
-        .unwrap();
+    stdin.write_all(config.as_bytes()).await.unwrap();
     drop(stdin);
     child
+}
+
+#[tokio::test]
+async fn codex_profile_authenticates_capabilities_and_denies_other_operations() {
+    let (addr, mut child) = spawn_serving_with_config(|listen| {
+        serde_json::json!({
+            "listen": listen,
+            "capability_token": "the-right-token",
+            "upstream_host": "chatgpt.com",
+            "injection": {
+                "scheme": "codex_access_token",
+                "credential": "at-host-only",
+                "account_id": "workspace-123",
+                "is_fedramp": false
+            }
+        })
+        .to_string()
+    })
+    .await;
+
+    for (method, path, token, expected) in [
+        ("POST", "/v1/responses", "wrong-token", "401"),
+        ("GET", "/v1/responses", "the-right-token", "403"),
+        ("POST", "/v1/responses/compact", "the-right-token", "403"),
+        (
+            "POST",
+            "/backend-api/codex/responses",
+            "the-right-token",
+            "403",
+        ),
+        ("GET", "/backend-api/me", "the-right-token", "403"),
+        ("POST", "/v1/messages", "the-right-token", "403"),
+    ] {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: attacker.invalid\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(RESPONSE_TIMEOUT, stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {expected} ")),
+            "unexpected response for {method} {path}: {response}"
+        );
+        assert!(!response.contains("at-host-only"));
+    }
+    child.kill().await.unwrap();
 }
 
 /// Poll `addr` until the proxy answers, the child exits, or time runs out.

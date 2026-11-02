@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::marker::PhantomData;
-use std::net::TcpStream;
 use std::num::NonZeroU8;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -13,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
-use crate::config::{CoopConfig, Instance, MiB};
+use crate::config::{CoopConfig, FirecrackerNetworkMode, Instance, MiB};
 
 // ── Typestate markers ─────────────────────────────────────────
 
@@ -99,11 +98,14 @@ fn build_config(cfg: &CoopConfig, inst: &Instance) -> FirecrackerConfig {
             vcpu_count: cfg.vm.vcpu_count.get(),
             mem_size_mib: cfg.vm.mem_size_mib.get().as_u32(),
         },
-        network_interfaces: vec![NetworkInterface {
-            iface_id: "eth0".to_string(),
-            guest_mac: inst.guest_mac(),
-            host_dev_name: inst.tap_device(),
-        }],
+        network_interfaces: match inst.firecracker_network() {
+            FirecrackerNetworkMode::Open => vec![NetworkInterface {
+                iface_id: "eth0".to_string(),
+                guest_mac: inst.guest_mac(),
+                host_dev_name: inst.tap_device(),
+            }],
+            FirecrackerNetworkMode::Isolated => Vec::new(),
+        },
         vsock: Some(VsockConfig {
             guest_cid: inst.vsock_cid(),
             uds_path: inst.vsock_path().display().to_string(),
@@ -225,33 +227,31 @@ impl<'a> FirecrackerVm<'a, Configured> {
 
     /// Start the Firecracker process, consuming the `Configured`
     /// state and returning a `Running` VM.
+    #[cfg(not(target_os = "macos"))]
     pub fn start(self) -> Result<FirecrackerVm<'a, Running>> {
         let config_path = self.inst.vm_config_path();
         let log_path = self.inst.log_path();
-        let socket_path = self.inst.api_socket_path();
+        let api_socket_path = self.inst.api_socket_path();
+        let vsock_path = self.inst.vsock_path();
 
-        // Kill an orphaned Firecracker if the socket is present without a
-        // PID file: a prior stale-PID cleanup or interrupted startup can leave
-        // the socket behind while its process is still alive.
+        // Do not remove a live socket or overwrite the PID of an orphaned VMM.
+        // The liveness probe refuses live or uncertain API and base vsock
+        // sockets before any per-run path is unlinked.
         let pid_path = self.inst.pid_file_path();
-        if socket_path.exists() && !pid_path.exists() {
-            tracing::warn!(
-                "Socket {} exists without PID file — killing orphaned process",
-                socket_path.display()
-            );
-            kill_process_on_socket(&socket_path);
+        if self.inst.probe_liveness()? {
+            bail!("Instance '{}' is already running", self.inst.name);
         }
 
-        // Remove stale files from previous runs (may be owned by root)
-        for stale in [&socket_path, &self.inst.vsock_path(), &log_path, &pid_path] {
-            if stale.exists()
-                && let Err(e) = Cmd::new("rm").arg("-f").arg(stale).sudo().run()
-            {
-                tracing::debug!(
-                    "Failed to remove stale file {} (non-fatal): {e}",
+        // The instance directory is a pinned, user-owned 0700 namespace, so
+        // its owner can safely unlink root-owned Firecracker entries without
+        // following a substituted final component or invoking a shell as root.
+        for stale in [&api_socket_path, &vsock_path, &log_path, &pid_path] {
+            crate::fs_util::remove_private_if_exists(stale).with_context(|| {
+                format!(
+                    "Failed to remove stale Firecracker path {}",
                     stale.display()
-                );
-            }
+                )
+            })?;
         }
 
         // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
@@ -261,8 +261,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
             .args(["-c", PID_TRAMPOLINE, "sh"])
             .arg(&pid_path)
             .arg(&self.cfg.firecracker_bin)
-            .arg("--api-sock")
-            .arg(&socket_path)
+            .arg("--no-api")
             .arg("--config-file")
             .arg(&config_path)
             .arg("--log-path")
@@ -322,7 +321,7 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     /// Wait for the guest to become reachable via SSH.
     pub fn wait_for_boot(&self) -> Result<()> {
-        let addr = format!("{}:{}", self.inst.guest_ip(), self.cfg.ssh_port);
+        let target = crate::backend::firecracker_ssh_target(self.cfg, self.inst)?;
         let timeout = Duration::from_secs(60);
         let start = Instant::now();
 
@@ -332,12 +331,7 @@ impl<'a> FirecrackerVm<'a, Running> {
             if let Err(e) = self.check_alive() {
                 bail!("Firecracker crashed during boot: {e}");
             }
-            if TcpStream::connect_timeout(
-                &addr.parse().context("Invalid guest address")?,
-                Duration::from_secs(2),
-            )
-            .is_ok()
-            {
+            if target.transport_is_reachable(Duration::from_secs(2))? {
                 tracing::info!("Guest SSH is reachable");
                 return Ok(());
             }
@@ -389,16 +383,8 @@ impl<'a> FirecrackerVm<'a, Running> {
             terminate_firecracker(pid, term_timeout, kill_timeout, &mut wait)?;
         }
 
-        if let Err(e) = fs::remove_file(&pid_path) {
-            tracing::debug!("Failed to remove PID file (non-fatal): {e}");
-        }
-        if let Err(e) = Cmd::new("rm")
-            .arg("-f")
-            .arg(self.inst.api_socket_path())
-            .sudo()
-            .run()
-        {
-            tracing::debug!("Failed to remove API socket (non-fatal): {e}");
+        if let Err(error) = cleanup_runtime_paths(self.inst) {
+            tracing::debug!("Failed to remove stopped Firecracker runtime paths: {error:#}");
         }
 
         Ok(())
@@ -432,18 +418,11 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 
     fn shutdown_command(&self) -> Result<Command> {
-        let user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
         let session = crate::backend::SshSession {
-            target: crate::backend::SshTarget {
-                host: self.inst.guest_ip().into(),
-                port: self.cfg.ssh_port,
-                user: crate::backend::SshUser::new(user.as_str())?,
-                key_path: std::path::absolute(self.cfg.ssh_key_path())?,
-                host_tools: self.cfg.ssh.host_tools.clone(),
-            },
+            target: crate::backend::firecracker_ssh_target(self.cfg, self.inst)?,
             env: crate::backend::EnvForward::default(),
         };
-        // Firecracker exits on guest reboot; its CtrlAltDel API is x86-only.
+        // Firecracker exits on guest reboot; the control API is disabled.
         session.command(&[], "sudo -n /sbin/reboot")
     }
 
@@ -460,26 +439,23 @@ impl<'a> FirecrackerVm<'a, Running> {
             mem_size_mib: self.cfg.vm.mem_size_mib.get().as_u32(),
         });
 
+        let target = crate::backend::firecracker_ssh_target(self.cfg, self.inst)?;
+        let guest_ip = match self.inst.firecracker_network() {
+            FirecrackerNetworkMode::Open => self.inst.guest_ip().to_string(),
+            FirecrackerNetworkMode::Isolated => "none (isolated)".to_string(),
+        };
         let mut out = format!(
             "Instance '{}' running (PID: {pid})\n  \
              vCPUs: {}\n  Memory: {} MiB\n  \
-             Guest IP: {}\n  SSH: {}:{}",
+             Guest IP: {}\n  Network: {}\n  SSH: {}",
             self.inst.name,
             machine.vcpu_count,
             machine.mem_size_mib,
-            self.inst.guest_ip(),
-            self.inst.guest_ip(),
-            self.cfg.ssh_port,
+            guest_ip,
+            self.inst.firecracker_network(),
+            target.connection_description(),
         );
 
-        let guest_user = crate::backend::persisted_guest_user(self.cfg, &self.inst.image);
-        let target = crate::backend::SshTarget {
-            host: crate::backend::Hostname::from(self.inst.guest_ip()),
-            port: self.cfg.ssh_port,
-            user: crate::backend::SshUser::new(guest_user.as_str())?,
-            key_path: std::path::absolute(self.cfg.ssh_key_path())?,
-            host_tools: self.cfg.ssh.host_tools.clone(),
-        };
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
             let _ = write!(out, "\n  {usage}");
         }
@@ -540,23 +516,40 @@ impl<'a> FirecrackerVm<'a, Running> {
     }
 }
 
-/// Find and kill any process holding the given Unix socket.
+/// Remove Firecracker's per-run state after the VMM is confirmed stopped.
 ///
-/// Uses `lsof` to find the PID, then sends SIGKILL. This handles
-/// orphaned Firecracker processes whose PID file was removed while
-/// the process still held the socket.
-fn kill_process_on_socket(socket_path: &std::path::Path) {
-    let Ok(stdout) = Cmd::new("lsof").arg("-t").arg(socket_path).sudo().capture() else {
-        return;
-    };
-    for pid_str in stdout.split_whitespace() {
-        tracing::info!(
-            "Killing orphaned process {pid_str} on {}",
-            socket_path.display()
-        );
-        if let Err(e) = Cmd::new("kill").args(["-9", pid_str]).sudo().run() {
-            tracing::debug!("Failed to kill PID {pid_str} (non-fatal): {e}");
+/// This is separate from [`FirecrackerVm::stop`] because lifecycle probing can
+/// discover that the VMM exited before `coop stop` acquired its operation lock.
+/// The checked parent descriptor keeps cleanup inside the private instance
+/// directory even if an untrusted guest caused an abrupt exit.
+pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()> {
+    let mut first_error = None;
+    let mut additional_errors = Vec::new();
+    for stale in [
+        inst.pid_file_path(),
+        inst.api_socket_path(),
+        inst.vsock_path(),
+    ] {
+        if let Err(error) = crate::fs_util::remove_private_if_exists(&stale)
+            .with_context(|| format!("Failed to remove Firecracker path {}", stale.display()))
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            } else {
+                additional_errors.push(format!("{error:#}"));
+            }
         }
+    }
+    let Some(error) = first_error else {
+        return Ok(());
+    };
+    if additional_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(error.context(format!(
+            "Additional Firecracker path cleanup failures: {}",
+            additional_errors.join("; ")
+        )))
     }
 }
 
@@ -581,6 +574,10 @@ const PID_TRAMPOLINE: &str = concat!(
     r#"chmod 644 "$pid_tmp" || exit 1; "#,
     r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
     r#"trap - EXIT HUP INT TERM; "#,
+    // Firecracker creates the base vsock socket as root. Its containing
+    // instance directory is user-owned mode 0700, so mode 0666 grants the
+    // invoking user access without exposing the socket to other users.
+    r#"umask 0111 || exit 1; "#,
     r#"shift; exec "$@""#,
 );
 
@@ -675,9 +672,89 @@ fn terminate_firecracker(
 mod tests {
     use super::{
         Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        read_machine_config, wait_for_exit, wait_for_pid_file,
+        build_config, cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
+
+    #[test]
+    fn isolated_config_has_no_network_interface_but_retains_vsock() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let mut inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::Vsock,
+        };
+        inst.set_firecracker_network(crate::config::FirecrackerNetworkMode::Isolated)
+            .unwrap();
+
+        let config = build_config(&CoopConfig::default(), &inst);
+
+        assert!(config.network_interfaces.is_empty());
+        assert!(config.vsock.is_some());
+    }
+
+    #[test]
+    fn open_config_has_exactly_one_network_interface() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::Vsock,
+        };
+
+        assert_eq!(
+            build_config(&CoopConfig::default(), &inst)
+                .network_interfaces
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn start_refuses_non_socket_legacy_api_path_without_unlinking_it() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+        };
+        std::fs::write(inst.api_socket_path(), "keep").unwrap();
+        let cfg = CoopConfig::default();
+
+        let error = FirecrackerVm::new(&cfg, &inst).start().err().unwrap();
+        assert!(format!("{error:#}").contains("legacy API socket path is not a Unix socket"));
+        assert!(inst.api_socket_path().exists());
+        assert_eq!(std::fs::read(inst.api_socket_path()).unwrap(), b"keep");
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    fn runtime_cleanup_attempts_every_path_after_an_error() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+        };
+        crate::test_support::create_private_dir_all(&inst.dir).unwrap();
+        std::fs::create_dir(inst.pid_file_path()).unwrap();
+        std::fs::write(inst.api_socket_path(), "api").unwrap();
+        std::fs::write(inst.vsock_path(), "vsock").unwrap();
+
+        assert!(cleanup_runtime_paths(&inst).is_err());
+        assert!(inst.pid_file_path().is_dir());
+        assert!(!inst.api_socket_path().exists());
+        assert!(!inst.vsock_path().exists());
+    }
 
     #[test]
     fn configure_creates_and_replaces_private_config_under_permissive_umask() {
@@ -704,6 +781,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.path().join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         let vm = FirecrackerVm::new(&cfg, &inst);
         vm.configure().unwrap();
@@ -756,7 +834,7 @@ mod tests {
                 "probe_failure",
                 "already_exited",
             ] {
-                let root = tempfile::tempdir().unwrap();
+                let root = crate::test_support::private_tempdir().unwrap();
                 let sudo = root.path().join("sudo");
                 fs::write(
                     &sudo,
@@ -815,6 +893,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         fs::create_dir(&inst.dir).unwrap();
         let pid = match mode.as_str() {
@@ -875,6 +954,7 @@ mod tests {
             index: InstanceIndex::new(0).unwrap(),
             dir: root.join("instance"),
             image: ImageName::new("default").unwrap(),
+            firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         };
         std::fs::create_dir(&inst.dir).unwrap();
         let mut process = std::process::Command::new("/bin/sleep")
@@ -895,15 +975,18 @@ mod tests {
         cfg.guest_env
             .insert("PATH".parse().unwrap(), "/guest-only".into());
         let vm = FirecrackerVm::from_running_unchecked(&cfg, &inst);
+        // The nested fixture competes with the full test suite for CPU; allow
+        // it to start before concluding that the reboot request stalled.
+        let graceful_timeout = Duration::from_secs(5);
         let started = Instant::now();
         let result = vm.stop_with_probe(
-            Duration::from_secs(1),
+            graceful_timeout,
             Duration::from_secs(1),
             Duration::from_secs(1),
             |_, timeout| probe_shutdown_fixture(&mut process, &root, &mode, timeout),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < graceful_timeout + Duration::from_secs(3),
             "unbounded shutdown"
         );
         assert_shutdown_result(result, &inst, &mut process, &mode);
@@ -1052,7 +1135,7 @@ mod tests {
 
     #[test]
     fn read_machine_config_parses_persisted_json() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("vm_config.json");
         std::fs::write(&path, SAMPLE_CONFIG_JSON).unwrap();
         let machine = read_machine_config(&path).unwrap();
@@ -1062,7 +1145,7 @@ mod tests {
 
     #[test]
     fn read_machine_config_returns_none_for_missing_or_malformed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let missing = dir.path().join("nope.json");
         assert!(read_machine_config(&missing).is_none(), "missing file");
 
@@ -1114,7 +1197,7 @@ mod tests {
     fn pid_trampoline_publishes_readable_pid_under_hardened_umask() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         // Pause any post-publication chmod in the shell itself. This makes the
         // old create-then-chmod window deterministic without sudo or a VM.
@@ -1147,7 +1230,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let directory = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
         // Linux POSIX default ACL u::rwx,g::---,o::---. Such an ACL replaces
         // the umask during file creation; changing the umask cannot grant read.
@@ -1211,7 +1294,7 @@ mod tests {
 
     #[test]
     fn pid_trampoline_cleans_staging_file_when_chmod_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         let result = std::process::Command::new("sh")
             .args([
@@ -1234,7 +1317,7 @@ mod tests {
 
     #[test]
     fn wait_for_pid_file_returns_immediately_when_already_valid() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         std::fs::write(&path, "4242\n").unwrap();
 
@@ -1253,7 +1336,7 @@ mod tests {
         // The trampoline's `echo $$ > "$1"` truncates before it writes, so a
         // reader can legitimately observe a zero-byte file. That must retry,
         // not fail.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("firecracker.pid");
         std::fs::write(&path, "").unwrap();
 
@@ -1271,7 +1354,7 @@ mod tests {
 
     #[test]
     fn wait_for_pid_file_times_out_when_never_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
         let path = dir.path().join("never-written.pid");
 
         let err = wait_for_pid_file(&path, Duration::from_millis(300)).unwrap_err();
@@ -1284,7 +1367,7 @@ mod tests {
         // A directory reads as EISDIR, not NotFound: abort rather than spin
         // until the timeout. This is the arm an unreadable root-owned PID
         // file also takes.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir().unwrap();
 
         let start = Instant::now();
         let err = wait_for_pid_file(dir.path(), Duration::from_secs(30)).unwrap_err();

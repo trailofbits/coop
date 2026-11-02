@@ -13,7 +13,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, kernel, Firecracker binary. |
-| `ssh_port` | integer | `22` | SSH port on the guest VM. Must be > 0. |
+| `ssh_port` | integer | `22` | SSH port for the legacy Firecracker TCP transport. Must be > 0. The opt-in vsock listener proxies fixed guest port 22; Lima uses its dynamically assigned host port. |
 | `firecracker_bin` | string (path) | `~/.coop/firecracker` | Path to the Firecracker binary. Linux only; ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
@@ -319,8 +319,29 @@ skip = ["trailofbits/big-repo"]
 
 VM resource allocation and boot configuration.
 
+### Size units
+
+Storage uses binary GiB (1 GiB = 1,073,741,824 bytes); memory uses binary
+MiB (1 MiB = 1,048,576 bytes). Config fields with `_gib` or `_mib` are bare
+positive integers in those units. CLI size flags accept bare integers or the
+matching `GiB`/`MiB` suffix; disk flags also accept legacy `G` and `g`, both
+meaning **GiB**. Decimal `GB`/`MB`, ambiguous `M`, fractions, and a unit from
+the other field are rejected. For example, `--disk 12GiB`, `--mem 4096MiB`,
+and `resize --size +2G` are valid; `--disk 12GB` is not.
+
+Absolute disk targets are exact whole GiB. Shrink checks compare exact image
+byte lengths, including any extra bytes beyond a GiB boundary. Relative resize
+rounds the current image length **up** to the next GiB before adding the
+requested increment. Reprovision preserves at least the previous byte length
+by rounding its target up; a nonaligned disk can therefore gain less than 1
+GiB. Lima rounds the base image length up when choosing a new instance's
+whole GiB disk size. Human image sizes are approximate display values; JSON
+`size_bytes` and resource fields ending in `_mib` keep their raw, named units.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `firecracker_control` | string | `legacy_tcp` | Control transport recorded for newly created Linux/Firecracker instances: `legacy_tcp` or opt-in `vsock`. Existing instances keep their persisted mode; older state without the field loads as `legacy_tcp` without being rewritten. A vsock instance requires image metadata from a current `coop setup`; incompatible images are rejected with rebuild guidance before instance allocation or restore. Ignored by Lima, which remains TCP-based. |
+| `firecracker_network` | string | `open` | Network-device policy for newly created Linux/Firecracker instances: `open` creates the normal NIC/TAP/NAT path; `isolated` creates no NIC or per-instance TAP and requires `firecracker_control = "vsock"`. Existing instances keep their persisted selection. See [Firecracker network modes](firecracker-network-modes.md). Ignored by Lima. |
 | `vcpu_count` | integer | `2` | Number of vCPUs for **new** instances. Must be > 0. Overridable with `--vcpus` on `setup` and `up`. Change an existing instance with `coop resize --vcpus`. |
 | `mem_size_mib` | integer | `4096` | Memory in MiB for **new** instances. Must be >= 128. Overridable with `--mem` on `setup` and `up`. Change an existing instance with `coop resize --mem`. |
 | `template_size_gib` | integer | `8` | Template rootfs disk size in GiB. Must be > 0. Overridable with `--template-size` on `setup`. |
@@ -354,8 +375,10 @@ sysctl = "/run/current-system/sw/bin/sysctl"
 These are NixOS's stable system-profile and privilege-wrapper paths; do not
 configure generation-specific `/nix/store` paths because garbage collection can
 remove them. Each field is optional. An unset field uses coop's built-in
-`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. A set field uses only
-the configured absolute path and never falls back.
+`/usr/bin`, `/usr/sbin`, `/bin`, and `/sbin` candidates. The built-in `sudo`
+candidate also accepts the exact `/usr/lib/cargo/bin/sudo` target used by Ubuntu
+26.04 CI. A set field uses only the configured absolute path and never falls
+back.
 
 Configured paths cannot contain shell expansion, `.` or `..`. Immediately
 before use, coop follows the actual symlink chain and requires every traversed
@@ -394,9 +417,9 @@ be a regular executable. These checks authorize a filesystem identity only,
 not package provenance or implementation semantics.
 
 Rsync passes its SSH executable and options through rsync's `-e` command
-grammar. Coop rejects an exact SSH path or key path containing bytes that
-cannot be represented there unambiguously; choose stable paths without spaces
-or shell metacharacters for rsync-backed workspaces.
+grammar. Coop quotes words with rsync's own quote rules, including paths with
+spaces or shell metacharacters. Non-UTF-8 paths and control characters cannot
+be represented unambiguously and are rejected for rsync-backed workspaces.
 
 ## Guest user
 
@@ -426,7 +449,7 @@ MY_FLAG = "1"
 
 Keys are env var names; values are the literals to inject. These names are applied only inside the guest, including `PATH` and loader settings. The values transit the host SSH process under inert internal aliases, so their original guest-controlled names—including names loaded from saved instance state—cannot configure that process. Entries here **override** any value resolved through other mechanisms for the same name (forwarded host env, `claude.api_key`, etc.), and the override is logged at `WARN`.
 
-**Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.).
+**Secrets:** values land in the guest's process environment in plain text and may be visible via `ps`/`/proc` to guest users. For credentials, prefer `env_forward` (host process env stays the source of truth) or one of the `cmd:` integrations on the structured fields (`claude.api_key`, etc.). [Isolated Firecracker mode](firecracker-network-modes.md) suppresses the recognized direct provider and GitHub credential names, including persisted `--env`; arbitrary custom variables remain the user's responsibility.
 
 Variables with special meaning to the guest shell still follow that shell's rules. If its environment-restoration shell rejects an assignment, Coop stops the command and reports the variable name without its value.
 
@@ -438,9 +461,9 @@ Claude Code configuration injected into the guest VM at start time. Every field 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api_key` | string | unset (reads `$ANTHROPIC_API_KEY` from environment) | Anthropic API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
+| `api_key` | string | unset (reads `$ANTHROPIC_API_KEY` from environment) | Anthropic API key. Forwarded to an open/direct-auth guest via SSH `SendEnv`; suppressed in isolated mode, which requires the managed proxy. Never written to disk inside the VM. |
 | `config_dir` | string (path) or `false` | `~/.claude` | Source for `CLAUDE.md`, `keybindings.json`, `rules/`, `commands/`, `skills/`, `agents/`, `output-styles/`, `themes/`, and `workflows/`, copied into guest `~/.claude/` on each start. Complete bundles and narrow companion preferences are imported. Supports `~` expansion; `false` stops copying while retaining prior files/preferences. Host deletions do not delete guest files. See [import semantics and limitations](claude-integration.md#config-directory). |
-| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set in open mode; recognized raw credentials are suppressed in isolated mode. |
 | `marketplaces` | array of strings | `[]` | Plugin marketplace sources. Each entry is a GitHub repo URL or an absolute local directory path. Local directories are copied into the guest before registration. |
 | `plugins` | array of strings | `[]` | Plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to register in the guest. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
@@ -497,9 +520,9 @@ Codex configuration injected into the guest VM at start time. Every field is opt
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `auth` | string | `"api_key"` | Codex auth mode: `"api_key"` forwards an OpenAI API key; `"chatgpt"` uses ChatGPT account or workspace login through the guest Linux keyring. |
-| `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Used only with `auth = "api_key"`. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
+| `api_key` | string | unset (reads `$OPENAI_API_KEY` from environment) | OpenAI API key. Used only with `auth = "api_key"`. Forwarded to an open/direct-auth guest via SSH `SendEnv`; suppressed in isolated mode, which requires the managed proxy. Never written to disk inside the VM. |
 | `config_dir` | string (path) or `false` | `~/.codex` | Source directory for Codex config files. Copies an allowlist of entries (`AGENTS.md`, `prompts/`, `config.toml`, `auth.json`) from this directory to `~/.codex/` in the guest on start. `auth.json` is omitted when `auth = "chatgpt"` or `[proxy.openai]` is active. Set to `false` to disable. Supports `~` expansion. |
-| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `OPENAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set in open mode; recognized raw credentials are suppressed in isolated mode. |
 | `marketplaces` | array of strings | `[]` | Codex plugin marketplace sources. Each entry is a `owner/repo`[`@ref`] shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
 | `plugins` | array of strings | `[]` | Codex plugins to install from registered marketplaces. Format: `plugin-name@marketplace-name`. |
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.codex/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
@@ -513,14 +536,14 @@ Grok Build configuration injected into the guest VM at start time. Every field i
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `api_key` | string | unset (reads `$XAI_API_KEY` from environment) | xAI API key. Forwarded to the guest via SSH `SendEnv`. Never written to disk inside the VM. |
-| `config_dir` | string (path) or `false` | `~/.grok` | Source for `AGENTS.md`, `auth.json`, `lsp.json`, `rules/`, `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`, overlaid into guest `~/.grok/` on each start. Host `config.toml` is merged into the guest file except `[plugins]`. Directory symlinks, hidden directories (`.git`, `.venv`, caches), and bare git repos (`*.git`) stay on the host. `.grok-plugin/` and `.claude-plugin/` manifests are copied. `installed-plugins/` is a host-absolute registry and stays on the host. Supports `~` expansion; `false` stops copying while retaining prior files. Host deletions do not delete guest files. See [config directory](grok-integration.md#config-directory). |
-| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `XAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set; list additional variables here. |
+| `api_key` | string | unset (reads `$XAI_API_KEY` from environment) | xAI API key. Forwarded to an open guest via SSH `SendEnv`; suppressed in isolated mode, where Grok is unsupported. Never written to disk inside the VM. |
+| `config_dir` | string (path) or `false` | `~/.grok` | Source for `AGENTS.md`, `auth.json`, `lsp.json`, `rules/`, `skills/`, `commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`, overlaid into guest `~/.grok/` on each start. Isolated mode omits new `auth.json` copies but retains prior guest-disk state. Host `config.toml` is merged into the guest file except `[plugins]`. Directory symlinks, hidden directories (`.git`, `.venv`, caches), and bare git repos (`*.git`) stay on the host. `.grok-plugin/` and `.claude-plugin/` manifests are copied. `installed-plugins/` is a host-absolute registry and stays on the host. Supports `~` expansion; `false` stops copying while retaining prior files. Host deletions do not delete guest files. See [config directory](grok-integration.md#config-directory). |
+| `env_forward` | array of strings | `[]` | Extra environment variable names to forward from host to guest via SSH `SendEnv`. `XAI_API_KEY` and `GITHUB_TOKEN` are forwarded automatically when set in open mode; recognized raw credentials are suppressed in isolated mode. |
 | `marketplaces` | array of strings | `[]` | Grok Build plugin marketplace sources. Each entry is a `owner/repo`[`@ref`] shorthand, a git URL, or an absolute local directory path. Local directories are copied into the guest before registration. Baked into the golden image and delta-installed on first boot. |
 | `plugins` | array of strings | `[]` | Grok Build plugins to install from registered marketplaces (`grok plugin install <name> --trust`). |
 | `mcp_servers` | table | `{}` | MCP servers to merge into the guest `~/.grok/config.toml`. Keys are server names; values are server definitions. See [MCP servers](#mcp-servers). |
 
-coop also writes `ui.permission_mode = "always-approve"` into the guest `~/.grok/config.toml`, drops the host `[plugins]` table (those names resolve through `installed-plugins/`), keeps the guest `[plugins]` table, and records `/workspace` in `~/.grok/trusted_folders.toml`. Other keys already on the guest, plus host keys that are not `[plugins]`, are preserved. A copied host `auth.json` is set to owner-only (`0600`) on the guest and signs the guest in; otherwise use `coop grok -- login --device-auth`.
+coop also writes `ui.permission_mode = "always-approve"` into the guest `~/.grok/config.toml`, drops the host `[plugins]` table (those names resolve through `installed-plugins/`), keeps the guest `[plugins]` table, and records `/workspace` in `~/.grok/trusted_folders.toml`. Other keys already on the guest, plus host keys that are not `[plugins]`, are preserved. In open mode, a copied host `auth.json` is set to owner-only (`0600`) on the guest and signs the guest in; isolated mode makes no new auth-file copy. Otherwise use `coop grok -- login --device-auth`.
 
 ## Local-model routing
 
@@ -571,9 +594,10 @@ Every golden image installs the Secret Service packages this mode needs
 gating them would let a later `auth = "chatgpt"` edit meet an image that cannot
 serve it.
 
-`[proxy.openai]` is API-key based and cannot be combined with
+`[proxy.openai]` accepts an OpenAI API key or a Codex workspace personal access
+token and cannot be combined with
 `[codex] auth = "chatgpt"`. Use one Codex remote auth path per VM: the proxy
-for an OpenAI API key, or ChatGPT auth for account/workspace access.
+for a host-held credential, or ChatGPT auth for login inside the guest.
 
 Proxy mode applies only in remote model mode
 ([`coop model <vm> remote`](commands.md#model)); local mode takes precedence.
@@ -585,8 +609,8 @@ Both blocks take the same fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `credential` | string | required | The real credential — an API key or a Claude `setup-token`. A plain value or a `cmd:` invocation resolved at proxy start. Never written to disk and never forwarded into the guest. |
-| `auth` | `api_key` \| `bearer` | `api_key` | How the proxy injects the credential upstream. `api_key` sends `x-api-key: <credential>` (the Anthropic API-key form); `bearer` sends `Authorization: Bearer <credential>`, used for a Claude `setup-token`. OpenAI keys are always Bearer. |
+| `credential` | string | required | An API key, Claude `setup-token`, or Codex personal access token. A plain value or a `cmd:` invocation resolved at proxy start. Resolved secrets are held in memory and never forwarded into the guest. |
+| `auth` | `api_key` \| `bearer` \| `codex_access_token` | `api_key` | `api_key` sends `x-api-key`; `bearer` sends `Authorization: Bearer` for API keys or Claude setup tokens. OpenAI-only `codex_access_token` validates a workspace PAT (`at-...`) on the host and routes inference to the ChatGPT Codex backend using workspace entitlements. |
 
 ```toml
 [proxy.anthropic]
@@ -660,7 +684,7 @@ Background update-check behavior for `coop update`. Defaults are safe; most user
 | `mode` | `"notify"` or `"off"` | `"notify"` | `"notify"` runs a background check at most once per `check_interval_hours` and prints a one-line stderr notice when a newer release is known. `"off"` disables both the check and the notice. |
 | `check_interval_hours` | integer | `24` | Minimum hours between background release-metadata fetches. |
 
-The background check is also silent when `COOP_NO_UPDATE_CHECK=1`, when `CI=true`, or when stdin is not a TTY. Dev builds (untagged or dirty trees) never run the check or notice.
+The background check is also silent when `COOP_NO_UPDATE_CHECK=1`, when `CI=true`, or when stdin is not a TTY. Dev builds (untagged or dirty trees) and Homebrew installations never run the check or notice. Use `brew upgrade coop` for Homebrew updates.
 
 ```toml
 [updates]
@@ -695,6 +719,8 @@ firecracker_bin = "~/.coop/firecracker"
 github = "auto"  # must be set explicitly; default is off
 
 [vm]
+firecracker_control = "vsock"
+firecracker_network = "open"
 vcpu_count = 4
 mem_size_mib = 8192
 template_size_gib = 20

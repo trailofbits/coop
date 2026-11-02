@@ -267,7 +267,7 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 /// Render a byte count as one-decimal gibibytes (1 GiB = 1024³ bytes).
 fn format_dir_size(total_bytes: u64) -> String {
     #[expect(clippy::cast_precision_loss, reason = "file sizes fit in f64")]
-    let gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let gib = total_bytes as f64 / crate::config::GIB_BYTES as f64;
     format!("{gib:.1} GiB")
 }
 

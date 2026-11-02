@@ -156,8 +156,33 @@ echo '  [guest] Preparing workspace directory...'
 mkdir -p /workspace
 chown "${GUEST_USER}:${GUEST_USER}" /workspace
 
+echo '  [guest] Installing Firecracker vsock SSH listener...'
+cat > /etc/systemd/system/coop-vsock-ssh.socket <<'VSOCKSOCKETEOF'
+[Unit]
+Description=coop SSH over Firecracker vsock
+
+[Socket]
+ListenStream=vsock::22
+
+[Install]
+WantedBy=sockets.target
+VSOCKSOCKETEOF
+
+cat > /etc/systemd/system/coop-vsock-ssh.service <<'VSOCKSERVICEEOF'
+[Unit]
+Description=Forward coop Firecracker vsock connections to SSH
+Requires=ssh.service
+After=ssh.service
+
+[Service]
+Type=notify
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:22
+PrivateTmp=yes
+PrivateNetwork=no
+VSOCKSERVICEEOF
+
 echo '  [guest] Enabling services...'
-systemctl enable docker ssh systemd-networkd serial-getty@ttyS0
+systemctl enable docker ssh systemd-networkd serial-getty@ttyS0 coop-vsock-ssh.socket
 
 echo '  [guest] Configuring SSH...'
 sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config

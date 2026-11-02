@@ -7,13 +7,26 @@
 //!   `v{CARGO_PKG_VERSION}` and the tree is clean, otherwise "dev". Updater
 //!   integration tests can compile a visibly non-release "test" variant.
 //! - `COOP_VERSION_STR` — pre-formatted version string for clap's `--version` output.
+//!
+//! `COOP_PACKAGE_MANAGER=homebrew` embeds package ownership via `coop_homebrew`.
+//! This is independent of release/dev provenance and cannot change at runtime.
 
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<(), String> {
+    println!("cargo:rerun-if-env-changed=COOP_PACKAGE_MANAGER");
+    println!("cargo:rustc-check-cfg=cfg(coop_homebrew)");
+    match env::var("COOP_PACKAGE_MANAGER") {
+        Ok(manager) if manager == "homebrew" => println!("cargo:rustc-cfg=coop_homebrew"),
+        Err(env::VarError::NotPresent) => {}
+        Ok(_) | Err(env::VarError::NotUnicode(_)) => {
+            return Err("COOP_PACKAGE_MANAGER must be unset or 'homebrew'".to_string());
+        }
+    }
+
     // Invalidate the build script (and thus the embedded version) whenever any of git's
     // state-tracking files change. We resolve the real gitdir first so this also works
     // inside worktrees, where `.git` is a file pointing at `<maindir>/.git/worktrees/<n>`.
@@ -44,6 +57,7 @@ fn main() {
     );
     println!("cargo:rustc-env=COOP_BUILD_KIND={kind}");
     println!("cargo:rustc-env=COOP_VERSION_STR={version_str}");
+    Ok(())
 }
 
 /// Files whose mtimes should invalidate the build script. Resolves `.git` to the real
