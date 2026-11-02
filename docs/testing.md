@@ -215,8 +215,27 @@ Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
 
-Run `tests/integration-update.sh` for the host-only self-updater flow. The
-script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+Run `tests/run-policy-integration.sh` for the host-only updater and uninstall
+suites plus an optimized release smoke test (also used by CI and release
+preflight). It builds each of four policy variants once with Cargo's development
+profile: test source, Homebrew-owned test source, official release policy, and
+forced dev policy. Policy provenance is independent of the optimization profile.
+Each binary is copied to a distinct immutable artifact path before the next
+build; consumers use disposable copies. The uninstall suite reuses the dev
+artifact and checks its path guard in a temporary `target/debug` tree. One
+additional release-profile binary checks version reporting, CLI startup, and
+rejection of runtime update-source overrides without external network I/O.
+
+The suites still run independently: `tests/integration-update.sh` builds its
+four development-profile variants; `tests/integration-uninstall.sh` builds only
+the dev variant. To reuse an explicit build, run
+`tests/build-policy-binaries.sh NEW_ARTIFACT_DIR`, then pass that directory to
+`tests/integration-update.sh NEW_ARTIFACT_DIR` and its `coop-dev` path to
+`tests/integration-uninstall.sh NEW_ARTIFACT_DIR/coop-dev`. The artifact directory
+must be new; Cargo's configured target directory and target triple are supported.
+Both suites clear inherited `RUST_LOG` filters so warning assertions are stable.
+
+The updater's distinct `COOP_FORCE_BUILD_KIND=test` binary receives its
 loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
 can construct the fixture source. Normal release builds reject the retired
 `COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers

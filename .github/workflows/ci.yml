@@ -82,11 +82,8 @@ jobs:
       - name: Integration test — installer provenance
         run: ./tests/integration-install.sh
 
-      - name: Integration test — coop update
-        run: ./tests/integration-update.sh
-
-      - name: Integration test — coop uninstall
-        run: ./tests/integration-uninstall.sh
+      - name: Integration tests — update/uninstall policies and release smoke
+        run: ./tests/run-policy-integration.sh
 
   kani:
     runs-on: ubuntu-latest
