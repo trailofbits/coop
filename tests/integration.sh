@@ -14,6 +14,8 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
+#   --shard NAME     Run all (default), lifecycle, workspace, or config phases.
+#                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
 #   TEST_BINARY            — Path to pre-built binary
@@ -31,6 +33,7 @@ BINARY="${TEST_BINARY:-}"
 PROFILES="${TEST_PROFILES:-python,node}"
 INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
+SHARD=all
 SUITE_CONFIG=""
 
 # Track all instances we create for cleanup
@@ -44,8 +47,13 @@ while [[ $# -gt 0 ]]; do
         --profile) PROFILES="$2"; shift 2 ;;
         --name)    INSTANCE="$2"; shift 2 ;;
         --full)    FULL=1;        shift ;;
+        --shard)
+            [[ $# -ge 2 ]] || { echo "--shard requires a name" >&2; exit 1; }
+            SHARD="$2"
+            shift 2
+            ;;
         --help|-h)
-            sed -n '3,19s/^# //p' "$0"
+            sed -n '3,21s/^# //p' "$0"
             exit 0
             ;;
         *)
@@ -54,6 +62,19 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+case "$SHARD" in
+    all) ;;
+    lifecycle|workspace|config)
+        [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
+        ;;
+    *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
+esac
+
+if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$SHARD" != all && "$SHARD" != config ]]; then
+    echo "--require-proxy requires the all or config shard" >&2
+    exit 1
+fi
 
 if [[ -z "$BINARY" ]]; then
     echo "ERROR: --binary is required" >&2
@@ -8991,6 +9012,7 @@ main() {
     echo "Binary:   $BINARY"
     echo "Instance: $INSTANCE"
     echo "Profiles: ${PROFILES:-<none>}"
+    echo "Shard:    $SHARD"
     echo "Full:     $( [[ "$FULL" == "1" ]] && echo "yes" || echo "no (use --full for workspace/multi-instance tests)" )"
     echo ""
 
@@ -9023,70 +9045,75 @@ EOF
 
     # Setup + primary instance
     test_setup
-    test_up_creates_primary_instance
-    test_private_storage
-    test_start_rejects_missing_instance
-    test_duplicate_name
-    test_status_running
-    test_list_running
-    test_running_vm_completions
-    test_auto_resolve_running
-    test_shell_connectivity
-    test_firecracker_vsock_transport
-    test_ssh_alias
-    test_ssh_config
-    test_editor
-    test_exec
-    test_claude_bin_path
-    test_grok_bin_path
-    test_grok_settings_merge
-    test_claude_settings_merge
-    test_claude_onboarding_seed
-    test_codex_bin_path
-    test_codex_account_auth_support
-    test_codex_chatgpt_mode
-    test_codex_sandbox_bypass
-    test_program_status
-    test_agent_update
-    test_github_token_forwarding
-    test_term_handling
-    test_guest_environment
-    test_sudo
-    test_network
-    test_docker
-    test_logs
-    test_profiles
-    test_guest_fingerprint
-    test_vsock_control_without_guest_network
-    test_firecracker_isolated_network_mode
-    test_legacy_firecracker_control_compatibility
+    # Keep the stateful primary-instance sequence together. Extended phases
+    # below create their own instances and only need the shared golden image.
+    if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
+        test_up_creates_primary_instance
+        test_private_storage
+        test_start_rejects_missing_instance
+        test_duplicate_name
+        test_status_running
+        test_list_running
+        test_running_vm_completions
+        test_auto_resolve_running
+        test_shell_connectivity
+        test_firecracker_vsock_transport
+        test_ssh_alias
+        test_ssh_config
+        test_editor
+        test_exec
+        test_claude_bin_path
+        test_grok_bin_path
+        test_grok_settings_merge
+        test_claude_settings_merge
+        test_claude_onboarding_seed
+        test_codex_bin_path
+        test_codex_account_auth_support
+        test_codex_chatgpt_mode
+        test_codex_sandbox_bypass
+        test_program_status
+        test_agent_update
+        test_github_token_forwarding
+        test_term_handling
+        test_guest_environment
+        test_sudo
+        test_network
+        test_docker
+        test_logs
+        test_profiles
+        test_guest_fingerprint
+        test_vsock_control_without_guest_network
+        test_firecracker_isolated_network_mode
+        test_legacy_firecracker_control_compatibility
 
-    # Stop + restart + stopped-state verification
-    test_stop_preserves_recent_writes
-    test_stop
-    test_stop_idempotency
-    test_auto_resolve_stopped
-    test_status_stopped
-    test_agent_update_stopped
-    test_list_stopped
-    test_stopped_vm_completions
-    test_resize_status
-    test_resize_retry_firecracker
-    test_reconfigure
-    test_commit_restore
-    test_private_storage
-    test_restart_stopped
-    test_restart_rejects_ignored_flags
-    test_restore_reprovision
-    test_destroy
-    test_auto_resolve_no_instances
-    test_list_empty
+        # Stop + restart + stopped-state verification
+        test_stop_preserves_recent_writes
+        test_stop
+        test_stop_idempotency
+        test_auto_resolve_stopped
+        test_status_stopped
+        test_agent_update_stopped
+        test_list_stopped
+        test_stopped_vm_completions
+        test_resize_status
+        test_resize_retry_firecracker
+        test_reconfigure
+        test_commit_restore
+        test_private_storage
+        test_restart_stopped
+        test_restart_rejects_ignored_flags
+        test_restore_reprovision
+        test_destroy
+        test_auto_resolve_no_instances
+        test_list_empty
 
-    # Idempotency: re-run commands that should be safe to repeat
-    test_idempotency
+        # Idempotency: re-run commands that should be safe to repeat
+        test_idempotency
+
+    fi
 
     # Extended tests (each manages its own instance lifecycle)
-    if [[ "$FULL" == "1" ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
         test_quickstart
         test_up_project_workflow
         test_git_repo
@@ -9108,6 +9135,9 @@ EOF
         test_creation_failed_descendants
         test_creation_restart_serialization
 
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
         # Local marketplace directory copy
         test_local_marketplace
 
