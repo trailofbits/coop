@@ -791,13 +791,27 @@ pub(crate) fn seal_existing(path: &Path) -> Result<()> {
     invoke("seal", path, None)
 }
 pub(crate) fn remove(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("remove", path, None)
 }
 pub(crate) fn ensure_disk_unmounted(path: &Path) -> Result<()> {
     invoke("ensure-unmounted", path, None)
 }
 pub(crate) fn copy_disk(src: &Path, dst: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(dst)?;
     invoke("copy", src, Some(dst.as_os_str()))
+}
+
+fn lock_template_mount(path: &Path) -> Result<Option<crate::fs_util::FileLock>> {
+    let collection = path.ancestors().nth(2).context("Disk has no collection")?;
+    if collection.file_name() != Some(OsStr::new("images")) {
+        return Ok(None);
+    }
+    let root = collection.parent().context("Disk path has no data root")?;
+    // Template images share one mountpoint. Wait for another image's mount
+    // guard before the helper checks it, and hold the lock through mutation.
+    // Mount/unmount calls already hold this lock through MountGuard.
+    crate::fs_util::lock_sibling(&root.join("rootfs-mount")).map(Some)
 }
 
 pub(crate) fn cleanup_copy_scratch(directory: &Path) -> Result<()> {
@@ -829,6 +843,7 @@ pub(crate) fn format(path: &Path) -> Result<()> {
     invoke("format", path, None)
 }
 pub(crate) fn swap(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("swap", path, None)
 }
 pub(crate) fn mount(path: &Path) -> Result<()> {
@@ -924,6 +939,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mount_id(&child).unwrap(), mount_id(&parent).unwrap());
+    }
+
+    #[test]
+    fn template_mutations_share_the_mount_guard_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let mount_path = root.path().join("rootfs-mount");
+        let mounting = crate::fs_util::lock_sibling(&mount_path).unwrap();
+        let other_image = root.path().join("images/other/rootfs-template.ext4.new");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let lock = lock_template_mount(&other_image).unwrap();
+            acquired_tx.send(lock.is_some()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let while_mounted = acquired_rx.recv_timeout(Duration::from_millis(100));
+        drop(mounting);
+        let after_unmount = acquired_rx.recv_timeout(Duration::from_secs(5));
+        worker.join().unwrap();
+        assert_eq!(while_mounted, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(after_unmount, Ok(true));
+
+        let instance = root.path().join("instances/test/rootfs.ext4");
+        assert!(lock_template_mount(&instance).unwrap().is_none());
     }
 
     struct TemporaryMount(CString);
