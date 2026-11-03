@@ -5,6 +5,14 @@ formal verification (kani), and two manual quality checks — mutation testing
 and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
+The `Firecracker integration` workflow runs
+`./tests/run-integration.sh --full --require-proxy` on a disposable GitHub-hosted
+Ubuntu 24.04 x64 runner for pull requests, pushes to `main`, and manual runs.
+It requires KVM VM creation to succeed before starting the suite, enables
+`COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
+output as a seven-day artifact. This job covers Linux/Firecracker; macOS/Lima
+integration remains a separate platform gate.
+
 ## Cross-platform compile and lint checks
 
 The workspace uses compile-time backend selection. `cargo clippy --all-targets`
