@@ -90,7 +90,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Compile-time policy variants overwrite target/release/coop. Keep their
+      # Compile-time policy variants overwrite Cargo's output binaries. Keep their
       # builds serial on a separate runner from the workspace/namespace tests.
       - name: Cache policy dependencies and build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -98,15 +98,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target/debug
             target/release
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v2-
 
-      - name: Integration test — coop update
-        run: ./tests/integration-update.sh
-
-      - name: Integration test — coop uninstall
-        run: ./tests/integration-uninstall.sh
+      - name: Integration tests — update/uninstall policies and release smoke
+        run: ./tests/run-policy-integration.sh
 
   # Preserve the existing required-check name. always() makes a failed,
   # cancelled, or skipped dependency fail this gate instead of skipping it.
