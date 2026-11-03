@@ -32,8 +32,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v4-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v4-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v5-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v5-
 
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
       # workspace tests below build it.
@@ -52,6 +52,22 @@ jobs:
       - name: Guest-file copy regression tests
         run: bash tests/guest-files-copy.sh
 
+      - name: Integration test — proxy reverse forwarding
+        run: ./tests/integration-proxy-forward.sh
+
+      - name: Integration test — bridge isolation
+        run: ./tests/integration-network.sh
+
+      - name: Integration test — installer provenance
+        run: ./tests/integration-install.sh
+
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Release preflight regression tests
         run: python3 tests/test-preflight-release.py
 
@@ -63,15 +79,6 @@ jobs:
 
       - name: Linux unit runner regression tests
         run: python3 tests/test-linux-unit-runner.py
-
-      - name: Integration test — proxy reverse forwarding
-        run: ./tests/integration-proxy-forward.sh
-
-      - name: Integration test — bridge isolation
-        run: ./tests/integration-network.sh
-
-      - name: Integration test — installer provenance
-        run: ./tests/integration-install.sh
 
   lint:
     runs-on: ubuntu-latest
@@ -91,8 +98,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v1-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v2-
 
       - name: Install cmake
         run: sudo apt-get update && sudo apt-get install -y cmake
@@ -119,8 +126,8 @@ jobs:
             ~/.cargo/git
             target/debug
             target/x86_64-unknown-linux-musl
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v2-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v3-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v3-
 
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -153,8 +160,8 @@ jobs:
             ~/.cargo/git
             target/debug
             target/release
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v4-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v4-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v5-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v5-
 
       - name: Integration tests — update/uninstall policies and release smoke
         run: ./tests/run-policy-integration.sh
@@ -163,7 +170,7 @@ jobs:
   # cancelled, or skipped dependency fail this gate instead of skipping it.
   check:
     if: ${{ always() }}
-    needs: [test, policy, musl, lint]
+    needs: [test, policy, musl, lint, regression]
     runs-on: ubuntu-latest
     steps:
       - name: Require every test job to succeed
@@ -172,11 +179,13 @@ jobs:
           POLICY_RESULT: ${{ needs.policy.result }}
           MUSL_RESULT: ${{ needs.musl.result }}
           LINT_RESULT: ${{ needs.lint.result }}
+          REGRESSION_RESULT: ${{ needs.regression.result }}
         run: |
           test "$TEST_RESULT" = success
           test "$POLICY_RESULT" = success
           test "$MUSL_RESULT" = success
           test "$LINT_RESULT" = success
+          test "$REGRESSION_RESULT" = success
 
   kani:
     runs-on: ubuntu-latest
@@ -217,8 +226,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/kani
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v2-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v2-${{ env.KANI_VERSION }}-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v3-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v3-${{ env.KANI_VERSION }}-
 
       - name: Verify all proofs
         run: cargo kani --workspace --output-format terse
@@ -238,7 +247,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-deny
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-v1-${{ env.CARGO_DENY_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-v2-${{ env.CARGO_DENY_VERSION }}
 
       - name: Install cargo-binstall
         if: steps.cache-deny.outputs.cache-hit != 'true'
