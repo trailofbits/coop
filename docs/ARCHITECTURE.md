@@ -43,6 +43,7 @@ coop/
 │   ├── ssh.rs              # interactive SSH launching
 │   ├── remote_command.rs   # injection-safe remote shell-command builder
 │   ├── cmd.rs              # host std::process::Command wrapper (redaction, sudo)
+│   ├── process_output.rs   # bounded concurrent capture + transient process groups
 │   ├── port_forward.rs     # ssh -L port forwards + state
 │   ├── signal.rs           # SIGINT/SIGTERM cooperative cancellation
 │   ├── paths.rs            # GuestPath / HostPath type split

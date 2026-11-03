@@ -470,6 +470,11 @@ parsing, or state composition:
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
   parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
+- `src/process_output.rs` — bounded concurrent stdout/stderr capture, timeout,
+  overflow, process-group cleanup, and direct-child reaping. Hermetic process
+  fixtures cover exact bounds, asymmetric pipe closure, ordinary descendants,
+  and a deliberately detached pipe holder, so this module remains fully in
+  mutation scope despite owning host IO.
 - `src/update_policy.rs` — updater source, tag, and release-asset identity
   policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
