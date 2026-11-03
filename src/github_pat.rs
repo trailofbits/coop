@@ -487,7 +487,10 @@ fn open_browser_best_effort(url: &str) {
         // xdg-open on Linux; Windows uses `start` but coop is unix-only.
         "xdg-open"
     };
-    let _ = Command::new(opener).arg(url).spawn();
+    let _ = Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Read a pasted secret from the terminal without echoing it. Shared with

@@ -250,7 +250,11 @@ pub(crate) fn authority_options(target: &SshTarget, forwarding: Forwarding) -> R
 }
 
 fn command(tool: &ResolvedHostTool<OpenSshTool>) -> Command {
-    TrustedLaunchContext::system().command(tool).build()
+    let mut command = TrustedLaunchContext::system().command(tool).build();
+    // Managed OpenSSH launches are non-interactive by default. The foreground
+    // shell entrypoints opt back into inherited stdin explicitly.
+    command.stdin(std::process::Stdio::null());
+    command
 }
 
 pub(crate) fn ssh_command(target: &SshTarget, forwarding: Forwarding) -> Result<Command> {
@@ -324,8 +328,10 @@ pub(crate) fn rsync_ssh_command(target: &SshTarget) -> Result<String> {
 #[expect(clippy::unwrap_used, reason = "test fixtures")]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
     use std::num::{NonZeroU16, NonZeroU32};
     use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
 
     use super::*;
 
@@ -367,6 +373,58 @@ mod tests {
         fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn managed_ssh_closes_stdin_by_default() {
+        const FIXTURE: &str = "COOP_OPENSSH_STDIN_FIXTURE";
+        const RESULT: &str = "COOP_OPENSSH_STDIN_RESULT";
+
+        if let (Some(fixture), Some(result)) = (std::env::var_os(FIXTURE), std::env::var_os(RESULT))
+        {
+            let ssh = Path::new(&fixture).join("ssh");
+            let config = SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap();
+            let status = ssh_command(&target(config), Forwarding::Disabled)
+                .unwrap()
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(fs::read(result).unwrap(), b"eof");
+            return;
+        }
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let ssh = fixture.path().join("ssh");
+        let result = fixture.path().join("stdin-result");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nif IFS= read -r line; then printf '%s' \"$line\"; else printf eof; fi > {}\n",
+                crate::shell::shell_escape(&result.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "openssh::tests::managed_ssh_closes_stdin_by_default",
+                "--nocapture",
+            ])
+            .env(FIXTURE, fixture.path())
+            .env(RESULT, &result)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"parent-stdin-sentinel\n")
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::read(result).unwrap(), b"eof");
     }
 
     fn assert_scp_uses_ssh(command: &Command, ssh: &Path) {

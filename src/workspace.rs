@@ -1241,7 +1241,11 @@ fn launch_editor(
             strategy.cmd,
             strategy.args.join(" ")
         );
-        match Command::new(&strategy.cmd).args(&strategy.args).status() {
+        match Command::new(&strategy.cmd)
+            .args(&strategy.args)
+            .stdin(std::process::Stdio::inherit())
+            .status()
+        {
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
                 tracing::debug!("{} exited with {status}", strategy.name);
