@@ -14,10 +14,10 @@ set -euo pipefail
 #      `target/release` or `target/debug`.
 #
 # Run manually:   ./tests/integration-uninstall.sh
-# Run in CI:      same (fast — no VM, no network)
+# Run in CI:      ./tests/run-policy-integration.sh (shared build, no VM)
+# Optional arg:   prebuilt ordinary coop binary (skips compilation)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
 # (here, `uninstall`'s confirmation) on stdin being a TTY. The --yes calls skip
@@ -58,19 +58,25 @@ fail() {
     return 0
 }
 
-# ── Build a release binary outside the project's target/ tree ────────────────
-#
-# The uninstall command refuses to delete binaries whose path contains
-# `target/{debug,release}` (the dev-build guard). For the success-path tests we
-# need a binary that *isn't* under that pattern, so we stash a copy in
-# $TMPDIR/bin. Test 4 deliberately runs the in-target binary to exercise the
-# guard.
+# ── Obtain an optimized binary before isolating HOME ─────────────────────────
 
-echo "==> Building release binary..."
-(cd "$PROJECT_DIR" && cargo build --release --quiet)
-TARGET_BIN="$PROJECT_DIR/target/release/coop"
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [COOP_BINARY]" >&2
+    exit 2
+fi
+if [[ $# -eq 0 ]]; then
+    "$SCRIPT_DIR/build-policy-binaries.sh" "$TMPDIR/artifacts" release-smoke
+    set -- "$TMPDIR/artifacts/coop-release-smoke"
+fi
 STABLE_BIN="$TMPDIR/bin/coop-stable"
-cp "$TARGET_BIN" "$STABLE_BIN"
+cp "$1" "$STABLE_BIN"
+
+# Exercise the path-based guard using a disposable target/debug tree. Never
+# uninstall Cargo's mutable output or a shared input, even if the guard breaks.
+mkdir -p "$TMPDIR/target/debug"
+TARGET_BIN="$TMPDIR/target/debug/coop"
+cp "$STABLE_BIN" "$TARGET_BIN"
+unset RUST_LOG
 
 # ── Isolate $HOME / XDG dirs ─────────────────────────────────────────────────
 
@@ -221,13 +227,13 @@ else
     fail "binary removed despite refusal"
 fi
 
-# ── Test 4: dev-build guard refuses to remove target/release/coop ────────────
+# ── Test 4: dev-build guard refuses to remove target/debug/coop ────────────
 
-echo "==> Test 4: dev-build guard refuses target/release binary"
+echo "==> Test 4: dev-build guard refuses target/debug binary"
 seed_data_dir
 
-# Run the in-target binary directly. It's under PROJECT_DIR/target/release/,
-# which matches the consecutive `target/release` guard.
+# The fixture has the same consecutive `target/debug` components as a Cargo
+# development build, independently of the caller's Cargo target directory.
 if "$TARGET_BIN" uninstall --yes --keep-data > "$TMPDIR/t4.log" 2>&1; then
     if [[ -e "$TARGET_BIN" ]]; then
         if grep -qi "cargo build artifact" "$TMPDIR/t4.log"; then
@@ -237,7 +243,7 @@ if "$TARGET_BIN" uninstall --yes --keep-data > "$TMPDIR/t4.log" 2>&1; then
                 "$(tail -5 "$TMPDIR/t4.log")"
         fi
     else
-        fail "guard failed — target/release/coop was deleted"
+        fail "guard failed — target/debug/coop was deleted"
     fi
 else
     fail "uninstall returned non-zero on dev-build guard path" \
