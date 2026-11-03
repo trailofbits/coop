@@ -13,22 +13,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Cache cargo registry and build
+      - name: Cache test dependencies and build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+            target/debug
+            target/x86_64-unknown-linux-musl
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v1-
 
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
       # `--workspace` clippy/test below build it. The musl compile catches
@@ -82,11 +83,45 @@ jobs:
       - name: Integration test — installer provenance
         run: ./tests/integration-install.sh
 
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Compile-time policy variants overwrite target/release/coop. Keep their
+      # builds serial on a separate runner from the workspace/namespace tests.
+      - name: Cache policy dependencies and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-
+
       - name: Integration test — coop update
         run: ./tests/integration-update.sh
 
       - name: Integration test — coop uninstall
         run: ./tests/integration-uninstall.sh
+
+  # Preserve the existing required-check name. always() makes a failed,
+  # cancelled, or skipped dependency fail this gate instead of skipping it.
+  check:
+    if: ${{ always() }}
+    needs: [test, policy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every test job to succeed
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+        run: |
+          test "$TEST_RESULT" = success
+          test "$POLICY_RESULT" = success
 
   kani:
     runs-on: ubuntu-latest

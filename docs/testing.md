@@ -5,6 +5,17 @@ formal verification (kani), and two manual quality checks — mutation testing
 and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
+CI runs workspace/lint/namespace checks in `test` and the updater/uninstall
+policy suites in `policy` on independent runners. The `check` job retains the
+required status name and succeeds only when both jobs succeed; a failed,
+cancelled, or skipped dependency fails the gate. Kani, cargo-deny, taplo, and
+zizmor remain independent gates. Each build job caches only its Cargo profiles;
+cache keys separate runner OS/architecture, job, toolchain, and lockfile.
+
+See [CI performance measurements](ci-performance.md) for the five-run baseline
+and the end-to-end acceptance target. These hosted checks do not run the full
+Lima or Firecracker VM suites.
+
 ## Cross-platform compile and lint checks
 
 The workspace uses compile-time backend selection. `cargo clippy --all-targets`
