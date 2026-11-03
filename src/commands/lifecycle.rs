@@ -3606,13 +3606,9 @@ mod tests {
                 .unwrap_err();
         assert!(format!("{error:#}").contains("model.json"), "{error:#}");
         let _signals = super::signal::install_handlers();
-        assert!(
-            std::process::Command::new("kill")
-                .args(["-TERM", &std::process::id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
+        // SAFETY: the isolated child has installed a SIGTERM handler. Raising
+        // on this thread runs the handler before returning to the assertion.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         assert!(super::signal::shutdown_requested());
         let error =
             super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
