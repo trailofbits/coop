@@ -396,6 +396,9 @@ The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
 
+The `MountGuard` EBUSY unit test checks error propagation and retained mounted
+state in the unmount helper; it does not exercise network patching or VM startup.
+
 Guest-file unit tests cover multiple mappings, guest-home expansion, destination
 validation, source snapshots, private writable modes, macOS staging ACL inheritance,
 symlink materialization,

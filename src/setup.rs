@@ -2214,7 +2214,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn busy_network_patch_unmount_returns_error_before_start() {
+    fn mount_guard_unmount_preserves_error_and_mounted_state_on_ebusy() {
         let root = tempfile::tempdir().unwrap();
         let mount_path = root.path().join("rootfs-mount");
         let mut guard = MountGuard {
