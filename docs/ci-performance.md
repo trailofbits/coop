@@ -46,6 +46,9 @@ warm repeats, every required job's result, assertion/skip counts, median,
 worst case, and total runner time. Cache misses and failed attempts must remain
 visible; a failed or partial run is not a performance win.
 
-The 30% reduction has **not yet been measured** for this change. Full Lima and
-Firecracker VM performance is a separate benchmark; these CI runs cannot
-establish an improvement in image provisioning or VM startup.
+Candidate run links, timings, cache state, and validation results are recorded
+in [PR #627](https://github.com/trailofbits/coop/pull/627). Use those measured
+results to assess the 30% target; the workflow split alone is not evidence of
+a speedup. Full Lima and Firecracker VM performance is a separate benchmark;
+these CI runs cannot establish an improvement in image provisioning or VM
+startup.
