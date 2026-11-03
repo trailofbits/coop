@@ -19,6 +19,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::ProxyConfig;
 
+const STARTUP_CONFIG_MAX_BYTES: usize = 65_536;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Serve,
@@ -99,11 +101,21 @@ fn main() -> Result<()> {
 /// Read the JSON startup blob from stdin to EOF, then let stdin close. The
 /// secret lands in process memory only — never argv, never a file.
 fn read_config() -> Result<ProxyConfig> {
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
+    read_config_from(&mut std::io::stdin().lock())
+}
+
+fn read_config_from(input: &mut impl Read) -> Result<ProxyConfig> {
+    let mut bytes = Vec::with_capacity(4096);
+    input
+        .take((STARTUP_CONFIG_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .context("reading stdin")?;
-    ProxyConfig::from_json(&buf)
+    anyhow::ensure!(
+        bytes.len() <= STARTUP_CONFIG_MAX_BYTES,
+        "startup config exceeds the {STARTUP_CONFIG_MAX_BYTES}-byte limit"
+    );
+    let json = String::from_utf8(bytes).context("startup config is not valid UTF-8")?;
+    ProxyConfig::from_json(&json)
 }
 
 /// Resolve on SIGTERM (coop's teardown signal) or Ctrl-C, so the proxy stops
@@ -170,5 +182,17 @@ mod tests {
                 "unexpectedly accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn startup_config_is_accepted_at_limit_and_rejected_one_byte_over() {
+        let config = r#"{"listen":"127.0.0.1:1234","capability_token":"token","upstream_host":"api.openai.com","injection":{"scheme":"bearer","credential":"secret"}}"#;
+        let padding = " ".repeat(STARTUP_CONFIG_MAX_BYTES - config.len());
+        let mut exact = std::io::Cursor::new(format!("{config}{padding}"));
+        assert!(read_config_from(&mut exact).is_ok());
+
+        let mut oversized = std::io::Cursor::new(format!("{config}{padding} "));
+        let error = read_config_from(&mut oversized).unwrap_err();
+        assert!(format!("{error:#}").contains("byte limit"));
     }
 }

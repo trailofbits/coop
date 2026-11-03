@@ -110,7 +110,7 @@ pub fn run_status(
     json_out: bool,
     inst: Option<&crate::config::Instance>,
 ) -> Result<()> {
-    let mut view = build_status(cfg, probe);
+    let mut view = build_status(cfg, probe)?;
     view.vm = inst.map(|inst| build_vm_status(cfg, inst)).transpose()?;
     if json_out {
         return json::render_json(&view);
@@ -209,32 +209,39 @@ pub(crate) struct PatEntryView<'a> {
 // fully lib-tested; excluded in .cargo/mutants.toml. The pure projections
 // (GithubMode::of, ProbeStatus::from_resolved) and the non-probe shape are
 // covered by tests.
-fn build_status(cfg: &CoopConfig, probe: bool) -> GithubStatus<'_> {
+fn build_status(cfg: &CoopConfig, probe: bool) -> Result<GithubStatus<'_>> {
     let mode = GithubMode::of(cfg.github.as_ref());
     let (entries, skip) = match cfg.github.as_ref() {
         Some(GitHubAuth::Pat(c)) => {
             let entries = c
                 .entries
                 .iter()
-                .map(|(repo, entry)| PatEntryView {
-                    repo,
-                    storage: CmdToken::parse(entry.token.expose()).map(|t| t.backend()),
-                    probe: probe.then(|| {
-                        ProbeStatus::from_resolved(&resolve_cmd_value(entry.token.expose()))
-                    }),
+                .map(|(repo, entry)| {
+                    let probe = if probe {
+                        let resolved = resolve_cmd_value(entry.token.expose());
+                        crate::signal::check_shutdown()?;
+                        Some(ProbeStatus::from_resolved(&resolved))
+                    } else {
+                        None
+                    };
+                    Ok(PatEntryView {
+                        repo,
+                        storage: CmdToken::parse(entry.token.expose()).map(|t| t.backend()),
+                        probe,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let skip = c.skip.iter().collect();
             (entries, skip)
         }
         _ => (Vec::new(), Vec::new()),
     };
-    GithubStatus {
+    Ok(GithubStatus {
         vm: None,
         mode,
         entries,
         skip,
-    }
+    })
 }
 
 /// Render the status view as the plain-text report (unchanged output).
@@ -1208,7 +1215,7 @@ mod tests {
             SelectionSource::Assignment
         );
 
-        let mut view = build_status(&cfg, false);
+        let mut view = build_status(&cfg, false).unwrap();
         view.vm = Some(build_vm_status(&cfg, &inst).unwrap());
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(
@@ -1222,7 +1229,7 @@ mod tests {
             text.contains("projects") && text.contains("org/entry") && text.contains("Assignment")
         );
         cfg.github = None;
-        let mut view = build_status(&cfg, false);
+        let mut view = build_status(&cfg, false).unwrap();
         view.vm = Some(build_vm_status(&cfg, &inst).unwrap());
         assert_eq!(
             serde_json::to_value(&view).unwrap()["vm"]["source"],
@@ -1688,7 +1695,7 @@ mod tests {
     }
 
     fn render_status(cfg: &CoopConfig, probe: bool) -> String {
-        format_status(&build_status(cfg, probe))
+        format_status(&build_status(cfg, probe).unwrap())
     }
 
     #[test]
@@ -1734,7 +1741,7 @@ mod tests {
     #[test]
     fn build_status_off_mode_json_shape() {
         let cfg = config_from("github = \"off\"\n");
-        let view = build_status(&cfg, false);
+        let view = build_status(&cfg, false).unwrap();
         let v = serde_json::to_value(&view).unwrap();
         assert_eq!(v["mode"], serde_json::json!("off"));
         assert_eq!(v["entries"], serde_json::json!([]));
@@ -1749,7 +1756,7 @@ mod tests {
         let cfg = config_from(
             "[github]\nmode = \"pat\"\n\n[github.pat.\"a/b\"]\ntoken = \"cmd:echo x\"\n",
         );
-        let view = build_status(&cfg, false);
+        let view = build_status(&cfg, false).unwrap();
         let v = serde_json::to_value(&view).unwrap();
         assert_eq!(v["mode"], serde_json::json!("pat"));
         assert_eq!(v["entries"][0]["repo"], serde_json::json!("a/b"));
@@ -1760,7 +1767,7 @@ mod tests {
     #[test]
     fn build_status_skip_only_json_lists_repo() {
         let cfg = config_from("[github]\nmode = \"pat\"\nskip = [\"a/b\"]\n");
-        let view = build_status(&cfg, false);
+        let view = build_status(&cfg, false).unwrap();
         let v = serde_json::to_value(&view).unwrap();
         assert_eq!(v["skip"], serde_json::json!(["a/b"]));
         assert_eq!(v["entries"], serde_json::json!([]));
