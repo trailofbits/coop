@@ -983,6 +983,16 @@ test_shell_connectivity() {
     else
         fail "shell command output correct" "got: $output"
     fi
+
+    if output=$(printf 'coop-stdin-sentinel\n' | guest_exec sh -c 'IFS= read -r line; printf "%s" "$line"'); then
+        if [[ "$output" == "coop-stdin-sentinel" ]]; then
+            pass "shell command forwards piped stdin"
+        else
+            fail "shell command forwards piped stdin" "got: $output"
+        fi
+    else
+        fail "shell command forwards piped stdin" "stderr: $(guest_stderr)"
+    fi
 }
 
 test_firecracker_vsock_transport() {
@@ -7569,8 +7579,9 @@ CFGEOF
 # asserts the non-exposure property end-to-end on both backends. There is no
 # mock upstream: the proxy pins TLS to the real hosts (a security property), so
 # a local mock cannot present a trusted cert. Instead the checks are hermetic
-# and need no upstream — the injection-into-the-header logic is covered by the
-# `coop-proxy` unit tests + `gate.rs`. Here we assert what only a live VM can:
+# and need no upstream — the injection-into-the-header logic and capability
+# gate are covered by the `coop-proxy` unit tests. Here we assert what only a
+# live VM can:
 #   - the guest is wired at the proxy (Codex `config.toml`, Claude
 #     `settings.json`) and holds only the capability token;
 #   - the raw keys are suppressed even when set on the host (crown jewel), and

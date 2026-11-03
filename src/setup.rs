@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -2185,15 +2187,18 @@ fn step(msg: &str) {
 }
 
 fn confirm(action: &str, skip: bool) -> Result<bool> {
+    confirm_with(action, skip, crate::prompt::confirm)
+}
+
+fn confirm_with(
+    action: &str,
+    skip: bool,
+    prompt: impl FnOnce(&str) -> Result<bool>,
+) -> Result<bool> {
     if skip {
         return Ok(true);
     }
-    eprint!("  {action}? [Y/n] ");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim().to_lowercase();
-    Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
+    prompt(&format!("  {action}?"))
 }
 
 #[cfg(test)]
@@ -2202,6 +2207,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    #[test]
+    fn setup_confirmation_uses_prompt_unless_explicitly_skipped() {
+        let mut prompts = 0;
+        let declined = confirm_with("Proceed", false, |message| {
+            prompts += 1;
+            assert_eq!(message, "  Proceed?");
+            Ok(false)
+        })
+        .unwrap();
+        assert!(!declined);
+        assert_eq!(prompts, 1);
+
+        let skipped = confirm_with("Proceed", true, |_| -> Result<bool> {
+            unreachable!("--yes must not consult stdin")
+        })
+        .unwrap();
+        assert!(skipped);
+    }
 
     fn setup_options(extra_packages: &[&str], post_install: Option<PathBuf>) -> SetupOptions {
         SetupOptions {
