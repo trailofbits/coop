@@ -475,6 +475,7 @@ impl<'a> FirecrackerVm<'a, Running> {
                 let mut child = Command::new("tail")
                     .arg("-f")
                     .arg(&log_path)
+                    .stdin(Stdio::null())
                     .spawn()
                     .context("Failed to tail log file")?;
                 child.wait().context("Log streaming interrupted")?;

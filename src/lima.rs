@@ -888,6 +888,7 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
         .args(["-t", "ed25519", "-f"])
         .arg(&key_path)
         .args(["-N", "", "-q"])
+        .stdin(Stdio::null())
         .status()
         .context("Failed to generate SSH key")?;
 
@@ -2118,6 +2119,7 @@ fn lima_name_for(name: &InstanceName) -> String {
 fn private_limactl() -> Command {
     use std::os::unix::process::CommandExt as _;
     let mut command = Command::new("limactl");
+    command.stdin(Stdio::null());
     // SAFETY: umask is async-signal-safe and only affects the child process.
     unsafe {
         command.pre_exec(|| {

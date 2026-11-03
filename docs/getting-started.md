@@ -311,6 +311,9 @@ Skip confirmation prompts with `-y`:
 coop setup -y --profile python
 ```
 
+Setup otherwise defaults to no: empty input, end-of-file, and non-terminal
+stdin decline prompted actions. Use `--yes` explicitly in automation.
+
 Setup is idempotent. Rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
 
 ### 2. Bring up a project environment

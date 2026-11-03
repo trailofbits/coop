@@ -983,6 +983,16 @@ test_shell_connectivity() {
     else
         fail "shell command output correct" "got: $output"
     fi
+
+    if output=$(printf 'coop-stdin-sentinel\n' | guest_exec sh -c 'IFS= read -r line; printf "%s" "$line"'); then
+        if [[ "$output" == "coop-stdin-sentinel" ]]; then
+            pass "shell command forwards piped stdin"
+        else
+            fail "shell command forwards piped stdin" "got: $output"
+        fi
+    else
+        fail "shell command forwards piped stdin" "stderr: $(guest_stderr)"
+    fi
 }
 
 test_firecracker_vsock_transport() {

@@ -15,7 +15,7 @@
 )]
 
 use std::fs;
-use std::io::{BufRead as _, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -487,68 +487,17 @@ fn open_browser_best_effort(url: &str) {
         // xdg-open on Linux; Windows uses `start` but coop is unix-only.
         "xdg-open"
     };
-    let _ = Command::new(opener).arg(url).spawn();
+    let _ = Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Read a pasted secret from the terminal without echoing it. Shared with
 /// `coop proxy setup` (issue #411).
 pub(crate) fn read_token_no_echo() -> Result<String> {
-    eprint!("Paste token: ");
-    std::io::stderr().flush().ok();
-    let guard = EchoGuard::off();
-    let stdin = std::io::stdin();
-    let mut buf = String::new();
-    stdin
-        .lock()
-        .read_line(&mut buf)
-        .context("Failed to read token from stdin")?;
-    // Print a newline because the user's RET wasn't echoed.
-    if guard.is_active() {
-        eprintln!();
-    }
-    drop(guard);
-    let trimmed = buf.trim().to_string();
-    if trimmed.is_empty() {
-        bail!("No token entered");
-    }
-    Ok(trimmed)
-}
-
-/// RAII guard that turns terminal echo off via `stty -echo` and restores
-/// it on drop. Disabling fails silently if no controlling TTY exists or
-/// `stty` is unavailable (`is_active` then returns false, so the caller
-/// can skip the trailing newline).
-///
-/// `Drop` runs on normal scope exit but **not** when the process is killed
-/// by an uncaught signal (Ctrl-C / SIGTERM). Users who interrupt the
-/// wizard mid-paste can restore echo with `stty echo`. A `tcsetattr`-based
-/// implementation would let the kernel handle restoration via terminal
-/// reset, but the shell-out keeps the dependency footprint minimal.
-struct EchoGuard {
-    active: bool,
-}
-
-impl EchoGuard {
-    fn off() -> Self {
-        let active = Command::new("stty")
-            .arg("-echo")
-            .status()
-            .is_ok_and(|s| s.success());
-        Self { active }
-    }
-
-    #[mutants::skip] // equivalent: trivial accessor over self.active
-    fn is_active(&self) -> bool {
-        self.active
-    }
-}
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = Command::new("stty").arg("echo").status();
-        }
-    }
+    crate::prompt::read_secret("Paste token", crate::prompt::SECRET_MAX_BYTES)?
+        .ok_or_else(|| anyhow!("No token entered"))
 }
 
 fn warn_token_format(token: &str) {
@@ -996,17 +945,9 @@ pub(crate) fn pick_backend() -> Result<crate::secret_store::Backend> {
     for (i, b) in backends.iter().enumerate() {
         eprintln!("  {}) {}", i + 1, b.label());
     }
-    eprint!("> ");
-    std::io::stderr().flush().ok();
-    let mut buf = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .context("Failed to read backend choice")?;
-    let n: usize = buf
-        .trim()
-        .parse()
-        .context("Backend choice must be a number")?;
+    let choice = crate::prompt::read_line_any("Choice", crate::prompt::CONFIRM_MAX_BYTES)?
+        .ok_or_else(|| anyhow!("Backend choice must be a number"))?;
+    let n: usize = choice.parse().context("Backend choice must be a number")?;
     select_backend(n, &backends)
 }
 
