@@ -400,8 +400,7 @@ step "Release preflight regression tests" python3 tests/test-preflight-release.p
 step "Integration — bridge isolation" run_bridge_isolation
 step "Integration — proxy reverse forwarding" run_proxy_forward
 step "Integration — installer provenance" ./tests/integration-install.sh
-step "Integration — coop update" ./tests/integration-update.sh
-step "Integration — coop uninstall" ./tests/integration-uninstall.sh
+step "Integration — update/uninstall policies and release smoke" ./tests/run-policy-integration.sh
 step "Formal verification (kani)" run_kani
 
 if [[ "$RUN_MUTANTS" == 1 ]]; then
