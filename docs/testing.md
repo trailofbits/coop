@@ -403,6 +403,8 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It holds the loop mount busy to check that unmount fails and the mounted disk
+cannot be removed, then verifies the unmounted path is accepted.
 It also corrupts an ext4 inode reference count, checks that read-only verification
 rejects it, then retries `coop resize` at the already extended image size and
 checks the filesystem's block capacity. It also checks a completed no-op retry
@@ -414,6 +416,9 @@ and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
+
+The `MountGuard` EBUSY unit test checks error propagation and retained mounted
+state in the unmount helper; it does not exercise network patching or VM startup.
 
 Guest-file unit tests cover multiple mappings, guest-home expansion, destination
 validation, source snapshots, private writable modes, macOS staging ACL inheritance,

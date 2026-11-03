@@ -519,10 +519,14 @@ impl MountGuard {
 
     /// Tear down the mount while errors can still abort publication.
     fn finish(mut self) -> Result<()> {
-        let result = match self.kind {
-            MountKind::Chroot => unmount_chroot(&self.disk_path, &self.mount_path),
-            MountKind::Simple => unmount_simple(&self.disk_path, &self.mount_path),
-        };
+        match self.kind {
+            MountKind::Chroot => self.unmount_with(unmount_chroot),
+            MountKind::Simple => self.unmount_with(unmount_simple),
+        }
+    }
+
+    fn unmount_with(&mut self, unmount: impl FnOnce(&Path, &str) -> Result<()>) -> Result<()> {
+        let result = unmount(&self.disk_path, &self.mount_path);
         if result.is_ok() {
             self.mounted = false;
         }
@@ -2207,6 +2211,33 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_guard_unmount_preserves_error_and_mounted_state_on_ebusy() {
+        let root = tempfile::tempdir().unwrap();
+        let mount_path = root.path().join("rootfs-mount");
+        let mut guard = MountGuard {
+            mount_path: mount_path.display().to_string(),
+            disk_path: root.path().join("rootfs.ext4"),
+            kind: MountKind::Simple,
+            mounted: true,
+            _mount_lock: crate::fs_util::lock_sibling(&mount_path).unwrap(),
+        };
+        let result =
+            guard.unmount_with(|_, _| Err(io::Error::from_raw_os_error(libc::EBUSY).into()));
+        let still_mounted = guard.mounted;
+        // Disarm the synthetic guard before assertions so a regression cannot
+        // invoke real privileged cleanup while the test is unwinding.
+        guard.unmount_with(|_, _| Ok(())).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        assert!(still_mounted);
+        assert!(!guard.mounted);
+    }
 
     #[test]
     fn setup_confirmation_uses_prompt_unless_explicitly_skipped() {
