@@ -477,9 +477,9 @@ It scopes out:
   compile them, and `cargo kani` exercises them separately.
 - Shell-out, filesystem, network, stdout, backend, and terminal functions in
   otherwise logic-bearing modules through `\b`-anchored `exclude_re` entries.
-- The `prompt.rs` `confirm` and `read_line` terminal adapters through targeted
-  file-and-function patterns, while their pure decision helpers remain in
-  scope.
+- The `prompt.rs` `confirm`, `read_line`, `read_line_any`, and `read_secret`
+  ambient-stdio adapters through targeted file-and-function patterns, while
+  their pure decision helpers remain in scope.
 - The `src/commands/` dispatch entrypoints and backend-driving or TTY handlers,
   while leaving their extracted pure helpers in scope.
 
