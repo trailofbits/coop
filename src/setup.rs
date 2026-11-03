@@ -338,9 +338,7 @@ pub fn commit_instance_rootfs(
     // Repair a private staging disk before publishing it. The existing image
     // and its metadata remain a matched pair if copying, repair, or unmounting
     // fails; swap is the only operation that replaces the live disk.
-    if let Err(error) = crate::privileged_disk::remove(&staging) {
-        tracing::debug!("Failed to remove stale commit staging disk (non-fatal): {error}");
-    }
+    crate::privileged_disk::remove(&staging).context("Cannot remove stale commit staging disk")?;
     let result = (|| {
         reflink_copy(&rootfs, &staging)?;
         patch_image_vsock_listener(&staging, &cfg.data_dir.join("rootfs-mount"))?;
@@ -1065,9 +1063,7 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     let staging = template.with_extension("ext4.new");
 
     // Clean up leftover staging artifact from a previous failed build
-    if let Err(e) = crate::privileged_disk::remove(&staging) {
-        tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
-    }
+    crate::privileged_disk::remove(&staging).context("Cannot remove stale staging image")?;
 
     // Build the persisted config once: `build_template` embeds it as the
     // in-guest version marker, and we save the same value after the image

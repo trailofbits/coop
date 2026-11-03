@@ -200,9 +200,14 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   ACL mask is restricted by `0600`. Managed storage operations pin checked
   directories and open child files relative to those descriptors. The Linux
   privileged disk helper repeats managed-path validation after sudo, uses the
-  opened disk for filesystem tools and loop setup, and serializes copies through
-  a private lock. Sudo runs the current executable through the parent's procfs
-  executable link, which pins its inode even if its install pathname changes.
+  opened disk for filesystem tools and loop setup, and serializes copies
+  through a private lock. Before replacing or changing disk contents, it
+  checks the managed mountpoint, loop backing identity, and process descriptors
+  for the currently named disk inode. These current-state checks do not serialize
+  every helper operation or prove that a delayed VM launcher cannot attach the
+  disk later, or identify a formerly named inode after a rename. Sudo runs the
+  current executable through the parent's procfs executable link, which pins its inode
+  even if its install pathname changes.
   Privileged unmounts use the kernel's no-follow flag on guest mountpoint names.
   Disk replacement and failed-start directory removal stop if the rootfs mount
   still has a distinct kernel mount ID.
