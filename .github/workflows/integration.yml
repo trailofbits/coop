@@ -1,16 +1,15 @@
 name: Firecracker integration
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: firecracker-${{ github.event.pull_request.number || github.ref }}
+  group: firecracker-${{ github.ref }}
   cancel-in-progress: true
 
 env:

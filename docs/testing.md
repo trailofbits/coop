@@ -7,7 +7,8 @@ fuzzing run manually when a change warrants them.
 
 The `Firecracker integration` workflow runs
 `./tests/run-integration.sh --full --require-proxy` on a disposable GitHub-hosted
-Ubuntu 24.04 x64 runner for pull requests, pushes to `main`, and manual runs.
+Ubuntu 24.04 x64 runner daily at 03:17 UTC on the default branch and on manual
+dispatch. It does not run automatically for pull requests or pushes.
 It requires KVM VM creation to succeed before starting the suite, enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
 output as a seven-day artifact. This job covers Linux/Firecracker; macOS/Lima
