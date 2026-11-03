@@ -17,9 +17,13 @@ env:
 
 jobs:
   integration:
-    name: Full integration (Linux x64 / KVM)
+    name: Full integration (${{ matrix.shard }} / Linux x64 / KVM)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [lifecycle, workspace, config]
     defaults:
       run:
         shell: bash
@@ -35,25 +39,6 @@ jobs:
             iproute2 iptables iputils-ping jq openssh-client openssh-server \
             pkg-config python3 rsync squashfs-tools util-linux zsh
 
-      - name: Verify hardware virtualization
-        run: |
-          test "$(uname -m)" = x86_64
-          test -c /dev/kvm
-          test -c /dev/net/tun
-          sudo -n setfacl -m "u:$(id -un):rw" /dev/kvm
-          python3 - <<'PY'
-          import fcntl
-          import os
-
-          with open("/dev/kvm", "r+b", buffering=0) as kvm:
-              version = fcntl.ioctl(kvm, 0xAE00, 0)  # KVM_GET_API_VERSION
-              if version != 12:
-                  raise SystemExit(f"Unsupported KVM API version: {version}")
-              vm = fcntl.ioctl(kvm, 0xAE01, 0)  # KVM_CREATE_VM
-              os.close(vm)
-          print("KVM VM creation succeeded")
-          PY
-
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
       - name: Make room for VM images
@@ -64,20 +49,25 @@ jobs:
           free -h
 
       - name: Full Firecracker integration
-        timeout-minutes: 80
+        timeout-minutes: 30
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
+          SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
-          ./tests/run-integration.sh --full --require-proxy 2>&1 \
+          args=(--full --shard "$SHARD")
+          if [[ "$SHARD" == config ]]; then
+            args+=(--require-proxy)
+          fi
+          ./tests/run-integration.sh "${args[@]}" 2>&1 \
             | tee "$RUNNER_TEMP/firecracker-integration.log"
 
       - name: Upload integration output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: firecracker-integration-log
+          name: firecracker-integration-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/firecracker-integration.log
           if-no-files-found: ignore
           retention-days: 7

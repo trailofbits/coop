@@ -6,12 +6,20 @@ and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
 The `Firecracker integration` workflow runs
-`./tests/run-integration.sh --full --require-proxy` on a disposable GitHub-hosted
-Ubuntu 24.04 x64 runner daily at 03:17 UTC on the default branch and on manual
-dispatch. It does not run automatically for pull requests or pushes.
-It requires KVM VM creation to succeed before starting the suite, enables
+the full suite across three disposable GitHub-hosted Ubuntu 24.04 x64 runners
+daily at 03:17 UTC on the default branch and on manual dispatch. Each runs
+`./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
+VM sequence together, `workspace` covers independent workspace/profile phases,
+and `config` covers configuration, proxy, and recovery phases. The `config`
+shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
+It does not run automatically for pull requests or pushes.
+It enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output as a seven-day artifact. This job covers Linux/Firecracker; macOS/Lima
+output per shard as a seven-day artifact. Each suite step has a 30-minute
+timeout (35 minutes for the job including prerequisites and artifact upload).
+Shards must run on separate hosts: they share image names and destructive
+cleanup affects host-wide state. Unsharded local and release runs retain the
+complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
 integration remains a separate platform gate.
 
 ## Cross-platform compile and lint checks
