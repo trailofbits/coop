@@ -712,6 +712,7 @@ fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> R
     let program = tool.program();
     let mut command = Command::new(program);
     command.args(args);
+    command.stdin(std::process::Stdio::null());
     // SAFETY: pre_exec performs only async-signal-safe fcntl calls. The fd
     // vector is captured before fork and each fd is owned by a live File.
     unsafe {

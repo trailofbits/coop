@@ -73,7 +73,10 @@ fn restore_terminal() {
     }
     let _ = stdout.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
     let _ = stdout.flush();
-    let _ = Command::new("stty").arg("sane").status();
+    let _ = Command::new("stty")
+        .arg("sane")
+        .stdin(std::process::Stdio::inherit())
+        .status();
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +155,7 @@ fn run_interactive_impl(
     );
 
     let mut ssh_command = interactive_ssh_command(session, &remote_cmd)?;
+    ssh_command.stdin(std::process::Stdio::inherit());
     if let Some(program) = program {
         report_program_status(program, "working");
     }
@@ -179,6 +183,9 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     let status = session
         .command(&[], &remote_cmd)?
+        // `coop shell NAME -- COMMAND...` is the documented streaming command
+        // surface: preserve pipes even though it does not allocate a PTY.
+        .stdin(std::process::Stdio::inherit())
         .status()
         .context("Failed to launch SSH")?;
 
@@ -222,6 +229,8 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests construct known-valid SSH values")]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -379,6 +388,69 @@ printf x >> {}
             std::fs::read(marker).expect("all launches reached fixture"),
             b"xxxx"
         );
+    }
+
+    #[test]
+    fn shell_command_deliberately_forwards_parent_stdin() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const FIXTURE: &str = "COOP_SHELL_STDIN_FIXTURE";
+        const RESULT: &str = "COOP_SHELL_STDIN_RESULT";
+
+        if let (Some(fixture), Some(result)) = (std::env::var_os(FIXTURE), std::env::var_os(RESULT))
+        {
+            let session = SshSession {
+                target: crate::backend::SshTarget::tcp(
+                    crate::backend::Hostname::new("127.0.0.1").expect("host"),
+                    std::num::NonZeroU16::MIN,
+                    crate::backend::SshUser::new("ubuntu").expect("user"),
+                    "/unused-key".into(),
+                    crate::config::SshHostToolsConfig::with_exact_paths(
+                        Some(&std::path::Path::new(&fixture).join("ssh")),
+                        None,
+                        None,
+                    )
+                    .expect("exact fixture ssh"),
+                ),
+                env: crate::backend::EnvForward::default(),
+            };
+            run_command(&session, &["cat".into()]).expect("streaming shell command");
+            assert_eq!(std::fs::read(result).expect("stdin result"), b"shell-stdin");
+            return;
+        }
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let ssh = fixture.path().join("ssh");
+        let result = fixture.path().join("stdin-result");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > {}\n",
+                crate::shell::shell_escape(&result.to_string_lossy())
+            ),
+        )
+        .expect("SSH fixture");
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).expect("executable");
+
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "ssh::tests::shell_command_deliberately_forwards_parent_stdin",
+                "--nocapture",
+            ])
+            .env(FIXTURE, fixture.path())
+            .env(RESULT, &result)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("child test");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(b"shell-stdin\n")
+            .expect("write sentinel");
+        assert!(child.wait().expect("child test").success());
+        assert_eq!(std::fs::read(result).expect("stdin result"), b"shell-stdin");
     }
 
     #[test]

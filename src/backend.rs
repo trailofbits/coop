@@ -1169,6 +1169,11 @@ pub trait VmBackend: std::fmt::Display {
         image: &ImageName,
     ) -> Result<()>;
     fn is_running(&self, inst: &Instance) -> bool;
+    /// Point-in-time observations for list output, in input order.
+    /// Never use these observations to authorize lifecycle operations.
+    fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
+        instances.iter().map(|inst| self.is_running(inst)).collect()
+    }
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM
@@ -1757,6 +1762,10 @@ impl VmBackend for LimaBackend {
 
     fn is_running(&self, inst: &Instance) -> bool {
         crate::lima::is_running(inst)
+    }
+
+    fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
+        crate::lima::list_running(instances)
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
@@ -3462,8 +3471,6 @@ fn write_managed_claude_settings(
     target: &SshTarget,
     local_env: &BTreeMap<String, String>,
 ) -> Result<()> {
-    target.exec(RemoteCommand::new().literal("mkdir -p ~/.claude"))?;
-
     // Read and merge as one fallible step so a read failure falls back to
     // managed defaults rather than aborting boot. `capture` decodes the file as
     // UTF-8, so a non-UTF-8 settings.json fails here; that is corrupt input,
@@ -3484,7 +3491,7 @@ fn write_managed_claude_settings(
     target
         .exec_with_stdin(
             RemoteCommand::new().literal(
-                "t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
+                "mkdir -p ~/.claude && t=\"$(mktemp ~/.claude/settings.json.XXXXXX)\" && \
                  cat > \"$t\" && mv \"$t\" ~/.claude/settings.json",
             ),
             merged.as_bytes(),

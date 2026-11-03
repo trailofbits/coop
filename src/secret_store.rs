@@ -87,6 +87,7 @@ fn tool_on_path(name: &ToolName) -> bool {
     Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {name}"))
+        .stdin(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }

@@ -44,11 +44,6 @@ exclude_globs = [
   "src/vm.rs",
   # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
   "src/main.rs",
-  # Interactive prompts (confirm / read_line) short-circuit off a TTY
-  # and otherwise reads stdin; the trailing match on the reply is only
-  # reachable behind a real terminal, so a `--lib` test cannot observe any of
-  # it. Whole-module exclude (cf. read_line added for #352, issue #373).
-  "src/prompt.rs",
 ]
 
 # Individual functions in otherwise-logic-bearing modules. Patterns match
@@ -57,6 +52,15 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # Ambient stdin/stderr adapters are covered through their injected helpers;
+  # the bounded parsing and terminal-control logic remains mutation-scoped.
+  "src/prompt\\.rs:.*\\bconfirm\\b",
+  "src/prompt\\.rs:.*\\bread_line\\b",
+  "src/prompt\\.rs:.*\\bread_line_any\\b",
+  "src/prompt\\.rs:.*\\bread_secret\\b",
+  # Best-effort fallback for unwinding after an early return. Explicit restore
+  # and PTY tests cover the ordinary success/error paths.
+  "src/prompt\\.rs:.*<impl Drop for EchoGuard",
   # vsock_proxy.rs: Unix-socket readiness and stdio relay are syscall adapters.
   # Unit fixtures cover successful, malformed, oversized, and timed-out
   # handshakes; tests/vsock_proxy.rs covers interactive subprocess relay, and
@@ -119,7 +123,6 @@ exclude_re = [
   "\\bprint_form_instructions\\b",
   "\\bprint_widen_instructions\\b",
   "\\bwarn_token_format\\b",
-  "impl Drop for EchoGuard",
   # PAT-wizard submodule orchestration: curl prefetch, then terminal prompts
   # (read_token_no_echo) and eprintln advice gated on the discovery result.
   # The classification logic (classify_urls / extract_urls / drop_public) is
@@ -395,8 +398,8 @@ exclude_re = [
   # mutant — which load_or_default_is_remote_when_missing alone cannot, since
   # the default IS Remote on the missing-file path.)
 
-  # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
-  # via exclude_globs above.)
+  # (prompt.rs — only the ambient-stdio adapters are excluded by the targeted
+  # patterns above; bounded parsing/pure helpers remain in scope.)
 
   # lifecycle.rs — backend-driving helpers: bootstrap_on_boot installs guest
   # agents, run_configured_post_start executes the configured guest hook, and
