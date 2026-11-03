@@ -457,7 +457,8 @@ parsing, or state composition:
 
 **Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
 `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
-`prompt.rs` (TTY prompts), `main.rs`, and — inside `src/commands/` — the
+the terminal-adapter functions in `prompt.rs`, `main.rs`, and — inside
+`src/commands/` — the
 `cmd_*` dispatch entrypoints and handlers that take a `&PlatformBackend`, write
 stdout, or open a TTY prompt. These mostly shell out, run SSH, or talk to
 external services, so unit tests cannot observe their effects. The integration
@@ -471,12 +472,14 @@ means "real unit-test gap," not "code a `--lib` test structurally cannot reach."
 cargo-mutants reads this file automatically on every run (`--list` included).
 It scopes out:
 
-- Whole IO/backend modules through `exclude_globs`, including `main.rs` and
-  `prompt.rs`.
+- Whole IO/backend modules through `exclude_globs`, including `main.rs`.
 - `cfg(kani)` proofs through `exclude_re = ["proofs::"]`; normal builds never
   compile them, and `cargo kani` exercises them separately.
 - Shell-out, filesystem, network, stdout, backend, and terminal functions in
   otherwise logic-bearing modules through `\b`-anchored `exclude_re` entries.
+- The `prompt.rs` `confirm` and `read_line` terminal adapters through targeted
+  file-and-function patterns, while their pure decision helpers remain in
+  scope.
 - The `src/commands/` dispatch entrypoints and backend-driving or TTY handlers,
   while leaving their extracted pure helpers in scope.
 

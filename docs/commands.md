@@ -177,7 +177,7 @@ coop setup [FLAGS]
 
 | Flag | Description |
 |------|-------------|
-| `-y`, `--yes` | Skip confirmation prompts (accept all) |
+| `-y`, `--yes` | Explicitly approve setup confirmation prompts. Required when a prompted Linux/Firecracker setup action runs non-interactively. |
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
@@ -188,6 +188,9 @@ coop setup [FLAGS]
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
 | `--builder-timeout <duration>` | Duration to wait for setup image build commands before timing out. Accepts seconds by default, or `s`, `m`, and `h` suffixes. |
+
+Setup confirmations default to no. Empty input, end-of-file, and non-terminal
+stdin decline the action; pass `--yes` for an intentional non-interactive run.
 
 ```
 coop setup -y --profile python,node --template-size 12
