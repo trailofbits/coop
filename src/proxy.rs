@@ -491,9 +491,9 @@ fn await_proxy_ready(
 /// Build the `Command` that launches `coop-proxy` under the platform's process
 /// confinement (issue #411, slice 3).
 ///
-/// On Linux the proxy self-confines with Landlock unconditionally (it never
-/// receives a `--no-jail` opt-out from `coop`), so the command is the binary
-/// itself. On macOS — which has no first-class in-process sandbox — the
+/// On Linux the proxy self-confines with Landlock unconditionally and the
+/// binary has no unconfined serving mode, so the command is the binary itself.
+/// On macOS — which has no first-class in-process sandbox — the
 /// launcher wraps it in `sandbox-exec` with a Seatbelt profile
 /// ([`SEATBELT_PROFILE`]) that denies filesystem writes and program execution
 /// and limits egress to the two upstream ports. `sandbox-exec`

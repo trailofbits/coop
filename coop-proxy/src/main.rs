@@ -12,11 +12,34 @@ mod jail;
 mod proxy;
 mod tls;
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::config::ProxyConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Serve,
+    JailSelftest,
+}
+
+/// Parse the complete production argument grammar.
+///
+/// The proxy is normally an implementation detail launched by `coop`, so it
+/// deliberately has no extensible argument surface: unknown input must fail
+/// before stdin (which carries the real credential) is read.
+fn parse_mode(args: impl IntoIterator<Item = OsString>) -> Result<Mode> {
+    let args: Vec<OsString> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Ok(Mode::Serve),
+        [arg] if arg == OsStr::new("--jail-selftest") => Ok(Mode::JailSelftest),
+        _ => bail!(
+            "unsupported coop-proxy arguments; expected no arguments or exactly --jail-selftest"
+        ),
+    }
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -27,12 +50,12 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = parse_mode(std::env::args_os().skip(1))?;
 
     // Diagnostic used by the integration suite to assert the jail actually
     // restricts on the host (see `jail::selftest`). Handles no config or
     // credential, so it runs before reading stdin.
-    if args.iter().any(|a| a == "--jail-selftest") {
+    if mode == Mode::JailSelftest {
         return jail::selftest();
     }
 
@@ -42,29 +65,27 @@ fn main() -> Result<()> {
     // by threads created afterwards, and the multi-thread runtime spawns its
     // workers below — so applying it here covers every worker.
     //
-    // Fail-closed by default: on Linux the credential proxy always confines
-    // unless the explicit `--no-jail` opt-out is passed. Only the in-repo
-    // `coop-proxy` tests pass it (they run on hosts that may lack Landlock);
-    // `coop` never does, so there is no path where the launcher serves the
-    // credential proxy unconfined. macOS confines externally via `sandbox-exec`
-    // (coop's `proxy.rs`), so this is Linux-only.
+    // Fail closed: every serving Linux process applies the jail. Tests that
+    // exercise HTTP policy without a compatible Landlock host call the server
+    // in-process under `cfg(test)`; the production binary has no opt-out.
+    // macOS confines externally via `sandbox-exec` (coop's `proxy.rs`), so
+    // this is Linux-only.
     #[cfg(target_os = "linux")]
-    if !args.iter().any(|a| a == "--no-jail") {
-        let net_scoped =
-            jail::apply(cfg.listen.port()).context("failed to establish the Landlock jail")?;
-        if net_scoped {
-            tracing::info!(
-                "Landlock jail established: filesystem writes and program exec denied; \
-                 TCP egress limited to :443/:53"
-            );
-        } else {
-            tracing::warn!(
-                "Landlock jail established with reduced scope: filesystem writes and program \
-                 exec denied, but this kernel (<6.7) has no Landlock network rules, so TCP \
-                 egress is not port-scoped (open egress). Upstream identity is still enforced \
-                 at the TLS layer."
-            );
-        }
+    let net_scoped =
+        jail::apply(cfg.listen.port()).context("failed to establish the Landlock jail")?;
+    #[cfg(target_os = "linux")]
+    if net_scoped {
+        tracing::info!(
+            "Landlock jail established: filesystem writes and program exec denied; \
+             TCP egress limited to :443/:53"
+        );
+    } else {
+        tracing::warn!(
+            "Landlock jail established with reduced scope: filesystem writes and program \
+             exec denied, but this kernel (<6.7) has no Landlock network rules, so TCP \
+             egress is not port-scoped (open egress). Upstream identity is still enforced \
+             at the TLS layer."
+        );
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -112,6 +133,42 @@ async fn shutdown_signal() {
     {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::warn!("ctrl_c handler error: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests;
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn production_argument_grammar_is_closed() {
+        assert_eq!(parse_mode(args(&[])).unwrap(), Mode::Serve);
+        assert_eq!(
+            parse_mode(args(&["--jail-selftest"])).unwrap(),
+            Mode::JailSelftest
+        );
+
+        for invalid in [
+            vec!["--no-jail"],
+            vec!["--unknown"],
+            vec!["positional"],
+            vec!["--jail-selftest=true"],
+            vec!["--jail-selftest", "--jail-selftest"],
+            vec!["--jail-selftest", "ignored"],
+        ] {
+            assert!(
+                parse_mode(args(&invalid)).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
         }
     }
 }
