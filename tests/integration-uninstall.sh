@@ -58,15 +58,15 @@ fail() {
     return 0
 }
 
-# ── Obtain a development-profile binary before isolating HOME ────────────────
+# ── Obtain an optimized binary before isolating HOME ─────────────────────────
 
 if [[ $# -gt 1 ]]; then
     echo "Usage: $0 [COOP_BINARY]" >&2
     exit 2
 fi
 if [[ $# -eq 0 ]]; then
-    "$SCRIPT_DIR/build-policy-binaries.sh" "$TMPDIR/artifacts" dev
-    set -- "$TMPDIR/artifacts/coop-dev"
+    "$SCRIPT_DIR/build-policy-binaries.sh" "$TMPDIR/artifacts" release-smoke
+    set -- "$TMPDIR/artifacts/coop-release-smoke"
 fi
 STABLE_BIN="$TMPDIR/bin/coop-stable"
 cp "$1" "$STABLE_BIN"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build once into a fresh artifact directory, before consumers isolate HOME.
 # Usage: build-policy-binaries.sh OUTPUT_DIR [test-source homebrew official dev release-smoke]
-# With no variants specified, build the four development-profile policy variants.
+# With no variants specified, build the four updater policy variants.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT_DIR="${1:?usage: build-policy-binaries.sh OUTPUT_DIR [VARIANT ...]}"
@@ -20,7 +20,7 @@ for variant in "$@"; do
     unset COOP_PACKAGE_MANAGER
     profile=dev
     case "$variant" in
-        test-source) kind=test ;;
+        test-source) kind=test; profile=release ;;
         homebrew) kind=test; export COOP_PACKAGE_MANAGER=homebrew ;;
         official) kind=release ;;
         dev) kind=dev ;;

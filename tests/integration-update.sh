@@ -119,8 +119,8 @@ JSON
 
 # ── Obtain policy artifacts (real HOME, before isolation) ───────────────────
 #
-# Standalone runs build their own development-profile matrix. The shared runner
-# supplies the same immutable artifacts to both functional suites.
+# Standalone runs build an optimized test-source binary and development-profile
+# policy guards. The shared runner supplies prebuilt immutable artifacts.
 if [[ $# -gt 1 ]]; then
     echo "Usage: $0 [POLICY_ARTIFACT_DIR]" >&2
     exit 2

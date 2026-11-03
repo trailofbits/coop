@@ -217,21 +217,23 @@ skip of the routed guest-isolation probe, since it would mask the coop rule.
 
 Run `tests/run-policy-integration.sh` for the host-only updater and uninstall
 suites plus an optimized release smoke test (also used by CI and release
-preflight). It builds each of four policy variants once with Cargo's development
-profile: test source, Homebrew-owned test source, official release policy, and
-forced dev policy. Policy provenance is independent of the optimization profile.
+preflight). The test-source updater binary uses Cargo's release profile so the
+full update flow exercises optimized code. The Homebrew-owned test source,
+official release policy, and forced dev policy variants use the development
+profile. Policy provenance is independent of the optimization profile.
 Each binary is copied to a distinct immutable artifact path before the next
-build; consumers use disposable copies. The uninstall suite reuses the dev
-artifact and checks its path guard in a temporary `target/debug` tree. One
-additional release-profile binary checks version reporting, CLI startup, and
-rejection of runtime update-source overrides without external network I/O.
+build; consumers use disposable copies. The uninstall suite reuses the optimized
+release-smoke binary and checks its path guard in a temporary `target/debug`
+tree. That same binary checks version reporting, CLI startup, and rejection of
+runtime update-source overrides without external network I/O.
 
 The suites still run independently: `tests/integration-update.sh` builds its
-four development-profile variants; `tests/integration-uninstall.sh` builds only
-the dev variant. To reuse an explicit build, run
-`tests/build-policy-binaries.sh NEW_ARTIFACT_DIR`, then pass that directory to
-`tests/integration-update.sh NEW_ARTIFACT_DIR` and its `coop-dev` path to
-`tests/integration-uninstall.sh NEW_ARTIFACT_DIR/coop-dev`. The artifact directory
+optimized test-source and three development-profile variants;
+`tests/integration-uninstall.sh` builds only the optimized release-smoke variant.
+To reuse an explicit build, run
+`tests/build-policy-binaries.sh NEW_ARTIFACT_DIR test-source homebrew official dev release-smoke`,
+then pass that directory to `tests/integration-update.sh NEW_ARTIFACT_DIR` and
+`tests/integration-uninstall.sh NEW_ARTIFACT_DIR/coop-release-smoke`. The artifact directory
 must be new; Cargo's configured target directory and target triple are supported.
 Both suites clear inherited `RUST_LOG` filters so warning assertions are stable.
 

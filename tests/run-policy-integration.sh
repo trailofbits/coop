@@ -11,7 +11,6 @@ exec </dev/null
 "$SCRIPT_DIR/build-policy-binaries.sh" "$POLICY_TMP/artifacts" \
     test-source homebrew official dev release-smoke
 
-# Keep an optimized smoke test in addition to the development-profile matrix.
 # Pin the source-policy rejection so this never contacts the release service.
 echo "==> Optimized release smoke test"
 RELEASE_BIN="$POLICY_TMP/artifacts/coop-release-smoke"
@@ -29,5 +28,5 @@ echo "  PASS  optimized release version, CLI, and update-source policy"
 # Run both suites even if one fails, preserving preflight's failure reporting.
 status=0
 "$SCRIPT_DIR/integration-update.sh" "$POLICY_TMP/artifacts" || status=1
-"$SCRIPT_DIR/integration-uninstall.sh" "$POLICY_TMP/artifacts/coop-dev" || status=1
+"$SCRIPT_DIR/integration-uninstall.sh" "$RELEASE_BIN" || status=1
 exit "$status"
