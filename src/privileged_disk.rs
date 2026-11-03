@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn template_mutations_share_the_mount_guard_lock() {
+    fn copy_disk_waits_for_shared_template_mount_lock() {
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -951,19 +951,26 @@ mod tests {
         let mounting = crate::fs_util::lock_sibling(&mount_path).unwrap();
         let other_image = root.path().join("images/other/rootfs-template.ext4.new");
         let (started_tx, started_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let lock = lock_template_mount(&other_image).unwrap();
-            acquired_tx.send(lock.is_some()).unwrap();
+            // This source reaches invoke's path validation after the wrapper
+            // acquires the destination lock, then fails before any sudo call.
+            let result = copy_disk(Path::new("source"), &other_image);
+            finished_tx
+                .send(result.map_err(|error| error.to_string()))
+                .unwrap();
         });
         started_rx.recv().unwrap();
-        let while_mounted = acquired_rx.recv_timeout(Duration::from_millis(100));
+        let while_mounted = finished_rx.recv_timeout(Duration::from_millis(100));
         drop(mounting);
-        let after_unmount = acquired_rx.recv_timeout(Duration::from_secs(5));
+        let after_unmount = finished_rx.recv_timeout(Duration::from_secs(5));
         worker.join().unwrap();
         assert_eq!(while_mounted, Err(mpsc::RecvTimeoutError::Timeout));
-        assert_eq!(after_unmount, Ok(true));
+        assert_eq!(
+            after_unmount,
+            Ok(Err("Disk path has no data root".to_string()))
+        );
 
         let instance = root.path().join("instances/test/rootfs.ext4");
         assert!(lock_template_mount(&instance).unwrap().is_none());
