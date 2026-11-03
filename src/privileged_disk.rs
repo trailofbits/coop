@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, bail};
+use rustix::fs::{AtFlags, StatxFlags, statx};
 
 use crate::cmd::Cmd;
 
@@ -211,6 +212,7 @@ impl DiskPath {
     }
 
     fn remove(&self, uid: u32) -> Result<()> {
+        ensure_unmounted(self)?;
         match self.file(false, uid) {
             Ok(_file) => {}
             Err(error)
@@ -256,6 +258,7 @@ fn is_root_owned_symlink(parent: &File, name: &CStr) -> bool {
 
 fn copy(src: &DiskPath, dst: &DiskPath, uid: u32) -> Result<()> {
     let source = src.file(false, uid)?;
+    ensure_unmounted(dst)?;
     // Refuse to replace a symlink, hardlink, foreign-owned file, or directory.
     if let Err(error) = dst.file(false, uid)
         && error
@@ -387,6 +390,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
+        "ensure-unmounted" if argument.is_none() => ensure_unmounted(&disk),
         "mount-proc" if argument.is_none() => mount_child(&disk, "proc"),
         "mount-sys" if argument.is_none() => mount_child(&disk, "sys"),
         "mount-dev" if argument.is_none() => mount_child(&disk, "dev"),
@@ -411,6 +415,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
                 name: final_name.to_owned(),
                 kind: disk.kind,
             };
+            ensure_unmounted(&final_disk)?;
             if let Err(error) = final_disk.file(false, uid)
                 && error
                     .downcast_ref::<io::Error>()
@@ -470,11 +475,41 @@ fn mount_directory(disk: &DiskPath, create: bool) -> Result<File> {
     Ok(directory)
 }
 
+fn mount_id(file: &File) -> Result<u64> {
+    let stat = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        bail!("Kernel did not report the mount ID");
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+fn ensure_unmounted(disk: &DiskPath) -> Result<()> {
+    let base = if disk.kind == DiskKind::Instance {
+        &disk.parent
+    } else {
+        &disk.root
+    };
+    let mount = match open_at(
+        base,
+        c"rootfs-mount",
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(mount) => mount,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if mount_id(&mount)? != mount_id(base)? {
+        bail!("Rootfs mount is still active; unmount it before changing the disk");
+    }
+    Ok(())
+}
+
 fn proc_fd(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
 }
 
 fn mount_disk(disk: &DiskPath, uid: u32) -> Result<()> {
+    ensure_unmounted(disk)?;
     let source = disk.file(true, uid)?;
     let target = mount_directory(disk, true)?;
     let control = fs::OpenOptions::new()
@@ -756,10 +791,27 @@ pub(crate) fn seal_existing(path: &Path) -> Result<()> {
     invoke("seal", path, None)
 }
 pub(crate) fn remove(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("remove", path, None)
 }
+pub(crate) fn ensure_disk_unmounted(path: &Path) -> Result<()> {
+    invoke("ensure-unmounted", path, None)
+}
 pub(crate) fn copy_disk(src: &Path, dst: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(dst)?;
     invoke("copy", src, Some(dst.as_os_str()))
+}
+
+fn lock_template_mount(path: &Path) -> Result<Option<crate::fs_util::FileLock>> {
+    let collection = path.ancestors().nth(2).context("Disk has no collection")?;
+    if collection.file_name() != Some(OsStr::new("images")) {
+        return Ok(None);
+    }
+    let root = collection.parent().context("Disk path has no data root")?;
+    // Template images share one mountpoint. Wait for another image's mount
+    // guard before the helper checks it, and hold the lock through mutation.
+    // Mount/unmount calls already hold this lock through MountGuard.
+    crate::fs_util::lock_sibling(&root.join("rootfs-mount")).map(Some)
 }
 
 pub(crate) fn cleanup_copy_scratch(directory: &Path) -> Result<()> {
@@ -791,6 +843,7 @@ pub(crate) fn format(path: &Path) -> Result<()> {
     invoke("format", path, None)
 }
 pub(crate) fn swap(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("swap", path, None)
 }
 pub(crate) fn mount(path: &Path) -> Result<()> {
@@ -872,6 +925,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mount_id_accepts_o_path_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("mount")).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let child = open_at(
+            &parent,
+            c"mount",
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(mount_id(&child).unwrap(), mount_id(&parent).unwrap());
+    }
+
+    #[test]
+    fn copy_disk_waits_for_shared_template_mount_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let mount_path = root.path().join("rootfs-mount");
+        let mounting = crate::fs_util::lock_sibling(&mount_path).unwrap();
+        let other_image = root.path().join("images/other/rootfs-template.ext4.new");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            // This source reaches invoke's path validation after the wrapper
+            // acquires the destination lock, then fails before any sudo call.
+            let result = copy_disk(Path::new("source"), &other_image);
+            finished_tx
+                .send(result.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let while_mounted = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(mounting);
+        let after_unmount = finished_rx.recv_timeout(Duration::from_secs(5));
+        worker.join().unwrap();
+        assert_eq!(while_mounted, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(
+            after_unmount,
+            Ok(Err("Disk path has no data root".to_string()))
+        );
+
+        let instance = root.path().join("instances/test/rootfs.ext4");
+        assert!(lock_template_mount(&instance).unwrap().is_none());
     }
 
     struct TemporaryMount(CString);

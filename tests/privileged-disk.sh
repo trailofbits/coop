@@ -39,6 +39,21 @@ mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
+# Holding cwd inside the mount reproduces an EBUSY unmount. A failed cleanup
+# must retain both the mounted filesystem and its backing file.
+if (cd "$data_dir/rootfs-mount" && sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage") 2>/dev/null; then
+    echo 'busy rootfs was unmounted' >&2
+    exit 1
+fi
+if sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage" 2>/dev/null; then
+    echo 'busy rootfs was reported unmounted' >&2
+    exit 1
+fi
+if sudo -n "$coop_bin" __disk-op remove "$data_dir" "$stage" 2>/dev/null; then
+    echo 'mounted backing file was removed' >&2
+    exit 1
+fi
+[[ -f $stage ]]
 sudo -n mount -t tmpfs tmpfs "$data_dir/sentinel"
 if sudo -n "$coop_bin" __disk-op mount-proc "$data_dir" "$stage" 2>/dev/null; then
     echo 'guest-authored proc symlink was mounted' >&2
@@ -58,6 +73,7 @@ if ! mountpoint -q "$data_dir/sentinel"; then
 fi
 sudo -n umount "$data_dir/sentinel"
 sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage"
 
 ln -s "$data_dir/sentinel" "$instance"
 if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then

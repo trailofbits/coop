@@ -193,9 +193,8 @@ CI must pass before a pull request can merge. The
 - **`cargo fmt -- --check`** — formatting.
 - **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — lints.
 - **`cargo test --workspace`** — tests for both crates.
-- **`./tests/integration-install.sh`**, **`./tests/integration-update.sh`**,
-  and **`./tests/integration-uninstall.sh`** — installer provenance, update,
-  and uninstall flows.
+- **`./tests/integration-install.sh`** and **`./tests/run-policy-integration.sh`** —
+  installer provenance, updater and uninstall policies, and release smoke.
 - **`./tests/integration-network.sh`** — Linux bridge isolation.
 - **`./tests/integration-proxy-forward.sh`** — authenticated SSH reverse
   forwarding and rejected-bind cleanup on Linux.

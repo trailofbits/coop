@@ -15,6 +15,11 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Keep debug assertions, but avoid generating and caching full debug symbols.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,28 +32,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-            target/x86_64-unknown-linux-musl
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v1-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v5-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v5-
 
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
-      # `--workspace` clippy/test below build it. The musl compile catches
-      # target-specific libc API differences before the release workflow.
-      - name: Install cmake, musl tools, and zsh
-        run: sudo apt-get update && sudo apt-get install -y cmake musl-tools zsh
-
-      - name: Check musl portability
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          cargo check --target x86_64-unknown-linux-musl
-
-      - name: Format check
-        run: cargo fmt -- --check
-
-      # `--workspace` so coop-proxy is linted/tested too (it is not a default
-      # member, to keep plain `cargo build` and the integration scripts light).
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # workspace tests below build it.
+      - name: Install cmake and zsh
+        run: sudo apt-get update && sudo apt-get install -y cmake zsh
 
       - name: Unit tests
         run: cargo test --workspace
@@ -62,6 +52,22 @@ jobs:
       - name: Guest-file copy regression tests
         run: bash tests/guest-files-copy.sh
 
+      - name: Integration test — proxy reverse forwarding
+        run: ./tests/integration-proxy-forward.sh
+
+      - name: Integration test — bridge isolation
+        run: ./tests/integration-network.sh
+
+      - name: Integration test — installer provenance
+        run: ./tests/integration-install.sh
+
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Release preflight regression tests
         run: python3 tests/test-preflight-release.py
 
@@ -74,23 +80,77 @@ jobs:
       - name: Linux unit runner regression tests
         run: python3 tests/test-linux-unit-runner.py
 
-      - name: Integration test — proxy reverse forwarding
-        run: ./tests/integration-proxy-forward.sh
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Integration test — bridge isolation
-        run: ./tests/integration-network.sh
+      - name: Cache lint dependencies and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v2-
 
-      - name: Integration test — installer provenance
-        run: ./tests/integration-install.sh
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
-  policy:
+      - name: Format check
+        run: cargo fmt -- --check
+
+      # coop-proxy is not a default member, so lint it explicitly as well.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  musl:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Compile-time policy variants overwrite target/release/coop. Keep their
+      - name: Cache musl dependencies and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/x86_64-unknown-linux-musl
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v3-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v3-
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Catch target-specific libc API differences before the release workflow.
+      - name: Check musl portability
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo check --target x86_64-unknown-linux-musl
+
+  policy:
+    runs-on: ubuntu-latest
+    # Reuse unchanged code across compile-time policy variants at release opt-level.
+    env:
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "true"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_INCREMENTAL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Compile-time policy variants overwrite Cargo's output binaries. Keep their
       # builds serial on a separate runner from the workspace/namespace tests.
       - name: Cache policy dependencies and build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -98,30 +158,34 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target/debug
             target/release
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v1-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v5-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v5-
 
-      - name: Integration test — coop update
-        run: ./tests/integration-update.sh
-
-      - name: Integration test — coop uninstall
-        run: ./tests/integration-uninstall.sh
+      - name: Integration tests — update/uninstall policies and release smoke
+        run: ./tests/run-policy-integration.sh
 
   # Preserve the existing required-check name. always() makes a failed,
   # cancelled, or skipped dependency fail this gate instead of skipping it.
   check:
     if: ${{ always() }}
-    needs: [test, policy]
+    needs: [test, policy, musl, lint, regression]
     runs-on: ubuntu-latest
     steps:
       - name: Require every test job to succeed
         env:
           TEST_RESULT: ${{ needs.test.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
+          MUSL_RESULT: ${{ needs.musl.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          REGRESSION_RESULT: ${{ needs.regression.result }}
         run: |
           test "$TEST_RESULT" = success
           test "$POLICY_RESULT" = success
+          test "$MUSL_RESULT" = success
+          test "$LINT_RESULT" = success
+          test "$REGRESSION_RESULT" = success
 
   kani:
     runs-on: ubuntu-latest
@@ -133,8 +197,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Kani setup installs its own pinned nightly Rust toolchain. Cache both
-      # that toolchain and the verifier so subsequent runs only check proofs.
+      # Kani setup installs its own pinned nightly Rust toolchain.
       - name: Cache Kani toolchain
         id: cache-kani
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -154,23 +217,45 @@ jobs:
         if: steps.cache-kani.outputs.cache-hit != 'true'
         run: cargo kani setup
 
+      # Kani uses a separate Cargo target directory and compiler. Restore build
+      # artifacts independently of the verifier installation; always rerun proofs.
+      - name: Cache Kani dependencies and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/kani
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v3-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v3-${{ env.KANI_VERSION }}-
+
       - name: Verify all proofs
         run: cargo kani --workspace --output-format terse
 
   deny:
     runs-on: ubuntu-latest
+    # Keep in sync with CARGO_DENY_VERSION in scripts/install-dev-tools.sh.
+    env:
+      CARGO_DENY_VERSION: 0.19.9
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Cache cargo-deny
+        id: cache-deny
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-v2-${{ env.CARGO_DENY_VERSION }}
+
       - name: Install cargo-binstall
+        if: steps.cache-deny.outputs.cache-hit != 'true'
         uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
 
-      # Pin to match CARGO_DENY_VERSION in scripts/install-dev-tools.sh so CI and
-      # local installs run the same version.
       - name: Install cargo-deny
-        run: cargo binstall --no-confirm cargo-deny@0.19.9
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: cargo binstall --no-confirm "cargo-deny@${CARGO_DENY_VERSION}"
 
       # `--workspace` roots the crate graph at every workspace member. With a
       # root package present, cargo-deny otherwise checks only `coop`, missing

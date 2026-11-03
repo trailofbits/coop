@@ -181,8 +181,8 @@ You can also run the suite directly if you already have a binary:
 
 The test exercises the full VM lifecycle (setup → start → status → shell →
 guest environment → docker → stop → destroy). CI additionally runs the fast,
-host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
-`tests/integration-uninstall.sh` suites.
+host-only `tests/integration-install.sh` and `tests/run-policy-integration.sh`
+suites.
 The full VM suite rebuilds the image and requires the Grok CLI to report a
 version. The shorter suite may reuse an older image and reports that check as
 skipped when Grok is absent.
@@ -224,8 +224,29 @@ Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
 
-Run `tests/integration-update.sh` for the host-only self-updater flow. The
-script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+Run `tests/run-policy-integration.sh` for the host-only updater and uninstall
+suites plus an optimized release smoke test (also used by CI and release
+preflight). The test-source updater binary uses Cargo's release profile so the
+full update flow exercises optimized code. The Homebrew-owned test source,
+official release policy, and forced dev policy variants use the development
+profile. Policy provenance is independent of the optimization profile.
+Each binary is copied to a distinct immutable artifact path before the next
+build; consumers use disposable copies. The uninstall suite reuses the optimized
+release-smoke binary and checks its path guard in a temporary `target/debug`
+tree. That same binary checks version reporting, CLI startup, and rejection of
+runtime update-source overrides without external network I/O.
+
+The suites still run independently: `tests/integration-update.sh` builds its
+optimized test-source and three development-profile variants;
+`tests/integration-uninstall.sh` builds only the optimized release-smoke variant.
+To reuse an explicit build, run
+`tests/build-policy-binaries.sh NEW_ARTIFACT_DIR test-source homebrew official dev release-smoke`,
+then pass that directory to `tests/integration-update.sh NEW_ARTIFACT_DIR` and
+`tests/integration-uninstall.sh NEW_ARTIFACT_DIR/coop-release-smoke`. The artifact directory
+must be new; Cargo's configured target directory and target triple are supported.
+Both suites clear inherited `RUST_LOG` filters so warning assertions are stable.
+
+The updater's distinct `COOP_FORCE_BUILD_KIND=test` binary receives its
 loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
 can construct the fixture source. Normal release builds reject the retired
 `COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers
@@ -391,6 +412,8 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It holds the loop mount busy to check that unmount fails and the mounted disk
+cannot be removed, then verifies the unmounted path is accepted.
 It also corrupts an ext4 inode reference count, checks that read-only verification
 rejects it, then retries `coop resize` at the already extended image size and
 checks the filesystem's block capacity. It also checks a completed no-op retry
@@ -402,6 +425,9 @@ and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
+
+The `MountGuard` EBUSY unit test checks error propagation and retained mounted
+state in the unmount helper; it does not exercise network patching or VM startup.
 
 Guest-file unit tests cover multiple mappings, guest-home expansion, destination
 validation, source snapshots, private writable modes, macOS staging ACL inheritance,
