@@ -32,21 +32,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/debug
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v3-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v3-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v4-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-v4-
 
       # coop-proxy's aws-lc-sys crypto backend (issue #411) needs cmake; the
-      # `--workspace` clippy/test below build it.
+      # workspace tests below build it.
       - name: Install cmake and zsh
         run: sudo apt-get update && sudo apt-get install -y cmake zsh
-
-      - name: Format check
-        run: cargo fmt -- --check
-
-      # `--workspace` so coop-proxy is linted/tested too (it is not a default
-      # member, to keep plain `cargo build` and the integration scripts light).
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Unit tests
         run: cargo test --workspace
@@ -81,6 +73,37 @@ jobs:
       - name: Integration test — installer provenance
         run: ./tests/integration-install.sh
 
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache lint dependencies and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-lint-v1-
+
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Format check
+        run: cargo fmt -- --check
+
+      # coop-proxy is not a default member, so lint it explicitly as well.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   musl:
     runs-on: ubuntu-latest
     steps:
@@ -96,8 +119,8 @@ jobs:
             ~/.cargo/git
             target/debug
             target/x86_64-unknown-linux-musl
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v1-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-musl-v2-
 
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -130,8 +153,8 @@ jobs:
             ~/.cargo/git
             target/debug
             target/release
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v3-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v3-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v4-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-policy-v4-
 
       - name: Integration tests — update/uninstall policies and release smoke
         run: ./tests/run-policy-integration.sh
@@ -140,7 +163,7 @@ jobs:
   # cancelled, or skipped dependency fail this gate instead of skipping it.
   check:
     if: ${{ always() }}
-    needs: [test, policy, musl]
+    needs: [test, policy, musl, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Require every test job to succeed
@@ -148,10 +171,12 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           POLICY_RESULT: ${{ needs.policy.result }}
           MUSL_RESULT: ${{ needs.musl.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
         run: |
           test "$TEST_RESULT" = success
           test "$POLICY_RESULT" = success
           test "$MUSL_RESULT" = success
+          test "$LINT_RESULT" = success
 
   kani:
     runs-on: ubuntu-latest
@@ -192,8 +217,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/kani
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v1-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v1-${{ env.KANI_VERSION }}-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v2-${{ env.KANI_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-kani-v2-${{ env.KANI_VERSION }}-
 
       - name: Verify all proofs
         run: cargo kani --workspace --output-format terse
@@ -213,7 +238,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-deny
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-${{ env.CARGO_DENY_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-v1-${{ env.CARGO_DENY_VERSION }}
 
       - name: Install cargo-binstall
         if: steps.cache-deny.outputs.cache-hit != 'true'
