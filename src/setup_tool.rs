@@ -20,6 +20,76 @@ use crate::host_tool::{
 const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 
+fn apt_directive_has_separator(input: &[u8]) -> bool {
+    let mut offset = 0;
+    let mut separated = false;
+    while offset < input.len() {
+        let tail = &input[offset..];
+        if tail[0].is_ascii_whitespace() {
+            separated = true;
+            offset += 1;
+        } else if tail.starts_with(b"/*") {
+            let Some(end) = tail.windows(2).position(|part| part == b"*/") else {
+                return false;
+            };
+            separated |= tail[..end + 2].contains(&b'\n');
+            offset += end + 2;
+        } else if tail.starts_with(b"//") {
+            let Some(end) = tail.iter().position(|byte| *byte == b'\n') else {
+                return false;
+            };
+            separated = true;
+            offset += end + 1;
+        } else {
+            break;
+        }
+    }
+    separated
+}
+
+fn apt_directive_body(input: &[u8]) -> Result<(Vec<u8>, usize), SetupToolError> {
+    let mut cursor = 0;
+    let mut value = Vec::new();
+    let mut quoted = false;
+    while cursor < input.len() {
+        let tail = &input[cursor..];
+        if quoted && tail.starts_with(b"\\") && tail.len() > 1 {
+            value.extend_from_slice(&tail[..2]);
+            cursor += 2;
+            continue;
+        }
+        if !quoted && tail.starts_with(b"/*") {
+            let end = tail
+                .windows(2)
+                .position(|part| part == b"*/")
+                .ok_or_else(|| SetupToolError::AptConfiguration {
+                    reason: "unterminated apt directive comment".into(),
+                })?;
+            cursor += end + 2;
+            value.push(b' ');
+            continue;
+        }
+        if !quoted && tail.starts_with(b"//") {
+            cursor += tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(tail.len(), |end| end + 1);
+            value.push(b' ');
+            continue;
+        }
+        if tail[0] == b'"' {
+            quoted = !quoted;
+        } else if !quoted && tail[0] == b';' {
+            return Ok((value, cursor + 1));
+        }
+        value.push(tail[0]);
+        cursor += 1;
+    }
+    Err(SetupToolError::AptConfiguration {
+        reason: "unterminated apt directive".into(),
+    })
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SetupToolError {
     #[error(
@@ -96,44 +166,129 @@ fn validate_apt_configuration_at(
                 fs::read(&canonical).map_err(|error| SetupToolError::AptConfiguration {
                     reason: error.to_string(),
                 })?;
-            for line in contents.split(|byte| *byte == b'\n') {
-                let mut remaining = line;
-                while let Some(start) = remaining.windows(8).position(|part| part == b"#include") {
-                    let tail = &remaining[start + 8..];
-                    let end = tail.iter().position(|byte| *byte == b';').ok_or_else(|| {
-                        SetupToolError::AptConfiguration {
-                            reason: "unterminated apt include directive".into(),
-                        }
-                    })?;
-                    let value = std::str::from_utf8(&tail[..end])
-                        .map_err(|_| SetupToolError::AptConfiguration {
-                            reason: "non-UTF-8 apt include path".into(),
-                        })?
-                        .trim();
-                    let value = value
-                        .strip_prefix('"')
-                        .and_then(|v| v.strip_suffix('"'))
-                        .unwrap_or(value);
-                    if value.is_empty() || value.contains(['"', '\\', '\n']) {
-                        return Err(SetupToolError::AptConfiguration {
-                            reason: "unsupported apt include path".into(),
-                        });
-                    }
-                    let included = Path::new(value);
-                    pending.push((
-                        if included.is_absolute() {
-                            included.to_path_buf()
-                        } else {
-                            Path::new("/").join(included)
-                        },
-                        true,
-                    ));
-                    remaining = &tail[end + 1..];
-                }
+            for included in apt_include_paths(&contents)? {
+                pending.push((included, true));
             }
         }
     }
     Ok(())
+}
+
+fn apt_include_paths(contents: &[u8]) -> Result<Vec<PathBuf>, SetupToolError> {
+    let mut includes = Vec::new();
+    let mut offset = 0;
+    let mut block_comment = false;
+    let mut quoted = false;
+    while offset < contents.len() {
+        let tail = &contents[offset..];
+        if block_comment {
+            if tail.starts_with(b"*/") {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if quoted {
+            if tail.starts_with(b"\\") {
+                offset += 2;
+            } else if tail.starts_with(b"\"") {
+                quoted = false;
+                offset += 1;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if tail.starts_with(b"//") {
+            offset += tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(tail.len());
+            if offset == contents.len() {
+                break;
+            }
+            offset += 1;
+            continue;
+        }
+        if tail.starts_with(b"/*") {
+            block_comment = true;
+            offset += 2;
+            continue;
+        }
+        if tail.starts_with(b"\"") {
+            quoted = true;
+            offset += 1;
+            continue;
+        }
+        let previous_offset = offset;
+        for (directive, is_include) in [(b"#clear".as_slice(), false), (b"#include", true)] {
+            if !tail.starts_with(directive) {
+                continue;
+            }
+            if !apt_directive_has_separator(&tail[directive.len()..]) {
+                if let Ok((_, consumed)) = apt_directive_body(&tail[directive.len()..]) {
+                    offset += directive.len() + consumed;
+                    break;
+                }
+                continue;
+            }
+            let (body, consumed) = apt_directive_body(&tail[directive.len()..])?;
+            if is_include {
+                includes.push(apt_include_path(&body)?);
+            }
+            offset += directive.len() + consumed;
+            break;
+        }
+        if offset != previous_offset {
+            continue;
+        }
+        if tail.starts_with(b"#") {
+            offset += tail
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(tail.len());
+            if offset == contents.len() {
+                break;
+            }
+            offset += 1;
+        } else {
+            offset += 1;
+        }
+    }
+    Ok(includes)
+}
+
+fn apt_include_path(value_bytes: &[u8]) -> Result<PathBuf, SetupToolError> {
+    let value = std::str::from_utf8(value_bytes)
+        .map_err(|_| SetupToolError::AptConfiguration {
+            reason: "non-UTF-8 apt include path".into(),
+        })?
+        .trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    if value.is_empty() || value.contains(['"', '\\', '\n']) {
+        return Err(SetupToolError::AptConfiguration {
+            reason: "unsupported apt include path".into(),
+        });
+    }
+    let included = Path::new(value);
+    if included
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(SetupToolError::AptConfiguration {
+            reason: "apt include path contains a parent component".into(),
+        });
+    }
+    Ok(if included.is_absolute() {
+        included.to_path_buf()
+    } else {
+        Path::new("/").join(included)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -507,6 +662,42 @@ mod tests {
     }
 
     #[test]
+    fn apt_include_parent_component_cannot_hide_a_symlink_hop() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = fixture.path().join("apt");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let trusted = fixture.path().join("trusted");
+        fs::create_dir(&trusted).unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o755)).unwrap();
+        let external = fixture.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
+        let nested = external.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(
+            external.join("hook.conf"),
+            "DPkg::Pre-Invoke { \"true\"; };",
+        )
+        .unwrap();
+        let decoy = trusted.join("hook.conf");
+        fs::write(&decoy, "").unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&nested, trusted.join("link")).unwrap();
+        let config = root.join("apt.conf");
+        fs::write(
+            &config,
+            format!("#include \"{}/link/../hook.conf\";", trusted.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
+        let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
+        let error = validate_apt_configuration_at(&root, &policy).unwrap_err();
+        assert!(error.to_string().contains("parent component"), "{error}");
+    }
+
+    #[test]
     fn apt_include_outside_tree_must_be_trusted() {
         let fixture = crate::host_tool::trusted_test_tempdir();
         let root = fixture.path().join("apt");
@@ -522,16 +713,52 @@ mod tests {
         let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
         validate_apt_configuration_at(&root, &policy).unwrap();
 
+        let missing = fixture.path().join("missing.conf");
+        fs::write(
+            &config,
+            format!(
+                "// #include \"{}\";\n/* #include \"{}\"; */\n# comment #include \"{}\";\n#include\"{}\";\n#include/*x*/\"{}\";\nAPT::Note \"#include {} ;\";\n#clear /* ; #include \"{}\"; */ Acquire;\n#clear \"Acquire; #include {} ;\";\n#include/*x*/ \"{}\";\n#include /*x*/ \"{}\";\n#include//x\n \"{}\";",
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                missing.display(),
+                external.display(),
+                external.display(),
+                external.display()
+            ),
+        )
+        .unwrap();
+        validate_apt_configuration_at(&root, &policy).unwrap();
+
         let writable = fixture.path().join("writable");
         fs::create_dir(&writable).unwrap();
         fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
         let untrusted = writable.join("hook.conf");
         fs::write(&untrusted, "DPkg::Pre-Invoke { \"true\"; };").unwrap();
-        fs::write(&config, format!("#include \"{}\";", untrusted.display())).unwrap();
-        assert!(matches!(
-            validate_apt_configuration_at(&root, &policy),
-            Err(SetupToolError::AptConfiguration { .. })
-        ));
+        for source in [
+            format!("#clear Acquire; #include \"{}\";", untrusted.display()),
+            format!("#clear/*x*/ Acquire; #include \"{}\";", untrusted.display()),
+            format!("#clear//x\n Acquire; #include \"{}\";", untrusted.display()),
+            format!("#include/*x*/ \"{}\";", untrusted.display()),
+            format!("#include/*\n*/\"{}\";", untrusted.display()),
+            format!("#include \"{}\";", untrusted.display()),
+            format!("#include\"ignored\"; #include \"{}\";", untrusted.display()),
+            format!(
+                "#include/*x*/\"ignored\"; #include \"{}\";",
+                untrusted.display()
+            ),
+            format!("#clear\"A\"; #include \"{}\";", untrusted.display()),
+        ] {
+            fs::write(&config, source).unwrap();
+            let error = validate_apt_configuration_at(&root, &policy)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("writable"), "{error}");
+        }
     }
 
     #[cfg(target_os = "linux")]

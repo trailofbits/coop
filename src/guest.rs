@@ -188,12 +188,12 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
 /// Verify that every required guest binary is present, bailing with a
 /// uniform error if any are missing.
 ///
-/// `probe` answers "does this binary exist in the image?" — its mechanism
-/// differs per backend (`test -x` inside the chroot for Firecracker, or over
-/// `limactl shell` for Lima). `source_label` names what
-/// produced the image ("install script" vs "provision script"), and
-/// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
-/// evaluated lazily only when something is missing.
+/// `probe` answers whether a binary exists in the image; its errors abort
+/// verification. Its mechanism differs per backend (`test -x` inside the
+/// chroot for Firecracker, or over `limactl shell` for Lima).
+/// `source_label` names what produced the image ("install script" vs
+/// "provision script"). `diagnostics` supplies trailing detail, such as a
+/// build-log tail, and is evaluated only when something is missing.
 #[expect(
     clippy::print_stderr,
     reason = "verification progress is interactive CLI — stderr is user communication"

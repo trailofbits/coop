@@ -159,14 +159,16 @@ environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
 its default config file and receives only HTTPS proxy and no-proxy settings
 from the caller. Elevated programs remain subject to trusted sudoers and host
 package-manager configuration. Before package installation, setup checks the
-filesystem entries below `/etc/apt`, their symlink targets, and apt configuration
-include paths for root ownership and group/other writability. Apt delegates its method helpers, `dpkg`,
-configured hooks, and package maintainer scripts to that system package policy;
-these indirect children are not a closed preflight family.
-Package installation passes only
+filesystem entries below `/etc/apt`, their symlink targets, and apt
+configuration include paths for root ownership and group/other writability.
+Apt delegates its method helpers, `dpkg`, configured hooks, and package
+maintainer scripts to that system package policy; these indirect children are
+not a closed preflight family. Package installation passes only
 `DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
 launcher environment. These pathname checks do not authenticate
-downloaded artifacts or pin an executable inode through `exec`.
+downloaded artifacts or pin an executable inode through `exec`. For elevated
+launches, a nonzero `sudo` status can come from `sudo`, `timeout`, or the target;
+the outer status alone does not prove which process returned it.
 
 ## Secrets and how they cross into the guest
 
