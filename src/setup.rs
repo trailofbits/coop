@@ -24,6 +24,10 @@ use crate::guest::{
 use crate::setup_tool::SetupTool;
 use crate::sha256_hash::Sha256Hash;
 
+// A generous cap keeps routine package/image builds compatible while ensuring
+// an unattended stuck setup child eventually releases its process group.
+pub(crate) const SETUP_TOOL_DEADLINE: Duration = Duration::from_secs(6 * 60 * 60);
+
 // Path-style URL: the bucket name contains dots, so virtual-hosted HTTPS
 // (`https://spec.ccfc.min.s3.amazonaws.com`) fails TLS wildcard-cert matching.
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
@@ -204,6 +208,13 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
         },
         |_| preflight_image_tools(cfg),
         |_| {
+            for prefix in [
+                ".coop-firecracker-download-",
+                ".coop-firecracker-extract-",
+                ".coop-rootfs-download-",
+            ] {
+                cleanup_stale_staging(&cfg.data_dir, prefix)?;
+            }
             crate::private_storage::prepare(cfg)
                 .context("Failed to prepare private coop storage")?;
             ensure_kvm_access(opts.skip_confirm)?;
@@ -238,20 +249,46 @@ fn execute_setup_phases<Bootstrap>(
 }
 
 #[cfg(target_os = "linux")]
+const BOOTSTRAP_TOOLS: &[SetupTool] = &[SetupTool::Sudo, SetupTool::Curl];
+
+#[cfg(target_os = "linux")]
+const PACKAGE_PREREQUISITES: &[SetupTool] = &[
+    SetupTool::Setfacl,
+    SetupTool::Unsquashfs,
+    SetupTool::MkfsExt4,
+];
+
+#[cfg(target_os = "linux")]
+const IMAGE_TOOLS: &[SetupTool] = &[
+    SetupTool::Sudo,
+    SetupTool::Curl,
+    SetupTool::Tar,
+    SetupTool::Gzip,
+    SetupTool::Chmod,
+    SetupTool::Rm,
+    SetupTool::Unsquashfs,
+    SetupTool::SshKeygen,
+    SetupTool::Mkdir,
+    SetupTool::Tee,
+    SetupTool::Chroot,
+    SetupTool::Rmdir,
+    SetupTool::MkfsExt4,
+    SetupTool::E2fsck,
+    SetupTool::Resize2fs,
+];
+
+#[cfg(target_os = "linux")]
 pub(crate) fn preflight_bootstrap(cfg: &CoopConfig) -> Result<()> {
-    SetupTool::Sudo.resolve()?;
-    SetupTool::Curl.resolve()?;
+    for tool in BOOTSTRAP_TOOLS {
+        tool.resolve()?;
+    }
     // Check package prerequisites without granting PATH lookup authority.
-    let missing = [
-        SetupTool::Setfacl,
-        SetupTool::Unsquashfs,
-        SetupTool::MkfsExt4,
-    ]
-    .into_iter()
-    .map(|tool| tool.resolve_if_present().map_err(anyhow::Error::from))
-    .collect::<Result<Vec<_>>>()?
-    .iter()
-    .any(Option::is_none);
+    let missing = PACKAGE_PREREQUISITES
+        .iter()
+        .map(|tool| tool.resolve_if_present().map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(Option::is_none);
     let missing_transport = [
         crate::openssh::OpenSshTool::Ssh,
         crate::openssh::OpenSshTool::Scp,
@@ -266,29 +303,14 @@ pub(crate) fn preflight_bootstrap(cfg: &CoopConfig) -> Result<()> {
         SetupTool::AptGet
             .resolve()
             .context("Install the missing packages manually if apt-get is unavailable")?;
+        crate::setup_tool::validate_apt_configuration()?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn preflight_image_tools(cfg: &CoopConfig) -> Result<()> {
-    for tool in [
-        SetupTool::Sudo,
-        SetupTool::Curl,
-        SetupTool::Tar,
-        SetupTool::Gzip,
-        SetupTool::Chmod,
-        SetupTool::Rm,
-        SetupTool::Unsquashfs,
-        SetupTool::SshKeygen,
-        SetupTool::Mkdir,
-        SetupTool::Tee,
-        SetupTool::Chroot,
-        SetupTool::Rmdir,
-        SetupTool::MkfsExt4,
-        SetupTool::E2fsck,
-        SetupTool::Resize2fs,
-    ] {
+    for tool in IMAGE_TOOLS {
         tool.resolve()?;
     }
     for tool in [
@@ -542,7 +564,7 @@ fn patch_image_vsock_listener(rootfs: &Path, mount_dir: &Path) -> Result<()> {
         .arg(crate::privileged_disk::running_executable_path())
         .arg("__patch-guest-vsock-listener")
         .arg(&mount_str)
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Failed to restore Firecracker vsock listener in image")?;
     guard
         .finish()
@@ -661,7 +683,11 @@ impl Drop for MountGuard {
 fn unmount_simple(disk: &Path, mount_path: &str) -> Result<()> {
     crate::privileged_disk::unmount(disk)
         .with_context(|| format!("Failed to unmount {mount_path}"))?;
-    if let Err(error) = SetupTool::Rmdir.elevated()?.arg(mount_path).run() {
+    if let Err(error) = SetupTool::Rmdir
+        .elevated()?
+        .arg(mount_path)
+        .run_bounded(SETUP_TOOL_DEADLINE)
+    {
         tracing::warn!("Failed to remove mount directory {mount_path} (non-fatal): {error}");
     }
     Ok(())
@@ -692,7 +718,7 @@ fn patch_guest_network(inst: &Instance) -> Result<()> {
         .arg(&mount_str)
         .arg(&hostname)
         .arg(inst.guest_ip().to_string())
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Failed to patch guest network and identity")?;
 
     guard.finish()
@@ -1343,11 +1369,13 @@ fn build_template(
     // Clean up intermediate files
     eprintln!("  Cleaning up...");
     let unpack_dir = cfg.data_dir.join("squashfs-root");
-    if let Err(e) = SetupTool::Rm.elevated()?.arg("-rf").arg(&unpack_dir).run() {
+    if let Err(e) = SetupTool::Rm
+        .elevated()?
+        .arg("-rf")
+        .arg(&unpack_dir)
+        .run_bounded(SETUP_TOOL_DEADLINE)
+    {
         tracing::debug!("Failed to clean up squashfs-root (non-fatal): {e}");
-    }
-    if let Err(e) = fs::remove_file(cfg.data_dir.join(rootfs_name)) {
-        tracing::debug!("Failed to clean up rootfs download (non-fatal): {e}");
     }
 
     eprintln!(
@@ -1606,12 +1634,15 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
         SetupTool::Setfacl
             .elevated()?
             .args(["-m", &format!("u:{uid}:rw"), "/dev/kvm"])
-            .run()?;
+            .run_bounded(SETUP_TOOL_DEADLINE)?;
         return Ok(());
     }
 
     // Fall back to adding user to kvm group
-    let user = SetupTool::Id.command()?.arg("-run").capture()?;
+    let user = SetupTool::Id
+        .command()?
+        .arg("-run")
+        .capture_bounded(SETUP_TOOL_DEADLINE, 4096)?;
     let user = user.trim();
     let cmd = format!("sudo usermod -aG kvm {user}");
     eprintln!("  setfacl not available, will add you to the kvm group instead.");
@@ -1622,7 +1653,7 @@ fn fix_kvm_access(skip_confirm: bool) -> Result<()> {
     SetupTool::Usermod
         .elevated()?
         .args(["-aG", "kvm", "--", user])
-        .run()?;
+        .run_bounded(SETUP_TOOL_DEADLINE)?;
 
     if !has_kvm_access(Path::new("/dev/kvm")) {
         bail!(
@@ -1703,7 +1734,7 @@ fn install_system_packages(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     SetupTool::apt_install_command()?
         .args(["install", "-y"])
         .args(&missing)
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Package installation failed")?;
 
     Ok(())
@@ -1756,23 +1787,38 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     )
     .context("Failed to download Firecracker tarball")?;
 
+    extract_firecracker_archive(tarball.path(), &cfg.data_dir, &latest, arch)?;
+
+    // Do not execute a network artifact merely to print a version string.
+    eprintln!("  Installed Firecracker {latest}");
+
+    Ok(())
+}
+
+fn extract_firecracker_archive(
+    tarball: &Path,
+    data_dir: &Path,
+    latest: &FirecrackerRelease,
+    arch: Architecture,
+) -> Result<()> {
+    let fc_path = data_dir.join("firecracker");
     let strip_prefix = format!("release-{latest}-{arch}/firecracker-{latest}-{arch}");
     let gzip = SetupTool::Gzip.resolve()?;
     let extracted_dir = tempfile::Builder::new()
         .prefix(".coop-firecracker-extract-")
-        .tempdir_in(&cfg.data_dir)
+        .tempdir_in(data_dir)
         .context("Failed to stage Firecracker extraction")?;
     SetupTool::Tar
         .command()?
         .args(["-xf"])
-        .arg(tarball.path())
+        .arg(tarball)
         .arg("--use-compress-program")
         .arg(gzip.launch_path())
         .arg("-C")
         .arg(extracted_dir.path())
         .arg("--strip-components=1")
         .arg(&strip_prefix)
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Failed to extract Firecracker binary")?;
 
     let extracted = extracted_dir
@@ -1783,7 +1829,7 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
         .command()?
         .arg("+x")
         .arg(&extracted)
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Failed to make Firecracker executable")?;
     fs::rename(&extracted, &fc_path).context("Failed to publish Firecracker binary")?;
 
@@ -1792,19 +1838,19 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     if let Err(e) = SetupTool::Tar
         .command()?
         .args(["-xf"])
-        .arg(tarball.path())
+        .arg(tarball)
         .arg("--use-compress-program")
         .arg(gzip.launch_path())
         .arg("-C")
         .arg(extracted_dir.path())
         .arg("--strip-components=1")
         .arg(&jailer_prefix)
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
     {
         tracing::debug!("Failed to extract jailer from tarball (non-fatal): {e}");
     }
     let jailer_extracted = extracted_dir.path().join(format!("jailer-{latest}-{arch}"));
-    let jailer_target = cfg.data_dir.join("jailer");
+    let jailer_target = data_dir.join("jailer");
     if jailer_extracted.exists() {
         let result = (|| {
             ensure_extracted_regular_file(&jailer_extracted)?;
@@ -1812,7 +1858,7 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
                 .command()?
                 .arg("+x")
                 .arg(&jailer_extracted)
-                .run()?;
+                .run_bounded(SETUP_TOOL_DEADLINE)?;
             fs::rename(&jailer_extracted, &jailer_target)?;
             Ok::<(), anyhow::Error>(())
         })();
@@ -1820,9 +1866,6 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
             tracing::debug!("Failed to publish jailer binary (non-fatal): {error}");
         }
     }
-
-    // Do not execute a network artifact merely to print a version string.
-    eprintln!("  Installed Firecracker {latest}");
 
     Ok(())
 }
@@ -1850,6 +1893,10 @@ fn ensure_extracted_regular_file(path: &Path) -> Result<()> {
 fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     let _kernel_lock =
         crate::fs_util::lock_sibling_bounded(&cfg.vm.kernel_path, Duration::from_secs(30))?;
+    let kernel_prefix = kernel_staging_prefix(&cfg.vm.kernel_path);
+    if let Some(parent) = cfg.vm.kernel_path.parent() {
+        cleanup_stale_staging(parent, &kernel_prefix)?;
+    }
     if cfg.vm.kernel_path.exists() {
         step(&format!(
             "Kernel: already at {}",
@@ -1898,7 +1945,7 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
         .context("Kernel path has no parent")?;
     fs::create_dir_all(parent)?;
     let staged = tempfile::Builder::new()
-        .prefix(".coop-kernel-download-")
+        .prefix(&kernel_prefix)
         .tempfile_in(parent)
         .context("Failed to stage kernel download")?;
 
@@ -2040,8 +2087,8 @@ fn find_latest_ci_assets(
     );
 }
 
-/// S3 keys become URL paths and, for rootfs assets, a host filename. CI
-/// assets use one flat object name below the version/architecture prefix.
+/// S3 keys become URL paths. CI assets use one flat object name below the
+/// version/architecture prefix.
 fn valid_ci_key(key: &str, prefix: &str) -> bool {
     let Some(suffix) = key.strip_prefix(prefix) else {
         return false;
@@ -2072,7 +2119,12 @@ fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str) -> Result<()> 
     .context("Failed to download rootfs")?;
 
     eprintln!("  Unpacking squashfs...");
-    if let Err(e) = SetupTool::Rm.elevated()?.arg("-rf").arg(&unpack_dir).run() {
+    if let Err(e) = SetupTool::Rm
+        .elevated()?
+        .arg("-rf")
+        .arg(&unpack_dir)
+        .run_bounded(SETUP_TOOL_DEADLINE)
+    {
         tracing::debug!("Failed to remove old unpack dir (non-fatal): {e}");
     }
     SetupTool::Unsquashfs
@@ -2080,7 +2132,7 @@ fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str) -> Result<()> 
         .arg("-d")
         .arg(&unpack_dir)
         .arg(squashfs.path())
-        .run()
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Failed to unpack squashfs image")?;
 
     Ok(())
@@ -2095,7 +2147,7 @@ fn inject_ssh_keys(cfg: &CoopConfig) -> Result<()> {
             .args(["-t", "ed25519", "-f"])
             .arg(&ssh_key_path)
             .args(["-N", "", "-q"])
-            .run()
+            .run_bounded(SETUP_TOOL_DEADLINE)
             .context("Failed to generate SSH key")?;
     }
 
@@ -2114,13 +2166,13 @@ fn inject_ssh_keys(cfg: &CoopConfig) -> Result<()> {
         .elevated()?
         .arg("-p")
         .arg(&auth_keys_dir)
-        .run()?;
+        .run_bounded(SETUP_TOOL_DEADLINE)?;
 
     let auth_keys_path = auth_keys_dir.join("authorized_keys");
     SetupTool::Tee
         .elevated()?
         .arg(&auth_keys_path)
-        .stdin_write(pubkey.as_bytes())
+        .stdin_write_bounded(pubkey.as_bytes(), SETUP_TOOL_DEADLINE)
         .context("Failed to write authorized_keys")?;
 
     Ok(())
@@ -2169,8 +2221,9 @@ fn install_guest_packages(
         command = command.args(["/usr/bin/timeout", timeout_arg.as_str()]);
     }
     command
-        .args(["/bin/bash", "-c", script])
-        .run()
+        .args(["/bin/bash", "-c"])
+        .redacted_arg(script)
+        .run_bounded(SETUP_TOOL_DEADLINE)
         .context("Guest package installation failed")?;
 
     verify_chroot_binaries(&mount_str, guest_user)?;
@@ -2191,7 +2244,7 @@ fn verify_chroot_binaries(mount_str: &str, guest_user: &GuestUser) -> Result<()>
             let path = path.to_string();
             SetupTool::Chroot.elevated().is_ok_and(|cmd| {
                 cmd.args([mount_str, "/usr/bin/test", "-x", path.as_str()])
-                    .run()
+                    .run_bounded(SETUP_TOOL_DEADLINE)
                     .is_ok()
             })
         },
@@ -2231,13 +2284,54 @@ fn unmount_chroot(disk: &Path, mount_str: &str) -> Result<()> {
     if let Err(e) = crate::privileged_disk::unmount(disk) {
         first_error.get_or_insert_with(|| anyhow::anyhow!("Failed to unmount {mount_str}: {e}"));
     }
-    if let Err(error) = SetupTool::Rmdir.elevated()?.arg(mount_str).run() {
+    if let Err(error) = SetupTool::Rmdir
+        .elevated()?
+        .arg(mount_str)
+        .run_bounded(SETUP_TOOL_DEADLINE)
+    {
         tracing::warn!("Failed to remove mount directory {mount_str} (non-fatal): {error}");
     }
     first_error.map_or(Ok(()), Err)
 }
 
 // ── General helpers ───────────────────────────────────────────
+
+fn kernel_staging_prefix(path: &Path) -> String {
+    use sha2::Digest as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let digest = sha2::Sha256::digest(path.as_os_str().as_bytes());
+    format!(".coop-kernel-download-{}-", hex::encode(&digest[..8]))
+}
+
+/// Retry removes only the names generated by tempfile for this setup phase.
+/// The setup or target lock must be held while this scans and removes them.
+fn cleanup_stale_staging(parent: &Path, prefix: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Failed to inspect setup staging directory"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name.as_bytes().strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        if suffix.len() != 6 || !suffix.iter().all(u8::is_ascii_alphanumeric) {
+            continue;
+        }
+        let path = entry.path();
+        if fs::symlink_metadata(&path)?.file_type().is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
 
 fn curl_output(
     command: &Cmd,
@@ -2256,9 +2350,25 @@ fn curl_output(
         bail!("curl transfer timed out");
     }
     if !output.status.success() {
-        bail!("curl exited with {}", output.status);
+        bail!(
+            "curl exited with {}: {}",
+            output.status,
+            curl_exit_hint(output.status.code())
+        );
     }
     Ok(output)
+}
+
+fn curl_exit_hint(code: Option<i32>) -> &'static str {
+    match code {
+        Some(5) => "could not resolve the configured proxy",
+        Some(6) => "could not resolve the download host",
+        Some(7) => "could not connect to the download host or proxy",
+        Some(22) => "the server returned an HTTP error",
+        Some(35) => "the TLS connection failed",
+        Some(60 | 77) => "the certificate trust configuration failed",
+        _ => "check the host network and certificate configuration",
+    }
 }
 
 pub fn utc_timestamp() -> String {
@@ -3103,6 +3213,42 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn preflight_role_sets_cover_bootstrap_install_and_image_consumers() {
+        assert_eq!(BOOTSTRAP_TOOLS, [SetupTool::Sudo, SetupTool::Curl]);
+        assert_eq!(
+            PACKAGE_PREREQUISITES,
+            [
+                SetupTool::Setfacl,
+                SetupTool::Unsquashfs,
+                SetupTool::MkfsExt4
+            ]
+        );
+        assert_eq!(
+            IMAGE_TOOLS,
+            [
+                SetupTool::Sudo,
+                SetupTool::Curl,
+                SetupTool::Tar,
+                SetupTool::Gzip,
+                SetupTool::Chmod,
+                SetupTool::Rm,
+                SetupTool::Unsquashfs,
+                SetupTool::SshKeygen,
+                SetupTool::Mkdir,
+                SetupTool::Tee,
+                SetupTool::Chroot,
+                SetupTool::Rmdir,
+                SetupTool::MkfsExt4,
+                SetupTool::E2fsck,
+                SetupTool::Resize2fs,
+            ]
+        );
+        assert!(!BOOTSTRAP_TOOLS.contains(&SetupTool::Unsquashfs));
+        assert!(IMAGE_TOOLS.contains(&SetupTool::Unsquashfs));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn setup_phases_preflight_before_each_effect() {
         use std::cell::RefCell;
 
@@ -3209,6 +3355,82 @@ mod tests {
         assert!(ensure_extracted_regular_file(&link).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_archive_extraction_does_not_publish_and_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let data_dir = fixture.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let tarball = fixture.path().join("release.tgz");
+        let latest = FirecrackerRelease::parse("v1.2.3").unwrap();
+        let arch = Architecture::current().unwrap();
+        fs::write(&tarball, "truncated archive").unwrap();
+        assert!(extract_firecracker_archive(&tarball, &data_dir, &latest, arch).is_err());
+        assert!(!data_dir.join("firecracker").exists());
+
+        let release = format!("release-{latest}-{arch}");
+        let source = fixture.path().join(&release);
+        fs::create_dir(&source).unwrap();
+        let binary_name = format!("firecracker-{latest}-{arch}");
+        fs::write(source.join(&binary_name), "binary witness").unwrap();
+        fs::write(
+            source.join(format!("jailer-{latest}-{arch}")),
+            "jailer witness",
+        )
+        .unwrap();
+        let output = Command::new("/usr/bin/tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(fixture.path())
+            .arg(&release)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        extract_firecracker_archive(&tarball, &data_dir, &latest, arch).unwrap();
+        let published = data_dir.join("firecracker");
+        assert_eq!(fs::read(&published).unwrap(), b"binary witness");
+        assert_ne!(
+            fs::metadata(&published).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+
+    #[test]
+    fn retry_removes_only_complete_setup_staging_names() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let prefix = ".coop-firecracker-download-";
+        let stale = fixture.path().join(format!("{prefix}Ab12Cd"));
+        let unknown = fixture.path().join(format!("{prefix}Ab12Cd.keep"));
+        let unrelated = fixture.path().join("rootfs.squashfs");
+        fs::write(&stale, "old partial download").unwrap();
+        fs::write(&unknown, "keep").unwrap();
+        fs::write(&unrelated, "keep").unwrap();
+        let stale_dir = fixture.path().join(format!("{prefix}Xy98Zz"));
+        fs::create_dir(&stale_dir).unwrap();
+        fs::write(stale_dir.join("part"), "old").unwrap();
+        let stale_link = fixture.path().join(format!("{prefix}Lm34No"));
+        symlink(&unrelated, &stale_link).unwrap();
+        cleanup_stale_staging(fixture.path(), prefix).unwrap();
+        assert!(!stale.exists());
+        assert!(!stale_dir.exists());
+        assert!(!stale_link.exists());
+        assert_eq!(fs::read_to_string(&unknown).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "keep");
+
+        let first = kernel_staging_prefix(Path::new("/var/lib/coop/vmlinux"));
+        let second = kernel_staging_prefix(Path::new("/var/lib/coop/other"));
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn curl_runner_distinguishes_launch_exit_and_deadline_failures() {
         let launch = curl_output(
@@ -3217,11 +3439,10 @@ mod tests {
             32,
         )
         .unwrap_err();
-        assert!(
-            launch
-                .downcast_ref::<crate::process_output::CaptureError>()
-                .is_some()
-        );
+        assert!(matches!(
+            launch.downcast_ref::<crate::process_output::CaptureError>(),
+            Some(crate::process_output::CaptureError::Spawn(_))
+        ));
 
         let exit = curl_output(&Cmd::new("/bin/false"), Duration::from_secs(1), 32).unwrap_err();
         assert!(exit.to_string().contains("curl exited"));
@@ -3240,6 +3461,14 @@ mod tests {
             deadline.downcast_ref::<crate::process_output::CaptureError>(),
             Some(crate::process_output::CaptureError::Timeout(_))
         ));
+        assert_eq!(
+            curl_exit_hint(Some(60)),
+            "the certificate trust configuration failed"
+        );
+        assert_eq!(
+            curl_exit_hint(Some(5)),
+            "could not resolve the configured proxy"
+        );
     }
 
     #[test]

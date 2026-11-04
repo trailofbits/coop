@@ -43,14 +43,6 @@ enum DiskTool {
 }
 
 impl DiskTool {
-    fn program(self) -> &'static str {
-        match self {
-            Self::FsckFix | Self::FsckRead => "/usr/sbin/e2fsck",
-            Self::Resize => "/usr/sbin/resize2fs",
-            Self::Format => "/usr/sbin/mkfs.ext4",
-        }
-    }
-
     fn setup_role(self) -> SetupTool {
         match self {
             Self::FsckFix | Self::FsckRead => SetupTool::E2fsck,
@@ -719,7 +711,7 @@ fn write_resolv(disk: &DiskPath) -> Result<()> {
 fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let fds: Vec<_> = descriptors.iter().map(|file| file.as_raw_fd()).collect();
-    let program = tool.program();
+    let program = tool.setup_role().name();
     let mut command = tool.setup_role().command()?.build();
     command.args(args);
     command.stdin(std::process::Stdio::null());
@@ -735,9 +727,12 @@ fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> R
             Ok(())
         });
     }
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run {program}"))?;
+    let status = crate::process_output::run_status_bounded(
+        &mut command,
+        crate::setup::SETUP_TOOL_DEADLINE,
+        None,
+    )
+    .with_context(|| format!("Failed to run {program}"))?;
     if !tool.succeeded(status) {
         bail!("{program} failed with status {status}");
     }
@@ -791,7 +786,7 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
     if let Some(argument) = argument {
         command = command.arg(argument);
     }
-    command.run()
+    command.run_bounded(crate::setup::SETUP_TOOL_DEADLINE)
 }
 
 /// Procfs resolves this to the running executable inode while the parent

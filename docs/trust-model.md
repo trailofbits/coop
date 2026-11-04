@@ -158,7 +158,12 @@ filesystem tools again after `sudo`. Setup launches from `/` with a cleared
 environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
 its default config file and receives only HTTPS proxy and no-proxy settings
 from the caller. Elevated programs remain subject to trusted sudoers and host
-package-manager configuration. Package installation passes only
+package-manager configuration. Before package installation, setup checks the
+filesystem entries below `/etc/apt` and their symlink targets for root ownership
+and group/other writability. Apt delegates its method helpers, `dpkg`,
+configured hooks, and package maintainer scripts to that system package policy;
+these indirect children are not a closed preflight family.
+Package installation passes only
 `DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
 launcher environment. These pathname checks do not authenticate
 downloaded artifacts or pin an executable inode through `exec`.

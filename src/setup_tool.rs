@@ -1,6 +1,7 @@
-//! Host executables used by Firecracker setup. Resolution is repeated at use:
-//! the preflight establishes the phase's complete family before effects, while
-//! each launch rejects a path that changed since that preflight.
+//! Host executables used by Firecracker setup. Preflight checks the complete
+//! phase family before effects; each launch revalidates its selected path
+//! against the policy. Pathname validation does not pin the executed inode.
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -14,6 +15,8 @@ use crate::host_tool::{
     ResolveHostToolError, ResolvedHostTool, TrustedLaunchContext, TrustedToolPolicy,
     resolve_host_tool,
 };
+
+const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Error)]
 pub(crate) enum SetupToolError {
@@ -35,6 +38,54 @@ pub(crate) enum SetupToolError {
     },
     #[error("Firecracker setup tool '{tool}' candidate is not an absolute path: {path}")]
     InvalidCandidate { tool: &'static str, path: PathBuf },
+    #[error(
+        "System apt configuration is not root-controlled: {reason}; repair it before retrying setup"
+    )]
+    AptConfiguration { reason: String },
+}
+
+pub(crate) fn validate_apt_configuration() -> Result<(), SetupToolError> {
+    let policy = TrustedToolPolicy::new("/", [], 0);
+    validate_apt_configuration_at(Path::new("/etc/apt"), &policy)
+}
+
+fn validate_apt_configuration_at(
+    root: &Path,
+    policy: &TrustedToolPolicy,
+) -> Result<(), SetupToolError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = HashSet::new();
+    let mut entries = 0usize;
+    while let Some(path) = pending.pop() {
+        entries += 1;
+        if entries > 4096 {
+            return Err(SetupToolError::AptConfiguration {
+                reason: "configuration tree exceeds 4096 entries".into(),
+            });
+        }
+        let (canonical, metadata) = crate::host_tool::validate_trusted_path(&path, policy)
+            .map_err(|reason| SetupToolError::AptConfiguration { reason })?;
+        if !visited.insert(canonical.clone()) {
+            continue;
+        }
+        if metadata.is_dir() {
+            let children =
+                fs::read_dir(&canonical).map_err(|error| SetupToolError::AptConfiguration {
+                    reason: error.to_string(),
+                })?;
+            for child in children {
+                let child = child.map_err(|error| SetupToolError::AptConfiguration {
+                    reason: error.to_string(),
+                })?;
+                pending.push(child.path());
+            }
+        } else if !metadata.is_file() {
+            return Err(SetupToolError::AptConfiguration {
+                reason: "configuration contains a special file".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,7 +199,7 @@ impl SetupTool {
             .ok_or(SetupToolError::Absent { tool: self.name() })
     }
 
-    /// Absence permits the bounded package-install phase. A present candidate
+    /// Absence permits the package-install phase. A present candidate
     /// rejected by the trust policy is never treated as an installable absence.
     pub(crate) fn resolve_if_present(
         self,
@@ -208,7 +259,7 @@ impl SetupTool {
             .command(&tool)
             // GNU tar's decompressor and package tools require helper lookup.
             // These fixed system directories do not come from the caller.
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+            .env("PATH", SYSTEM_HELPER_PATH);
         if self == Self::Curl {
             // curl reads ~/.curlrc even if HOME is absent on some builds.
             // -q must be its first argument to disable that implicit input.
@@ -229,10 +280,11 @@ impl SetupTool {
         let tool = self.resolve()?;
         Ok(TrustedLaunchContext::system()
             .elevated(&sudo, &tool)
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"))
+            .env("PATH", SYSTEM_HELPER_PATH))
     }
 
     pub(crate) fn apt_install_command() -> Result<Cmd> {
+        validate_apt_configuration()?;
         let sudo = Self::Sudo.resolve()?;
         let apt = Self::AptGet.resolve()?;
         Ok(Self::apt_command_from(&sudo, &apt))
@@ -243,7 +295,7 @@ impl SetupTool {
         // through sudo so debconf cannot block an unattended package install.
         TrustedLaunchContext::system()
             .command(sudo)
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("PATH", SYSTEM_HELPER_PATH)
             .env("DEBIAN_FRONTEND", "noninteractive")
             .arg("--preserve-env=DEBIAN_FRONTEND")
             .arg("--")
@@ -331,6 +383,49 @@ mod tests {
         let mut permissions = fs::metadata(&blocked).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&blocked, permissions).unwrap();
+    }
+
+    #[test]
+    fn apt_configuration_requires_trusted_files_and_symlink_targets() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = fixture.path().join("apt");
+        let parts = root.join("apt.conf.d");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parts).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&parts, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = parts.join("policy");
+        fs::write(&config, "").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
+        let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
+        validate_apt_configuration_at(&root, &policy).unwrap();
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            validate_apt_configuration_at(&root, &policy),
+            Err(SetupToolError::AptConfiguration { .. })
+        ));
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let writable = fixture.path().join("writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        let target = writable.join("external");
+        fs::write(&target, "").unwrap();
+        symlink(&target, parts.join("redirect")).unwrap();
+        assert!(matches!(
+            validate_apt_configuration_at(&root, &policy),
+            Err(SetupToolError::AptConfiguration { .. })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_apt_configuration_passes_the_supported_host_policy() {
+        if SetupTool::AptGet.resolve_if_present().unwrap().is_some() {
+            validate_apt_configuration().unwrap();
+        }
     }
 
     #[test]
@@ -452,6 +547,19 @@ mod tests {
             assert_eq!(result.stdout, b"setup-tool-witness");
             assert!(!Path::new(&marker).exists());
             assert!(!Path::new(&config_marker).exists());
+            let argv_destination = Path::new(&source).with_file_name("argv-output$(printf X)");
+            let output = SetupTool::Curl
+                .command()
+                .unwrap()
+                .arg("-o")
+                .arg(&argv_destination)
+                .arg(format!("file://{source}"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(fs::read(&argv_destination).unwrap(), b"setup-tool-witness");
+            assert!(!Path::new(&source).with_file_name("argv-outputX").exists());
+            assert!(!Path::new(&marker).exists());
             assert!(built.get_program().to_string_lossy().starts_with('/'));
             assert_eq!(built.get_current_dir(), Some(Path::new("/")));
             let vars = built.get_envs().collect::<Vec<_>>();

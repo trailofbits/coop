@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -131,8 +132,8 @@ impl Cmd {
     /// or large payloads. The bytes are written and stdin is closed before
     /// the child exits, so the child sees EOF without further input.
     ///
-    /// Compatible with [`Cmd::run`] and [`Cmd::capture`]; the existing
-    /// [`Cmd::stdin_write`] takes its data per-call instead.
+    /// Compatible with [`Cmd::run`] and [`Cmd::capture`];
+    /// [`Cmd::stdin_write_bounded`] takes its data per-call instead.
     pub fn stdin_input(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = ChildStdin::Bytes(bytes.into());
         self
@@ -207,20 +208,29 @@ impl Cmd {
         Ok(())
     }
 
-    /// Pipe `data` into stdin, suppress stdout, and check exit status.
-    pub fn stdin_write(&self, data: &[u8]) -> Result<()> {
+    /// Run a noninteractive host command with a deadline and cooperative
+    /// signal cancellation, retaining progress on the inherited streams.
+    pub(crate) fn run_bounded(&self, deadline: Duration) -> Result<()> {
+        let desc = self.describe();
+        tracing::debug!("Running: {desc}");
+        let status = crate::process_output::run_status_bounded(&mut self.build(), deadline, None)
+            .with_context(|| format!("Failed to run {desc}"))?;
+        if !status.success() {
+            bail!("{desc} exited with {status}");
+        }
+        Ok(())
+    }
+
+    /// Supply a small fixed payload and close stdin before waiting.
+    pub(crate) fn stdin_write_bounded(&self, data: &[u8], deadline: Duration) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running (stdin pipe): {desc}");
-        let mut child = self
-            .build()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to start {desc}"))?;
-        write_stdin_and_close(&mut child, data, &desc)?;
-        let status = child
-            .wait()
-            .with_context(|| format!("Failed to wait for {desc}"))?;
+        let status = crate::process_output::run_status_bounded(
+            self.build().stdout(Stdio::null()),
+            deadline,
+            Some(data),
+        )
+        .with_context(|| format!("Failed to run {desc}"))?;
         if !status.success() {
             bail!("{desc} exited with {status}");
         }
@@ -262,6 +272,24 @@ impl Cmd {
                     .with_context(|| format!("Failed to wait for {desc}"))?
             }
         };
+        if !output.status.success() {
+            bail!("{desc} exited with {}", output.status);
+        }
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("{desc} produced non-UTF-8 output"))
+    }
+
+    pub(crate) fn capture_bounded(&self, deadline: Duration, max_output: usize) -> Result<String> {
+        let desc = self.describe();
+        let output = crate::process_output::run_bounded(
+            &mut self.build(),
+            crate::process_output::CapturePolicy {
+                stdout_max: max_output,
+                stderr_max: max_output,
+                completion: crate::process_output::CompletionPolicy::Deadline(deadline),
+            },
+        )
+        .with_context(|| format!("Failed to capture {desc}"))?;
         if !output.status.success() {
             bail!("{desc} exited with {}", output.status);
         }

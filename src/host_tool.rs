@@ -794,6 +794,17 @@ fn resolve_and_validate(
     }
 }
 
+/// Validate the actual filesystem object and every path component controlling
+/// it, including symlink hops. Used for root-managed tool configuration.
+pub(crate) fn validate_trusted_path(
+    path: &Path,
+    policy: &TrustedToolPolicy,
+) -> Result<(PathBuf, Metadata), String> {
+    let (canonical, metadata) = resolve_and_validate(path, policy)?;
+    validate_owner_and_mode(&metadata, &policy.trusted_uids, "path target")?;
+    Ok((canonical, metadata))
+}
+
 fn validate_owner_and_mode(
     metadata: &Metadata,
     trusted_uids: &[u32],

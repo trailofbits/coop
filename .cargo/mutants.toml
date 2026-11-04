@@ -52,6 +52,11 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # process_output.rs — status runner spawns and reaps real process groups.
+  # Its exit, timeout, cancellation, and stdin paths have direct process tests;
+  # pure capture/limit decisions remain in mutation scope.
+  "src/process_output\\.rs:.*\\brun_status_bounded\\b",
+  "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
   # Ambient stdin/stderr adapters are covered through their injected helpers;
   # the bounded parsing and terminal-control logic remains mutation-scoped.
   "src/prompt\\.rs:.*\\bconfirm\\b",
