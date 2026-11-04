@@ -5,9 +5,10 @@ formal verification (kani), and two manual quality checks — mutation testing
 and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
-The `Firecracker integration` workflow runs
-the full suite across three disposable GitHub-hosted Ubuntu 24.04 x64 runners
-daily at 03:17 UTC on the default branch and on manual dispatch. Each runs
+The `Firecracker integration` workflow runs the full suite across six
+disposable GitHub-hosted x64 runners: three on Ubuntu 24.04 and three on
+Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
+dispatch. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
 VM sequence together, `workspace` covers independent workspace/profile phases,
 and `config` covers configuration, proxy, and recovery phases. The `config`
@@ -15,7 +16,7 @@ shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output per shard as a seven-day artifact. Each suite step has a 30-minute
+output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
 timeout (35 minutes for the job including prerequisites and artifact upload).
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
@@ -422,6 +423,8 @@ the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
 It holds the loop mount busy to check that unmount fails and the mounted disk
 cannot be removed, then verifies the unmounted path is accepted.
+It also waits for a short-lived holder during interrupted-mount recovery and
+removes the fixed chroot child mounts before rebuilding.
 It also corrupts an ext4 inode reference count, checks that read-only verification
 rejects it, then retries `coop resize` at the already extended image size and
 checks the filesystem's block capacity. It also checks a completed no-op retry
