@@ -6,6 +6,7 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
@@ -3107,9 +3108,12 @@ impl Instance {
 
     /// Check if this instance has a running Firecracker process.
     ///
-    /// Validates the PID is alive and belongs to a Firecracker process
-    /// (guards against PID reuse). Removes stale PID files as a side
-    /// effect when the process is gone or belongs to something else.
+    /// Validates the PID is alive and carries this instance's Firecracker
+    /// config path in its launch arguments. This narrows accidental PID-reuse
+    /// matches but does not authenticate the executable or pin the PID after
+    /// the probe.
+    /// Removes stale PID files as a side effect when the process is gone or
+    /// belongs to something else.
     #[mutants::skip] // OS process probe wrapper; Linux process tests exercise it directly
     pub fn is_running(&self) -> bool {
         self.probe_running().unwrap_or_else(|error| {
@@ -3164,13 +3168,10 @@ impl Instance {
         let cmdline = fs::read(format!("/proc/{pid}/cmdline")).with_context(|| {
             format!("Failed to read Firecracker process identity for PID {pid}")
         })?;
-        if !cmdline
-            .windows(b"firecracker".len())
-            .any(|w| w == b"firecracker")
-        {
+        if !firecracker_cmdline_matches_instance(&cmdline, &self.vm_config_path()) {
             tracing::debug!(
                 "Removing stale PID file for instance '{}' \
-                 (PID {pid} is not a Firecracker process)",
+                 (PID {pid} does not name this instance's Firecracker config)",
                 self.name
             );
             if let Err(e) = fs::remove_file(&pid_path) {
@@ -3215,12 +3216,18 @@ impl Instance {
                 }
             };
             if exists {
-                let cmdline = Cmd::new("cat")
+                let output = Cmd::new("cat")
                     .arg(format!("/proc/{pid}/cmdline"))
                     .sudo()
-                    .capture()
+                    .output()
                     .context("Failed to inspect Firecracker PID")?;
-                if cmdline.contains("firecracker") {
+                if !output.status.success() {
+                    bail!(
+                        "Failed to inspect Firecracker PID: cat exited with {}",
+                        output.status
+                    );
+                }
+                if firecracker_cmdline_matches_instance(&output.stdout, &self.vm_config_path()) {
                     return Ok(true);
                 }
             }
@@ -3253,6 +3260,28 @@ impl Instance {
         }
         Ok(false)
     }
+}
+
+/// Identify the VMM by its instance-specific launch argument, not its binary
+/// name: `firecracker_bin` may point to a custom-named executable.
+/// `/proc/<pid>/cmdline` is NUL-delimited and paths need not be UTF-8, so compare
+/// raw argument bytes and reject ambiguous duplicate `--config-file` flags.
+fn firecracker_cmdline_matches_instance(cmdline: &[u8], config_path: &Path) -> bool {
+    let expected = config_path.as_os_str().as_bytes();
+    let mut args = cmdline.split(|byte| *byte == 0);
+    let mut matched = false;
+    while let Some(arg) = args.next() {
+        if arg == b"--config-file" {
+            let Some(value) = args.next() else {
+                return false;
+            };
+            if matched || value != expected {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
 }
 
 /// Confirm that a root-owned Firecracker socket is no longer accepting
@@ -3857,13 +3886,11 @@ mod tests {
         assert!(json.contains(r#""firecracker_control": "legacy_tcp""#));
     }
 
-    // ── Instance::is_running / is_firecracker_process ────────
+    // ── Firecracker PID identity probes ──────────────────────
     //
-    // These tests drive `is_running` through real PID files and
-    // real subprocesses. The happy path requires a process whose
-    // `/proc/<pid>/cmdline` contains "firecracker", which we
-    // synthesize with `bash -c 'exec -a firecracker-test sleep'`
-    // — argv[0] is renamed so the matcher recognizes it.
+    // These tests drive the probes through real PID files and subprocesses.
+    // An exact instance config argument is accepted even with a custom binary
+    // name; a renamed process without that argument is rejected.
     //
     // Sudo-using paths (`kill -0`, `cat /proc/.../cmdline`) are
     // gated `#[cfg(target_os = "linux")]`: CI runs Linux with
@@ -3878,16 +3905,27 @@ mod tests {
     const DEAD_PID: u32 = 999_999;
 
     #[cfg(target_os = "linux")]
-    fn spawn_firecracker_like() -> std::process::Child {
+    fn spawn_renamed_sleep() -> std::process::Child {
         use std::os::unix::process::CommandExt;
-        // Set argv[0] to a firecracker-like name in a single execve (no shell
-        // `exec -a` indirection). A shell wrapper would exec twice, and reading
-        // /proc/<pid>/cmdline during the second transition races an empty
-        // cmdline. `wait_for_firecracker_cmdline` then waits out the one
-        // remaining fork→execve gap before the process is inspected.
+        // The executable and its arguments have no instance config; only
+        // argv[0] claims to be Firecracker.
         std::process::Command::new("sleep")
             .arg0("firecracker-test")
             .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_matching_process(inst: &Instance) -> std::process::Child {
+        // `read` blocks with the pipe open, leaving the shell's exact argv
+        // available for the probe. Its name deliberately is not Firecracker:
+        // configured Firecracker binaries can have arbitrary names.
+        std::process::Command::new("sh")
+            .args(["-c", "read _", "custom-vmm"])
+            .arg("--config-file")
+            .arg(inst.vm_config_path())
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap()
     }
@@ -3896,15 +3934,15 @@ mod tests {
     /// post-`execve` argv. Between `spawn` and `execve` the cmdline is empty, so
     /// process-detection assertions must not run until it settles.
     #[cfg(target_os = "linux")]
-    fn wait_for_firecracker_cmdline(pid: u32) {
+    fn wait_for_cmdline(pid: u32, ready: impl Fn(&[u8]) -> bool) {
         let path = format!("/proc/{pid}/cmdline");
         for _ in 0..500 {
-            if fs::read_to_string(&path).is_ok_and(|c| c.contains("firecracker")) {
+            if fs::read(&path).is_ok_and(|cmdline| ready(&cmdline)) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("firecracker-like process {pid} never exposed its cmdline");
+        panic!("process {pid} never exposed the expected cmdline");
     }
 
     #[cfg(target_os = "linux")]
@@ -3998,11 +4036,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_recognizes_running_firecracker() {
+    fn probe_liveness_recognizes_matching_instance_process() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let mut child = spawn_firecracker_like();
-        wait_for_firecracker_cmdline(child.id());
+        let mut child = spawn_matching_process(&inst);
+        wait_for_cmdline(child.id(), |cmdline| {
+            firecracker_cmdline_matches_instance(cmdline, &inst.vm_config_path())
+        });
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
         let _api = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
 
@@ -4047,11 +4087,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn is_running_true_for_live_firecracker_like_pid() {
+    fn is_running_requires_matching_instance_config_argument() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let mut child = spawn_firecracker_like();
-        wait_for_firecracker_cmdline(child.id());
+        let mut child = spawn_matching_process(&inst);
+        wait_for_cmdline(child.id(), |cmdline| {
+            firecracker_cmdline_matches_instance(cmdline, &inst.vm_config_path())
+        });
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
         let running = inst.is_running();
@@ -4061,12 +4103,61 @@ mod tests {
 
         assert!(
             running,
-            "is_running must return true for a live firecracker"
+            "is_running must accept the exact instance config argument"
         );
         assert!(
             pid_file_kept,
             "PID file should be preserved while firecracker is running"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn renamed_non_firecracker_process_is_not_running_instance() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_renamed_sleep();
+        wait_for_cmdline(child.id(), |cmdline| {
+            cmdline
+                .windows(b"firecracker".len())
+                .any(|part| part == b"firecracker")
+        });
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!running.unwrap());
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    fn firecracker_cmdline_matches_only_exact_unique_config_argument() {
+        let path = Path::new("/private/instance/vm_config.json");
+        assert!(firecracker_cmdline_matches_instance(
+            b"custom-vmm\0--no-api\0--config-file\0/private/instance/vm_config.json\0",
+            path,
+        ));
+        for cmdline in [
+            &b"firecracker\0--config-file\0/private/other/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json.bak\0"[..],
+            &b"firecracker\0--log-path\0/private/instance/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json\0--config-file\0/private/instance/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json\0--config-file\0/private/other/vm_config.json\0"[..],
+        ] {
+            assert!(!firecracker_cmdline_matches_instance(cmdline, path));
+        }
+
+        let raw_path = b"/private/instance-\xff/vm_config.json";
+        let mut raw_cmdline = b"custom-vmm\0--config-file\0".to_vec();
+        raw_cmdline.extend_from_slice(raw_path);
+        raw_cmdline.push(0);
+        assert!(firecracker_cmdline_matches_instance(
+            &raw_cmdline,
+            Path::new(OsStr::from_bytes(raw_path)),
+        ));
     }
 
     // ── Allocate instance ────────────────────────────────────
