@@ -4123,6 +4123,32 @@ test_resize_retry_firecracker() {
     fi
 }
 
+test_resize_disk_start() {
+    echo ""
+    echo "=== Phase: disk-only resize starts the instance ==="
+
+    if coop resize "$INSTANCE" --size +1G --start; then
+        pass "disk-only resize --start exits 0"
+    else
+        fail "disk-only resize --start exits 0" "exit code: $?"
+        return
+    fi
+
+    if coop status "$INSTANCE" 2>/dev/null &&
+        [[ "$HARNESS_OUT" == *"running"* || "$HARNESS_OUT" == *"Running"* ]]; then
+        pass "instance is running after disk-only resize --start"
+    else
+        fail "instance is running after disk-only resize --start" \
+            "status unavailable for running instance"
+    fi
+
+    if coop stop "$INSTANCE" >/dev/null 2>&1; then
+        pass "stop after disk-only resize --start exits 0"
+    else
+        fail "stop after disk-only resize --start exits 0" "exit code: $?"
+    fi
+}
+
 test_reconfigure() {
     echo ""
     echo "=== Phase: resize changes memory and vCPUs ==="
@@ -9097,6 +9123,7 @@ EOF
         test_stopped_vm_completions
         test_resize_status
         test_resize_retry_firecracker
+        test_resize_disk_start
         test_reconfigure
         test_commit_restore
         test_private_storage

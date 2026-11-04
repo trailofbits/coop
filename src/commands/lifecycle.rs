@@ -2378,10 +2378,14 @@ pub(crate) fn cmd_resize(
         };
         Some(operation)
     } else if opts.start {
-        let inst = stopped.instance().clone();
-        drop(stopped);
-        be.start_existing(cfg, &inst)?;
-        None
+        let name = stopped.instance().name.clone();
+        let _operation = be.start_confirmed_stopped(cfg, stopped).with_context(|| {
+            format!(
+                "Disk resize for instance '{name}' completed before start failed. \
+                 The VM may have started; inspect it with `coop status {name}` before retrying"
+            )
+        })?;
+        return Ok(());
     } else {
         None
     };
