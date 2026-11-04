@@ -250,7 +250,7 @@ fn apply_to_running(
     };
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    let session = super::prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
+    let session = super::prepare_session_from_target(cfg, &inst, target, repo.as_ref())?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(
         &session,

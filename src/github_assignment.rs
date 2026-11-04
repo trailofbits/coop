@@ -176,7 +176,7 @@ mod tests {
             inst.dir.join("unused"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = crate::commands::prepare_session_from_target(cfg, Some(inst), target, repo)?;
+        let session = crate::commands::prepare_session_from_target(cfg, inst, target, repo)?;
         Ok(session.env.guest_values().get("GITHUB_TOKEN").cloned())
     }
 
