@@ -198,14 +198,17 @@ fn run_bounded_with_shutdown(
             }
             Err(error) => break Some(CaptureError::Io(error)),
         }
-        if status.is_none() {
+        if shutdown_requested() {
+            break Some(CaptureError::Interrupted);
+        }
+        // Do not reap the group leader while a detached descendant still
+        // holds a pipe open. Its unreaped PID pins the numeric group ID used
+        // for timeout and cancellation cleanup.
+        if stdout_eof && stderr_eof && status.is_none() {
             match child.try_wait() {
                 Ok(observed) => status = observed,
                 Err(error) => break Some(CaptureError::Io(error)),
             }
-        }
-        if shutdown_requested() {
-            break Some(CaptureError::Interrupted);
         }
         if status.is_some() && stdout_eof && stderr_eof {
             break None;
@@ -698,6 +701,62 @@ mod tests {
             .unwrap();
         // SAFETY: terminate only the PID written by this test's detached fixture.
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_keeps_group_leader_unreaped_until_pipes_close() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let leader_file = temp.path().join("leader-pid");
+        let detached_file = temp.path().join("detached-pid");
+        let executable = std::env::current_exe().unwrap();
+        let script = format!(
+            "echo $$ > {}; {} --exact process_output::tests::detached_descendant_cannot_extend_the_return_deadline --nocapture &",
+            crate::shell::shell_escape(&leader_file.to_string_lossy()),
+            crate::shell::shell_escape(&executable.to_string_lossy()),
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .env("COOP_CAPTURE_SETSID_HELPER", "1")
+            .env("COOP_CAPTURE_SETSID_PID_FILE", &detached_file);
+        let worker = std::thread::spawn(move || {
+            run_bounded(
+                &mut command,
+                CapturePolicy {
+                    stdout_max: 1024,
+                    stderr_max: 1024,
+                    completion: CompletionPolicy::Deadline(Duration::from_secs(2)),
+                },
+            )
+        });
+        for _ in 0..200 {
+            if leader_file.exists() && detached_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let leader_pid = std::fs::read_to_string(&leader_file).unwrap();
+        let mut unreaped = false;
+        for _ in 0..200 {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", leader_pid.trim()));
+            if stat.is_ok_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|tail| tail.split_whitespace().next() == Some("Z"))
+            }) {
+                unreaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let result = worker.join().unwrap();
+        let detached_pid = std::fs::read_to_string(detached_file).unwrap();
+        let detached_pid: i32 = detached_pid.trim().parse().unwrap();
+        // SAFETY: terminate only the PID written by this test's detached fixture.
+        let _ = unsafe { libc::kill(detached_pid, libc::SIGKILL) };
+        assert!(matches!(result, Err(CaptureError::Timeout(_))));
+        assert!(unreaped, "the group leader was reaped before pipe EOF");
     }
 
     #[test]
