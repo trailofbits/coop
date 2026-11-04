@@ -677,8 +677,8 @@ needs its own toolchain.
 
 Proofs live in a `#[cfg(kani)]` module so the normal build never compiles them.
 They live beside their kernels in `src/config.rs`, `src/proxy.rs`,
-`src/privileged_disk.rs`, `src/vsock_proxy.rs`, `src/commands/lifecycle.rs`, and
-`coop-proxy/src/proxy.rs`.
+`src/privileged_disk.rs`, `src/setup_tool.rs`, `src/vsock_proxy.rs`,
+`src/commands/lifecycle.rs`, and `coop-proxy/src/proxy.rs`.
 
 **Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install
 kani-verifier --version =0.67.0 --locked && cargo kani setup`. Keep the version
@@ -728,6 +728,21 @@ cargo kani --workspace --harness disk_relative_add_never_wraps
   shorter than the old disk, the regrow target holds every old byte; otherwise
   no regrow is requested. The proof binds the old GiB size to the old byte
   length using the same ceil conversion as the caller.
+- `apt_quoted_advance_is_in_bounds` — a quoted escape advances one or two bytes
+  without passing the end of a nonempty input, including a trailing backslash.
+- `apt_block_comment_end_is_first_and_in_bounds` — on arbitrary inputs up to
+  eight bytes beginning with `/*`, the helper returns the first closing `*/`
+  after the opener, or `None` only when there is no such pair.
+- `apt_first_newline_is_exact` — on arbitrary inputs up to eight bytes, newline
+  detection returns the first newline, or `None` only when there is none.
+- `apt_directive_separator_handles_comments` — a block comment separates a
+  directive when it contains a newline or is followed by whitespace; a line
+  comment separates one only when it ends with a newline.
+
+The APT proofs cover byte-index decisions shared by the configuration scanner
+and directive parser. They do not establish equivalence with APT's full grammar
+or the trustworthiness of files reached by `#include`; the setup-tool fixture
+tests cover parser composition and path validation.
 
 A note on the disk proof: the harness verifies the `checked_add` kernel directly
 rather than calling `DiskSize::resolve`, because `resolve` wraps the overflow
