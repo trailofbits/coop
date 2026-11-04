@@ -822,6 +822,9 @@ in that case coop keeps the new configuration so it matches the running VM.
 If the VM state cannot be determined, coop also keeps the new configuration
 and reports that uncertainty. Inspect the instance before retrying.
 
+For a disk-only resize, a failed `--start` leaves the disk change in place. The
+VM may already be running; inspect its status before retrying.
+
 Combining `--size` with `--mem`/`--vcpus` applies the disk change first, then the
 machine-resource change; the two are separate artifacts and are not applied
 transactionally, so if the second step fails the disk change has already taken
