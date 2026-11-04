@@ -22,6 +22,33 @@ const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 const APT_CONFIG_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const APT_CONFIG_READ_DEADLINE: Duration = Duration::from_secs(30);
 
+fn apt_block_comment_end(input: &[u8]) -> Option<usize> {
+    // The opener's `*` cannot also start the closing `*/`.
+    let mut offset = 3;
+    while offset < input.len() {
+        if input[offset - 1] == b'*' && input[offset] == b'/' {
+            return Some(offset + 1);
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn apt_first_newline(input: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while offset < input.len() {
+        if input[offset] == b'\n' {
+            return Some(offset);
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn apt_quoted_advance(input: &[u8]) -> usize {
+    usize::from(input.starts_with(b"\\") && input.len() > 1) + 1
+}
+
 fn apt_directive_has_separator(input: &[u8]) -> bool {
     let mut offset = 0;
     let mut separated = false;
@@ -31,13 +58,13 @@ fn apt_directive_has_separator(input: &[u8]) -> bool {
             separated = true;
             offset += 1;
         } else if tail.starts_with(b"/*") {
-            let Some(end) = tail.windows(2).position(|part| part == b"*/") else {
+            let Some(end) = apt_block_comment_end(tail) else {
                 return false;
             };
-            separated |= tail[..end + 2].contains(&b'\n');
-            offset += end + 2;
+            separated |= apt_first_newline(&tail[..end]).is_some();
+            offset += end;
         } else if tail.starts_with(b"//") {
-            let Some(end) = tail.iter().position(|byte| *byte == b'\n') else {
+            let Some(end) = apt_first_newline(tail) else {
                 return false;
             };
             separated = true;
@@ -55,27 +82,22 @@ fn apt_directive_body(input: &[u8]) -> Result<(Vec<u8>, usize), SetupToolError> 
     let mut quoted = false;
     while cursor < input.len() {
         let tail = &input[cursor..];
-        if quoted && tail.starts_with(b"\\") && tail.len() > 1 {
+        if quoted && apt_quoted_advance(tail) == 2 {
             value.extend_from_slice(&tail[..2]);
             cursor += 2;
             continue;
         }
         if !quoted && tail.starts_with(b"/*") {
-            let end = tail
-                .windows(2)
-                .position(|part| part == b"*/")
-                .ok_or_else(|| SetupToolError::AptConfiguration {
+            let end =
+                apt_block_comment_end(tail).ok_or_else(|| SetupToolError::AptConfiguration {
                     reason: "unterminated apt directive comment".into(),
                 })?;
-            cursor += end + 2;
+            cursor += end;
             value.push(b' ');
             continue;
         }
         if !quoted && tail.starts_with(b"//") {
-            cursor += tail
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(tail.len(), |end| end + 1);
+            cursor += apt_first_newline(tail).map_or(tail.len(), |end| end + 1);
             value.push(b' ');
             continue;
         }
@@ -234,21 +256,14 @@ fn apt_include_paths(contents: &[u8]) -> Result<Vec<PathBuf>, SetupToolError> {
             continue;
         }
         if quoted {
-            if tail.starts_with(b"\\") {
-                offset += 2;
-            } else if tail.starts_with(b"\"") {
+            if tail.starts_with(b"\"") {
                 quoted = false;
-                offset += 1;
-            } else {
-                offset += 1;
             }
+            offset += apt_quoted_advance(tail);
             continue;
         }
         if tail.starts_with(b"//") {
-            offset += tail
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .unwrap_or(tail.len());
+            offset += apt_first_newline(tail).unwrap_or(tail.len());
             if offset == contents.len() {
                 break;
             }
@@ -288,10 +303,7 @@ fn apt_include_paths(contents: &[u8]) -> Result<Vec<PathBuf>, SetupToolError> {
             continue;
         }
         if tail.starts_with(b"#") {
-            offset += tail
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .unwrap_or(tail.len());
+            offset += apt_first_newline(tail).unwrap_or(tail.len());
             if offset == contents.len() {
                 break;
             }
@@ -332,6 +344,102 @@ fn apt_include_path(value_bytes: &[u8]) -> Result<PathBuf, SetupToolError> {
     } else {
         Path::new("/").join(included)
     })
+}
+
+#[cfg(kani)]
+mod proofs {
+    /// A quoted escape always advances, and never moves past the remaining
+    /// input when a backslash is the final byte.
+    #[kani::proof]
+    fn apt_quoted_advance_is_in_bounds() {
+        let bytes: [u8; 4] = kani::any();
+        let length: usize = kani::any();
+        kani::assume((1..=bytes.len()).contains(&length));
+        let step = super::apt_quoted_advance(&bytes[..length]);
+        assert!(step >= 1 && step <= length);
+        assert_eq!(step == 2, bytes[0] == b'\\' && length > 1);
+    }
+
+    /// For a `/*` opener, the first non-overlapping `*/` pair is returned.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn apt_block_comment_end_is_first_and_in_bounds() {
+        let bytes: [u8; 8] = kani::any();
+        let length: usize = kani::any();
+        kani::assume((2..=bytes.len()).contains(&length));
+        kani::assume(bytes[0] == b'/' && bytes[1] == b'*');
+        let input = &bytes[..length];
+        match super::apt_block_comment_end(input) {
+            Some(end) => {
+                assert!(end >= 4 && end <= input.len());
+                assert_eq!(&input[end - 2..end], b"*/");
+                for index in 3..end - 1 {
+                    assert!(input[index - 1] != b'*' || input[index] != b'/');
+                }
+            }
+            None => {
+                for index in 3..input.len() {
+                    assert!(input[index - 1] != b'*' || input[index] != b'/');
+                }
+            }
+        }
+    }
+
+    /// Newline detection returns the first in-bounds newline, or None only
+    /// when the bounded input contains no newline.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn apt_first_newline_is_exact() {
+        let bytes: [u8; 8] = kani::any();
+        let length: usize = kani::any();
+        kani::assume(length <= bytes.len());
+        let input = &bytes[..length];
+        match super::apt_first_newline(input) {
+            Some(found) => {
+                assert!(found < input.len());
+                assert_eq!(input[found], b'\n');
+                for index in 0..found {
+                    assert_ne!(input[index], b'\n');
+                }
+            }
+            None => {
+                for byte in input {
+                    assert_ne!(*byte, b'\n');
+                }
+            }
+        }
+    }
+
+    /// A newline within a block comment separates `#include` from its body;
+    /// a line comment separates it only when terminated by a newline.
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn apt_directive_separator_handles_comments() {
+        let comment_byte: u8 = kani::any();
+        kani::assume(!comment_byte.is_ascii_whitespace());
+        let newline: bool = kani::any();
+        let trailing_space: bool = kani::any();
+        let block = [
+            b'/',
+            b'*',
+            if newline { b'\n' } else { comment_byte },
+            b'*',
+            b'/',
+            if trailing_space { b' ' } else { b'x' },
+        ];
+        assert_eq!(
+            super::apt_directive_has_separator(&block),
+            newline || trailing_space
+        );
+        let line = [
+            b'/',
+            b'/',
+            comment_byte,
+            if newline { b'\n' } else { b'x' },
+            b'x',
+        ];
+        assert_eq!(super::apt_directive_has_separator(&line), newline);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,6 +726,74 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn apt_byte_scans_preserve_short_input_boundaries() {
+        assert_eq!(apt_block_comment_end(b"/*"), None);
+        assert_eq!(apt_block_comment_end(b"/*/"), None);
+        assert_eq!(apt_block_comment_end(b"/*x*"), None);
+        assert_eq!(apt_block_comment_end(b"/*x*/"), Some(5));
+        assert_eq!(apt_block_comment_end(b"/*/*/"), Some(5));
+        assert_eq!(apt_first_newline(b""), None);
+        assert_eq!(apt_first_newline(b"x"), None);
+        assert_eq!(apt_first_newline(b"\n"), Some(0));
+        assert_eq!(apt_first_newline(b"x\n\n"), Some(1));
+        assert_eq!(apt_quoted_advance(b"\\"), 1);
+        assert_eq!(apt_quoted_advance(b"\\x"), 2);
+    }
+
+    #[test]
+    fn apt_directive_parser_preserves_boundaries_and_bytes() {
+        assert!(!apt_directive_has_separator(b""));
+        assert!(apt_directive_has_separator(b" "));
+        assert!(!apt_directive_has_separator(b"//x\n/*"));
+        assert!(matches!(
+            apt_directive_body(b""),
+            Err(SetupToolError::AptConfiguration { .. })
+        ));
+        assert_eq!(
+            apt_directive_body(b"\"\\x\";").unwrap(),
+            (b"\"\\x\"".to_vec(), 5)
+        );
+        assert_eq!(
+            apt_directive_body(b"//x\n/a;").unwrap(),
+            (b" /a".to_vec(), 7)
+        );
+    }
+
+    #[test]
+    fn apt_include_scanner_handles_short_inputs() {
+        assert!(apt_include_paths(b"").unwrap().is_empty());
+        assert!(apt_include_paths(b"/**/").unwrap().is_empty());
+        assert!(apt_include_paths(b"\"\\").unwrap().is_empty());
+    }
+
+    #[test]
+    fn apt_include_path_rejects_empty_and_accepts_absolute() {
+        assert!(apt_include_path(b"").is_err());
+        assert_eq!(apt_include_path(b"/a").unwrap(), PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn apt_include_scanner_resumes_only_after_closed_comments() {
+        assert_eq!(
+            apt_include_paths(b"// \"\n#include \"/a\";").unwrap(),
+            vec![PathBuf::from("/a")]
+        );
+        assert_eq!(
+            apt_include_paths(b"# #include \"/ignored\";\n#include \"/a\";").unwrap(),
+            vec![PathBuf::from("/a")]
+        );
+        assert_eq!(
+            apt_include_paths(b"#include/*/*/ \"/a\";").unwrap(),
+            vec![PathBuf::from("/a")]
+        );
+        assert!(
+            apt_include_paths(b"/*/#include \"/a\";")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn resolution_distinguishes_absent_unusable_and_rejected() {
