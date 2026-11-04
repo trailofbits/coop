@@ -1132,19 +1132,22 @@ pub trait VmBackend: std::fmt::Display {
     /// survives restarts rather than being reset from the global config.
     ///
     /// Firecracker writes the JSON atomically and does not boot the VM;
-    /// Lima must `limactl start` to validate and apply the new spec, and
-    /// restores the previous `lima.yaml` if that start fails. When
+    /// Lima must `limactl start` to validate and apply the new spec. A failed
+    /// start restores the previous configuration only after the backend
+    /// confirms the instance is stopped. When
     /// `start_after` is true the instance is left running; otherwise it
     /// ends stopped (Lima stops it again after the validation boot).
-    /// Gated on a [`StoppedInstance`] like [`Self::resize_disk`].
+    /// Consumes the [`StoppedInstance`] because applying the change may boot
+    /// the VM. The returned guard retains the operation lock without claiming
+    /// the instance is still stopped.
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()>;
+    ) -> Result<InstanceOperationGuard>;
     /// Save a stopped instance's filesystem and matching metadata as image
     /// `image`. Takes a [`StoppedInstance`] observation and lock through
     /// publication. Overwriting an existing image is the caller's decision,
@@ -1174,6 +1177,10 @@ pub trait VmBackend: std::fmt::Display {
     fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
         instances.iter().map(|inst| self.is_running(inst)).collect()
     }
+    /// Fallible batch probe for decisions that require every instance's state
+    /// to be known. Unlike `list_running`, an uncertain state cannot select a
+    /// different instance by omission.
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>>;
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM
@@ -1257,6 +1264,39 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     }
     let running = vm.start()?;
     running.wait_for_boot()
+}
+
+/// A failed readiness wait does not prove the VM stopped. Only roll back a
+/// machine spec after a fresh liveness probe confirms that it is stopped.
+#[cfg(not(target_os = "macos"))]
+fn recover_firecracker_machine_start(
+    name: &str,
+    start_error: anyhow::Error,
+    state: Result<bool>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> anyhow::Error {
+    match state {
+        Ok(true) => start_error.context(format!(
+            "Instance '{name}' started but did not become ready. It is still running with the \
+             resized machine resources; inspect it with `coop status {name}` and stop it \
+             before retrying the resize",
+        )),
+        Ok(false) => match rollback() {
+            Ok(()) => start_error.context(format!(
+                "Instance '{name}' is stopped; restored its previous machine resources \
+                 after the failed start",
+            )),
+            Err(revert) => start_error.context(format!(
+                "Instance '{name}' is stopped, but restoring its previous machine \
+                 resources failed: {revert:#}. Inspect its machine config before retrying",
+            )),
+        },
+        Err(probe) => start_error.context(format!(
+            "Could not determine whether instance '{name}' is running after the failed \
+             start: {probe:#}. Its resized machine resources remain configured; inspect \
+             the instance before retrying",
+        )),
+    }
 }
 
 /// Build the legacy Linux/Firecracker TCP control transport.
@@ -1499,26 +1539,26 @@ impl VmBackend for FirecrackerBackend {
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()> {
+    ) -> Result<InstanceOperationGuard> {
         let inst = stopped.instance();
         // Snapshot the prior spec so a failed validation boot can be rolled
-        // back — otherwise `configure()` would re-read the rejected value on
-        // every subsequent `coop start` and the instance would stay wedged.
+        // back once the VM is confirmed stopped. Otherwise `configure()`
+        // would re-read the rejected value on every subsequent `coop start`.
         let previous = crate::vm::machine_resources(inst)?;
         crate::vm::set_machine_resources(inst, mem.map(VmMemory::get), vcpus)?;
-        if start_after && let Err(e) = start_firecracker_existing(cfg, inst) {
-            if let Err(revert) =
-                crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
-            {
-                tracing::error!("Failed to revert machine config after failed start: {revert}");
-            }
-            return Err(e.context("Failed to start after reconfigure — reverted machine config"));
+        if start_after && let Err(start_error) = start_firecracker_existing(cfg, inst) {
+            return Err(recover_firecracker_machine_start(
+                inst.name.as_str(),
+                start_error,
+                inst.probe_liveness(),
+                || crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1)),
+            ));
         }
-        Ok(())
+        Ok(stopped.into_operation_guard())
     }
 
     fn commit_disk(
@@ -1548,6 +1588,10 @@ impl VmBackend for FirecrackerBackend {
 
     fn is_running(&self, inst: &Instance) -> bool {
         inst.is_running()
+    }
+
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>> {
+        instances.iter().map(Instance::probe_liveness).collect()
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
@@ -1727,18 +1771,19 @@ impl VmBackend for LimaBackend {
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()> {
+    ) -> Result<InstanceOperationGuard> {
         crate::lima::set_machine_resources(
             cfg,
             stopped.instance(),
             mem.map(VmMemory::get),
             vcpus,
             start_after,
-        )
+        )?;
+        Ok(stopped.into_operation_guard())
     }
 
     fn commit_disk(
@@ -1766,6 +1811,10 @@ impl VmBackend for LimaBackend {
 
     fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
         crate::lima::list_running(instances)
+    }
+
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>> {
+        crate::lima::probe_running_states(instances)
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
@@ -1893,45 +1942,54 @@ pub fn prepare_env_forwarding(
     prepare_env_forwarding_for_network(
         cfg,
         repo,
-        suppress_anthropic_key,
-        suppress_openai_key,
-        crate::config::FirecrackerNetworkMode::Open,
+        CredentialForwardingPolicy::new(
+            cfg,
+            suppress_anthropic_key,
+            suppress_openai_key,
+            crate::config::FirecrackerNetworkMode::Open,
+        ),
     )
 }
 
+/// The saved `--env` snapshot has a distinct historical rule for
+/// `CODEX_ACCESS_TOKEN` under `ChatGPT` account auth. Keep that distinction
+/// explicit until changing it is reviewed as a behavior change.
 #[derive(Clone, Copy)]
-struct CredentialForwardingPolicy {
-    suppress_anthropic_key: bool,
-    suppress_openai_key: bool,
-    codex_proxy_active: bool,
-    openai_suppression_reason: &'static str,
+pub(crate) enum ForwardingSource {
+    Configured,
+    PersistedOverride,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialForwardingPolicy {
+    anthropic_proxy_active: bool,
+    openai_proxy_active: bool,
+    codex_account_auth: bool,
     network: crate::config::FirecrackerNetworkMode,
 }
 
 impl CredentialForwardingPolicy {
-    fn suppression_reason(self, name: &str) -> &'static str {
-        if self.network == crate::config::FirecrackerNetworkMode::Isolated {
-            "isolated network mode"
-        } else if name == "OPENAI_API_KEY" {
-            self.openai_suppression_reason
-        } else {
-            "proxy mode"
+    pub(crate) fn new(
+        cfg: &CoopConfig,
+        anthropic_proxy_active: bool,
+        openai_proxy_active: bool,
+        network: crate::config::FirecrackerNetworkMode,
+    ) -> Self {
+        Self {
+            anthropic_proxy_active,
+            openai_proxy_active,
+            codex_account_auth: cfg.codex.auth.uses_chatgpt_account(),
+            network,
         }
     }
 
-    fn suppressed_names(self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        if self.suppress_anthropic_key {
-            names.push("ANTHROPIC_API_KEY");
-        }
-        if self.suppress_openai_key {
-            names.push("OPENAI_API_KEY");
-        }
-        if self.codex_proxy_active {
-            names.push("CODEX_ACCESS_TOKEN");
-        }
+    pub(crate) fn suppression_reason(
+        self,
+        name: &str,
+        source: ForwardingSource,
+    ) -> Option<&'static str> {
         if self.network == crate::config::FirecrackerNetworkMode::Isolated {
-            names.extend([
+            const ISOLATED_SUPPRESSED: &[&str] = &[
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
                 "CODEX_ACCESS_TOKEN",
@@ -1941,11 +1999,24 @@ impl CredentialForwardingPolicy {
                 "GITHUB_TOKEN",
                 "GH_TOKEN",
                 crate::model_state::CODEX_LOCAL_ENV_KEY,
-            ]);
-            names.sort_unstable();
-            names.dedup();
+            ];
+            if ISOLATED_SUPPRESSED.contains(&name) {
+                return Some("isolated network mode");
+            }
         }
-        names
+        match name {
+            "ANTHROPIC_API_KEY" if self.anthropic_proxy_active => Some("proxy mode"),
+            "OPENAI_API_KEY" if self.codex_account_auth => Some("codex.auth = \"chatgpt\""),
+            "OPENAI_API_KEY" if self.openai_proxy_active => Some("proxy mode"),
+            "CODEX_ACCESS_TOKEN"
+                if self.openai_proxy_active
+                    || (matches!(source, ForwardingSource::Configured)
+                        && self.codex_account_auth) =>
+            {
+                Some("proxy mode")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1955,7 +2026,10 @@ fn populate_builtin_credentials(
     policy: CredentialForwardingPolicy,
     env: &mut EnvForward,
 ) -> Result<()> {
-    if policy.suppress_anthropic_key {
+    if policy
+        .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
+        .is_some()
+    {
         tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
     } else if let Some(key) = &cfg.claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
@@ -1965,11 +2039,9 @@ fn populate_builtin_credentials(
         env.set("ANTHROPIC_API_KEY", key)?;
     }
 
-    if policy.suppress_openai_key {
-        tracing::debug!(
-            "{}: not forwarding OPENAI_API_KEY into the guest",
-            policy.suppression_reason("OPENAI_API_KEY")
-        );
+    if let Some(reason) = policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
+    {
+        tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
     } else if let Some(key) = &cfg.codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
@@ -1978,7 +2050,10 @@ fn populate_builtin_credentials(
         env.set("OPENAI_API_KEY", key)?;
     }
 
-    if policy.network == crate::config::FirecrackerNetworkMode::Isolated {
+    if policy
+        .suppression_reason("XAI_API_KEY", ForwardingSource::Configured)
+        .is_some()
+    {
         tracing::debug!("isolated network mode: not resolving or forwarding XAI_API_KEY");
         tracing::debug!("isolated network mode: not resolving or forwarding GITHUB_TOKEN");
     } else {
@@ -2001,30 +2076,13 @@ fn populate_builtin_credentials(
 pub(crate) fn prepare_env_forwarding_for_network(
     cfg: &CoopConfig,
     repo: Option<&crate::github_repo::RepoSlug>,
-    suppress_anthropic_key: bool,
-    suppress_openai_key: bool,
-    network: crate::config::FirecrackerNetworkMode,
+    policy: CredentialForwardingPolicy,
 ) -> Result<EnvForward> {
     let claude = &cfg.claude;
-    let codex = &cfg.codex;
     let grok = &cfg.grok;
-    let codex_account_auth = codex.auth.uses_chatgpt_account();
-    let policy = CredentialForwardingPolicy {
-        suppress_anthropic_key,
-        suppress_openai_key: suppress_openai_key || codex_account_auth,
-        codex_proxy_active: suppress_openai_key,
-        openai_suppression_reason: if codex_account_auth {
-            "codex.auth = \"chatgpt\""
-        } else {
-            "proxy mode"
-        },
-        network,
-    };
+    let codex = &cfg.codex;
     let mut env = EnvForward::default();
     populate_builtin_credentials(cfg, repo, policy, &mut env)?;
-    let suppressed = policy.suppressed_names();
-
-    let suppression_reason = |name: &str| policy.suppression_reason(name);
 
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
@@ -2037,8 +2095,8 @@ pub(crate) fn prepare_env_forwarding_for_network(
         .chain(grok.env_forward.iter())
         .chain(grok_mcp_env_names.iter())
     {
-        if suppressed.contains(&name.as_str()) {
-            let reason = suppression_reason(name.as_str());
+        if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
+        {
             tracing::warn!("{reason}: ignoring env_forward entry '{name}'");
             continue;
         }
@@ -2054,8 +2112,8 @@ pub(crate) fn prepare_env_forwarding_for_network(
     // an inherited one. Warn on collision so the override is visible —
     // values are not logged (they may be secrets).
     for (name, value) in &cfg.guest_env {
-        if suppressed.contains(&name.as_str()) {
-            let reason = suppression_reason(name.as_str());
+        if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
+        {
             tracing::warn!("{reason}: ignoring guest_env entry '{name}'");
             continue;
         }
@@ -4749,6 +4807,88 @@ fn gh_auth_token() -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn failed_firecracker_reconfigure_rolls_back_only_when_stopped() {
+        let rolled_back = std::cell::Cell::new(false);
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(true),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(!rolled_back.get());
+        assert!(error.to_string().contains("still running"), "{error:#}");
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Err(anyhow::anyhow!("probe failed")),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(!rolled_back.get());
+        assert!(
+            error.to_string().contains("Could not determine"),
+            "{error:#}"
+        );
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(false),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(rolled_back.get());
+        assert!(error.to_string().contains("restored"), "{error:#}");
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(false),
+            || Err(anyhow::anyhow!("rollback failed")),
+        );
+        assert!(error.to_string().contains("rollback failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("start failed"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn machine_resource_transition_retains_operation_lock() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+        let cfg = CoopConfig::default();
+        crate::vm::FirecrackerVm::new(&cfg, &inst)
+            .configure()
+            .unwrap();
+        let backend = FirecrackerBackend::new();
+        let stopped = backend.as_stopped(inst.clone()).unwrap();
+        let operation = backend
+            .set_machine_resources(&cfg, stopped, Some(cfg.vm.mem_size_mib), None, false)
+            .unwrap();
+        assert!(
+            crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::from_millis(100)).is_err()
+        );
+        drop(operation);
+        assert!(
+            crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::from_millis(100)).is_ok()
+        );
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]

@@ -112,7 +112,10 @@ flags — this is a load-bearing design choice (see
   successful `stop` mint `StoppedInstance` only after confirming exit.
   `StoppedInstance` holds the per-instance operation lock through cleanup and
   stopped-only disk mutations. Lima only mints it for confirmed `Stopped`;
-  absent, broken, unknown, and failed probes stay distinct.
+  absent, broken, unknown, and failed probes stay distinct. A machine-resource
+  update consumes the stopped token because Lima validates it by booting the VM
+  and Firecracker may boot when `--start` is requested; the returned operation
+  guard keeps the lock without claiming the VM is still stopped.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **Setup preflight** rejects explicit inputs unsupported by the selected
@@ -204,7 +207,11 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    `post_create` in the guest home.
    Save successful completion atomically. Failures retain the VM and block agent
    launch; running `up` and stopped-instance restarts retry the pending hook under
-   the instance operation lock. Guest execution uses a private staged script,
+   the provisioning lock. The instance operation lock covers the initial state
+   read and the final liveness probe, recipe revalidation, and completion write;
+   it is released while the guest hook runs so stop and destroy can proceed.
+   A hook that succeeds but loses the VM or cannot save completion stays pending
+   and may run again on retry. Guest execution uses a private staged script,
    a PTY-bound supervisor, and a guest lock; cancellation terminates and reaps
    the supervised process group. Shell and exec remain available for recovery.
 8. **`post_start`** hook — runs after creation, workspace, and mount provisioning,

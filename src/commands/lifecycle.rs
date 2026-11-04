@@ -968,7 +968,7 @@ fn restart_confirmed_instance(
         &inst,
         &target,
         repo.as_ref(),
-        opts,
+        opts.no_agents,
         backend::BootMode::Restart,
     )?;
     // User-supplied creation and post-start hooks are intentionally outside
@@ -976,7 +976,7 @@ fn restart_confirmed_instance(
     // lock would prevent a concurrent stop/destroy from recovering a hung
     // hook. Reacquire and revalidate before reporting restart success.
     drop(operation);
-    let command = creation_post_start(be, cfg, &inst, opts)?;
+    let command = creation_post_start(be, cfg, &inst, opts.post_start_override)?;
     run_configured_post_start(cfg, &inst, &target, repo.as_ref(), command.as_deref())?;
 
     let operation = backend::InstanceOperationGuard::acquire(&inst)?;
@@ -1068,12 +1068,50 @@ fn start_instance(
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
     drop(image_lock);
 
-    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
+    let inputs = FirstBootInputs {
+        source: FirstBootSource::from_options(opts.workspace_dir, opts.git_repo),
+        mounts: &opts.mounts,
+        exclude_git: opts.exclude_git,
+        no_agents: opts.no_agents,
+        post_start_override: opts.post_start_override,
+        persisted_guest_env: &opts.persisted_guest_env,
+    };
+    provision_first_boot(be, cfg, inst, &inputs, repo.as_ref(), &payload)
 }
 
 struct BootPayload {
     forwards: Vec<config::PortForward>,
     files: crate::guest_files::StagedFiles,
+}
+
+/// Inputs shared by a newly created VM and a restored blank disk. Creation
+/// flags such as disk size and prompt policy cannot be read during provisioning.
+struct FirstBootInputs<'a> {
+    source: FirstBootSource<'a>,
+    mounts: &'a [config::Mount],
+    exclude_git: bool,
+    no_agents: bool,
+    post_start_override: Option<&'a str>,
+    persisted_guest_env: &'a std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
+}
+
+#[derive(Clone, Copy)]
+enum FirstBootSource<'a> {
+    None,
+    Workspace(&'a str),
+    GitRepo(&'a str),
+}
+
+impl<'a> FirstBootSource<'a> {
+    fn from_options(workspace_dir: Option<&'a str>, git_repo: Option<&'a str>) -> Self {
+        if let Some(path) = workspace_dir {
+            Self::Workspace(path)
+        } else if let Some(url) = git_repo {
+            Self::GitRepo(url)
+        } else {
+            Self::None
+        }
+    }
 }
 
 impl BootPayload {
@@ -1105,18 +1143,13 @@ impl BootPayload {
 /// [`backend::BootMode::Restart`] path, which assumes plugins, MCP servers
 /// and `/workspace` survived on the guest disk.
 ///
-/// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, `post_start_override`, plus what
-/// [`bootstrap_on_boot`] consumes (`no_agents`).
-/// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
-/// resolved forward set arrives in `payload`, because callers merge it
-/// differently. Reaching for one of those fields here would silently change
-/// behavior for `reprovision_instance` only, which passes placeholders for them.
+/// The resolved forward set arrives in `payload`, because callers merge it
+/// differently. `FirstBootInputs` contains only fields both paths can supply.
 fn provision_first_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-    opts: &StartOpts<'_>,
+    inputs: &FirstBootInputs<'_>,
     repo: Option<&github_repo::RepoSlug>,
     payload: &BootPayload,
 ) -> Result<()> {
@@ -1146,7 +1179,7 @@ fn provision_first_boot(
 
     // Persist CLI `--env` entries for later commands that reload config.
     guest_env_state::GuestEnvState {
-        entries: opts.persisted_guest_env.clone(),
+        entries: (*inputs.persisted_guest_env).clone(),
     }
     .save(inst)?;
     payload.files.install(&target)?;
@@ -1156,7 +1189,7 @@ fn provision_first_boot(
         inst,
         &target,
         repo,
-        opts,
+        inputs.no_agents,
         backend::BootMode::FirstBoot,
     )?;
 
@@ -1165,7 +1198,7 @@ fn provision_first_boot(
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
-    let workspace_state = if let Some(ws_dir) = opts.workspace_dir {
+    let workspace_state = if let FirstBootSource::Workspace(ws_dir) = inputs.source {
         let ws_path = std::path::Path::new(ws_dir);
         anyhow::ensure!(
             ws_path.is_dir(),
@@ -1176,7 +1209,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::copy_workspace(&target, &abs_path, opts.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, inputs.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1186,7 +1219,7 @@ fn provision_first_boot(
         };
         state.save(inst)?;
         Some(state)
-    } else if let Some(repo_url) = opts.git_repo {
+    } else if let FirstBootSource::GitRepo(repo_url) = inputs.source {
         let assignment = crate::github_assignment::active(cfg, inst)?;
         backend::clone_git_repo(
             &target,
@@ -1207,20 +1240,20 @@ fn provision_first_boot(
         None
     };
 
-    if !opts.mounts.is_empty() {
+    if !inputs.mounts.is_empty() {
         if be.mounts_are_live() {
             // Lima: virtiofs already serves the host directory live. No
             // sync step, but we still record state so `push`/`pull` and
             // PAT slug detection work for follow-up commands.
             if workspace_state.is_none() {
-                workspace::record_mount_state(inst, &opts.mounts)?;
+                workspace::record_mount_state(inst, inputs.mounts)?;
             }
-            warn_on_live_git_mounts(&opts.mounts);
+            warn_on_live_git_mounts(inputs.mounts);
         } else {
             if workspace_state.is_some() {
-                workspace::sync_mount_contents(&target, &opts.mounts, opts.exclude_git)?;
+                workspace::sync_mount_contents(&target, inputs.mounts, inputs.exclude_git)?;
             } else {
-                workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+                workspace::sync_mounts(&target, inst, inputs.mounts, inputs.exclude_git)?;
             }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
@@ -1230,7 +1263,7 @@ fn provision_first_boot(
         }
     }
 
-    let command = creation_post_start(be, cfg, inst, opts)?;
+    let command = creation_post_start(be, cfg, inst, inputs.post_start_override)?;
     run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
@@ -1294,8 +1327,17 @@ pub(crate) fn resolve_running(
         return Ok(running);
     }
 
-    let (running, stopped): (Vec<_>, Vec<_>) =
-        instances.into_iter().partition(|i| be.is_running(i));
+    let states = be.probe_running_states(&instances)?;
+    anyhow::ensure!(
+        states.len() == instances.len(),
+        "Backend returned an incomplete instance state inventory"
+    );
+    let (running, stopped): (Vec<_>, Vec<_>) = instances
+        .into_iter()
+        .zip(states)
+        .partition(|(_, running)| *running);
+    let running: Vec<_> = running.into_iter().map(|(inst, _)| inst).collect();
+    let stopped: Vec<_> = stopped.into_iter().map(|(inst, _)| inst).collect();
 
     match running.len() {
         1 => {
@@ -1455,7 +1497,7 @@ pub(crate) fn open_ssh_session(
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1517,7 +1559,7 @@ pub(crate) fn open_agent_session(
     )?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
 }
 
 fn ensure_isolated_agent_supported(
@@ -1667,11 +1709,10 @@ fn creation_post_start(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-    opts: &StartOpts<'_>,
+    post_start_override: Option<&str>,
 ) -> Result<Option<String>> {
     crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Ready)?;
-    Ok(resume_creation(be, cfg, inst)?
-        .post_start(opts.post_start_override, cfg.post_start.as_deref()))
+    Ok(resume_creation(be, cfg, inst)?.post_start(post_start_override, cfg.post_start.as_deref()))
 }
 
 pub(super) fn resume_running_creation(
@@ -1702,8 +1743,10 @@ fn resume_creation(
         let _guard = signal::install_handlers();
         let repo = backend::detect_instance_repo(inst);
         let target = be.ssh_target(cfg, inst)?;
-        let session = prepare_session_from_target(cfg, Some(inst), target, repo.as_ref())?;
-        crate::creation_hooks::run_pending(inst, &session)
+        let session = prepare_session_from_target(cfg, inst, target, repo.as_ref())?;
+        crate::creation_hooks::run_pending(inst, &session, || {
+            Ok(be.as_running(cfg, inst.clone())?.is_some())
+        })
     })()
     .map_err(|source| crate::creation_hooks::CreationIncomplete::new(inst, source).into())
 }
@@ -1715,15 +1758,15 @@ fn bootstrap_on_boot(
     inst: &config::Instance,
     target: &backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
-    opts: &StartOpts<'_>,
+    no_agents: bool,
     mode: backend::BootMode,
 ) -> Result<()> {
-    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, mode)?;
+    preflight_isolated_bootstrap(cfg, inst, no_agents, mode)?;
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
                 .is_some();
-    if opts.no_agents && proxy_configured {
+    if no_agents && proxy_configured {
         // Proxy mode suppresses the raw API keys on every session, but the
         // proxy + guest base-URL override are only set up during agent
         // bootstrap — which --no-agents skips. Warn so the loud auth failure
@@ -1736,7 +1779,7 @@ fn bootstrap_on_boot(
     // A failed read degrades to "not materialized", which at worst warns when
     // it need not. Aborting `--no-agents` — a path that otherwise never opens
     // this file — over an unreadable model.json would be the worse trade.
-    if no_agents_skips_codex_keyring(opts.no_agents, cfg.codex.auth, || {
+    if no_agents_skips_codex_keyring(no_agents, cfg.codex.auth, || {
         model_state::ModelState::try_load(inst)
             .ok()
             .flatten()
@@ -1744,7 +1787,7 @@ fn bootstrap_on_boot(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents {
+    if no_agents {
         if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
             && let Some(assignment) = crate::github_assignment::active(cfg, inst)?
         {
@@ -1753,11 +1796,10 @@ fn bootstrap_on_boot(
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
-    // Pass `Some(inst)` so proxy-mode key suppression (and the guest-env /
-    // Codex-local overlays) apply to the bootstrap session too — otherwise the
-    // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
-    // defeating proxy-mode non-exposure (issue #411).
-    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    // Bootstrap uses this instance's proxy policy and persisted overlays too;
+    // omitting them would forward the raw ANTHROPIC_API_KEY during bootstrap
+    // and defeat proxy-mode non-exposure (issue #411).
+    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     Ok(())
@@ -1776,7 +1818,7 @@ fn run_configured_post_start(
     };
     signal::check_shutdown()?;
     // Bootstrap may mint a proxy capability token; construct this session afterward.
-    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
     backend::run_post_start(&session, command);
     Ok(())
 }
@@ -1814,48 +1856,41 @@ pub(crate) fn no_agents_skips_codex_keyring(
 /// without going through `resolve_running` — namely the post-boot bootstrap in
 /// fresh start and restart, where the instance isn't yet registered as running.
 ///
-/// When `inst` is `Some`, any persisted start-time guest environment for that
-/// instance is overlaid onto the resolved env-forward set. This keeps current
-/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
-/// values available across the per-invocation config reload. Bootstrap callers
-/// inside fresh `start_instance` pass `None` because the in-memory
-/// `cfg.guest_env` is already authoritative for that one process; restart and
-/// every post-start command pass `Some` because the on-disk snapshot is the
-/// only place the original persisted set still lives.
+/// The instance is required because its persisted model, proxy, and guest
+/// environment state determine which credentials may enter this SSH session.
 pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
-    inst: Option<&config::Instance>,
+    inst: &config::Instance,
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
     // Load the per-instance model selection once: it decides both the
     // proxy-mode key suppression and the Codex local-key forwarding below.
-    let model = match inst {
-        Some(inst) => Some(model_state::ModelState::load_or_default(inst)?),
-        None => None,
-    };
+    let model = model_state::ModelState::load_or_default(inst)?;
 
     // In proxy mode (issue #411: an effective upstream — `[proxy.<provider>]`
     // default or a per-VM override — and the VM in remote model mode) the raw
     // key must never be forwarded into the guest; the host-side proxy holds it
     // and the guest gets only the capability token. Overrides live in the
     // instance state, so this is resolved per provider and needs `inst`.
-    let remote = model
-        .as_ref()
-        .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
-    let isolated = inst
-        .is_some_and(|inst| inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated);
-    let (proxy_anthropic, proxy_openai) = match inst {
-        Some(inst) if remote => (
+    let remote = model.mode == model_state::ModelMode::Remote;
+    let isolated = inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated;
+    let (proxy_anthropic, proxy_openai) = if remote {
+        (
             proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
                 .is_some(),
             proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?.is_some(),
-        ),
-        _ => (false, false),
+        )
+    } else {
+        (false, false)
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
-    let suppress_anthropic_key = proxy_anthropic || isolated;
-    let suppress_openai_key = proxy_openai || codex_account_auth || isolated;
+    let forwarding_policy = backend::CredentialForwardingPolicy::new(
+        cfg,
+        proxy_anthropic,
+        proxy_openai,
+        inst.firecracker_network(),
+    );
     // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
     // auth even though `CoopConfig::validate` rejects that combination in the
     // config file. Warn here so the reason is visible on every session, and
@@ -1871,69 +1906,41 @@ pub(crate) fn prepare_session_from_target(
     let assignment = if isolated {
         None
     } else {
-        inst.map(|inst| crate::github_assignment::active(cfg, inst))
-            .transpose()?
-            .flatten()
+        crate::github_assignment::active(cfg, inst)?
     };
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding_for_network(
-        cfg,
-        repo,
-        suppress_anthropic_key,
-        suppress_openai_key,
-        inst.map_or(config::FirecrackerNetworkMode::Open, |inst| {
-            inst.firecracker_network()
-        }),
-    )?;
-    if let Some(inst) = inst {
-        if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
-            for (name, value) in &state.entries {
-                // A raw provider key snapshotted via `coop start --env` must
-                // not re-enter the guest under either suppression mode: in
-                // proxy mode the host-side proxy holds it, and under
-                // `codex.auth = "chatgpt"` forwarding it would let Codex
-                // silently fall back to API billing. Skip and warn, matching
-                // `prepare_env_forwarding`.
-                if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
-                    || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
-                    || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
-                    || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
-                    || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
-                    || (isolated && name.as_str() == "XAI_API_KEY")
-                    || (isolated && name.as_str() == "GITHUB_TOKEN")
-                    || (isolated && name.as_str() == "GH_TOKEN")
-                    || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
-                {
-                    let reason = if isolated {
-                        "isolated network mode"
-                    } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
-                        "codex.auth = \"chatgpt\""
-                    } else {
-                        "proxy mode"
-                    };
-                    tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
-                    continue;
-                }
-                env.set(name.as_str(), value.as_str())?;
-            }
-        }
-        // Codex reads its provider key from the env var named by `env_key`. In
-        // local-model mode that is the local endpoint's token; in remote proxy
-        // mode it is the per-instance capability token (the raw key stays on
-        // the host). Claude's token rides in settings.json instead. The two
-        // modes are mutually exclusive (mode is Local or Remote).
-        if let Some(model) = &model {
-            if !isolated
-                && model.mode == model_state::ModelMode::Local
-                && let Some(ep) = model.resolved_codex(&cfg.codex)
+    let mut env = backend::prepare_env_forwarding_for_network(cfg, repo, forwarding_policy)?;
+    if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
+        for (name, value) in &state.entries {
+            // A raw provider key snapshotted via `coop start --env` must
+            // not re-enter the guest under either suppression mode: in
+            // proxy mode the host-side proxy holds it, and under
+            // `codex.auth = "chatgpt"` forwarding it would let Codex
+            // silently fall back to API billing. Skip and warn, matching
+            // `prepare_env_forwarding`.
+            if let Some(reason) = forwarding_policy
+                .suppression_reason(name.as_str(), backend::ForwardingSource::PersistedOverride)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
-            } else if proxy_openai
-                && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
-            {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
+                tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
+                continue;
             }
+            env.set(name.as_str(), value.as_str())?;
         }
+    }
+    // Codex reads its provider key from the env var named by `env_key`. In
+    // local-model mode that is the local endpoint's token; in remote proxy
+    // mode it is the per-instance capability token (the raw key stays on
+    // the host). Claude's token rides in settings.json instead. The two
+    // modes are mutually exclusive (mode is Local or Remote).
+    if !isolated
+        && model.mode == model_state::ModelMode::Local
+        && let Some(ep) = model.resolved_codex(&cfg.codex)
+    {
+        env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
+    } else if proxy_openai
+        && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
+    {
+        env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
     }
     Ok(backend::SshSession { target, env })
 }
@@ -2366,15 +2373,33 @@ pub(crate) fn cmd_resize(
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
-    if opts.mem.is_some() || opts.vcpus.is_some() {
+    let _operation = if opts.mem.is_some() || opts.vcpus.is_some() {
         // The backend applies mem/vcpu and, for `--start`, boots the
         // instance itself (Lima must boot to validate regardless).
-        be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
+        let name = stopped.instance().name.clone();
+        let result = be.set_machine_resources(cfg, stopped, opts.mem, opts.vcpus, opts.start);
+        let operation = if opts.disk.is_some() {
+            result.with_context(|| {
+                format!(
+                    "Disk resize for instance '{name}' completed before the machine-resource step failed"
+                )
+            })?
+        } else {
+            result?
+        };
+        Some(operation)
     } else if opts.start {
-        let inst = stopped.instance().clone();
-        drop(stopped);
-        be.start_existing(cfg, &inst)?;
-    }
+        let name = stopped.instance().name.clone();
+        let _operation = be.start_confirmed_stopped(cfg, stopped).with_context(|| {
+            format!(
+                "Disk resize for instance '{name}' completed before start failed. \
+                 The VM may have started; inspect it with `coop status {name}` before retrying"
+            )
+        })?;
+        return Ok(());
+    } else {
+        None
+    };
 
     Ok(())
 }
@@ -2712,27 +2737,22 @@ fn reprovision_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
-    let start_opts = StartOpts {
-        name: Some(&inst.name),
-        workspace_dir: ws_inputs.workspace_dir.as_deref(),
-        git_repo: ws_inputs.git_repo.as_deref(),
-        no_agents: opts.no_agents,
-        no_prompt: opts.no_prompt,
-        // Creation-only: the disk already exists and was sized above.
-        disk: None,
-        mounts: ws_inputs.mounts,
+    let inputs = FirstBootInputs {
+        source: FirstBootSource::from_options(
+            ws_inputs.workspace_dir.as_deref(),
+            ws_inputs.git_repo.as_deref(),
+        ),
+        mounts: &ws_inputs.mounts,
         // No command persists `--exclude-git`, so it cannot be replayed: a
         // workspace originally pushed without `.git/` is re-synced with it.
         exclude_git: false,
-        forward_ports: Vec::new(),
-        config_path: opts.config_path,
+        no_agents: opts.no_agents,
         post_start_override: None,
-        persisted_guest_env: saved_guest_env,
+        persisted_guest_env: &saved_guest_env,
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &payload)
-        .with_context(partial)?;
+    provision_first_boot(be, cfg, &inst, &inputs, repo.as_ref(), &payload).with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
     Ok(())
@@ -2841,8 +2861,8 @@ fn check_reprovision_workspace_source(
     }
 
     // Neither arm can carry a non-UTF-8 path back to the guest: the
-    // `Workspace` arm goes through `StartOpts::workspace_dir`
-    // (`Option<&str>`), and the `Mount` arm through `Mount::from_parts`,
+    // `Workspace` arm goes through `FirstBootSource::Workspace`
+    // (`&str`), and the `Mount` arm through `Mount::from_parts`,
     // which also takes `&str`. Both would see only a lossy rendering naming a
     // different (missing) directory, so both would bail *after* the swap — and
     // identically on every re-run, making the "re-run to finish" advice
@@ -2862,8 +2882,8 @@ fn check_reprovision_workspace_source(
     Ok(())
 }
 
-/// The workspace-shaped `StartOpts` inputs, owned because `StartOpts` borrows
-/// them and they must outlive the call.
+/// The workspace inputs reconstructed for first-boot provisioning. Paths and
+/// URLs are owned because `FirstBootInputs` borrows them during provisioning.
 ///
 /// Named fields rather than a tuple: `workspace_dir` and `git_repo` are both
 /// `Option<String>`, so positional slots would let a swap turn a re-sync into
@@ -2895,7 +2915,7 @@ fn prepare_reprovision_payload(
     })
 }
 
-/// Rebuild the workspace-shaped `StartOpts` inputs from the association the
+/// Rebuild the first-boot workspace inputs from the association the
 /// instance recorded at creation, so the first-boot sync repopulates the
 /// blank disk from the same source it was originally filled from.
 ///
@@ -3248,18 +3268,45 @@ mod tests {
             .unwrap();
         let recipe = inst.dir.join("creation.json");
         let before = std::fs::read(&recipe).unwrap();
-        std::fs::write(inst.pid_file_path(), std::process::id().to_string()).unwrap();
+        #[cfg(target_os = "linux")]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read _", "custom-vmm"])
+            .arg("--config-file")
+            .arg(inst.vm_config_path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let pid = child.id();
+        #[cfg(not(target_os = "linux"))]
+        let pid = std::process::id();
+        std::fs::write(inst.pid_file_path(), pid.to_string()).unwrap();
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::ffi::OsStrExt as _;
             use std::os::unix::fs::PermissionsExt as _;
+
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            let mut ready = false;
+            for _ in 0..500 {
+                if std::fs::read(&cmdline_path).is_ok_and(|bytes| {
+                    bytes
+                        .split(|byte| *byte == 0)
+                        .any(|arg| arg == inst.vm_config_path().as_os_str().as_bytes())
+                }) {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready, "fixture did not expose its instance config argument");
 
             // Inspect the real child without granting the fixture other privileged operations.
             let sudo = root.join("sudo");
             let script = format!(
                 "#!/bin/bash\nset -euo pipefail\n\
-                 [ \"$#\" -eq 2 ] && [ \"$1\" = cat ] && \\\n                 [ \"$2\" = /proc/{}/cmdline ] || exit 1\n\
-                 exec /bin/cat -- \"$2\"\n",
-                std::process::id()
+                 [ \"$#\" -eq 2 ] && [ \"$1\" = cat ] && \\\n                 [ \"$2\" = /proc/{pid}/cmdline ] || exit 1\n\
+                 exec /bin/cat -- \"$2\"\n"
             );
             std::fs::write(&sudo, script).unwrap();
             std::fs::set_permissions(sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3275,6 +3322,11 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(std::fs::read(recipe).unwrap(), before);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]
@@ -3395,6 +3447,23 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unnamed_running_selection_propagates_uncertain_pid_state() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().join("data"));
+        let name = super::config::InstanceName::new("uncertain").unwrap();
+        let image = super::config::ImageName::new("default").unwrap();
+        let inst = cfg.allocate_instance(Some(&name), &image, None).unwrap();
+        std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
+
+        let error = super::resolve_running(&super::backend::PlatformBackend::new(), &cfg, None)
+            .err()
+            .expect("uncertain PID must stop automatic selection")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
     }
 
     #[cfg(target_os = "linux")]
@@ -3906,7 +3975,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let ssh = session
             .command(&[], "/usr/bin/printenv PATH")
@@ -3985,7 +4054,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4035,7 +4104,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4047,6 +4116,51 @@ mod tests {
             Some("saved-value"),
             "non-suppressed --env entries must still flow through",
         );
+    }
+
+    #[test]
+    fn chatgpt_auth_keeps_existing_codex_token_source_distinction() {
+        use std::num::NonZeroU16;
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
+        };
+        let token_name = super::guest_env_state::EnvVarName::new("CODEX_ACCESS_TOKEN").unwrap();
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
+        cfg.guest_env
+            .insert(token_name.clone(), "configured-token".into());
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state.entries.insert(token_name, "persisted-token".into());
+        state.save(&inst).unwrap();
+
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
+        let with_snapshot =
+            super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
+        assert_eq!(
+            with_snapshot
+                .env
+                .guest_values()
+                .get("CODEX_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("persisted-token"),
+        );
+
+        std::fs::remove_file(inst.guest_env_state_path()).unwrap();
+        let without_snapshot =
+            super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
+        assert!(!without_snapshot.env.contains("CODEX_ACCESS_TOKEN"));
     }
 
     #[test]
@@ -4082,7 +4196,7 @@ mod tests {
         // session on the same instance must still come up. `coop codex` and
         // the agent bootstrap are what fail hard, via
         // `backend::ensure_codex_remote_auth_consistent`.
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
@@ -4142,8 +4256,7 @@ mod tests {
                     cfg.ssh.host_tools.clone(),
                 );
                 let session =
-                    super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
-                        .unwrap();
+                    super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
                 assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
                 assert_eq!(
                     session
@@ -4158,8 +4271,7 @@ mod tests {
                     ..Default::default()
                 };
                 model.save(&inst).unwrap();
-                let local =
-                    super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+                let local = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
                 assert_eq!(
                     local
                         .env
@@ -4252,7 +4364,7 @@ mod tests {
             tmp.path().join("id_test"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
 
         for name in [
             "ANTHROPIC_API_KEY",
@@ -4313,7 +4425,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
             .expect("ChatGPT account auth must not break session preparation");
 
         let envs = session.env.guest_values();
@@ -4327,29 +4439,6 @@ mod tests {
             envs.get("COOP_TEST_PASSTHROUGH").map(String::as_str),
             Some("kept"),
             "non-suppressed entries must still flow through",
-        );
-    }
-
-    #[test]
-    fn prepare_session_skips_overlay_without_instance() {
-        use std::num::NonZeroU16;
-
-        let tmp = crate::test_support::private_tempdir().expect("tempdir");
-        let cfg = super::config::CoopConfig::default();
-        let target = super::backend::SshTarget::tcp(
-            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            NonZeroU16::new(22).expect("non-zero"),
-            super::backend::SshUser::new("ubuntu").expect("valid user"),
-            tmp.path().join("id_test"),
-            cfg.ssh.host_tools.clone(),
-        );
-
-        let session =
-            super::prepare_session_from_target(&cfg, None, target, None).expect("session");
-
-        assert!(
-            !session.env.contains("FROM_CLI"),
-            "without an instance, no persisted overlay should be applied",
         );
     }
 
@@ -4523,7 +4612,7 @@ mod tests {
     }
 
     /// A non-UTF-8 workspace path must be rejected *before* `restore_disk`.
-    /// `StartOpts::workspace_dir` is `Option<&str>`, so it would otherwise
+    /// `FirstBootSource::Workspace` holds `&str`, so it would otherwise
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
