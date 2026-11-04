@@ -214,12 +214,8 @@ enum Commands {
         /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
         /// Overrides `guest_env` entries from config and any forwarded
         /// values with the same name.
-        #[arg(
-            long = "env",
-            value_name = "KEY=VALUE",
-            value_parser = guest_env_state::parse_cli_env_arg,
-        )]
-        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        guest_env: Vec<String>,
     },
     /// One-shot: ensure default image, start an instance for cwd, launch Claude.
     ///
@@ -314,12 +310,8 @@ enum Commands {
         /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
         /// Overrides `guest_env` entries from config and any forwarded
         /// values with the same name.
-        #[arg(
-            long = "env",
-            value_name = "KEY=VALUE",
-            value_parser = guest_env_state::parse_cli_env_arg,
-        )]
-        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        guest_env: Vec<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -977,6 +969,14 @@ pub fn run() -> Result<()> {
     clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command).complete();
 
     let cli = Cli::parse();
+    // Clap echoes a rejected value in its error, so parse secret-bearing
+    // --env entries after clap and before any config or VM work.
+    let parsed_guest_env = match &cli.command {
+        Commands::Up { guest_env, .. } | Commands::Start { guest_env, .. } => {
+            guest_env_state::parse_cli_env_args(guest_env)?
+        }
+        _ => Vec::new(),
+    };
     validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
@@ -1126,7 +1126,7 @@ pub fn run() -> Result<()> {
             no_prompt,
             forward_port,
             post_start,
-            guest_env,
+            guest_env: _,
         } => {
             cfg.validate_and_warn()?;
             let transport = match (copy, mount) {
@@ -1164,7 +1164,7 @@ pub fn run() -> Result<()> {
                     no_prompt,
                     forward_ports: forward_port,
                     post_start,
-                    guest_env,
+                    guest_env: parsed_guest_env,
                 },
             };
             cmd_up(&be, &mut cfg, &cli.config, &opts)
@@ -1212,7 +1212,7 @@ pub fn run() -> Result<()> {
             no_github: _,
             no_prompt,
             post_start,
-            guest_env,
+            guest_env: _,
             forward_port: forward_ports,
         } => {
             cfg.validate_and_warn()?;
@@ -1236,7 +1236,7 @@ pub fn run() -> Result<()> {
                 persisted_guest_env: std::collections::BTreeMap::new(),
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
-            apply_runtime_guest_env(&mut cfg, &guest_env, &mut start_opts);
+            apply_runtime_guest_env(&mut cfg, &parsed_guest_env, &mut start_opts);
             cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
@@ -2250,7 +2250,8 @@ token = "test-pat"
         let super::Commands::Start { guest_env, .. } = cli.command else {
             panic!("expected Start variant");
         };
-        let pairs: Vec<(String, String)> = guest_env
+        let pairs: Vec<(String, String)> = super::guest_env_state::parse_cli_env_args(&guest_env)
+            .unwrap()
             .into_iter()
             .map(|(k, v)| (k.as_str().to_string(), v))
             .collect();
@@ -2264,13 +2265,17 @@ token = "test-pat"
     }
 
     #[test]
-    fn start_env_flag_rejects_invalid_key_at_clap_time() {
+    fn start_env_flag_validates_after_clap_without_echoing_value() {
         use clap::Parser as _;
-        let argv = ["coop", "start", "--env", "1BAD=value"];
-        let Err(err) = super::Cli::try_parse_from(argv) else {
-            panic!("expected --env to reject invalid KEY");
+        let cli =
+            super::Cli::try_parse_from(["coop", "start", "--env", "1BAD=secret-sentinel"]).unwrap();
+        let super::Commands::Start { guest_env, .. } = cli.command else {
+            panic!("expected Start variant");
         };
-        assert!(format!("{err}").contains("--env KEY is invalid"));
+        let error = super::guest_env_state::parse_cli_env_args(&guest_env).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--env KEY is invalid"));
+        assert!(!message.contains("secret-sentinel"));
     }
 
     #[test]
