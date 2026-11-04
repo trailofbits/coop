@@ -60,6 +60,7 @@ mod signal;
     reason = "setup is interactive CLI — stderr is user communication"
 )]
 mod setup;
+mod setup_tool;
 mod shell;
 mod ssh;
 #[cfg(test)]
@@ -1072,9 +1073,23 @@ pub fn run() -> Result<()> {
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    #[cfg(target_os = "linux")]
+    if matches!(&cli.command, Commands::Setup { .. }) {
+        setup::preflight_bootstrap(&cfg)?;
+    }
+    #[cfg(target_os = "linux")]
+    if !matches!(&cli.command, Commands::Setup { .. }) {
+        private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
+    }
+    #[cfg(target_os = "macos")]
     private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
+    #[cfg(target_os = "linux")]
+    if !matches!(&cli.command, Commands::Setup { .. }) {
+        update::maybe_run_background_check(&cfg.updates);
+    }
+    #[cfg(target_os = "macos")]
     update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
     tracing::debug!("Using backend: {be}");

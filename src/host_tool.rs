@@ -47,13 +47,6 @@ impl TrustedToolPolicy {
         self
     }
 
-    #[cfg_attr(
-        not(any(target_os = "linux", test)),
-        expect(
-            dead_code,
-            reason = "the first production policy is Linux-only; later families can reuse this constructor"
-        )
-    )]
     pub(crate) fn new(
         trust_anchor: impl Into<PathBuf>,
         allowed_roots: impl IntoIterator<Item = PathBuf>,
@@ -799,6 +792,17 @@ fn resolve_and_validate(
             return Ok((current, metadata));
         }
     }
+}
+
+/// Validate the actual filesystem object and every path component controlling
+/// it, including symlink hops. Used for root-managed tool configuration.
+pub(crate) fn validate_trusted_path(
+    path: &Path,
+    policy: &TrustedToolPolicy,
+) -> Result<(PathBuf, Metadata), String> {
+    let (canonical, metadata) = resolve_and_validate(path, policy)?;
+    validate_owner_and_mode(&metadata, &policy.trusted_uids, "path target")?;
+    Ok((canonical, metadata))
 }
 
 fn validate_owner_and_mode(

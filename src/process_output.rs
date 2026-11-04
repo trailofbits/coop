@@ -1,5 +1,6 @@
 //! Bounded output capture for host subprocesses.
 
+use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, ExitStatus, Stdio};
@@ -43,6 +44,88 @@ pub(crate) enum CaptureError {
     Io(#[source] std::io::Error),
     #[error("process identifier cannot be represented as a process group")]
     InvalidPid,
+    #[error("process stdin payload exceeds the 4096-byte setup limit")]
+    InputLimit,
+}
+
+/// Run a setup child with inherited output, closed or bounded input, and a
+/// process-group deadline. This keeps package and extraction progress visible.
+pub(crate) fn run_status_bounded(
+    command: &mut Command,
+    deadline: Duration,
+    input: Option<&[u8]>,
+) -> Result<ExitStatus, CaptureError> {
+    let _signals = crate::signal::install_handlers();
+    run_status_bounded_with_shutdown(command, deadline, input, crate::signal::shutdown_requested)
+}
+
+fn run_status_bounded_with_shutdown(
+    command: &mut Command,
+    deadline: Duration,
+    input: Option<&[u8]>,
+    shutdown_requested: impl Fn() -> bool,
+) -> Result<ExitStatus, CaptureError> {
+    if input.is_some_and(|bytes| bytes.len() > 4096) {
+        return Err(CaptureError::InputLimit);
+    }
+    command.process_group(0);
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command.spawn().map_err(CaptureError::Spawn)?;
+    let Ok(pid) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CaptureError::InvalidPid);
+    };
+    if let Some(bytes) = input {
+        let Some(mut stdin) = child.stdin.take() else {
+            kill_group(pid, &mut child);
+            let _ = child.wait();
+            return Err(CaptureError::Io(std::io::Error::other(
+                "child stdin pipe was not created",
+            )));
+        };
+        if let Err(error) = stdin.write_all(bytes) {
+            kill_group(pid, &mut child);
+            let _ = child.wait();
+            return Err(CaptureError::Io(error));
+        }
+    }
+    let started = Instant::now();
+    loop {
+        if shutdown_requested() {
+            terminate_group(pid, &mut child);
+            return Err(CaptureError::Interrupted);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                kill_group(pid, &mut child);
+                let _ = child.wait();
+                return Err(CaptureError::Io(error));
+            }
+        }
+        if started.elapsed() >= deadline {
+            terminate_group(pid, &mut child);
+            return Err(CaptureError::Timeout(deadline));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn terminate_group(pid: i32, child: &mut std::process::Child) {
+    // Give wrappers such as sudo time to forward a catchable termination
+    // signal to a privileged child before the wrapper is killed.
+    let _ = unsafe { libc::kill(-pid, libc::SIGTERM) }; // SAFETY: pid is our positive group leader.
+    // Keep the direct child unreaped, so its PID cannot be reused before the
+    // final group signal. A descendant may outlive a wrapper that exits early.
+    std::thread::sleep(Duration::from_secs(3));
+    kill_group(pid, child);
+    let _ = child.wait();
 }
 
 pub(crate) fn run_bounded(
@@ -115,14 +198,17 @@ fn run_bounded_with_shutdown(
             }
             Err(error) => break Some(CaptureError::Io(error)),
         }
-        if status.is_none() {
+        if shutdown_requested() {
+            break Some(CaptureError::Interrupted);
+        }
+        // Do not reap the group leader while a detached descendant still
+        // holds a pipe open. Its unreaped PID pins the numeric group ID used
+        // for timeout and cancellation cleanup.
+        if stdout_eof && stderr_eof && status.is_none() {
             match child.try_wait() {
                 Ok(observed) => status = observed,
                 Err(error) => break Some(CaptureError::Io(error)),
             }
-        }
-        if shutdown_requested() {
-            break Some(CaptureError::Interrupted);
         }
         if status.is_some() && stdout_eof && stderr_eof {
             break None;
@@ -220,6 +306,122 @@ fn kill_group(pid: i32, child: &mut std::process::Child) {
 #[expect(clippy::panic, clippy::unwrap_used, reason = "process fixtures")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_runner_distinguishes_exit_timeout_and_cancellation() {
+        let success = run_status_bounded_with_shutdown(
+            &mut Command::new("/bin/true"),
+            Duration::from_secs(1),
+            None,
+            || false,
+        )
+        .unwrap();
+        assert!(success.success());
+
+        let exit = run_status_bounded_with_shutdown(
+            &mut Command::new("/bin/false"),
+            Duration::from_secs(1),
+            None,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(exit.code(), Some(1));
+
+        let timeout = run_status_bounded_with_shutdown(
+            Command::new("/bin/sleep").arg("2"),
+            Duration::from_millis(20),
+            None,
+            || false,
+        )
+        .unwrap_err();
+        assert!(matches!(timeout, CaptureError::Timeout(_)));
+
+        let cancelled = run_status_bounded_with_shutdown(
+            Command::new("/bin/sleep").arg("2"),
+            Duration::from_secs(1),
+            None,
+            || true,
+        )
+        .unwrap_err();
+        assert!(matches!(cancelled, CaptureError::Interrupted));
+    }
+
+    #[test]
+    fn status_runner_closes_bounded_stdin_after_the_payload() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("payload");
+        let status = run_status_bounded_with_shutdown(
+            Command::new("/usr/bin/tee")
+                .arg(&target)
+                .stdout(Stdio::null()),
+            Duration::from_secs(1),
+            Some(b"fixed payload"),
+            || false,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&target).unwrap(), b"fixed payload");
+        let too_long = run_status_bounded_with_shutdown(
+            &mut Command::new("/bin/true"),
+            Duration::from_secs(1),
+            Some(&[0; 4097]),
+            || false,
+        )
+        .unwrap_err();
+        assert!(matches!(too_long, CaptureError::InputLimit));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_runner_cancels_a_privileged_sudo_child_when_available() {
+        if !Command::new("/usr/bin/sudo")
+            .args(["-n", "/bin/true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join("child-pid");
+        let script = format!(
+            "trap '' TERM; echo $$ > {}; exec /bin/sleep 30",
+            marker.display()
+        );
+        let mut command = crate::setup_tool::SetupTool::sudo_command(Duration::from_secs(5))
+            .unwrap()
+            .args(["/bin/sh", "-c", &script])
+            .build();
+        let error = run_status_bounded_with_shutdown(
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            Duration::from_secs(5),
+            None,
+            || marker.exists(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CaptureError::Interrupted));
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(gone, "sudo's privileged child remained after cancellation");
+    }
 
     struct InterruptedThenData(u8);
 
@@ -499,6 +701,62 @@ mod tests {
             .unwrap();
         // SAFETY: terminate only the PID written by this test's detached fixture.
         let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_keeps_group_leader_unreaped_until_pipes_close() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let leader_file = temp.path().join("leader-pid");
+        let detached_file = temp.path().join("detached-pid");
+        let executable = std::env::current_exe().unwrap();
+        let script = format!(
+            "echo $$ > {}; {} --exact process_output::tests::detached_descendant_cannot_extend_the_return_deadline --nocapture &",
+            crate::shell::shell_escape(&leader_file.to_string_lossy()),
+            crate::shell::shell_escape(&executable.to_string_lossy()),
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .env("COOP_CAPTURE_SETSID_HELPER", "1")
+            .env("COOP_CAPTURE_SETSID_PID_FILE", &detached_file);
+        let worker = std::thread::spawn(move || {
+            run_bounded(
+                &mut command,
+                CapturePolicy {
+                    stdout_max: 1024,
+                    stderr_max: 1024,
+                    completion: CompletionPolicy::Deadline(Duration::from_secs(2)),
+                },
+            )
+        });
+        for _ in 0..200 {
+            if leader_file.exists() && detached_file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let leader_pid = std::fs::read_to_string(&leader_file).unwrap();
+        let mut unreaped = false;
+        for _ in 0..200 {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", leader_pid.trim()));
+            if stat.is_ok_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|tail| tail.split_whitespace().next() == Some("Z"))
+            }) {
+                unreaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let result = worker.join().unwrap();
+        let detached_pid = std::fs::read_to_string(detached_file).unwrap();
+        let detached_pid: i32 = detached_pid.trim().parse().unwrap();
+        // SAFETY: terminate only the PID written by this test's detached fixture.
+        let _ = unsafe { libc::kill(detached_pid, libc::SIGKILL) };
+        assert!(matches!(result, Err(CaptureError::Timeout(_))));
+        assert!(unreaped, "the group leader was reaped before pipe EOF");
     }
 
     #[test]

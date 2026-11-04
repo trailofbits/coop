@@ -146,6 +146,37 @@ close inherited file descriptors. It also does not cover other host subprocess
 families. Exact overrides are re-resolved from the current config on every
 operation and are never persisted into instance state.
 
+Firecracker setup applies the same pathname checks to its system tools. On the
+Ubuntu CI coreutils layout, the conventional candidates for `cat`, `chmod`,
+`rm`, `mkdir`, `tee`, `chroot`, `rmdir`, `id`, and `timeout` may also resolve to
+their exact `/usr/lib/cargo/bin/coreutils/<tool>` targets. Only those setup
+roles accept those targets; ownership and writability checks still cover every
+path component. The bootstrap phase resolves `sudo`, `timeout`, and `curl`, the
+available package prerequisites, and `apt-get` plus `cat` if installation is
+needed before setup's first storage change.
+After package installation, setup re-resolves `sudo` and `timeout`, then resolves `tar`, `gzip`, `chmod`, `rm`,
+`unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
+`e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
+request. KVM access repair additionally resolves `setfacl` or `usermod` and
+`id` before changing permissions. The privileged disk helper resolves its
+filesystem tools again after `sudo`. Setup launches from `/` with a cleared
+environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
+its default config file and receives only HTTPS proxy and no-proxy settings
+from the caller. Elevated programs remain subject to trusted sudoers and host
+package-manager configuration. Before package installation, setup checks the
+filesystem entries below `/etc/apt`, their symlink targets, and apt
+configuration include paths for root ownership and group/other writability.
+Private root-owned apt fragments are read through the resolved `cat` under
+the same bounded `sudo` launch path; their contents are not logged.
+Apt delegates its method helpers, `dpkg`, configured hooks, and package
+maintainer scripts to that system package policy; these indirect children are
+not a closed preflight family. Package installation passes only
+`DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
+launcher environment. These pathname checks do not authenticate
+downloaded artifacts or pin an executable inode through `exec`. For elevated
+launches, a nonzero `sudo` status can come from `sudo`, `timeout`, or the target;
+the outer status alone does not prove which process returned it.
+
 ## Secrets and how they cross into the guest
 
 `[[guest_files]]` explicitly authorizes copying complete host source trees into

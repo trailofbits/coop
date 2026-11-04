@@ -150,7 +150,7 @@ if sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" \
     echo 'read-only check accepted an inconsistent filesystem' >&2
     exit 1
 fi
-grep -Fq '/usr/sbin/e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
+grep -Fq 'e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
 
 # The image grew before fsck, but ext4 did not. Retrying the same absolute size
 # must repair the inode and finish the filesystem grow through the public CLI.

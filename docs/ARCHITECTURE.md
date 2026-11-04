@@ -23,6 +23,7 @@ coop/
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
+│   ├── setup_tool.rs       # Firecracker setup-tool roles and launch policy
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
 │   ├── workspace.rs        # workspace sync (rsync) + ~/.ssh/config injection
@@ -155,7 +156,9 @@ any instance operation lock is acquired.
    loading, or other setup side effects.
 4. Init tracing (→ **stderr**) and handle commands that must work **without** a
    loaded config — `Completions`, `Init`, `Update`, `Uninstall` — first.
-5. `config::CoopConfig::load`, then fire the update-notifier check.
+5. `config::CoopConfig::load`; on Linux, preflight Firecracker setup tools
+   before managed-storage repair. Non-setup commands prepare storage here.
+   Print the update notice; run its background check except during Linux setup.
 6. Construct `backend::PlatformBackend::new()`.
 7. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
    handlers call `cfg.validate_and_warn()?` before VM work; query commands
@@ -291,6 +294,10 @@ The invocation-selected config may replace any identity with one exact absolute
 path for non-FHS layouts. An override never falls back; it retains the full
 root-owned, non-writable path-chain checks but intentionally does not claim
 package, hash, basename, or command-semantic identity.
-`setup_tap` resolves the complete set before its first probe or mutation. This
-policy is specific to `network.rs`; other host subprocess families retain their
-own launch contracts until migrated.
+`setup_tap` resolves the complete set before its first probe or mutation.
+Firecracker setup also uses the resolver for its fixed system-tool family:
+bootstrap tools are checked before storage changes or package installation,
+and the installed family is checked afterward, before artifact downloads and
+image construction. The privileged disk helper repeats filesystem-tool
+resolution at its elevated launch boundary. Other host subprocess families
+retain their own launch contracts.
