@@ -1327,8 +1327,17 @@ pub(crate) fn resolve_running(
         return Ok(running);
     }
 
-    let (running, stopped): (Vec<_>, Vec<_>) =
-        instances.into_iter().partition(|i| be.is_running(i));
+    let states = be.probe_running_states(&instances)?;
+    anyhow::ensure!(
+        states.len() == instances.len(),
+        "Backend returned an incomplete instance state inventory"
+    );
+    let (running, stopped): (Vec<_>, Vec<_>) = instances
+        .into_iter()
+        .zip(states)
+        .partition(|(_, running)| *running);
+    let running: Vec<_> = running.into_iter().map(|(inst, _)| inst).collect();
+    let stopped: Vec<_> = stopped.into_iter().map(|(inst, _)| inst).collect();
 
     match running.len() {
         1 => {
@@ -3436,6 +3445,23 @@ mod tests {
             data_dir: super::config::ConfigPath::new(dir),
             ..super::config::CoopConfig::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unnamed_running_selection_propagates_uncertain_pid_state() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().join("data"));
+        let name = super::config::InstanceName::new("uncertain").unwrap();
+        let image = super::config::ImageName::new("default").unwrap();
+        let inst = cfg.allocate_instance(Some(&name), &image, None).unwrap();
+        std::fs::write(inst.pid_file_path(), "invalid-pid").unwrap();
+
+        let error = super::resolve_running(&super::backend::PlatformBackend::new(), &cfg, None)
+            .err()
+            .expect("uncertain PID must stop automatic selection")
+            .to_string();
+        assert!(error.contains("Invalid Firecracker PID file"), "{error}");
     }
 
     #[cfg(target_os = "linux")]

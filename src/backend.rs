@@ -1177,6 +1177,10 @@ pub trait VmBackend: std::fmt::Display {
     fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
         instances.iter().map(|inst| self.is_running(inst)).collect()
     }
+    /// Fallible batch probe for decisions that require every instance's state
+    /// to be known. Unlike `list_running`, an uncertain state cannot select a
+    /// different instance by omission.
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>>;
     /// Probe the live state of `inst`, returning a `RunningInstance`
     /// when it is up. This is the single chokepoint for "is this VM
     /// alive?" — call sites that need to operate on a running VM
@@ -1586,6 +1590,10 @@ impl VmBackend for FirecrackerBackend {
         inst.is_running()
     }
 
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>> {
+        instances.iter().map(Instance::probe_liveness).collect()
+    }
+
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
         if !inst.probe_liveness()? {
             return Ok(None);
@@ -1803,6 +1811,10 @@ impl VmBackend for LimaBackend {
 
     fn list_running(&self, instances: &[Instance]) -> Vec<bool> {
         crate::lima::list_running(instances)
+    }
+
+    fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>> {
+        crate::lima::probe_running_states(instances)
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {

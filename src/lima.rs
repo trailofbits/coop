@@ -722,6 +722,54 @@ pub(crate) fn list_running(instances: &[Instance]) -> Vec<bool> {
         .collect()
 }
 
+/// Probe every registered instance from one Lima inventory. Selection must
+/// fail if any state is uncertain, even when another instance is running.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn probe_running_states(instances: &[Instance]) -> Result<Vec<bool>> {
+    if instances.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = lima_home()?;
+    for inst in instances {
+        seal_instance_storage(&home.join(lima_name(inst)))?;
+    }
+
+    let names: std::collections::HashSet<_> = instances.iter().map(lima_name).collect();
+    let output = limactl_list_output()?;
+    let mut states = std::collections::HashMap::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: serde_json::Value =
+            serde_json::from_str(line).context("Failed to parse limactl JSON output")?;
+        if let Some(name) = entry["name"].as_str().filter(|name| names.contains(*name)) {
+            let status = entry["status"]
+                .as_str()
+                .context("Lima status is missing or invalid")?;
+            states
+                .entry(name.to_owned())
+                .or_insert_with(|| LimaState::from_status_str(status));
+        }
+    }
+
+    instances
+        .iter()
+        .map(|inst| {
+            let name = lima_name(inst);
+            match states.get(&name) {
+                Some(LimaState::Running) => Ok(true),
+                Some(LimaState::Stopped) => Ok(false),
+                Some(state) => anyhow::bail!(
+                    "Lima instance '{}' is {state}; running state is unknown",
+                    inst.name
+                ),
+                None => anyhow::bail!(
+                    "Lima instance '{}' is absent; running state is unknown",
+                    inst.name
+                ),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
     lima_state(&inst.name)
 }
@@ -2452,6 +2500,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated limactl fixture covers both batch probe contracts"
+    )]
     fn list_running_reuses_inventory() {
         use std::os::unix::fs::PermissionsExt as _;
         let Ok(root) = std::env::var("COOP_TEST_LIST_INVENTORY") else {
@@ -2516,6 +2568,50 @@ mod tests {
                 1
             );
         }
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert_eq!(
+            probe_running_states(&instances[..2]).unwrap(),
+            [true, false]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            probe_running_states(&instances)
+                .unwrap_err()
+                .to_string()
+                .contains("absent")
+        );
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Broken\"}\n").unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Broken")
+        );
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Starting\"}\n").unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Starting")
+        );
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\ninvalid\n",
+        )
+        .unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse limactl JSON output")
+        );
         fs::write(
             root.join("inventory"),
             "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
@@ -2524,12 +2620,13 @@ mod tests {
         fs::write(root.join("fail"), "").unwrap();
         fs::write(root.join("count"), "").unwrap();
         assert_eq!(list_running(&instances), vec![false; 3]);
+        assert!(probe_running_states(&instances[..2]).is_err());
         assert_eq!(
             fs::read_to_string(root.join("count"))
                 .unwrap()
                 .lines()
                 .count(),
-            1
+            2
         );
         fs::remove_file(root.join("fail")).unwrap();
         assert_eq!(list_running(&instances), vec![true, false, false]);
@@ -2537,6 +2634,7 @@ mod tests {
         // A rejected storage path affects only that instance, even with a shared inventory.
         std::os::unix::fs::symlink(root.join("outside"), root.join("coop-alpha")).unwrap();
         assert_eq!(list_running(&instances), vec![false, true, false]);
+        assert!(probe_running_states(&instances[..2]).is_err());
         fs::remove_file(root.join("coop-alpha")).unwrap();
         fs::write(root.join("count"), "").unwrap();
         assert!(list_running(&[]).is_empty());
