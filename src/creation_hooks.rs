@@ -12,7 +12,7 @@ use crate::config::{CoopConfig, Instance};
 use crate::remote_command::RemoteCommand;
 
 /// A NUL-free shell command with redacted debug output.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 struct CreationCommand(String);
 
@@ -268,23 +268,62 @@ impl CreationIncomplete {
     }
 }
 
-pub(crate) fn run_pending(inst: &Instance, session: &SshSession) -> Result<CreationProgress> {
-    let _lock = crate::backend::lock_instance_operation(inst)?;
-    let Some(mut state) = CreationState::load(inst)? else {
-        return Ok(CreationProgress::Unchanged);
+pub(crate) fn run_pending(
+    inst: &Instance,
+    session: &SshSession,
+    probe_running: impl FnOnce() -> Result<bool>,
+) -> Result<CreationProgress> {
+    run_pending_with(
+        inst,
+        |command| {
+            let directory = crate::guest::GuestUser::new(session.target.user().as_ref())?.home();
+            execute(session, command, directory.as_ref())
+        },
+        probe_running,
+    )
+}
+
+fn run_pending_with(
+    inst: &Instance,
+    execute_hook: impl FnOnce(&CreationCommand) -> Result<()>,
+    probe_running: impl FnOnce() -> Result<bool>,
+) -> Result<CreationProgress> {
+    let command = {
+        let _operation = crate::backend::lock_instance_operation(inst)?;
+        let Some(state) = CreationState::load(inst)? else {
+            return Ok(CreationProgress::Unchanged);
+        };
+        let Some(stage) = state.global.as_ref() else {
+            return Ok(CreationProgress::Unchanged);
+        };
+        if stage.completion == Completion::Succeeded {
+            return Ok(CreationProgress::Unchanged);
+        }
+        ensure_prepared(&state)?;
+        stage.command.clone()
     };
-    let Some(mut stage) = state.global.take() else {
-        return Ok(CreationProgress::Unchanged);
-    };
-    if stage.completion == Completion::Succeeded {
-        return Ok(CreationProgress::Unchanged);
-    }
-    ensure_prepared(&state)?;
-    let directory = crate::guest::GuestUser::new(session.target.user().as_ref())?.home();
+
     tracing::info!("Running global post_create");
-    execute(session, &stage.command, directory.as_ref()).context("global post_create failed")?;
+    execute_hook(&command).context("global post_create failed")?;
+
+    let _operation = crate::backend::lock_instance_operation(inst)?;
+    ensure!(
+        probe_running()?,
+        "Instance '{}' stopped while global post_create was running; completion remains pending",
+        inst.name
+    );
+    let Some(mut state) = CreationState::load(inst)? else {
+        anyhow::bail!("Creation recipe disappeared while global post_create was running");
+    };
+    ensure_prepared(&state)?;
+    let Some(stage) = state.global.as_mut() else {
+        anyhow::bail!("Global post_create was removed while it was running");
+    };
+    ensure!(
+        stage.completion == Completion::Pending && stage.command == command,
+        "Global post_create changed while it was running; completion remains pending"
+    );
     stage.completion = Completion::Succeeded;
-    state.global = Some(stage);
     state.save(inst)?;
     Ok(CreationProgress::Finished(state.post_start))
 }
@@ -375,13 +414,14 @@ mod tests {
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
     use crate::creation_hooks::{
         Completion, CreationCommand, CreationProgress, CreationState, Preparation, ensure_complete,
-        ensure_prepared, execute_staged, pending, restore_disk, script, set_preparation,
-        wait_for_hook,
+        ensure_prepared, execute_staged, pending, restore_disk, run_pending_with, script,
+        set_preparation, wait_for_hook,
     };
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
     use std::process::Command;
+    use std::time::Duration;
 
     fn instance(dir: &Path) -> Instance {
         Instance {
@@ -502,6 +542,72 @@ mod tests {
             0o600
         );
         assert!(ensure_complete(&inst).is_err());
+    }
+
+    #[test]
+    fn pending_hook_releases_operation_lock_and_revalidates_before_completion() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = instance(&root.path().join("instance"));
+        let cfg = CoopConfig {
+            post_create: Some("saved command".into()),
+            ..CoopConfig::default()
+        };
+        let mut state = CreationState::select(&cfg, None).unwrap();
+        state.preparation = Preparation::Ready;
+        state.save(&inst).unwrap();
+
+        let progress = run_pending_with(
+            &inst,
+            |command| {
+                assert_eq!(command.0, "saved command");
+                // A concurrent stop must be able to take this lock while the
+                // guest hook is running.
+                let _concurrent =
+                    crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::ZERO).unwrap();
+                Ok(())
+            },
+            || {
+                assert!(
+                    crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::ZERO).is_err(),
+                    "operation lock must cover final liveness probe and save"
+                );
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(matches!(progress, CreationProgress::Finished(None)));
+        assert!(!pending(&inst).unwrap());
+
+        state.save(&inst).unwrap();
+        let error = run_pending_with(&inst, |_| Ok(()), || Ok(false))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("stopped"), "{error:#}");
+        assert!(pending(&inst).unwrap());
+
+        let error = run_pending_with(
+            &inst,
+            |_| {
+                let mut changed = CreationState::load(&inst)?.unwrap();
+                changed.global.as_mut().unwrap().command =
+                    CreationCommand::shell("replacement command")?;
+                changed.save(&inst)
+            },
+            || Ok(true),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(
+            CreationState::load(&inst)
+                .unwrap()
+                .unwrap()
+                .global
+                .unwrap()
+                .command
+                .0,
+            "replacement command"
+        );
     }
 
     fn completed_restore_fixture(root: &Path) -> (Instance, std::path::PathBuf) {
