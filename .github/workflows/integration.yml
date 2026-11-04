@@ -17,13 +17,14 @@ env:
 
 jobs:
   integration:
-    name: Full integration (${{ matrix.shard }} / Linux x64 / KVM)
-    runs-on: ubuntu-24.04
+    name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         shard: [lifecycle, workspace, config]
+        os: [ubuntu-24.04, ubuntu-26.04]
     defaults:
       run:
         shell: bash
@@ -67,7 +68,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: firecracker-integration-${{ matrix.shard }}-log
+          name: firecracker-integration-${{ matrix.os }}-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/firecracker-integration.log
           if-no-files-found: ignore
           retention-days: 7
