@@ -1064,6 +1064,11 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
     // so a crash mid-build leaves the old image intact.
     let staging = template.with_extension("ext4.new");
 
+    // SIGKILL can bypass MountGuard while a chroot child is still running.
+    // Reap the fixed shared mount tree before replacing any staging disk.
+    crate::privileged_disk::recover_stale_template_mount(&staging)
+        .context("Failed to recover interrupted template mount")?;
+
     // Clean up leftover staging artifact from a previous failed build
     if let Err(e) = crate::privileged_disk::remove(&staging) {
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
@@ -2044,10 +2049,17 @@ fn unmount_chroot(disk: &Path, mount_str: &str) -> Result<()> {
     if let Err(e) = crate::privileged_disk::unmount(disk) {
         first_error.get_or_insert_with(|| anyhow::anyhow!("Failed to unmount {mount_str}: {e}"));
     }
+    if first_error.is_some() {
+        // A child can briefly retain cwd or an open descriptor after its
+        // parent exits. Retry only the mounts still present, while the guard
+        // continues to hold the shared mount lock.
+        crate::privileged_disk::recover_template_mount_under_lock(disk)
+            .context("Failed to finish chroot mount cleanup")?;
+    }
     if let Err(error) = Cmd::new("rmdir").arg(mount_str).sudo().run() {
         tracing::warn!("Failed to remove mount directory {mount_str} (non-fatal): {error}");
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 // ── General helpers ───────────────────────────────────────────

@@ -72,7 +72,13 @@ if ! mountpoint -q "$data_dir/sentinel"; then
     exit 1
 fi
 sudo -n umount "$data_dir/sentinel"
-sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+# A killed setup can leave the root mount busy until a child exits. Recovery
+# must wait for that child, unmount the old image, and permit a fresh build.
+(cd "$data_dir/rootfs-mount" && touch "$data_dir/holder-ready" && sleep 1) &
+holder=$!
+while [[ ! -e $data_dir/holder-ready ]]; do sleep 0.01; done
+sudo -n "$coop_bin" __disk-op recover-template-mount "$data_dir" "$stage"
+wait "$holder"
 sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage"
 
 ln -s "$data_dir/sentinel" "$instance"
@@ -100,7 +106,7 @@ sudo -n cmp "$sparse_source" "$sparse_target"
 rm "$data_dir/squashfs-root/proc"
 mkdir "$data_dir/squashfs-root/proc"
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
-for _ in 1 2; do
+for iteration in 1 2; do
     sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
     for child in proc sys dev devpts tmp; do
         sudo -n "$coop_bin" __disk-op "mount-$child" "$data_dir" "$stage"
@@ -113,10 +119,14 @@ for _ in 1 2; do
     [[ -s "$data_dir/rootfs-mount/etc/resolv.conf" ]]
     # Guest can make its own root writable; cleanup must still work.
     sudo -n chmod 0777 "$data_dir/rootfs-mount"
-    for child in tmp devpts dev sys proc; do
-        sudo -n "$coop_bin" __disk-op "unmount-$child" "$data_dir" "$stage"
-    done
-    sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+    if [[ $iteration == 1 ]]; then
+        sudo -n "$coop_bin" __disk-op recover-template-mount "$data_dir" "$stage"
+    else
+        for child in tmp devpts dev sys proc; do
+            sudo -n "$coop_bin" __disk-op "unmount-$child" "$data_dir" "$stage"
+        done
+        sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+    fi
     if mountpoint -q "$data_dir/rootfs-mount"; then
         echo 'loop mount remained after unmount' >&2
         exit 1
