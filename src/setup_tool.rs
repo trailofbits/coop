@@ -19,6 +19,7 @@ use crate::host_tool::{
 
 const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
+const APT_CONFIG_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
 fn apt_directive_has_separator(input: &[u8]) -> bool {
     let mut offset = 0;
@@ -111,21 +112,62 @@ pub(crate) enum SetupToolError {
     #[error("Firecracker setup tool '{tool}' candidate is not an absolute path: {path}")]
     InvalidCandidate { tool: &'static str, path: PathBuf },
     #[error(
-        "System apt configuration is not root-controlled: {reason}; repair it before retrying setup"
+        "System apt configuration could not be validated: {reason}; repair its files or permissions and retry setup"
     )]
     AptConfiguration { reason: String },
 }
 
 pub(crate) fn validate_apt_configuration() -> Result<(), SetupToolError> {
+    // A private root-owned apt fragment may require an elevated read.
+    SetupTool::Cat.resolve()?;
     let policy = TrustedToolPolicy::new("/", [], 0);
     validate_apt_configuration_at(Path::new("/etc/apt"), &policy)
+}
+
+fn read_apt_configuration(path: &Path) -> Result<Vec<u8>, SetupToolError> {
+    match fs::read(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let mut command = SetupTool::Cat
+                .elevated()
+                .map_err(|error| SetupToolError::AptConfiguration {
+                    reason: error.to_string(),
+                })?
+                .arg(path.as_os_str())
+                .build();
+            let output = crate::process_output::run_bounded(
+                &mut command,
+                crate::process_output::CapturePolicy {
+                    stdout_max: APT_CONFIG_CAPTURE_LIMIT,
+                    stderr_max: 4096,
+                    completion: crate::process_output::CompletionPolicy::Deadline(
+                        Duration::from_secs(30),
+                    ),
+                },
+            )
+            .map_err(|error| SetupToolError::AptConfiguration {
+                reason: format!("elevated configuration read failed: {error}"),
+            })?;
+            if !output.status.success() {
+                return Err(SetupToolError::AptConfiguration {
+                    reason: format!("elevated configuration read exited with {}", output.status),
+                });
+            }
+            Ok(output.stdout)
+        }
+        Err(error) => Err(SetupToolError::AptConfiguration {
+            reason: error.to_string(),
+        }),
+    }
 }
 
 fn validate_apt_configuration_at(
     root: &Path,
     policy: &TrustedToolPolicy,
 ) -> Result<(), SetupToolError> {
-    let mut pending = vec![(root.to_path_buf(), false)];
+    let (root, _) = crate::host_tool::validate_trusted_path(root, policy)
+        .map_err(|reason| SetupToolError::AptConfiguration { reason })?;
+    let mut pending = vec![(root.clone(), false)];
     let mut visited = HashSet::new();
     let mut entries = 0usize;
     while let Some((path, scan_config)) = pending.pop() {
@@ -162,10 +204,7 @@ fn validate_apt_configuration_at(
         } else if scan_config {
             // apt.conf's #include can reach outside /etc/apt. Apt runs with
             // cwd /, so relative include paths are anchored there too.
-            let contents =
-                fs::read(&canonical).map_err(|error| SetupToolError::AptConfiguration {
-                    reason: error.to_string(),
-                })?;
+            let contents = read_apt_configuration(&canonical)?;
             for included in apt_include_paths(&contents)? {
                 pending.push((included, true));
             }
@@ -297,6 +336,7 @@ pub(crate) enum SetupTool {
     Curl,
     Tar,
     Gzip,
+    Cat,
     Chmod,
     Rm,
     Setfacl,
@@ -334,6 +374,7 @@ impl SetupTool {
             Self::Curl => "curl",
             Self::Tar => "tar",
             Self::Gzip => "gzip",
+            Self::Cat => "cat",
             Self::Chmod => "chmod",
             Self::Rm => "rm",
             Self::Setfacl => "setfacl",
@@ -695,6 +736,76 @@ mod tests {
         let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
         let error = validate_apt_configuration_at(&root, &policy).unwrap_err();
         assert!(error.to_string().contains("parent component"), "{error}");
+    }
+
+    #[test]
+    fn apt_root_symlink_still_scans_its_configuration_files() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = fixture.path().join("apt");
+        let real_root = fixture.path().join("real-apt");
+        fs::create_dir(&real_root).unwrap();
+        fs::set_permissions(&real_root, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&real_root, &root).unwrap();
+        let config = real_root.join("apt.conf");
+        let trusted = fixture.path().join("trusted.conf");
+        fs::write(&trusted, "").unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&config, format!("#include \"{}\";", trusted.display())).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
+        let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
+        validate_apt_configuration_at(&root, &policy).unwrap();
+
+        let writable = fixture.path().join("writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        let untrusted = writable.join("hook.conf");
+        fs::write(&untrusted, "DPkg::Pre-Invoke { \"true\"; };").unwrap();
+        fs::write(&config, format!("#include \"{}\";", untrusted.display())).unwrap();
+        let error = validate_apt_configuration_at(&root, &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("writable"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_root_owned_apt_fragment_is_read_through_trusted_cat() {
+        if !std::process::Command::new("/usr/bin/sudo")
+            .args(["-n", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = fixture.path().join("apt");
+        let parts = root.join("apt.conf.d");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parts).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&parts, fs::Permissions::from_mode(0o755)).unwrap();
+        let included = fixture.path().join("included.conf");
+        fs::write(&included, "").unwrap();
+        fs::set_permissions(&included, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = parts.join("private");
+        fs::write(&config, format!("#include \"{}\";", included.display())).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/sudo")
+                .args(["-n", "/usr/bin/chown", "0:0"])
+                .arg(&config)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            fs::read(&config).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
+        let policy = TrustedToolPolicy::new_with_owners(fixture.path(), [], [0, uid]);
+        validate_apt_configuration_at(&root, &policy).unwrap();
     }
 
     #[test]

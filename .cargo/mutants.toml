@@ -57,6 +57,10 @@ exclude_re = [
   # pure capture/limit decisions remain in mutation scope.
   "src/process_output\\.rs:.*\\brun_status_bounded\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
+  # Root-only apt fragments use bounded sudo/cat; the private-fragment test
+  # and deliberate-break probe exercise this IO adapter. Directive parsing
+  # and include-path decisions remain mutation-scoped.
+  "src/setup_tool\\.rs:.*\\bread_apt_configuration\\b",
   # Ambient stdin/stderr adapters are covered through their injected helpers;
   # the bounded parsing and terminal-control logic remains mutation-scoped.
   "src/prompt\\.rs:.*\\bconfirm\\b",
