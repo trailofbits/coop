@@ -3239,18 +3239,45 @@ mod tests {
             .unwrap();
         let recipe = inst.dir.join("creation.json");
         let before = std::fs::read(&recipe).unwrap();
-        std::fs::write(inst.pid_file_path(), std::process::id().to_string()).unwrap();
+        #[cfg(target_os = "linux")]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read _", "custom-vmm"])
+            .arg("--config-file")
+            .arg(inst.vm_config_path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let pid = child.id();
+        #[cfg(not(target_os = "linux"))]
+        let pid = std::process::id();
+        std::fs::write(inst.pid_file_path(), pid.to_string()).unwrap();
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::ffi::OsStrExt as _;
             use std::os::unix::fs::PermissionsExt as _;
+
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            let mut ready = false;
+            for _ in 0..500 {
+                if std::fs::read(&cmdline_path).is_ok_and(|bytes| {
+                    bytes
+                        .split(|byte| *byte == 0)
+                        .any(|arg| arg == inst.vm_config_path().as_os_str().as_bytes())
+                }) {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready, "fixture did not expose its instance config argument");
 
             // Inspect the real child without granting the fixture other privileged operations.
             let sudo = root.join("sudo");
             let script = format!(
                 "#!/bin/bash\nset -euo pipefail\n\
-                 [ \"$#\" -eq 2 ] && [ \"$1\" = cat ] && \\\n                 [ \"$2\" = /proc/{}/cmdline ] || exit 1\n\
-                 exec /bin/cat -- \"$2\"\n",
-                std::process::id()
+                 [ \"$#\" -eq 2 ] && [ \"$1\" = cat ] && \\\n                 [ \"$2\" = /proc/{pid}/cmdline ] || exit 1\n\
+                 exec /bin/cat -- \"$2\"\n"
             );
             std::fs::write(&sudo, script).unwrap();
             std::fs::set_permissions(sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3266,6 +3293,11 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(std::fs::read(recipe).unwrap(), before);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]
