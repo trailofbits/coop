@@ -429,10 +429,24 @@ impl SetupTool {
             .map(|relative| anchor.join(relative)),
             uid,
         );
-        if self == Self::Sudo {
-            policy.with_allowed_target_beneath_anchor("usr/lib/cargo/bin/sudo")
-        } else {
-            policy
+        match self {
+            Self::Sudo => policy.with_allowed_target_beneath_anchor("usr/lib/cargo/bin/sudo"),
+            // Ubuntu's coreutils layout can use these exact targets behind
+            // the conventional /usr/bin links. The resolver still checks every
+            // traversed component for root ownership and writability.
+            Self::Cat
+            | Self::Chmod
+            | Self::Rm
+            | Self::Mkdir
+            | Self::Tee
+            | Self::Chroot
+            | Self::Rmdir
+            | Self::Id
+            | Self::Timeout => policy.with_allowed_target_beneath_anchor(&format!(
+                "usr/lib/cargo/bin/coreutils/{}",
+                self.name()
+            )),
+            _ => policy,
         }
     }
 
@@ -903,25 +917,27 @@ mod tests {
     }
 
     #[test]
-    fn only_sudo_accepts_the_documented_non_fhs_target() {
+    fn non_fhs_targets_are_limited_to_their_setup_roles() {
         let fixture = crate::host_tool::trusted_test_tempdir();
         let anchor = fixture.path();
         let bin = anchor.join("usr/bin");
-        let target_dir = anchor.join("usr/lib/cargo/bin");
+        let cargo_bin = anchor.join("usr/lib/cargo/bin");
+        let coreutils_bin = cargo_bin.join("coreutils");
         fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&target_dir).unwrap();
+        fs::create_dir_all(&coreutils_bin).unwrap();
         for directory in [
             anchor.join("usr"),
             bin.clone(),
             anchor.join("usr/lib"),
             anchor.join("usr/lib/cargo"),
-            target_dir.clone(),
+            cargo_bin.clone(),
+            coreutils_bin.clone(),
         ] {
             let mut permissions = fs::metadata(&directory).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&directory, permissions).unwrap();
         }
-        let target = target_dir.join("sudo");
+        let target = cargo_bin.join("sudo");
         fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = fs::metadata(&target).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -936,10 +952,57 @@ mod tests {
             &SetupTool::Sudo.policy_at(anchor, uid),
         );
         assert!(sudo_result.is_ok(), "{sudo_result:?}");
+        for tool in [
+            SetupTool::Cat,
+            SetupTool::Chmod,
+            SetupTool::Rm,
+            SetupTool::Mkdir,
+            SetupTool::Tee,
+            SetupTool::Chroot,
+            SetupTool::Rmdir,
+            SetupTool::Id,
+            SetupTool::Timeout,
+        ] {
+            let target = coreutils_bin.join(tool.name());
+            fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            let candidate = bin.join(tool.name());
+            symlink(&target, &candidate).unwrap();
+            let resolved = tool
+                .resolve_required_in(
+                    std::slice::from_ref(&candidate),
+                    &tool.policy_at(anchor, uid),
+                )
+                .unwrap();
+            assert_eq!(resolved.canonical_target(), target);
+            assert_eq!(resolved.launch_path(), candidate);
+        }
+        let substituted = bin.join("cat");
+        fs::remove_file(&substituted).unwrap();
+        symlink(coreutils_bin.join("rm"), &substituted).unwrap();
+        assert!(matches!(
+            SetupTool::Cat.resolve_required_in(
+                std::slice::from_ref(&substituted),
+                &SetupTool::Cat.policy_at(anchor, uid)
+            ),
+            Err(SetupToolError::Rejected { .. })
+        ));
         assert!(matches!(
             SetupTool::Curl.resolve_required_in(
                 std::slice::from_ref(&curl),
                 &SetupTool::Curl.policy_at(anchor, uid)
+            ),
+            Err(SetupToolError::Rejected { .. })
+        ));
+        let wrong_target = coreutils_bin.join("tar");
+        fs::write(&wrong_target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrong_target, fs::Permissions::from_mode(0o755)).unwrap();
+        let tar = bin.join("tar");
+        symlink(&wrong_target, &tar).unwrap();
+        assert!(matches!(
+            SetupTool::Tar.resolve_required_in(
+                std::slice::from_ref(&tar),
+                &SetupTool::Tar.policy_at(anchor, uid)
             ),
             Err(SetupToolError::Rejected { .. })
         ));

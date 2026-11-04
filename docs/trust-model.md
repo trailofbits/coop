@@ -146,9 +146,14 @@ close inherited file descriptors. It also does not cover other host subprocess
 families. Exact overrides are re-resolved from the current config on every
 operation and are never persisted into instance state.
 
-Firecracker setup applies the same pathname checks to its system tools. The
-bootstrap phase resolves `sudo`, `timeout`, and `curl`, the available package prerequisites,
-and `apt-get` plus `cat` if installation is needed before setup's first storage change.
+Firecracker setup applies the same pathname checks to its system tools. On the
+Ubuntu CI coreutils layout, the conventional candidates for `cat`, `chmod`,
+`rm`, `mkdir`, `tee`, `chroot`, `rmdir`, `id`, and `timeout` may also resolve to
+their exact `/usr/lib/cargo/bin/coreutils/<tool>` targets. Only those setup
+roles accept those targets; ownership and writability checks still cover every
+path component. The bootstrap phase resolves `sudo`, `timeout`, and `curl`, the
+available package prerequisites, and `apt-get` plus `cat` if installation is
+needed before setup's first storage change.
 After package installation, setup re-resolves `sudo` and `timeout`, then resolves `tar`, `gzip`, `chmod`, `rm`,
 `unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
 `e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
