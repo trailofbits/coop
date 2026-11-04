@@ -2365,7 +2365,17 @@ pub(crate) fn cmd_resize(
     if opts.mem.is_some() || opts.vcpus.is_some() {
         // The backend applies mem/vcpu and, for `--start`, boots the
         // instance itself (Lima must boot to validate regardless).
-        be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start)?;
+        let result = be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start);
+        if opts.disk.is_some() {
+            result.with_context(|| {
+                format!(
+                    "Disk resize for instance '{}' completed before the machine-resource step failed",
+                    stopped.instance().name,
+                )
+            })?;
+        } else {
+            result?;
+        }
     } else if opts.start {
         let inst = stopped.instance().clone();
         drop(stopped);

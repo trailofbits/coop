@@ -1132,8 +1132,9 @@ pub trait VmBackend: std::fmt::Display {
     /// survives restarts rather than being reset from the global config.
     ///
     /// Firecracker writes the JSON atomically and does not boot the VM;
-    /// Lima must `limactl start` to validate and apply the new spec, and
-    /// restores the previous `lima.yaml` if that start fails. When
+    /// Lima must `limactl start` to validate and apply the new spec. A failed
+    /// start restores the previous configuration only after the backend
+    /// confirms the instance is stopped. When
     /// `start_after` is true the instance is left running; otherwise it
     /// ends stopped (Lima stops it again after the validation boot).
     /// Gated on a [`StoppedInstance`] like [`Self::resize_disk`].
@@ -1257,6 +1258,39 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     }
     let running = vm.start()?;
     running.wait_for_boot()
+}
+
+/// A failed readiness wait does not prove the VM stopped. Only roll back a
+/// machine spec after a fresh liveness probe confirms that it is stopped.
+#[cfg(not(target_os = "macos"))]
+fn recover_firecracker_machine_start(
+    name: &str,
+    start_error: anyhow::Error,
+    state: Result<bool>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> anyhow::Error {
+    match state {
+        Ok(true) => start_error.context(format!(
+            "Instance '{name}' started but did not become ready. It is still running with the \
+             resized machine resources; inspect it with `coop status {name}` and stop it \
+             before retrying the resize",
+        )),
+        Ok(false) => match rollback() {
+            Ok(()) => start_error.context(format!(
+                "Instance '{name}' is stopped; restored its previous machine resources \
+                 after the failed start",
+            )),
+            Err(revert) => start_error.context(format!(
+                "Instance '{name}' is stopped, but restoring its previous machine \
+                 resources failed: {revert:#}. Inspect its machine config before retrying",
+            )),
+        },
+        Err(probe) => start_error.context(format!(
+            "Could not determine whether instance '{name}' is running after the failed \
+             start: {probe:#}. Its resized machine resources remain configured; inspect \
+             the instance before retrying",
+        )),
+    }
 }
 
 /// Build the legacy Linux/Firecracker TCP control transport.
@@ -1506,17 +1540,17 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<()> {
         let inst = stopped.instance();
         // Snapshot the prior spec so a failed validation boot can be rolled
-        // back — otherwise `configure()` would re-read the rejected value on
-        // every subsequent `coop start` and the instance would stay wedged.
+        // back once the VM is confirmed stopped. Otherwise `configure()`
+        // would re-read the rejected value on every subsequent `coop start`.
         let previous = crate::vm::machine_resources(inst)?;
         crate::vm::set_machine_resources(inst, mem.map(VmMemory::get), vcpus)?;
-        if start_after && let Err(e) = start_firecracker_existing(cfg, inst) {
-            if let Err(revert) =
-                crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1))
-            {
-                tracing::error!("Failed to revert machine config after failed start: {revert}");
-            }
-            return Err(e.context("Failed to start after reconfigure — reverted machine config"));
+        if start_after && let Err(start_error) = start_firecracker_existing(cfg, inst) {
+            return Err(recover_firecracker_machine_start(
+                inst.name.as_str(),
+                start_error,
+                inst.probe_liveness(),
+                || crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1)),
+            ));
         }
         Ok(())
     }
@@ -4758,6 +4792,59 @@ fn gh_auth_token() -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn failed_firecracker_reconfigure_rolls_back_only_when_stopped() {
+        let rolled_back = std::cell::Cell::new(false);
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(true),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(!rolled_back.get());
+        assert!(error.to_string().contains("still running"), "{error:#}");
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Err(anyhow::anyhow!("probe failed")),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(!rolled_back.get());
+        assert!(
+            error.to_string().contains("Could not determine"),
+            "{error:#}"
+        );
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(false),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(rolled_back.get());
+        assert!(error.to_string().contains("restored"), "{error:#}");
+
+        let error = recover_firecracker_machine_start(
+            "example",
+            anyhow::anyhow!("start failed"),
+            Ok(false),
+            || Err(anyhow::anyhow!("rollback failed")),
+        );
+        assert!(error.to_string().contains("rollback failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("start failed"));
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]

@@ -381,11 +381,11 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
 /// `lima.yaml`, then validating the new spec with a start.
 ///
 /// Lima re-reads `lima.yaml` on `limactl start`, so the edit is what
-/// applies the change. The edit is written atomically and the prior file
-/// restored if the start fails (limactl rejects a malformed or over-large
-/// spec). With `start_after` the instance is left running; otherwise it is
-/// stopped again after the validating boot so `coop resize` leaves it in
-/// the state it found it.
+/// applies the change. The edit is written atomically. A failed start restores
+/// the old spec only if the VM is confirmed
+/// stopped; a running or uncertain VM retains the new spec. With `start_after`
+/// the instance is left running; otherwise it is stopped again after the
+/// validating boot so `coop resize` leaves it in the state it found it.
 pub fn set_machine_resources(
     cfg: &CoopConfig,
     inst: &Instance,
@@ -412,21 +412,71 @@ pub fn set_machine_resources(
     yaml_dir.write_atomic_private(yaml_name(), edited.as_bytes(), 0o644)?;
 
     // Lima applies cpus/memory only at start, so boot to validate + apply.
-    if let Err(e) = start_existing(cfg, inst) {
-        if let Err(restore) = yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644)
-        {
-            tracing::error!(
-                "Failed to restore {} after a failed reconfigure: {restore}",
-                yaml_path.display()
-            );
-        }
-        return Err(e.context("Failed to apply new machine resources — reverted lima.yaml"));
+    if let Err(start_error) = start_existing(cfg, inst) {
+        return Err(recover_lima_machine_start(
+            inst.name.as_str(),
+            &yaml_path,
+            start_error,
+            probe_state(inst),
+            || yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644),
+        ));
     }
 
-    if !start_after {
-        stop_running(inst)?;
+    if !start_after && let Err(stop_error) = stop_running(inst) {
+        let state = match probe_state(inst) {
+            Ok(Some(state)) => state.to_string(),
+            Ok(None) => "absent".to_string(),
+            Err(probe) => format!("unknown ({probe:#})"),
+        };
+        return Err(stop_error.context(format!(
+            "Resized machine resources remain configured, but the validation-boot stop \
+             command failed; instance '{}' is {state}. Inspect it before retrying",
+            inst.name,
+        )));
     }
     Ok(())
+}
+
+/// A failed `limactl start` may leave a running VM. Do not replace the YAML
+/// under that VM with a spec it did not boot with.
+fn recover_lima_machine_start(
+    name: &str,
+    yaml_path: &Path,
+    start_error: anyhow::Error,
+    state: Result<Option<LimaState>>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> anyhow::Error {
+    match state {
+        Ok(Some(LimaState::Stopped)) => match rollback() {
+            Ok(()) => start_error.context(format!(
+                "Instance '{name}' is stopped; restored its previous machine resources \
+                 after the failed start",
+            )),
+            Err(restore) => start_error.context(format!(
+                "Instance '{name}' is stopped, but restoring {} failed: {restore:#}. \
+                 Inspect its machine config before retrying",
+                yaml_path.display(),
+            )),
+        },
+        Ok(Some(LimaState::Running)) => start_error.context(format!(
+            "Instance '{name}' is running despite the start error. Its resized machine \
+             resources remain configured; inspect it with `coop status {name}` and stop it \
+             before retrying the resize",
+        )),
+        Ok(Some(state)) => start_error.context(format!(
+            "Instance '{name}' is {state} after the failed start. Its resized machine \
+             resources remain configured; inspect the instance before retrying",
+        )),
+        Ok(None) => start_error.context(format!(
+            "Lima instance '{name}' is absent after the failed start. Its resized machine \
+             resources remain configured; inspect the instance before retrying",
+        )),
+        Err(probe) => start_error.context(format!(
+            "Could not determine whether instance '{name}' is running after the failed \
+             start: {probe:#}. Its resized machine resources remain configured; inspect \
+             the instance before retrying",
+        )),
+    }
 }
 
 /// Replace the value of a top-level scalar `key` in a YAML document,
@@ -2271,6 +2321,58 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn failed_lima_reconfigure_rolls_back_only_when_stopped() {
+        let yaml = Path::new("lima.yaml");
+        let rolled_back = std::cell::Cell::new(false);
+        for (state, expected) in [
+            (Ok(Some(LimaState::Running)), "running"),
+            (Ok(Some(LimaState::Broken)), "Broken"),
+            (
+                Ok(Some(LimaState::Unknown("Restarting".to_owned()))),
+                "Restarting",
+            ),
+            (Ok(None), "absent"),
+            (Err(anyhow::anyhow!("probe failed")), "Could not determine"),
+        ] {
+            let error = recover_lima_machine_start(
+                "example",
+                yaml,
+                anyhow::anyhow!("start failed"),
+                state,
+                || {
+                    rolled_back.set(true);
+                    Ok(())
+                },
+            );
+            assert!(!rolled_back.get());
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        let error = recover_lima_machine_start(
+            "example",
+            yaml,
+            anyhow::anyhow!("start failed"),
+            Ok(Some(LimaState::Stopped)),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(rolled_back.get());
+        assert!(error.to_string().contains("restored"), "{error:#}");
+
+        let error = recover_lima_machine_start(
+            "example",
+            yaml,
+            anyhow::anyhow!("start failed"),
+            Ok(Some(LimaState::Stopped)),
+            || Err(anyhow::anyhow!("rollback failed")),
+        );
+        assert!(error.to_string().contains("rollback failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("start failed"));
+    }
 
     #[test]
     fn plain_setup_refuses_interrupted_publication_with_matching_metadata() {
