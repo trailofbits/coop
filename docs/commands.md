@@ -815,10 +815,12 @@ On Firecracker, retry an interrupted disk resize with the same absolute
 filesystem even if the image file already has the requested length.
 
 By default the instance is left stopped and the change takes effect on the next
-`coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
-`--start` boot fails (e.g. more memory than the host has), the previous mem/vcpu
-is restored so a plain `coop start` still works; on Lima the `lima.yaml` is
-likewise restored.
+`coop start`. Pass `--start` to boot it immediately. If a start fails and the
+instance is confirmed stopped, coop restores the previous memory and vCPU
+configuration. A start can also report an error after the VM begins running;
+in that case coop keeps the new configuration so it matches the running VM.
+If the VM state cannot be determined, coop also keeps the new configuration
+and reports that uncertainty. Inspect the instance before retrying.
 
 Combining `--size` with `--mem`/`--vcpus` applies the disk change first, then the
 machine-resource change; the two are separate artifacts and are not applied
