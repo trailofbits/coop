@@ -20,6 +20,7 @@ use crate::host_tool::{
 const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 const APT_CONFIG_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+const APT_CONFIG_READ_DEADLINE: Duration = Duration::from_secs(30);
 
 fn apt_directive_has_separator(input: &[u8]) -> bool {
     let mut offset = 0;
@@ -128,20 +129,14 @@ fn read_apt_configuration(path: &Path) -> Result<Vec<u8>, SetupToolError> {
     match fs::read(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let mut command = SetupTool::Cat
-                .elevated()
-                .map_err(|error| SetupToolError::AptConfiguration {
-                    reason: error.to_string(),
-                })?
-                .arg(path.as_os_str())
-                .build();
+            let mut command = apt_cat_command(path)?.build();
             let output = crate::process_output::run_bounded(
                 &mut command,
                 crate::process_output::CapturePolicy {
                     stdout_max: APT_CONFIG_CAPTURE_LIMIT,
                     stderr_max: 4096,
                     completion: crate::process_output::CompletionPolicy::Deadline(
-                        Duration::from_secs(30),
+                        APT_CONFIG_READ_DEADLINE,
                     ),
                 },
             )
@@ -159,6 +154,15 @@ fn read_apt_configuration(path: &Path) -> Result<Vec<u8>, SetupToolError> {
             reason: error.to_string(),
         }),
     }
+}
+
+fn apt_cat_command(path: &Path) -> Result<Cmd, SetupToolError> {
+    SetupTool::Cat
+        .elevated_with_deadline(APT_CONFIG_READ_DEADLINE)
+        .map(|command| command.arg(path.as_os_str()))
+        .map_err(|error| SetupToolError::AptConfiguration {
+            reason: error.to_string(),
+        })
 }
 
 fn validate_apt_configuration_at(
@@ -806,6 +810,24 @@ mod tests {
         let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
         let policy = TrustedToolPolicy::new_with_owners(fixture.path(), [], [0, uid]);
         validate_apt_configuration_at(&root, &policy).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_apt_read_bounds_its_privileged_child() {
+        let config = Path::new("/etc/apt/apt.conf");
+        let command = apt_cat_command(config).unwrap().build();
+        assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "--");
+        assert_eq!(args[2], ROOT_TIMEOUT_GRACE);
+        assert_eq!(args[3], "60s");
+        assert_eq!(args[5], config.to_str().unwrap());
+        assert!(args[1].starts_with('/'));
+        assert!(args[4].starts_with('/'));
     }
 
     #[test]
