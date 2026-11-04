@@ -1874,8 +1874,12 @@ pub(crate) fn prepare_session_from_target(
         (false, false)
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
-    let suppress_anthropic_key = proxy_anthropic || isolated;
-    let suppress_openai_key = proxy_openai || codex_account_auth || isolated;
+    let forwarding_policy = backend::CredentialForwardingPolicy::new(
+        cfg,
+        proxy_anthropic,
+        proxy_openai,
+        inst.firecracker_network(),
+    );
     // A per-VM proxy override can pair an OpenAI upstream with ChatGPT account
     // auth even though `CoopConfig::validate` rejects that combination in the
     // config file. Warn here so the reason is visible on every session, and
@@ -1894,13 +1898,7 @@ pub(crate) fn prepare_session_from_target(
         crate::github_assignment::active(cfg, inst)?
     };
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding_for_network(
-        cfg,
-        repo,
-        suppress_anthropic_key,
-        suppress_openai_key,
-        inst.firecracker_network(),
-    )?;
+    let mut env = backend::prepare_env_forwarding_for_network(cfg, repo, forwarding_policy)?;
     if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
         for (name, value) in &state.entries {
             // A raw provider key snapshotted via `coop start --env` must
@@ -1909,23 +1907,9 @@ pub(crate) fn prepare_session_from_target(
             // `codex.auth = "chatgpt"` forwarding it would let Codex
             // silently fall back to API billing. Skip and warn, matching
             // `prepare_env_forwarding`.
-            if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
-                || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
-                || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
-                || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
-                || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
-                || (isolated && name.as_str() == "XAI_API_KEY")
-                || (isolated && name.as_str() == "GITHUB_TOKEN")
-                || (isolated && name.as_str() == "GH_TOKEN")
-                || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
+            if let Some(reason) = forwarding_policy
+                .suppression_reason(name.as_str(), backend::ForwardingSource::PersistedOverride)
             {
-                let reason = if isolated {
-                    "isolated network mode"
-                } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
-                    "codex.auth = \"chatgpt\""
-                } else {
-                    "proxy mode"
-                };
                 tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
                 continue;
             }
@@ -4054,6 +4038,51 @@ mod tests {
             Some("saved-value"),
             "non-suppressed --env entries must still flow through",
         );
+    }
+
+    #[test]
+    fn chatgpt_auth_keeps_existing_codex_token_source_distinction() {
+        use std::num::NonZeroU16;
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: tmp.path().to_path_buf(),
+            image: super::config::ImageName::new(super::config::DEFAULT_IMAGE).unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
+        };
+        let token_name = super::guest_env_state::EnvVarName::new("CODEX_ACCESS_TOKEN").unwrap();
+        let mut cfg = super::config::CoopConfig::default();
+        cfg.codex.auth = super::config::CodexAuthMode::ChatGpt;
+        cfg.guest_env
+            .insert(token_name.clone(), "configured-token".into());
+        let mut state = super::guest_env_state::GuestEnvState::default();
+        state.entries.insert(token_name, "persisted-token".into());
+        state.save(&inst).unwrap();
+
+        let target = super::backend::SshTarget::tcp(
+            super::backend::Hostname::new("127.0.0.1").unwrap(),
+            NonZeroU16::new(22).unwrap(),
+            super::backend::SshUser::new("ubuntu").unwrap(),
+            tmp.path().join("id_test"),
+            cfg.ssh.host_tools.clone(),
+        );
+        let with_snapshot =
+            super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
+        assert_eq!(
+            with_snapshot
+                .env
+                .guest_values()
+                .get("CODEX_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("persisted-token"),
+        );
+
+        std::fs::remove_file(inst.guest_env_state_path()).unwrap();
+        let without_snapshot =
+            super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
+        assert!(!without_snapshot.env.contains("CODEX_ACCESS_TOKEN"));
     }
 
     #[test]

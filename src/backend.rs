@@ -1893,45 +1893,54 @@ pub fn prepare_env_forwarding(
     prepare_env_forwarding_for_network(
         cfg,
         repo,
-        suppress_anthropic_key,
-        suppress_openai_key,
-        crate::config::FirecrackerNetworkMode::Open,
+        CredentialForwardingPolicy::new(
+            cfg,
+            suppress_anthropic_key,
+            suppress_openai_key,
+            crate::config::FirecrackerNetworkMode::Open,
+        ),
     )
 }
 
+/// The saved `--env` snapshot has a distinct historical rule for
+/// `CODEX_ACCESS_TOKEN` under `ChatGPT` account auth. Keep that distinction
+/// explicit until changing it is reviewed as a behavior change.
 #[derive(Clone, Copy)]
-struct CredentialForwardingPolicy {
-    suppress_anthropic_key: bool,
-    suppress_openai_key: bool,
-    codex_proxy_active: bool,
-    openai_suppression_reason: &'static str,
+pub(crate) enum ForwardingSource {
+    Configured,
+    PersistedOverride,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialForwardingPolicy {
+    anthropic_proxy_active: bool,
+    openai_proxy_active: bool,
+    codex_account_auth: bool,
     network: crate::config::FirecrackerNetworkMode,
 }
 
 impl CredentialForwardingPolicy {
-    fn suppression_reason(self, name: &str) -> &'static str {
-        if self.network == crate::config::FirecrackerNetworkMode::Isolated {
-            "isolated network mode"
-        } else if name == "OPENAI_API_KEY" {
-            self.openai_suppression_reason
-        } else {
-            "proxy mode"
+    pub(crate) fn new(
+        cfg: &CoopConfig,
+        anthropic_proxy_active: bool,
+        openai_proxy_active: bool,
+        network: crate::config::FirecrackerNetworkMode,
+    ) -> Self {
+        Self {
+            anthropic_proxy_active,
+            openai_proxy_active,
+            codex_account_auth: cfg.codex.auth.uses_chatgpt_account(),
+            network,
         }
     }
 
-    fn suppressed_names(self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        if self.suppress_anthropic_key {
-            names.push("ANTHROPIC_API_KEY");
-        }
-        if self.suppress_openai_key {
-            names.push("OPENAI_API_KEY");
-        }
-        if self.codex_proxy_active {
-            names.push("CODEX_ACCESS_TOKEN");
-        }
+    pub(crate) fn suppression_reason(
+        self,
+        name: &str,
+        source: ForwardingSource,
+    ) -> Option<&'static str> {
         if self.network == crate::config::FirecrackerNetworkMode::Isolated {
-            names.extend([
+            const ISOLATED_SUPPRESSED: &[&str] = &[
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
                 "CODEX_ACCESS_TOKEN",
@@ -1941,11 +1950,24 @@ impl CredentialForwardingPolicy {
                 "GITHUB_TOKEN",
                 "GH_TOKEN",
                 crate::model_state::CODEX_LOCAL_ENV_KEY,
-            ]);
-            names.sort_unstable();
-            names.dedup();
+            ];
+            if ISOLATED_SUPPRESSED.contains(&name) {
+                return Some("isolated network mode");
+            }
         }
-        names
+        match name {
+            "ANTHROPIC_API_KEY" if self.anthropic_proxy_active => Some("proxy mode"),
+            "OPENAI_API_KEY" if self.codex_account_auth => Some("codex.auth = \"chatgpt\""),
+            "OPENAI_API_KEY" if self.openai_proxy_active => Some("proxy mode"),
+            "CODEX_ACCESS_TOKEN"
+                if self.openai_proxy_active
+                    || (matches!(source, ForwardingSource::Configured)
+                        && self.codex_account_auth) =>
+            {
+                Some("proxy mode")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1955,7 +1977,10 @@ fn populate_builtin_credentials(
     policy: CredentialForwardingPolicy,
     env: &mut EnvForward,
 ) -> Result<()> {
-    if policy.suppress_anthropic_key {
+    if policy
+        .suppression_reason("ANTHROPIC_API_KEY", ForwardingSource::Configured)
+        .is_some()
+    {
         tracing::debug!("proxy mode: not forwarding ANTHROPIC_API_KEY into the guest");
     } else if let Some(key) = &cfg.claude.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
@@ -1965,11 +1990,9 @@ fn populate_builtin_credentials(
         env.set("ANTHROPIC_API_KEY", key)?;
     }
 
-    if policy.suppress_openai_key {
-        tracing::debug!(
-            "{}: not forwarding OPENAI_API_KEY into the guest",
-            policy.suppression_reason("OPENAI_API_KEY")
-        );
+    if let Some(reason) = policy.suppression_reason("OPENAI_API_KEY", ForwardingSource::Configured)
+    {
+        tracing::debug!("{}: not forwarding OPENAI_API_KEY into the guest", reason);
     } else if let Some(key) = &cfg.codex.api_key {
         let resolved = crate::config::resolve_cmd_value(key.expose())
             .context("Failed to resolve codex.api_key")?;
@@ -1978,7 +2001,10 @@ fn populate_builtin_credentials(
         env.set("OPENAI_API_KEY", key)?;
     }
 
-    if policy.network == crate::config::FirecrackerNetworkMode::Isolated {
+    if policy
+        .suppression_reason("XAI_API_KEY", ForwardingSource::Configured)
+        .is_some()
+    {
         tracing::debug!("isolated network mode: not resolving or forwarding XAI_API_KEY");
         tracing::debug!("isolated network mode: not resolving or forwarding GITHUB_TOKEN");
     } else {
@@ -2001,30 +2027,13 @@ fn populate_builtin_credentials(
 pub(crate) fn prepare_env_forwarding_for_network(
     cfg: &CoopConfig,
     repo: Option<&crate::github_repo::RepoSlug>,
-    suppress_anthropic_key: bool,
-    suppress_openai_key: bool,
-    network: crate::config::FirecrackerNetworkMode,
+    policy: CredentialForwardingPolicy,
 ) -> Result<EnvForward> {
     let claude = &cfg.claude;
-    let codex = &cfg.codex;
     let grok = &cfg.grok;
-    let codex_account_auth = codex.auth.uses_chatgpt_account();
-    let policy = CredentialForwardingPolicy {
-        suppress_anthropic_key,
-        suppress_openai_key: suppress_openai_key || codex_account_auth,
-        codex_proxy_active: suppress_openai_key,
-        openai_suppression_reason: if codex_account_auth {
-            "codex.auth = \"chatgpt\""
-        } else {
-            "proxy mode"
-        },
-        network,
-    };
+    let codex = &cfg.codex;
     let mut env = EnvForward::default();
     populate_builtin_credentials(cfg, repo, policy, &mut env)?;
-    let suppressed = policy.suppressed_names();
-
-    let suppression_reason = |name: &str| policy.suppression_reason(name);
 
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
@@ -2037,8 +2046,8 @@ pub(crate) fn prepare_env_forwarding_for_network(
         .chain(grok.env_forward.iter())
         .chain(grok_mcp_env_names.iter())
     {
-        if suppressed.contains(&name.as_str()) {
-            let reason = suppression_reason(name.as_str());
+        if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
+        {
             tracing::warn!("{reason}: ignoring env_forward entry '{name}'");
             continue;
         }
@@ -2054,8 +2063,8 @@ pub(crate) fn prepare_env_forwarding_for_network(
     // an inherited one. Warn on collision so the override is visible —
     // values are not logged (they may be secrets).
     for (name, value) in &cfg.guest_env {
-        if suppressed.contains(&name.as_str()) {
-            let reason = suppression_reason(name.as_str());
+        if let Some(reason) = policy.suppression_reason(name.as_str(), ForwardingSource::Configured)
+        {
             tracing::warn!("{reason}: ignoring guest_env entry '{name}'");
             continue;
         }
