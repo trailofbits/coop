@@ -1066,6 +1066,8 @@ fn build_or_check_template(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> 
 
     // SIGKILL can bypass MountGuard while a chroot child is still running.
     // Reap the fixed shared mount tree before replacing any staging disk.
+    crate::fs_util::private_dir(&cfg.image_dir(image))
+        .context("Failed to create image directory")?;
     crate::privileged_disk::recover_stale_template_mount(&staging)
         .context("Failed to recover interrupted template mount")?;
 
