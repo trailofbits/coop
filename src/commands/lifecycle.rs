@@ -1455,7 +1455,7 @@ pub(crate) fn open_ssh_session(
     let running = resolve_running(be, cfg, name)?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1517,7 +1517,7 @@ pub(crate) fn open_agent_session(
     )?;
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
 }
 
 fn ensure_isolated_agent_supported(
@@ -1702,7 +1702,7 @@ fn resume_creation(
         let _guard = signal::install_handlers();
         let repo = backend::detect_instance_repo(inst);
         let target = be.ssh_target(cfg, inst)?;
-        let session = prepare_session_from_target(cfg, Some(inst), target, repo.as_ref())?;
+        let session = prepare_session_from_target(cfg, inst, target, repo.as_ref())?;
         crate::creation_hooks::run_pending(inst, &session)
     })()
     .map_err(|source| crate::creation_hooks::CreationIncomplete::new(inst, source).into())
@@ -1753,11 +1753,10 @@ fn bootstrap_on_boot(
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
-    // Pass `Some(inst)` so proxy-mode key suppression (and the guest-env /
-    // Codex-local overlays) apply to the bootstrap session too — otherwise the
-    // raw ANTHROPIC_API_KEY would be forwarded via SendEnv during bootstrap,
-    // defeating proxy-mode non-exposure (issue #411).
-    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    // Bootstrap uses this instance's proxy policy and persisted overlays too;
+    // omitting them would forward the raw ANTHROPIC_API_KEY during bootstrap
+    // and defeat proxy-mode non-exposure (issue #411).
+    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     Ok(())
@@ -1776,7 +1775,7 @@ fn run_configured_post_start(
     };
     signal::check_shutdown()?;
     // Bootstrap may mint a proxy capability token; construct this session afterward.
-    let session = prepare_session_from_target(cfg, Some(inst), target.clone(), repo)?;
+    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
     backend::run_post_start(&session, command);
     Ok(())
 }
@@ -1814,44 +1813,33 @@ pub(crate) fn no_agents_skips_codex_keyring(
 /// without going through `resolve_running` — namely the post-boot bootstrap in
 /// fresh start and restart, where the instance isn't yet registered as running.
 ///
-/// When `inst` is `Some`, any persisted start-time guest environment for that
-/// instance is overlaid onto the resolved env-forward set. This keeps current
-/// `coop start --env KEY=VAL` values and legacy devcontainer `containerEnv`
-/// values available across the per-invocation config reload. Bootstrap callers
-/// inside fresh `start_instance` pass `None` because the in-memory
-/// `cfg.guest_env` is already authoritative for that one process; restart and
-/// every post-start command pass `Some` because the on-disk snapshot is the
-/// only place the original persisted set still lives.
+/// The instance is required because its persisted model, proxy, and guest
+/// environment state determine which credentials may enter this SSH session.
 pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
-    inst: Option<&config::Instance>,
+    inst: &config::Instance,
     target: backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
     // Load the per-instance model selection once: it decides both the
     // proxy-mode key suppression and the Codex local-key forwarding below.
-    let model = match inst {
-        Some(inst) => Some(model_state::ModelState::load_or_default(inst)?),
-        None => None,
-    };
+    let model = model_state::ModelState::load_or_default(inst)?;
 
     // In proxy mode (issue #411: an effective upstream — `[proxy.<provider>]`
     // default or a per-VM override — and the VM in remote model mode) the raw
     // key must never be forwarded into the guest; the host-side proxy holds it
     // and the guest gets only the capability token. Overrides live in the
     // instance state, so this is resolved per provider and needs `inst`.
-    let remote = model
-        .as_ref()
-        .is_some_and(|m| m.mode == model_state::ModelMode::Remote);
-    let isolated = inst
-        .is_some_and(|inst| inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated);
-    let (proxy_anthropic, proxy_openai) = match inst {
-        Some(inst) if remote => (
+    let remote = model.mode == model_state::ModelMode::Remote;
+    let isolated = inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated;
+    let (proxy_anthropic, proxy_openai) = if remote {
+        (
             proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?
                 .is_some(),
             proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?.is_some(),
-        ),
-        _ => (false, false),
+        )
+    } else {
+        (false, false)
     };
     let codex_account_auth = cfg.codex.auth.uses_chatgpt_account();
     let suppress_anthropic_key = proxy_anthropic || isolated;
@@ -1871,9 +1859,7 @@ pub(crate) fn prepare_session_from_target(
     let assignment = if isolated {
         None
     } else {
-        inst.map(|inst| crate::github_assignment::active(cfg, inst))
-            .transpose()?
-            .flatten()
+        crate::github_assignment::active(cfg, inst)?
     };
     let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
     let mut env = backend::prepare_env_forwarding_for_network(
@@ -1881,59 +1867,53 @@ pub(crate) fn prepare_session_from_target(
         repo,
         suppress_anthropic_key,
         suppress_openai_key,
-        inst.map_or(config::FirecrackerNetworkMode::Open, |inst| {
-            inst.firecracker_network()
-        }),
+        inst.firecracker_network(),
     )?;
-    if let Some(inst) = inst {
-        if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
-            for (name, value) in &state.entries {
-                // A raw provider key snapshotted via `coop start --env` must
-                // not re-enter the guest under either suppression mode: in
-                // proxy mode the host-side proxy holds it, and under
-                // `codex.auth = "chatgpt"` forwarding it would let Codex
-                // silently fall back to API billing. Skip and warn, matching
-                // `prepare_env_forwarding`.
-                if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
-                    || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
-                    || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
-                    || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
-                    || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
-                    || (isolated && name.as_str() == "XAI_API_KEY")
-                    || (isolated && name.as_str() == "GITHUB_TOKEN")
-                    || (isolated && name.as_str() == "GH_TOKEN")
-                    || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
-                {
-                    let reason = if isolated {
-                        "isolated network mode"
-                    } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
-                        "codex.auth = \"chatgpt\""
-                    } else {
-                        "proxy mode"
-                    };
-                    tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
-                    continue;
-                }
-                env.set(name.as_str(), value.as_str())?;
-            }
-        }
-        // Codex reads its provider key from the env var named by `env_key`. In
-        // local-model mode that is the local endpoint's token; in remote proxy
-        // mode it is the per-instance capability token (the raw key stays on
-        // the host). Claude's token rides in settings.json instead. The two
-        // modes are mutually exclusive (mode is Local or Remote).
-        if let Some(model) = &model {
-            if !isolated
-                && model.mode == model_state::ModelMode::Local
-                && let Some(ep) = model.resolved_codex(&cfg.codex)
+    if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
+        for (name, value) in &state.entries {
+            // A raw provider key snapshotted via `coop start --env` must
+            // not re-enter the guest under either suppression mode: in
+            // proxy mode the host-side proxy holds it, and under
+            // `codex.auth = "chatgpt"` forwarding it would let Codex
+            // silently fall back to API billing. Skip and warn, matching
+            // `prepare_env_forwarding`.
+            if (suppress_anthropic_key && name.as_str() == "ANTHROPIC_API_KEY")
+                || (suppress_openai_key && name.as_str() == "OPENAI_API_KEY")
+                || ((proxy_openai || isolated) && name.as_str() == "CODEX_ACCESS_TOKEN")
+                || (isolated && name.as_str() == "ANTHROPIC_AUTH_TOKEN")
+                || (isolated && name.as_str() == "CLAUDE_CODE_OAUTH_TOKEN")
+                || (isolated && name.as_str() == "XAI_API_KEY")
+                || (isolated && name.as_str() == "GITHUB_TOKEN")
+                || (isolated && name.as_str() == "GH_TOKEN")
+                || (isolated && name.as_str() == model_state::CODEX_LOCAL_ENV_KEY)
             {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
-            } else if proxy_openai
-                && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
-            {
-                env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
+                let reason = if isolated {
+                    "isolated network mode"
+                } else if name.as_str() == "OPENAI_API_KEY" && codex_account_auth {
+                    "codex.auth = \"chatgpt\""
+                } else {
+                    "proxy mode"
+                };
+                tracing::warn!("{reason}: ignoring runtime --env entry '{}'", name.as_str());
+                continue;
             }
+            env.set(name.as_str(), value.as_str())?;
         }
+    }
+    // Codex reads its provider key from the env var named by `env_key`. In
+    // local-model mode that is the local endpoint's token; in remote proxy
+    // mode it is the per-instance capability token (the raw key stays on
+    // the host). Claude's token rides in settings.json instead. The two
+    // modes are mutually exclusive (mode is Local or Remote).
+    if !isolated
+        && model.mode == model_state::ModelMode::Local
+        && let Some(ep) = model.resolved_codex(&cfg.codex)
+    {
+        env.set(model_state::CODEX_LOCAL_ENV_KEY, ep.auth_token_or_default())?;
+    } else if proxy_openai
+        && let Some(token) = proxy::read_capability_token(inst, proxy::Provider::Openai)
+    {
+        env.set(model_state::CODEX_LOCAL_ENV_KEY, token)?;
     }
     Ok(backend::SshSession { target, env })
 }
@@ -3906,7 +3886,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let ssh = session
             .command(&[], "/usr/bin/printenv PATH")
@@ -3985,7 +3965,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4035,7 +4015,7 @@ mod tests {
         );
 
         let session =
-            super::prepare_session_from_target(&cfg, Some(&inst), target, None).expect("session");
+            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4082,7 +4062,7 @@ mod tests {
         // session on the same instance must still come up. `coop codex` and
         // the agent bootstrap are what fail hard, via
         // `backend::ensure_codex_remote_auth_consistent`.
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
@@ -4142,8 +4122,7 @@ mod tests {
                     cfg.ssh.host_tools.clone(),
                 );
                 let session =
-                    super::prepare_session_from_target(&cfg, Some(&inst), target.clone(), None)
-                        .unwrap();
+                    super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
                 assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
                 assert_eq!(
                     session
@@ -4158,8 +4137,7 @@ mod tests {
                     ..Default::default()
                 };
                 model.save(&inst).unwrap();
-                let local =
-                    super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+                let local = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
                 assert_eq!(
                     local
                         .env
@@ -4252,7 +4230,7 @@ mod tests {
             tmp.path().join("id_test"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None).unwrap();
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
 
         for name in [
             "ANTHROPIC_API_KEY",
@@ -4313,7 +4291,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session = super::prepare_session_from_target(&cfg, Some(&inst), target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
             .expect("ChatGPT account auth must not break session preparation");
 
         let envs = session.env.guest_values();
@@ -4327,29 +4305,6 @@ mod tests {
             envs.get("COOP_TEST_PASSTHROUGH").map(String::as_str),
             Some("kept"),
             "non-suppressed entries must still flow through",
-        );
-    }
-
-    #[test]
-    fn prepare_session_skips_overlay_without_instance() {
-        use std::num::NonZeroU16;
-
-        let tmp = crate::test_support::private_tempdir().expect("tempdir");
-        let cfg = super::config::CoopConfig::default();
-        let target = super::backend::SshTarget::tcp(
-            super::backend::Hostname::new("127.0.0.1").expect("valid host"),
-            NonZeroU16::new(22).expect("non-zero"),
-            super::backend::SshUser::new("ubuntu").expect("valid user"),
-            tmp.path().join("id_test"),
-            cfg.ssh.host_tools.clone(),
-        );
-
-        let session =
-            super::prepare_session_from_target(&cfg, None, target, None).expect("session");
-
-        assert!(
-            !session.env.contains("FROM_CLI"),
-            "without an instance, no persisted overlay should be applied",
         );
     }
 
