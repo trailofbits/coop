@@ -968,7 +968,7 @@ fn restart_confirmed_instance(
         &inst,
         &target,
         repo.as_ref(),
-        opts,
+        opts.no_agents,
         backend::BootMode::Restart,
     )?;
     // User-supplied creation and post-start hooks are intentionally outside
@@ -976,7 +976,7 @@ fn restart_confirmed_instance(
     // lock would prevent a concurrent stop/destroy from recovering a hung
     // hook. Reacquire and revalidate before reporting restart success.
     drop(operation);
-    let command = creation_post_start(be, cfg, &inst, opts)?;
+    let command = creation_post_start(be, cfg, &inst, opts.post_start_override)?;
     run_configured_post_start(cfg, &inst, &target, repo.as_ref(), command.as_deref())?;
 
     let operation = backend::InstanceOperationGuard::acquire(&inst)?;
@@ -1068,12 +1068,50 @@ fn start_instance(
     be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
     drop(image_lock);
 
-    provision_first_boot(be, cfg, inst, opts, repo.as_ref(), &payload)
+    let inputs = FirstBootInputs {
+        source: FirstBootSource::from_options(opts.workspace_dir, opts.git_repo),
+        mounts: &opts.mounts,
+        exclude_git: opts.exclude_git,
+        no_agents: opts.no_agents,
+        post_start_override: opts.post_start_override,
+        persisted_guest_env: &opts.persisted_guest_env,
+    };
+    provision_first_boot(be, cfg, inst, &inputs, repo.as_ref(), &payload)
 }
 
 struct BootPayload {
     forwards: Vec<config::PortForward>,
     files: crate::guest_files::StagedFiles,
+}
+
+/// Inputs shared by a newly created VM and a restored blank disk. Creation
+/// flags such as disk size and prompt policy cannot be read during provisioning.
+struct FirstBootInputs<'a> {
+    source: FirstBootSource<'a>,
+    mounts: &'a [config::Mount],
+    exclude_git: bool,
+    no_agents: bool,
+    post_start_override: Option<&'a str>,
+    persisted_guest_env: &'a std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
+}
+
+#[derive(Clone, Copy)]
+enum FirstBootSource<'a> {
+    None,
+    Workspace(&'a str),
+    GitRepo(&'a str),
+}
+
+impl<'a> FirstBootSource<'a> {
+    fn from_options(workspace_dir: Option<&'a str>, git_repo: Option<&'a str>) -> Self {
+        if let Some(path) = workspace_dir {
+            Self::Workspace(path)
+        } else if let Some(url) = git_repo {
+            Self::GitRepo(url)
+        } else {
+            Self::None
+        }
+    }
 }
 
 impl BootPayload {
@@ -1105,18 +1143,13 @@ impl BootPayload {
 /// [`backend::BootMode::Restart`] path, which assumes plugins, MCP servers
 /// and `/workspace` survived on the guest disk.
 ///
-/// Reads only these `opts` fields: `workspace_dir`, `git_repo`, `mounts`,
-/// `exclude_git`, `persisted_guest_env`, `post_start_override`, plus what
-/// [`bootstrap_on_boot`] consumes (`no_agents`).
-/// The creation-only fields (`disk`, `forward_ports`) are **not** read — the
-/// resolved forward set arrives in `payload`, because callers merge it
-/// differently. Reaching for one of those fields here would silently change
-/// behavior for `reprovision_instance` only, which passes placeholders for them.
+/// The resolved forward set arrives in `payload`, because callers merge it
+/// differently. `FirstBootInputs` contains only fields both paths can supply.
 fn provision_first_boot(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-    opts: &StartOpts<'_>,
+    inputs: &FirstBootInputs<'_>,
     repo: Option<&github_repo::RepoSlug>,
     payload: &BootPayload,
 ) -> Result<()> {
@@ -1146,7 +1179,7 @@ fn provision_first_boot(
 
     // Persist CLI `--env` entries for later commands that reload config.
     guest_env_state::GuestEnvState {
-        entries: opts.persisted_guest_env.clone(),
+        entries: (*inputs.persisted_guest_env).clone(),
     }
     .save(inst)?;
     payload.files.install(&target)?;
@@ -1156,7 +1189,7 @@ fn provision_first_boot(
         inst,
         &target,
         repo,
-        opts,
+        inputs.no_agents,
         backend::BootMode::FirstBoot,
     )?;
 
@@ -1165,7 +1198,7 @@ fn provision_first_boot(
     // Mounts may be additional data directories or the workspace source
     // itself. Only mount-only instances record the first mount as the
     // workspace identity.
-    let workspace_state = if let Some(ws_dir) = opts.workspace_dir {
+    let workspace_state = if let FirstBootSource::Workspace(ws_dir) = inputs.source {
         let ws_path = std::path::Path::new(ws_dir);
         anyhow::ensure!(
             ws_path.is_dir(),
@@ -1176,7 +1209,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::copy_workspace(&target, &abs_path, opts.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, inputs.exclude_git)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1186,7 +1219,7 @@ fn provision_first_boot(
         };
         state.save(inst)?;
         Some(state)
-    } else if let Some(repo_url) = opts.git_repo {
+    } else if let FirstBootSource::GitRepo(repo_url) = inputs.source {
         let assignment = crate::github_assignment::active(cfg, inst)?;
         backend::clone_git_repo(
             &target,
@@ -1207,20 +1240,20 @@ fn provision_first_boot(
         None
     };
 
-    if !opts.mounts.is_empty() {
+    if !inputs.mounts.is_empty() {
         if be.mounts_are_live() {
             // Lima: virtiofs already serves the host directory live. No
             // sync step, but we still record state so `push`/`pull` and
             // PAT slug detection work for follow-up commands.
             if workspace_state.is_none() {
-                workspace::record_mount_state(inst, &opts.mounts)?;
+                workspace::record_mount_state(inst, inputs.mounts)?;
             }
-            warn_on_live_git_mounts(&opts.mounts);
+            warn_on_live_git_mounts(inputs.mounts);
         } else {
             if workspace_state.is_some() {
-                workspace::sync_mount_contents(&target, &opts.mounts, opts.exclude_git)?;
+                workspace::sync_mount_contents(&target, inputs.mounts, inputs.exclude_git)?;
             } else {
-                workspace::sync_mounts(&target, inst, &opts.mounts, opts.exclude_git)?;
+                workspace::sync_mounts(&target, inst, inputs.mounts, inputs.exclude_git)?;
             }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
@@ -1230,7 +1263,7 @@ fn provision_first_boot(
         }
     }
 
-    let command = creation_post_start(be, cfg, inst, opts)?;
+    let command = creation_post_start(be, cfg, inst, inputs.post_start_override)?;
     run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
 
     tracing::info!(
@@ -1667,11 +1700,10 @@ fn creation_post_start(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
-    opts: &StartOpts<'_>,
+    post_start_override: Option<&str>,
 ) -> Result<Option<String>> {
     crate::creation_hooks::set_preparation(inst, crate::creation_hooks::Preparation::Ready)?;
-    Ok(resume_creation(be, cfg, inst)?
-        .post_start(opts.post_start_override, cfg.post_start.as_deref()))
+    Ok(resume_creation(be, cfg, inst)?.post_start(post_start_override, cfg.post_start.as_deref()))
 }
 
 pub(super) fn resume_running_creation(
@@ -1715,15 +1747,15 @@ fn bootstrap_on_boot(
     inst: &config::Instance,
     target: &backend::SshTarget,
     repo: Option<&github_repo::RepoSlug>,
-    opts: &StartOpts<'_>,
+    no_agents: bool,
     mode: backend::BootMode,
 ) -> Result<()> {
-    preflight_isolated_bootstrap(cfg, inst, opts.no_agents, mode)?;
+    preflight_isolated_bootstrap(cfg, inst, no_agents, mode)?;
     let proxy_configured =
         proxy_state::effective_upstream(inst, proxy::Provider::Anthropic, &cfg.proxy)?.is_some()
             || proxy_state::effective_upstream(inst, proxy::Provider::Openai, &cfg.proxy)?
                 .is_some();
-    if opts.no_agents && proxy_configured {
+    if no_agents && proxy_configured {
         // Proxy mode suppresses the raw API keys on every session, but the
         // proxy + guest base-URL override are only set up during agent
         // bootstrap — which --no-agents skips. Warn so the loud auth failure
@@ -1736,7 +1768,7 @@ fn bootstrap_on_boot(
     // A failed read degrades to "not materialized", which at worst warns when
     // it need not. Aborting `--no-agents` — a path that otherwise never opens
     // this file — over an unreadable model.json would be the worse trade.
-    if no_agents_skips_codex_keyring(opts.no_agents, cfg.codex.auth, || {
+    if no_agents_skips_codex_keyring(no_agents, cfg.codex.auth, || {
         model_state::ModelState::try_load(inst)
             .ok()
             .flatten()
@@ -1744,7 +1776,7 @@ fn bootstrap_on_boot(
     }) {
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
-    if opts.no_agents {
+    if no_agents {
         if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
             && let Some(assignment) = crate::github_assignment::active(cfg, inst)?
         {
@@ -2692,27 +2724,22 @@ fn reprovision_instance(
         cfg.guest_env.insert(key.clone(), value.clone());
     }
 
-    let start_opts = StartOpts {
-        name: Some(&inst.name),
-        workspace_dir: ws_inputs.workspace_dir.as_deref(),
-        git_repo: ws_inputs.git_repo.as_deref(),
-        no_agents: opts.no_agents,
-        no_prompt: opts.no_prompt,
-        // Creation-only: the disk already exists and was sized above.
-        disk: None,
-        mounts: ws_inputs.mounts,
+    let inputs = FirstBootInputs {
+        source: FirstBootSource::from_options(
+            ws_inputs.workspace_dir.as_deref(),
+            ws_inputs.git_repo.as_deref(),
+        ),
+        mounts: &ws_inputs.mounts,
         // No command persists `--exclude-git`, so it cannot be replayed: a
         // workspace originally pushed without `.git/` is re-synced with it.
         exclude_git: false,
-        forward_ports: Vec::new(),
-        config_path: opts.config_path,
+        no_agents: opts.no_agents,
         post_start_override: None,
-        persisted_guest_env: saved_guest_env,
+        persisted_guest_env: &saved_guest_env,
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &start_opts, repo.as_ref(), &payload)
-        .with_context(partial)?;
+    provision_first_boot(be, cfg, &inst, &inputs, repo.as_ref(), &payload).with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
     Ok(())
@@ -2821,8 +2848,8 @@ fn check_reprovision_workspace_source(
     }
 
     // Neither arm can carry a non-UTF-8 path back to the guest: the
-    // `Workspace` arm goes through `StartOpts::workspace_dir`
-    // (`Option<&str>`), and the `Mount` arm through `Mount::from_parts`,
+    // `Workspace` arm goes through `FirstBootSource::Workspace`
+    // (`&str`), and the `Mount` arm through `Mount::from_parts`,
     // which also takes `&str`. Both would see only a lossy rendering naming a
     // different (missing) directory, so both would bail *after* the swap — and
     // identically on every re-run, making the "re-run to finish" advice
@@ -2842,8 +2869,8 @@ fn check_reprovision_workspace_source(
     Ok(())
 }
 
-/// The workspace-shaped `StartOpts` inputs, owned because `StartOpts` borrows
-/// them and they must outlive the call.
+/// The workspace inputs reconstructed for first-boot provisioning. Paths and
+/// URLs are owned because `FirstBootInputs` borrows them during provisioning.
 ///
 /// Named fields rather than a tuple: `workspace_dir` and `git_repo` are both
 /// `Option<String>`, so positional slots would let a swap turn a re-sync into
@@ -2875,7 +2902,7 @@ fn prepare_reprovision_payload(
     })
 }
 
-/// Rebuild the workspace-shaped `StartOpts` inputs from the association the
+/// Rebuild the first-boot workspace inputs from the association the
 /// instance recorded at creation, so the first-boot sync repopulates the
 /// blank disk from the same source it was originally filled from.
 ///
@@ -4478,7 +4505,7 @@ mod tests {
     }
 
     /// A non-UTF-8 workspace path must be rejected *before* `restore_disk`.
-    /// `StartOpts::workspace_dir` is `Option<&str>`, so it would otherwise
+    /// `FirstBootSource::Workspace` holds `&str`, so it would otherwise
     /// reach `provision_first_boot` as `display()`'s U+FFFD substitution,
     /// naming a directory that does not exist — and fail there identically on
     /// every re-run, so the "re-run to finish" advice would never finish.
