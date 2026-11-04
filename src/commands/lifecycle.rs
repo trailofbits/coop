@@ -1744,7 +1744,9 @@ fn resume_creation(
         let repo = backend::detect_instance_repo(inst);
         let target = be.ssh_target(cfg, inst)?;
         let session = prepare_session_from_target(cfg, inst, target, repo.as_ref())?;
-        crate::creation_hooks::run_pending(inst, &session)
+        crate::creation_hooks::run_pending(inst, &session, || {
+            Ok(be.as_running(cfg, inst.clone())?.is_some())
+        })
     })()
     .map_err(|source| crate::creation_hooks::CreationIncomplete::new(inst, source).into())
 }
