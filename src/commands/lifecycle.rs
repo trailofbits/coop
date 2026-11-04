@@ -2362,25 +2362,29 @@ pub(crate) fn cmd_resize(
         be.resize_disk(cfg, &stopped, new_size)?;
     }
 
-    if opts.mem.is_some() || opts.vcpus.is_some() {
+    let _operation = if opts.mem.is_some() || opts.vcpus.is_some() {
         // The backend applies mem/vcpu and, for `--start`, boots the
         // instance itself (Lima must boot to validate regardless).
-        let result = be.set_machine_resources(cfg, &stopped, opts.mem, opts.vcpus, opts.start);
-        if opts.disk.is_some() {
+        let name = stopped.instance().name.clone();
+        let result = be.set_machine_resources(cfg, stopped, opts.mem, opts.vcpus, opts.start);
+        let operation = if opts.disk.is_some() {
             result.with_context(|| {
                 format!(
-                    "Disk resize for instance '{}' completed before the machine-resource step failed",
-                    stopped.instance().name,
+                    "Disk resize for instance '{name}' completed before the machine-resource step failed"
                 )
-            })?;
+            })?
         } else {
-            result?;
-        }
+            result?
+        };
+        Some(operation)
     } else if opts.start {
         let inst = stopped.instance().clone();
         drop(stopped);
         be.start_existing(cfg, &inst)?;
-    }
+        None
+    } else {
+        None
+    };
 
     Ok(())
 }
