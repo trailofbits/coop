@@ -10,6 +10,7 @@ use std::os::unix::fs::{
 };
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, StatxFlags, statx};
@@ -390,6 +391,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
+        "recover-template-mount" if argument.is_none() => recover_template_mount(&disk),
         "ensure-unmounted" if argument.is_none() => ensure_unmounted(&disk),
         "mount-proc" if argument.is_none() => mount_child(&disk, "proc"),
         "mount-sys" if argument.is_none() => mount_child(&disk, "sys"),
@@ -674,6 +676,103 @@ fn unmount_target(disk: &DiskPath, child: Option<&str>) -> Result<()> {
     unmount_checked_name(&parent, &name, || {})
 }
 
+/// Clean up a template mount left behind by an interrupted setup. The shared
+/// mount lock must be held by the caller. Only the fixed mountpoint and its
+/// fixed chroot children are touched; a busy mount is never detached.
+fn recover_template_mount(disk: &DiskPath) -> Result<()> {
+    if disk.kind != DiskKind::Template {
+        bail!("Only a template mount can be recovered");
+    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mount = match mount_directory(disk, false) {
+            Ok(mount) => mount,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if mount_id(&mount)? == mount_id(&disk.root)? {
+            return Ok(());
+        }
+        drop(mount);
+
+        let mut busy = false;
+        for child in ["tmp", "dev/pts", "dev", "sys", "proc"] {
+            match unmount_if_mounted(disk, Some(child)) {
+                Ok(()) => {}
+                Err(error) if is_busy(&error) => busy = true,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Failed to recover {child} mount"));
+                }
+            }
+        }
+        match unmount_if_mounted(disk, None) {
+            Ok(()) if !busy => return Ok(()),
+            Ok(()) => {}
+            Err(error) if is_busy(&error) => busy = true,
+            Err(error) => return Err(error).context("Failed to recover rootfs mount"),
+        }
+        if !busy {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Timed out waiting for interrupted rootfs mount to become idle");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|e| e.raw_os_error() == Some(libc::EBUSY))
+}
+
+fn unmount_if_mounted(disk: &DiskPath, child: Option<&str>) -> Result<()> {
+    let (parent, name) = match child {
+        None => (disk.root.try_clone()?, c"rootfs-mount".to_owned()),
+        Some("dev/pts") => {
+            let dev = match mounted_child(disk, "dev") {
+                Ok(dev) => dev,
+                Err(error) if is_missing_mount_target(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            (dev, c"pts".to_owned())
+        }
+        Some(name @ ("proc" | "sys" | "dev" | "tmp")) => {
+            (mount_directory(disk, false)?, CString::new(name)?)
+        }
+        _ => bail!("Unsupported chroot unmount target"),
+    };
+    let target = match open_at(
+        &parent,
+        &name,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(target) => target,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if mount_id(&target)? == mount_id(&parent)? {
+        return Ok(());
+    }
+    drop(target);
+    unmount_checked_name(&parent, &name, || {})
+}
+
+fn is_missing_mount_target(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)))
+}
+
 fn unmount_checked_name(parent: &File, name: &CStr, before_unmount: impl FnOnce()) -> Result<()> {
     // Reject an existing guest symlink and ask the kernel not to follow a
     // replacement introduced before umount resolves the final component.
@@ -851,6 +950,14 @@ pub(crate) fn mount(path: &Path) -> Result<()> {
 }
 pub(crate) fn unmount(path: &Path) -> Result<()> {
     invoke("unmount", path, None)
+}
+/// The caller already owns the shared template mount lock.
+pub(crate) fn recover_template_mount_under_lock(path: &Path) -> Result<()> {
+    invoke("recover-template-mount", path, None)
+}
+pub(crate) fn recover_stale_template_mount(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
+    recover_template_mount_under_lock(path)
 }
 pub(crate) fn mount_sub(path: &Path, name: &str) -> Result<()> {
     invoke(&format!("mount-{name}"), path, None)
