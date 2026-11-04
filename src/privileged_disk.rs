@@ -9,12 +9,14 @@ use std::os::unix::fs::{
     FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
+#[cfg(test)]
+use std::process::Command;
+use std::process::ExitStatus;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, StatxFlags, statx};
 
-use crate::cmd::Cmd;
+use crate::setup_tool::SetupTool;
 
 const COPY_LOCK_NAME: &CStr = c".coop-disk-copy.lock";
 const COPY_TMP_NAME: &CStr = c".coop-disk-copy.tmp";
@@ -46,6 +48,14 @@ impl DiskTool {
             Self::FsckFix | Self::FsckRead => "/usr/sbin/e2fsck",
             Self::Resize => "/usr/sbin/resize2fs",
             Self::Format => "/usr/sbin/mkfs.ext4",
+        }
+    }
+
+    fn setup_role(self) -> SetupTool {
+        match self {
+            Self::FsckFix | Self::FsckRead => SetupTool::E2fsck,
+            Self::Resize => SetupTool::Resize2fs,
+            Self::Format => SetupTool::MkfsExt4,
         }
     }
 
@@ -710,7 +720,7 @@ fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> R
     use std::os::unix::process::CommandExt as _;
     let fds: Vec<_> = descriptors.iter().map(|file| file.as_raw_fd()).collect();
     let program = tool.program();
-    let mut command = Command::new(program);
+    let mut command = tool.setup_role().command()?.build();
     command.args(args);
     command.stdin(std::process::Stdio::null());
     // SAFETY: pre_exec performs only async-signal-safe fcntl calls. The fd
@@ -770,7 +780,10 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
         .ancestors()
         .nth(3)
         .context("Disk path has no data root")?;
-    let mut command = Cmd::new(running_executable_path())
+    let mut command = SetupTool::Sudo
+        .command()?
+        .arg("--")
+        .arg(running_executable_path())
         .arg("__disk-op")
         .arg(operation)
         .arg(root)
@@ -778,7 +791,7 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
     if let Some(argument) = argument {
         command = command.arg(argument);
     }
-    command.sudo().run()
+    command.run()
 }
 
 /// Procfs resolves this to the running executable inode while the parent

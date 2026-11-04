@@ -291,6 +291,10 @@ The invocation-selected config may replace any identity with one exact absolute
 path for non-FHS layouts. An override never falls back; it retains the full
 root-owned, non-writable path-chain checks but intentionally does not claim
 package, hash, basename, or command-semantic identity.
-`setup_tap` resolves the complete set before its first probe or mutation. This
-policy is specific to `network.rs`; other host subprocess families retain their
-own launch contracts until migrated.
+`setup_tap` resolves the complete set before its first probe or mutation.
+Firecracker setup also uses the resolver for its fixed system-tool family:
+bootstrap tools are checked before storage changes or package installation,
+and the installed family is checked afterward, before artifact downloads and
+image construction. The privileged disk helper repeats filesystem-tool
+resolution at its elevated launch boundary. Other host subprocess families
+retain their own launch contracts.

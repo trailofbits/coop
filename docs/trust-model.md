@@ -146,6 +146,23 @@ close inherited file descriptors. It also does not cover other host subprocess
 families. Exact overrides are re-resolved from the current config on every
 operation and are never persisted into instance state.
 
+Firecracker setup applies the same pathname checks to its system tools. The
+bootstrap phase resolves `sudo` and `curl`, the available package prerequisites,
+and `apt-get` if installation is needed before setup's first storage change.
+After package installation, setup resolves `tar`, `gzip`, `chmod`, `rm`,
+`unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
+`e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
+request. KVM access repair additionally resolves `setfacl` or `usermod` and
+`id` before changing permissions. The privileged disk helper resolves its
+filesystem tools again after `sudo`. Setup launches from `/` with a cleared
+environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
+its default config file and receives only HTTPS proxy and no-proxy settings
+from the caller. Elevated programs remain subject to trusted sudoers and host
+package-manager configuration. Package installation passes only
+`DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
+launcher environment. These pathname checks do not authenticate
+downloaded artifacts or pin an executable inode through `exec`.
+
 ## Secrets and how they cross into the guest
 
 `[[guest_files]]` explicitly authorizes copying complete host source trees into

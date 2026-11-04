@@ -47,13 +47,6 @@ impl TrustedToolPolicy {
         self
     }
 
-    #[cfg_attr(
-        not(any(target_os = "linux", test)),
-        expect(
-            dead_code,
-            reason = "the first production policy is Linux-only; later families can reuse this constructor"
-        )
-    )]
     pub(crate) fn new(
         trust_anchor: impl Into<PathBuf>,
         allowed_roots: impl IntoIterator<Item = PathBuf>,
