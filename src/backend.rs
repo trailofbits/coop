@@ -1137,15 +1137,17 @@ pub trait VmBackend: std::fmt::Display {
     /// confirms the instance is stopped. When
     /// `start_after` is true the instance is left running; otherwise it
     /// ends stopped (Lima stops it again after the validation boot).
-    /// Gated on a [`StoppedInstance`] like [`Self::resize_disk`].
+    /// Consumes the [`StoppedInstance`] because applying the change may boot
+    /// the VM. The returned guard retains the operation lock without claiming
+    /// the instance is still stopped.
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()>;
+    ) -> Result<InstanceOperationGuard>;
     /// Save a stopped instance's filesystem and matching metadata as image
     /// `image`. Takes a [`StoppedInstance`] observation and lock through
     /// publication. Overwriting an existing image is the caller's decision,
@@ -1533,11 +1535,11 @@ impl VmBackend for FirecrackerBackend {
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()> {
+    ) -> Result<InstanceOperationGuard> {
         let inst = stopped.instance();
         // Snapshot the prior spec so a failed validation boot can be rolled
         // back once the VM is confirmed stopped. Otherwise `configure()`
@@ -1552,7 +1554,7 @@ impl VmBackend for FirecrackerBackend {
                 || crate::vm::set_machine_resources(inst, Some(previous.0), Some(previous.1)),
             ));
         }
-        Ok(())
+        Ok(stopped.into_operation_guard())
     }
 
     fn commit_disk(
@@ -1761,18 +1763,19 @@ impl VmBackend for LimaBackend {
     fn set_machine_resources(
         &self,
         cfg: &CoopConfig,
-        stopped: &StoppedInstance,
+        stopped: StoppedInstance,
         mem: Option<VmMemory>,
         vcpus: Option<NonZeroU8>,
         start_after: bool,
-    ) -> Result<()> {
+    ) -> Result<InstanceOperationGuard> {
         crate::lima::set_machine_resources(
             cfg,
             stopped.instance(),
             mem.map(VmMemory::get),
             vcpus,
             start_after,
-        )
+        )?;
+        Ok(stopped.into_operation_guard())
     }
 
     fn commit_disk(
@@ -4844,6 +4847,35 @@ mod tests {
         );
         assert!(error.to_string().contains("rollback failed"), "{error:#}");
         assert!(format!("{error:#}").contains("start failed"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn machine_resource_transition_retains_operation_lock() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: crate::config::InstanceName::new("test").unwrap(),
+            index: crate::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::LegacyTcp,
+        };
+        let cfg = CoopConfig::default();
+        crate::vm::FirecrackerVm::new(&cfg, &inst)
+            .configure()
+            .unwrap();
+        let backend = FirecrackerBackend::new();
+        let stopped = backend.as_stopped(inst.clone()).unwrap();
+        let operation = backend
+            .set_machine_resources(&cfg, stopped, Some(cfg.vm.mem_size_mib), None, false)
+            .unwrap();
+        assert!(
+            crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::from_millis(100)).is_err()
+        );
+        drop(operation);
+        assert!(
+            crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::from_millis(100)).is_ok()
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
