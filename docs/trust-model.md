@@ -147,9 +147,9 @@ families. Exact overrides are re-resolved from the current config on every
 operation and are never persisted into instance state.
 
 Firecracker setup applies the same pathname checks to its system tools. The
-bootstrap phase resolves `sudo` and `curl`, the available package prerequisites,
+bootstrap phase resolves `sudo`, `timeout`, and `curl`, the available package prerequisites,
 and `apt-get` if installation is needed before setup's first storage change.
-After package installation, setup resolves `tar`, `gzip`, `chmod`, `rm`,
+After package installation, setup re-resolves `sudo` and `timeout`, then resolves `tar`, `gzip`, `chmod`, `rm`,
 `unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
 `e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
 request. KVM access repair additionally resolves `setfacl` or `usermod` and
@@ -159,8 +159,8 @@ environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
 its default config file and receives only HTTPS proxy and no-proxy settings
 from the caller. Elevated programs remain subject to trusted sudoers and host
 package-manager configuration. Before package installation, setup checks the
-filesystem entries below `/etc/apt` and their symlink targets for root ownership
-and group/other writability. Apt delegates its method helpers, `dpkg`,
+filesystem entries below `/etc/apt`, their symlink targets, and apt configuration
+include paths for root ownership and group/other writability. Apt delegates its method helpers, `dpkg`,
 configured hooks, and package maintainer scripts to that system package policy;
 these indirect children are not a closed preflight family.
 Package installation passes only

@@ -1,11 +1,12 @@
 //! Host executables used by Firecracker setup. Preflight checks the complete
-//! phase family before effects; each launch revalidates its selected path
+//! coop-selected phase family before effects; each launch revalidates its selected path
 //! against the policy. Pathname validation does not pin the executed inode.
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use thiserror::Error;
@@ -17,6 +18,7 @@ use crate::host_tool::{
 };
 
 const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 
 #[derive(Debug, Error)]
 pub(crate) enum SetupToolError {
@@ -53,10 +55,10 @@ fn validate_apt_configuration_at(
     root: &Path,
     policy: &TrustedToolPolicy,
 ) -> Result<(), SetupToolError> {
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = vec![(root.to_path_buf(), false)];
     let mut visited = HashSet::new();
     let mut entries = 0usize;
-    while let Some(path) = pending.pop() {
+    while let Some((path, scan_config)) = pending.pop() {
         entries += 1;
         if entries > 4096 {
             return Err(SetupToolError::AptConfiguration {
@@ -65,7 +67,7 @@ fn validate_apt_configuration_at(
         }
         let (canonical, metadata) = crate::host_tool::validate_trusted_path(&path, policy)
             .map_err(|reason| SetupToolError::AptConfiguration { reason })?;
-        if !visited.insert(canonical.clone()) {
+        if !visited.insert((canonical.clone(), scan_config)) {
             continue;
         }
         if metadata.is_dir() {
@@ -77,12 +79,58 @@ fn validate_apt_configuration_at(
                 let child = child.map_err(|error| SetupToolError::AptConfiguration {
                     reason: error.to_string(),
                 })?;
-                pending.push(child.path());
+                let child_path = child.path();
+                let child_is_config = scan_config
+                    || child_path == root.join("apt.conf")
+                    || child_path.starts_with(root.join("apt.conf.d"));
+                pending.push((child_path, child_is_config));
             }
         } else if !metadata.is_file() {
             return Err(SetupToolError::AptConfiguration {
                 reason: "configuration contains a special file".into(),
             });
+        } else if scan_config {
+            // apt.conf's #include can reach outside /etc/apt. Apt runs with
+            // cwd /, so relative include paths are anchored there too.
+            let contents =
+                fs::read(&canonical).map_err(|error| SetupToolError::AptConfiguration {
+                    reason: error.to_string(),
+                })?;
+            for line in contents.split(|byte| *byte == b'\n') {
+                let mut remaining = line;
+                while let Some(start) = remaining.windows(8).position(|part| part == b"#include") {
+                    let tail = &remaining[start + 8..];
+                    let end = tail.iter().position(|byte| *byte == b';').ok_or_else(|| {
+                        SetupToolError::AptConfiguration {
+                            reason: "unterminated apt include directive".into(),
+                        }
+                    })?;
+                    let value = std::str::from_utf8(&tail[..end])
+                        .map_err(|_| SetupToolError::AptConfiguration {
+                            reason: "non-UTF-8 apt include path".into(),
+                        })?
+                        .trim();
+                    let value = value
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .unwrap_or(value);
+                    if value.is_empty() || value.contains(['"', '\\', '\n']) {
+                        return Err(SetupToolError::AptConfiguration {
+                            reason: "unsupported apt include path".into(),
+                        });
+                    }
+                    let included = Path::new(value);
+                    pending.push((
+                        if included.is_absolute() {
+                            included.to_path_buf()
+                        } else {
+                            Path::new("/").join(included)
+                        },
+                        true,
+                    ));
+                    remaining = &tail[end + 1..];
+                }
+            }
         }
     }
     Ok(())
@@ -121,6 +169,7 @@ pub(crate) enum SetupTool {
     )]
     Resize2fs,
     Id,
+    Timeout,
 }
 
 impl SetupTool {
@@ -145,6 +194,7 @@ impl SetupTool {
             Self::E2fsck => "e2fsck",
             Self::Resize2fs => "resize2fs",
             Self::Id => "id",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -276,21 +326,51 @@ impl SetupTool {
     }
 
     pub(crate) fn elevated(self) -> Result<Cmd> {
+        self.elevated_with_deadline(crate::setup::SETUP_TOOL_DEADLINE)
+    }
+
+    pub(crate) fn elevated_with_deadline(self, deadline: Duration) -> Result<Cmd> {
         let sudo = Self::Sudo.resolve()?;
+        let timeout = Self::Timeout.resolve()?;
         let tool = self.resolve()?;
-        Ok(TrustedLaunchContext::system()
-            .elevated(&sudo, &tool)
-            .env("PATH", SYSTEM_HELPER_PATH))
+        Ok(Self::root_timeout_command(&sudo, &timeout, deadline).arg(tool.launch_path()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sudo_command(deadline: Duration) -> Result<Cmd> {
+        let sudo = Self::Sudo.resolve()?;
+        let timeout = Self::Timeout.resolve()?;
+        Ok(Self::root_timeout_command(&sudo, &timeout, deadline))
+    }
+
+    fn root_timeout_command(
+        sudo: &ResolvedHostTool<Self>,
+        timeout: &ResolvedHostTool<Self>,
+        deadline: Duration,
+    ) -> Cmd {
+        let root_deadline = deadline.saturating_add(Duration::from_secs(30));
+        TrustedLaunchContext::system()
+            .command(sudo)
+            .env("PATH", SYSTEM_HELPER_PATH)
+            .arg("--")
+            .arg(timeout.launch_path())
+            .arg(ROOT_TIMEOUT_GRACE)
+            .arg(format!("{}s", root_deadline.as_secs()))
     }
 
     pub(crate) fn apt_install_command() -> Result<Cmd> {
         validate_apt_configuration()?;
         let sudo = Self::Sudo.resolve()?;
+        let timeout = Self::Timeout.resolve()?;
         let apt = Self::AptGet.resolve()?;
-        Ok(Self::apt_command_from(&sudo, &apt))
+        Ok(Self::apt_command_from(&sudo, &timeout, &apt))
     }
 
-    fn apt_command_from(sudo: &ResolvedHostTool<Self>, apt: &ResolvedHostTool<Self>) -> Cmd {
+    fn apt_command_from(
+        sudo: &ResolvedHostTool<Self>,
+        timeout: &ResolvedHostTool<Self>,
+        apt: &ResolvedHostTool<Self>,
+    ) -> Cmd {
         // The input environment is empty. Preserve only this explicit value
         // through sudo so debconf cannot block an unattended package install.
         TrustedLaunchContext::system()
@@ -299,6 +379,12 @@ impl SetupTool {
             .env("DEBIAN_FRONTEND", "noninteractive")
             .arg("--preserve-env=DEBIAN_FRONTEND")
             .arg("--")
+            .arg(timeout.launch_path())
+            .arg(ROOT_TIMEOUT_GRACE)
+            .arg(format!(
+                "{}s",
+                (crate::setup::SETUP_TOOL_DEADLINE + Duration::from_secs(30)).as_secs()
+            ))
             .arg(apt.launch_path())
     }
 }
@@ -420,6 +506,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn apt_include_outside_tree_must_be_trusted() {
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let root = fixture.path().join("apt");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("apt.conf");
+        let external = fixture.path().join("external.conf");
+        fs::write(&external, "").unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&config, format!("#include \"{}\";", external.display())).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = unsafe { libc::geteuid() }; // SAFETY: geteuid has no preconditions.
+        let policy = TrustedToolPolicy::new(fixture.path(), [], uid);
+        validate_apt_configuration_at(&root, &policy).unwrap();
+
+        let writable = fixture.path().join("writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        let untrusted = writable.join("hook.conf");
+        fs::write(&untrusted, "DPkg::Pre-Invoke { \"true\"; };").unwrap();
+        fs::write(&config, format!("#include \"{}\";", untrusted.display())).unwrap();
+        assert!(matches!(
+            validate_apt_configuration_at(&root, &policy),
+            Err(SetupToolError::AptConfiguration { .. })
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn installed_apt_configuration_passes_the_supported_host_policy() {
@@ -499,7 +613,8 @@ mod tests {
             TrustedToolPolicy::new_with_owners("/", [fixture.path().to_path_buf()], [0, uid]);
         let sudo_path = fixture.path().join("sudo");
         let apt_path = fixture.path().join("apt-get");
-        for path in [&sudo_path, &apt_path] {
+        let timeout_path = fixture.path().join("timeout");
+        for path in [&sudo_path, &apt_path, &timeout_path] {
             fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
             let mut permissions = fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -509,7 +624,13 @@ mod tests {
             resolve_host_tool(SetupTool::Sudo, std::slice::from_ref(&sudo_path), &policy).unwrap();
         let apt =
             resolve_host_tool(SetupTool::AptGet, std::slice::from_ref(&apt_path), &policy).unwrap();
-        let built = SetupTool::apt_command_from(&sudo, &apt).build();
+        let timeout = resolve_host_tool(
+            SetupTool::Timeout,
+            std::slice::from_ref(&timeout_path),
+            &policy,
+        )
+        .unwrap();
+        let built = SetupTool::apt_command_from(&sudo, &timeout, &apt).build();
         assert_eq!(built.get_program(), sudo_path.as_os_str());
         assert_eq!(built.get_current_dir(), Some(Path::new("/")));
         let args = built.get_args().collect::<Vec<_>>();
@@ -518,6 +639,9 @@ mod tests {
             [
                 "--preserve-env=DEBIAN_FRONTEND",
                 "--",
+                timeout_path.to_str().unwrap(),
+                ROOT_TIMEOUT_GRACE,
+                "21630s",
                 apt_path.to_str().unwrap()
             ]
         );

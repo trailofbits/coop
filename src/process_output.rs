@@ -69,9 +69,11 @@ fn run_status_bounded_with_shutdown(
         return Err(CaptureError::InputLimit);
     }
     command.process_group(0);
-    if input.is_some() {
-        command.stdin(Stdio::piped());
-    }
+    command.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = command.spawn().map_err(CaptureError::Spawn)?;
     let Ok(pid) = i32::try_from(child.id()) else {
         let _ = child.kill();
@@ -119,13 +121,9 @@ fn terminate_group(pid: i32, child: &mut std::process::Child) {
     // Give wrappers such as sudo time to forward a catchable termination
     // signal to a privileged child before the wrapper is killed.
     let _ = unsafe { libc::kill(-pid, libc::SIGTERM) }; // SAFETY: pid is our positive group leader.
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
-        if child.try_wait().is_ok_and(|status| status.is_some()) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Keep the direct child unreaped, so its PID cannot be reused before the
+    // final group signal. A descendant may outlive a wrapper that exits early.
+    std::thread::sleep(Duration::from_secs(3));
     kill_group(pid, child);
     let _ = child.wait();
 }
@@ -385,10 +383,16 @@ mod tests {
         }
         let fixture = tempfile::tempdir().unwrap();
         let marker = fixture.path().join("child-pid");
-        let script = format!("echo $$ > {}; exec /bin/sleep 30", marker.display());
+        let script = format!(
+            "trap '' TERM; echo $$ > {}; exec /bin/sleep 30",
+            marker.display()
+        );
+        let mut command = crate::setup_tool::SetupTool::sudo_command(Duration::from_secs(5))
+            .unwrap()
+            .args(["/bin/sh", "-c", &script])
+            .build();
         let error = run_status_bounded_with_shutdown(
-            Command::new("/usr/bin/sudo")
-                .args(["-n", "/bin/sh", "-c", &script])
+            command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),

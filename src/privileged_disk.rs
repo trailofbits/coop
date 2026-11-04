@@ -775,9 +775,7 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
         .ancestors()
         .nth(3)
         .context("Disk path has no data root")?;
-    let mut command = SetupTool::Sudo
-        .command()?
-        .arg("--")
+    let mut command = SetupTool::sudo_command(crate::setup::SETUP_TOOL_DEADLINE)?
         .arg(running_executable_path())
         .arg("__disk-op")
         .arg(operation)

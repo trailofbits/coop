@@ -208,8 +208,9 @@ impl Cmd {
         Ok(())
     }
 
-    /// Run a noninteractive host command with a deadline and cooperative
-    /// signal cancellation, retaining progress on the inherited streams.
+    /// Run a host command with a deadline and signal cancellation, retaining
+    /// progress on the inherited streams. Authentication policy can still
+    /// cause a launcher such as sudo to use its controlling terminal.
     pub(crate) fn run_bounded(&self, deadline: Duration) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running: {desc}");

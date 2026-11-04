@@ -1530,7 +1530,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
         guest_user,
         "provision script",
         |path| {
-            private_limactl()
+            Ok(private_limactl()
                 .args([
                     "shell",
                     BUILDER_NAME,
@@ -1542,7 +1542,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok_and(|s| s.success()))
         },
         builder_log_tail,
     )
