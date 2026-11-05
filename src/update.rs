@@ -524,14 +524,11 @@ fn resolve_provenance(
     let mut url = source.metadata_url(REPO, "latest")?;
     url.set_path(&format!("/repos/{REPO}/attestations/sha256:{digest}"));
     url.set_query(Some("per_page=100"));
-    let body = match curl_capture(source, &url, None) {
-        Ok(body) => body,
-        Err(_) => {
-            tracing::warn!(
-                "Anonymous attestation API request failed; trying authenticated gh verification"
-            );
-            return Ok(Provenance::Api);
-        }
+    let Ok(body) = curl_capture(source, &url, None) else {
+        tracing::warn!(
+            "Anonymous attestation API request failed; trying authenticated gh verification"
+        );
+        return Ok(Provenance::Api);
     };
     let jsonl = parse_attestation_bundles(&body)?;
     fs::write(&dest, jsonl).context("Failed to write downloaded attestation bundle")?;
