@@ -73,9 +73,8 @@ Always run:
   phantom features, and at most one structural concern.
 - **Conventions:** project Rust idioms, rename completeness, shared constants,
   mutation scope, cross-file synchronization, and diff noise.
-- **User impact:** read `docs/user-impact.md`; check task completion, friction,
-  failure and recovery, and material security or reliability trade-offs. A
-  downside calls for an informed requester decision, not an automatic veto.
+- **User impact:** follow [`docs/user-impact.md`](../../../docs/user-impact.md)
+  for affected user tasks and material trade-offs.
 
 Run when triggered:
 

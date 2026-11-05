@@ -50,13 +50,14 @@ Report what ran, accepted/fixed findings, rejected findings with a one-line
 reason, follow-ups, unrun platform gates, and a `clean` or `blocked` code-review
 verdict. Report validation separately as complete, incomplete, or failed. An
 unavailable test does not turn an otherwise clean code review into a passed
-validation gate. An unresolved material user-impact decision remains explicit
-in a blocked verdict; it does not automatically reject a security measure.
+validation gate. Apply the [user-impact guidance](../../../docs/user-impact.md)
+when a material decision remains unresolved.
 
 Iterate on the uncommitted diff as needed. After committing fixes, run one final
 full-diff review of the branch tip intended for the PR. Record its verdict in
-one marker. A blocked verdict permits a **draft** PR to carry unresolved
-findings or decisions for discussion; it does not permit opening a ready PR.
+one marker. After a blocked verdict, open only a **draft** PR to carry unresolved
+findings or decisions for discussion. The compatibility hook checks that the
+commit was reviewed; it does not enforce PR readiness.
 Never write the marker before the final review or for an uncommitted diff:
 
 ```bash

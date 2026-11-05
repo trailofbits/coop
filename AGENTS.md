@@ -106,11 +106,7 @@ over adding a runtime check.
 
 ## User impact
 
-For user-visible features and hardening, assess the normal task, failure and
-recovery, friction, and both backends where relevant. Compare the security or
-reliability benefit with the user cost and feasible alternatives that meet the
-same goal. A credible, material downside needs explicit requester acceptance;
-it does not automatically veto a planned control. See
+For user-visible features and hardening, follow
 [`docs/user-impact.md`](docs/user-impact.md).
 
 ## Pull requests
@@ -144,8 +140,8 @@ it does not automatically veto a planned control. See
 The [`review`](.agents/skills/review/SKILL.md) skill is the canonical review
 workflow. In addition to lens-specific checks, every review must:
 
-- Check user task completion, friction, and recovery; raise material trade-offs
-  for the requester to decide without treating a security control as optional.
+- Check affected user tasks and material trade-offs using
+  [`docs/user-impact.md`](docs/user-impact.md).
 - Treat each finding and each author claim as a hypothesis. Reproduce or inspect
   the real behavior when possible; check the pinned dependency/tool version.
 - Mutation-check or deliberately break new tests and tripwires. An assertion

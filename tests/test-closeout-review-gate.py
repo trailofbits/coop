@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise draft and ready PR review markers in the Claude compatibility hook."""
+"""Exercise current-commit review markers in the Claude compatibility hook."""
 
 import json
 import os
@@ -60,28 +60,23 @@ class CloseoutReviewGateTests(unittest.TestCase):
             env=env,
         ).returncode
 
-    def test_draft_requires_current_review_but_not_clean_verdict(self):
+    def test_pr_creation_requires_current_review(self):
         self.assertNotEqual(self.gate("gh pr create --draft"), 0)
         self.marker("blocked")
         self.assertEqual(self.gate("gh pr create --draft"), 0)
-        self.assertNotEqual(self.gate("gh pr create"), 0)
+        self.assertEqual(self.gate("gh pr create"), 0)
         (self.repo / "file").write_text("second\n")
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "Second"], check=True)
         self.assertNotEqual(self.gate("gh pr create --draft"), 0)
+        self.assertNotEqual(self.gate("gh pr create"), 0)
 
-    def test_ready_requires_clean_marker_and_quoted_draft_does_not_bypass(self):
-        self.marker("blocked")
-        self.assertNotEqual(self.gate("gh pr create --title 'text --draft here'"), 0)
-        self.assertNotEqual(self.gate("gh pr create --title '--draft'"), 0)
-        self.assertNotEqual(self.gate("gh pr create --title --draft --body ''"), 0)
-        self.assertNotEqual(self.gate("gh pr create --title x --draft"), 0)
-        self.assertNotEqual(self.gate("gh pr create # --draft"), 0)
-        self.assertNotEqual(self.gate("gh pr create && echo --draft"), 0)
-        self.assertNotEqual(self.gate("gh pr create --draft && gh pr ready"), 0)
+    def test_only_completed_verdicts_are_accepted(self):
+        self.marker("pending")
+        self.assertNotEqual(self.gate("gh pr create"), 0)
         self.marker("clean")
         self.assertEqual(self.gate("gh pr create"), 0)
         self.marker("blocked")
-        self.assertNotEqual(self.gate("gh pr create"), 0)
+        self.assertEqual(self.gate("gh pr create"), 0)
 
     def test_gate_does_not_execute_pr_command(self):
         self.assertNotEqual(self.gate("gh pr create --draft"), 0)
