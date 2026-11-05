@@ -3479,7 +3479,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(failed.unwrap_err().to_string().contains("invalid squashfs"));
+        assert!(failed.unwrap_err().to_string().contains("absent"));
         assert_eq!(
             events.into_inner(),
             [
@@ -3647,7 +3647,7 @@ mod tests {
             unpack_cached_rootfs(fixture.path(), "https://example.test/c", fetch, |_path| {
                 anyhow::bail!("invalid squashfs")
             });
-        assert!(failed.is_err());
+        assert!(failed.unwrap_err().to_string().contains("invalid squashfs"));
         assert!(!first.exists());
         assert!(!manifest_path.exists());
         assert_eq!(downloads.get(), 5);
