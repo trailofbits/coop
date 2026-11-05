@@ -74,6 +74,9 @@ jobs:
       - name: Integration probe regression tests
         run: python3 tests/test-integration-probes.py
 
+      - name: Closeout review gate regression tests
+        run: python3 tests/test-closeout-review-gate.py
+
       - name: Codex account wrapper regression tests
         run: python3 tests/test-codex-account.py
 
