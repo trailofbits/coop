@@ -14,6 +14,12 @@ A template is a fully provisioned ext4 root filesystem. The build process:
 
 coop stores the result under `~/.coop/images/<name>/`. When creating an instance, coop copies the template to create an instance-specific rootfs. The copy uses `cp --reflink=auto` on Linux. On filesystems that support reflinks (btrfs, XFS), this shares storage blocks until written, making the copy fast and space-efficient.
 
+On Linux, image builds reuse the downloaded Firecracker CI squashfs from the
+private coop data directory when its source URL and stored SHA-256 checksum
+match. Coop keeps one cached download, verifies it on each reuse, and downloads
+it again if it is missing, changed, or fails to unpack. Each build still
+unpacks into a fresh working tree.
+
 ## What every template includes
 
 Every template installs these packages regardless of profile selection.

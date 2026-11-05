@@ -22,6 +22,10 @@ Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
 integration remains a separate platform gate.
+The runner logs `TIMING build:*` durations, and the suite logs `TIMING test:*`
+durations, so shard logs show which work is on the critical path.
+The KVM matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs that
+host-only gate. Unsharded full runs still include it.
 
 ## Cross-platform compile and lint checks
 
@@ -287,11 +291,13 @@ native release.
 
 ## Host-only bridge isolation test
 
-`./tests/run-integration.sh --full` runs the bridge isolation gate before
-the VM suite, on the selected local or remote host. A failure stops the full
-run; macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables
-both gates. Remote full runs copy the tracked working-tree source and require
-the build and namespace prerequisites below on the remote host.
+`./tests/run-integration.sh --full` runs the bridge isolation gate before the
+VM suite on the selected local or remote host. A failure stops the full run;
+macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables it.
+Remote bridge-gate runs copy the tracked working-tree source and require the
+build and namespace prerequisites below on the remote host. The KVM matrix sets
+`COOP_TEST_SKIP_BRIDGE=1` so its three shards do not repeat the gate already
+run by regular Linux CI.
 
 Run `./tests/integration-network.sh` directly on Linux to test bridge-port
 isolation without KVM or VM images. It builds a library test as the current

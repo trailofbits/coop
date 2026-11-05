@@ -2103,43 +2103,171 @@ fn valid_ci_key(key: &str, prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str) -> Result<()> {
-    let squashfs = tempfile::Builder::new()
+/// Keep the unmodified CI artifact across image builds. The setup lock covers
+/// both publication and validation, and extraction always uses a fresh tree.
+#[derive(Serialize, Deserialize)]
+struct RootfsCacheManifest {
+    source_url: String,
+    sha256: String,
+}
+
+fn rootfs_cache_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
+    (
+        data_dir.join("rootfs-cache.squashfs"),
+        data_dir.join("rootfs-cache.json"),
+    )
+}
+
+fn cached_rootfs(
+    data_dir: &Path,
+    rootfs_url: &str,
+    download: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    let (cache, manifest_path) = rootfs_cache_paths(data_dir);
+    if rootfs_cache_valid(&cache, &manifest_path, rootfs_url) {
+        eprintln!("  Reusing verified rootfs download");
+        return Ok(cache);
+    }
+
+    let staged = tempfile::Builder::new()
         .prefix(".coop-rootfs-download-")
-        .tempfile_in(&cfg.data_dir)
+        .tempfile_in(data_dir)
         .context("Failed to stage rootfs download")?;
-    let unpack_dir = cfg.data_dir.join("squashfs-root");
 
     eprintln!("  Downloading rootfs...");
-    curl_output(
-        &SetupTool::Curl
-            .command()?
-            .args(["-fSL", "-o"])
-            .arg(squashfs.path())
-            .arg(rootfs_url),
-        Duration::from_secs(3600),
-        64 * 1024,
-    )
-    .context("Failed to download rootfs")?;
-
-    eprintln!("  Unpacking squashfs...");
-    if let Err(e) = SetupTool::Rm
-        .elevated()?
-        .arg("-rf")
-        .arg(&unpack_dir)
-        .run_bounded(SETUP_TOOL_DEADLINE)
-    {
-        tracing::debug!("Failed to remove old unpack dir (non-fatal): {e}");
+    download(staged.path())?;
+    let digest = rootfs_file_hash(staged.path()).context("Failed to hash rootfs download")?;
+    if fs::metadata(staged.path())?.len() == 0 {
+        bail!("Downloaded rootfs is empty");
     }
-    SetupTool::Unsquashfs
-        .elevated()?
-        .arg("-d")
-        .arg(&unpack_dir)
-        .arg(squashfs.path())
-        .run_bounded(SETUP_TOOL_DEADLINE)
-        .context("Failed to unpack squashfs image")?;
+    staged
+        .persist(&cache)
+        .map_err(|error| error.error)
+        .context("Failed to publish rootfs download")?;
 
-    Ok(())
+    let manifest = tempfile::Builder::new()
+        .prefix(".coop-rootfs-download-")
+        .tempfile_in(data_dir)
+        .context("Failed to stage rootfs cache manifest")?;
+    let metadata = RootfsCacheManifest {
+        source_url: rootfs_url.to_owned(),
+        sha256: digest,
+    };
+    fs::write(manifest.path(), serde_json::to_vec(&metadata)?)
+        .context("Failed to write rootfs cache manifest")?;
+    manifest
+        .persist(&manifest_path)
+        .map_err(|error| error.error)
+        .context("Failed to publish rootfs cache manifest")?;
+    Ok(cache)
+}
+
+fn rootfs_cache_valid(cache: &Path, manifest_path: &Path, rootfs_url: &str) -> bool {
+    let Ok(cache_meta) = fs::symlink_metadata(cache) else {
+        return false;
+    };
+    let Ok(manifest_meta) = fs::symlink_metadata(manifest_path) else {
+        return false;
+    };
+    if !cache_meta.file_type().is_file()
+        || cache_meta.len() == 0
+        || !manifest_meta.file_type().is_file()
+        || manifest_meta.len() > 4096
+    {
+        return false;
+    }
+    let Ok(bytes) = fs::read(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<RootfsCacheManifest>(&bytes) else {
+        return false;
+    };
+    if manifest.source_url != rootfs_url {
+        return false;
+    }
+    let Ok(actual) = rootfs_file_hash(cache) else {
+        return false;
+    };
+    actual == manifest.sha256
+}
+
+/// An unpack failure can mean the downloaded bytes are invalid. Do not make
+/// every later setup retry the same artifact indefinitely.
+fn unpack_cached_rootfs(
+    data_dir: &Path,
+    rootfs_url: &str,
+    download: impl FnOnce(&Path) -> Result<()>,
+    unpack: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let cache = cached_rootfs(data_dir, rootfs_url, download)?;
+    let result = unpack(&cache);
+    if result.is_err() {
+        let (_, manifest_path) = rootfs_cache_paths(data_dir);
+        for path in [&manifest_path, &cache] {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!("Failed to discard invalid rootfs cache entry: {error}");
+            }
+        }
+    }
+    result
+}
+
+fn rootfs_file_hash(path: &Path) -> Result<String> {
+    use sha2::Digest as _;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = io::Read::read(&mut file, &mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn download_and_unpack_rootfs(cfg: &CoopConfig, rootfs_url: &str) -> Result<()> {
+    let unpack_dir = cfg.data_dir.join("squashfs-root");
+    unpack_cached_rootfs(
+        &cfg.data_dir,
+        rootfs_url,
+        |path| {
+            curl_output(
+                &SetupTool::Curl
+                    .command()?
+                    .args(["-fSL", "-o"])
+                    .arg(path)
+                    .arg(rootfs_url),
+                Duration::from_secs(3600),
+                64 * 1024,
+            )
+            .context("Failed to download rootfs")?;
+            Ok(())
+        },
+        |squashfs| {
+            eprintln!("  Unpacking squashfs...");
+            if let Err(e) = SetupTool::Rm
+                .elevated()?
+                .arg("-rf")
+                .arg(&unpack_dir)
+                .run_bounded(SETUP_TOOL_DEADLINE)
+            {
+                tracing::debug!("Failed to remove old unpack dir (non-fatal): {e}");
+            }
+            SetupTool::Unsquashfs
+                .elevated()?
+                .arg("-d")
+                .arg(&unpack_dir)
+                .arg(squashfs)
+                .run_bounded(SETUP_TOOL_DEADLINE)
+                .context("Failed to unpack squashfs image")?;
+            Ok(())
+        },
+    )
 }
 
 fn inject_ssh_keys(cfg: &CoopConfig) -> Result<()> {
@@ -3351,7 +3479,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(failed.is_err());
+        assert!(failed.unwrap_err().to_string().contains("invalid squashfs"));
         assert_eq!(
             events.into_inner(),
             [
@@ -3479,6 +3607,62 @@ mod tests {
         let first = kernel_staging_prefix(Path::new("/var/lib/coop/vmlinux"));
         let second = kernel_staging_prefix(Path::new("/var/lib/coop/other"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn rootfs_cache_reuses_only_verified_artifact_for_same_url() {
+        let fixture = tempfile::tempdir().unwrap();
+        let downloads = std::cell::Cell::new(0);
+        let fetch = |path: &Path| -> Result<()> {
+            downloads.set(downloads.get() + 1);
+            fs::write(path, b"squashfs fixture")?;
+            Ok(())
+        };
+
+        let first = cached_rootfs(fixture.path(), "https://example.test/a", fetch).unwrap();
+        let reused = cached_rootfs(fixture.path(), "https://example.test/a", fetch).unwrap();
+        assert_eq!(first, reused);
+        assert_eq!(downloads.get(), 1);
+
+        // Keep the byte length unchanged so the checksum, not just metadata,
+        // must detect the corruption.
+        fs::write(&first, b"tampered fixture").unwrap();
+        cached_rootfs(fixture.path(), "https://example.test/a", fetch).unwrap();
+        assert_eq!(downloads.get(), 2);
+        assert_eq!(fs::read(&first).unwrap(), b"squashfs fixture");
+
+        let (_, manifest_path) = rootfs_cache_paths(fixture.path());
+        fs::remove_file(&manifest_path).unwrap();
+        cached_rootfs(fixture.path(), "https://example.test/a", fetch).unwrap();
+        assert_eq!(downloads.get(), 3);
+
+        let other = cached_rootfs(fixture.path(), "https://example.test/b", fetch).unwrap();
+        assert_eq!(first, other);
+        assert_eq!(downloads.get(), 4);
+        let manifest: RootfsCacheManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.source_url, "https://example.test/b");
+
+        let failed =
+            unpack_cached_rootfs(fixture.path(), "https://example.test/c", fetch, |_path| {
+                anyhow::bail!("invalid squashfs")
+            });
+        assert!(failed.is_err());
+        assert!(!first.exists());
+        assert!(!manifest_path.exists());
+        assert_eq!(downloads.get(), 5);
+        cached_rootfs(fixture.path(), "https://example.test/c", fetch).unwrap();
+        assert_eq!(downloads.get(), 6);
+
+        for _ in 0..2 {
+            unpack_cached_rootfs(fixture.path(), "https://example.test/c", fetch, |path| {
+                assert_eq!(fs::read(path).unwrap(), b"squashfs fixture");
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(first.exists());
+        assert_eq!(downloads.get(), 6);
     }
 
     #[test]

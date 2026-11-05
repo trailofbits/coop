@@ -54,6 +54,8 @@ jobs:
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
+          # Regular CI runs this host-only gate; do not repeat it in each shard.
+          COOP_TEST_SKIP_BRIDGE: "1"
           SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
