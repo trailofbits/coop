@@ -8,10 +8,10 @@ IFS= read -r -t 15 password
 [[ $password =~ ^[a-f0-9]{64}$ ]]
 config="${socket%/*}/config.yaml"
 
-version=4.141.0
+version=4.145.0
 case $(uname -m) in
-    x86_64) arch=amd64; checksum=65bcd20b524d03eb1b5adb7f360244599ef0e5b74089a46a982d32c074b97a29 ;;
-    aarch64|arm64) arch=arm64; checksum=e5cc78da1d631c6cf6162f9b18eeaa8ee9d3239e1a88bb99d0602cdc5fa1852d ;;
+    x86_64) arch=amd64; checksum=771bf6038658034d7caf509fcc44af50f0b8bdac5e738177b6cf9c4181dd3382 ;;
+    aarch64|arm64) arch=arm64; checksum=425d3bc5167c85dc070427d2aa93760083b02aec852ea9ce75c2906c99138f45 ;;
     *) exit 64 ;;
 esac
 test -d /workspace
