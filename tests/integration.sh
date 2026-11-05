@@ -218,6 +218,26 @@ assert_lima_headless() {
     fi
 }
 
+# Return the host image size, rather than guest filesystem usage. Stopped
+# instances do not report disk size through `coop status` on either backend.
+host_disk_bytes() {
+    local inst="$1"
+    case "$(uname -s)" in
+        Linux)
+            stat -c %s "$HOME/.coop/instances/$inst/rootfs.ext4"
+            ;;
+        Darwin)
+            local lima_dir="${LIMA_HOME:-$HOME/.lima}/coop-$inst"
+            if [[ -e "$lima_dir/disk" ]]; then
+                stat -L -f %z "$lima_dir/disk"
+            else
+                stat -L -f %z "$lima_dir/diffdisk"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # Cross-platform timeout wrapper. Prefer GNU timeout (Linux, or macOS with
 # coreutils installed as `gtimeout`); fall back to a perl-based implementation
 # since perl ships in the macOS base system.
@@ -4014,25 +4034,20 @@ test_status_stopped() {
     fi
 }
 
-test_resize_status() {
+test_resize_disk_size() {
     echo ""
-    echo "=== Phase: resize updates status disk size ==="
+    echo "=== Phase: resize updates host disk size ==="
 
-    # Get current disk size from status (instance is stopped).
-    # Firecracker status requires a running VM and doesn't show
-    # "Disk: N GiB", so skip this test if status fails or the
-    # disk line is absent (Lima-only feature).
-    if ! coop status "$INSTANCE" 2>/dev/null; then
-        skip "resize updates status disk size" "status unavailable for stopped instance"
+    local old_bytes old_disk same_bytes new_bytes
+    local gib_bytes=1073741824
+    if ! old_bytes=$(host_disk_bytes "$INSTANCE") ||
+        [[ ! "$old_bytes" =~ ^[0-9]+$ ]] ||
+        (( old_bytes == 0 || old_bytes % gib_bytes != 0 )); then
+        fail "inspect disk before resize" "missing or non-GiB host image size: ${old_bytes:-unavailable}"
         return
     fi
-    local old_disk
-    old_disk=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-    if [[ -z "$old_disk" || "$old_disk" -eq 0 ]]; then
-        skip "resize updates status disk size" "status does not report disk GiB"
-        return
-    fi
-    pass "status shows disk before resize (${old_disk} GiB)"
+    old_disk=$((old_bytes / gib_bytes))
+    pass "host disk before resize is ${old_disk} GiB"
 
     if coop resize "$INSTANCE" --size 1GB; then
         fail "resize rejects decimal GB suffix" "accepted 1GB"
@@ -4047,6 +4062,12 @@ test_resize_status() {
         fail "resize accepts explicit GiB suffix" "stderr: $HARNESS_ERR"
         return
     fi
+    if ! same_bytes=$(host_disk_bytes "$INSTANCE") || [[ "$same_bytes" != "$old_bytes" ]]; then
+        fail "same-size resize preserves host disk size" \
+            "before=$old_bytes bytes after=${same_bytes:-unavailable} bytes"
+        return
+    fi
+    pass "same-size resize preserves host disk size"
 
     # Resize by +1G while stopped
     if coop resize "$INSTANCE" --size +1G; then
@@ -4056,19 +4077,15 @@ test_resize_status() {
         return
     fi
 
-    # Verify status now reports the larger size
-    if coop status "$INSTANCE" 2>/dev/null; then
-        local new_disk
-        new_disk=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-        local expected_disk=$(( old_disk + 1 ))
-        if [[ "$new_disk" -eq "$expected_disk" ]]; then
-            pass "status reflects resized disk (${new_disk} GiB)"
-        else
-            fail "status reflects resized disk" \
-                "expected ${expected_disk} GiB, got ${new_disk} GiB"
-        fi
+    # Verify the host image grew by exactly one GiB.
+    if ! new_bytes=$(host_disk_bytes "$INSTANCE") ||
+        [[ ! "$new_bytes" =~ ^[0-9]+$ ]]; then
+        fail "inspect disk after resize" "host image size unavailable"
+    elif (( new_bytes == old_bytes + gib_bytes )); then
+        pass "host disk grew by 1 GiB"
     else
-        fail "status after resize" "exit code: $?"
+        fail "host disk grew by 1 GiB" \
+            "expected $((old_bytes + gib_bytes)) bytes, got $new_bytes bytes"
     fi
 }
 
@@ -4747,22 +4764,34 @@ test_restore_reprovision() {
     # Grow the disk first, so the reprovision has a non-template size to carry
     # across the swap. `restore_disk` copies the template, which is smaller,
     # so a reprovision that skipped the re-grow would shrink the instance back.
-    # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
-    # absent value degrades to a skip rather than a spurious failure.
-    local disk_before=""
+    local disk_initial="" disk_before=""
     if coop stop "$INSTANCE"; then
         pass "stop before disk grow exits 0"
     else
         fail "stop before disk grow exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
+    if ! disk_initial=$(host_disk_bytes "$INSTANCE") ||
+        [[ ! "$disk_initial" =~ ^[0-9]+$ ]]; then
+        fail "inspect disk before reprovision grow" "host image size unavailable"
+        return
+    fi
     if coop resize "$INSTANCE" --size +1G; then
         pass "grow disk before reprovision exits 0"
-        if coop status "$INSTANCE" 2>/dev/null; then
-            disk_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+        if ! disk_before=$(host_disk_bytes "$INSTANCE") ||
+            [[ ! "$disk_before" =~ ^[0-9]+$ ]]; then
+            fail "inspect disk before reprovision" "host image size unavailable"
+            return
         fi
+        if (( disk_before != disk_initial + 1073741824 )); then
+            fail "host disk grows before reprovision" \
+                "expected $((disk_initial + 1073741824)) bytes, got $disk_before bytes"
+            return
+        fi
+        pass "host disk grows before reprovision"
     else
         fail "grow disk before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
     fi
     # Not `|| true`: a failed restart silently sends the reprovision down the
     # already-stopped branch instead of the running one, and the phase would
@@ -4948,23 +4977,18 @@ PYEOF
     # A `coop resize --size` must survive the wipe: the image the disk is
     # restored from may be smaller, so the reprovision may have to re-grow it.
     local disk_after=""
-    if coop status "$INSTANCE" 2>/dev/null; then
-        disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-    fi
-    if [[ -z "$disk_before" || -z "$disk_after" ]]; then
-        skip "disk size preserved across reprovision" "status does not report disk GiB"
-    elif [[ "$disk_after" -ge "$disk_before" ]]; then
-        pass "disk size preserved across reprovision (${disk_after} GiB)"
+    if ! disk_after=$(host_disk_bytes "$INSTANCE") ||
+        [[ ! "$disk_after" =~ ^[0-9]+$ ]]; then
+        fail "inspect disk after reprovision" "host image size unavailable"
+    elif [[ "$disk_after" == "$disk_before" ]]; then
+        pass "disk size preserved across reprovision ($disk_after bytes)"
     else
         fail "disk size preserved across reprovision" \
-            "before=${disk_before} GiB after=${disk_after} GiB (the reprovision shrank the disk)"
+            "before=${disk_before} bytes after=${disk_after} bytes"
     fi
 
-    # `coop status` reports the host image file's size, which `resize_disk`
-    # changes with `truncate` (and a matching lima.yaml `disk:`) — the guest
-    # filesystem only grows
-    # when the guest expands the partition on boot. So the host-side check
-    # above cannot tell a real re-grow from a shrunken guest. Compare what the
+    # The host image check alone cannot tell a real filesystem re-grow from a
+    # larger image containing a shrunken guest filesystem. Compare what the
     # guest itself sees, in 1K blocks.
     local guest_fs_after=""
     guest_fs_after=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_after=""
@@ -9121,7 +9145,7 @@ EOF
         test_agent_update_stopped
         test_list_stopped
         test_stopped_vm_completions
-        test_resize_status
+        test_resize_disk_size
         test_resize_retry_firecracker
         test_resize_disk_start
         test_reconfigure
