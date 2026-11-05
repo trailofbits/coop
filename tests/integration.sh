@@ -238,6 +238,12 @@ host_disk_bytes() {
     esac
 }
 
+# Lima includes the image capacity in `coop status` only while running.
+lima_status_disk_bytes() {
+    coop status "$1" || return 1
+    sed -n 's/^ *Disk: .* (\([0-9][0-9]*\) bytes)$/\1/p' <<<"$HARNESS_OUT" | head -1
+}
+
 # Cross-platform timeout wrapper. Prefer GNU timeout (Linux, or macOS with
 # coreutils installed as `gtimeout`); fall back to a perl-based implementation
 # since perl ships in the macOS base system.
@@ -4087,6 +4093,25 @@ test_resize_disk_size() {
         fail "host disk grew by 1 GiB" \
             "expected $((old_bytes + gib_bytes)) bytes, got $new_bytes bytes"
     fi
+
+    # Lima promises the capacity in its running status report too.
+    if [[ $(uname -s) == Darwin ]]; then
+        if ! coop start "$INSTANCE" --no-agents; then
+            fail "start before status disk check" "stderr: $HARNESS_ERR"
+            return
+        fi
+        local status_bytes=""
+        if ! status_bytes=$(lima_status_disk_bytes "$INSTANCE") ||
+            [[ "$status_bytes" != "$new_bytes" ]]; then
+            fail "status reflects resized disk" \
+                "expected $new_bytes bytes, got ${status_bytes:-unavailable} bytes"
+        else
+            pass "status reflects resized disk ($status_bytes bytes)"
+        fi
+        if ! coop stop "$INSTANCE"; then
+            fail "stop after status disk check" "stderr: $HARNESS_ERR"
+        fi
+    fi
 }
 
 test_resize_retry_firecracker() {
@@ -4764,7 +4789,7 @@ test_restore_reprovision() {
     # Grow the disk first, so the reprovision has a non-template size to carry
     # across the swap. `restore_disk` copies the template, which is smaller,
     # so a reprovision that skipped the re-grow would shrink the instance back.
-    local disk_initial="" disk_before=""
+    local disk_initial="" disk_before="" status_disk_before=""
     if coop stop "$INSTANCE"; then
         pass "stop before disk grow exits 0"
     else
@@ -4801,6 +4826,15 @@ test_restore_reprovision() {
     else
         fail "restart before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
+    fi
+    if [[ $(uname -s) == Darwin ]]; then
+        if ! status_disk_before=$(lima_status_disk_bytes "$INSTANCE") ||
+            [[ "$status_disk_before" != "$disk_before" ]]; then
+            fail "status shows disk before reprovision" \
+                "expected $disk_before bytes, got ${status_disk_before:-unavailable} bytes"
+            return
+        fi
+        pass "status shows disk before reprovision"
     fi
 
     # The guest root filesystem size *after* the grow, so the comparison below
@@ -4985,6 +5019,16 @@ PYEOF
     else
         fail "disk size preserved across reprovision" \
             "before=${disk_before} bytes after=${disk_after} bytes"
+    fi
+    if [[ $(uname -s) == Darwin ]]; then
+        local status_disk_after=""
+        if ! status_disk_after=$(lima_status_disk_bytes "$INSTANCE") ||
+            [[ "$status_disk_after" != "$status_disk_before" ]]; then
+            fail "status disk size preserved across reprovision" \
+                "before=$status_disk_before bytes after=${status_disk_after:-unavailable} bytes"
+        else
+            pass "status disk size preserved across reprovision ($status_disk_after bytes)"
+        fi
     fi
 
     # The host image check alone cannot tell a real filesystem re-grow from a
