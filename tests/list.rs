@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
 
 #[test]
-fn list_and_ls_share_sorted_output_and_one_inventory() {
+fn list_and_ls_share_sorted_output_without_path_limactl() {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let data = root.path().join("data");
@@ -28,11 +28,7 @@ fn list_and_ls_share_sorted_output_and_one_inventory() {
     )
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
-    let alpha_state = if cfg!(target_os = "macos") {
-        "running"
-    } else {
-        "stopped"
-    };
+    let alpha_state = "stopped";
     for command in ["list", "ls"] {
         for json in [false, true] {
             fs::write(&count, "").unwrap();
@@ -76,10 +72,7 @@ fn list_and_ls_share_sorted_output_and_one_inventory() {
                     ),
                 );
             }
-            assert_eq!(
-                fs::read_to_string(&count).unwrap().lines().count(),
-                usize::from(cfg!(target_os = "macos")),
-            );
+            assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 0);
         }
     }
 }

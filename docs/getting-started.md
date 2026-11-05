@@ -6,7 +6,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 
 **macOS (Lima backend)**
 
-- [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
+- [Lima](https://github.com/lima-vm/lima) installed in a [supported system directory](backends.md#macos--lima)
   (`brew install lima`) — `coop setup` fails without it
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`

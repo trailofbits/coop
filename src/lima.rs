@@ -122,7 +122,7 @@ pub fn create_and_start(
             "Lima instance '{name}' already exists (status: {state}) — \
              cleaning up before re-creating"
         );
-        let deletion = private_limactl()
+        let deletion = private_limactl()?
             .args(["delete", "--force", &name])
             .status()
             .context("Failed to delete stale Lima instance")?;
@@ -134,7 +134,7 @@ pub fn create_and_start(
     tracing::info!("Creating Lima instance '{name}'");
 
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
-    let mut child = headless_limactl_start()
+    let mut child = headless_limactl_start()?
         .arg(&effective_template)
         .arg(format!("--name={name}"))
         .arg(format!("--cpus={}", cfg.vm.vcpu_count))
@@ -218,7 +218,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
-    let mut child = headless_limactl_start()
+    let mut child = headless_limactl_start()?
         .arg(&name)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -265,7 +265,7 @@ pub fn stop_running(inst: &Instance) -> Result<()> {
 
     tracing::info!("Stopping Lima instance '{name}'");
 
-    let status = private_limactl()
+    let status = private_limactl()?
         .args(["stop", &name])
         .status()
         .context("Failed to run limactl stop")?;
@@ -292,7 +292,8 @@ pub fn destroy(inst: &Instance) -> Result<()> {
 
     // Stop first if running
     if state == Some(LimaState::Running)
-        && let Err(e) = private_limactl().args(["stop", &name]).status()
+        && let Err(e) =
+            private_limactl().and_then(|mut command| command.args(["stop", &name]).status())
     {
         tracing::debug!("Failed to stop Lima instance '{name}' before delete (non-fatal): {e}");
     }
@@ -301,7 +302,7 @@ pub fn destroy(inst: &Instance) -> Result<()> {
         bail!("Lima instance '{name}' has unknown state '{status}' — refusing delete");
     }
 
-    let status = private_limactl()
+    let status = private_limactl()?
         .args(["delete", "--force", &name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -953,7 +954,10 @@ pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
 fn check_requirements() -> Result<()> {
     eprintln!("\n=> Checking Lima requirements");
 
-    let output = private_limactl().arg("--version").output();
+    let output = private_limactl()
+        .context("Could not resolve limactl; install Lima with `brew install lima`")?
+        .arg("--version")
+        .output();
 
     match output {
         Ok(o) if o.status.success() => {
@@ -1077,8 +1081,7 @@ fn build_golden_image(
 
     // Clean up any leftover builder instance from a previous failed build
     if let Err(e) = private_limactl()
-        .args(["delete", "--force", BUILDER_NAME])
-        .output()
+        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).output())
     {
         tracing::debug!("Failed to clean up leftover builder (non-fatal): {e}");
     }
@@ -1199,8 +1202,7 @@ fn report_builder_inputs(profiles: &[ProfileDef]) {
 fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr) {
     eprintln!("  Cleaning up builder VM...");
     if let Err(error) = private_limactl()
-        .args(["delete", "--force", BUILDER_NAME])
-        .status()
+        .and_then(|mut command| command.args(["delete", "--force", BUILDER_NAME]).status())
     {
         tracing::warn!("Failed to delete builder VM (non-fatal): {error}");
     }
@@ -1238,7 +1240,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
-    let mut command = headless_limactl_start();
+    let mut command = headless_limactl_start()?;
     if let Some(timeout) = builder_timeout {
         command
             .arg("--timeout")
@@ -1273,7 +1275,7 @@ fn run_builder_vm(
 
     // Clean cloud-init state so it re-runs on new instances
     eprintln!("  Preparing image for reuse...");
-    let ci_status = private_limactl()
+    let ci_status = private_limactl()?
         .args([
             "shell",
             BUILDER_NAME,
@@ -1295,7 +1297,7 @@ fn run_builder_vm(
 
     // Stop the builder VM
     eprintln!("  Stopping builder VM...");
-    let status = private_limactl()
+    let status = private_limactl()?
         .args(["stop", BUILDER_NAME])
         .status()
         .context("Failed to stop builder VM")?;
@@ -1474,19 +1476,20 @@ fn dump_builder_logs() {
     }
 
     // 2. Guest-side: try to grab cloud-init-output.log via SSH
-    if let Ok(output) = private_limactl()
-        .args([
-            "shell",
-            BUILDER_NAME,
-            "--",
-            "sudo",
-            "tail",
-            "-n",
-            "40",
-            "/var/log/cloud-init-output.log",
-        ])
-        .output()
-    {
+    if let Ok(output) = private_limactl().and_then(|mut command| {
+        command
+            .args([
+                "shell",
+                BUILDER_NAME,
+                "--",
+                "sudo",
+                "tail",
+                "-n",
+                "40",
+                "/var/log/cloud-init-output.log",
+            ])
+            .output()
+    }) {
         let log = String::from_utf8_lossy(&output.stdout);
         if !log.trim().is_empty() {
             eprintln!(
@@ -1521,7 +1524,7 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
         "--wait".to_string(),
     ]);
 
-    let output = private_limactl()
+    let output = private_limactl()?
         .args(args)
         .output()
         .context("Failed to check cloud-init status in builder VM")?;
@@ -1545,18 +1548,22 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
         // Grab diagnostics from both cloud-init logs
         let grab_log = |path: &str| -> String {
             private_limactl()
-                .args([
-                    "shell",
-                    BUILDER_NAME,
-                    "--",
-                    "sudo",
-                    "tail",
-                    "-n",
-                    "30",
-                    path,
-                ])
-                .output()
                 .ok()
+                .and_then(|mut command| {
+                    command
+                        .args([
+                            "shell",
+                            BUILDER_NAME,
+                            "--",
+                            "sudo",
+                            "tail",
+                            "-n",
+                            "30",
+                            path,
+                        ])
+                        .output()
+                        .ok()
+                })
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default()
         };
@@ -1628,7 +1635,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
         guest_user,
         "provision script",
         |path| {
-            Ok(private_limactl()
+            Ok(private_limactl()?
                 .args([
                     "shell",
                     BUILDER_NAME,
@@ -1650,18 +1657,22 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
 /// the missing-binaries error. Empty when the log is unavailable or blank.
 fn builder_log_tail() -> String {
     let log_tail = private_limactl()
-        .args([
-            "shell",
-            BUILDER_NAME,
-            "--",
-            "sudo",
-            "tail",
-            "-n",
-            "50",
-            "/var/log/cloud-init-output.log",
-        ])
-        .output()
         .ok()
+        .and_then(|mut command| {
+            command
+                .args([
+                    "shell",
+                    BUILDER_NAME,
+                    "--",
+                    "sudo",
+                    "tail",
+                    "-n",
+                    "50",
+                    "/var/log/cloud-init-output.log",
+                ])
+                .output()
+                .ok()
+        })
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
 
@@ -2214,9 +2225,49 @@ fn lima_name_for(name: &InstanceName) -> String {
 }
 
 /// Restrict files created by Lima, including disks and transient builder state.
-fn private_limactl() -> Command {
+#[cfg_attr(
+    test,
+    expect(clippy::unnecessary_wraps, reason = "production resolves a host tool")
+)]
+fn private_limactl() -> io::Result<Command> {
     use std::os::unix::process::CommandExt as _;
+    // Unit fixtures supply PATH shims; CLI tests exercise production lookup.
+    #[cfg(test)]
     let mut command = Command::new("limactl");
+    #[cfg(not(test))]
+    let mut command = {
+        use crate::host_tool::{TrustedToolPolicy, resolve_host_tool};
+        const SEARCH_PATH: &str =
+            "/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        let candidates: Vec<_> = SEARCH_PATH
+            .split(':')
+            .map(|dir| PathBuf::from(dir).join("limactl"))
+            .collect();
+        // Package-manager symlinks can point into Cellar or libexec trees.
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let policy = TrustedToolPolicy::new_with_owners(
+            "/",
+            [
+                "/opt/homebrew",
+                "/usr/local",
+                "/opt/local",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+            ]
+            .map(PathBuf::from),
+            [0, uid],
+        );
+        // macOS reserves GID 80 for admin; Homebrew uses admin-writable directories.
+        #[cfg(target_os = "macos")]
+        let policy = policy.with_trusted_writable_gid(80);
+        let tool = resolve_host_tool("limactl", &candidates, &policy).map_err(io::Error::other)?;
+        let mut command = Command::new(tool.launch_path());
+        command.env("PATH", SEARCH_PATH);
+        command
+    };
     command.stdin(Stdio::null());
     // SAFETY: umask is async-signal-safe and only affects the child process.
     unsafe {
@@ -2225,7 +2276,7 @@ fn private_limactl() -> Command {
             Ok(())
         });
     }
-    command
+    Ok(command)
 }
 
 /// Start Lima without any interactive or graphical UI.
@@ -2233,10 +2284,10 @@ fn private_limactl() -> Command {
 /// The explicit video override also repairs existing instances whose persisted
 /// `lima.yaml` enables a display, while the generated template keeps new
 /// instances headless from creation.
-fn headless_limactl_start() -> Command {
-    let mut command = private_limactl();
+fn headless_limactl_start() -> io::Result<Command> {
+    let mut command = private_limactl()?;
     command.args(["start", "--tty=false", "--set", ".video.display=\"none\""]);
-    command
+    Ok(command)
 }
 
 #[cfg(target_os = "macos")]
@@ -2348,7 +2399,7 @@ fn limactl_list_entry_optional(lima_name: &str) -> Result<Option<serde_json::Val
 }
 
 fn limactl_list_output() -> Result<String> {
-    let output = private_limactl()
+    let output = private_limactl()?
         .args(["list", "--json"])
         .output()
         .context("Failed to run limactl list")?;
@@ -2488,7 +2539,7 @@ mod tests {
 
     #[test]
     fn lima_start_disables_interactive_and_graphical_ui() {
-        let command = headless_limactl_start();
+        let command = headless_limactl_start().unwrap();
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -2652,6 +2703,7 @@ mod tests {
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
         let path = root.path().join("disk");
         let status = private_limactl()
+            .unwrap()
             .env("PATH", root.path())
             .env("COOP_PRIVATE_LIMA_TEST", &path)
             .status()

@@ -16,7 +16,7 @@ Install Lima before running `coop setup`:
 brew install lima
 ```
 
-Setup verifies that `limactl --version` is reachable. If it is not, setup fails with an install hint.
+Coop resolves `limactl` through the shared host-tool validator and uses a fixed helper `PATH`: `/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`. Setup verifies that `limactl --version` is reachable there; otherwise it fails with an install hint.
 
 ### Setup process
 
