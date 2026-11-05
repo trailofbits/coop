@@ -11,7 +11,8 @@ Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
 dispatch. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
 VM sequence together, `workspace` covers independent workspace/profile phases,
-and `config` covers configuration, proxy, and recovery phases. The `config`
+and `config` covers configuration, alternate guest-user, proxy, and recovery
+phases. The `config`
 shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables

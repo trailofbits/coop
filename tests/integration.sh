@@ -9107,7 +9107,6 @@ EOF
         run_timed_test test_workspace_sync
         run_timed_test test_appledouble_sidecars
         run_timed_test test_multi_instance
-        run_timed_test test_guest_user_alt
         run_timed_test test_custom_profiles
         run_timed_test test_builtin_profiles
         run_timed_test test_builtin_profile_plugins
@@ -9121,6 +9120,9 @@ EOF
     fi
 
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
+        # This image/instance lifecycle is independent of the workspace phases.
+        run_timed_test test_guest_user_alt
+
         # Local marketplace directory copy
         run_timed_test test_local_marketplace
 
