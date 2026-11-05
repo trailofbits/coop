@@ -85,7 +85,7 @@ exclude_re = [
   "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd",
   "src/vsock_proxy\\.rs:.*\\b(read_fd|write_fd)\\b",
   "src/vsock_proxy\\.rs:.*Relay<.*>::(run|poll|read_stdin|write_guest|read_guest|check_guest_error|write_stdout|check_stdio_errors|finish_input)\\b",
-   # Web editor orchestration is exercised by direct SSH and real VM fixtures.
+  # Web editor orchestration is exercised by direct SSH and real VM fixtures.
   "src/web_editor\\.rs:.*\\b(control|control_request|load|stop|run|wait_attached|serve_session|show|ssh_launch|nonblocking_stdin|finish|drop)\\b",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
