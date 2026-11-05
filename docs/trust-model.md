@@ -538,7 +538,7 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 reducing exposure through the native host-editor integrations used by `coop editor`.
 Browser vulnerabilities remain part of the attack surface.
 
-Code-server's password login restricts access to the editor, and the host 
+Code-server's password login restricts access to the editor, and the host
 browser handles guest-controlled content under a fresh, session-specific
 `.localhost` origin.
 
