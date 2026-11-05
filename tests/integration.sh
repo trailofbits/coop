@@ -9133,7 +9133,6 @@ EOF
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features ) ]]; then
         run_timed_test test_builtin_profiles
         run_timed_test test_guest_files
-        run_timed_test test_no_github
         run_timed_test test_config_dir
     fi
 
@@ -9146,6 +9145,7 @@ EOF
 
         # github = "pat" mode + per-repo token forwarding (uses a stub image)
         run_timed_test test_github_pat_forwarding
+        run_timed_test test_no_github
 
         # [guest_env] config block + literal-over-forwarded precedence
         run_timed_test test_guest_env_config
