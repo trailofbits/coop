@@ -22,7 +22,7 @@ Build the VM template image:
 coop setup
 ```
 
-Update coop's binaries:
+Keep coop updated:
 
 ```shell
 coop update
