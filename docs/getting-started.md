@@ -141,6 +141,8 @@ upgrade/removal, or remove that entry and reinstall with `.#coop`.
 
 On macOS, the package includes Lima and the host command-line tools used by
 coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The package embeds Lima's executable and helper paths at build time; changing
+runtime `PATH` cannot redirect Lima lookup.
 The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
 install the [host prerequisites](#prerequisites) separately and keep them on
 `PATH`. VM images are created by `coop setup`.

@@ -17,6 +17,36 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() -> Result<(), String> {
+    // Packaging input only: runtime environment variables cannot change this
+    // closure. Reject empty/relative entries instead of admitting PATH lookup.
+    println!("cargo:rerun-if-env-changed=COOP_NIX_LIMA_PATH");
+    match env::var("COOP_NIX_LIMA_PATH") {
+        Ok(paths) => {
+            for entry in paths.split(':') {
+                let path = std::path::Path::new(entry);
+                if !path.starts_with("/nix/store")
+                    || path.components().count() != 5
+                    || path.file_name() != Some(std::ffi::OsStr::new("bin"))
+                    || path.components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+                    || entry.contains(['\n', '\r'])
+                {
+                    return Err(
+                        "COOP_NIX_LIMA_PATH must contain absolute Nix store bin directories".into(),
+                    );
+                }
+            }
+        }
+        Err(env::VarError::NotPresent) => {}
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("COOP_NIX_LIMA_PATH must be UTF-8".into());
+        }
+    }
+
     println!("cargo:rerun-if-env-changed=COOP_PACKAGE_MANAGER");
     println!("cargo:rustc-check-cfg=cfg(coop_homebrew)");
     match env::var("COOP_PACKAGE_MANAGER") {

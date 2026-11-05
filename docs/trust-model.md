@@ -337,7 +337,11 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   and package-manager paths. Paths must be owned by root or the invoking user;
   macOS `admin` (GID 80) group write is permitted for Homebrew compatibility.
   Other group write and all world write remain forbidden. Lima retains its host
-  configuration, with a fixed helper `PATH`.
+  configuration, with a fixed helper `PATH`. The macOS Nix package instead
+  embeds its exact Lima and helper store paths at build time. That route trusts
+  Nix's immutable runtime closure rather than applying the generic ownership
+  checks to the build-user-writable store directory. It does not add a general
+  `/nix/store` search root or accept runtime path overrides.
 - An exact host-tool setting authorizes only the validated filesystem identity:
   coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
   semantics. Resolution is pathname-based and does not pin an executable

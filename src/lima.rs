@@ -2235,7 +2235,9 @@ fn private_limactl() -> io::Result<Command> {
     #[cfg(test)]
     let mut command = Command::new("limactl");
     #[cfg(not(test))]
-    let mut command = {
+    let mut command = if let Some(search_path) = option_env!("COOP_NIX_LIMA_PATH") {
+        packaged_limactl(search_path)
+    } else {
         use crate::host_tool::{TrustedToolPolicy, resolve_host_tool};
         const SEARCH_PATH: &str =
             "/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -2277,6 +2279,23 @@ fn private_limactl() -> io::Result<Command> {
         });
     }
     Ok(command)
+}
+
+/// Nix embeds an immutable runtime closure at build time. Its first directory
+/// contains Lima; the remaining directories provide its packaged helpers.
+/// This never reads the caller's PATH or a runtime package override. Nix owns
+/// the store's integrity, including its build-user-writable store directory;
+/// the generic system-path ownership policy is not applied to that closure.
+fn packaged_limactl(search_path: &str) -> Command {
+    let bin = search_path
+        .split_once(':')
+        .map_or(search_path, |(bin, _)| bin);
+    let mut command = Command::new(Path::new(bin).join("limactl"));
+    command.env(
+        "PATH",
+        format!("{search_path}:/usr/bin:/bin:/usr/sbin:/sbin"),
+    );
+    command
 }
 
 /// Start Lima without any interactive or graphical UI.
@@ -2420,6 +2439,33 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn packaged_lima_executes_with_its_helper_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::test_support::private_tempdir().unwrap();
+        let bin = root.path().join("lima/bin");
+        let helpers = root.path().join("helpers/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        for (path, body) in [
+            (bin.join("limactl"), "#!/bin/sh\nexec lima-test-helper\n"),
+            (
+                helpers.join("lima-test-helper"),
+                "#!/bin/sh\nprintf 'packaged Lima executed\\n'\n",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let search_path = format!("{}:{}", bin.display(), helpers.display());
+        let output = packaged_limactl(&search_path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"packaged Lima executed\n");
+        std::fs::remove_file(bin.join("limactl")).unwrap();
+        assert!(packaged_limactl(&search_path).output().is_err());
+    }
 
     #[test]
     fn failed_lima_reconfigure_rolls_back_only_when_stopped() {

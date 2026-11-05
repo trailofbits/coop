@@ -130,6 +130,12 @@
             # dev-build guard against `coop update` and its background notifier.
             COOP_FORCE_BUILD_KIND = "dev";
 
+            # Compile the immutable Lima/helper closure into the executable.
+            # Runtime PATH (including the wrapper below) cannot select Lima.
+            env = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+              COOP_NIX_LIMA_PATH = pkgs.lib.makeBinPath darwinRuntimeInputs;
+            };
+
             # Keep the real executable in bin/ so its sibling lookup still
             # finds coop-proxy after adding Lima and host tools to PATH.
             postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
