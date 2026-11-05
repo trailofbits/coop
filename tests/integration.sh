@@ -4083,7 +4083,6 @@ test_resize_disk_size() {
         return
     fi
 
-    # Verify the host image grew by exactly one GiB.
     if ! new_bytes=$(host_disk_bytes "$INSTANCE") ||
         [[ ! "$new_bytes" =~ ^[0-9]+$ ]]; then
         fail "inspect disk after resize" "host image size unavailable"
@@ -4092,25 +4091,6 @@ test_resize_disk_size() {
     else
         fail "host disk grew by 1 GiB" \
             "expected $((old_bytes + gib_bytes)) bytes, got $new_bytes bytes"
-    fi
-
-    # Lima promises the capacity in its running status report too.
-    if [[ $(uname -s) == Darwin ]]; then
-        if ! coop start "$INSTANCE" --no-agents; then
-            fail "start before status disk check" "stderr: $HARNESS_ERR"
-            return
-        fi
-        local status_bytes=""
-        if ! status_bytes=$(lima_status_disk_bytes "$INSTANCE") ||
-            [[ "$status_bytes" != "$new_bytes" ]]; then
-            fail "status reflects resized disk" \
-                "expected $new_bytes bytes, got ${status_bytes:-unavailable} bytes"
-        else
-            pass "status reflects resized disk ($status_bytes bytes)"
-        fi
-        if ! coop stop "$INSTANCE"; then
-            fail "stop after status disk check" "stderr: $HARNESS_ERR"
-        fi
     fi
 }
 
@@ -4169,6 +4149,16 @@ test_resize_disk_start() {
     echo ""
     echo "=== Phase: disk-only resize starts the instance ==="
 
+    local disk_before="" expected_disk="" disk_after="" status_bytes=""
+    if [[ $(uname -s) == Darwin ]]; then
+        if ! disk_before=$(host_disk_bytes "$INSTANCE") ||
+            [[ ! "$disk_before" =~ ^[0-9]+$ ]]; then
+            fail "inspect disk before resize --start" "host image size unavailable"
+            return
+        fi
+        expected_disk=$((disk_before + 1073741824))
+    fi
+
     if coop resize "$INSTANCE" --size +1G --start; then
         pass "disk-only resize --start exits 0"
     else
@@ -4182,6 +4172,24 @@ test_resize_disk_start() {
     else
         fail "instance is running after disk-only resize --start" \
             "status unavailable for running instance"
+    fi
+
+    # The existing start also lets Lima prove `coop status` reports the new size.
+    if [[ $(uname -s) == Darwin ]]; then
+        if ! disk_after=$(host_disk_bytes "$INSTANCE") ||
+            [[ "$disk_after" != "$expected_disk" ]]; then
+            fail "resize --start grows host disk" \
+                "expected $expected_disk bytes, got ${disk_after:-unavailable} bytes"
+        else
+            pass "resize --start grows host disk"
+        fi
+        if ! status_bytes=$(lima_status_disk_bytes "$INSTANCE") ||
+            [[ "$status_bytes" != "$expected_disk" ]]; then
+            fail "status reflects resized disk" \
+                "expected $expected_disk bytes, got ${status_bytes:-unavailable} bytes"
+        else
+            pass "status reflects resized disk ($status_bytes bytes)"
+        fi
     fi
 
     if coop stop "$INSTANCE" >/dev/null 2>&1; then
