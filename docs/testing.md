@@ -5,7 +5,7 @@ formal verification (kani), and two manual quality checks — mutation testing
 and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
-The `Firecracker integration` workflow runs the full suite across six
+The `Firecracker integration` workflow runs the full suite across eight
 disposable GitHub-hosted x64 runners: four on Ubuntu 24.04 and four on
 Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
 dispatch. Each runner executes
@@ -298,7 +298,7 @@ VM suite on the selected local or remote host. A failure stops the full run;
 macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables it.
 Remote bridge-gate runs copy the tracked working-tree source and require the
 build and namespace prerequisites below on the remote host. The KVM matrix sets
-`COOP_TEST_SKIP_BRIDGE=1` so its three shards do not repeat the gate already
+`COOP_TEST_SKIP_BRIDGE=1` so its four shards do not repeat the gate already
 run by regular Linux CI.
 
 Run `./tests/integration-network.sh` directly on Linux to test bridge-port
