@@ -1,0 +1,61 @@
+name: Update code-server
+
+on:
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: update-code-server
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Propose code-server updates
+    if: github.repository == 'trailofbits/coop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # Publish the update branch.
+      pull-requests: write # Open the update PR for human review.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Download and hash the latest stable release
+        id: update
+        run: python3 scripts/update-code-server.py >> "$GITHUB_OUTPUT"
+
+      - name: Check for an existing proposal
+        if: steps.update.outputs.version != ''
+        id: proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          count=$(gh pr list --head "deps/code-server-$VERSION" --state all --limit 1 --json number --jq 'length')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Propose the pin update
+        if: steps.update.outputs.version != '' && steps.proposal.outputs.count == '0'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          add-paths: scripts/guest/web-editor.sh
+          branch: deps/code-server-${{ steps.update.outputs.version }}
+          commit-message: "fix(web-editor): update code-server to ${{ steps.update.outputs.version }}"
+          title: "fix(web-editor): update code-server to ${{ steps.update.outputs.version }}"
+          body: |
+            Update code-server from ${{ steps.update.outputs.previous }} to ${{ steps.update.outputs.version }}.
+
+            [Upstream release](https://github.com/coder/code-server/releases/tag/v${{ steps.update.outputs.version }})
+
+            SHA-256 of the downloaded Linux archives:
+            - amd64: `${{ steps.update.outputs.amd64 }}`
+            - arm64: `${{ steps.update.outputs.arm64 }}`
+
+            Archives were hashed without extraction or execution. Review and VM validation are required before merging.
