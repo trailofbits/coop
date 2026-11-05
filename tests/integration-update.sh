@@ -6,22 +6,22 @@ set -euo pipefail
 # Serves a synthetic GitHub-shaped fixture from a local HTTP server and
 # verifies that the update flow downloads, checksums, and atomically
 # replaces the running binary and its proxy companion. Also verifies checksum
-# rollback, `--check` behaviour, and dev-build refusal.
+# rollback, `--check` behaviour, dev-build refusal, and Homebrew ownership.
 #
 # Run manually:   ./tests/integration-update.sh
-# Run in CI:      same (fast — no VM, no external network)
+# Run in CI:      ./tests/run-policy-integration.sh (shared build, no VM)
+# Optional arg:   directory from build-policy-binaries.sh (skips compilation)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
-# (here, `update`'s confirmation) on stdin being a TTY. Every call below passes
+# (here, `update`'s confirmation) on stdin being a TTY. Direct update calls pass
 # --yes or --check so no prompt fires today, but a future prompt-bearing case
 # run from an interactive shell (the release preflight) would read real
 # keystrokes and block — under CI stdin is already not a TTY, so it would never
-# be caught there. Redirecting the whole script makes every coop subprocess see
-# a non-TTY stdin regardless of how the suite is invoked. The script itself
-# never reads stdin.
+# be caught there. Redirect the script's stdin regardless of how the suite is
+# invoked. The Homebrew regression fixture explicitly supplies a pseudo-terminal
+# to exercise interactive background checks. The script itself never reads stdin.
 exec </dev/null
 
 # ── Platform detection (matches install.sh / update::target_triple) ──────────
@@ -117,41 +117,31 @@ full_assets_block() {
 JSON
 }
 
-# ── Build coop policy variants (real HOME, before isolation) ─────────────────
+# ── Obtain policy artifacts (real HOME, before isolation) ───────────────────
 #
-# All `cargo build` invocations must run before HOME is redirected — cargo
-# uses $HOME for its registry and toolchain caches.
-
-echo "==> Building explicit test-source binary..."
-(
-    cd "$PROJECT_DIR"
-    COOP_FORCE_BUILD_KIND=test cargo build --release --quiet
-)
-# Stash each binary at a stable path. The later builds share
-# `target/release/coop`, so we can't keep referring to that path after
-# `cargo build` runs again.
+# Standalone runs build an optimized test-source binary and development-profile
+# policy guards. The shared runner supplies prebuilt immutable artifacts.
+if [[ $# -gt 1 ]]; then
+    echo "Usage: $0 [POLICY_ARTIFACT_DIR]" >&2
+    exit 2
+fi
+ARTIFACT_DIR="${1:-$TMPDIR/artifacts}"
+if [[ $# -eq 0 ]]; then
+    "$SCRIPT_DIR/build-policy-binaries.sh" "$ARTIFACT_DIR"
+fi
+# Execute only private copies, so even a broken guard cannot mutate inputs.
+for variant in test-source homebrew official dev; do
+    cp "$ARTIFACT_DIR/coop-$variant" "$TMPDIR/bin/coop-$variant"
+    chmod u+w "$TMPDIR/bin/coop-$variant"
+done
 FIXTURE_BIN="$TMPDIR/bin/coop-test-source"
-cp "$PROJECT_DIR/target/release/coop" "$FIXTURE_BIN"
+HOMEBREW_BIN="$TMPDIR/bin/coop-homebrew"
+OFFICIAL_BIN="$TMPDIR/bin/coop-official"
 cp "$FIXTURE_BIN" "$TMPDIR/bin/coop"
 export COOP_BIN="$TMPDIR/bin/coop"
 
-echo "==> Building official release-policy binary..."
-(
-    cd "$PROJECT_DIR"
-    COOP_FORCE_BUILD_KIND=release cargo build --release --quiet
-)
-OFFICIAL_BIN="$TMPDIR/bin/coop-official"
-cp "$PROJECT_DIR/target/release/coop" "$OFFICIAL_BIN"
-
-echo "==> Building dev binary..."
-# Force kind=dev rather than relying on git state. When CI runs on a tag
-# matching the Cargo version (the release workflow's normal trigger),
-# build.rs correctly bakes kind=release, which would defeat test 4.
-(
-    cd "$PROJECT_DIR"
-    COOP_FORCE_BUILD_KIND=dev cargo build --release --quiet
-)
-cp "$PROJECT_DIR/target/release/coop" "$TMPDIR/bin/coop-dev"
+# Warning assertions must not depend on an inherited tracing filter.
+unset RUST_LOG
 
 # ── Isolate test invocations from the real user environment ──────────────────
 #
@@ -169,6 +159,7 @@ export HOME="$TMPDIR/home"
 export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_DATA_HOME="$HOME/.local/share"
 mkdir -p "$XDG_STATE_HOME" "$XDG_DATA_HOME"
+chmod 700 "$HOME" "$HOME/.local" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 
 # ── Fabricate a "newer" release tarball ──────────────────────────────────────
 
@@ -230,6 +221,10 @@ write_release_json \
     "$FIXTURE/repos/trailofbits/coop/releases/latest" \
     "$FAKE_TAG" \
     "$(full_assets_block)"
+
+echo "==> Homebrew ownership guards"
+python3 "$SCRIPT_DIR/homebrew-guards.py" "$FIXTURE_BIN" "$HOMEBREW_BIN"
+pass "Homebrew suppresses background updates and refuses self-update/uninstall"
 
 echo "==> Test 1: successful update replaces binary"
 if "$COOP_BIN" update --yes > "$TMPDIR/t1.log" 2>&1; then

@@ -188,12 +188,12 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
 /// Verify that every required guest binary is present, bailing with a
 /// uniform error if any are missing.
 ///
-/// `probe` answers "does this binary exist in the image?" — its mechanism
-/// differs per backend (`test -x` inside the chroot for Firecracker, or over
-/// `limactl shell` for Lima). `source_label` names what
-/// produced the image ("install script" vs "provision script"), and
-/// `diagnostics` supplies any trailing detail (e.g. a build-log tail),
-/// evaluated lazily only when something is missing.
+/// `probe` answers whether a binary exists in the image; its errors abort
+/// verification. Its mechanism differs per backend (`test -x` inside the
+/// chroot for Firecracker, or over `limactl shell` for Lima).
+/// `source_label` names what produced the image ("install script" vs
+/// "provision script"). `diagnostics` supplies trailing detail, such as a
+/// build-log tail, and is evaluated only when something is missing.
 #[expect(
     clippy::print_stderr,
     reason = "verification progress is interactive CLI — stderr is user communication"
@@ -201,15 +201,16 @@ pub fn required_guest_binaries(user: &GuestUser) -> [GuestPath; 10] {
 pub fn verify_required_binaries(
     guest_user: &GuestUser,
     source_label: &str,
-    probe: impl Fn(&GuestPath) -> bool,
+    probe: impl Fn(&GuestPath) -> Result<bool>,
     diagnostics: impl FnOnce() -> String,
 ) -> Result<()> {
     eprintln!("  Verifying installed binaries...");
-    let missing: Vec<String> = required_guest_binaries(guest_user)
-        .into_iter()
-        .filter(|path| !probe(path))
-        .map(|path| path.to_string())
-        .collect();
+    let mut missing = Vec::new();
+    for path in required_guest_binaries(guest_user) {
+        if !probe(&path)? {
+            missing.push(path.to_string());
+        }
+    }
 
     if !missing.is_empty() {
         bail!(
@@ -954,7 +955,7 @@ mod tests {
         let result = verify_required_binaries(
             &user,
             "install script",
-            |_path| true,
+            |_path| Ok(true),
             || {
                 diag_called.set(true);
                 String::new()
@@ -973,7 +974,7 @@ mod tests {
         let result = verify_required_binaries(
             &user,
             "provision script",
-            |path| path.to_string() != "/usr/bin/docker",
+            |path| Ok(path.to_string() != "/usr/bin/docker"),
             || "\n\ntail of log".to_string(),
         );
         let err = result.unwrap_err().to_string();
@@ -994,7 +995,8 @@ mod tests {
     #[test]
     fn verify_required_binaries_lists_every_missing_binary() {
         let user = GuestUser::default();
-        let result = verify_required_binaries(&user, "install script", |_path| false, String::new);
+        let result =
+            verify_required_binaries(&user, "install script", |_path| Ok(false), String::new);
         let err = result.unwrap_err().to_string();
         for expected in [
             "/usr/bin/docker",
@@ -1005,5 +1007,19 @@ mod tests {
         ] {
             assert!(err.contains(expected), "{expected} missing from: {err}");
         }
+    }
+
+    #[test]
+    fn binary_probe_failure_is_not_reported_as_a_missing_binary() {
+        let user = GuestUser::default();
+        let result = verify_required_binaries(
+            &user,
+            "install script",
+            |_path| anyhow::bail!("probe launcher failed"),
+            String::new,
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("probe launcher failed"));
+        assert!(!error.contains("missing required binaries"));
     }
 }

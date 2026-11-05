@@ -22,7 +22,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -34,10 +34,16 @@ use serde::Serialize;
 
 use crate::backend::SshTarget;
 use crate::codex_token::CodexTokenMetadata;
-use crate::config::{Instance, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value};
+use crate::config::{
+    Instance, InstanceIndex, ProxyAuthScheme, ProxyUpstream, Secret, resolve_cmd_value,
+};
+use crate::remote_command::RemoteCommand;
 
 /// The proxy binary name, expected next to the `coop` binary.
 const PROXY_BIN_NAME: &str = "coop-proxy";
+/// Wire contract mirrored by coop-proxy's bounded startup reader.
+const STARTUP_CONFIG_MAX_BYTES: usize = 65_536;
+const DIAGNOSTIC_MAX_BYTES: usize = 16_384;
 
 /// Maximum time for SSH authentication and the guest's forwarding acknowledgment.
 const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -100,7 +106,11 @@ impl Provider {
 
     /// Per-instance listen port: base + index.
     fn port(self, inst: &Instance) -> u16 {
-        self.base_port().saturating_add(inst.index.as_u16())
+        self.port_for_index(inst.index)
+    }
+
+    fn port_for_index(self, index: InstanceIndex) -> u16 {
+        self.base_port().saturating_add(index.as_u16())
     }
 
     /// Whether the capability token must be persisted host-side for later
@@ -111,6 +121,45 @@ impl Provider {
     /// its token stays in host memory only (unchanged from slice 1).
     fn persists_token(self) -> bool {
         matches!(self, Provider::Openai)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{InstanceIndex, Provider};
+
+    /// Every valid provider/instance pair gets an exact, unique host port.
+    #[kani::proof]
+    fn proxy_ports_are_exact_and_unique() {
+        let Some(first_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let Some(second_index) = InstanceIndex::new(kani::any()) else {
+            return;
+        };
+        let first = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let second = if kani::any() {
+            Provider::Anthropic
+        } else {
+            Provider::Openai
+        };
+        let first_port = first.port_for_index(first_index);
+        let second_port = second.port_for_index(second_index);
+        assert_eq!(
+            u32::from(first_port),
+            u32::from(first.base_port()) + first_index.as_u32()
+        );
+        assert_eq!(
+            u32::from(second_port),
+            u32::from(second.base_port()) + second_index.as_u32()
+        );
+        if first != second || first_index != second_index {
+            assert_ne!(first_port, second_port);
+        }
     }
 }
 
@@ -253,6 +302,99 @@ pub fn read_capability_token(inst: &Instance, provider: Provider) -> Option<Stri
     (!token.is_empty()).then(|| token.to_string())
 }
 
+/// Confirm that a configured provider's host proxy and reverse SSH tunnel are
+/// still available before launching an agent that has no public-network
+/// fallback. PID checks catch terminated children, the host-loopback connect
+/// checks the fixed proxy endpoint, and a guest-loopback request checks the
+/// reverse-forward path over the instance's persisted SSH transport.
+pub(crate) fn ensure_runtime_available(
+    inst: &Instance,
+    provider: Provider,
+    target: &SshTarget,
+) -> Result<()> {
+    ensure_pid_file_live(&pid_path(inst, provider.name()), "credential proxy")?;
+    ensure_pid_file_live(
+        &fwd_pid_path(inst, provider.name()),
+        "credential proxy reverse tunnel",
+    )?;
+    if provider.persists_token() {
+        read_capability_token(inst, provider).with_context(|| {
+            format!(
+                "{} credential proxy capability token is missing or empty",
+                provider.name()
+            )
+        })?;
+    }
+    let address = SocketAddr::from(([127, 0, 0, 1], provider.port(inst)));
+    ensure_proxy_protocol(address, provider)?;
+    let guest_url = format!("http://127.0.0.1:{}/", provider.port(inst));
+    let guest_reachable = target.exec_ok(guest_proxy_probe_command(&guest_url))?;
+    anyhow::ensure!(
+        guest_reachable,
+        "{} credential proxy reverse endpoint did not return the expected response on guest loopback",
+        provider.name()
+    );
+    Ok(())
+}
+
+fn guest_proxy_probe_command(url: &str) -> RemoteCommand {
+    RemoteCommand::new()
+        .literal("response=$(curl -q --silent --show-error --noproxy '*' --max-time 3 --write-out ':%{http_code}' ")
+        .arg(url)
+        .literal(
+            ") || exit 1; case \"$response\" in \
+             *'missing or invalid coop-proxy capability token'*':401') exit 0 ;; \
+             *) exit 1 ;; esac",
+        )
+}
+
+fn ensure_proxy_protocol(address: SocketAddr, provider: Provider) -> Result<()> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .with_context(|| {
+            format!(
+                "{} credential proxy is not accepting connections on host loopback at {address}",
+                provider.name()
+            )
+        })?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    stream.take(4096).read_to_string(&mut response)?;
+    anyhow::ensure!(
+        response.starts_with("HTTP/1.1 401 ")
+            && response.contains("missing or invalid coop-proxy capability token"),
+        "{} credential proxy endpoint returned an unexpected protocol response",
+        provider.name()
+    );
+    Ok(())
+}
+
+fn ensure_pid_file_live(path: &Path, label: &str) -> Result<()> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("{label} state is missing at {}", path.display()))?;
+    let pid = contents
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("{label} state is malformed at {}", path.display()))?;
+    anyhow::ensure!(
+        pid > 0,
+        "{label} state has an invalid PID at {}",
+        path.display()
+    );
+    // SAFETY: signal 0 performs a liveness/permission probe without changing
+    // the parsed positive process ID's state.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("{label} process {pid} is not running"))
+}
+
 // ── process supervision ──────────────────────────────────────
 
 fn spawn_proxy(inst: &Instance, name: &str, listen: SocketAddr, json: &str) -> Result<()> {
@@ -324,7 +466,7 @@ fn await_proxy_ready(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let log = fs::read_to_string(log_path).unwrap_or_default();
+                let log = bounded_log_excerpt(log_path);
                 bail!(
                     "credential proxy exited before it began serving ({status}) — its \
                      confinement or bind failed; refusing to start the VM (fail-closed).\n{}",
@@ -338,7 +480,7 @@ fn await_proxy_ready(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let log = fs::read_to_string(log_path).unwrap_or_default();
+            let log = bounded_log_excerpt(log_path);
             bail!(
                 "credential proxy did not begin serving on {listen} within \
                  {PROXY_READY_GRACE:?} — refusing to start the VM (fail-closed).\n{}",
@@ -352,9 +494,9 @@ fn await_proxy_ready(
 /// Build the `Command` that launches `coop-proxy` under the platform's process
 /// confinement (issue #411, slice 3).
 ///
-/// On Linux the proxy self-confines with Landlock unconditionally (it never
-/// receives a `--no-jail` opt-out from `coop`), so the command is the binary
-/// itself. On macOS — which has no first-class in-process sandbox — the
+/// On Linux the proxy self-confines with Landlock unconditionally and the
+/// binary has no unconfined serving mode, so the command is the binary itself.
+/// On macOS — which has no first-class in-process sandbox — the
 /// launcher wraps it in `sandbox-exec` with a Seatbelt profile
 /// ([`SEATBELT_PROFILE`]) that denies filesystem writes and program execution
 /// and limits egress to the two upstream ports. `sandbox-exec`
@@ -496,7 +638,7 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
     if let Err(e) = setup {
         let _ = child.kill();
         let _ = child.wait();
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let log = bounded_log_excerpt(&log_path);
         return Err(e).context(format!(
             "Failed to establish the credential proxy's reverse SSH tunnel.\n{}",
             log.trim()
@@ -504,6 +646,27 @@ fn spawn_reverse_forward(inst: &Instance, name: &str, target: &SshTarget, port: 
     }
     // The master no longer needs a control socket: later teardown uses its PID.
     Ok(())
+}
+
+fn bounded_log_excerpt(path: &Path) -> String {
+    let Ok(file) = File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(DIAGNOSTIC_MAX_BYTES + 1);
+    if file
+        .take((DIAGNOSTIC_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return String::new();
+    }
+    let truncated = bytes.len() > DIAGNOSTIC_MAX_BYTES;
+    bytes.truncate(DIAGNOSTIC_MAX_BYTES);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("\n[diagnostic truncated at 16384 bytes]");
+    }
+    text
 }
 
 /// Use a short, private path even when TMPDIR or the instance path is long.
@@ -676,7 +839,12 @@ fn wire_config_json(
         upstream_host,
         injection,
     };
-    serde_json::to_string(&wire).context("Failed to serialize proxy startup config")
+    let json = serde_json::to_string(&wire).context("Failed to serialize proxy startup config")?;
+    anyhow::ensure!(
+        json.len() <= STARTUP_CONFIG_MAX_BYTES,
+        "credential proxy startup config exceeds the {STARTUP_CONFIG_MAX_BYTES}-byte limit"
+    );
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -803,6 +971,58 @@ mod tests {
         assert_eq!(v["upstream_host"], "api.anthropic.com");
         assert_eq!(v["injection"]["scheme"], "x_api_key");
         assert_eq!(v["injection"]["credential"], "sk-real");
+    }
+
+    #[test]
+    fn wire_json_accepts_exact_limit_and_rejects_one_byte_over() {
+        let listen: SocketAddr = "127.0.0.1:8788".parse().unwrap();
+        let empty = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            "",
+            None,
+        )
+        .unwrap();
+        let exact_credential = "x".repeat(STARTUP_CONFIG_MAX_BYTES - empty.len());
+        let exact = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            &exact_credential,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), STARTUP_CONFIG_MAX_BYTES);
+
+        let oversized_credential = format!("{exact_credential}x");
+        let error = wire_config_json(
+            &listen,
+            "cap",
+            "api.anthropic.com",
+            ProxyAuthScheme::ApiKey,
+            &oversized_credential,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("byte limit"));
+    }
+
+    #[test]
+    fn proxy_log_excerpt_is_bounded_and_marks_truncation() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let path = temp.path().join("proxy.log");
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_MAX_BYTES]).unwrap();
+        let exact = bounded_log_excerpt(&path);
+        assert_eq!(exact, "x".repeat(DIAGNOSTIC_MAX_BYTES));
+
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_MAX_BYTES + 1]).unwrap();
+        let excerpt = bounded_log_excerpt(&path);
+        assert!(excerpt.starts_with(&"x".repeat(DIAGNOSTIC_MAX_BYTES)));
+        assert!(excerpt.ends_with("[diagnostic truncated at 16384 bytes]"));
+        assert!(excerpt.len() < DIAGNOSTIC_MAX_BYTES + 64);
     }
 
     #[test]
@@ -1304,5 +1524,94 @@ mod tests {
             read_capability_token(&inst, Provider::Openai),
             Some("cap-123".to_string())
         );
+    }
+
+    #[test]
+    fn protocol_probe_requires_the_proxy_unauthorized_response() {
+        fn serve_once(response: &'static [u8]) -> SocketAddr {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response).unwrap();
+            });
+            address
+        }
+
+        let expected = serve_once(
+            b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nmissing or invalid coop-proxy capability token",
+        );
+        ensure_proxy_protocol(expected, Provider::Openai).unwrap();
+
+        let unrelated =
+            serve_once(b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nunrelated listener");
+        assert!(ensure_proxy_protocol(unrelated, Provider::Openai).is_err());
+    }
+
+    #[test]
+    fn guest_protocol_probe_requires_the_proxy_unauthorized_response() {
+        let curl_home = crate::test_support::private_tempdir().unwrap();
+        std::fs::write(curl_home.path().join(".curlrc"), "fail\n").unwrap();
+        let accepts = |status: &str, body: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let server = std::thread::spawn(move || -> std::io::Result<()> {
+                listener.set_nonblocking(true)?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "probe did not connect to the fixture",
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(4)))?;
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request)?;
+                stream.write_all(response.as_bytes())?;
+                Ok(())
+            });
+            let probe = super::guest_proxy_probe_command(&url).into_string();
+            let accepted = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&probe)
+                .env("CURL_HOME", curl_home.path())
+                .env("HOME", curl_home.path())
+                .status()
+                .unwrap()
+                .success();
+            server.join().unwrap().unwrap();
+            accepted
+        };
+        assert!(accepts(
+            "401",
+            "missing or invalid coop-proxy capability token"
+        ));
+        for (status, body) in [
+            ("502", "upstream request failed"),
+            ("401", "unrelated listener"),
+            ("500", "missing or invalid coop-proxy capability token"),
+            ("200", "missing or invalid coop-proxy capability token"),
+        ] {
+            assert!(
+                !accepts(status, body),
+                "unexpectedly accepted {status} {body}"
+            );
+        }
     }
 }

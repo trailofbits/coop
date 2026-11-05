@@ -205,7 +205,7 @@ pub(crate) fn cmd_agent_update(
     let inst_name = running.instance().name.to_string();
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    let session = prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
+    let session = prepare_session_from_target(cfg, &inst, target, repo.as_ref())?;
 
     if opts.check {
         return run_check(&session, opts.selection);

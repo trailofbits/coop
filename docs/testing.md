@@ -1,9 +1,27 @@
 # Testing
 
-coop has four test layers: integration tests (the primary gate), unit tests,
-and three manual quality checks — mutation testing, fuzzing, and formal
-verification (kani). Only the integration and unit tests run in CI; the other
-three are manual, run when a change warrants them.
+coop has five test layers: integration tests (the primary gate), unit tests,
+formal verification (kani), and two manual quality checks — mutation testing
+and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
+fuzzing run manually when a change warrants them.
+
+The `Firecracker integration` workflow runs the full suite across six
+disposable GitHub-hosted x64 runners: three on Ubuntu 24.04 and three on
+Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
+dispatch. Each runner executes
+`./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
+VM sequence together, `workspace` covers independent workspace/profile phases,
+and `config` covers configuration, proxy, and recovery phases. The `config`
+shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
+It does not run automatically for pull requests or pushes.
+It enables
+`COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
+output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
+timeout (35 minutes for the job including prerequisites and artifact upload).
+Shards must run on separate hosts: they share image names and destructive
+cleanup affects host-wide state. Unsharded local and release runs retain the
+complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
+integration remains a separate platform gate.
 
 ## Cross-platform compile and lint checks
 
@@ -179,8 +197,8 @@ You can also run the suite directly if you already have a binary:
 
 The test exercises the full VM lifecycle (setup → start → status → shell →
 guest environment → docker → stop → destroy). CI additionally runs the fast,
-host-only `tests/integration-install.sh`, `tests/integration-update.sh`, and
-`tests/integration-uninstall.sh` suites.
+host-only `tests/integration-install.sh` and `tests/run-policy-integration.sh`
+suites.
 The full VM suite rebuilds the image and requires the Grok CLI to report a
 version. The shorter suite may reuse an older image and reports that check as
 skipped when Grok is absent.
@@ -222,8 +240,29 @@ Linux CI runs them. The full VM suite additionally checks these probes against
 real guests. A host FORWARD policy other than ACCEPT still causes an explicit
 skip of the routed guest-isolation probe, since it would mask the coop rule.
 
-Run `tests/integration-update.sh` for the host-only self-updater flow. The
-script compiles a distinct `COOP_FORCE_BUILD_KIND=test` binary and supplies its
+Run `tests/run-policy-integration.sh` for the host-only updater and uninstall
+suites plus an optimized release smoke test (also used by CI and release
+preflight). The test-source updater binary uses Cargo's release profile so the
+full update flow exercises optimized code. The Homebrew-owned test source,
+official release policy, and forced dev policy variants use the development
+profile. Policy provenance is independent of the optimization profile.
+Each binary is copied to a distinct immutable artifact path before the next
+build; consumers use disposable copies. The uninstall suite reuses the optimized
+release-smoke binary and checks its path guard in a temporary `target/debug`
+tree. That same binary checks version reporting, CLI startup, and rejection of
+runtime update-source overrides without external network I/O.
+
+The suites still run independently: `tests/integration-update.sh` builds its
+optimized test-source and three development-profile variants;
+`tests/integration-uninstall.sh` builds only the optimized release-smoke variant.
+To reuse an explicit build, run
+`tests/build-policy-binaries.sh NEW_ARTIFACT_DIR test-source homebrew official dev release-smoke`,
+then pass that directory to `tests/integration-update.sh NEW_ARTIFACT_DIR` and
+`tests/integration-uninstall.sh NEW_ARTIFACT_DIR/coop-release-smoke`. The artifact directory
+must be new; Cargo's configured target directory and target triple are supported.
+Both suites clear inherited `RUST_LOG` filters so warning assertions are stable.
+
+The updater's distinct `COOP_FORCE_BUILD_KIND=test` binary receives its
 loopback fixture through `COOP_UPDATE_TEST_API_BASE_URL`; only that build kind
 can construct the fixture source. Normal release builds reject the retired
 `COOP_UPDATE_API_BASE_URL` control before network I/O. The fixture also covers
@@ -389,6 +428,10 @@ On Linux hosts with passwordless sudo, e2fsprogs, and loop-mount privileges,
 run `bash tests/privileged-disk.sh` after `cargo build --bin coop`. It exercises
 the privileged disk helper with real formatting, loop mounts, cleanup, symlink
 rejection, sparse copy, and reuse of staging data left by an interrupted copy.
+It holds the loop mount busy to check that unmount fails and the mounted disk
+cannot be removed, then verifies the unmounted path is accepted.
+It also waits for a short-lived holder during interrupted-mount recovery and
+removes the fixed chroot child mounts before rebuilding.
 It also corrupts an ext4 inode reference count, checks that read-only verification
 rejects it, then retries `coop resize` at the already extended image size and
 checks the filesystem's block capacity. It also checks a completed no-op retry
@@ -400,6 +443,9 @@ and signals remain failures.
 The ignored unmount probe swaps a checked mountpoint name to an outside-mounted
 symlink between validation and `umount2`; it also checks a normal unmount.
 This host probe does not replace either VM integration gate.
+
+The `MountGuard` EBUSY unit test checks error propagation and retained mounted
+state in the unmount helper; it does not exercise network patching or VM startup.
 
 Guest-file unit tests cover multiple mappings, guest-home expansion, destination
 validation, source snapshots, private writable modes, macOS staging ACL inheritance,
@@ -456,6 +502,11 @@ parsing, or state composition:
 - `src/github_repo.rs`, `src/github_pat.rs`, `src/secret_store.rs` — slug
   parsing and secret routing
 - `src/fs_util.rs` — path manipulation helpers
+- `src/process_output.rs` — bounded concurrent stdout/stderr capture, timeout,
+  overflow, process-group cleanup, and direct-child reaping. Hermetic process
+  fixtures cover exact bounds, asymmetric pipe closure, ordinary descendants,
+  and a deliberately detached pipe holder, so this module remains fully in
+  mutation scope despite owning host IO.
 - `src/update_policy.rs` — updater source, tag, and release-asset identity
   policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
@@ -464,7 +515,8 @@ parsing, or state composition:
 
 **Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
 `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
-`prompt.rs` (TTY prompts), `main.rs`, and — inside `src/commands/` — the
+the terminal-adapter functions in `prompt.rs`, `main.rs`, and — inside
+`src/commands/` — the
 `cmd_*` dispatch entrypoints and handlers that take a `&PlatformBackend`, write
 stdout, or open a TTY prompt. These mostly shell out, run SSH, or talk to
 external services, so unit tests cannot observe their effects. The integration
@@ -478,12 +530,14 @@ means "real unit-test gap," not "code a `--lib` test structurally cannot reach."
 cargo-mutants reads this file automatically on every run (`--list` included).
 It scopes out:
 
-- Whole IO/backend modules through `exclude_globs`, including `main.rs` and
-  `prompt.rs`.
+- Whole IO/backend modules through `exclude_globs`, including `main.rs`.
 - `cfg(kani)` proofs through `exclude_re = ["proofs::"]`; normal builds never
   compile them, and `cargo kani` exercises them separately.
 - Shell-out, filesystem, network, stdout, backend, and terminal functions in
   otherwise logic-bearing modules through `\b`-anchored `exclude_re` entries.
+- The `prompt.rs` `confirm`, `read_line`, `read_line_any`, and `read_secret`
+  ambient-stdio adapters through targeted file-and-function patterns, while
+  their pure decision helpers remain in scope.
 - The `src/commands/` dispatch entrypoints and backend-driving or TTY handlers,
   while leaving their extracted pure helpers in scope.
 
@@ -623,24 +677,26 @@ fuzz run <target> <artifact-path>`.
 ## Formal verification (kani)
 
 [Kani](https://model-checking.github.io/kani/) is a bounded model checker that
-proves the *absence* of a property (here: arithmetic overflow / panics) over all
-inputs in a range, rather than sampling like proptest. It is a **narrow fit** —
-the type system already makes most illegal states unrepresentable, so kani earns
-its keep only on bounded integer/float arithmetic. A manual check, not a CI gate;
-it needs its own toolchain.
+checks assertions over every input admitted by a proof harness, rather than
+sampling like proptest. We use it for small arithmetic and byte-policy kernels.
+The `kani` CI job runs every workspace proof on PRs and pushes to `main`. It
+needs its own toolchain.
 
 Proofs live in a `#[cfg(kani)]` module so the normal build never compiles them.
-They run as one module in `src/config.rs`.
+They live beside their kernels in `src/config.rs`, `src/proxy.rs`,
+`src/privileged_disk.rs`, `src/setup_tool.rs`, `src/vsock_proxy.rs`,
+`src/commands/lifecycle.rs`, and `coop-proxy/src/proxy.rs`.
 
 **Install once** (or `./scripts/install-dev-tools.sh --all`): `cargo install
---locked kani-verifier && cargo kani setup`
+kani-verifier --version =0.67.0 --locked && cargo kani setup`. Keep the version
+in `.github/workflows/ci.yml` synchronized with `scripts/install-dev-tools.sh`.
 
 ```bash
-cargo kani                                            # run every proof harness (~5s)
-cargo kani --harness disk_relative_add_never_wraps    # one harness
+cargo kani --workspace --output-format terse          # run every proof harness
+cargo kani --workspace --harness disk_relative_add_never_wraps
 ```
 
-**Current proofs (`src/config.rs`, `mod proofs`):**
+**Current proofs:**
 
 - `disk_relative_add_never_wraps` — the arithmetic kernel of `DiskSize::resolve`'s
   relative branch (`current.checked_add(delta)`): for any two non-zero `u32`
@@ -650,6 +706,50 @@ cargo kani --harness disk_relative_add_never_wraps    # one harness
   strictly positive across the whole non-zero range.
 - `instance_index_octet_stays_in_range` — the guest IP/MAC last octet
   (`index + 2`) stays in `2..=254` for every valid `InstanceIndex` (`0..=252`).
+- `gib_ceil_conversion_never_wraps` — rounding any `u64` byte length up to GiB
+  preserves the quotient or rejects it when it exceeds `u32`.
+- `gib_as_bytes_is_exact` — every valid GiB quantity has an exact `u64` byte
+  representation with no remainder or overflow.
+- `privileged_disk_size_never_wraps` — the privileged disk helper's GiB-to-byte
+  multiplication preserves the size or rejects overflow.
+- `proxy_ports_are_exact_and_unique` — valid provider/instance pairs get their
+  exact base-plus-index port, and different pairs never collide.
+- `firecracker_acknowledgement_acceptance_requires_decimal_framing` — for any
+  response through the longest valid length (14 bytes), acceptance implies an
+  `OK ` prefix, at least one ASCII decimal digit, and a final newline. The
+  parser's `NonZeroU32` result and checked arithmetic constrain the port;
+  unit tests check exact boundary values and that the following SSH bytes
+  remain untouched. The parser rejects longer responses at its length guard.
+- `operation_policy_is_exact_allowlist` — for arbitrary bounded host/path bytes,
+  a request is allowed exactly for POST and the four allowed host/path pairs.
+  The production length guard denies inputs longer than the longest allowed
+  host or path. URI parsing and query handling remain covered by proxy unit tests.
+- `capability_token_comparison_matches_byte_equality` — every pair of 64-byte
+  tokens compares equal exactly when every byte matches; 63-byte and 65-byte
+  presented tokens reject. This is a functional proof; it does not prove
+  execution timing.
+- `relative_disk_target_preserves_exact_bytes` — a relative resize uses the
+  ceiling of the exact old byte length, then adds the requested GiB; a target
+  is returned exactly when the non-zero old length and sum are representable.
+- `reprovision_regrow_preserves_exact_old_length` — when the replacement is
+  shorter than the old disk, the regrow target holds every old byte; otherwise
+  no regrow is requested. The proof binds the old GiB size to the old byte
+  length using the same ceil conversion as the caller.
+- `apt_quoted_advance_is_in_bounds` — a quoted escape advances one or two bytes
+  without passing the end of a nonempty input, including a trailing backslash.
+- `apt_block_comment_end_is_first_and_in_bounds` — on arbitrary inputs up to
+  eight bytes beginning with `/*`, the helper returns the first closing `*/`
+  after the opener, or `None` only when there is no such pair.
+- `apt_first_newline_is_exact` — on arbitrary inputs up to eight bytes, newline
+  detection returns the first newline, or `None` only when there is none.
+- `apt_directive_separator_handles_comments` — a block comment separates a
+  directive when it contains a newline or is followed by whitespace; a line
+  comment separates one only when it ends with a newline.
+
+The APT proofs cover byte-index decisions shared by the configuration scanner
+and directive parser. They do not establish equivalence with APT's full grammar
+or the trustworthiness of files reached by `#include`; the setup-tool fixture
+tests cover parser composition and path validation.
 
 A note on the disk proof: the harness verifies the `checked_add` kernel directly
 rather than calling `DiskSize::resolve`, because `resolve` wraps the overflow

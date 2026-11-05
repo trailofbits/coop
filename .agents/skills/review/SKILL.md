@@ -129,10 +129,12 @@ apply across all lenses:
 - If later diagnostics need the cause, preserve it structurally (for example an
   enum) instead of collapsing it to `None` and re-deriving a possibly false
   message.
-- Classify the component that produced an exit status before assigning meaning
-  to it. A launcher or wrapper failing to find its target is not equivalent to
-  the target program starting and declining the request; fallback and error
-  reporting often need to distinguish those cases.
+- Before mapping a subprocess exit status to a user-facing state, trace which
+  component produced it and whether different outcomes, such as cancellation
+  and transport failure, share that status. A launcher or wrapper failing to
+  find its target is not equivalent to the target program starting and
+  declining the request; fallback and error reporting often need to
+  distinguish those cases.
 - Correct the rationale even when the code happens to be right. False comments
   and security claims become future implementation guidance.
 

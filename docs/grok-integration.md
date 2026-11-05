@@ -32,12 +32,13 @@ Trailing arguments go straight through to the `grok` CLI:
 coop grok -- --model grok-4.6
 ```
 
-`login` and `logout` run without `--always-approve`. If the host has
-`~/.grok/auth.json` (from `grok login` on the host), coop copies it into the
-guest on boot — same as Codex — and sets it to owner-only (`0600`). A
-copied session token takes precedence over `XAI_API_KEY`. If there is no
-host file, sign in from the guest with device-code auth (there is no
-browser in the VM):
+`login` and `logout` run without `--always-approve`. In open mode, if the host
+has `~/.grok/auth.json` (from `grok login` on the host), coop copies it into
+the guest on boot — same as Codex — and sets it to owner-only (`0600`). A
+copied session token takes precedence over `XAI_API_KEY`. Isolated mode omits
+new host auth-file copies; a copy retained on the guest disk from an earlier
+open boot is not removed. If there is no host file, sign in from the guest with
+device-code auth (there is no browser in the VM):
 
 ```bash
 coop grok -- login --device-auth
@@ -67,9 +68,11 @@ on boot.
 
 ### API key forwarding
 
-coop forwards `XAI_API_KEY` to the guest via SSH `SendEnv` on every session:
-`coop grok`, `coop shell`, and `coop exec` alike. The key is never written to
-disk inside the guest.
+With open networking, coop forwards `XAI_API_KEY` to the guest via SSH
+`SendEnv` on every session: `coop grok`, `coop shell`, and `coop exec` alike.
+The key is never written to disk inside the guest. [Isolated Firecracker
+mode](firecracker-network-modes.md) suppresses the raw key, and Grok is
+unsupported there because it has no managed proxy path.
 
 Resolution order:
 
@@ -89,7 +92,9 @@ forwarded API key. That file comes from the host copy on boot, or from
 on every agent bootstrap (`coop up` or `coop start`, without `--no-agents`).
 The default is `~/.grok`; a custom path supports `~` expansion. The copied
 entries are `AGENTS.md`, `auth.json`, `lsp.json`, `rules/`, `skills/`,
-`commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`.
+`commands/`, `plugins/`, `hooks/`, `agents/`, and `workflows/`. Isolated mode
+omits `auth.json` from a new copy but retains any version already on the guest
+disk, matching the mode's non-sanitization contract.
 
 Guest `config.toml` is the merge base. Host `config.toml` keys are
 overlaid except `[plugins]`. coop then forces
@@ -134,7 +139,8 @@ workspace and do not need to be copied.
 
 `env_forward` lists additional environment variable names to forward from
 the host to the guest via SSH `SendEnv`. These are forwarded on every SSH
-session, not just during bootstrap.
+session except for recognized raw credential names suppressed in isolated
+mode.
 
 `XAI_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms
 and do not need to appear here. An active VM PAT assignment rejects

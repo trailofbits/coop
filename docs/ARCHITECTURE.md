@@ -23,6 +23,7 @@ coop/
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
+│   ├── setup_tool.rs       # Firecracker setup-tool roles and launch policy
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
 │   ├── workspace.rs        # workspace sync (rsync) + ~/.ssh/config injection
@@ -44,6 +45,7 @@ coop/
 │   ├── ssh.rs              # interactive SSH launching
 │   ├── remote_command.rs   # injection-safe remote shell-command builder
 │   ├── cmd.rs              # host std::process::Command wrapper (redaction, sudo)
+│   ├── process_output.rs   # bounded concurrent capture + transient process groups
 │   ├── port_forward.rs     # ssh -L port forwards + state
 │   ├── signal.rs           # SIGINT/SIGTERM cooperative cancellation
 │   ├── paths.rs            # GuestPath / HostPath type split
@@ -111,7 +113,10 @@ flags — this is a load-bearing design choice (see
   successful `stop` mint `StoppedInstance` only after confirming exit.
   `StoppedInstance` holds the per-instance operation lock through cleanup and
   stopped-only disk mutations. Lima only mints it for confirmed `Stopped`;
-  absent, broken, unknown, and failed probes stay distinct.
+  absent, broken, unknown, and failed probes stay distinct. A machine-resource
+  update consumes the stopped token because Lima validates it by booting the VM
+  and Firecracker may boot when `--start` is requested; the returned operation
+  guard keeps the lock without claiming the VM is still stopped.
 - **`FirecrackerVm<Configured>` / `FirecrackerVm<Running>`** (`vm.rs`) gate
   `start()`/`stop()` transitions at compile time.
 - **Setup preflight** rejects explicit inputs unsupported by the selected
@@ -131,6 +136,14 @@ then used for readiness, shutdown, and every shared SSH consumer. Older state
 without the tag maps to `LegacyTcp` in memory without an eager rewrite. Lima
 remains TCP-based.
 
+Firecracker instances also persist an `open` or `isolated` network mode. The
+isolated representation uses the composite `vsock_isolated` value in the
+existing control field so supported prior releases reject it instead of
+ignoring a new field and booting with a NIC. In memory it normalizes to vsock
+control plus an isolated network policy. Firecracker config generation emits an
+empty `network-interfaces` list and backend startup skips TAP setup; every
+shared SSH consumer continues through the same vsock target.
+
 An instance operation lock is held from the stopped-state probe through disk
 resize, commit, or restore. Start, stop, and destroy acquire the same bounded
 lock. Its file is a sibling of the instance directory, so directory removal
@@ -147,7 +160,9 @@ any instance operation lock is acquired.
    loading, or other setup side effects.
 4. Init tracing (→ **stderr**) and handle commands that must work **without** a
    loaded config — `Completions`, `Init`, `Update`, `Uninstall` — first.
-5. `config::CoopConfig::load`, then fire the update-notifier check.
+5. `config::CoopConfig::load`; on Linux, preflight Firecracker setup tools
+   before managed-storage repair. Non-setup commands prepare storage here.
+   Print the update notice; run its background check except during Linux setup.
 6. Construct `backend::PlatformBackend::new()`.
 7. `match` each `Commands` variant to a `commands::cmd_*` handler. Lifecycle
    handlers call `cfg.validate_and_warn()?` before VM work; query commands
@@ -193,7 +208,11 @@ The lifecycle is **setup → up/start → shell → stop → destroy**. A first 
    `post_create` in the guest home.
    Save successful completion atomically. Failures retain the VM and block agent
    launch; running `up` and stopped-instance restarts retry the pending hook under
-   the instance operation lock. Guest execution uses a private staged script,
+   the provisioning lock. The instance operation lock covers the initial state
+   read and the final liveness probe, recipe revalidation, and completion write;
+   it is released while the guest hook runs so stop and destroy can proceed.
+   A hook that succeeds but loses the VM or cannot save completion stays pending
+   and may run again on retry. Guest execution uses a private staged script,
    a PTY-bound supervisor, and a guest lock; cancellation terminates and reaps
    the supervised process group. Shell and exec remain available for recovery.
 8. **`post_start`** hook — runs after creation, workspace, and mount provisioning,
@@ -283,6 +302,10 @@ The invocation-selected config may replace any identity with one exact absolute
 path for non-FHS layouts. An override never falls back; it retains the full
 root-owned, non-writable path-chain checks but intentionally does not claim
 package, hash, basename, or command-semantic identity.
-`setup_tap` resolves the complete set before its first probe or mutation. This
-policy is specific to `network.rs`; other host subprocess families retain their
-own launch contracts until migrated.
+`setup_tap` resolves the complete set before its first probe or mutation.
+Firecracker setup also uses the resolver for its fixed system-tool family:
+bootstrap tools are checked before storage changes or package installation,
+and the installed family is checked afterward, before artifact downloads and
+image construction. The privileged disk helper repeats filesystem-tool
+resolution at its elevated launch boundary. Other host subprocess families
+retain their own launch contracts.

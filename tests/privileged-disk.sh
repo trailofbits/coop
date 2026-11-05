@@ -39,6 +39,21 @@ mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
+# Holding cwd inside the mount reproduces an EBUSY unmount. A failed cleanup
+# must retain both the mounted filesystem and its backing file.
+if (cd "$data_dir/rootfs-mount" && sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage") 2>/dev/null; then
+    echo 'busy rootfs was unmounted' >&2
+    exit 1
+fi
+if sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage" 2>/dev/null; then
+    echo 'busy rootfs was reported unmounted' >&2
+    exit 1
+fi
+if sudo -n "$coop_bin" __disk-op remove "$data_dir" "$stage" 2>/dev/null; then
+    echo 'mounted backing file was removed' >&2
+    exit 1
+fi
+[[ -f $stage ]]
 sudo -n mount -t tmpfs tmpfs "$data_dir/sentinel"
 if sudo -n "$coop_bin" __disk-op mount-proc "$data_dir" "$stage" 2>/dev/null; then
     echo 'guest-authored proc symlink was mounted' >&2
@@ -57,7 +72,14 @@ if ! mountpoint -q "$data_dir/sentinel"; then
     exit 1
 fi
 sudo -n umount "$data_dir/sentinel"
-sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+# A killed setup can leave the root mount busy until a child exits. Recovery
+# must wait for that child, unmount the old image, and permit a fresh build.
+(cd "$data_dir/rootfs-mount" && touch "$data_dir/holder-ready" && sleep 1) &
+holder=$!
+while [[ ! -e $data_dir/holder-ready ]]; do sleep 0.01; done
+sudo -n "$coop_bin" __disk-op recover-template-mount "$data_dir" "$stage"
+wait "$holder"
+sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage"
 
 ln -s "$data_dir/sentinel" "$instance"
 if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then
@@ -84,7 +106,7 @@ sudo -n cmp "$sparse_source" "$sparse_target"
 rm "$data_dir/squashfs-root/proc"
 mkdir "$data_dir/squashfs-root/proc"
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
-for _ in 1 2; do
+for iteration in 1 2; do
     sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
     for child in proc sys dev devpts tmp; do
         sudo -n "$coop_bin" __disk-op "mount-$child" "$data_dir" "$stage"
@@ -97,10 +119,14 @@ for _ in 1 2; do
     [[ -s "$data_dir/rootfs-mount/etc/resolv.conf" ]]
     # Guest can make its own root writable; cleanup must still work.
     sudo -n chmod 0777 "$data_dir/rootfs-mount"
-    for child in tmp devpts dev sys proc; do
-        sudo -n "$coop_bin" __disk-op "unmount-$child" "$data_dir" "$stage"
-    done
-    sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+    if [[ $iteration == 1 ]]; then
+        sudo -n "$coop_bin" __disk-op recover-template-mount "$data_dir" "$stage"
+    else
+        for child in tmp devpts dev sys proc; do
+            sudo -n "$coop_bin" __disk-op "unmount-$child" "$data_dir" "$stage"
+        done
+        sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage"
+    fi
     if mountpoint -q "$data_dir/rootfs-mount"; then
         echo 'loop mount remained after unmount' >&2
         exit 1
@@ -124,7 +150,7 @@ if sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$instance" \
     echo 'read-only check accepted an inconsistent filesystem' >&2
     exit 1
 fi
-grep -Fq '/usr/sbin/e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
+grep -Fq 'e2fsck failed with status exit status: 4' "$data_dir/fsck-read-error"
 
 # The image grew before fsck, but ext4 did not. Retrying the same absolute size
 # must repair the inode and finish the filesystem grow through the public CLI.

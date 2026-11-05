@@ -22,8 +22,8 @@ backend. The sections below note where that applies.
   ```
 
   The script pins the local dev-tool versions; bump a version there rather than
-  installing a floating `latest`. CI pins its own copies of taplo and cargo-deny
-  in `.github/workflows/ci.yml`, so keep those in sync when bumping.
+  installing a floating `latest`. CI pins its own copies of taplo, cargo-deny,
+  and Kani in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
     (`limactl` on your PATH).
@@ -73,6 +73,17 @@ current platform. VM integration tests still need the host prerequisites
 and must be run separately. The Nix package skips the invalid UTF-8 filename
 test on macOS because APFS rejects its fixture; it remains enabled on Linux.
 Format the flake with `nix fmt`.
+
+### Homebrew
+
+After publishing a release, update `url` and the source archive's `sha256` in
+[`Formula/coop.rb`](Formula/coop.rb). The Homebrew workflow builds and tests the
+formula on macOS whenever `Formula/` changes.
+
+Keep `COOP_PACKAGE_MANAGER=homebrew` to mark Homebrew ownership and
+`COOP_FORCE_BUILD_KIND=release` to avoid a `-dev` version in source-archive builds.
+The current formula backports the ownership guards to v0.9.2; remove `patch :DATA`
+and the patch after `__END__` once the pinned release includes them.
 
 ## Pre-commit hooks
 
@@ -135,11 +146,12 @@ new integration test phase.
 
 ### Optional deeper checks
 
-coop also carries mutation tests (`cargo-mutants`), fuzz targets
-(`cargo-fuzz`), and formal proofs (`kani`). These are manual quality checks,
-not required for every change. If you touch a logic-dense module — config
-parsing and the arithmetic kernels — see
-[docs/testing.md](docs/testing.md) for when and how to run them.
+coop also carries mutation tests (`cargo-mutants`) and fuzz targets
+(`cargo-fuzz`). These are manual quality checks, not required for every change.
+Kani proofs run in CI; run `cargo kani --workspace` locally when changing a
+proof or its kernel. If you touch a logic-dense module — config parsing and the
+arithmetic kernels — see [docs/testing.md](docs/testing.md) for when and how to
+run the manual checks.
 
 ## Code style
 
@@ -181,9 +193,8 @@ CI must pass before a pull request can merge. The
 - **`cargo fmt -- --check`** — formatting.
 - **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — lints.
 - **`cargo test --workspace`** — tests for both crates.
-- **`./tests/integration-install.sh`**, **`./tests/integration-update.sh`**,
-  and **`./tests/integration-uninstall.sh`** — installer provenance, update,
-  and uninstall flows.
+- **`./tests/integration-install.sh`** and **`./tests/run-policy-integration.sh`** —
+  installer provenance, updater and uninstall policies, and release smoke.
 - **`./tests/integration-network.sh`** — Linux bridge isolation.
 - **`./tests/integration-proxy-forward.sh`** — authenticated SSH reverse
   forwarding and rejected-bind cleanup on Linux.

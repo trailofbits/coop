@@ -44,11 +44,6 @@ exclude_globs = [
   "src/vm.rs",
   # Thin binary shim: `fn main() { coop::run() }`. All logic is in the lib.
   "src/main.rs",
-  # Interactive prompts (confirm / read_line) short-circuit off a TTY
-  # and otherwise reads stdin; the trailing match on the reply is only
-  # reachable behind a real terminal, so a `--lib` test cannot observe any of
-  # it. Whole-module exclude (cf. read_line added for #352, issue #373).
-  "src/prompt.rs",
 ]
 
 # Individual functions in otherwise-logic-bearing modules. Patterns match
@@ -57,11 +52,29 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # process_output.rs — status runner spawns and reaps real process groups.
+  # Its exit, timeout, cancellation, and stdin paths have direct process tests;
+  # pure capture/limit decisions remain in mutation scope.
+  "src/process_output\\.rs:.*\\brun_status_bounded\\b",
+  "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
+  # Root-only apt fragments use bounded sudo/cat; the private-fragment test
+  # and deliberate-break probe exercise this IO adapter. Directive parsing
+  # and include-path decisions remain mutation-scoped.
+  "src/setup_tool\\.rs:.*\\bread_apt_configuration\\b",
+  # Ambient stdin/stderr adapters are covered through their injected helpers;
+  # the bounded parsing and terminal-control logic remains mutation-scoped.
+  "src/prompt\\.rs:.*\\bconfirm\\b",
+  "src/prompt\\.rs:.*\\bread_line\\b",
+  "src/prompt\\.rs:.*\\bread_line_any\\b",
+  "src/prompt\\.rs:.*\\bread_secret\\b",
+  # Best-effort fallback for unwinding after an early return. Explicit restore
+  # and PTY tests cover the ordinary success/error paths.
+  "src/prompt\\.rs:.*<impl Drop for EchoGuard",
   # vsock_proxy.rs: Unix-socket readiness and stdio relay are syscall adapters.
   # Unit fixtures cover successful, malformed, oversized, and timed-out
   # handshakes; tests/vsock_proxy.rs covers interactive subprocess relay, and
   # the Firecracker integration gate covers the real VMM. Keep the pure
-  # response grammar (`validate_response`) in mutation scope.
+  # response grammar and bounded pending-byte queue in mutation scope.
   "src/vsock_proxy\\.rs:.*\\brun\\b",
   "src/vsock_proxy\\.rs:.*\\brelay\\b",
   "src/vsock_proxy\\.rs:.*\\bconnect\\b",
@@ -69,8 +82,10 @@ exclude_re = [
   "src/vsock_proxy\\.rs:.*\\bwait_fd\\b",
   "src/vsock_proxy\\.rs:.*\\bread_response\\b",
   "src/vsock_proxy\\.rs:.*NonblockingFd::new",
-  "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd>::drop",
-  # Web editor orchestration is exercised by direct SSH and real VM fixtures.
+  "src/vsock_proxy\\.rs:.*<impl Drop for NonblockingFd",
+  "src/vsock_proxy\\.rs:.*\\b(read_fd|write_fd)\\b",
+  "src/vsock_proxy\\.rs:.*Relay<.*>::(run|poll|read_stdin|write_guest|read_guest|check_guest_error|write_stdout|check_stdio_errors|finish_input)\\b",
+   # Web editor orchestration is exercised by direct SSH and real VM fixtures.
   "src/web_editor\\.rs:.*\\b(control|control_request|load|stop|run|wait_attached|serve_session|show|ssh_launch|nonblocking_stdin|finish|drop)\\b",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
@@ -88,7 +103,7 @@ exclude_re = [
   "src/private_storage\\.rs:.*MigrationOutcome::report",
   # VM status discovers repository state through git; view formatting remains tested.
   "\\bbuild_vm_status\\b",
-  # cfg(kani) proofs (config.rs `mod proofs`): never compiled in a normal
+  # cfg(kani) proofs (each module's `mod proofs`): never compiled in a normal
   # build, so every mutation is a silent no-op and always "missed". The
   # proofs are exercised by `cargo kani`, not by mutation testing.
   "proofs::",
@@ -119,7 +134,6 @@ exclude_re = [
   "\\bprint_form_instructions\\b",
   "\\bprint_widen_instructions\\b",
   "\\bwarn_token_format\\b",
-  "impl Drop for EchoGuard",
   # PAT-wizard submodule orchestration: curl prefetch, then terminal prompts
   # (read_token_no_echo) and eprintln advice gated on the discovery result.
   # The classification logic (classify_urls / extract_urls / drop_public) is
@@ -239,6 +253,12 @@ exclude_re = [
   "IsolationNetworkTools::resolve_production",
   "<impl BridgeToolset for IsolationNetworkTools>::bridge",
 
+  # The Firecracker-only allocation arm is compiled out on macOS. Native
+  # Linux allocation tests pin the isolated comparison; the macOS test pins
+  # that Lima ignores the Firecracker network default. A Darwin mutation run
+  # cannot observe this operator even though cargo-mutants discovers it.
+  "src/config\\.rs:.*replace == with != in CoopConfig::allocate_instance",
+
   # ---- src/commands/ and the lib.rs/main.rs shims ----
   # The #321-#327 refactor split every command handler out of lib.rs into
   # src/commands/. Apply the SAME surgical treatment the flat shell-out
@@ -266,6 +286,7 @@ exclude_re = [
   "\\bapply_vm_overrides\\b",
   "\\bfind_stopped_instance\\b",
   "\\brestart_instance\\b",
+  "\\brestart_confirmed_instance\\b",
   "\\bstart_instance\\b",
   # Runs host proxy teardown before backend cleanup for a confirmed-stopped VM;
   # the ordering is covered by a filesystem-backed lifecycle unit test.
@@ -280,6 +301,12 @@ exclude_re = [
   # dispatch pattern (it is no longer a `cmd_*`), so it is named here: it
   # drives stop/disk-swap/boot over the backend, none of it `--lib`-observable.
   "\\breprovision_instance\\b",
+  # Image publication locks, backend metadata checks, interactive confirmation,
+  # and PAT prompting are IO wrappers around the mutation-scoped workspace and
+  # network policy helpers.
+  "\\bpreflight_reprovision_image\\b",
+  "\\bvalidate_reprovision_image\\b",
+  "\\bconfirm_reprovision\\b",
   # Resolves guest file staging through the backend and reads host paths after
   # stop; a unit mutant cannot observe the VM lifecycle recovery context.
   "\\bprepare_reprovision_payload\\b",
@@ -295,6 +322,13 @@ exclude_re = [
   "\\bcurrent_disk_bytes\\b",
   # instance_status (#385) queries usage over SSH.
   "\\binstance_status\\b",
+  # Network-mode lifecycle wrappers hold backend locks, drive cleanup/start,
+  # or write stdout. Their extracted policy enums remain mutation-scoped.
+  "\\bensure_isolated_agent_supported\\b",
+  "\\bpreflight_isolated_bootstrap\\b",
+  "\\bpreflight_isolated_bootstrap_for_network\\b",
+  "\\bstop_confirmed\\b",
+  "\\brender_network_status\\b",
 
   # ---- src/commands/json.rs (#385): --json output ----
   # render_json is the single stdout JSON writer; a `--lib` test cannot
@@ -375,8 +409,8 @@ exclude_re = [
   # mutant — which load_or_default_is_remote_when_missing alone cannot, since
   # the default IS Remote on the missing-file path.)
 
-  # (prompt.rs — read_line and the other TTY prompts are scoped whole-module
-  # via exclude_globs above.)
+  # (prompt.rs — only the ambient-stdio adapters are excluded by the targeted
+  # patterns above; bounded parsing/pure helpers remain in scope.)
 
   # lifecycle.rs — backend-driving helpers: bootstrap_on_boot installs guest
   # agents, run_configured_post_start executes the configured guest hook, and
@@ -448,5 +482,7 @@ exclude_re = [
   "src/proxy\\.rs:.*\\bpid_path\\b",
   "src/proxy\\.rs:.*\\bfwd_pid_path\\b",
   "src/proxy\\.rs:.*\\btoken_path\\b",
+  "src/proxy\\.rs:.*\\bensure_runtime_available\\b",
+  "src/proxy\\.rs:.*\\bensure_pid_file_live\\b",
 
 ]

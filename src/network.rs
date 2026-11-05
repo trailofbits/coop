@@ -129,7 +129,14 @@ fn resolve_network_tool_from_candidates(
     candidates: &[PathBuf],
     policy: &TrustedToolPolicy,
 ) -> Result<ResolvedHostTool<NetworkTool>> {
-    resolve_host_tool(tool, candidates, policy).map_err(Into::into)
+    // Ubuntu 26.04 CI resolves /usr/bin/sudo to this non-FHS target.
+    // Extend only sudo's policy; other network tools keep the FHS roots.
+    let sudo_policy = (tool == NetworkTool::Sudo).then(|| {
+        policy
+            .clone()
+            .with_allowed_target_beneath_anchor("usr/lib/cargo/bin/sudo")
+    });
+    resolve_host_tool(tool, candidates, sudo_policy.as_ref().unwrap_or(policy)).map_err(Into::into)
 }
 
 struct SetupNetworkTools {
@@ -837,7 +844,7 @@ fn tap_exists(name: &str, ip: Cmd) -> bool {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
     use std::path::Path;
 
     use super::*;
@@ -977,6 +984,47 @@ mod tests {
                     .all(|candidate| Path::new(candidate).is_absolute())
             );
         }
+    }
+
+    #[test]
+    fn builtin_sudo_accepts_only_the_ubuntu_cargo_target() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let anchor = temp.path().join("root");
+        let bin = anchor.join("usr/bin");
+        let cargo_bin = anchor.join("usr/lib/cargo/bin");
+        crate::test_support::create_private_dir_all(&bin).unwrap();
+        crate::test_support::create_private_dir_all(&cargo_bin).unwrap();
+        let sudo_target = cargo_bin.join("sudo");
+        let other_target = cargo_bin.join("other");
+        for target in [&sudo_target, &other_target] {
+            fs::write(target, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sudo = bin.join("sudo");
+        symlink(&sudo_target, &sudo).unwrap();
+        let policy =
+            TrustedToolPolicy::new(&anchor, [bin.clone()], fs::metadata(&anchor).unwrap().uid());
+
+        let resolved = resolve_network_tool_from_candidates(
+            NetworkTool::Sudo,
+            std::slice::from_ref(&sudo),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(resolved.launch_path(), sudo);
+        assert_eq!(resolved.canonical_target(), sudo_target);
+
+        let ip = bin.join("ip");
+        symlink(&sudo_target, &ip).unwrap();
+        let error =
+            resolve_network_tool_from_candidates(NetworkTool::Ip, &[ip], &policy).unwrap_err();
+        assert!(error.to_string().contains("outside the allowed roots"));
+
+        fs::remove_file(&sudo).unwrap();
+        symlink(&other_target, &sudo).unwrap();
+        let error =
+            resolve_network_tool_from_candidates(NetworkTool::Sudo, &[sudo], &policy).unwrap_err();
+        assert!(error.to_string().contains("outside the allowed roots"));
     }
 
     #[test]

@@ -9,11 +9,15 @@ use std::os::unix::fs::{
     FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
+#[cfg(test)]
+use std::process::Command;
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use rustix::fs::{AtFlags, StatxFlags, statx};
 
-use crate::cmd::Cmd;
+use crate::setup_tool::SetupTool;
 
 const COPY_LOCK_NAME: &CStr = c".coop-disk-copy.lock";
 const COPY_TMP_NAME: &CStr = c".coop-disk-copy.tmp";
@@ -40,11 +44,11 @@ enum DiskTool {
 }
 
 impl DiskTool {
-    fn program(self) -> &'static str {
+    fn setup_role(self) -> SetupTool {
         match self {
-            Self::FsckFix | Self::FsckRead => "/usr/sbin/e2fsck",
-            Self::Resize => "/usr/sbin/resize2fs",
-            Self::Format => "/usr/sbin/mkfs.ext4",
+            Self::FsckFix | Self::FsckRead => SetupTool::E2fsck,
+            Self::Resize => SetupTool::Resize2fs,
+            Self::Format => SetupTool::MkfsExt4,
         }
     }
 
@@ -211,6 +215,7 @@ impl DiskPath {
     }
 
     fn remove(&self, uid: u32) -> Result<()> {
+        ensure_unmounted(self)?;
         match self.file(false, uid) {
             Ok(_file) => {}
             Err(error)
@@ -256,6 +261,7 @@ fn is_root_owned_symlink(parent: &File, name: &CStr) -> bool {
 
 fn copy(src: &DiskPath, dst: &DiskPath, uid: u32) -> Result<()> {
     let source = src.file(false, uid)?;
+    ensure_unmounted(dst)?;
     // Refuse to replace a symlink, hardlink, foreign-owned file, or directory.
     if let Err(error) = dst.file(false, uid)
         && error
@@ -325,8 +331,28 @@ fn open_copy_scratch(parent: &File, name: &CStr, uid: u32) -> Result<File> {
 
 fn size_bytes(size_gib: &str) -> Result<u64> {
     let gib: u64 = size_gib.parse().context("Invalid disk size")?;
+    size_bytes_gib(gib).context("Disk size overflow")
+}
+
+fn size_bytes_gib(gib: u64) -> Option<u64> {
     gib.checked_mul(crate::config::GIB_BYTES)
-        .context("Disk size overflow")
+}
+
+#[cfg(kani)]
+mod proofs {
+    /// A requested GiB count either converts exactly to bytes or reports
+    /// overflow before the privileged helper resizes a disk.
+    #[kani::proof]
+    fn privileged_disk_size_never_wraps() {
+        let gib: u64 = kani::any();
+        let converted = super::size_bytes_gib(gib);
+        let gib_bytes = crate::config::GIB_BYTES;
+        assert_eq!(converted.is_some(), gib <= u64::MAX / gib_bytes);
+        if let Some(bytes) = converted {
+            assert_eq!(bytes / gib_bytes, gib);
+            assert_eq!(bytes % gib_bytes, 0);
+        }
+    }
 }
 
 pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&str>) -> Result<()> {
@@ -367,6 +393,8 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
         "format" if argument.is_none() => format_disk(&disk, uid),
         "mount" if argument.is_none() => mount_disk(&disk, uid),
         "unmount" if argument.is_none() => unmount_target(&disk, None),
+        "recover-template-mount" if argument.is_none() => recover_template_mount(&disk),
+        "ensure-unmounted" if argument.is_none() => ensure_unmounted(&disk),
         "mount-proc" if argument.is_none() => mount_child(&disk, "proc"),
         "mount-sys" if argument.is_none() => mount_child(&disk, "sys"),
         "mount-dev" if argument.is_none() => mount_child(&disk, "dev"),
@@ -391,6 +419,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
                 name: final_name.to_owned(),
                 kind: disk.kind,
             };
+            ensure_unmounted(&final_disk)?;
             if let Err(error) = final_disk.file(false, uid)
                 && error
                     .downcast_ref::<io::Error>()
@@ -450,11 +479,41 @@ fn mount_directory(disk: &DiskPath, create: bool) -> Result<File> {
     Ok(directory)
 }
 
+fn mount_id(file: &File) -> Result<u64> {
+    let stat = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        bail!("Kernel did not report the mount ID");
+    }
+    Ok(stat.stx_mnt_id)
+}
+
+fn ensure_unmounted(disk: &DiskPath) -> Result<()> {
+    let base = if disk.kind == DiskKind::Instance {
+        &disk.parent
+    } else {
+        &disk.root
+    };
+    let mount = match open_at(
+        base,
+        c"rootfs-mount",
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(mount) => mount,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if mount_id(&mount)? != mount_id(base)? {
+        bail!("Rootfs mount is still active; unmount it before changing the disk");
+    }
+    Ok(())
+}
+
 fn proc_fd(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
 }
 
 fn mount_disk(disk: &DiskPath, uid: u32) -> Result<()> {
+    ensure_unmounted(disk)?;
     let source = disk.file(true, uid)?;
     let target = mount_directory(disk, true)?;
     let control = fs::OpenOptions::new()
@@ -619,6 +678,103 @@ fn unmount_target(disk: &DiskPath, child: Option<&str>) -> Result<()> {
     unmount_checked_name(&parent, &name, || {})
 }
 
+/// Clean up a template mount left behind by an interrupted setup. The shared
+/// mount lock must be held by the caller. Only the fixed mountpoint and its
+/// fixed chroot children are touched; a busy mount is never detached.
+fn recover_template_mount(disk: &DiskPath) -> Result<()> {
+    if disk.kind != DiskKind::Template {
+        bail!("Only a template mount can be recovered");
+    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mount = match mount_directory(disk, false) {
+            Ok(mount) => mount,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if mount_id(&mount)? == mount_id(&disk.root)? {
+            return Ok(());
+        }
+        drop(mount);
+
+        let mut busy = false;
+        for child in ["tmp", "dev/pts", "dev", "sys", "proc"] {
+            match unmount_if_mounted(disk, Some(child)) {
+                Ok(()) => {}
+                Err(error) if is_busy(&error) => busy = true,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Failed to recover {child} mount"));
+                }
+            }
+        }
+        match unmount_if_mounted(disk, None) {
+            Ok(()) if !busy => return Ok(()),
+            Ok(()) => {}
+            Err(error) if is_busy(&error) => busy = true,
+            Err(error) => return Err(error).context("Failed to recover rootfs mount"),
+        }
+        if !busy {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Timed out waiting for interrupted rootfs mount to become idle");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|e| e.raw_os_error() == Some(libc::EBUSY))
+}
+
+fn unmount_if_mounted(disk: &DiskPath, child: Option<&str>) -> Result<()> {
+    let (parent, name) = match child {
+        None => (disk.root.try_clone()?, c"rootfs-mount".to_owned()),
+        Some("dev/pts") => {
+            let dev = match mounted_child(disk, "dev") {
+                Ok(dev) => dev,
+                Err(error) if is_missing_mount_target(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            (dev, c"pts".to_owned())
+        }
+        Some(name @ ("proc" | "sys" | "dev" | "tmp")) => {
+            (mount_directory(disk, false)?, CString::new(name)?)
+        }
+        _ => bail!("Unsupported chroot unmount target"),
+    };
+    let target = match open_at(
+        &parent,
+        &name,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(target) => target,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if mount_id(&target)? == mount_id(&parent)? {
+        return Ok(());
+    }
+    drop(target);
+    unmount_checked_name(&parent, &name, || {})
+}
+
+fn is_missing_mount_target(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)))
+}
+
 fn unmount_checked_name(parent: &File, name: &CStr, before_unmount: impl FnOnce()) -> Result<()> {
     // Reject an existing guest symlink and ask the kernel not to follow a
     // replacement introduced before umount resolves the final component.
@@ -654,9 +810,10 @@ fn write_resolv(disk: &DiskPath) -> Result<()> {
 fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let fds: Vec<_> = descriptors.iter().map(|file| file.as_raw_fd()).collect();
-    let program = tool.program();
-    let mut command = Command::new(program);
+    let program = tool.setup_role().name();
+    let mut command = tool.setup_role().command()?.build();
     command.args(args);
+    command.stdin(std::process::Stdio::null());
     // SAFETY: pre_exec performs only async-signal-safe fcntl calls. The fd
     // vector is captured before fork and each fd is owned by a live File.
     unsafe {
@@ -669,9 +826,12 @@ fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> R
             Ok(())
         });
     }
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run {program}"))?;
+    let status = crate::process_output::run_status_bounded(
+        &mut command,
+        crate::setup::SETUP_TOOL_DEADLINE,
+        None,
+    )
+    .with_context(|| format!("Failed to run {program}"))?;
     if !tool.succeeded(status) {
         bail!("{program} failed with status {status}");
     }
@@ -714,7 +874,8 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
         .ancestors()
         .nth(3)
         .context("Disk path has no data root")?;
-    let mut command = Cmd::new(running_executable_path())
+    let mut command = SetupTool::sudo_command(crate::setup::SETUP_TOOL_DEADLINE)?
+        .arg(running_executable_path())
         .arg("__disk-op")
         .arg(operation)
         .arg(root)
@@ -722,7 +883,7 @@ fn invoke(operation: &str, path: &Path, argument: Option<&OsStr>) -> Result<()> 
     if let Some(argument) = argument {
         command = command.arg(argument);
     }
-    command.sudo().run()
+    command.run_bounded(crate::setup::SETUP_TOOL_DEADLINE)
 }
 
 /// Procfs resolves this to the running executable inode while the parent
@@ -735,10 +896,27 @@ pub(crate) fn seal_existing(path: &Path) -> Result<()> {
     invoke("seal", path, None)
 }
 pub(crate) fn remove(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("remove", path, None)
 }
+pub(crate) fn ensure_disk_unmounted(path: &Path) -> Result<()> {
+    invoke("ensure-unmounted", path, None)
+}
 pub(crate) fn copy_disk(src: &Path, dst: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(dst)?;
     invoke("copy", src, Some(dst.as_os_str()))
+}
+
+fn lock_template_mount(path: &Path) -> Result<Option<crate::fs_util::FileLock>> {
+    let collection = path.ancestors().nth(2).context("Disk has no collection")?;
+    if collection.file_name() != Some(OsStr::new("images")) {
+        return Ok(None);
+    }
+    let root = collection.parent().context("Disk path has no data root")?;
+    // Template images share one mountpoint. Wait for another image's mount
+    // guard before the helper checks it, and hold the lock through mutation.
+    // Mount/unmount calls already hold this lock through MountGuard.
+    crate::fs_util::lock_sibling(&root.join("rootfs-mount")).map(Some)
 }
 
 pub(crate) fn cleanup_copy_scratch(directory: &Path) -> Result<()> {
@@ -770,6 +948,7 @@ pub(crate) fn format(path: &Path) -> Result<()> {
     invoke("format", path, None)
 }
 pub(crate) fn swap(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
     invoke("swap", path, None)
 }
 pub(crate) fn mount(path: &Path) -> Result<()> {
@@ -777,6 +956,14 @@ pub(crate) fn mount(path: &Path) -> Result<()> {
 }
 pub(crate) fn unmount(path: &Path) -> Result<()> {
     invoke("unmount", path, None)
+}
+/// The caller already owns the shared template mount lock.
+pub(crate) fn recover_template_mount_under_lock(path: &Path) -> Result<()> {
+    invoke("recover-template-mount", path, None)
+}
+pub(crate) fn recover_stale_template_mount(path: &Path) -> Result<()> {
+    let _mount_lock = lock_template_mount(path)?;
+    recover_template_mount_under_lock(path)
 }
 pub(crate) fn mount_sub(path: &Path, name: &str) -> Result<()> {
     invoke(&format!("mount-{name}"), path, None)
@@ -802,6 +989,16 @@ mod tests {
         DiskTool::Resize,
         DiskTool::Format,
     ];
+
+    #[test]
+    fn size_bytes_rejects_overflow() {
+        let maximum = u64::MAX / crate::config::GIB_BYTES;
+        assert_eq!(
+            size_bytes(&maximum.to_string()).unwrap(),
+            maximum * crate::config::GIB_BYTES
+        );
+        assert!(size_bytes(&(maximum + 1).to_string()).is_err());
+    }
 
     #[test]
     fn disk_tools_accept_clean_status() {
@@ -841,6 +1038,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mount_id_accepts_o_path_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("mount")).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let child = open_at(
+            &parent,
+            c"mount",
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(mount_id(&child).unwrap(), mount_id(&parent).unwrap());
+    }
+
+    #[test]
+    fn copy_disk_waits_for_shared_template_mount_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let mount_path = root.path().join("rootfs-mount");
+        let mounting = crate::fs_util::lock_sibling(&mount_path).unwrap();
+        let other_image = root.path().join("images/other/rootfs-template.ext4.new");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            // This source reaches invoke's path validation after the wrapper
+            // acquires the destination lock, then fails before any sudo call.
+            let result = copy_disk(Path::new("source"), &other_image);
+            finished_tx
+                .send(result.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let while_mounted = finished_rx.recv_timeout(Duration::from_millis(100));
+        drop(mounting);
+        let after_unmount = finished_rx.recv_timeout(Duration::from_secs(5));
+        worker.join().unwrap();
+        assert_eq!(while_mounted, Err(mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(
+            after_unmount,
+            Ok(Err("Disk path has no data root".to_string()))
+        );
+
+        let instance = root.path().join("instances/test/rootfs.ext4");
+        assert!(lock_template_mount(&instance).unwrap().is_none());
     }
 
     struct TemporaryMount(CString);

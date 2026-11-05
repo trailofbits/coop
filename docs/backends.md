@@ -104,14 +104,14 @@ Keep the backup until the guest boots and its files are checked. If `hdiutil` ca
 
 ## Linux / Firecracker
 
-The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.github.io/) with KVM hardware virtualization. Each instance is a lightweight VM with its own rootfs, TAP network device, and Firecracker process.
+The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.github.io/) with KVM hardware virtualization. Each instance is a lightweight VM with its own rootfs and Firecracker process. An `open` instance also has a TAP-backed virtio NIC; an [isolated instance](firecracker-network-modes.md) has neither.
 
 ### Prerequisites
 
 - **KVM access**: `/dev/kvm` must exist and be readable/writable by the current user. Setup checks this and offers to fix permissions via `setfacl` or by adding the user to the `kvm` group.
 - **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
-- **curl**: Required for downloading the Firecracker binary and kernel.
-- **System packages**: Setup checks for `setfacl`, `unsquashfs`, and `mkfs.ext4` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. If tools are missing, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using `apt-get`. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If `apt-get` is unavailable, setup lists the missing tools; install or configure the tools and rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
+- **curl and host utilities**: Firecracker setup uses root-owned executables from `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`, and `/usr/local/sbin`. It checks the complete Coop-selected bootstrap family before setup changes storage, and checks the image-build family after any package installation but before downloading artifacts. A missing or rejected tool stops setup with its role and a repair hint. Setup does not search the invoking `PATH`.
+- **System packages**: Setup checks trusted `setfacl`, `unsquashfs`, and `mkfs.ext4` paths, plus resolved `ssh`, `scp`, and `rsync` clients. If tools are absent, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using a trusted system `apt-get`. It checks ownership and writability of `/etc/apt` and files reached through apt configuration includes before automatic installation. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If trusted `apt-get` is unavailable, install the packages with your host's package manager, then rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
 - **Network control-plane tools**: `sudo`, `ip`, `bridge`, `iptables`, and
   `sysctl` use validated absolute system paths. Non-FHS hosts can provide exact
   per-tool paths under `[network.host_tools]`; see
@@ -134,8 +134,8 @@ Creating an instance (`coop up`) follows this sequence:
 1. Copies the template rootfs to the instance directory using `cp --reflink=auto` for copy-on-write on supported filesystems.
 2. Mounts the copy and patches the guest network config with the instance's unique IP address, plus `/etc/hostname` and the matching `/etc/hosts` alias so the guest can resolve its own name.
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
-4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, network interface, and vsock device.
-5. Creates and attaches a TAP device to the bridge (see TAP networking below).
+4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, vsock device, and either the open-mode network interface or an empty interface list.
+5. In `open` mode, creates and attaches a TAP device to the bridge (see TAP networking below). Isolated mode skips all per-instance host networking setup.
 6. Starts the Firecracker process with `sudo` and `--no-api`. Firecracker requires root for KVM and TAP access; coop does not expose its control API socket.
 7. Records the Firecracker PID and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
@@ -148,9 +148,9 @@ Stopping a VM requests a guest reboot over SSH and waits up to ten seconds for
 Firecracker to exit. If the process does not exit, coop falls back to `SIGTERM`,
 then `SIGKILL`.
 
-### TAP networking
+### TAP networking (`open` mode)
 
-Each Firecracker instance gets a dedicated TAP device (`tap0`, `tap1`, ...) derived from its instance index.
+Each open Firecracker instance gets a dedicated TAP device (`tap0`, `tap1`, ...) derived from its instance index. [Isolated mode](firecracker-network-modes.md) boots without a NIC or TAP and retains control through vsock-backed SSH.
 
 The network is configured as follows:
 
@@ -161,13 +161,13 @@ The network is configured as follows:
 - Each instance's TAP device is created, attached to the bridge, marked as an isolated bridge port, and brought up.
 - Guest IPs are assigned statically: `172.16.0.{index + 2}`. Instance 0 gets `172.16.0.2`.
 
-**Instances cannot reach each other by IP.** Two controls enforce that and both are required: the isolated bridge-port flag blocks the direct L2 path, and the `FORWARD` rule blocks the L3 path a guest could otherwise take by routing through the host's bridge address. Each guest still reaches the host and the internet. The flag is read back after being set, so a host that cannot apply it fails the VM start rather than booting an unisolated guest; this needs Linux ≥ 4.18 and iproute2 ≥ 4.19.
+**Open instances cannot reach each other by IP.** Two controls enforce that and both are required: the isolated bridge-port flag blocks the direct L2 path, and the `FORWARD` rule blocks the L3 path a guest could otherwise take by routing through the host's bridge address. Each open guest still reaches the host and the internet. The flag is read back after being set, so a host that cannot apply it fails the VM start rather than booting an unisolated guest; this needs Linux ≥ 4.18 and iproute2 ≥ 4.19.
 
 Isolation is applied per start. Because the kernel drops a frame only when both ports are isolated, a VM still running from before the upgrade leaves the *whole bridge* unisolated until it is stopped and started — not just itself.
 
 [`docs/trust-model.md`](trust-model.md) carries the full invariant and its known residuals (ARP/IP impersonation, IPv6, firewall reloads).
 
-On teardown, the TAP device is removed. If no TAP devices remain on the bridge, the bridge and all associated iptables rules are also removed.
+On teardown, any TAP left by a prior open boot is removed, including when the instance is now selected as isolated. If no TAP devices remain on the bridge, the bridge and all associated iptables rules are also removed.
 
 ### Network configuration
 
@@ -219,10 +219,10 @@ the intentional setup and mount differences listed below:
 |---|---|---|
 | `coop setup` | Builds golden image via builder VM | Installs binary + kernel, builds rootfs via chroot |
 | Explicit `setup --extra-packages` / `--post-install` | Refused | Consumed by provisioning and image staleness checks |
-| `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures TAP, starts Firecracker; `--profile` builds/starts a derived image |
+| `coop up` | Creates or reconnects/restarts a project VM; `--profile` builds/starts a derived image | Copies rootfs, configures the selected open-TAP or isolated-no-NIC mode, starts Firecracker; `--profile` builds/starts a derived image |
 | `coop start` | Restarts a stopped Lima VM | Restarts a stopped Firecracker VM |
-| `coop stop` | `limactl stop` | Guest reboot over SSH, SIGTERM/SIGKILL fallback, remove TAP |
-| `coop destroy` | `limactl delete --force` | Kill process, remove TAP, delete instance dir |
+| `coop stop` | `limactl stop` | Guest reboot over persisted SSH transport, SIGTERM/SIGKILL fallback, remove any prior TAP |
+| `coop destroy` | `limactl delete --force` | Kill process, remove any prior TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Reads PID file, queries guest via SSH |
 | `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH over the instance's persisted control mode: guest IP for `legacy_tcp`, Firecracker vsock ProxyCommand for `vsock` |

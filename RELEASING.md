@@ -6,8 +6,8 @@ How a `coop` release is cut, and what to check before cutting one.
 
 - **`ci.yml`** runs on pushes to `main` and on every PR: `fmt --check`, `clippy -D warnings`,
   `cargo test --workspace`, the preflight/probe regression tests, Linux bridge
-  isolation, `integration-proxy-forward.sh`, `integration-install.sh`, `integration-update.sh`,
-  `integration-uninstall.sh`,
+  isolation, `integration-proxy-forward.sh`, `integration-install.sh`,
+  `run-policy-integration.sh` (updater, uninstall, and release smoke),
   `cargo deny --workspace check`, `taplo format --check`, and `zizmor`.
 - **`release.yml`** runs when a `v*` tag is pushed. It **re-runs all of CI as a
   gate**, then builds both `coop` and `coop-proxy` on native runners for three
@@ -24,20 +24,20 @@ push succeeds and ships something correct.
 
 ## What runs where
 
-| Check | CI (on PR + on tag) | `preflight-release.sh` | Manual judgement |
+| Check | CI workflows | `preflight-release.sh` | Manual judgement |
 |-------|:---:|:---:|:---:|
 | fmt / clippy / unit tests | ✓ | ✓ | |
 | `cargo deny --workspace`, `zizmor`, `taplo` | ✓ | ✓ (if installed) | |
 | Host-only integration and preflight/probe regression suites | ✓ | ✓ | |
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
-| Formal verification (`cargo kani`) | | ✓ (if installed) | |
+| Formal verification (`cargo kani`) | ✓ (PR/main) | ✓ (if installed) | |
 | Full VM integration, both platforms | | ✓ (local + 1 remote) | pick remote host |
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
 | Fuzzing (`--fuzz`) | | opt-in | when a parser changed |
 
-CI can't run the full VM integration suite or the extra-toolchain checks
-(kani/mutants/fuzz); those are the preflight's job.
+CI can't run the full VM integration suite or the mutation/fuzzing checks;
+those remain the preflight's job.
 
 ## Release checklist
 

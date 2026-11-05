@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -45,10 +46,20 @@ pub struct Cmd {
     program: OsString,
     args: Vec<Arg>,
     sudo: bool,
-    stdin: Option<Vec<u8>>,
+    stdin: ChildStdin,
     env_clear: bool,
     env: Vec<(OsString, OsString)>,
     current_dir: Option<OsString>,
+}
+
+/// Stdin authority granted to a child process.
+///
+/// Commands default to [`ChildStdin::Null`]. Callers may opt in when a command
+/// consumes a fixed payload; interactive launch sites configure their raw
+/// [`Command`] explicitly instead of going through `Cmd`.
+enum ChildStdin {
+    Null,
+    Bytes(Vec<u8>),
 }
 
 impl Cmd {
@@ -57,7 +68,7 @@ impl Cmd {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
             sudo: false,
-            stdin: None,
+            stdin: ChildStdin::Null,
             env_clear: false,
             env: Vec::new(),
             current_dir: None,
@@ -114,16 +125,17 @@ impl Cmd {
         self
     }
 
-    /// Pipe `bytes` to the child's stdin instead of inheriting the parent's.
+    /// Pipe a fixed payload to the child's stdin instead of keeping the
+    /// default closed stdin.
     ///
     /// Use this for any data that must NOT appear on argv — secrets, tokens,
     /// or large payloads. The bytes are written and stdin is closed before
     /// the child exits, so the child sees EOF without further input.
     ///
-    /// Compatible with [`Cmd::run`] and [`Cmd::capture`]; the existing
-    /// [`Cmd::stdin_write`] takes its data per-call instead.
+    /// Compatible with [`Cmd::run`] and [`Cmd::capture`];
+    /// [`Cmd::stdin_write_bounded`] takes its data per-call instead.
     pub fn stdin_input(mut self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.stdin = Some(bytes.into());
+        self.stdin = ChildStdin::Bytes(bytes.into());
         self
     }
 
@@ -148,6 +160,14 @@ impl Cmd {
         if let Some(dir) = &self.current_dir {
             cmd.current_dir(dir);
         }
+        match &self.stdin {
+            ChildStdin::Null => {
+                cmd.stdin(Stdio::null());
+            }
+            ChildStdin::Bytes(_) => {
+                cmd.stdin(Stdio::piped());
+            }
+        }
         cmd
     }
 
@@ -166,15 +186,14 @@ impl Cmd {
     pub fn run(&self) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running: {desc}");
-        let status = match self.stdin.as_deref() {
-            None => self
+        let status = match &self.stdin {
+            ChildStdin::Null => self
                 .build()
                 .status()
                 .with_context(|| format!("Failed to execute {desc}"))?,
-            Some(bytes) => {
+            ChildStdin::Bytes(bytes) => {
                 let mut child = self
                     .build()
-                    .stdin(Stdio::piped())
                     .spawn()
                     .with_context(|| format!("Failed to start {desc}"))?;
                 write_stdin_and_close(&mut child, bytes, &desc)?;
@@ -189,20 +208,30 @@ impl Cmd {
         Ok(())
     }
 
-    /// Pipe `data` into stdin, suppress stdout, and check exit status.
-    pub fn stdin_write(&self, data: &[u8]) -> Result<()> {
+    /// Run a host command with a deadline and signal cancellation, retaining
+    /// progress on the inherited streams. Authentication policy can still
+    /// cause a launcher such as sudo to use its controlling terminal.
+    pub(crate) fn run_bounded(&self, deadline: Duration) -> Result<()> {
+        let desc = self.describe();
+        tracing::debug!("Running: {desc}");
+        let status = crate::process_output::run_status_bounded(&mut self.build(), deadline, None)
+            .with_context(|| format!("Failed to run {desc}"))?;
+        if !status.success() {
+            bail!("{desc} exited with {status}");
+        }
+        Ok(())
+    }
+
+    /// Supply a small fixed payload and close stdin before waiting.
+    pub(crate) fn stdin_write_bounded(&self, data: &[u8], deadline: Duration) -> Result<()> {
         let desc = self.describe();
         tracing::debug!("Running (stdin pipe): {desc}");
-        let mut child = self
-            .build()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to start {desc}"))?;
-        write_stdin_and_close(&mut child, data, &desc)?;
-        let status = child
-            .wait()
-            .with_context(|| format!("Failed to wait for {desc}"))?;
+        let status = crate::process_output::run_status_bounded(
+            self.build().stdout(Stdio::null()),
+            deadline,
+            Some(data),
+        )
+        .with_context(|| format!("Failed to run {desc}"))?;
         if !status.success() {
             bail!("{desc} exited with {status}");
         }
@@ -225,16 +254,15 @@ impl Cmd {
     pub fn capture(&self) -> Result<String> {
         let desc = self.describe();
         tracing::debug!("Running (capture): {desc}");
-        let output = match self.stdin.as_deref() {
-            None => self
+        let output = match &self.stdin {
+            ChildStdin::Null => self
                 .build()
                 .stderr(Stdio::null())
                 .output()
                 .with_context(|| format!("Failed to execute {desc}"))?,
-            Some(bytes) => {
+            ChildStdin::Bytes(bytes) => {
                 let mut child = self
                     .build()
-                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()
@@ -252,15 +280,35 @@ impl Cmd {
             .with_context(|| format!("{desc} produced non-UTF-8 output"))
     }
 
+    pub(crate) fn capture_bounded(&self, deadline: Duration, max_output: usize) -> Result<String> {
+        let desc = self.describe();
+        let output = crate::process_output::run_bounded(
+            &mut self.build(),
+            crate::process_output::CapturePolicy {
+                stdout_max: max_output,
+                stderr_max: max_output,
+                completion: crate::process_output::CompletionPolicy::Deadline(deadline),
+            },
+        )
+        .with_context(|| format!("Failed to capture {desc}"))?;
+        if !output.status.success() {
+            bail!("{desc} exited with {}", output.status);
+        }
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("{desc} produced non-UTF-8 output"))
+    }
+
     /// Run the command with stdout and stderr suppressed.
     /// Returns `true` if the exit status is success.
     ///
     /// `stdin_input` is ignored here — `status_ok` is used for probes
-    /// (`command -v gh`, `gh auth status`) that take no input.
+    /// (`command -v gh`, `gh auth status`) that take no input. The child always
+    /// receives closed stdin even if this builder was configured otherwise.
     pub fn status_ok(&self) -> bool {
         let desc = self.describe();
         tracing::debug!("Running (status_ok): {desc}");
         self.build()
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -300,6 +348,10 @@ fn write_stdin_and_close(child: &mut std::process::Child, bytes: &[u8], desc: &s
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+
     use super::*;
 
     #[test]
@@ -366,6 +418,70 @@ mod tests {
             .stdin_input(b"data".to_vec())
             .run()
             .expect("cat run");
+    }
+
+    /// Subprocess half of [`stdin_policy_is_closed_across_execution_paths`].
+    ///
+    /// The outer test gives this test process a sentinel pipe as fd 0. The
+    /// nested command records either the first line or `EOF`, making the
+    /// default-null paths observable without replacing the unit-test runner's
+    /// stdin in-process.
+    #[test]
+    fn stdin_policy_child() {
+        let Ok(mode) = std::env::var("COOP_TEST_STDIN_POLICY_CHILD") else {
+            return;
+        };
+        let output = PathBuf::from(
+            std::env::var_os("COOP_TEST_STDIN_POLICY_OUTPUT")
+                .expect("child output path must be supplied"),
+        );
+        let script =
+            "if IFS= read -r line; then printf '%s' \"$line\"; else printf EOF; fi > \"$1\"";
+        let command = Cmd::new("sh").args(["-c", script, "sh"]).arg(&output);
+        let status = match mode.as_str() {
+            "run-default" => command.run().map(|()| true),
+            "status-default" => Ok(command.status_ok()),
+            "build-default" => command
+                .build()
+                .status()
+                .map(|status| status.success())
+                .map_err(anyhow::Error::from),
+            other => unreachable!("unknown child stdin-policy mode: {other}"),
+        };
+        assert!(status.expect("run stdin-policy child"));
+    }
+
+    #[test]
+    fn stdin_policy_is_closed_across_execution_paths() {
+        for mode in ["run-default", "status-default", "build-default"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = temp.path().join("output");
+            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe"))
+                .args(["--exact", "cmd::tests::stdin_policy_child", "--nocapture"])
+                .env("COOP_TEST_STDIN_POLICY_CHILD", mode)
+                .env("COOP_TEST_STDIN_POLICY_OUTPUT", &output)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn child test");
+            child
+                .stdin
+                .take()
+                .expect("child stdin")
+                .write_all(b"sentinel\n")
+                .expect("write sentinel");
+            let result = child.wait_with_output().expect("wait for child test");
+            assert!(
+                result.status.success(),
+                "stdin fixture {mode} failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&output).expect("read child output"),
+                "EOF"
+            );
+        }
     }
 
     #[test]

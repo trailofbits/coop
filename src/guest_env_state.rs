@@ -104,13 +104,28 @@ impl<'de> Deserialize<'de> for EnvVarName {
 }
 
 /// Persisted start-time guest environment, applied on later invocations.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct GuestEnvState {
     /// Entries to overlay onto the resolved env-forward set. `BTreeMap`
     /// gives deterministic iteration so `serde_json` output is stable
     /// across runs.
     #[serde(default)]
     pub entries: BTreeMap<EnvVarName, String>,
+}
+
+impl fmt::Debug for GuestEnvState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuestEnvState")
+            .field(
+                "entries",
+                &self
+                    .entries
+                    .keys()
+                    .map(|name| (name.as_str(), "<redacted>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .finish()
+    }
 }
 
 impl GuestEnvState {
@@ -149,8 +164,9 @@ impl GuestEnvState {
     }
 }
 
-/// Parse a single `--env KEY=VALUE` entry. Suitable for clap
-/// `value_parser`, so invalid keys fail before any VM lifecycle work.
+/// Parse a single `--env KEY=VALUE` entry after clap accepts it as a raw
+/// string. `run()` calls this before config loading or VM lifecycle work.
+/// A clap value parser would echo the full secret-bearing input on error.
 ///
 /// Rejects entries missing `=` and entries whose key fails
 /// [`EnvVarName`] validation. Empty values are allowed (e.g.
@@ -158,10 +174,20 @@ impl GuestEnvState {
 pub fn parse_cli_env_arg(entry: &str) -> Result<(EnvVarName, String)> {
     let (key, value) = entry
         .split_once('=')
-        .with_context(|| format!("--env expects KEY=VALUE, got '{entry}' (missing '=')"))?;
-    let name =
-        EnvVarName::new(key).with_context(|| format!("--env KEY is invalid (got '{entry}')"))?;
+        .context("--env expects KEY=VALUE (missing '=')")?;
+    let name = EnvVarName::new(key).map_err(|_| {
+        anyhow::anyhow!(
+            "--env KEY is invalid; use a letter or '_' first, then letters, digits, or '_'"
+        )
+    })?;
     Ok((name, value.to_string()))
+}
+
+pub fn parse_cli_env_args(entries: &[String]) -> Result<Vec<(EnvVarName, String)>> {
+    entries
+        .iter()
+        .map(|entry| parse_cli_env_arg(entry))
+        .collect()
 }
 
 #[cfg(test)]
@@ -293,6 +319,18 @@ mod tests {
         let (k, v) = parse_cli_env_arg("URL=https://x?a=b&c=d").unwrap();
         assert_eq!(k, env("URL"));
         assert_eq!(v, "https://x?a=b&c=d");
+    }
+
+    #[test]
+    fn guest_env_debug_redacts_values() {
+        let mut state = GuestEnvState::default();
+        state
+            .entries
+            .insert(env("API_KEY"), "secret-sentinel".into());
+        let rendered = format!("{state:?}");
+        assert!(rendered.contains("API_KEY"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("secret-sentinel"));
     }
 
     // ── property tests ───────────────────────────────────────

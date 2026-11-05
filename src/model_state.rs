@@ -32,8 +32,8 @@ use crate::config::{ClaudeConfig, CodexConfig, Instance, LocalModel};
 pub const CODEX_LOCAL_PROVIDER: &str = "coop_local";
 
 /// Env var Codex reads the local provider's API key from (`env_key`).
-/// Forwarded to the guest with the configured (or dummy) token whenever
-/// the VM is in local mode.
+/// Forwarded with the configured (or dummy) token in open-network local-mode
+/// sessions. Isolated sessions suppress it because local routing is unavailable.
 pub const CODEX_LOCAL_ENV_KEY: &str = "COOP_LOCAL_API_KEY";
 
 /// Whether a VM's agents target the cloud or a host-side local server.

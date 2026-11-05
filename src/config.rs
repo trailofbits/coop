@@ -6,12 +6,12 @@ use std::io::Read as _;
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -26,15 +26,16 @@ pub const DEFAULT_IMAGE: &str = "default";
 
 // ── Command substitution for secrets ─────────────────────────
 
-const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+const CMD_OUTPUT_MAX: usize = 64 * 1024;
 
 /// Resolve a config value that may use `cmd:` prefix for secret
 /// manager integration.
 ///
 /// If the value starts with `cmd:`, the remainder is executed as
 /// a shell command and its trimmed stdout is returned. Plain values
-/// pass through unchanged. Commands that fail, timeout, or produce
-/// empty output return an error.
+/// pass through unchanged. Commands that fail or produce empty output
+/// return an error. Resolution remains interruptible while allowing time
+/// for user-mediated secret-manager authorization.
 pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
     let cmd_str = match value.strip_prefix("cmd:") {
         Some(cmd) => cmd.trim(),
@@ -47,63 +48,38 @@ pub(crate) fn resolve_cmd_value(value: &str) -> Result<String> {
 
     tracing::debug!("Resolving secret via command");
 
-    let mut child = Command::new("sh")
-        .args(["-c", cmd_str])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to spawn secret command: {cmd_str}"))?;
+    let mut command = Command::new("sh");
+    command.args(["-c", cmd_str]);
+    let output = crate::process_output::run_bounded(
+        &mut command,
+        crate::process_output::CapturePolicy {
+            stdout_max: CMD_OUTPUT_MAX,
+            stderr_max: CMD_OUTPUT_MAX,
+            completion: crate::process_output::CompletionPolicy::UntilExit,
+        },
+    )
+    .context("Secret command output was not accepted")?;
 
-    let start = Instant::now();
-
-    loop {
-        if child
-            .try_wait()
-            .context("Failed to check command status")?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .with_context(|| format!("Failed to read output: {cmd_str}"))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let code = output
-                    .status
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |c| c.to_string());
-                bail!(
-                    "Secret command failed (exit {code}): {cmd_str}\n\
-                     stderr: {stderr}"
-                );
-            }
-
-            let stdout = String::from_utf8(output.stdout)
-                .context("Secret command output is not valid UTF-8")?;
-            let resolved = stdout.trim().to_string();
-
-            if resolved.is_empty() {
-                bail!(
-                    "Secret command produced empty output: {cmd_str}\n\
-                     The command succeeded but stdout was empty after trimming."
-                );
-            }
-
-            return Ok(resolved);
-        }
-
-        if start.elapsed() >= CMD_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "Secret command timed out after {}s: {cmd_str}\n\
-                 Ensure the command runs non-interactively.",
-                CMD_TIMEOUT.as_secs(),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!("Secret command failed (exit {code}); bounded stderr: {stderr}");
     }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("Secret command output is not valid UTF-8")?;
+    let resolved = stdout.trim().to_string();
+
+    if resolved.is_empty() {
+        bail!(
+            "Secret command produced empty output; the command succeeded but stdout was empty after trimming."
+        );
+    }
+
+    Ok(resolved)
 }
 
 // ── Secret wrapper ───────────────────────────────────────────
@@ -259,10 +235,13 @@ impl Quantity<GibUnit> {
 
     /// Smallest whole-GiB size that can contain `bytes`.
     pub fn from_bytes_ceil(bytes: u64) -> Result<Self> {
-        let gib = bytes.div_ceil(GIB_BYTES);
-        let value = u32::try_from(gib).context("Disk size exceeds supported GiB range")?;
+        let value = gib_ceil_u32(bytes).context("Disk size exceeds supported GiB range")?;
         Self::new(value).context("Disk is smaller than 1 byte")
     }
+}
+
+fn gib_ceil_u32(bytes: u64) -> Option<u32> {
+    u32::try_from(bytes.div_ceil(GIB_BYTES)).ok()
 }
 
 /// Show the exact file length alongside its binary-unit context.
@@ -361,11 +340,7 @@ impl DiskSize {
     pub fn resolve(self, current: GiB) -> Result<GiB> {
         match self {
             Self::Absolute(gib) => Ok(gib),
-            Self::Relative(gib) => current
-                .as_nonzero()
-                .checked_add(gib.as_u32())
-                .map(GiB::from_nonzero)
-                .context("Disk size overflow"),
+            Self::Relative(gib) => relative_disk_target(current, gib).context("Disk size overflow"),
         }
     }
 
@@ -377,6 +352,13 @@ impl DiskSize {
             Self::Relative(_) => self.resolve(GiB::from_bytes_ceil(current_bytes)?),
         }
     }
+}
+
+fn relative_disk_target(current: GiB, delta: GiB) -> Option<GiB> {
+    current
+        .as_nonzero()
+        .checked_add(delta.as_u32())
+        .map(GiB::from_nonzero)
 }
 
 /// Instance index (0..=252), used to derive guest IP, TAP name, MAC, and vsock CID.
@@ -1000,6 +982,13 @@ pub struct VmConfig {
     /// Lima ignores this setting and continues to use its TCP transport.
     #[serde(default = "legacy_firecracker_control_mode")]
     pub firecracker_control: FirecrackerControlMode,
+
+    /// Network device policy assigned to newly created Firecracker instances.
+    ///
+    /// Lima ignores this setting. Existing instances retain their persisted
+    /// selection when this default changes.
+    #[serde(default)]
+    pub firecracker_network: FirecrackerNetworkMode,
 
     /// Number of vCPUs
     #[serde(default = "default_vcpus")]
@@ -1661,7 +1650,9 @@ impl<'de> serde::Deserialize<'de> for ConfigDir {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaudeConfig {
-    /// Anthropic API key (forwarded via `SendEnv`, never written to disk)
+    /// Anthropic API key (forwarded via `SendEnv` for open/direct-auth
+    /// sessions, suppressed for isolated/proxy-only sessions, never written
+    /// to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1725,7 +1716,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub auth: CodexAuthMode,
 
-    /// `OpenAI` API key (forwarded via `SendEnv`, never written to disk)
+    /// `OpenAI` API key (forwarded via `SendEnv` for open/direct-auth sessions,
+    /// suppressed for isolated/proxy-only sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -1757,7 +1749,8 @@ pub struct CodexConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GrokConfig {
-    /// xAI API key (forwarded via `SendEnv`, never written to disk)
+    /// xAI API key (forwarded via `SendEnv` for open sessions, suppressed for
+    /// isolated sessions, never written to disk)
     pub api_key: Option<Secret<String>>,
 
     /// Additional env var names to forward from host to guest via SSH
@@ -2303,6 +2296,10 @@ impl CoopConfig {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
+        if let Err(error) = validate_firecracker_config(&self.vm) {
+            errors.push(error.to_string());
+        }
+
         // VM config value bounds are enforced by construction, not here:
         // `vcpu_count`/`template_size_gib`/`ssh_port` are NonZero types
         // (zero rejected at deserialization) and `mem_size_mib` is
@@ -2685,12 +2682,23 @@ impl CoopConfig {
 
         let dir = self.instances_dir().join(name.as_str());
         classify_instance_dir_probe(&name, fs::symlink_metadata(&dir).map(|_| ()))?;
+        validate_configured_firecracker_control(self.vm.firecracker_control)?;
+        #[cfg(target_os = "macos")]
+        let firecracker_control = self.vm.firecracker_control;
+        #[cfg(not(target_os = "macos"))]
+        let firecracker_control = if self.vm.firecracker_network == FirecrackerNetworkMode::Isolated
+        {
+            validate_firecracker_modes(self.vm.firecracker_control, self.vm.firecracker_network)?;
+            FirecrackerControlMode::VsockIsolated
+        } else {
+            self.vm.firecracker_control
+        };
         let instance = Instance {
             name,
             index,
             dir,
             image: image.clone(),
-            firecracker_control: self.vm.firecracker_control,
+            firecracker_control,
         };
         instance.save()?;
         Ok(instance)
@@ -2739,6 +2747,7 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             firecracker_control: legacy_firecracker_control_mode(),
+            firecracker_network: FirecrackerNetworkMode::default(),
             vcpu_count: default_vcpus(),
             mem_size_mib: default_mem_mib(),
             kernel_path: default_kernel_path(),
@@ -2748,11 +2757,12 @@ impl Default for VmConfig {
     }
 }
 
-/// Durable control transport selected when a Firecracker instance is created.
+/// Durable Firecracker connectivity tag selected when an instance is created.
 ///
-/// The value records a mechanism, not a runtime endpoint. Hostnames, ports,
-/// and socket paths continue to be derived from trusted configuration and the
-/// instance directory when the target is constructed.
+/// The legacy values record only the control transport. `VsockIsolated` is a
+/// downgrade-rejecting persisted composite; runtime callers should use
+/// [`Instance::firecracker_control`] and [`Instance::firecracker_network`] to
+/// obtain its normalized dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FirecrackerControlMode {
@@ -2760,10 +2770,78 @@ pub enum FirecrackerControlMode {
     LegacyTcp,
     /// OpenSSH reaches the guest through Firecracker's base vsock socket.
     Vsock,
+    /// Persisted isolated connectivity. This composite value is deliberately
+    /// unknown to prior releases, which makes them reject isolated state
+    /// instead of silently regenerating an open-network VM configuration.
+    #[doc(hidden)]
+    VsockIsolated,
+}
+
+/// Durable Firecracker network-device policy.
+///
+/// `Isolated` is structural: Firecracker is started without a virtio network
+/// interface. Coop control remains available only through vsock-backed SSH.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum FirecrackerNetworkMode {
+    /// Configure the existing TAP-backed virtio network interface.
+    #[default]
+    Open,
+    /// Configure no network interface; only explicit SSH-over-vsock tunnels
+    /// cross the guest boundary.
+    Isolated,
+}
+
+impl FirecrackerNetworkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
+impl fmt::Display for FirecrackerNetworkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 fn legacy_firecracker_control_mode() -> FirecrackerControlMode {
     FirecrackerControlMode::LegacyTcp
+}
+
+/// Check the only cross-field Firecracker connectivity invariant.
+pub(crate) fn validate_firecracker_modes(
+    control: FirecrackerControlMode,
+    network: FirecrackerNetworkMode,
+) -> Result<()> {
+    validate_configured_firecracker_control(control)?;
+    if network == FirecrackerNetworkMode::Isolated && control != FirecrackerControlMode::Vsock {
+        bail!(
+            "Firecracker network mode 'isolated' requires vsock control; \
+             legacy TCP instances must be recreated explicitly with \
+             [vm].firecracker_control = \"vsock\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_configured_firecracker_control(control: FirecrackerControlMode) -> Result<()> {
+    if control == FirecrackerControlMode::VsockIsolated {
+        bail!(
+            "[vm].firecracker_control = \"vsock_isolated\" is reserved for persisted \
+             instance state; configure \"vsock\" with firecracker_network = \"isolated\""
+        );
+    }
+    Ok(())
+}
+
+fn validate_firecracker_config(vm: &VmConfig) -> Result<()> {
+    validate_configured_firecracker_control(vm.firecracker_control)?;
+    #[cfg(not(target_os = "macos"))]
+    validate_firecracker_modes(vm.firecracker_control, vm.firecracker_network)?;
+    Ok(())
 }
 
 impl Default for NetworkConfig {
@@ -2854,7 +2932,8 @@ pub struct Instance {
     pub dir: PathBuf,
     /// Name of the golden image this instance was created from.
     pub image: ImageName,
-    /// Firecracker control transport chosen at instance creation time.
+    /// Raw persisted Firecracker connectivity tag. Runtime policy should use
+    /// the normalized accessors instead of matching this field directly.
     pub firecracker_control: FirecrackerControlMode,
 }
 
@@ -2956,6 +3035,54 @@ impl Instance {
         self.save()
     }
 
+    /// Persist a stopped instance's Firecracker network-device policy.
+    ///
+    /// The caller must hold the instance operation lock. This method validates
+    /// the control/network pair before changing memory or disk state.
+    pub(crate) fn set_firecracker_network(
+        &mut self,
+        network: FirecrackerNetworkMode,
+    ) -> Result<()> {
+        let previous = self.firecracker_control;
+        self.firecracker_control = match (previous, network) {
+            (FirecrackerControlMode::LegacyTcp, FirecrackerNetworkMode::Isolated) => {
+                bail!(
+                    "Firecracker network mode 'isolated' requires vsock control; legacy TCP \
+                     instances must be recreated explicitly"
+                )
+            }
+            (
+                FirecrackerControlMode::Vsock | FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Isolated,
+            ) => FirecrackerControlMode::VsockIsolated,
+            (FirecrackerControlMode::VsockIsolated, FirecrackerNetworkMode::Open) => {
+                FirecrackerControlMode::Vsock
+            }
+            (control, FirecrackerNetworkMode::Open) => control,
+        };
+        if let Err(error) = self.save() {
+            self.firecracker_control = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn firecracker_network(&self) -> FirecrackerNetworkMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerNetworkMode::Isolated,
+            FirecrackerControlMode::LegacyTcp | FirecrackerControlMode::Vsock => {
+                FirecrackerNetworkMode::Open
+            }
+        }
+    }
+
+    pub fn firecracker_control(&self) -> FirecrackerControlMode {
+        match self.firecracker_control {
+            FirecrackerControlMode::VsockIsolated => FirecrackerControlMode::Vsock,
+            control => control,
+        }
+    }
+
     fn load(dir: &Path) -> Result<Self> {
         crate::private_storage::prepare_directory(dir)?;
         let directory = crate::fs_util::PrivateDir::open_existing(dir)?;
@@ -2981,9 +3108,12 @@ impl Instance {
 
     /// Check if this instance has a running Firecracker process.
     ///
-    /// Validates the PID is alive and belongs to a Firecracker process
-    /// (guards against PID reuse). Removes stale PID files as a side
-    /// effect when the process is gone or belongs to something else.
+    /// Validates the PID is alive and carries this instance's Firecracker
+    /// config path in its launch arguments. This narrows accidental PID-reuse
+    /// matches but does not authenticate the executable or pin the PID after
+    /// the probe.
+    /// Removes stale PID files as a side effect when the process is gone or
+    /// belongs to something else.
     #[mutants::skip] // OS process probe wrapper; Linux process tests exercise it directly
     pub fn is_running(&self) -> bool {
         self.probe_running().unwrap_or_else(|error| {
@@ -3038,13 +3168,10 @@ impl Instance {
         let cmdline = fs::read(format!("/proc/{pid}/cmdline")).with_context(|| {
             format!("Failed to read Firecracker process identity for PID {pid}")
         })?;
-        if !cmdline
-            .windows(b"firecracker".len())
-            .any(|w| w == b"firecracker")
-        {
+        if !firecracker_cmdline_matches_instance(&cmdline, &self.vm_config_path()) {
             tracing::debug!(
                 "Removing stale PID file for instance '{}' \
-                 (PID {pid} is not a Firecracker process)",
+                 (PID {pid} does not name this instance's Firecracker config)",
                 self.name
             );
             if let Err(e) = fs::remove_file(&pid_path) {
@@ -3089,12 +3216,18 @@ impl Instance {
                 }
             };
             if exists {
-                let cmdline = Cmd::new("cat")
+                let output = Cmd::new("cat")
                     .arg(format!("/proc/{pid}/cmdline"))
                     .sudo()
-                    .capture()
+                    .output()
                     .context("Failed to inspect Firecracker PID")?;
-                if cmdline.contains("firecracker") {
+                if !output.status.success() {
+                    bail!(
+                        "Failed to inspect Firecracker PID: cat exited with {}",
+                        output.status
+                    );
+                }
+                if firecracker_cmdline_matches_instance(&output.stdout, &self.vm_config_path()) {
                     return Ok(true);
                 }
             }
@@ -3127,6 +3260,28 @@ impl Instance {
         }
         Ok(false)
     }
+}
+
+/// Identify the VMM by its instance-specific launch argument, not its binary
+/// name: `firecracker_bin` may point to a custom-named executable.
+/// `/proc/<pid>/cmdline` is NUL-delimited and paths need not be UTF-8, so compare
+/// raw argument bytes and reject ambiguous duplicate `--config-file` flags.
+fn firecracker_cmdline_matches_instance(cmdline: &[u8], config_path: &Path) -> bool {
+    let expected = config_path.as_os_str().as_bytes();
+    let mut args = cmdline.split(|byte| *byte == 0);
+    let mut matched = false;
+    while let Some(arg) = args.next() {
+        if arg == b"--config-file" {
+            let Some(value) = args.next() else {
+                return false;
+            };
+            if matched || value != expected {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
 }
 
 /// Confirm that a root-owned Firecracker socket is no longer accepting
@@ -3313,24 +3468,45 @@ fn default_firecracker_bin() -> ConfigPath {
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
-/// `clippy` never compile them. Run manually with `cargo kani`; see the
+/// `clippy` never compile them. Run with `cargo kani`; see the
 /// "Formal verification (kani)" section in `docs/testing.md`.
 ///
-/// Kani is a narrow fit in a string-heavy CLI — the type system carries
-/// most invariants here. These proofs target the only genuine fit:
-/// bounded integer/float arithmetic where a wrap or overflow would panic.
+/// The type system carries most invariants here. These proofs target bounded
+/// integer/float arithmetic and exact-byte disk sizing.
 /// The `InstanceIndex` IP-derivation range is verified instead by the
 /// exhaustive `0..=252` unit test (`instance_network_derivations_over_full_range`),
 /// and `SubnetMask` carries no arithmetic to verify — it is stored and
 /// rendered as `/N`, with the `0..=32` bound enforced by its constructor.
 #[cfg(kani)]
 mod proofs {
-    use super::{GiB, InstanceIndex, MiB};
+    use super::{GIB_BYTES, GiB, InstanceIndex, MiB, gib_ceil_u32, relative_disk_target};
 
-    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch:
-    /// `current.checked_add(delta)`. Over every pair of non-zero `u32`
-    /// sizes it yields `Some(current + delta)` exactly when the sum fits,
-    /// and `None` otherwise — it never wraps and never panics.
+    /// Whole-GiB rounding preserves the quotient or rejects an out-of-range
+    /// value; it cannot narrow a large file length into a small disk size.
+    #[kani::proof]
+    fn gib_ceil_conversion_never_wraps() {
+        let bytes: u64 = kani::any();
+        let rounded = bytes.div_ceil(GIB_BYTES);
+        let converted = gib_ceil_u32(bytes);
+        assert_eq!(converted.is_some(), rounded <= u64::from(u32::MAX));
+        if let Some(gib) = converted {
+            assert_eq!(u64::from(gib), rounded);
+        }
+    }
+
+    /// Every valid GiB quantity converts to an exact byte count in `u64`.
+    #[kani::proof]
+    fn gib_as_bytes_is_exact() {
+        let raw: u32 = kani::any();
+        let Some(gib) = GiB::new(raw) else { return };
+        let bytes = gib.as_bytes();
+        assert_eq!(bytes / GIB_BYTES, u64::from(raw));
+        assert_eq!(bytes % GIB_BYTES, 0);
+    }
+
+    /// The arithmetic kernel of `DiskSize::resolve`'s relative branch.
+    /// Over every pair of non-zero `u32` sizes it yields the exact sum
+    /// when it fits, and `None` otherwise.
     ///
     /// This proves the kernel directly rather than through `resolve`,
     /// because `resolve` wraps the `None` case with `anyhow`'s
@@ -3346,13 +3522,33 @@ mod proofs {
         let (Some(current), Some(delta)) = (GiB::new(current_raw), GiB::new(delta_raw)) else {
             return;
         };
-        match current
-            .as_nonzero()
-            .checked_add(delta.as_u32())
-            .map(GiB::from_nonzero)
-        {
+        match relative_disk_target(current, delta) {
             Some(sum) => assert_eq!(sum.as_u32(), current_raw + delta_raw),
             None => assert!(current_raw.checked_add(delta_raw).is_none()),
+        }
+    }
+
+    /// A relative increase is added to the ceiling of the exact old file
+    /// length. A successful target always holds that file plus the requested
+    /// increase; an unrepresentable old length or sum is rejected.
+    #[kani::proof]
+    fn relative_disk_target_preserves_exact_bytes() {
+        let bytes: u64 = kani::any();
+        let delta_raw: u32 = kani::any();
+        let Some(delta) = GiB::new(delta_raw) else {
+            return;
+        };
+        let current = gib_ceil_u32(bytes).and_then(GiB::new);
+        let target = current.and_then(|current| relative_disk_target(current, delta));
+        let needed = u128::from(bytes) + u128::from(delta_raw) * u128::from(GIB_BYTES);
+        let expected = u128::from(bytes.div_ceil(GIB_BYTES)) + u128::from(delta_raw);
+        assert_eq!(
+            target.is_some(),
+            bytes != 0 && expected <= u128::from(u32::MAX)
+        );
+        if let Some(target) = target {
+            assert_eq!(u128::from(target.as_u32()), expected);
+            assert!(u128::from(target.as_bytes()) >= needed);
         }
     }
 
@@ -3583,6 +3779,71 @@ mod tests {
     }
 
     #[test]
+    fn isolated_instance_round_trips_and_prior_parser_rejects_it() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum PriorControlMode {
+            LegacyTcp,
+            Vsock,
+        }
+        #[derive(Deserialize)]
+        struct PriorInstanceMeta {
+            #[serde(rename = "firecracker_control")]
+            _control: PriorControlMode,
+        }
+
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("isolated");
+        let mut inst = test_inst("isolated", idx(4), dir.clone());
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+        inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+            .unwrap();
+
+        let loaded = Instance::load(&dir).unwrap();
+        assert_eq!(
+            loaded.firecracker_network(),
+            FirecrackerNetworkMode::Isolated
+        );
+        assert_eq!(loaded.firecracker_control(), FirecrackerControlMode::Vsock);
+        let json = fs::read_to_string(dir.join("instance.json")).unwrap();
+        assert!(json.contains(r#""firecracker_control": "vsock_isolated""#));
+        assert!(serde_json::from_str::<PriorInstanceMeta>(&json).is_err());
+    }
+
+    #[test]
+    fn isolated_transition_rejects_legacy_tcp_without_persisting() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let dir = tmp.path().join("legacy");
+        let mut inst = test_inst("legacy", idx(5), dir.clone());
+        inst.save().unwrap();
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(
+            Instance::load(&dir).unwrap().firecracker_network(),
+            FirecrackerNetworkMode::Open
+        );
+    }
+
+    #[test]
+    fn isolated_transition_rolls_memory_back_when_publication_fails() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let not_a_directory = tmp.path().join("not-a-directory");
+        fs::write(&not_a_directory, "occupied").unwrap();
+        let mut inst = test_inst("failure", idx(6), not_a_directory);
+        inst.firecracker_control = FirecrackerControlMode::Vsock;
+
+        assert!(
+            inst.set_firecracker_network(FirecrackerNetworkMode::Isolated)
+                .is_err()
+        );
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
     fn loading_legacy_instance_does_not_rewrite_its_state() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let dir = tmp.path().join("legacy");
@@ -3598,6 +3859,7 @@ mod tests {
             FirecrackerControlMode::LegacyTcp
         );
         assert_eq!(fs::read(dir.join("instance.json")).unwrap(), original);
+        assert_eq!(loaded.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
@@ -3624,13 +3886,11 @@ mod tests {
         assert!(json.contains(r#""firecracker_control": "legacy_tcp""#));
     }
 
-    // ── Instance::is_running / is_firecracker_process ────────
+    // ── Firecracker PID identity probes ──────────────────────
     //
-    // These tests drive `is_running` through real PID files and
-    // real subprocesses. The happy path requires a process whose
-    // `/proc/<pid>/cmdline` contains "firecracker", which we
-    // synthesize with `bash -c 'exec -a firecracker-test sleep'`
-    // — argv[0] is renamed so the matcher recognizes it.
+    // These tests drive the probes through real PID files and subprocesses.
+    // An exact instance config argument is accepted even with a custom binary
+    // name; a renamed process without that argument is rejected.
     //
     // Sudo-using paths (`kill -0`, `cat /proc/.../cmdline`) are
     // gated `#[cfg(target_os = "linux")]`: CI runs Linux with
@@ -3645,16 +3905,27 @@ mod tests {
     const DEAD_PID: u32 = 999_999;
 
     #[cfg(target_os = "linux")]
-    fn spawn_firecracker_like() -> std::process::Child {
+    fn spawn_renamed_sleep() -> std::process::Child {
         use std::os::unix::process::CommandExt;
-        // Set argv[0] to a firecracker-like name in a single execve (no shell
-        // `exec -a` indirection). A shell wrapper would exec twice, and reading
-        // /proc/<pid>/cmdline during the second transition races an empty
-        // cmdline. `wait_for_firecracker_cmdline` then waits out the one
-        // remaining fork→execve gap before the process is inspected.
+        // The executable and its arguments have no instance config; only
+        // argv[0] claims to be Firecracker.
         std::process::Command::new("sleep")
             .arg0("firecracker-test")
             .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_matching_process(inst: &Instance) -> std::process::Child {
+        // `read` blocks with the pipe open, leaving the shell's exact argv
+        // available for the probe. Its name deliberately is not Firecracker:
+        // configured Firecracker binaries can have arbitrary names.
+        std::process::Command::new("sh")
+            .args(["-c", "read _", "custom-vmm"])
+            .arg("--config-file")
+            .arg(inst.vm_config_path())
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap()
     }
@@ -3663,15 +3934,15 @@ mod tests {
     /// post-`execve` argv. Between `spawn` and `execve` the cmdline is empty, so
     /// process-detection assertions must not run until it settles.
     #[cfg(target_os = "linux")]
-    fn wait_for_firecracker_cmdline(pid: u32) {
+    fn wait_for_cmdline(pid: u32, ready: impl Fn(&[u8]) -> bool) {
         let path = format!("/proc/{pid}/cmdline");
         for _ in 0..500 {
-            if fs::read_to_string(&path).is_ok_and(|c| c.contains("firecracker")) {
+            if fs::read(&path).is_ok_and(|cmdline| ready(&cmdline)) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("firecracker-like process {pid} never exposed its cmdline");
+        panic!("process {pid} never exposed the expected cmdline");
     }
 
     #[cfg(target_os = "linux")]
@@ -3765,11 +4036,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn probe_liveness_recognizes_running_firecracker() {
+    fn probe_liveness_recognizes_matching_instance_process() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let mut child = spawn_firecracker_like();
-        wait_for_firecracker_cmdline(child.id());
+        let mut child = spawn_matching_process(&inst);
+        wait_for_cmdline(child.id(), |cmdline| {
+            firecracker_cmdline_matches_instance(cmdline, &inst.vm_config_path())
+        });
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
         let _api = std::os::unix::net::UnixListener::bind(inst.api_socket_path()).unwrap();
 
@@ -3814,11 +4087,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn is_running_true_for_live_firecracker_like_pid() {
+    fn is_running_requires_matching_instance_config_argument() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
-        let mut child = spawn_firecracker_like();
-        wait_for_firecracker_cmdline(child.id());
+        let mut child = spawn_matching_process(&inst);
+        wait_for_cmdline(child.id(), |cmdline| {
+            firecracker_cmdline_matches_instance(cmdline, &inst.vm_config_path())
+        });
         fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
 
         let running = inst.is_running();
@@ -3828,12 +4103,61 @@ mod tests {
 
         assert!(
             running,
-            "is_running must return true for a live firecracker"
+            "is_running must accept the exact instance config argument"
         );
         assert!(
             pid_file_kept,
             "PID file should be preserved while firecracker is running"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn renamed_non_firecracker_process_is_not_running_instance() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let inst = test_inst("test", idx(0), tmp.path().to_path_buf());
+        let mut child = spawn_renamed_sleep();
+        wait_for_cmdline(child.id(), |cmdline| {
+            cmdline
+                .windows(b"firecracker".len())
+                .any(|part| part == b"firecracker")
+        });
+        fs::write(inst.pid_file_path(), child.id().to_string()).unwrap();
+
+        let running = inst.probe_liveness();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!running.unwrap());
+        assert!(!inst.pid_file_path().exists());
+    }
+
+    #[test]
+    fn firecracker_cmdline_matches_only_exact_unique_config_argument() {
+        let path = Path::new("/private/instance/vm_config.json");
+        assert!(firecracker_cmdline_matches_instance(
+            b"custom-vmm\0--no-api\0--config-file\0/private/instance/vm_config.json\0",
+            path,
+        ));
+        for cmdline in [
+            &b"firecracker\0--config-file\0/private/other/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json.bak\0"[..],
+            &b"firecracker\0--log-path\0/private/instance/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json\0--config-file\0/private/instance/vm_config.json\0"[..],
+            &b"firecracker\0--config-file\0/private/instance/vm_config.json\0--config-file\0/private/other/vm_config.json\0"[..],
+        ] {
+            assert!(!firecracker_cmdline_matches_instance(cmdline, path));
+        }
+
+        let raw_path = b"/private/instance-\xff/vm_config.json";
+        let mut raw_cmdline = b"custom-vmm\0--config-file\0".to_vec();
+        raw_cmdline.extend_from_slice(raw_path);
+        raw_cmdline.push(0);
+        assert!(firecracker_cmdline_matches_instance(
+            &raw_cmdline,
+            Path::new(OsStr::from_bytes(raw_path)),
+        ));
     }
 
     // ── Allocate instance ────────────────────────────────────
@@ -3861,6 +4185,34 @@ mod tests {
             Instance::load(&inst.dir).unwrap().firecracker_control,
             FirecrackerControlMode::Vsock
         );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn allocation_persists_configured_isolated_network_mode() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Isolated);
+        assert_eq!(inst.firecracker_control(), FirecrackerControlMode::Vsock);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn lima_allocation_ignores_the_firecracker_network_default() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.vm.firecracker_control = FirecrackerControlMode::Vsock;
+        cfg.vm.firecracker_network = FirecrackerNetworkMode::Isolated;
+
+        let inst = cfg.allocate_instance(None, &default_img(), None).unwrap();
+
+        assert_eq!(inst.firecracker_control, FirecrackerControlMode::Vsock);
+        assert_eq!(inst.firecracker_network(), FirecrackerNetworkMode::Open);
     }
 
     #[test]
@@ -5739,6 +6091,55 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
+    fn firecracker_network_mode_parses_and_defaults_open() {
+        let default_cfg: CoopConfig = toml::from_str("[vm]\n").unwrap();
+        assert_eq!(
+            default_cfg.vm.firecracker_network,
+            FirecrackerNetworkMode::Open
+        );
+        let isolated: CoopConfig =
+            toml::from_str("[vm]\nfirecracker_network = \"isolated\"\n").unwrap();
+        assert_eq!(
+            isolated.vm.firecracker_network,
+            FirecrackerNetworkMode::Isolated
+        );
+        assert!(toml::from_str::<CoopConfig>("[vm]\nfirecracker_network = \"offline\"\n").is_err());
+        assert_eq!(FirecrackerNetworkMode::Open.as_str(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.as_str(), "isolated");
+        assert_eq!(FirecrackerNetworkMode::Open.to_string(), "open");
+        assert_eq!(FirecrackerNetworkMode::Isolated.to_string(), "isolated");
+    }
+
+    #[test]
+    fn isolated_network_requires_explicit_vsock_control() {
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::LegacyTcp,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::Vsock,
+                FirecrackerNetworkMode::Isolated,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_firecracker_modes(
+                FirecrackerControlMode::VsockIsolated,
+                FirecrackerNetworkMode::Open,
+            )
+            .is_err()
+        );
+        let mut cfg = CoopConfig::default();
+        cfg.vm.firecracker_control = FirecrackerControlMode::VsockIsolated;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("reserved for persisted instance state"));
+    }
+
+    #[test]
     fn deserialize_rejects_invalid_host_ip() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let path = tmp.path().join("config.toml");
@@ -6422,6 +6823,9 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert_eq!(GiB::from_bytes_ceil(GIB_BYTES + 4096).unwrap().as_u32(), 2);
         assert_eq!(GiB::from_bytes_ceil(1).unwrap().as_u32(), 1);
         assert!(GiB::from_bytes_ceil(0).is_err());
+        let largest = u64::from(u32::MAX) * GIB_BYTES;
+        assert_eq!(GiB::from_bytes_ceil(largest).unwrap().as_u32(), u32::MAX);
+        assert!(GiB::from_bytes_ceil(largest + 1).is_err());
         assert!(GiB::from_bytes_ceil(u64::MAX).is_err());
         assert_eq!(
             format_disk_bytes(GIB_BYTES + 4096),
@@ -7018,6 +7422,32 @@ rsync = "/run/current-system/sw/bin/rsync"
         let err = resolve_cmd_value("cmd:echo oops 1>&2; exit 1").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("oops"), "expected stderr in error, got: {msg}");
+    }
+
+    #[test]
+    fn resolve_cmd_value_drains_both_streams_without_deadlock() {
+        let resolved =
+            resolve_cmd_value("cmd:(head -c 60000 /dev/zero >&2) & head -c 60000 /dev/zero; wait")
+                .unwrap();
+        assert_eq!(resolved.len(), 60_000);
+    }
+
+    #[test]
+    fn resolve_cmd_value_rejects_each_output_limit() {
+        let stdout = resolve_cmd_value("cmd:head -c 65537 /dev/zero").unwrap_err();
+        assert!(format!("{stdout:#}").contains("stdout exceeded"));
+
+        let stderr = resolve_cmd_value("cmd:head -c 65537 /dev/zero >&2").unwrap_err();
+        assert!(format!("{stderr:#}").contains("stderr exceeded"));
+    }
+
+    #[test]
+    fn resolve_cmd_value_rejects_invalid_utf8_and_does_not_echo_the_command() {
+        let invalid = resolve_cmd_value("cmd:printf '\\377'").unwrap_err();
+        assert!(format!("{invalid:#}").contains("not valid UTF-8"));
+
+        let error = resolve_cmd_value("cmd:false # private-command-sentinel").unwrap_err();
+        assert!(!format!("{error:#}").contains("private-command-sentinel"));
     }
 
     #[test]

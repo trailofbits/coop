@@ -177,7 +177,7 @@ coop setup [FLAGS]
 
 | Flag | Description |
 |------|-------------|
-| `-y`, `--yes` | Skip confirmation prompts (accept all) |
+| `-y`, `--yes` | Explicitly approve setup confirmation prompts. Required when a prompted Linux/Firecracker setup action runs non-interactively. |
 | `--vcpus <N>` | Number of vCPUs (overrides config) |
 | `--mem <MiB>` | Memory in MiB (overrides config) |
 | `--rebuild` | Force rebuild of template rootfs |
@@ -188,6 +188,9 @@ coop setup [FLAGS]
 | `--image <name>` | Named image to build (default: `default`) |
 | `--guest-user <name>` | Guest username to bake into the image (default: `ubuntu`). |
 | `--builder-timeout <duration>` | Duration to wait for setup image build commands before timing out. Accepts seconds by default, or `s`, `m`, and `h` suffixes. |
+
+Setup confirmations default to no. Empty input, end-of-file, and non-terminal
+stdin decline the action; pass `--yes` for an intentional non-interactive run.
 
 ```
 coop setup -y --profile python,node --template-size 12
@@ -244,7 +247,12 @@ coop shell [NAME] [FLAGS] [-- COMMAND...]
 | `NAME` | Instance name (required if multiple instances exist) |
 | `-- COMMAND...` | Command to run non-interactively (no PTY allocated) |
 
-Without a trailing command, `shell` drops you into an interactive shell at `/workspace`. With a trailing command, it executes the command and returns its exit code.
+Without a trailing command, `shell` drops you into an interactive shell at
+`/workspace`. With a trailing command, it executes the command, forwards coop's
+stdin to it, and returns its exit code. This makes normal pipelines work, for
+example `printf 'input' | coop shell my-project -- cat`. Other non-interactive
+coop subprocesses receive closed stdin unless their command contract explicitly
+documents a stream.
 
 ```
 coop shell
@@ -255,6 +263,8 @@ coop shell my-project -- cat /etc/os-release
 ### `claude`
 
 Launch Claude Code inside the VM. The guest's `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs without permission prompts — the VM itself is the isolation boundary. Use `--ask` to override the guest default for that session (coop passes `--permission-mode default`).
+
+On a terminal, coop reports `working` while the session runs and `done`, `error`, or `idle` when it exits using the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status). Internal approval prompts are not reported.
 
 ```
 coop claude [NAME] [FLAGS] [ARGS...]
@@ -300,6 +310,8 @@ coop ca my-project -- --cwd /workspace
 
 Launch Codex inside the VM. By default coop passes `--dangerously-bypass-approvals-and-sandbox`, so Codex runs without its sandbox or approval prompts — parity with `coop claude`. The VM is the isolation boundary, and Codex's own Linux sandbox does not work in the guest (no functioning bubblewrap), so leaving it enabled makes every shell command Codex runs fail. Use `--ask` to keep Codex's sandbox and approval prompts for that session. With `[codex] auth = "chatgpt"`, `coop codex` launches through the guest keyring wrapper. The `login` and `logout` subcommands are always launched without the bypass flag: they never start an agent session, so there is nothing to sandbox.
 
+Terminal status reports follow the same session lifecycle as `coop claude`.
+
 ```
 coop codex [NAME] [FLAGS] [ARGS...]
 ```
@@ -327,9 +339,12 @@ Protocol servers load without a first-run question. Use `--ask` to restore
 permission prompts for that session (coop passes `--permission-mode default`,
 which overrides the guest `ui.permission_mode = "always-approve"`). The
 `login` and `logout` subcommands are launched without `--always-approve`.
-Host `~/.grok/auth.json` is copied into the guest on boot when `config_dir`
-is enabled and set to owner-only (`0600`). If there is no host file, sign
-in with `coop grok -- login --device-auth`.
+In open mode, host `~/.grok/auth.json` is copied into the guest on boot when
+`config_dir` is enabled and set to owner-only (`0600`). Isolated mode makes no
+new auth-file copy and does not remove a copy retained from an earlier open
+boot. If there is no host file, sign in with `coop grok -- login --device-auth`.
+
+Terminal status reports follow the same session lifecycle as `coop claude`.
 
 ```
 coop grok [NAME] [FLAGS] [ARGS...]
@@ -412,7 +427,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print every instance with its state (`running` or `stopped`) and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
 
 ```
 coop list
@@ -423,11 +438,11 @@ Alias: `ls`.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit a JSON array (`[{ "name", "state" }, …]`) instead of the text table |
+| `--json` | Emit a JSON array (`[{ "name", "state", "network" }, …]`) instead of the text table; `network` is `open`/`isolated` for Firecracker and `null` for Lima |
 
 ### `status`
 
-Print instance status. Without a name, lists every instance with its state, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
+Print instance status. Without a name, lists every instance with its state, selected network mode, image, backend, and resource usage (for running instances). With a name, prints detailed status for that instance.
 
 ```
 coop status [NAME]
@@ -445,8 +460,9 @@ coop status my-project
 
 With `--json`, a bare `coop status` emits a JSON array and `coop status NAME`
 emits a single object. Each carries the common fields — `name`, `state`
-(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), and `usage`
-(raw MiB / load, or `null` when stopped or the query fails). The rich
+(`running`/`stopped`), `image`, `backend` (`firecracker`/`lima`), `network`
+(`open`/`isolated` for Firecracker or `null` for Lima), and `usage` (raw MiB /
+load, or `null` when stopped or the query fails). The rich
 single-instance text report (guest IP, PID, SSH port, …) is text-only. JSON goes
 to stdout; tracing stays on stderr, so `coop status --json | jq` stays clean.
 
@@ -457,6 +473,7 @@ $ coop status my-project --json
   "state": "running",
   "image": "default",
   "backend": "firecracker",
+  "network": "isolated",
   "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
              "disk_used_mib": 8192, "disk_total_mib": 20480 }
 }
@@ -551,6 +568,11 @@ instance. (A non-interactive run declines the prompt.) If no tool ends up with
 an endpoint, the command fails. Claude and Codex are independent: you can put
 one on a local model and leave the other on cloud.
 
+Interactive input is bounded: model names accept up to 1 KiB, URLs up to 8
+KiB, and tokens up to 64 KiB. Token input is not echoed. The endpoint workflow
+requires a terminal because its confirmation, URL, and model prompts are
+interactive.
+
 `coop model NAME remote` switches back to cloud defaults for both tools. Saved
 endpoints are kept, so a later `local` does not re-prompt.
 
@@ -571,6 +593,29 @@ reference and the local-model sections of
 [docs/claude-integration.md](claude-integration.md) and
 [docs/codex-integration.md](codex-integration.md) for the resolution and
 materialization details.
+
+### `network`
+
+Show or change a Firecracker VM's persistent network-device policy.
+
+```text
+coop network [NAME] [open|isolated] [--restart] [--no-agents]
+```
+
+With no mode, the command prints the selected mode and current run state.
+The instance name may be omitted only for this query form when it resolves
+unambiguously; mode changes require an explicit instance name.
+Changing a stopped VM persists the target for its next start. A running VM
+refuses the change unless `--restart` is present; that flag stops the VM,
+persists the target, and starts it again. `--no-agents` requires `--restart` and
+permits a control-only isolated boot without credential proxies. Switching to
+`open` warns that every guest process receives general network access.
+
+`isolated` requires persisted vsock control and a compatible image. It creates
+no Firecracker NIC or TAP and never falls back to TCP/open networking. Lima
+reports changes as unsupported. See
+[Firecracker network modes](firecracker-network-modes.md) for guarantees,
+supported agent paths, maintenance, persistence, and limitations.
 
 ### `logs`
 
@@ -786,10 +831,15 @@ On Firecracker, retry an interrupted disk resize with the same absolute
 filesystem even if the image file already has the requested length.
 
 By default the instance is left stopped and the change takes effect on the next
-`coop start`. Pass `--start` to boot it immediately. On Firecracker, if a
-`--start` boot fails (e.g. more memory than the host has), the previous mem/vcpu
-is restored so a plain `coop start` still works; on Lima the `lima.yaml` is
-likewise restored.
+`coop start`. Pass `--start` to boot it immediately. If a start fails and the
+instance is confirmed stopped, coop restores the previous memory and vCPU
+configuration. A start can also report an error after the VM begins running;
+in that case coop keeps the new configuration so it matches the running VM.
+If the VM state cannot be determined, coop also keeps the new configuration
+and reports that uncertainty. Inspect the instance before retrying.
+
+For a disk-only resize, a failed `--start` leaves the disk change in place. The
+VM may already be running; inspect its status before retrying.
 
 Combining `--size` with `--mem`/`--vcpus` applies the disk change first, then the
 machine-resource change; the two are separate artifacts and are not applied
@@ -958,6 +1008,9 @@ coop update [FLAGS]
 
 If coop is installed in a protected directory (e.g. `/usr/local/bin`), run with `sudo`. Dev builds (built from an untagged or dirty tree) refuse to self-update; use `install.sh` to replace them.
 
+Homebrew builds refuse `coop update`, including `--check`. Use
+`brew upgrade trailofbits/coop/coop` instead.
+
 ```
 coop update --check
 coop update
@@ -984,6 +1037,12 @@ coop uninstall [FLAGS]
 
 Without `--yes`, the command prints a summary (binary path, data directory, instance and image counts) and asks for confirmation. A second prompt asks whether to also remove the data directory unless `--keep-data` or `--purge` is set. Non-interactive runs require `--yes`.
 
+Homebrew binaries are refused before any data or SSH configuration is changed,
+including with `--yes`, `--purge`, or `--keep-data`. Use `brew uninstall coop`.
+This preserves VM data and configuration; stop VMs before removing the package.
+If you intend to delete the VMs, run `coop destroy --all` with your usual
+configuration before uninstalling.
+
 Nix-store binaries are refused before any data or SSH configuration is changed,
 including with `--yes` or `--purge`. Use `nix profile remove coop` for a profile
 installation, or remove the package from your NixOS/Home Manager configuration
@@ -991,7 +1050,7 @@ and rebuild. Package removal preserves data; follow the explicit
 [Nix data-cleanup procedure](getting-started.md#removing-a-nix-installation)
 before removing the package if you want to delete that data too.
 
-For a non-Nix binary in a protected directory (e.g. `/usr/local/bin`), run with
+For a standalone binary in a protected directory (e.g. `/usr/local/bin`), run with
 `sudo`. A config file outside the data directory is left in place and a note is
 printed.
 
@@ -1038,6 +1097,10 @@ coop github <subcommand>
 | `status [--vm NAME] [--probe] [--json]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. Pass `--json` for machine-readable output. |
 | `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
 
+Pasted tokens are read without terminal echo and are limited to 64 KiB.
+Confirmation and storage-choice replies are limited to 64 bytes. Redirected
+token input remains supported and receives the same bound.
+
 ```
 coop github setup-pat --repo trailofbits/coop
 coop github status
@@ -1072,6 +1135,10 @@ remote model mode (`coop model <vm> remote`); local mode takes precedence. See
 the [credential proxy guide](credential-proxy.md) and the
 [`proxy` configuration reference](configuration.md#proxy-section) for the data
 model.
+
+Pasted proxy credentials are read without terminal echo and are limited to 64
+KiB. Redirected credential-plus-storage-choice input remains supported; menu
+replies are limited to 64 bytes.
 
 | Subcommand | Effect |
 |------------|--------|

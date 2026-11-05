@@ -86,10 +86,12 @@ Every field is optional. An empty `[codex]` section (or omitting it entirely) ke
 
 ### API key forwarding
 
-The default auth mode is `auth = "api_key"`. In this mode, coop forwards
-`OPENAI_API_KEY` to the guest via SSH `SendEnv` on every session: `coop codex`,
-`coop shell`, and `coop exec` alike. The key is never written to disk inside
-the guest.
+The default auth mode is `auth = "api_key"`. With open networking and direct
+authentication, coop forwards `OPENAI_API_KEY` to the guest via SSH `SendEnv`
+on every session: `coop codex`, `coop shell`, and `coop exec` alike. The key is
+never written to disk inside the guest. [Isolated Firecracker
+mode](firecracker-network-modes.md) suppresses the raw key and requires the
+managed OpenAI/Codex proxy instead.
 
 Resolution order:
 
@@ -219,7 +221,7 @@ The default is `~/.codex`. Set to `false` to disable config file copying entirel
 
 ### Environment variable forwarding
 
-`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session, not just during bootstrap.
+`env_forward` lists additional environment variable names to forward from the host to the guest via SSH `SendEnv`. These are forwarded on every SSH session except for recognized raw credential names suppressed in isolated mode.
 
 `OPENAI_API_KEY` and `GITHUB_TOKEN` are handled through their own mechanisms and do not need to appear here.
 
@@ -338,9 +340,10 @@ In local mode coop injects three coop-owned keys into `~/.codex/config.toml`:
 `[model_providers.coop_local]` block pointing `base_url` at the guest-visible
 endpoint with `wire_api = "responses"`. The provider reads its API key from the
 `COOP_LOCAL_API_KEY` env var, which coop forwards with the configured (or dummy)
-token. These keys are coop-owned: they are written on a switch to local and
-removed on a switch back to remote, so they are not preserved across a mode
-change.
+token in open-network mode. Isolated sessions suppress that token because local
+model routing is unavailable. These keys are coop-owned: they are written on a
+switch to local and removed on a switch back to remote, so they are not
+preserved across a mode change.
 
 Switching takes effect without a VM restart: coop rewrites `config.toml` live
 over SSH on a running VM (or saves the selection to apply on the next start). A

@@ -48,7 +48,9 @@ pub(crate) fn cmd_validate(
     // Per-repo PAT validation
     if let Some(config::GitHubAuth::Pat(pat)) = cfg.github.as_ref() {
         for (repo, entry) in &pat.entries {
-            match config::resolve_cmd_value(entry.token.expose()) {
+            let resolved = config::resolve_cmd_value(entry.token.expose());
+            crate::signal::check_shutdown()?;
+            match resolved {
                 Ok(token) => {
                     if token.starts_with(github_pat::TOKEN_PREFIX) {
                         writeln!(
@@ -104,6 +106,16 @@ pub(crate) fn cmd_uninstall(
     opts: &UninstallOpts,
 ) -> Result<()> {
     use std::io::IsTerminal as _;
+
+    if update::is_homebrew_build() {
+        bail!(
+            "Cannot uninstall a Homebrew-managed binary with `coop uninstall`. \
+             No data has been removed.\n\
+             Use `brew uninstall coop` to remove the package. \
+             Homebrew preserves VM instances, images, and configuration. \
+             To delete the VMs too, first run `coop destroy --all` with your usual --config."
+        );
+    }
 
     let binary_path =
         std::env::current_exe().context("Failed to resolve current executable path for removal")?;

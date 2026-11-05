@@ -125,8 +125,10 @@ The Linux network control-plane family is one narrow implementation of this
 contract. `network.rs` selects `sudo`, `ip`, `bridge`, `iptables`, and `sysctl`
 from exact absolute paths. Unset fields use candidates under `/usr/bin`,
 `/usr/sbin`, `/bin`, or `/sbin` and require the canonical target to remain
-under those roots. The invocation-selected config can replace an identity with
-one exact path for non-FHS layouts; an override never falls back to built-ins.
+under those roots. The built-in `sudo` candidate may also resolve to the exact
+`/usr/lib/cargo/bin/sudo` target seen on Ubuntu 26.04 CI. The invocation-selected
+config can replace an identity with one exact path for non-FHS layouts; an
+override never falls back to built-ins.
 Both forms validate every actually traversed path component and symlink hop and
 require root ownership, a regular executable target, and no group/other write
 bits. Configured paths establish filesystem control only, not package, hash,
@@ -143,6 +145,37 @@ it does not pin an inode, validate an executable's loader/library closure, or
 close inherited file descriptors. It also does not cover other host subprocess
 families. Exact overrides are re-resolved from the current config on every
 operation and are never persisted into instance state.
+
+Firecracker setup applies the same pathname checks to its system tools. On the
+Ubuntu CI coreutils layout, the conventional candidates for `cat`, `chmod`,
+`rm`, `mkdir`, `tee`, `chroot`, `rmdir`, `id`, and `timeout` may also resolve to
+their exact `/usr/lib/cargo/bin/coreutils/<tool>` targets. Only those setup
+roles accept those targets; ownership and writability checks still cover every
+path component. The bootstrap phase resolves `sudo`, `timeout`, and `curl`, the
+available package prerequisites, and `apt-get` plus `cat` if installation is
+needed before setup's first storage change.
+After package installation, setup re-resolves `sudo` and `timeout`, then resolves `tar`, `gzip`, `chmod`, `rm`,
+`unsquashfs`, `ssh-keygen`, `mkdir`, `tee`, `chroot`, `rmdir`, `mkfs.ext4`,
+`e2fsck`, `resize2fs`, and the managed SSH clients before its first artifact
+request. KVM access repair additionally resolves `setfacl` or `usermod` and
+`id` before changing permissions. The privileged disk helper resolves its
+filesystem tools again after `sudo`. Setup launches from `/` with a cleared
+environment, fixed system `PATH`, and `LANG=C`/`LC_ALL=C`; curl also disables
+its default config file and receives only HTTPS proxy and no-proxy settings
+from the caller. Elevated programs remain subject to trusted sudoers and host
+package-manager configuration. Before package installation, setup checks the
+filesystem entries below `/etc/apt`, their symlink targets, and apt
+configuration include paths for root ownership and group/other writability.
+Private root-owned apt fragments are read through the resolved `cat` under
+the same bounded `sudo` launch path; their contents are not logged.
+Apt delegates its method helpers, `dpkg`, configured hooks, and package
+maintainer scripts to that system package policy; these indirect children are
+not a closed preflight family. Package installation passes only
+`DEBIAN_FRONTEND=noninteractive` through `sudo` in addition to the fixed
+launcher environment. These pathname checks do not authenticate
+downloaded artifacts or pin an executable inode through `exec`. For elevated
+launches, a nonzero `sudo` status can come from `sudo`, `timeout`, or the target;
+the outer status alone does not prove which process returned it.
 
 ## Secrets and how they cross into the guest
 
@@ -202,14 +235,17 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   a private lock. Sudo runs the current executable through the parent's procfs
   executable link, which pins its inode even if its install pathname changes.
   Privileged unmounts use the kernel's no-follow flag on guest mountpoint names.
+  Disk replacement and failed-start directory removal stop if the rootfs mount
+  still has a distinct kernel mount ID.
   Atomic replacement assumes the trusted host user does not
   concurrently replace names inside the private directory. `limactl` accepts
   paths rather than inherited descriptors, so its own path resolution remains
   within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
   its coop directories separately from `data_dir`. See
   [private host storage](configuration.md#private-host-storage). A host
-  `~/.grok/auth.json` copied into the guest is `chmod 0600` after `scp`
-  (`backend.rs:restrict_guest_grok_auth`).
+  `~/.grok/auth.json` copied into an open-mode guest is `chmod 0600` after
+  `scp` (`backend.rs:restrict_guest_grok_auth`). Isolated bootstrap makes no
+  new auth-file copy and does not sanitize a copy retained on the guest disk.
 - **Guest environment names never configure host tools.** `EnvForward` sends
   values under generated `COOP_SSH_ENV_<index>` aliases. A guest shell captures
   all aliases, removes them, and exports the original names before executing
@@ -338,6 +374,13 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   that tag. Older untagged instances map to `legacy_tcp` for compatibility.
   This is control-plane independence, not host network isolation: the guest
   NIC, TAP, bridge, forwarding, NAT, and TCP SSH recovery listener remain.
+- A Firecracker instance in persisted `isolated` network mode is started with
+  no network interface and coop does not create its TAP. Control and managed
+  fixed-destination proxy forwards use SSH over vsock without a TCP fallback.
+  The composite persisted marker is rejected by prior releases. This prevents
+  guest Ethernet/IP egress through coop, but model request bodies still leave
+  through the selected host credential proxy and existing guest-disk secrets
+  are not sanitized by switching modes.
 - The guest SSH key (`<data_dir>/vm_key`, ed25519, **passphrase-less by
   design**) is a VM-access credential. Do not "harden" it with a passphrase
   (it must be used non-interactively), but do flag any change that exposes it
@@ -426,6 +469,14 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   binds anything wider than loopback, is a finding. The proxy streams allowed
   request bodies opaquely, so this does not isolate provider objects referenced
   by ID within an allowed request.
+
+  Its stdin startup document is capped at 64 KiB by both producer and consumer.
+  Host `cmd:` credential resolvers concurrently drain independently capped
+  stdout/stderr. They may wait for user-mediated authorization, but interruption
+  or overflow kills their transient process group and reaps the direct child.
+  Proxy and tunnel startup diagnostics are also bounded, and autonomous tunnel
+  setup retains a fixed deadline, preventing a configurable peer from turning
+  error capture into unbounded host allocation or pipe backpressure.
 
 - **The credential proxy is jailed (issue #411, slice 3).** `coop-proxy` holds
   the real credential and terminates connections the untrusted guest

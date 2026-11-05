@@ -18,6 +18,9 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
+Or [install with Homebrew](docs/getting-started.md#homebrew), which builds from
+source and includes Lima on macOS.
+
 Or build from source (requires [Rust](https://rustup.rs/) and CMake):
 
 ```shell
@@ -38,11 +41,13 @@ coop setup
 
 On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
 
-Keep coop updated:
+Keep installer builds updated:
 
 ```shell
 coop update
 ```
+
+For Homebrew installations, use `brew upgrade trailofbits/coop/coop`.
 
 See [`coop update`](docs/commands.md#update) and the [`updates` config section](docs/configuration.md#updates-section).
 

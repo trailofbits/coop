@@ -82,6 +82,12 @@ fn set_local(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
 ) -> Result<()> {
+    if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated {
+        bail!(
+            "Local model routing is unavailable in isolated network mode because the guest has \
+             no route to the host endpoint; switch the stopped VM to open networking first"
+        );
+    }
     let mut state = ModelState::load_or_default(inst)?;
     state.mode = ModelMode::Local;
 
@@ -244,7 +250,7 @@ fn apply_to_running(
     };
     let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    let session = super::prepare_session_from_target(cfg, Some(&inst), target, repo.as_ref())?;
+    let session = super::prepare_session_from_target(cfg, &inst, target, repo.as_ref())?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(
         &session,
@@ -262,19 +268,24 @@ fn prompt_endpoint(tool: &str) -> Result<Option<LocalModel>> {
     if !prompt::confirm(&format!("Configure a local model for {tool}?"))? {
         return Ok(None);
     }
-    let Some(host_url) =
-        prompt::read_line(&format!("{tool} host URL (e.g. http://localhost:11434)"))?
+    let Some(host_url) = prompt::read_line(
+        &format!("{tool} host URL (e.g. http://localhost:11434)"),
+        prompt::URL_MAX_BYTES,
+    )?
     else {
         bail!("{tool} host URL is required");
     };
     let url = url::Url::parse(&host_url)
         .map_err(|e| anyhow::anyhow!("invalid {tool} host URL '{host_url}': {e}"))?;
-    let Some(model) = prompt::read_line(&format!("{tool} model name"))? else {
+    let Some(model) =
+        prompt::read_line(&format!("{tool} model name"), prompt::MODEL_NAME_MAX_BYTES)?
+    else {
         bail!("{tool} model name is required");
     };
-    let token = prompt::read_line(&format!(
-        "{tool} auth token (optional — press enter to skip)"
-    ))?;
+    let token = prompt::read_secret(
+        &format!("{tool} auth token (optional — press enter to skip)"),
+        prompt::SECRET_MAX_BYTES,
+    )?;
     let endpoint = LocalModel::new(url, model, token.map(Secret::new))?;
     Ok(Some(endpoint))
 }

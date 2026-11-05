@@ -30,6 +30,7 @@ mod port_forward;
 mod private_storage;
 #[cfg(target_os = "linux")]
 mod privileged_disk;
+mod process_output;
 mod proxy;
 mod proxy_state;
 mod remote_command;
@@ -59,6 +60,7 @@ mod signal;
     reason = "setup is interactive CLI — stderr is user communication"
 )]
 mod setup;
+mod setup_tool;
 mod shell;
 mod ssh;
 #[cfg(test)]
@@ -80,13 +82,13 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts, ReprovisionOpts,
-    ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
-    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
-    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_profiles, cmd_proxy,
-    cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop,
-    cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
-    preflight_start_target, prepend_binary, resolve_running,
+    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
+    ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts,
+    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
+    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
+    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
+    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
+    open_agent_session, preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -213,12 +215,8 @@ enum Commands {
         /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
         /// Overrides `guest_env` entries from config and any forwarded
         /// values with the same name.
-        #[arg(
-            long = "env",
-            value_name = "KEY=VALUE",
-            value_parser = guest_env_state::parse_cli_env_arg,
-        )]
-        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        guest_env: Vec<String>,
     },
     /// One-shot: ensure default image, start an instance for cwd, launch Claude.
     ///
@@ -313,12 +311,8 @@ enum Commands {
         /// Literal env var to set in the guest (`KEY=VALUE`, repeatable).
         /// Overrides `guest_env` entries from config and any forwarded
         /// values with the same name.
-        #[arg(
-            long = "env",
-            value_name = "KEY=VALUE",
-            value_parser = guest_env_state::parse_cli_env_arg,
-        )]
-        guest_env: Vec<(guest_env_state::EnvVarName, String)>,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        guest_env: Vec<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
     #[command(alias = "ssh")]
@@ -415,7 +409,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// List instances by name and state
+    /// List instances by name, state, and network mode
     #[command(alias = "ls")]
     List {
         /// Emit machine-readable JSON instead of the text table
@@ -433,6 +427,24 @@ enum Commands {
         /// Emit machine-readable JSON instead of the text output
         #[arg(long)]
         json: bool,
+    },
+    /// Show or change a Firecracker VM's persisted network mode.
+    Network {
+        /// Instance name (required for mode changes or if multiple instances exist)
+        #[arg(
+            value_parser = config::InstanceName::new,
+            add = ArgValueCandidates::new(completions::instance_candidates),
+        )]
+        name: Option<config::InstanceName>,
+        /// Target mode; omit to show the selected mode
+        #[arg(value_enum)]
+        mode: Option<config::FirecrackerNetworkMode>,
+        /// Stop a running VM, apply the mode, and start it again
+        #[arg(long, requires = "mode")]
+        restart: bool,
+        /// Restart without agent bootstrap (allows a control-only isolated VM)
+        #[arg(long, requires = "restart")]
+        no_agents: bool,
     },
     /// Manage the coding agents installed inside a VM
     Agent {
@@ -968,6 +980,14 @@ pub fn run() -> Result<()> {
     clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command).complete();
 
     let cli = Cli::parse();
+    // Clap echoes a rejected value in its error, so parse secret-bearing
+    // --env entries after clap and before any config or VM work.
+    let parsed_guest_env = match &cli.command {
+        Commands::Up { guest_env, .. } | Commands::Start { guest_env, .. } => {
+            guest_env_state::parse_cli_env_args(guest_env)?
+        }
+        _ => Vec::new(),
+    };
     validate_pre_config_command_inputs(&cli.command, setup::PLATFORM_EXPLICIT_SETUP_INPUT_SUPPORT)?;
     init_tracing(cli.verbose);
 
@@ -1064,9 +1084,23 @@ pub fn run() -> Result<()> {
     }
 
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    #[cfg(target_os = "linux")]
+    if matches!(&cli.command, Commands::Setup { .. }) {
+        setup::preflight_bootstrap(&cfg)?;
+    }
+    #[cfg(target_os = "linux")]
+    if !matches!(&cli.command, Commands::Setup { .. }) {
+        private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
+    }
+    #[cfg(target_os = "macos")]
     private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
+    #[cfg(target_os = "linux")]
+    if !matches!(&cli.command, Commands::Setup { .. }) {
+        update::maybe_run_background_check(&cfg.updates);
+    }
+    #[cfg(target_os = "macos")]
     update::maybe_run_background_check(&cfg.updates);
     let be: backend::PlatformBackend = backend::PlatformBackend::new();
     tracing::debug!("Using backend: {be}");
@@ -1103,7 +1137,7 @@ pub fn run() -> Result<()> {
             no_prompt,
             forward_port,
             post_start,
-            guest_env,
+            guest_env: _,
         } => {
             cfg.validate_and_warn()?;
             let transport = match (copy, mount) {
@@ -1141,7 +1175,7 @@ pub fn run() -> Result<()> {
                     no_prompt,
                     forward_ports: forward_port,
                     post_start,
-                    guest_env,
+                    guest_env: parsed_guest_env,
                 },
             };
             cmd_up(&be, &mut cfg, &cli.config, &opts)
@@ -1189,7 +1223,7 @@ pub fn run() -> Result<()> {
             no_github: _,
             no_prompt,
             post_start,
-            guest_env,
+            guest_env: _,
             forward_port: forward_ports,
         } => {
             cfg.validate_and_warn()?;
@@ -1213,7 +1247,7 @@ pub fn run() -> Result<()> {
                 persisted_guest_env: std::collections::BTreeMap::new(),
             };
             preflight_start_target(&be, &cfg, &start_opts)?;
-            apply_runtime_guest_env(&mut cfg, &guest_env, &mut start_opts);
+            apply_runtime_guest_env(&mut cfg, &parsed_guest_env, &mut start_opts);
             cmd_start(&be, &mut cfg, &start_opts).map(|_| ())
         }
         Commands::Shell { name, command } => cmd_shell(&be, &cfg, name.as_ref(), &command),
@@ -1222,7 +1256,7 @@ pub fn run() -> Result<()> {
             ask,
             mut args,
         } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             // Guest user settings set `defaultMode: bypassPermissions`. Opting in
             // to prompts means overriding that default explicitly.
             if ask {
@@ -1230,16 +1264,20 @@ pub fn run() -> Result<()> {
                 args.insert(0, "--permission-mode".to_string());
             }
             let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(claude_bin.as_ref(), args),
+                ssh::AgentProgram::Claude,
+            )
         }
         Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
             args.insert(0, "agents".to_string());
             let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
             ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
         }
         Commands::Codex { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Codex)?;
             let args = codex_launch_args(ask, args);
             let codex_bin = if cfg.codex.auth.uses_chatgpt_account() {
                 let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1254,13 +1292,21 @@ pub fn run() -> Result<()> {
             } else {
                 guest::codex_bin()
             };
-            ssh::run_interactive(&sess, &prepend_binary(codex_bin.as_ref(), args))
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(codex_bin.as_ref(), args),
+                ssh::AgentProgram::Codex,
+            )
         }
         Commands::Grok { name, ask, args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref())?;
+            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Grok)?;
             let args = grok_launch_args(ask, args);
             let grok_bin = guest::GuestUser::new(sess.target.user().as_ref())?.grok_bin();
-            ssh::run_interactive(&sess, &prepend_binary(grok_bin.as_ref(), args))
+            ssh::run_agent_interactive(
+                &sess,
+                &prepend_binary(grok_bin.as_ref(), args),
+                ssh::AgentProgram::Grok,
+            )
         }
         Commands::Stop { name } => {
             let inst = cfg.resolve_instance(name.as_ref())?;
@@ -1272,6 +1318,20 @@ pub fn run() -> Result<()> {
         }
         Commands::List { json } => cmd_list(&be, &cfg, json),
         Commands::Status { name, json } => cmd_status(&be, &cfg, name.as_ref(), json),
+        Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } => cmd_network(
+            &be,
+            &mut cfg,
+            &cli.config,
+            name.as_ref(),
+            mode,
+            restart,
+            no_agents,
+        ),
         Commands::Agent {
             action:
                 AgentAction::Update {
@@ -2219,7 +2279,8 @@ token = "test-pat"
         let super::Commands::Start { guest_env, .. } = cli.command else {
             panic!("expected Start variant");
         };
-        let pairs: Vec<(String, String)> = guest_env
+        let pairs: Vec<(String, String)> = super::guest_env_state::parse_cli_env_args(&guest_env)
+            .unwrap()
             .into_iter()
             .map(|(k, v)| (k.as_str().to_string(), v))
             .collect();
@@ -2233,13 +2294,17 @@ token = "test-pat"
     }
 
     #[test]
-    fn start_env_flag_rejects_invalid_key_at_clap_time() {
+    fn start_env_flag_validates_after_clap_without_echoing_value() {
         use clap::Parser as _;
-        let argv = ["coop", "start", "--env", "1BAD=value"];
-        let Err(err) = super::Cli::try_parse_from(argv) else {
-            panic!("expected --env to reject invalid KEY");
+        let cli =
+            super::Cli::try_parse_from(["coop", "start", "--env", "1BAD=secret-sentinel"]).unwrap();
+        let super::Commands::Start { guest_env, .. } = cli.command else {
+            panic!("expected Start variant");
         };
-        assert!(format!("{err}").contains("--env KEY is invalid"));
+        let error = super::guest_env_state::parse_cli_env_args(&guest_env).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--env KEY is invalid"));
+        assert!(!message.contains("secret-sentinel"));
     }
 
     #[test]
@@ -2388,6 +2453,44 @@ token = "test-pat"
             panic!("expected Status variant");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn network_query_and_transition_parse() {
+        let cli = parse(&["network", "vm"]);
+        let super::Commands::Network {
+            name,
+            mode,
+            restart,
+            no_agents,
+        } = cli.command
+        else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("vm")
+        );
+        assert!(mode.is_none());
+        assert!(!restart);
+        assert!(!no_agents);
+
+        let cli = parse(&["network", "vm", "isolated", "--restart", "--no-agents"]);
+        let super::Commands::Network { mode, restart, .. } = cli.command else {
+            panic!("expected Network variant");
+        };
+        assert_eq!(mode, Some(super::config::FirecrackerNetworkMode::Isolated));
+        assert!(restart);
+    }
+
+    #[test]
+    fn network_rejects_invalid_or_incomplete_transitions() {
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "offline"]).is_err());
+        assert!(super::Cli::try_parse_from(["coop", "network", "vm", "--restart"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["coop", "network", "vm", "isolated", "--no-agents",])
+                .is_err()
+        );
     }
 
     #[test]

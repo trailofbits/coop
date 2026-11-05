@@ -17,7 +17,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
 - `sudo` privileges (Firecracker uses jailer and TAP networking)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
-- Setup also checks for `setfacl` and `unsquashfs` on `PATH`, plus trusted resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
+- Setup also checks trusted system paths for `setfacl` and `unsquashfs`, plus resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires a trusted system `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
 ## Install
 
@@ -53,6 +53,38 @@ Both paths require the release workflow at the selected tag (including its
 `v` prefix), with attestation generated on a GitHub-hosted runner. An older
 `gh` that does not support these flags fails verification; upgrade it before
 retrying.
+
+### Homebrew
+
+This repository also serves as a Homebrew tap:
+
+```sh
+brew tap trailofbits/coop https://github.com/trailofbits/coop
+brew install trailofbits/coop/coop
+```
+
+The formula builds `coop` and `coop-proxy` from release source, installs shell
+completions, and includes Lima on macOS. The host prerequisites above still
+apply, including Rosetta 2 for x86_64 guests on Apple Silicon. Run `coop setup`
+before first use.
+
+To upgrade:
+
+```sh
+brew update
+brew upgrade trailofbits/coop/coop
+```
+
+To uninstall, stop running VMs first. Homebrew preserves VM data and
+configuration. To delete the VMs too, run `coop destroy --all` with your usual
+configuration before removing the package:
+
+```sh
+brew uninstall trailofbits/coop/coop
+```
+
+Homebrew builds refuse `coop update` (including `--check`) and `coop uninstall`,
+and tell you to use the Homebrew commands above.
 
 ## Upgrading from v0.5.4
 
@@ -279,6 +311,9 @@ Skip confirmation prompts with `-y`:
 coop setup -y --profile python
 ```
 
+Setup otherwise defaults to no: empty input, end-of-file, and non-terminal
+stdin decline prompted actions. Use `--yes` explicitly in automation.
+
 Setup is idempotent. Rerunning with the same profiles skips completed work. Pass `--rebuild` to force a fresh template build.
 
 ### 2. Bring up a project environment
@@ -414,9 +449,10 @@ coop grok
 ```
 
 coop launches `grok --always-approve --trust --cwd /workspace`. For permission
-prompts, pass `--ask` (coop passes `--permission-mode default`). A host
-`~/.grok/auth.json` is copied into the guest on boot. If you have not signed
-in on the host, use device-code auth (there is no browser in the guest):
+prompts, pass `--ask` (coop passes `--permission-mode default`). In open mode,
+a host `~/.grok/auth.json` is copied into the guest on boot; isolated mode
+makes no new auth-file copy. If you have not signed in on the host, use
+device-code auth (there is no browser in the guest):
 
 ```
 coop grok -- login --device-auth

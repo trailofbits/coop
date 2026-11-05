@@ -187,6 +187,7 @@ pub(crate) struct InstanceStatus<'a> {
     pub state: InstanceState,
     pub image: &'a config::ImageName,
     pub backend: BackendKind,
+    pub network: Option<config::FirecrackerNetworkMode>, // None on Lima
     pub usage: Option<Usage>,   // None ⇔ stopped, or query failed on a running guest
 }
 ```
@@ -204,8 +205,9 @@ the type holds. The issue's `cpu_pct`/`mem_mib` example was illustrative.
   backend-*specific* fields (Firecracker: PID, guest IP; Lima: arch, disk, SSH
   port). Unifying those two differing shapes into one serializable struct is real
   cross-platform work and is **out of scope**. JSON single-instance emits the
-  common `InstanceStatus` shape. The common fields (state/image/backend/usage)
-  are computed from the same sources in both paths, so they never disagree; the
+  common `InstanceStatus` shape. The common fields
+  (state/image/backend/network/usage) are computed from the same sources in
+  both paths, so they never disagree; the
   human path just adds decoration. If rich JSON is wanted later, change
   `Backend::status` to return a struct — a separate change with its own
   cross-platform test cost. **Do not touch the `Backend` trait for this issue.**
@@ -215,11 +217,11 @@ the type holds. The issue's `cpu_pct`/`mem_mib` example was illustrative.
 ```json
 [
   { "name": "my-project", "state": "running", "image": "default",
-    "backend": "firecracker",
+    "backend": "firecracker", "network": "isolated",
     "usage": { "load_1m": 0.12, "mem_used_mib": 512, "mem_total_mib": 2048,
                "disk_used_mib": 8192, "disk_total_mib": 20480 } },
   { "name": "other", "state": "stopped", "image": "default",
-    "backend": "firecracker", "usage": null }
+    "backend": "firecracker", "network": "open", "usage": null }
 ]
 ```
 
@@ -235,6 +237,7 @@ the type holds. The issue's `cpu_pct`/`mem_mib` example was illustrative.
 pub(crate) struct InstanceSummary<'a> {
     pub name: &'a config::InstanceName,
     pub state: InstanceState,
+    pub network: Option<config::FirecrackerNetworkMode>, // None on Lima
 }
 ```
 
@@ -249,8 +252,8 @@ runs. Keep `list` cheap — do not add usage here. Consumers who want usage call
 overlap.
 
 ```json
-[ { "name": "my-project", "state": "running" },
-  { "name": "other", "state": "stopped" } ]
+[ { "name": "my-project", "state": "running", "network": "isolated" },
+  { "name": "other", "state": "stopped", "network": "open" } ]
 ```
 
 ### P1 — `images`

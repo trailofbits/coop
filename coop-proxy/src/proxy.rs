@@ -270,18 +270,25 @@ async fn proxy(req: Request<Incoming>, ctx: &Ctx) -> Result<Response<ProxyBody>,
 /// `coop credential proxy`, not `OpenAI`, so its OpenAI-specific
 /// `POST /v1/responses/compact` behavior does not apply.
 fn operation_allowed(method: &Method, uri: &Uri, upstream_host: &str) -> bool {
-    if method != Method::POST {
-        return false;
-    }
-
-    matches!(
-        (upstream_host, uri.path()),
-        ("api.openai.com" | "chatgpt.com", "/v1/responses")
-            | (
-                "api.anthropic.com",
-                "/v1/messages" | "/v1/messages/count_tokens"
-            )
+    operation_allowed_bytes(
+        method == Method::POST,
+        upstream_host.as_bytes(),
+        uri.path().as_bytes(),
     )
+}
+
+const MAX_ALLOWED_HOST_BYTES: usize = b"api.anthropic.com".len();
+const MAX_ALLOWED_PATH_BYTES: usize = b"/v1/messages/count_tokens".len();
+
+fn operation_allowed_bytes(is_post: bool, host: &[u8], path: &[u8]) -> bool {
+    is_post
+        && host.len() <= MAX_ALLOWED_HOST_BYTES
+        && path.len() <= MAX_ALLOWED_PATH_BYTES
+        && match host {
+            b"api.openai.com" | b"chatgpt.com" => path == b"/v1/responses",
+            b"api.anthropic.com" => path == b"/v1/messages" || path == b"/v1/messages/count_tokens",
+            _ => false,
+        }
 }
 
 async fn forward(
@@ -390,6 +397,84 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{
+        MAX_ALLOWED_HOST_BYTES, MAX_ALLOWED_PATH_BYTES, constant_time_eq, operation_allowed_bytes,
+    };
+
+    // Arbitrary bytes include every valid HTTP host/path spelling and also
+    // malformed spellings. Longer inputs cannot equal any allowed literal.
+    #[kani::proof]
+    fn operation_policy_is_exact_allowlist() {
+        let host: [u8; MAX_ALLOWED_HOST_BYTES] = kani::any();
+        let path: [u8; MAX_ALLOWED_PATH_BYTES] = kani::any();
+        let host_len: usize = kani::any();
+        let path_len: usize = kani::any();
+        let is_post: bool = kani::any();
+        kani::assume(host_len <= host.len() && path_len <= path.len());
+        let host = &host[..host_len];
+        let path = &path[..path_len];
+
+        let allowed = operation_allowed_bytes(is_post, host, path);
+        let openai_host = host == b"api.openai.com" || host == b"chatgpt.com";
+        let anthropic_host = host == b"api.anthropic.com";
+        let response = path == b"/v1/responses";
+        let message = path == b"/v1/messages";
+        let count = path == b"/v1/messages/count_tokens";
+        assert_eq!(
+            allowed,
+            is_post && ((openai_host && response) || (anthropic_host && (message || count)))
+        );
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.openai.com",
+            b"/v1/responses"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"chatgpt.com",
+            b"/v1/responses"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.anthropic.com",
+            b"/v1/messages"
+        ));
+        assert!(operation_allowed_bytes(
+            true,
+            b"api.anthropic.com",
+            b"/v1/messages/count_tokens"
+        ));
+        let overlong_host: [u8; MAX_ALLOWED_HOST_BYTES + 1] = kani::any();
+        let overlong_path: [u8; MAX_ALLOWED_PATH_BYTES + 1] = kani::any();
+        assert!(!operation_allowed_bytes(
+            true,
+            &overlong_host,
+            b"/v1/responses"
+        ));
+        assert!(!operation_allowed_bytes(
+            true,
+            b"api.openai.com",
+            &overlong_path
+        ));
+    }
+
+    #[kani::proof]
+    fn capability_token_comparison_matches_byte_equality() {
+        let presented: [u8; 64] = kani::any();
+        let expected: [u8; 64] = kani::any();
+        let mut equal = true;
+        for index in 0..64 {
+            equal &= presented[index] == expected[index];
+        }
+        assert_eq!(constant_time_eq(&presented, &expected), equal);
+        assert!(!constant_time_eq(&presented[..63], &expected));
+        let longer: [u8; 65] = kani::any();
+        assert!(!constant_time_eq(&longer, &expected));
+    }
 }
 
 /// Build the header set sent upstream: drop hop-by-hop headers, drop the

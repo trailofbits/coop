@@ -381,11 +381,11 @@ pub fn resize_disk(_cfg: &CoopConfig, inst: &Instance, new_size: crate::config::
 /// `lima.yaml`, then validating the new spec with a start.
 ///
 /// Lima re-reads `lima.yaml` on `limactl start`, so the edit is what
-/// applies the change. The edit is written atomically and the prior file
-/// restored if the start fails (limactl rejects a malformed or over-large
-/// spec). With `start_after` the instance is left running; otherwise it is
-/// stopped again after the validating boot so `coop resize` leaves it in
-/// the state it found it.
+/// applies the change. The edit is written atomically. A failed start restores
+/// the old spec only if the VM is confirmed
+/// stopped; a running or uncertain VM retains the new spec. With `start_after`
+/// the instance is left running; otherwise it is stopped again after the
+/// validating boot so `coop resize` leaves it in the state it found it.
 pub fn set_machine_resources(
     cfg: &CoopConfig,
     inst: &Instance,
@@ -412,21 +412,71 @@ pub fn set_machine_resources(
     yaml_dir.write_atomic_private(yaml_name(), edited.as_bytes(), 0o644)?;
 
     // Lima applies cpus/memory only at start, so boot to validate + apply.
-    if let Err(e) = start_existing(cfg, inst) {
-        if let Err(restore) = yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644)
-        {
-            tracing::error!(
-                "Failed to restore {} after a failed reconfigure: {restore}",
-                yaml_path.display()
-            );
-        }
-        return Err(e.context("Failed to apply new machine resources — reverted lima.yaml"));
+    if let Err(start_error) = start_existing(cfg, inst) {
+        return Err(recover_lima_machine_start(
+            inst.name.as_str(),
+            &yaml_path,
+            start_error,
+            probe_state(inst),
+            || yaml_dir.write_atomic_private(yaml_name(), original.as_bytes(), 0o644),
+        ));
     }
 
-    if !start_after {
-        stop_running(inst)?;
+    if !start_after && let Err(stop_error) = stop_running(inst) {
+        let state = match probe_state(inst) {
+            Ok(Some(state)) => state.to_string(),
+            Ok(None) => "absent".to_string(),
+            Err(probe) => format!("unknown ({probe:#})"),
+        };
+        return Err(stop_error.context(format!(
+            "Resized machine resources remain configured, but the validation-boot stop \
+             command failed; instance '{}' is {state}. Inspect it before retrying",
+            inst.name,
+        )));
     }
     Ok(())
+}
+
+/// A failed `limactl start` may leave a running VM. Do not replace the YAML
+/// under that VM with a spec it did not boot with.
+fn recover_lima_machine_start(
+    name: &str,
+    yaml_path: &Path,
+    start_error: anyhow::Error,
+    state: Result<Option<LimaState>>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> anyhow::Error {
+    match state {
+        Ok(Some(LimaState::Stopped)) => match rollback() {
+            Ok(()) => start_error.context(format!(
+                "Instance '{name}' is stopped; restored its previous machine resources \
+                 after the failed start",
+            )),
+            Err(restore) => start_error.context(format!(
+                "Instance '{name}' is stopped, but restoring {} failed: {restore:#}. \
+                 Inspect its machine config before retrying",
+                yaml_path.display(),
+            )),
+        },
+        Ok(Some(LimaState::Running)) => start_error.context(format!(
+            "Instance '{name}' is running despite the start error. Its resized machine \
+             resources remain configured; inspect it with `coop status {name}` and stop it \
+             before retrying the resize",
+        )),
+        Ok(Some(state)) => start_error.context(format!(
+            "Instance '{name}' is {state} after the failed start. Its resized machine \
+             resources remain configured; inspect the instance before retrying",
+        )),
+        Ok(None) => start_error.context(format!(
+            "Lima instance '{name}' is absent after the failed start. Its resized machine \
+             resources remain configured; inspect the instance before retrying",
+        )),
+        Err(probe) => start_error.context(format!(
+            "Could not determine whether instance '{name}' is running after the failed \
+             start: {probe:#}. Its resized machine resources remain configured; inspect \
+             the instance before retrying",
+        )),
+    }
 }
 
 /// Replace the value of a top-level scalar `key` in a YAML document,
@@ -634,6 +684,90 @@ impl std::fmt::Display for LimaState {
 /// Check if a Lima instance is running.
 pub fn is_running(inst: &Instance) -> bool {
     matches!(lima_state(&inst.name), Ok(Some(LimaState::Running)))
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn list_running(instances: &[Instance]) -> Vec<bool> {
+    let mut inventory = None;
+    instances
+        .iter()
+        .map(|inst| {
+            let name = lima_name(inst);
+            if lima_home()
+                .and_then(|home| seal_instance_storage(&home.join(&name)))
+                .is_err()
+            {
+                return false;
+            }
+            let states = inventory.get_or_insert_with(|| {
+                let mut states = std::collections::HashMap::new();
+                let Ok(output) = limactl_list_output() else {
+                    return states;
+                };
+                for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                    // A per-instance probe stops at its first match or parse error.
+                    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                        break;
+                    };
+                    if let Some(name) = entry["name"].as_str() {
+                        states
+                            .entry(name.to_owned())
+                            .or_insert(entry["status"].as_str() == Some("Running"));
+                    }
+                }
+                states
+            });
+            states.get(&name).copied().unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Probe every registered instance from one Lima inventory. Selection must
+/// fail if any state is uncertain, even when another instance is running.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn probe_running_states(instances: &[Instance]) -> Result<Vec<bool>> {
+    if instances.is_empty() {
+        return Ok(Vec::new());
+    }
+    let home = lima_home()?;
+    for inst in instances {
+        seal_instance_storage(&home.join(lima_name(inst)))?;
+    }
+
+    let names: std::collections::HashSet<_> = instances.iter().map(lima_name).collect();
+    let output = limactl_list_output()?;
+    let mut states = std::collections::HashMap::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: serde_json::Value =
+            serde_json::from_str(line).context("Failed to parse limactl JSON output")?;
+        if let Some(name) = entry["name"].as_str().filter(|name| names.contains(*name)) {
+            let status = entry["status"]
+                .as_str()
+                .context("Lima status is missing or invalid")?;
+            states
+                .entry(name.to_owned())
+                .or_insert_with(|| LimaState::from_status_str(status));
+        }
+    }
+
+    instances
+        .iter()
+        .map(|inst| {
+            let name = lima_name(inst);
+            match states.get(&name) {
+                Some(LimaState::Running) => Ok(true),
+                Some(LimaState::Stopped) => Ok(false),
+                Some(state) => anyhow::bail!(
+                    "Lima instance '{}' is {state}; running state is unknown",
+                    inst.name
+                ),
+                None => anyhow::bail!(
+                    "Lima instance '{}' is absent; running state is unknown",
+                    inst.name
+                ),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn probe_state(inst: &Instance) -> Result<Option<LimaState>> {
@@ -852,6 +986,7 @@ fn ensure_ssh_key(cfg: &CoopConfig) -> Result<()> {
         .args(["-t", "ed25519", "-f"])
         .arg(&key_path)
         .args(["-N", "", "-q"])
+        .stdin(Stdio::null())
         .status()
         .context("Failed to generate SSH key")?;
 
@@ -1493,7 +1628,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
         guest_user,
         "provision script",
         |path| {
-            private_limactl()
+            Ok(private_limactl()
                 .args([
                     "shell",
                     BUILDER_NAME,
@@ -1505,7 +1640,7 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok_and(|s| s.success()))
         },
         builder_log_tail,
     )
@@ -2082,6 +2217,7 @@ fn lima_name_for(name: &InstanceName) -> String {
 fn private_limactl() -> Command {
     use std::os::unix::process::CommandExt as _;
     let mut command = Command::new("limactl");
+    command.stdin(Stdio::null());
     // SAFETY: umask is async-signal-safe and only affects the child process.
     unsafe {
         command.pre_exec(|| {
@@ -2235,6 +2371,58 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn failed_lima_reconfigure_rolls_back_only_when_stopped() {
+        let yaml = Path::new("lima.yaml");
+        let rolled_back = std::cell::Cell::new(false);
+        for (state, expected) in [
+            (Ok(Some(LimaState::Running)), "running"),
+            (Ok(Some(LimaState::Broken)), "Broken"),
+            (
+                Ok(Some(LimaState::Unknown("Restarting".to_owned()))),
+                "Restarting",
+            ),
+            (Ok(None), "absent"),
+            (Err(anyhow::anyhow!("probe failed")), "Could not determine"),
+        ] {
+            let error = recover_lima_machine_start(
+                "example",
+                yaml,
+                anyhow::anyhow!("start failed"),
+                state,
+                || {
+                    rolled_back.set(true);
+                    Ok(())
+                },
+            );
+            assert!(!rolled_back.get());
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        let error = recover_lima_machine_start(
+            "example",
+            yaml,
+            anyhow::anyhow!("start failed"),
+            Ok(Some(LimaState::Stopped)),
+            || {
+                rolled_back.set(true);
+                Ok(())
+            },
+        );
+        assert!(rolled_back.get());
+        assert!(error.to_string().contains("restored"), "{error:#}");
+
+        let error = recover_lima_machine_start(
+            "example",
+            yaml,
+            anyhow::anyhow!("start failed"),
+            Ok(Some(LimaState::Stopped)),
+            || Err(anyhow::anyhow!("rollback failed")),
+        );
+        assert!(error.to_string().contains("rollback failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("start failed"));
+    }
+
+    #[test]
     fn plain_setup_refuses_interrupted_publication_with_matching_metadata() {
         let root = tempfile::tempdir().unwrap();
         let cfg = CoopConfig {
@@ -2309,6 +2497,150 @@ mod tests {
             args,
             ["start", "--tty=false", "--set", ".video.display=\"none\""]
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated limactl fixture covers both batch probe contracts"
+    )]
+    fn list_running_reuses_inventory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(root) = std::env::var("COOP_TEST_LIST_INVENTORY") else {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let shim = root.path().join("limactl");
+            fs::write(&shim, "#!/bin/sh\n[ \"$*\" = 'list --json' ] || exit 99\nprintf 'query\\n' >> \"$LIMA_HOME/count\"\n/bin/cat \"$LIMA_HOME/inventory\"\n[ ! -f \"$LIMA_HOME/fail\" ]\n").unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::list_running_reuses_inventory",
+                    "--nocapture",
+                ])
+                .env("COOP_TEST_LIST_INVENTORY", root.path())
+                .env("LIMA_HOME", root.path())
+                .env("PATH", root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = Path::new(&root);
+        let instances: Vec<_> = ["alpha", "beta", "missing"]
+            .into_iter()
+            .map(|name| Instance {
+                name: InstanceName::new(name).unwrap(),
+                index: crate::config::InstanceIndex::new(0).unwrap(),
+                dir: root.join(name),
+                image: ImageName::new("default").unwrap(),
+                firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+            })
+            .collect();
+        let cases = [
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+                vec![true, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\ninvalid\n{\"name\":\"coop-beta\",\"status\":\"Running\"}\n",
+                vec![true, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Broken\"}\n{\"name\":\"coop-beta\",\"status\":\"Unknown\"}\n",
+                vec![false, false, false],
+            ),
+            (
+                "{\"name\":\"coop-alpha\"}\n{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+                vec![false, false, false],
+            ),
+            ("", vec![false, false, false]),
+        ];
+        for (inventory, expected) in cases {
+            fs::write(root.join("inventory"), inventory).unwrap();
+            fs::write(root.join("count"), "").unwrap();
+            assert_eq!(list_running(&instances), expected);
+            assert_eq!(
+                fs::read_to_string(root.join("count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+        }
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert_eq!(
+            probe_running_states(&instances[..2]).unwrap(),
+            [true, false]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            probe_running_states(&instances)
+                .unwrap_err()
+                .to_string()
+                .contains("absent")
+        );
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Broken\"}\n").unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Broken")
+        );
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Starting\"}\n").unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Starting")
+        );
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\ninvalid\n",
+        )
+        .unwrap();
+        assert!(
+            probe_running_states(&instances[..2])
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to parse limactl JSON output")
+        );
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n",
+        )
+        .unwrap();
+        fs::write(root.join("fail"), "").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert_eq!(list_running(&instances), vec![false; 3]);
+        assert!(probe_running_states(&instances[..2]).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        fs::remove_file(root.join("fail")).unwrap();
+        assert_eq!(list_running(&instances), vec![true, false, false]);
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Running\"}\n").unwrap();
+        // A rejected storage path affects only that instance, even with a shared inventory.
+        std::os::unix::fs::symlink(root.join("outside"), root.join("coop-alpha")).unwrap();
+        assert_eq!(list_running(&instances), vec![false, true, false]);
+        assert!(probe_running_states(&instances[..2]).is_err());
+        fs::remove_file(root.join("coop-alpha")).unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        assert!(list_running(&[]).is_empty());
+        assert_eq!(fs::read_to_string(root.join("count")).unwrap(), "");
+        fs::remove_file(root.join("limactl")).unwrap();
+        assert_eq!(list_running(&instances), vec![false; 3]);
     }
 
     #[test]

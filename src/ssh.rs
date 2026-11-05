@@ -73,7 +73,53 @@ fn restore_terminal() {
     }
     let _ = stdout.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
     let _ = stdout.flush();
-    let _ = Command::new("stty").arg("sane").status();
+    let _ = Command::new("stty")
+        .arg("sane")
+        .stdin(std::process::Stdio::inherit())
+        .status();
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AgentProgram {
+    Claude,
+    Codex,
+    Grok,
+}
+
+impl AgentProgram {
+    const fn app(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::Codex => "codex",
+            Self::Grok => "grok-build",
+        }
+    }
+}
+
+/// Report the launcher state to terminals that support OSC 7501. Keep escape
+/// sequences out of redirected output and leave display choices to the terminal.
+fn report_program_status(program: AgentProgram, state: &str) {
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        let _ = write_program_status(&mut stdout, program, state);
+    }
+}
+
+fn write_program_status(
+    out: &mut impl std::io::Write,
+    program: AgentProgram,
+    state: &str,
+) -> std::io::Result<()> {
+    write!(out, "\x1b]7501;state={state}:app={}\x1b\\", program.app())?;
+    out.flush()
+}
+
+fn agent_exit_state(result: &std::io::Result<std::process::ExitStatus>) -> &'static str {
+    match result {
+        Ok(status) if status.success() => "done",
+        Ok(status) if status.code() == Some(130) => "idle",
+        _ => "error",
+    }
 }
 
 /// Run a command interactively over SSH with a PTY.
@@ -81,6 +127,23 @@ fn restore_terminal() {
 /// Empty `command` opens a bare interactive shell. Otherwise the
 /// arguments are shell-escaped and run inside the user's login shell.
 pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
+    run_interactive_impl(session, command, None)
+}
+
+/// Run an agent over SSH and report its coarse lifecycle to the terminal.
+pub(crate) fn run_agent_interactive(
+    session: &SshSession,
+    command: &[String],
+    program: AgentProgram,
+) -> Result<()> {
+    run_interactive_impl(session, command, Some(program))
+}
+
+fn run_interactive_impl(
+    session: &SshSession,
+    command: &[String],
+    program: Option<AgentProgram>,
+) -> Result<()> {
     let remote_cmd = render_remote(command);
 
     tracing::info!(
@@ -91,9 +154,16 @@ pub fn run_interactive(session: &SshSession, command: &[String]) -> Result<()> {
         "If the remote session stops responding, type Enter, then ~. to disconnect; run `stty sane` if your terminal remains broken.",
     );
 
-    let status = interactive_ssh_command(session, &remote_cmd)?
-        .status()
-        .context("Failed to launch SSH — is the ssh client installed?")?;
+    let mut ssh_command = interactive_ssh_command(session, &remote_cmd)?;
+    ssh_command.stdin(std::process::Stdio::inherit());
+    if let Some(program) = program {
+        report_program_status(program, "working");
+    }
+    let result = ssh_command.status();
+    if let Some(program) = program {
+        report_program_status(program, agent_exit_state(&result));
+    }
+    let status = result.context("Failed to launch SSH — is the ssh client installed?")?;
 
     if !status.success() {
         tracing::warn!("SSH session exited with status: {status}");
@@ -113,6 +183,9 @@ pub fn run_command(session: &SshSession, command: &[String]) -> Result<()> {
 
     let status = session
         .command(&[], &remote_cmd)?
+        // `coop shell NAME -- COMMAND...` is the documented streaming command
+        // surface: preserve pipes even though it does not allocate a PTY.
+        .stdin(std::process::Stdio::inherit())
         .status()
         .context("Failed to launch SSH")?;
 
@@ -156,7 +229,28 @@ pub fn exec_command(session: &SshSession, command: &[String]) -> Result<()> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests construct known-valid SSH values")]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    #[test]
+    fn interrupted_agent_is_idle() {
+        let interrupted = std::process::ExitStatus::from_raw(130 << 8);
+        assert_eq!(agent_exit_state(&Ok(interrupted)), "idle");
+    }
+
+    #[test]
+    fn program_status_uses_osc_7501_and_st() {
+        let mut output = Vec::new();
+        write_program_status(&mut output, AgentProgram::Claude, "working").expect("write status");
+        write_program_status(&mut output, AgentProgram::Codex, "done").expect("write status");
+        write_program_status(&mut output, AgentProgram::Grok, "error").expect("write status");
+        assert_eq!(
+            output,
+            b"\x1b]7501;state=working:app=claude-code\x1b\\\x1b]7501;state=done:app=codex\x1b\\\x1b]7501;state=error:app=grok-build\x1b\\"
+        );
+    }
 
     #[test]
     fn empty_command_renders_interactive_shell() {
@@ -294,6 +388,69 @@ printf x >> {}
             std::fs::read(marker).expect("all launches reached fixture"),
             b"xxxx"
         );
+    }
+
+    #[test]
+    fn shell_command_deliberately_forwards_parent_stdin() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const FIXTURE: &str = "COOP_SHELL_STDIN_FIXTURE";
+        const RESULT: &str = "COOP_SHELL_STDIN_RESULT";
+
+        if let (Some(fixture), Some(result)) = (std::env::var_os(FIXTURE), std::env::var_os(RESULT))
+        {
+            let session = SshSession {
+                target: crate::backend::SshTarget::tcp(
+                    crate::backend::Hostname::new("127.0.0.1").expect("host"),
+                    std::num::NonZeroU16::MIN,
+                    crate::backend::SshUser::new("ubuntu").expect("user"),
+                    "/unused-key".into(),
+                    crate::config::SshHostToolsConfig::with_exact_paths(
+                        Some(&std::path::Path::new(&fixture).join("ssh")),
+                        None,
+                        None,
+                    )
+                    .expect("exact fixture ssh"),
+                ),
+                env: crate::backend::EnvForward::default(),
+            };
+            run_command(&session, &["cat".into()]).expect("streaming shell command");
+            assert_eq!(std::fs::read(result).expect("stdin result"), b"shell-stdin");
+            return;
+        }
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let ssh = fixture.path().join("ssh");
+        let result = fixture.path().join("stdin-result");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > {}\n",
+                crate::shell::shell_escape(&result.to_string_lossy())
+            ),
+        )
+        .expect("SSH fixture");
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).expect("executable");
+
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "ssh::tests::shell_command_deliberately_forwards_parent_stdin",
+                "--nocapture",
+            ])
+            .env(FIXTURE, fixture.path())
+            .env(RESULT, &result)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("child test");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(b"shell-stdin\n")
+            .expect("write sentinel");
+        assert!(child.wait().expect("child test").success());
+        assert_eq!(std::fs::read(result).expect("stdin result"), b"shell-stdin");
     }
 
     #[test]
