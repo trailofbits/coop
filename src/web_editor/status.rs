@@ -67,8 +67,8 @@ fn parse(line: &[u8]) -> Result<Event> {
                 "failed preparing unsupported_architecture" => {
                     "Guest architecture is unsupported by the browser editor"
                 }
-                "failed preparing workspace_missing" => {
-                    "Guest /workspace is missing; provision the workspace before opening the editor"
+                "failed preparing project_missing" => {
+                    "Guest project directory is missing; choose an existing --project directory in the VM"
                 }
                 "failed preparing setup_failed" => {
                     "Guest editor preparation failed; check guest storage and permissions"

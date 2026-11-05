@@ -13,7 +13,7 @@ import socket
 import subprocess
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 def request(url, path="/", method="GET", headers=None, body=None):
@@ -84,7 +84,7 @@ def editor(command):
             child.wait(timeout=20)
 
 
-def inspect_guest_editor(command, name, url):
+def inspect_guest_editor(command, name, url, project):
     # Inspect the real guest process, not just the launch-script text.
     expected_config = f"/tmp/coop-we-{urlsplit(url).hostname.split('.')[0][:24]}/config.yaml"
     inspected = subprocess.run(command + ["exec", name, "--", "python3", "-c", '''
@@ -96,8 +96,9 @@ for path in Path("/proc").glob("[0-9]*/cmdline"):
         args = path.read_bytes().split(b"\\0")
     except OSError:
         continue
-    if b"--disable-workspace-trust" in args and sys.argv[1].encode() in args and any(b"coop-web-editor/code-server-" in arg for arg in args):
+    if b"--disable-workspace-trust" in args and b"--service-type=exec" not in args and sys.argv[1].encode() in args and any(b"coop-web-editor/code-server-" in arg for arg in args):
         assert args[args.index(b"--auth") + 1] == b"password"
+        assert args[-2] == sys.argv[2].encode()
         config_path = Path(args[args.index(b"--config") + 1].decode())
         config = config_path.read_text()
         assert "auth: password" in config and "password:" in config
@@ -115,7 +116,7 @@ for path in Path("/proc").glob("[0-9]*/cmdline"):
         break
 else:
     raise SystemExit("managed editor did not disable workspace trust")
-''', expected_config], check=True, capture_output=True, timeout=30)
+''', expected_config, project], check=True, capture_output=True, timeout=30)
     return inspected.stdout.decode().splitlines()
 
 
@@ -212,7 +213,12 @@ rm -rf -- "$fixture"
 
 def vm(binary, name, config):
     command = [binary] + (["--config", config] if config else [])
-    launch = command + ["web-editor", name]
+    default_launch = command + ["editor", name, "--web"]
+    project = "/workspace/editor app #? & %h ${USER} ü"
+    other_project = "/workspace/editor second"
+    subprocess.run(command + ["exec", name, "--", "mkdir", "-p", "--", project, other_project],
+                   check=True, capture_output=True, timeout=30)
+    launch = default_launch + ["--project", project]
     # A busy host port must fail before publishing an editor URL.
     with socket.socket() as busy:
         busy.bind(("127.0.0.1", 0))
@@ -224,6 +230,7 @@ def vm(binary, name, config):
         assert "editor.log" not in failed.stderr
     download_failure(command, name, launch)
     with editor(launch) as (child, url, path):
+        assert parse_qs(urlsplit(url).query) == {"folder": [project]}
         password = path.read_text()
         assert request(url)[0] == 302
         assert request(url, "/login")[0] == 200
@@ -234,12 +241,13 @@ def vm(binary, name, config):
         # /healthz is intentionally public in native code-server.
         assert request(url, "/healthz")[0] == 200
         assert request(url, "/healthz", headers={"Cookie": cookie})[0] == 200
-        assert request(url, "/?folder=/workspace", headers={"Cookie": cookie})[0] == 200
-        guest_config, cgroup = inspect_guest_editor(command, name, url)
+        assert request(url, f"/?{urlsplit(url).query}", headers={"Cookie": cookie})[0] == 200
+        guest_config, cgroup = inspect_guest_editor(command, name, url, project)
         # Both invocations remain in the foreground. Ctrl+C in the attached
         # terminal revokes the shared session and releases the original owner.
-        with editor(launch) as (attached, attached_url, path):
-            assert attached_url == url and attached.poll() is None
+        with editor(default_launch + ["--project", other_project]) as (attached, attached_url, path):
+            assert urlsplit(attached_url).netloc == urlsplit(url).netloc and attached.poll() is None
+            assert parse_qs(urlsplit(attached_url).query) == {"folder": [other_project]}
             assert path.read_text() == password
             renewed = login(url, password)
             assert request(url, "/healthz", headers={"Cookie": renewed})[0] == 200
@@ -271,7 +279,7 @@ def vm(binary, name, config):
     # Abrupt owner death closes stdin; the cooperative guest stops its service
     # and exits SSH. A retry cleans stale private state and starts afresh.
     with editor(launch) as (child, dead_url, path):
-        dead_config, dead_cgroup = inspect_guest_editor(command, name, dead_url)
+        dead_config, dead_cgroup = inspect_guest_editor(command, name, dead_url, project)
         child.kill()
         child.wait(timeout=5)
         deadline = time.monotonic() + 20
@@ -284,11 +292,12 @@ def vm(binary, name, config):
         else:
             raise AssertionError("SSH forward survived owner death")
         assert_guest_editor_stopped(command, name, dead_config, dead_cgroup)
-    with editor(launch) as (child, retry_url, path):
+    with editor(default_launch) as (child, retry_url, path):
+        assert parse_qs(urlsplit(retry_url).query) == {"folder": ["/workspace"]}
         assert retry_url != dead_url
         cookie = login(retry_url, path.read_text())
         assert request(retry_url, "/?folder=/workspace", headers={"Cookie": cookie})[0] == 200
-    print("PASS VM web editor: download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
+    print("PASS VM browser editor: custom/default projects, download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
 
 
 if __name__ == "__main__":

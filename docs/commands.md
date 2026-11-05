@@ -689,17 +689,40 @@ best-effort `.git` filters are not a guarantee that the result contains no Git
 administration aliases, and pull does not sanitize repositories created by an
 older vulnerable release.
 
-### `web-editor`
+### `editor`
 
-Open `/workspace` in your browser. Choose a running VM; code-server installs
-inside it on first use.
+Open VS Code or Zed connected to the guest VM over SSH, or use `--web` to run
+a browser editor inside the VM.
+`coop vscode` remains as an alias.
 
-```sh
-coop web-editor [NAME] [--port PORT]
+```
+coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
+coop editor [NAME] --web [--project PATH] [--port PORT]
 ```
 
-Open the URL printed in your terminal, then enter the displayed password to
-sign in. Use `--port` to choose the local port.
+| Flag | Description |
+|------|-------------|
+| `NAME` | Instance name (required if multiple instances exist) |
+| `--project <path>` | Absolute guest path to open in either mode (default: `/workspace`) |
+| `--editor <code\|zed>` | Host editor to launch. Omitted: try VS Code first, then Zed. |
+| `--clean` | Remove the SSH config entry for this instance and exit |
+| `--web` | Run code-server inside the VM; conflicts with `--editor` and `--clean` |
+| `--port <port>` | Host loopback port for browser editing; requires `--web` (default: select a free port) |
+
+```
+coop editor
+coop editor my-project --project /workspace/subdir
+coop editor my-project --editor zed
+coop editor my-project --clean
+coop editor my-project --web
+coop editor my-project --web --project /workspace/subdir --port 8080
+```
+
+#### Browser mode
+
+Choose a running VM; code-server installs inside it on first use. Open the URL
+printed in your terminal, then enter the displayed password to sign in.
+`--project` selects an existing guest directory, defaulting to `/workspace`.
 
 During first use, coop reports installation and download progress. Failures
 identify download, archive verification, systemd launch, or code-server startup
@@ -708,37 +731,16 @@ observed stage. The guest `~/.local/share/coop-web-editor/editor.log` is relevan
 only after code-server launch has been acknowledged.
 
 Keep the terminal running while you edit. A second invocation joins the same
-session. Ctrl+C in either terminal stops the editor and its terminals while
-keeping the VM running. Settings and extensions persist in the guest.
-
-### `editor`
-
-Open an editor (VS Code or Zed) connected to the guest VM over SSH remote.
-`coop vscode` remains as an alias.
-
-```
-coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
-```
-
-| Flag | Description |
-|------|-------------|
-| `NAME` | Instance name (required if multiple instances exist) |
-| `--project <path>` | Remote path to open in the editor (default: `/workspace`) |
-| `--editor <code\|zed>` | Editor to launch. Omitted: try VS Code first, then Zed. |
-| `--clean` | Remove the SSH config entry for this instance and exit |
-
-```
-coop editor
-coop editor my-project --project /workspace/subdir
-coop editor my-project --editor zed
-coop editor my-project --clean
-```
+session and can open a different `--project` in that session. Ctrl+C in either
+terminal stops the editor and its terminals while keeping the VM running.
+Settings and extensions persist in the guest. Browser mode does not install a
+host SSH config entry.
 
 ### `ssh-config`
 
 Install a `coop-<name>` alias into `~/.ssh/config` so plain `ssh`, `scp`, and
 `rsync` reach the guest without remembering its host, port, user, or key. This
-is the same SSH config block `coop editor` writes, but without launching an
+is the same SSH config block `coop editor` writes in host-editor mode, without launching an
 editor.
 
 ```
@@ -759,7 +761,8 @@ rsync -az ./dir/ coop-my-project:/workspace/dir/
 coop ssh-config my-project --clean
 ```
 
-The alias is created only when you run `coop ssh-config` (or `coop editor`).
+The alias is created only when you run `coop ssh-config` (or `coop editor`
+without `--web`).
 The lifecycle keeps it tidy: `coop stop` and `coop destroy` remove the block,
 and `coop start` refreshes an already-installed block so it stays valid across
 a restart. On macOS/Lima the forwarded SSH port changes on each start; the

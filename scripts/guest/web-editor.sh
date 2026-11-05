@@ -78,8 +78,8 @@ case $(uname -m) in
     aarch64|arm64) arch=arm64; checksum=425d3bc5167c85dc070427d2aa93760083b02aec852ea9ce75c2906c99138f45 ;;
     *) exit 64 ;;
 esac
-reason=workspace_missing
-test -d /workspace
+reason=project_missing
+test -d "$project"
 reason=setup_failed
 base="$HOME/.local/share/coop-web-editor"
 mkdir -p "$base"
@@ -160,16 +160,18 @@ printf 'starting\n'
 # The wrapper acknowledges systemd launch only after opening the code-server
 # log. No code-server output or systemd diagnostic reaches the protocol pipe.
 service_attempt=1
+# systemd expands environment references in argv; $$ preserves a literal dollar.
+project_arg=${project//\$/\$\$}
 setsid sudo -n systemd-run --quiet --collect --wait --pipe --service-type=exec \
     --unit="$unit" --uid="$(id -u)" --gid="$(id -g)" \
-    --property=WorkingDirectory=/workspace --property=KillMode=control-group \
+    --property=WorkingDirectory=/ --property=KillMode=control-group \
     --property=TimeoutStopSec=3 --setenv="HOME=$HOME" --setenv="USER=$(id -un)" \
     --setenv=PATH=/usr/local/bin:/usr/bin:/bin \
     /bin/bash -ec 'log=$1; marker=$2; shift 2; exec >"$log" 2>&1; : > "$marker"; exec "$@"' \
     bash "$base/editor.log" "$launch_marker" "$install/bin/code-server" --config "$config" \
     --auth password --socket "$socket" --socket-mode 0600 --session-socket "$session_socket" \
     --user-data-dir "$base/data" --extensions-dir "$base/extensions" \
-    --disable-workspace-trust --disable-proxy --disable-telemetry --disable-update-check /workspace \
+    --disable-workspace-trust --disable-proxy --disable-telemetry --disable-update-check "$project_arg" \
     </dev/null >/dev/null 2>&1 9>&- &
 child=$!
 ready=0

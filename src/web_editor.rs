@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{SshTarget, VmBackend};
 use crate::config::{CoopConfig, Instance, InstanceName};
 use crate::fs_util::{PrivateDir, lock_sibling_bounded};
+use crate::paths::GuestPath;
 use crate::remote_command::RemoteCommand;
 use crate::web_editor::status::{Event, Poll, Reader, Stage};
 
@@ -59,8 +60,12 @@ impl Session {
         Ok(session)
     }
 
-    fn url(&self, port: NonZeroU16) -> String {
-        format!("http://{}.localhost:{port}/?folder=/workspace", self.id)
+    fn url(&self, port: NonZeroU16, project: &GuestPath) -> String {
+        let folder = percent_encoding::utf8_percent_encode(
+            project.as_ref(),
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        format!("http://{}.localhost:{port}/?folder={folder}", self.id)
     }
 }
 
@@ -184,6 +189,7 @@ pub(crate) fn run(
     be: &impl VmBackend,
     cfg: &CoopConfig,
     name: Option<&InstanceName>,
+    project: &GuestPath,
     port: Option<NonZeroU16>,
 ) -> Result<()> {
     let inst = cfg.resolve_instance(name)?;
@@ -200,7 +206,7 @@ pub(crate) fn run(
             );
         }
         drop(operation);
-        return wait_attached(&inst, session);
+        return wait_attached(&inst, session, project);
     }
     let _owner = lock_sibling_bounded(&lock_path(&inst), Duration::from_secs(1))?;
     if let Some(session) = &previous {
@@ -238,7 +244,7 @@ pub(crate) fn run(
     let listener = UnixListener::bind(session.directory.join("control.sock"))?;
     listener.set_nonblocking(true)?;
     let _signals = crate::signal::install_handlers();
-    let mut command = ssh_launch(running.target(), port, &session.id)?;
+    let mut command = ssh_launch(running.target(), port, &session.id, project)?;
     command
         .process_group(0)
         .stdin(Stdio::piped())
@@ -267,6 +273,7 @@ pub(crate) fn run(
         serve_session(
             &inst,
             &session,
+            project,
             port,
             &password,
             &listener,
@@ -284,7 +291,7 @@ pub(crate) fn run(
 }
 
 /// An attached terminal has the same foreground/stop contract as the owner.
-fn wait_attached(inst: &Instance, session: &Session) -> Result<()> {
+fn wait_attached(inst: &Instance, session: &Session, project: &GuestPath) -> Result<()> {
     let _signals = crate::signal::install_handlers();
     let mut shown = false;
     loop {
@@ -300,7 +307,7 @@ fn wait_attached(inst: &Instance, session: &Session) -> Result<()> {
         if status.ready && !shown {
             let password = crate::fs_util::read_optional_private(&password_path(inst))?
                 .context("Missing editor session password")?;
-            show(inst, &session.url(status.port), &password);
+            show(inst, &session.url(status.port, project), &password);
             shown = true;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -314,6 +321,7 @@ fn wait_attached(inst: &Instance, session: &Session) -> Result<()> {
 fn serve_session(
     inst: &Instance,
     session: &Session,
+    project: &GuestPath,
     port: NonZeroU16,
     password: &str,
     listener: &UnixListener,
@@ -361,7 +369,7 @@ fn serve_session(
                             Stage::Starting => {
                                 tracing::info!("Starting code-server through guest systemd");
                             }
-                            Stage::Ready => show(inst, &session.url(port), password),
+                            Stage::Ready => show(inst, &session.url(port, project), password),
                             _ => {}
                         }
                     }
@@ -454,16 +462,23 @@ fn nonblocking_pipe(input: &impl AsRawFd) -> Result<()> {
     Ok(())
 }
 
-fn ssh_launch(target: &SshTarget, port: NonZeroU16, session: &str) -> Result<Command> {
+fn ssh_launch(
+    target: &SshTarget,
+    port: NonZeroU16,
+    session: &str,
+    project: &GuestPath,
+) -> Result<Command> {
     let guest_dir = format!("/tmp/coop-we-{}", &session[..24]);
     let guest_socket = format!("{guest_dir}/editor.sock");
     let script = format!(
-        "socket={guest_socket}\nsession_socket={guest_dir}/session.sock\n{}\n",
+        "socket={guest_socket}\nsession_socket={guest_dir}/session.sock\nproject=$1\n{}\n",
         include_str!("../scripts/guest/web-editor.sh"),
     );
     let remote = RemoteCommand::new()
         .literal("exec bash -c ")
         .arg(script)
+        .literal(" bash ")
+        .arg(project)
         .into_string();
     let mut command = target.ssh_forward_command()?;
     command
@@ -674,8 +689,16 @@ mod tests {
             "/private/vm_key".into(),
             crate::config::SshHostToolsConfig::default(),
         );
-        let command =
-            super::ssh_launch(&target, NonZeroU16::new(45678).unwrap(), &"a".repeat(32)).unwrap();
+        let project =
+            crate::paths::GuestPath::absolute("/workspace/app 'quoted' #? & $(echo injected)")
+                .unwrap();
+        let command = super::ssh_launch(
+            &target,
+            NonZeroU16::new(45678).unwrap(),
+            &"a".repeat(32),
+            &project,
+        )
+        .unwrap();
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         assert!(args.windows(2).any(|a| a
             == [
@@ -688,6 +711,12 @@ mod tests {
         );
         assert!(args.windows(2).any(|a| a == ["-F", "none"]));
         assert_eq!(command.get_current_dir(), Some(std::path::Path::new("/")));
+        let remote = args.last().unwrap();
+        assert!(remote.contains("project=$1"));
+        assert!(remote.ends_with(&format!(
+            " bash {}",
+            crate::shell::shell_escape(project.as_ref())
+        )));
     }
 
     #[test]
@@ -759,11 +788,34 @@ mod tests {
             };
             for port in [1, 80, 1234, u16::MAX] {
                 assert_eq!(
-                    session.url(NonZeroU16::new(port).unwrap()),
-                    format!("http://{id}.localhost:{port}/?folder=/workspace")
+                    session.url(
+                        NonZeroU16::new(port).unwrap(),
+                        &crate::workspace::default_workspace_path()
+                    ),
+                    format!("http://{id}.localhost:{port}/?folder=%2Fworkspace")
                 );
             }
         }
+    }
+
+    #[test]
+    fn browser_project_stays_in_one_encoded_query_parameter() {
+        let session = Session {
+            id: "a".repeat(32),
+            directory: "/unused".into(),
+        };
+        let project = crate::paths::GuestPath::absolute("/workspace/a b#c?d&e=%/ü").unwrap();
+        let raw = session.url(NonZeroU16::new(12345).unwrap(), &project);
+        let url = url::Url::parse(&raw).unwrap();
+        assert_eq!(
+            url.host_str(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.localhost")
+        );
+        assert!(url.fragment().is_none());
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            [("folder".into(), project.as_ref().into())]
+        );
     }
 
     #[test]

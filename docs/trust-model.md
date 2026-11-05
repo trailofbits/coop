@@ -534,7 +534,7 @@ user `env_forward` entries, and the VM SSH key. The invariants:
 
 ## Browser editor transport
 
-`coop web-editor` runs code-server, extensions, and terminals inside the VM,
+`coop editor --web` runs code-server, extensions, and terminals inside the VM,
 reducing exposure through the native host-editor integrations used by `coop editor`.
 Browser vulnerabilities remain part of the attack surface.
 

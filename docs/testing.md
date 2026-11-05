@@ -143,7 +143,8 @@ Lifecycle and guest-visible changes still require both real backends:
 
 ## Integration tests
 
-The web-editor phase checks login and session cleanup, including mounted workspaces.
+The `coop editor --web` phase checks login, default/custom projects, startup
+failure diagnostics and session cleanup, including mounted workspaces.
 For a focused run, use a disposable VM: this fixture stops and restarts it.
 
 ```sh

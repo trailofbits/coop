@@ -47,8 +47,8 @@ jobs:
         with:
           add-paths: scripts/guest/web-editor.sh
           branch: deps/code-server-${{ steps.update.outputs.version }}
-          commit-message: "fix(web-editor): update code-server to ${{ steps.update.outputs.version }}"
-          title: "fix(web-editor): update code-server to ${{ steps.update.outputs.version }}"
+          commit-message: "fix(editor): update code-server to ${{ steps.update.outputs.version }}"
+          title: "fix(editor): update code-server to ${{ steps.update.outputs.version }}"
           body: |
             Update code-server from ${{ steps.update.outputs.previous }} to ${{ steps.update.outputs.version }}.
 
