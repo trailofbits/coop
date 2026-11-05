@@ -1763,11 +1763,19 @@ esac
             assert!(!temp.path().join("unexpected").exists());
             let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
             assert_eq!(calls.matches("gh attestation verify ").count(), 2);
-            let api = calls
+            let expected_url = format!(
+                "https://api.github.com/repos/trailofbits/coop/attestations/sha256:{}?per_page=100",
+                Sha256Hash::of(b"verified bytes")
+            );
+            let api_calls: Vec<_> = calls
                 .lines()
-                .find(|line| line.contains("/attestations/sha256:"))
-                .unwrap();
-            assert!(api.starts_with("curl --disable ") && !api.contains("@-"));
+                .filter(|line| line.contains("/attestations/sha256:"))
+                .collect();
+            assert_eq!(api_calls.len(), 2);
+            for api in api_calls {
+                assert_eq!(api.split_whitespace().last(), Some(expected_url.as_str()));
+                assert!(api.starts_with("curl --disable ") && !api.contains("@-"));
+            }
             assert!(!calls.contains("fake-test-token"));
             assert_eq!(
                 calls.matches("curl --disable ").count(),

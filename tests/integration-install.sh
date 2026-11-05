@@ -124,6 +124,8 @@ if [ "$auth" = 1 ] && [ "${COOP_TEST_AUTH_FAIL:-0}" = 1 ]; then
 fi
 case "$url" in
     */attestations/sha256:*)
+        digest="$(cut -d' ' -f1 "$COOP_TEST_FIXTURE/SHA256SUMS")"
+        [ "$url" = "https://api.github.com/repos/trailofbits/coop/attestations/sha256:${digest}?per_page=100" ] || exit 52
         [ "$auth" = 0 ] || exit 51
         [ "${COOP_TEST_API_FAIL:-0}" != 1 ] || exit 22
         cp "$COOP_TEST_FIXTURE/api.json" "$destination"
@@ -234,6 +236,7 @@ fi
 
 echo "==> Test 3: releases without a usable bundle retain API fallback"
 : >"$GH_LOG"
+: >"$CURL_LOG"
 COOP_TEST_BUNDLE_FAIL=1
 export COOP_TEST_BUNDLE_FAIL
 if run_installer >"$TEST_ROOT/t3.log" 2>&1; then
@@ -244,8 +247,10 @@ else
 fi
 unset COOP_TEST_BUNDLE_FAIL
 
+expected_digest="$(cut -d' ' -f1 "$FIXTURE/SHA256SUMS")"
+expected_url="https://api.github.com/repos/trailofbits/coop/attestations/sha256:${expected_digest}?per_page=100"
 if grep -q -- '--bundle .*api-attestations.jsonl' "$GH_LOG" \
-    && grep -q '/attestations/sha256:' "$CURL_LOG"; then
+    && [[ "$(awk '/\/attestations\/sha256:/ {print $NF}' "$CURL_LOG")" == "$expected_url" ]]; then
     pass "legacy fallback fetches anonymously and verifies a local bundle"
 else
     fail "legacy fallback fetches anonymously and verifies a local bundle" "gh calls: $(cat "$GH_LOG")"
