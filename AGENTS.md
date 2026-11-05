@@ -17,6 +17,8 @@ navigational; durable detail lives in [`docs/`](docs/).
 - [`docs/code-style.md`](docs/code-style.md) — Rust authoring idioms and review
   checklists.
 - [`docs/testing.md`](docs/testing.md) — integration, mutation, fuzzing, kani.
+- [`docs/user-impact.md`](docs/user-impact.md) — user tasks and security or
+  reliability trade-offs.
 - [`docs/platform-notes.md`](docs/platform-notes.md) — CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
 - Agent workflows: [`.agents/skills/`](.agents/skills/).
@@ -74,12 +76,12 @@ cargo-fuzz, kani) with `./scripts/install-dev-tools.sh --all`, then `prek
 install`. CI pins its own taplo/cargo-deny/Kani versions in
 `.github/workflows/ci.yml`; keep those in sync with the installer.
 
-## Before committing
+## Validation before ready review
 
 Pre-commit hooks run automatically: `cargo fmt`, `cargo clippy`, `cargo test`,
 `taplo format --check`, plus whitespace, EOF, large-file, and merge-conflict
-checks. After hooks pass, run the integration suite on **both platforms** for
-guest-visible and lifecycle changes:
+checks. Before marking a PR ready, run the integration suite on **both
+platforms** for guest-visible and lifecycle changes:
 
 ```bash
 ./tests/run-integration.sh                       # local (macOS/Lima)
@@ -102,6 +104,15 @@ smart-constructor newtypes, type-state for lifecycles, absolute imports only,
 and tracing to **stderr**. Prefer changing a type to make a bug unrepresentable
 over adding a runtime check.
 
+## User impact
+
+For user-visible features and hardening, assess the normal task, failure and
+recovery, friction, and both backends where relevant. Compare the security or
+reliability benefit with the user cost and feasible alternatives that meet the
+same goal. A credible, material downside needs explicit requester acceptance;
+it does not automatically veto a planned control. See
+[`docs/user-impact.md`](docs/user-impact.md).
+
 ## Pull requests
 
 - **One PR = one logical change.** Put refactors/renames before behavior, never
@@ -113,19 +124,28 @@ over adding a runtime check.
   SSH target, local path, or identifying log output. Redact such details from
   pasted commands and logs. If a specific detail may be necessary to explain
   or reproduce a result, ask before including it.
-- Run the gates before opening: format, clippy with zero warnings, unit tests,
-  and both integration backends for guest-visible or lifecycle changes.
+- Run the gates before marking a PR ready: format, clippy with zero warnings,
+  unit tests, and both integration backends for guest-visible or lifecycle
+  changes. A draft PR may disclose an unavailable check, its unverified
+  behavior, risk, and next action. A draft may also carry a pending product
+  decision. Distinguish unrun checks from failures.
 - Keep cross-file representations in sync: CLI/config ↔ examples and docs;
   tool pins ↔ CI; logic-module shell/IO functions ↔ `.cargo/mutants.toml`.
-- Before opening, use the
+- Review the working diff while iterating, then use the
   [`closeout-review`](.agents/skills/closeout-review/SKILL.md) skill on the
-  working diff. Describe what the code does now in plain, factual language.
+  committed branch tip before opening a PR. Describe what the code does now
+  in plain, factual language.
+- For an issue, prompt file, or described change that should end in a draft PR,
+  use the [`implement-to-draft-pr`](.agents/skills/implement-to-draft-pr/SKILL.md)
+  workflow.
 
 ## Review discipline
 
 The [`review`](.agents/skills/review/SKILL.md) skill is the canonical review
 workflow. In addition to lens-specific checks, every review must:
 
+- Check user task completion, friction, and recovery; raise material trade-offs
+  for the requester to decide without treating a security control as optional.
 - Treat each finding and each author claim as a hypothesis. Reproduce or inspect
   the real behavior when possible; check the pinned dependency/tool version.
 - Mutation-check or deliberately break new tests and tripwires. An assertion

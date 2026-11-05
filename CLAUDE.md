@@ -21,6 +21,8 @@ navigational; durable detail lives in [`docs/`](docs/).
 - [`docs/code-style.md`](docs/code-style.md) — Rust authoring idioms + review /
   authoring checklists.
 - [`docs/testing.md`](docs/testing.md) — integration, mutation, fuzzing, kani.
+- [`docs/user-impact.md`](docs/user-impact.md) — user tasks and security or
+  reliability trade-offs.
 - [`docs/platform-notes.md`](docs/platform-notes.md) — CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
 - Agent workflows: `.agents/skills/`.
@@ -69,12 +71,12 @@ cargo-fuzz, kani) with `./scripts/install-dev-tools.sh --all`, then `prek
 install`. CI pins its own taplo/cargo-deny/Kani versions in
 `.github/workflows/ci.yml`; keep those in sync with the installer.
 
-## Before committing
+## Validation before ready review
 
 Pre-commit hooks (prek) run automatically: `cargo fmt`, `cargo clippy`, `cargo
 test`, `taplo format --check`, plus trailing-whitespace / EOF / large-file /
-merge-conflict checks. After hooks pass, run the integration suite on **both
-platforms** — too slow for hooks:
+merge-conflict checks. Before marking a PR ready, run the integration suite on
+**both platforms** for guest-visible and lifecycle changes — too slow for hooks:
 
 ```bash
 ./tests/run-integration.sh                       # local (macOS/Lima)
@@ -96,6 +98,9 @@ adding a runtime check.
 
 ## Pull requests
 
+- Assess material user impact and involve the requester in a security or
+  reliability trade-off; a user cost does not automatically veto a control.
+  See [`docs/user-impact.md`](docs/user-impact.md).
 - **One PR = one logical change.** Refactors/renames first, then behavior —
   never mixed. Split if the description needs "and" / unrelated bullets.
 - Keep private information out of commits, PRs, issues, and other repository
@@ -104,13 +109,17 @@ adding a runtime check.
   hostnames, IP addresses, SSH targets, local paths, and identifying log output.
   Redact pasted commands and logs. If a specific detail may be necessary to
   explain or reproduce a result, ask before including it.
-- Run the gates before opening: `cargo fmt -- --check`, `cargo clippy … -D
-  warnings`, `cargo test`, and the integration suite on both platforms for
-  guest-visible or lifecycle changes.
+- Run the gates before marking a PR ready: `cargo fmt -- --check`, `cargo
+  clippy … -D warnings`, `cargo test`, and the integration suite on both
+  platforms for guest-visible or lifecycle changes. A draft can disclose
+  unavailable checks, their specific gaps and risks, and next actions.
 - Keep cross-file infra in sync in the same PR — a new CLI flag/config field ↔
   `config.example.toml` + `docs/`; tool-version pins ↔ CI; a new shell-out/IO
   function in a scoped module ↔ `.cargo/mutants.toml`.
-- Before opening, run the [`closeout-review`](.agents/skills/closeout-review/SKILL.md)
-  skill on the working diff (a `PreToolUse` hook gates `gh pr create` on it).
+- Review the working diff while iterating, then run
+  [`closeout-review`](.agents/skills/closeout-review/SKILL.md) on the committed
+  branch tip before opening a PR (a `PreToolUse` hook gates `gh pr create`).
   Describe what the code does now — plain, factual language; a bug fix is a bug
   fix.
+- For implementation through a draft PR, use the
+  [`implement-to-draft-pr`](.agents/skills/implement-to-draft-pr/SKILL.md) workflow.
