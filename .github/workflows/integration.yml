@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle, workspace, config]
+        shard: [lifecycle, workspace, config, features]
         os: [ubuntu-24.04, ubuntu-26.04]
     defaults:
       run:

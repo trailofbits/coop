@@ -6,13 +6,14 @@ and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
 The `Firecracker integration` workflow runs the full suite across six
-disposable GitHub-hosted x64 runners: three on Ubuntu 24.04 and three on
+disposable GitHub-hosted x64 runners: four on Ubuntu 24.04 and four on
 Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
 dispatch. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
-VM sequence together, `workspace` covers independent workspace/profile phases,
-and `config` covers configuration, alternate guest-user, proxy, and recovery
-phases. The `config`
+VM sequence together, `workspace` covers independent workspace phases,
+`config` covers configuration, alternate guest-user, proxy, and setup recovery,
+and `features` covers commit/restore plus independent profile, guest-file, and
+configuration-source phases. The `config`
 shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables

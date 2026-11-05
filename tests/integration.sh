@@ -14,7 +14,7 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, or config phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -65,7 +65,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config)
+    lifecycle|workspace|config|features)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9082,7 +9082,9 @@ EOF
         run_timed_test test_resize_retry_firecracker
         run_timed_test test_resize_disk_start
         run_timed_test test_reconfigure
-        run_timed_test test_commit_restore
+        if [[ "$SHARD" == all ]]; then
+            run_timed_test test_commit_restore
+        fi
         run_timed_test test_private_storage
         run_timed_test test_restart_stopped
         run_timed_test test_restart_rejects_ignored_flags
@@ -9094,6 +9096,17 @@ EOF
         # Idempotency: re-run commands that should be safe to repeat
         run_timed_test test_idempotency
 
+    fi
+
+    if [[ "$SHARD" == features ]]; then
+        # Commit/restore needs a stopped primary instance but none of the
+        # preceding lifecycle phases. Keep its image and VM state on this runner.
+        run_timed_test test_up_creates_primary_instance
+        if ! coop stop "$INSTANCE"; then
+            fail "stop primary instance before commit/restore" "$HARNESS_ERR"
+        fi
+        run_timed_test test_commit_restore
+        run_timed_test test_destroy
     fi
 
     # Extended tests (each manages its own instance lifecycle)
@@ -9108,15 +9121,20 @@ EOF
         run_timed_test test_appledouble_sidecars
         run_timed_test test_multi_instance
         run_timed_test test_custom_profiles
-        run_timed_test test_builtin_profiles
         run_timed_test test_builtin_profile_plugins
         run_timed_test test_post_start
-        run_timed_test test_guest_files
         run_timed_test test_creation_hooks
         run_timed_test test_creation_hook_cancellation
         run_timed_test test_creation_failed_descendants
         run_timed_test test_creation_restart_serialization
 
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features ) ]]; then
+        run_timed_test test_builtin_profiles
+        run_timed_test test_guest_files
+        run_timed_test test_no_github
+        run_timed_test test_config_dir
     fi
 
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
@@ -9128,10 +9146,6 @@ EOF
 
         # github = "pat" mode + per-repo token forwarding (uses a stub image)
         run_timed_test test_github_pat_forwarding
-        run_timed_test test_no_github
-
-        # Config sources: Claude bundles, native discovery, preference refresh/recovery
-        run_timed_test test_config_dir
 
         # [guest_env] config block + literal-over-forwarded precedence
         run_timed_test test_guest_env_config
