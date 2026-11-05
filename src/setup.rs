@@ -2104,7 +2104,8 @@ fn valid_ci_key(key: &str, prefix: &str) -> bool {
 }
 
 /// Keep the unmodified CI artifact across image builds. The setup lock covers
-/// both publication and validation, and extraction always uses a fresh tree.
+/// both publication and validation. Extraction attempts to remove the previous
+/// working tree first, but cleanup failures are non-fatal and can leave stale files.
 #[derive(Serialize, Deserialize)]
 struct RootfsCacheManifest {
     source_url: String,

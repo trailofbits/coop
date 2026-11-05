@@ -17,8 +17,9 @@ coop stores the result under `~/.coop/images/<name>/`. When creating an instance
 On Linux, image builds reuse the downloaded Firecracker CI squashfs from the
 private coop data directory when its source URL and stored SHA-256 checksum
 match. Coop keeps one cached download, verifies it on each reuse, and downloads
-it again if it is missing, changed, or fails to unpack. Each build still
-unpacks into a fresh working tree.
+it again if it is missing, changed, or fails to unpack. Each build attempts to
+remove the previous working tree before unpacking. Cleanup failures are
+non-fatal, so extraction can retain stale files from an earlier build.
 
 ## What every template includes
 
