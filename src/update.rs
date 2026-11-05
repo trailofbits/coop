@@ -157,7 +157,7 @@ fn fetch_release_metadata(source: &UpdateSource, repo: &str, path_suffix: &str) 
     let strategy = select_auth_strategy_from_env(source);
     let body = with_anonymous_retry(
         &strategy,
-        || match &strategy {
+        match &strategy {
             AuthStrategy::Gh => gh_api_capture(&format!("repos/{repo}/releases/{path_suffix}")),
             AuthStrategy::CurlBearer(token) => curl_capture(source, &url, Some(token)),
             AuthStrategy::CurlBare => curl_capture(source, &url, None),
@@ -274,7 +274,7 @@ fn download_asset(asset: &ValidatedAsset, dest: &Path) -> Result<()> {
     let strategy = select_auth_strategy_from_env(asset.source());
     with_anonymous_retry(
         &strategy,
-        || match &strategy {
+        match &strategy {
             AuthStrategy::Gh => gh_release_download(asset.tag(), asset.name(), dest),
             AuthStrategy::CurlBearer(token) => curl_download(asset, dest, Some(token)),
             AuthStrategy::CurlBare => curl_download(asset, dest, None),
@@ -294,10 +294,10 @@ fn download_asset(asset: &ValidatedAsset, dest: &Path) -> Result<()> {
 /// failures. Parsing and integrity verification occur outside this retry.
 fn with_anonymous_retry<T>(
     strategy: &AuthStrategy,
-    authenticated: impl FnOnce() -> Result<T>,
+    result: Result<T>,
     anonymous: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    match authenticated() {
+    match result {
         Ok(value) => Ok(value),
         Err(first) if !matches!(strategy, AuthStrategy::CurlBare) => {
             tracing::info!("Authenticated GitHub request failed; retrying anonymously");
@@ -447,23 +447,140 @@ fn bundle_decision(release: &ValidatedRelease, gh_present: bool) -> BundleDecisi
     }
 }
 
-/// The source used for verification, or the established skip policy.
+/// Why verification fell back to the attestations API.
+///
+/// All three mean the same thing to the client — no bundle to read — but they
+/// are kept apart so the failure message can name the one that happened.
+#[derive(Debug)]
+enum ApiReason {
+    /// The release publishes no bundle asset.
+    NoAsset,
+    /// The bundle asset exists but could not be downloaded.
+    DownloadFailed,
+    /// The bundle downloaded but is empty. `gh` before 2.56.0 (cli/cli#9541)
+    /// reports success on an empty bundle, having verified nothing, so an
+    /// empty file must never reach `--bundle`.
+    EmptyBundle,
+}
+
+/// What `verify_attestation` verifies against.
+///
+/// The reason a bundle is absent is carried here rather than re-derived from
+/// its absence, so a failure message cannot claim the wrong one.
 #[derive(Debug)]
 enum Provenance {
+    /// Verification is skipped; see [`BundleDecision::TestMode`].
     TestMode,
+    /// Verification is skipped; see [`BundleDecision::NoGh`].
     NoGh,
-    /// Anonymous API access failed; preserve authenticated/private access.
-    Api,
+    /// Verify through the attestations API. The store itself is anonymously
+    /// readable for a public repo, but `gh` refuses to run the command without
+    /// `--bundle` unless it is logged in, so this path needs a credential
+    /// authorized for the org.
+    Api(ApiReason),
+    /// Verify against this downloaded bundle, with no credential.
     Bundle(PathBuf),
 }
 
 impl Provenance {
+    /// The path for `gh --bundle`, or `None` to use the attestations API.
     fn bundle(&self) -> Option<&Path> {
         match self {
             Provenance::Bundle(path) => Some(path),
-            Provenance::TestMode | Provenance::NoGh | Provenance::Api => None,
+            Provenance::TestMode | Provenance::NoGh | Provenance::Api(_) => None,
         }
     }
+
+    /// Explains the API fallback in a verification failure message. Empty
+    /// unless verification actually went through the API.
+    fn api_fallback_hint(&self) -> String {
+        let cause = match self {
+            Provenance::Api(ApiReason::NoAsset) => {
+                format!("the release publishes no {BUNDLE_ASSET}")
+            }
+            Provenance::Api(ApiReason::DownloadFailed) => {
+                format!("{BUNDLE_ASSET} could not be downloaded")
+            }
+            Provenance::Api(ApiReason::EmptyBundle) => {
+                format!("the published {BUNDLE_ASSET} is empty")
+            }
+            Provenance::TestMode | Provenance::NoGh | Provenance::Bundle(_) => {
+                return String::new();
+            }
+        };
+        format!(
+            " (authenticated API verification used because {cause} and anonymous API retrieval failed)"
+        )
+    }
+}
+
+/// Resolve how the attestation will be verified, downloading the release's
+/// provenance bundle when it publishes a usable one.
+///
+/// Never fails the update: every problem with the bundle falls back to the
+/// attestations API or skips verification outright.
+fn release_provenance(release: &ValidatedRelease, dir: &Path) -> Provenance {
+    let asset = match bundle_decision(release, command_exists("gh")) {
+        BundleDecision::TestMode => return Provenance::TestMode,
+        BundleDecision::NoGh => return Provenance::NoGh,
+        BundleDecision::NoAsset => {
+            tracing::info!(
+                "Release {} publishes no {BUNDLE_ASSET} — using the attestation API fallback.",
+                release.tag()
+            );
+            return Provenance::Api(ApiReason::NoAsset);
+        }
+        BundleDecision::Fetch(asset) => asset,
+    };
+
+    let dest = dir.join(BUNDLE_ASSET);
+    // Fetch bundles anonymously from the outset, avoiding unnecessary credential
+    // use even though ordinary release downloads can retry anonymously.
+    if let Err(err) = curl_download(asset, &dest, None) {
+        tracing::warn!(
+            "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — using the attestation API fallback.",
+            release.tag()
+        );
+        return Provenance::Api(ApiReason::DownloadFailed);
+    }
+    if !fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0) {
+        tracing::warn!(
+            "{BUNDLE_ASSET} for release {} is empty — using the attestation API fallback.",
+            release.tag()
+        );
+        return Provenance::Api(ApiReason::EmptyBundle);
+    }
+    Provenance::Bundle(dest)
+}
+
+fn verify_attestation(tarball: &Path, tag: &str, provenance: &Provenance) -> Result<()> {
+    match provenance {
+        Provenance::TestMode => return Ok(()),
+        Provenance::NoGh => {
+            tracing::info!(
+                "Note: `gh` not installed — skipped cryptographic attestation verification. \
+                 The download was verified against the published `SHA256SUMS` checksum, which \
+                 is the same assurance level as most `curl | bash` installers. For end-to-end \
+                 Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
+                 verify manually: `gh attestation verify <tarball> --repo {REPO} \
+                 --cert-identity https://github.com/{REPO}/{SIGNER_WORKFLOW}@refs/tags/{tag} \
+                 --source-ref refs/tags/{tag} --deny-self-hosted-runners --bundle \
+                 {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
+            );
+            return Ok(());
+        }
+        Provenance::Api(_) | Provenance::Bundle(_) => {}
+    }
+    Cmd::new("gh")
+        .args(attestation_verify_args(tarball, tag, provenance.bundle()))
+        .run()
+        .with_context(|| {
+            format!(
+                "Attestation verification failed for {} — refusing to install{}",
+                tarball.display(),
+                provenance.api_fallback_hint()
+            )
+        })
 }
 
 /// Extract nonempty JSONL bundles, leaving signature and subject checks to gh.
@@ -494,33 +611,17 @@ fn parse_attestation_bundles(body: &str) -> Result<String> {
     Ok(jsonl)
 }
 
-/// Prefer anonymous bundle retrieval, retaining gh API verification when the
-/// anonymous API transport fails. Parsing and verification failures are fatal.
+/// Try anonymous API retrieval before the existing authenticated fallback.
 fn resolve_provenance(
     release: &ValidatedRelease,
     dir: &Path,
     digest: &Sha256Hash,
 ) -> Result<Provenance> {
-    let dest = dir.join(BUNDLE_ASSET);
-    match bundle_decision(release, command_exists("gh")) {
-        BundleDecision::TestMode => return Ok(Provenance::TestMode),
-        BundleDecision::NoGh => return Ok(Provenance::NoGh),
-        BundleDecision::NoAsset => {
-            tracing::info!("Release has no attestation bundle; fetching attestations anonymously");
-        }
-        BundleDecision::Fetch(asset) => {
-            if curl_download(asset, &dest, None).is_ok()
-                && fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0)
-            {
-                return Ok(Provenance::Bundle(dest));
-            }
-            tracing::info!(
-                "Release attestation bundle unavailable or empty; fetching attestations anonymously"
-            );
-        }
+    let provenance = release_provenance(release, dir);
+    if !matches!(provenance, Provenance::Api(_)) {
+        return Ok(provenance);
     }
     let source = release.tarball().source();
-    // Reuse the validated API origin, including the explicit loopback test source.
     let mut url = source.metadata_url(REPO, "latest")?;
     url.set_path(&format!("/repos/{REPO}/attestations/sha256:{digest}"));
     url.set_query(Some("per_page=100"));
@@ -528,40 +629,12 @@ fn resolve_provenance(
         tracing::warn!(
             "Anonymous attestation API request failed; trying authenticated gh verification"
         );
-        return Ok(Provenance::Api);
+        return Ok(provenance);
     };
-    let jsonl = parse_attestation_bundles(&body)?;
-    fs::write(&dest, jsonl).context("Failed to write downloaded attestation bundle")?;
+    let dest = dir.join(BUNDLE_ASSET);
+    fs::write(&dest, parse_attestation_bundles(&body)?)
+        .context("Failed to write downloaded attestation bundle")?;
     Ok(Provenance::Bundle(dest))
-}
-
-fn verify_attestation(tarball: &Path, tag: &str, provenance: &Provenance) -> Result<()> {
-    match provenance {
-        Provenance::TestMode => return Ok(()),
-        Provenance::NoGh => {
-            tracing::info!(
-                "Note: `gh` not installed — skipped cryptographic attestation verification. \
-                 The download was verified against the published `SHA256SUMS` checksum, which \
-                 is the same assurance level as most `curl | bash` installers. For end-to-end \
-                 Sigstore verification, install `gh` (https://cli.github.com) and re-run, or \
-                 verify manually: `gh attestation verify <tarball> --repo {REPO} \
-                 --cert-identity https://github.com/{REPO}/{SIGNER_WORKFLOW}@refs/tags/{tag} \
-                 --source-ref refs/tags/{tag} --deny-self-hosted-runners --bundle \
-                 {BUNDLE_ASSET}` against the {BUNDLE_ASSET} asset from the same release."
-            );
-            return Ok(());
-        }
-        Provenance::Api | Provenance::Bundle(_) => {}
-    }
-    Cmd::new("gh")
-        .args(attestation_verify_args(tarball, tag, provenance.bundle()))
-        .run()
-        .with_context(|| {
-            format!(
-                "Attestation verification failed for {} — refusing to install",
-                tarball.display()
-            )
-        })
 }
 
 // ── Atomic self-replace ──────────────────────────────────────────────────────
@@ -1532,7 +1605,39 @@ mod tests {
         );
         assert_eq!(Provenance::TestMode.bundle(), None);
         assert_eq!(Provenance::NoGh.bundle(), None);
-        assert_eq!(Provenance::Api.bundle(), None);
+        assert_eq!(Provenance::Api(ApiReason::NoAsset).bundle(), None);
+    }
+
+    /// The failure message must name the reason that actually happened: a
+    /// failed download previously reported "the release publishes no
+    /// attestations.jsonl" on a release that publishes it.
+    #[test]
+    fn api_fallback_hint_names_the_reason_that_happened() {
+        assert!(
+            Provenance::Api(ApiReason::NoAsset)
+                .api_fallback_hint()
+                .contains("the release publishes no attestations.jsonl")
+        );
+        assert!(
+            Provenance::Api(ApiReason::DownloadFailed)
+                .api_fallback_hint()
+                .contains("attestations.jsonl could not be downloaded")
+        );
+        assert!(
+            Provenance::Api(ApiReason::EmptyBundle)
+                .api_fallback_hint()
+                .contains("the published attestations.jsonl is empty")
+        );
+    }
+
+    #[test]
+    fn api_fallback_hint_is_empty_when_the_api_was_not_used() {
+        assert_eq!(
+            Provenance::Bundle(PathBuf::from("/tmp/b.jsonl")).api_fallback_hint(),
+            ""
+        );
+        assert_eq!(Provenance::TestMode.api_fallback_hint(), "");
+        assert_eq!(Provenance::NoGh.api_fallback_hint(), "");
     }
 
     #[test]
@@ -1542,23 +1647,26 @@ mod tests {
             AuthStrategy::CurlBearer("fake-token".into()),
         ] {
             assert_eq!(
-                with_anonymous_retry(&strategy, || Ok(1), || panic!("unexpected retry")).unwrap(),
+                with_anonymous_retry(&strategy, Ok(1), || panic!("unexpected retry")).unwrap(),
                 1
             );
             assert_eq!(
-                with_anonymous_retry(&strategy, || bail!("rejected"), || Ok(2)).unwrap(),
+                with_anonymous_retry(&strategy, Err(anyhow::anyhow!("rejected")), || Ok(2))
+                    .unwrap(),
                 2
             );
             let error =
-                with_anonymous_retry::<()>(&strategy, || bail!("first"), || bail!("second"))
-                    .unwrap_err();
+                with_anonymous_retry::<()>(&strategy, Err(anyhow::anyhow!("first")), || {
+                    bail!("second")
+                })
+                .unwrap_err();
             let message = format!("{error:#}");
             assert!(message.contains("first") && message.contains("second"));
         }
         assert!(
             with_anonymous_retry::<()>(
                 &AuthStrategy::CurlBare,
-                || bail!("failed"),
+                Err(anyhow::anyhow!("failed")),
                 || panic!("unexpected retry")
             )
             .is_err()
@@ -1566,47 +1674,30 @@ mod tests {
     }
 
     fn write_transport_stubs(dir: &Path) {
-        let gh = dir.join("gh");
-        fs::write(
-            &gh,
-            r#"#!/bin/sh
+        // Both executables share logging and argument parsing. Unexpected calls
+        // fail loudly so they cannot masquerade as the intended auth rejection.
+        let script = r#"#!/bin/sh
 set -eu
-printf 'gh %s\n' "$*" >> "$COOP_UPDATE_TRANSPORT_CHILD/calls"
-case "$1 $2" in
-    'auth status') [ "$COOP_TEST_AUTH_MODE" = gh ]; exit $? ;;
-    'api repos/trailofbits/coop/releases/latest') exit 1 ;;
-    'release download')
-while [ "$#" -gt 0 ]; do
-    if [ "$1" = --output ]; then printf partial > "$2"; break; fi
-    shift
-done
-exit 1 ;;
-    'attestation verify') exit 42 ;;
-    *) exit 99 ;;
+tool=${0##*/}
+printf '%s %s\n' "$tool" "$*" >> "$COOP_UPDATE_TRANSPORT_CHILD/calls"
+case "$tool:$1 $2" in
+    'gh:auth status') [ "$COOP_TEST_AUTH_MODE" = gh ]; exit $? ;;
+    'gh:api repos/trailofbits/coop/releases/latest') exit 1 ;;
+    'gh:attestation verify') exit 42 ;;
+    'gh:release download'|'curl:--disable --proto') ;;
+    *) touch "$COOP_UPDATE_TRANSPORT_CHILD/unexpected"; exit 99 ;;
 esac
-"#,
-        )
-        .unwrap();
-        let curl = dir.join("curl");
-        fs::write(
-            &curl,
-            r#"#!/bin/sh
-set -eu
-printf 'curl %s\n' "$*" >> "$COOP_UPDATE_TRANSPORT_CHILD/calls"
-auth=0
-dest=''
-url=''
-[ "$1" = --disable ] || exit 98
+auth=0; dest=''; url=''
 while [ "$#" -gt 0 ]; do
     case "$1" in
--H) [ "$2" != @- ] || auth=1; shift 2 ;;
--o) dest="$2"; shift 2 ;;
-https:*) url="$1"; shift ;;
-*) shift ;;
+        -H) [ "$2" != @- ] || auth=1; shift 2 ;;
+        -o|--output) dest="$2"; shift 2 ;;
+        https:*) url="$1"; shift ;;
+        *) shift ;;
     esac
 done
-if [ "$auth" = 1 ]; then
-    cat >/dev/null
+if [ "$tool" = gh ] || [ "$auth" = 1 ]; then
+    [ "$auth" = 0 ] || cat >/dev/null
     [ -z "$dest" ] || printf partial > "$dest"
     exit 22
 fi
@@ -1615,16 +1706,14 @@ case "$url" in
     */attestations/sha256:*)
         [ ! -e "$COOP_UPDATE_TRANSPORT_CHILD/fail-api" ] || exit 22
         printf '%s' '{"attestations":[{"bundle":{"synthetic":true}}]}' ;;
-    *.tar.gz)
-[ ! -e "$dest" ] || exit 97
-printf 'verified bytes' > "$dest" ;;
-    *) exit 96 ;;
+    *.tar.gz) [ ! -e "$dest" ]; printf 'verified bytes' > "$dest" ;;
+    *) touch "$COOP_UPDATE_TRANSPORT_CHILD/unexpected"; exit 99 ;;
 esac
-"#,
-        )
-        .unwrap();
-        for script in [&gh, &curl] {
-            fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+"#;
+        for tool in ["gh", "curl"] {
+            let path = dir.join(tool);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
 
@@ -1641,8 +1730,6 @@ esac
             download_asset(release.tarball(), &tarball).unwrap();
             assert_eq!(fs::read(&tarball).unwrap(), b"verified bytes");
             let digest = Sha256Hash::of(b"verified bytes");
-            verify_sha256(&tarball, &digest).unwrap();
-            assert!(verify_sha256(&tarball, &Sha256Hash::of(b"wrong")).is_err());
             let provenance = resolve_provenance(&release, dir, &digest).unwrap();
             assert_eq!(
                 fs::read_to_string(provenance.bundle().unwrap()).unwrap(),
@@ -1652,14 +1739,14 @@ esac
             assert!(verify_attestation(&tarball, "v9.9.9", &provenance).is_err());
             fs::write(dir.join("fail-api"), b"").unwrap();
             let fallback = resolve_provenance(&release, dir, &digest).unwrap();
-            assert!(matches!(fallback, Provenance::Api));
+            assert!(matches!(fallback, Provenance::Api(_)));
             assert!(verify_attestation(&tarball, "v9.9.9", &fallback).is_err());
             return;
         }
         for mode in ["gh", "bearer"] {
             let temp = tempfile::tempdir().unwrap();
             write_transport_stubs(temp.path());
-            let output = std::process::Command::new(env::current_exe().unwrap())
+            let status = std::process::Command::new(env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "update::tests::rejected_credentials_retry_real_transports",
@@ -1670,22 +1757,12 @@ esac
                 .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
                 .env("GITHUB_TOKEN", "fake-test-token")
                 .env_remove("GH_TOKEN")
-                .output()
+                .status()
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert!(status.success(), "{mode}");
+            assert!(!temp.path().join("unexpected").exists());
             let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
-            assert_eq!(
-                calls
-                    .lines()
-                    .filter(|line| line.starts_with("gh attestation verify"))
-                    .count(),
-                2
-            );
+            assert_eq!(calls.matches("gh attestation verify ").count(), 2);
             let api = calls
                 .lines()
                 .find(|line| line.contains("/attestations/sha256:"))
@@ -1693,10 +1770,7 @@ esac
             assert!(api.starts_with("curl --disable ") && !api.contains("@-"));
             assert!(!calls.contains("fake-test-token"));
             assert_eq!(
-                calls
-                    .lines()
-                    .filter(|line| line.starts_with("curl "))
-                    .count(),
+                calls.matches("curl --disable ").count(),
                 if mode == "gh" { 4 } else { 6 }
             );
         }

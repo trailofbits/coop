@@ -269,70 +269,41 @@ else
 fi
 unset COOP_TEST_BUNDLE_FAIL COOP_TEST_GH_VERIFY_FAIL
 
-echo "==> Anonymous transfer retries and unusable API responses"
-COOP_TEST_AUTH_FAIL=1
-export COOP_TEST_AUTH_FAIL
-if run_installer >"$TEST_ROOT/retry.log" 2>&1; then
-    pass "rejected gh and token downloads retry anonymously, replacing partial files"
-else
-    fail "rejected downloads retry anonymously" "$(tail -10 "$TEST_ROOT/retry.log")"
-fi
-COOP_TEST_VERSION=""
-export COOP_TEST_VERSION
-if run_installer >"$TEST_ROOT/metadata.log" 2>&1; then
-    pass "latest metadata retries anonymously after gh and token failures"
-else
-    fail "latest metadata retries anonymously" "$(tail -10 "$TEST_ROOT/metadata.log")"
-fi
-unset COOP_TEST_VERSION
-printf '%s\n' keep-existing-install >"$INSTALL_DIR/coop"
-COOP_TEST_PUBLIC_FAIL=1
-export COOP_TEST_PUBLIC_FAIL
-if run_installer >"$TEST_ROOT/both-fail.log" 2>&1; then
-    fail "both transports failing aborts install"
-elif [[ "$(cat "$INSTALL_DIR/coop")" == keep-existing-install ]]; then
-    pass "both transports failing preserves installation"
-else
-    fail "both transports failing preserves installation"
-fi
-unset COOP_TEST_PUBLIC_FAIL COOP_TEST_AUTH_FAIL
-COOP_TEST_BUNDLE_FAIL=1
-export COOP_TEST_BUNDLE_FAIL
+# Each failed case must preserve the existing installation. The outcome also
+# distinguishes rejection before verification from authenticated API fallback.
+check_installer() {
+    local label="$1" expected="$2" outcome=failure
+    shift 2
+    : > "$GH_LOG"
+    printf '%s\n' keep-existing-install > "$INSTALL_DIR/coop"
+    # Each argument is an explicit NAME=value assignment for this test case.
+    # shellcheck disable=SC2163
+    if (export "$@"; run_installer) >"$TEST_ROOT/case.log" 2>&1; then outcome=success; fi
+    case "$expected" in
+        noverify) ! grep -q '^attestation verify ' "$GH_LOG" || outcome=unexpected; expected=failure ;;
+        api) grep -q '^attestation verify ' "$GH_LOG" && ! grep -q -- '--bundle' "$GH_LOG" || outcome=unexpected; expected=success ;;
+    esac
+    if [[ "$outcome" == "$expected" ]] && {
+        [[ "$expected" == success && "$("$INSTALL_DIR/coop")" == installed-coop ]] \
+        || [[ "$expected" == failure && "$(cat "$INSTALL_DIR/coop")" == keep-existing-install ]];
+    }; then
+        pass "$label"
+    else
+        fail "$label" "$(tail -10 "$TEST_ROOT/case.log")"
+    fi
+}
+
+check_installer "rejected downloads retry anonymously and replace partial files" success COOP_TEST_AUTH_FAIL=1
+check_installer "metadata retries anonymously" success COOP_TEST_AUTH_FAIL=1 COOP_TEST_VERSION=
+check_installer "both download transports failing preserves installation" noverify COOP_TEST_AUTH_FAIL=1 COOP_TEST_PUBLIC_FAIL=1
 for response in '{}' '{"attestations":[]}' '{"attestations":[{"bundle":null}]}' '{"attestations":[{"bundle":{}}]}' 'invalid-json'; do
     printf '%s\n' "$response" > "$FIXTURE/api.json"
-    : > "$GH_LOG"
-    if run_installer >"$TEST_ROOT/bad-api.log" 2>&1; then
-        fail "unusable API response aborts install: $response"
-    elif grep -q '^attestation verify ' "$GH_LOG"; then
-        fail "unusable API response must not reach verifier: $response"
-    else
-        pass "unusable API response rejected before verification: $response"
-    fi
+    check_installer "reject unusable API response: $response" noverify COOP_TEST_BUNDLE_FAIL=1
 done
 printf '%s\n' '{"attestations":[{"bundle":{"synthetic":true}}]}' > "$FIXTURE/api.json"
-unset COOP_TEST_BUNDLE_FAIL
+check_installer "API transport failure retains authenticated verification" api COOP_TEST_BUNDLE_FAIL=1 COOP_TEST_API_FAIL=1
+check_installer "all provenance transports failing aborts installation" failure COOP_TEST_BUNDLE_FAIL=1 COOP_TEST_API_FAIL=1 COOP_TEST_GH_VERIFY_FAIL=1
 
-echo "==> API transport failure and missing-jq compatibility"
-COOP_TEST_BUNDLE_FAIL=1
-COOP_TEST_API_FAIL=1
-export COOP_TEST_BUNDLE_FAIL COOP_TEST_API_FAIL
-: > "$GH_LOG"
-if run_installer >"$TEST_ROOT/api-fail.log" 2>&1 \
-    && grep -q '^attestation verify ' "$GH_LOG" \
-    && ! grep -q -- '--bundle' "$GH_LOG"; then
-    pass "anonymous API transport failure retains authenticated verification"
-else
-    fail "anonymous API failure retains authenticated verification"
-fi
-COOP_TEST_GH_VERIFY_FAIL=1
-export COOP_TEST_GH_VERIFY_FAIL
-if run_installer >"$TEST_ROOT/api-both-fail.log" 2>&1; then
-    fail "anonymous retrieval and authenticated verification failure abort installation"
-else
-    pass "anonymous retrieval and authenticated verification failure abort installation"
-fi
-unset COOP_TEST_GH_VERIFY_FAIL
-unset COOP_TEST_API_FAIL
 # Source only the helpers, then hide jq from has() while retaining all other
 # host tools. This exercises the compatibility branch without changing PATH.
 sed '/^# --- main /,$d' "$PROJECT_DIR/install.sh" > "$TEST_ROOT/helpers.sh"
