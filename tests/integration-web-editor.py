@@ -7,6 +7,7 @@ import http.client
 from pathlib import Path
 import queue
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -151,6 +152,64 @@ else:
     assert result.returncode == 0, result.stderr
 
 
+def download_failure(command, name, launch):
+    fixture = f"/tmp/coop-editor-download-{secrets.token_hex(12)}"
+    setup = r'''
+set -euo pipefail
+fixture=$1
+base="$HOME/.local/share/coop-web-editor"
+mkdir -m 700 -- "$fixture"
+mkdir -- "$fixture/installs"
+curl_config="${CURL_HOME:-$HOME}/.curlrc"
+if [[ -z ${CURL_HOME:-} && -n ${XDG_CONFIG_HOME:-} ]]; then
+    curl_config="$XDG_CONFIG_HOME/curlrc"
+fi
+mkdir -p -- "${curl_config%/*}"
+if [[ -e "$curl_config" || -L "$curl_config" ]]; then
+    mv -- "$curl_config" "$fixture/curlrc.original"
+fi
+for install in "$base"/code-server-*; do
+    [[ -e "$install" ]] || continue
+    mv -- "$install" "$fixture/installs/"
+done
+touch "$fixture/config-installed"
+# .invalid is reserved; an explicit empty noproxy overrides NO_PROXY.
+printf 'proxy = "http://coop-editor-download.invalid.:9"\nnoproxy = ""\n' > "$curl_config"
+'''
+    restore = r'''
+set -euo pipefail
+fixture=$1
+base="$HOME/.local/share/coop-web-editor"
+curl_config="${CURL_HOME:-$HOME}/.curlrc"
+if [[ -z ${CURL_HOME:-} && -n ${XDG_CONFIG_HOME:-} ]]; then
+    curl_config="$XDG_CONFIG_HOME/curlrc"
+fi
+if [[ -e "$fixture/config-installed" ]]; then
+    rm -f -- "$curl_config"
+fi
+if [[ -e "$fixture/curlrc.original" || -L "$fixture/curlrc.original" ]]; then
+    mv -- "$fixture/curlrc.original" "$curl_config"
+fi
+for install in "$fixture"/installs/*; do
+    [[ -e "$install" ]] || continue
+    mkdir -p -- "$base"
+    mv -- "$install" "$base/"
+done
+rm -rf -- "$fixture"
+'''
+    try:
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", setup, "bash", fixture],
+                       check=True, capture_output=True, timeout=30)
+        failed = subprocess.run(launch, capture_output=True, text=True, timeout=45)
+        assert failed.returncode != 0
+        assert "Guest code-server download failed DNS resolution" in failed.stderr, failed.stderr
+        assert "editor.log" not in failed.stderr and "Open: " not in failed.stderr
+        assert "curl:" not in failed.stdout + failed.stderr
+    finally:
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", restore, "bash", fixture],
+                       check=True, capture_output=True, timeout=30)
+
+
 def vm(binary, name, config):
     command = [binary] + (["--config", config] if config else [])
     launch = command + ["web-editor", name]
@@ -161,6 +220,9 @@ def vm(binary, name, config):
         failed = subprocess.run(launch + ["--port", str(busy.getsockname()[1])],
                                 capture_output=True, text=True, timeout=30)
         assert failed.returncode != 0 and "Open: " not in failed.stderr
+        assert "Cannot bind editor SSH forward" in failed.stderr
+        assert "editor.log" not in failed.stderr
+    download_failure(command, name, launch)
     with editor(launch) as (child, url, path):
         password = path.read_text()
         assert request(url)[0] == 302
@@ -226,7 +288,7 @@ def vm(binary, name, config):
         assert retry_url != dead_url
         cookie = login(retry_url, path.read_text())
         assert request(retry_url, "/?folder=/workspace", headers={"Cookie": cookie})[0] == 200
-    print("PASS VM web editor: port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
+    print("PASS VM web editor: download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
 
 
 if __name__ == "__main__":

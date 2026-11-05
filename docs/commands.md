@@ -701,6 +701,12 @@ coop web-editor [NAME] [--port PORT]
 Open the URL printed in your terminal, then enter the displayed password to
 sign in. Use `--port` to choose the local port.
 
+During first use, coop reports installation and download progress. Failures
+identify download, archive verification, systemd launch, or code-server startup
+when the guest supplies a status. SSH transport failures report the last
+observed stage. The guest `~/.local/share/coop-web-editor/editor.log` is relevant
+only after code-server launch has been acknowledged.
+
 Keep the terminal running while you edit. A second invocation joins the same
 session. Ctrl+C in either terminal stops the editor and its terminals while
 keeping the VM running. Settings and extensions persist in the guest.

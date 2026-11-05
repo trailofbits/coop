@@ -6,12 +6,11 @@ use std::ffi::OsStr;
 use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::net::TcpListener;
 use std::num::NonZeroU16;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -21,6 +20,9 @@ use crate::backend::{SshTarget, VmBackend};
 use crate::config::{CoopConfig, Instance, InstanceName};
 use crate::fs_util::{PrivateDir, lock_sibling_bounded};
 use crate::remote_command::RemoteCommand;
+use crate::web_editor::status::{Event, Poll, Reader, Stage};
+
+mod status;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -215,7 +217,12 @@ pub(crate) fn run(
     // OpenSSH owns the listener. A probe/bind collision is fatal through
     // ExitOnForwardFailure, before the remote command can report ready.
     let port = match port {
-        Some(port) => port,
+        Some(port) => {
+            let _probe = TcpListener::bind(("127.0.0.1", port.get())).with_context(|| {
+                format!("Cannot bind editor SSH forward to 127.0.0.1:{port}; choose another --port")
+            })?;
+            port
+        }
         None => NonZeroU16::new(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
             .context("Host assigned an invalid editor port")?,
     };
@@ -239,18 +246,17 @@ pub(crate) fn run(
         .stderr(Stdio::null());
     // OpenSSH closes inherited nonstandard descriptors. The session lock is
     // held by this owner only; each retry gets independent guest socket paths.
-    let mut child = OwnedChild(command.spawn()?);
+    let mut child = OwnedChild(
+        command
+            .spawn()
+            .context("Cannot launch editor SSH transport")?,
+    );
     let mut input = child.0.stdin.take().context("Missing SSH stdin")?;
     let output = child.0.stdout.take().context("Missing SSH stdout")?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut output = output;
-        let mut marker = [0; 6];
-        let ready = output.read_exact(&mut marker).is_ok() && marker == *b"ready\n";
-        let _ = tx.send(ready);
-    });
+    nonblocking_pipe(&output)?;
+    let mut events = Reader::new(output);
     let result = (|| {
-        nonblocking_stdin(&input)?;
+        nonblocking_pipe(&input)?;
         writeln!(input, "{password}")?;
         crate::fs_util::atomic_write_with_mode(&password_path(&inst), &password, 0o600)?;
         crate::fs_util::atomic_write_json(
@@ -266,7 +272,7 @@ pub(crate) fn run(
             &listener,
             &mut child.0,
             &mut input,
-            &rx,
+            &mut events,
         )
     })();
     drop(input);
@@ -313,11 +319,14 @@ fn serve_session(
     listener: &UnixListener,
     child: &mut Child,
     input: &mut ChildStdin,
-    events: &mpsc::Receiver<bool>,
+    events: &mut Reader<std::process::ChildStdout>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let mut heartbeat = started;
-    let mut ready = false;
+    let mut stage = Stage::default();
+    let mut reported_progress = started;
+    let mut exited = None;
+    let mut lease_error = None;
     tracing::info!(
         "Preparing browser editor in '{}' (first use installs code-server)",
         inst.name
@@ -326,25 +335,60 @@ fn serve_session(
         if crate::signal::shutdown_requested() {
             return Ok(());
         }
+        // Drain failure reports before observing process exit. Limit each batch
+        // so a noisy guest cannot starve cancellation, IPC or lease renewal.
+        for _ in 0..16 {
+            match events
+                .poll()
+                .with_context(|| format!("Reading status during {}", stage.label()))?
+            {
+                Poll::Pending => break,
+                Poll::Closed => bail!(
+                    "Editor SSH status stream closed during {}; no guest failure report was received. Check VM SSH access and the local forward on 127.0.0.1:{port}",
+                    stage.label()
+                ),
+                Poll::Event(event) => match event {
+                    Event::Downloaded(bytes)
+                        if reported_progress.elapsed() >= Duration::from_secs(2) =>
+                    {
+                        tracing::info!(bytes, "Downloading code-server in the VM");
+                        reported_progress = std::time::Instant::now();
+                    }
+                    Event::Stage(next) if next != stage => {
+                        stage = next;
+                        match stage {
+                            Stage::Installing => tracing::info!("Installing code-server in the VM"),
+                            Stage::Starting => {
+                                tracing::info!("Starting code-server through guest systemd");
+                            }
+                            Stage::Ready => show(inst, &session.url(port), password),
+                            _ => {}
+                        }
+                    }
+                    Event::Failed(message) => bail!("{message}"),
+                    _ => {}
+                },
+            }
+        }
         if child.try_wait()?.is_some() {
+            exited.get_or_insert_with(std::time::Instant::now);
+        }
+        if exited.is_some_and(|observed| observed.elapsed() >= Duration::from_secs(1)) {
+            if let Some(error) = lease_error {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!("Editor SSH lease failed during {}; no complete guest failure report was received", stage.label())
+                });
+            }
             bail!(
-                "Editor SSH session exited unexpectedly; check the requested port, VM and guest editor.log"
+                "Editor SSH session exited during {}; no complete guest failure report was received",
+                stage.label()
             );
         }
-        if !ready {
-            match events.try_recv() {
-                Ok(true) => {
-                    ready = true;
-                    show(inst, &session.url(port), password);
-                }
-                Ok(false) | Err(mpsc::TryRecvError::Disconnected) => bail!(
-                    "Editor startup failed; check the requested port, SSH connectivity, and guest editor.log"
-                ),
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
+        if !stage.ready() {
             ensure!(
                 started.elapsed() < Duration::from_secs(600),
-                "Guest editor startup timed out"
+                "Editor startup timed out during {}",
+                stage.label()
             );
         }
         match listener.accept() {
@@ -352,7 +396,7 @@ fn serve_session(
                 let status = Status {
                     session: session.id.clone(),
                     port,
-                    ready,
+                    ready: stage.ready(),
                 };
                 match control_request(stream, &status) {
                     Ok(true) => return Ok(()),
@@ -363,10 +407,13 @@ fn serve_session(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error.into()),
         }
-        if heartbeat.elapsed() >= Duration::from_secs(2) {
-            input
-                .write_all(b"alive\n")
-                .context("Editor SSH lease failed")?;
+        if heartbeat.elapsed() >= Duration::from_secs(2) && lease_error.is_none() {
+            if let Err(error) = input.write_all(b"alive\n") {
+                // A remote failure may close stdin just after our stdout poll.
+                // Give its already-written status the same bounded drain window.
+                lease_error = Some(error);
+                exited.get_or_insert_with(std::time::Instant::now);
+            }
             heartbeat = std::time::Instant::now();
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -395,14 +442,14 @@ fn control_request(mut stream: UnixStream, status: &Status) -> Result<bool> {
     }
 }
 
-fn nonblocking_stdin(input: &ChildStdin) -> Result<()> {
+fn nonblocking_pipe(input: &impl AsRawFd) -> Result<()> {
     // SAFETY: input owns a live pipe descriptor. Only its status flags change.
     let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
     ensure!(flags >= 0, "Cannot read SSH pipe flags");
     // SAFETY: same live descriptor, preserving existing flags.
     ensure!(
         unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
-        "Cannot make SSH lease writes nonblocking"
+        "Cannot make editor SSH pipe nonblocking"
     );
     Ok(())
 }
@@ -411,7 +458,7 @@ fn ssh_launch(target: &SshTarget, port: NonZeroU16, session: &str) -> Result<Com
     let guest_dir = format!("/tmp/coop-we-{}", &session[..24]);
     let guest_socket = format!("{guest_dir}/editor.sock");
     let script = format!(
-        "umask 077\nmkdir -- {guest_dir}\nsocket={guest_socket}\nsession_socket={guest_dir}/session.sock\n{}\n",
+        "socket={guest_socket}\nsession_socket={guest_dir}/session.sock\n{}\n",
         include_str!("../scripts/guest/web-editor.sh"),
     );
     let remote = RemoteCommand::new()
