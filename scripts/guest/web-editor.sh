@@ -103,47 +103,62 @@ if [[ ! -x "$install/bin/code-server" ]]; then
     staging="$base/install-staging"
     rm -rf -- "$staging"
     mkdir -- "$staging"
-    : > "$staging/package.tar.gz"
-    stage=download
-    reason=transfer_failed
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-        --connect-timeout 15 --max-time 1800 --max-filesize 536870912 \
-        "https://github.com/coder/code-server/releases/download/v$version/$package.tar.gz" \
-        --output "$staging/package.tar.gz" >/dev/null 2>&1 &
-    download=$!
-    last_progress=$SECONDS
-    while kill -0 "$download" 2>/dev/null; do
-        lease
-        if ((SECONDS - last_progress >= 2)); then
-            bytes=$(stat -c '%s' -- "$staging/package.tar.gz")
-            [[ $bytes =~ ^[0-9]{1,20}$ ]]
-            printf 'downloaded %s\n' "$bytes"
-            last_progress=$SECONDS
-        fi
+    # Keep one checksum-bound partial outside disposable extraction scratch.
+    archive="$base/download-$checksum.tar.gz"
+    for cached in "$base"/download-*.tar.gz; do
+        [[ $cached == "$archive" ]] || rm -f -- "$cached"
     done
-    if wait "$download"; then
-        download=
-    else
-        status=$?
-        download=
-        case $status in
-            5|6) reason=dns ;;
-            7) reason=connection ;;
-            22) reason=http ;;
-            28) reason=timeout ;;
-            35|51|58|60|77|83|90|91) reason=tls ;;
-        esac
-        exit "$status"
+    [[ ! -L $archive && (! -e $archive || -f $archive) ]]
+    # Keep output private and present before the first progress poll.
+    : >> "$archive"
+    chmod 600 -- "$archive"
+    if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status; then
+        stage=download
+        reason=transfer_failed
+        curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 1800 --max-filesize 536870912 --continue-at - \
+            "https://github.com/coder/code-server/releases/download/v$version/$package.tar.gz" \
+            --output "$archive" >/dev/null 2>&1 &
+        download=$!
+        last_progress=$SECONDS
+        while kill -0 "$download" 2>/dev/null; do
+            lease
+            if ((SECONDS - last_progress >= 2)); then
+                bytes=$(stat -c '%s' -- "$archive")
+                [[ $bytes =~ ^[0-9]{1,20}$ ]]
+                printf 'downloaded %s\n' "$bytes"
+                last_progress=$SECONDS
+            fi
+        done
+        if wait "$download"; then
+            download=
+        else
+            status=$?
+            download=
+            case $status in
+                5|6) reason=dns ;;
+                7) reason=connection ;;
+                22) reason=http; rm -f -- "$archive" ;;
+                33|36) rm -f -- "$archive" ;; # A refused resume must allow a fresh retry.
+                28) reason=timeout ;;
+                35|51|58|60|77|83|90|91) reason=tls ;;
+            esac
+            exit "$status"
+        fi
     fi
     stage=verification
     reason=checksum_mismatch
-    printf '%s  %s\n' "$checksum" "$staging/package.tar.gz" | sha256sum --check --status
+    if ! printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status; then
+        rm -f -- "$archive"
+        exit 1
+    fi
     stage=extraction
     reason=archive_invalid
-    tar --extract --gzip --no-same-owner --no-same-permissions --file "$staging/package.tar.gz" --directory "$staging"
+    tar --extract --gzip --no-same-owner --no-same-permissions --file "$archive" --directory "$staging"
     test -x "$staging/$package/bin/code-server"
     mv -- "$staging/$package" "$install"
     rm -rf -- "$staging"
+    rm -f -- "$archive"
     staging=
 fi
 if [[ $stage != preparing ]]; then
