@@ -61,9 +61,9 @@ def editor(command):
         lines = reader(child.stderr)
         diagnostics = []
         url = password_path = None
-        deadline = time.monotonic() + 620
+        deadline = time.monotonic() + 2120
         while time.monotonic() < deadline:
-            line = lines.get(timeout=630)
+            line = lines.get(timeout=2130)
             if line is None:
                 raise AssertionError(f"editor exited before ready: {child.wait()}\n{''.join(diagnostics)}")
             diagnostics.append(line)

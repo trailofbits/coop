@@ -414,8 +414,9 @@ fn serve_session(
             );
         }
         if !stage.ready() {
+            // Allow the guest's 30-minute download budget plus verification and startup.
             ensure!(
-                started.elapsed() < Duration::from_secs(600),
+                started.elapsed() < Duration::from_secs(2100),
                 "Editor startup timed out during {}",
                 stage.label()
             );

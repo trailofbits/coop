@@ -107,7 +107,7 @@ if [[ ! -x "$install/bin/code-server" ]]; then
     stage=download
     reason=transfer_failed
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-        --connect-timeout 15 --max-time 300 --max-filesize 536870912 \
+        --connect-timeout 15 --max-time 1800 --max-filesize 536870912 \
         "https://github.com/coder/code-server/releases/download/v$version/$package.tar.gz" \
         --output "$staging/package.tar.gz" >/dev/null 2>&1 &
     download=$!
