@@ -61,56 +61,51 @@ target_triple() {
 }
 
 latest_version() {
-    if has gh; then
-        gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null && return
+    local body
+    if has gh && body="$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null)"; then
+        printf '%s\n' "$body"
+        return
     fi
     local url="https://api.github.com/repos/${REPO}/releases/latest"
-    # Pass the auth header on stdin (`-H @-`) so $GITHUB_TOKEN never appears
-    # on argv where it would be visible in /proc/<pid>/cmdline or `set -x`.
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" \
-            | curl -fsSL -H @- "$url" \
-            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
-    else
-        curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+    if [ -n "${GITHUB_TOKEN:-}" ] && body="$(
+        printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" | curl --disable -fsSL -H @- "$url"
+    )"; then
+        printf '%s\n' "$body" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+        return
     fi
+    curl --disable -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
 }
 
-# Download a release asset. Tries gh first, then curl with token, then plain curl.
+# Retry failed authenticated transfers anonymously. Verification is never retried.
 download_asset() {
     local filename="$1" dest="$2"
-
     if has gh; then
         info "Downloading ${filename} (via gh)..."
-        gh release download "$VERSION" --repo "$REPO" --pattern "$filename" --dir "$(dirname "$dest")" 2>/dev/null \
-            && return
-        info "gh download failed, falling back to curl..."
+        if gh release download "$VERSION" --repo "$REPO" --pattern "$filename" --dir "$(dirname "$dest")" 2>/dev/null; then
+            return
+        fi
+        warn "gh download failed; trying curl."
+        rm -f "$dest"
     fi
-
     local url="https://github.com/${REPO}/releases/download/${VERSION}/${filename}"
-
-    info "Downloading ${filename}..."
-    # Pass the auth header on stdin (`-H @-`) so $GITHUB_TOKEN never appears
-    # on argv where it would be visible in /proc/<pid>/cmdline or `set -x`.
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" \
-            | curl -fsSL -H @- -o "$dest" "$url"
-    else
-        curl -fsSL -o "$dest" "$url"
+        if printf 'Authorization: token %s\n' "${GITHUB_TOKEN}" \
+            | curl --disable -fsSL -H @- -o "$dest" "$url"; then
+            return
+        fi
+        warn "Authenticated curl download failed; retrying anonymously."
+        rm -f "$dest"
     fi
+    curl --disable -fsSL -o "$dest" "$url"
 }
 
 # Fetch the release's provenance bundle with no credential attached.
 #
-# Deliberately not `download_asset`: that prefers `gh` and then falls back to
-# curl carrying $GITHUB_TOKEN, which would re-attach the credential `--bundle`
-# exists to avoid. A token with no SSO session for the org would 403 on this one
-# step and drop the whole chain back to the API path, failing with the original
-# error. The bundle is a public release file, so a bare curl reaches it and
-# keeps the path credential-free end to end.
+# Unlike download_asset, this never attempts authenticated access. Both the
+# published bundle and the public attestations API are readable anonymously.
 download_bundle() {
     local dest="$1"
-    curl -fsSL -o "$dest" \
+    curl --disable -fsSL -o "$dest" \
         "https://github.com/${REPO}/releases/download/${VERSION}/${BUNDLE}"
 }
 
@@ -132,7 +127,7 @@ verify_checksum() {
 }
 
 verify_attestation() {
-    local file="$1"
+    local file="$1" digest="$2"
     local signer_pin=(
         --cert-identity "https://github.com/${REPO}/${SIGNER_WORKFLOW}@refs/tags/${VERSION}"
         --source-ref "refs/tags/${VERSION}"
@@ -175,12 +170,31 @@ verify_attestation() {
         return 0
     fi
 
-    # Verifying through the API is exactly what every release did before the
-    # bundle asset existed. Without `--bundle`, `gh` gates the command on being
-    # logged in and attaches its token, so this path needs a credential
-    # authorized for the org — which is why it is the fallback, not the default.
-    info "Could not use ${BUNDLE} for ${VERSION} (not published, download failed, or empty) —"
-    info "verifying through the GitHub API instead."
+    info "Could not use ${BUNDLE} for ${VERSION} (not published, download failed, or empty)."
+    if has jq; then
+        info "Fetching attestations anonymously by SHA-256 digest..."
+        # Validate all entries before emitting JSONL; an empty bundle is unsafe
+        # with older gh versions that accept it without verification.
+        if curl --disable -fsSL -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "${TMPDIR}/attestations-api.json" \
+            "https://api.github.com/repos/${REPO}/attestations/sha256:${digest}?per_page=100"; then
+            if ! jq -ce '
+                .attestations
+                | if type == "array" and length > 0 then . else error("no attestations") end
+                | if all(.[]; (.bundle | type == "object" and length > 0))
+                  then .[].bundle else error("invalid attestation bundle") end
+            ' "${TMPDIR}/attestations-api.json" > "${TMPDIR}/api-${BUNDLE}"; then
+                die "Unusable anonymous attestations response — refusing to install"
+            fi
+            gh attestation verify "$file" --repo "$REPO" "${signer_pin[@]}" --bundle "${TMPDIR}/api-${BUNDLE}" \
+                || die "Attestation verification failed for $(basename "$file") — refusing to install"
+            return 0
+        fi
+        warn "Anonymous attestation API request failed; trying authenticated gh verification."
+    else
+        warn "Install jq to fetch legacy attestations without GitHub credentials."
+    fi
+    info "Verifying through gh's GitHub API transport instead."
     local out
     if out="$(gh attestation verify "$file" --repo "$REPO" "${signer_pin[@]}" 2>&1)"; then
         info "Attestation verified through the GitHub API."
@@ -225,7 +239,7 @@ EXPECTED="$(grep "${TARBALL}" "${TMPDIR}/SHA256SUMS" | cut -d' ' -f1)"
 [ -n "$EXPECTED" ] || die "Tarball ${TARBALL} not found in SHA256SUMS"
 verify_checksum "${TMPDIR}/${TARBALL}" "$EXPECTED"
 
-verify_attestation "${TMPDIR}/${TARBALL}"
+verify_attestation "${TMPDIR}/${TARBALL}" "$EXPECTED"
 
 info "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
