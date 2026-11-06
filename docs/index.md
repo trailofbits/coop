@@ -14,6 +14,8 @@ short navigational entrypoint; durable detail lives here.
   authoring checklists.
 - [`testing.md`](testing.md) — integration tests, mutation testing (+
   `.cargo/mutants.toml` scoping and baselines), fuzzing, kani.
+- [`user-impact.md`](user-impact.md) — assess user tasks and security or
+  reliability trade-offs during implementation and review.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
 - [`web-editor-design.md`](web-editor-design.md) — in-browser file editor.
@@ -42,6 +44,6 @@ short navigational entrypoint; durable detail lives here.
 ## Agent tooling
 
 - [`.agents/skills/`](../.agents/skills/) — shared review, closeout, mutation,
-  integration, and PR-shepherding workflows discovered by Codex.
+  integration, implementation-to-draft-PR, and PR-shepherding workflows.
 - [`.claude/`](../.claude/) — compatibility commands, skill entrypoints, and
   local hooks/settings.
