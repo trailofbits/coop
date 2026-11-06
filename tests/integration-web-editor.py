@@ -243,6 +243,19 @@ def vm(binary, name, config):
         assert request(url, "/healthz", headers={"Cookie": cookie})[0] == 200
         assert request(url, f"/?{urlsplit(url).query}", headers={"Cookie": cookie})[0] == 200
         guest_config, cgroup = inspect_guest_editor(command, name, url, project)
+        # Reject invalid projects on attach without advertising a URL or
+        # revoking the owner's existing session. '=' passes --help as a value.
+        for invalid_project, message in [
+            (f"{project}/missing-{secrets.token_hex(12)}", "Guest project directory is missing"),
+            ("--help", "--project must be an absolute guest path"),
+        ]:
+            failed = subprocess.run(default_launch + [f"--project={invalid_project}"],
+                                    capture_output=True, text=True, timeout=30)
+            assert failed.returncode != 0
+            assert message in failed.stderr, failed.stderr
+            assert "Open: " not in failed.stdout + failed.stderr
+            assert child.poll() is None and path.read_text() == password
+            assert request(url, "/healthz", headers={"Cookie": cookie})[0] == 200
         # Both invocations remain in the foreground. Ctrl+C in the attached
         # terminal revokes the shared session and releases the original owner.
         with editor(default_launch + ["--project", other_project]) as (attached, attached_url, path):
@@ -297,7 +310,7 @@ def vm(binary, name, config):
         assert retry_url != dead_url
         cookie = login(retry_url, path.read_text())
         assert request(retry_url, "/?folder=/workspace", headers={"Cookie": cookie})[0] == 200
-    print("PASS VM browser editor: custom/default projects, download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
+    print("PASS VM browser editor: custom/default projects, missing/option-like project rejection on attach, download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
 
 
 if __name__ == "__main__":

@@ -205,6 +205,7 @@ pub(crate) fn run(
                 status.port
             );
         }
+        check_project(&be.ssh_target(cfg, &inst)?, project)?;
         drop(operation);
         return wait_attached(&inst, session, project);
     }
@@ -288,6 +289,26 @@ pub(crate) fn run(
     crate::fs_util::remove_private_if_exists(&password_path(&inst))?;
     drop(directory);
     result
+}
+
+fn check_project(target: &SshTarget, project: &GuestPath) -> Result<()> {
+    let remote = RemoteCommand::new().literal("test -d ").arg(project);
+    let mut probe = target.ssh_command()?;
+    probe
+        .arg(target.addr())
+        .arg(remote.into_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let checked =
+        crate::process_output::run_status_bounded(&mut probe, Duration::from_secs(15), None)
+            .context("Cannot validate guest project directory over SSH")?;
+    match checked.code() {
+        Some(0) => Ok(()),
+        Some(1) => bail!(
+            "Guest project directory is missing; choose an existing --project directory in the VM"
+        ),
+        _ => bail!("Cannot validate guest project directory: SSH probe failed"),
+    }
 }
 
 /// An attached terminal has the same foreground/stop contract as the owner.
