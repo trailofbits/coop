@@ -205,6 +205,9 @@
         {
           inherit coop;
           shell = pkgs.mkShell {
+            env = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+              COOP_NIX_LIMA_PATH = pkgs.lib.makeBinPath darwinRuntimeInputs;
+            };
             packages = [
               toolchain
               pkgs.cmake
