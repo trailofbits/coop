@@ -192,7 +192,7 @@ child=$!
 ready=0
 while kill -0 "$child" 2>/dev/null; do
     observe_launch
-    if [[ $service_started == 1 && $ready == 0 ]] && curl --silent --fail --max-time 1 \
+    if [[ $service_started == 1 && $ready == 0 ]] && curl -q --silent --fail --max-time 1 \
         --unix-socket "$socket" http://localhost/healthz >/dev/null; then
         printf 'ready\n'
         ready=1
