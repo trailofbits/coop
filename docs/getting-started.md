@@ -6,7 +6,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 
 **macOS (Lima backend)**
 
-- [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
+- [Lima](https://github.com/lima-vm/lima) installed in a [supported system directory](backends.md#macos--lima)
   (`brew install lima`) — `coop setup` fails without it
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
@@ -141,6 +141,8 @@ upgrade/removal, or remove that entry and reinstall with `.#coop`.
 
 On macOS, the package includes Lima and the host command-line tools used by
 coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The package embeds Lima's executable and helper paths at build time; changing
+runtime `PATH` cannot redirect Lima lookup.
 The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
 install the [host prerequisites](#prerequisites) separately and keep them on
 `PATH`. VM images are created by `coop setup`.
