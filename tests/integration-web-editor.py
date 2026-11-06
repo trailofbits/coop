@@ -86,7 +86,7 @@ def editor(command):
 
 def inspect_guest_editor(command, name, url, project):
     # Inspect the real guest process, not just the launch-script text.
-    expected_config = f"/tmp/coop-we-{urlsplit(url).hostname.split('.')[0][:24]}/config.yaml"
+    expected_config = f"/tmp/coop-we-{urlsplit(url).hostname.split('.')[0][:24]}/config.yaml" if url else ""
     inspected = subprocess.run(command + ["exec", name, "--", "python3", "-c", '''
 from pathlib import Path
 import subprocess
@@ -96,7 +96,7 @@ for path in Path("/proc").glob("[0-9]*/cmdline"):
         args = path.read_bytes().split(b"\\0")
     except OSError:
         continue
-    if b"--disable-workspace-trust" in args and b"--service-type=exec" not in args and sys.argv[1].encode() in args and any(b"coop-web-editor/code-server-" in arg for arg in args):
+    if b"--disable-workspace-trust" in args and b"--service-type=exec" not in args and (not sys.argv[1] or sys.argv[1].encode() in args) and any(b"coop-web-editor/code-server-" in arg for arg in args):
         assert args[args.index(b"--auth") + 1] == b"password"
         assert args[-2] == sys.argv[2].encode()
         config_path = Path(args[args.index(b"--config") + 1].decode())
@@ -151,6 +151,56 @@ else:
     raise AssertionError(f"guest editor {unit} survived cleanup: {state}, remaining PIDs: {pids}")
 ''', unit, cgroup], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
+
+
+def owner_death_before_ready(command, name, launch, project):
+    # Suppress readiness while the real code-server and its sockets are live.
+    fixture = f"/tmp/coop-editor-curlrc-{secrets.token_hex(12)}"
+    curl_config = r'''
+set -euo pipefail
+config="$HOME/.curlrc"
+[[ -z ${XDG_CONFIG_HOME:-} ]] || config="$XDG_CONFIG_HOME/curlrc"
+[[ -z ${CURL_HOME:-} ]] || config="$CURL_HOME/.curlrc"
+if [[ $2 == setup ]]; then
+    mkdir -p -- "${config%/*}"
+    [[ ! -e $config && ! -L $config ]] || mv -- "$config" "$1"
+    printf 'proto = "=https"\n' > "$config"
+else
+    rm -f -- "$config"
+    [[ ! -e $1 && ! -L $1 ]] || mv -- "$1" "$config"
+fi
+'''
+    child = None
+    try:
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_config, "bash", fixture, "setup"],
+                       check=True, capture_output=True, timeout=30)
+        child = subprocess.Popen(launch, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 60
+        while True:
+            assert child.poll() is None, child.communicate()[1]
+            try:
+                guest_config, cgroup = inspect_guest_editor(command, name, None, project)
+                subprocess.run(command + ["exec", name, "--", "curl", "-q", "--silent", "--fail",
+                               "--max-time", "1", "--unix-socket", str(Path(guest_config).parent / "editor.sock"),
+                               "http://localhost/healthz"], check=True, capture_output=True, timeout=5)
+                break
+            except subprocess.CalledProcessError as error:
+                assert time.monotonic() < deadline, error.stderr
+                time.sleep(0.1)
+        child.kill()
+        stdout, stderr = child.communicate(timeout=10)
+        assert "Open: " not in stdout + stderr, "editor became ready before owner death"
+        assert_guest_editor_stopped(command, name, guest_config, cgroup)
+        subprocess.run(command + ["exec", name, "--", "timeout", "5", "bash", "-c",
+                       'while [[ -e $1 ]]; do sleep 0.1; done', "bash", str(Path(guest_config).parent)],
+                       check=True, capture_output=True, timeout=10)
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_config, "bash", fixture, "restore"],
+                       check=True, capture_output=True, timeout=30)
 
 
 def download_failure(command, name, launch):
@@ -289,6 +339,7 @@ def vm(binary, name, config):
         subprocess.run(command + ["stop", name], check=True, capture_output=True, timeout=60)
         assert child.wait(timeout=15) == 0
     subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True, timeout=120)
+    owner_death_before_ready(command, name, launch, project)
     # Abrupt owner death closes stdin; the cooperative guest stops its service
     # and exits SSH. A retry cleans stale private state and starts afresh.
     with editor(launch) as (child, dead_url, path):
@@ -310,7 +361,7 @@ def vm(binary, name, config):
         assert retry_url != dead_url
         cookie = login(retry_url, path.read_text())
         assert request(retry_url, "/?folder=/workspace", headers={"Cookie": cookie})[0] == 200
-    print("PASS VM browser editor: custom/default projects, missing/option-like project rejection on attach, download failure diagnostics, port collision, owner death/retry, native password auth, private config, repeat launch, stop, restart, session isolation")
+    print("PASS VM browser editor: custom/default projects, missing/option-like project rejection on attach, download failure diagnostics, port collision, owner death before/after readiness and retry, native password auth, private config, repeat launch, stop, restart, session isolation")
 
 
 if __name__ == "__main__":
