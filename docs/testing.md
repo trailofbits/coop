@@ -5,6 +5,13 @@ formal verification (kani), and two manual quality checks — mutation testing
 and fuzzing. Integration, unit tests, and Kani run in CI; mutation testing and
 fuzzing run manually when a change warrants them.
 
+## Refactoring and tests
+
+For a behavior-preserving refactor, establish a passing test baseline, then
+change the production code. Investigate failures before changing expectations,
+including compiler errors from private interface changes. Update tests to
+express the preserved behavior and verify they still detect a relevant regression.
+
 The `Firecracker integration` workflow runs the full suite across six
 disposable GitHub-hosted x64 runners: three on Ubuntu 24.04 and three on
 Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
