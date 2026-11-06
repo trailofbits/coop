@@ -1,6 +1,6 @@
 ---
 name: closeout-review
-description: Run the final scope-controlled review before committing, pushing, or opening a PR. Use for closeout review, readiness checks, or self-review of a completed branch.
+description: Run the final scope-controlled review before pushing or opening a PR. Use for closeout review, readiness checks, or self-review of a completed branch.
 ---
 
 # Closeout Review
@@ -47,18 +47,31 @@ Stop after two non-converging review/fix cycles, if the diff grows beyond about
 twice the baseline without approval, or when a local fix has become a redesign.
 
 Report what ran, accepted/fixed findings, rejected findings with a one-line
-reason, follow-ups, unrun platform gates, and a `clean` or `blocked` verdict.
+reason, follow-ups, unrun platform gates, and a `clean` or `blocked` code-review
+verdict. Report validation separately as complete, incomplete, or failed. An
+unavailable test does not turn an otherwise clean code review into a passed
+validation gate. Apply the [user-impact guidance](../../../docs/user-impact.md)
+when a material decision remains unresolved.
 
-On a `clean` verdict, record the reviewed commit for the compatibility PR gate:
+Iterate on the uncommitted diff as needed. After committing fixes, run one final
+full-diff review of the branch tip intended for the PR. Record its verdict in
+one marker. After a blocked verdict, open only a **draft** PR to carry unresolved
+findings or decisions for discussion. The compatibility hook checks that the
+commit was reviewed; it does not enforce PR readiness.
+Never write the marker before the final review or for an uncommitted diff:
 
 ```bash
+VERDICT=clean # or blocked, matching the reported code-review verdict
 COMMON_DIR="$(git rev-parse --git-common-dir)"
 case "$COMMON_DIR" in /*) ;; *) COMMON_DIR="$PWD/$COMMON_DIR" ;; esac
 COMMON_DIR="$(cd "$COMMON_DIR" && pwd)"
 DIR="$COMMON_DIR/closeout-review"
 mkdir -p "$DIR"
-git rev-parse HEAD > "$DIR/$(git rev-parse --abbrev-ref HEAD | tr '/' '-')"
+printf '%s %s\n' "$(git rev-parse HEAD)" "$VERDICT" > "$DIR/$(git rev-parse --abbrev-ref HEAD | tr '/' '-')"
 ```
 
-The marker is valid only for the current commit. Never record it for a blocked
-verdict or to bypass review.
+The marker is valid only for that commit. Writing the latest verdict replaces
+any earlier verdict for the same commit. A clean code-review verdict does not
+claim that every validation gate ran. Before marking an existing draft PR
+ready, repeat the closeout and validation checks; the PR creation hook does
+not guard that later transition.
