@@ -35,6 +35,7 @@ fn completion_protocol_returns_live_candidates_for_every_shell() -> anyhow::Resu
         for (words, index, candidate) in [
             (vec!["coop", ""], "1", "stop"),
             (vec!["coop", "profiles", "show", "py"], "3", "python"),
+            (vec!["coop", "editor", "--w"], "2", "--web"),
         ] {
             let output = Command::new(env!("CARGO_BIN_EXE_coop"))
                 .arg("--")

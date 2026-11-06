@@ -1443,6 +1443,7 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        crate::web_editor::stop(&inst)?;
         let outcome = if inst.probe_liveness()? {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, &inst);
             vm.stop()?;
@@ -1468,6 +1469,7 @@ impl VmBackend for FirecrackerBackend {
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
         if inst.probe_liveness()? {
+            crate::web_editor::stop(inst)?;
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
@@ -1612,6 +1614,7 @@ impl VmBackend for FirecrackerBackend {
                 inst.name,
             );
         }
+        crate::web_editor::stop(&inst)?;
         Ok(StoppedInstance::new(inst, lock))
     }
 
@@ -1713,6 +1716,7 @@ impl VmBackend for LimaBackend {
     ) -> Result<(StoppedInstance, StopOutcome)> {
         let (inst, _target) = running.into_parts();
         let operation = lock_instance_operation(&inst)?;
+        crate::web_editor::stop(&inst)?;
         let outcome = match crate::lima::probe_state(&inst)? {
             Some(crate::lima::LimaState::Running) => {
                 crate::lima::stop_running(&inst)?;
@@ -1727,6 +1731,7 @@ impl VmBackend for LimaBackend {
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        crate::web_editor::stop(inst)?;
         crate::lima::destroy(inst)?;
         if inst.dir.exists()
             && let Err(e) = fs::remove_dir_all(&inst.dir)
@@ -1838,6 +1843,7 @@ impl VmBackend for LimaBackend {
             Some(state) => bail!("Lima instance '{}' is {state}, not stopped", inst.name),
             None => bail!("Lima instance '{}' is absent, not stopped", inst.name),
         }
+        crate::web_editor::stop(&inst)?;
         Ok(StoppedInstance::new(inst, lock))
     }
 
