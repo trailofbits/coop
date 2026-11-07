@@ -23,13 +23,15 @@ Setup verifies that `limactl --version` is reachable. If it is not, setup fails 
 `coop setup` builds a golden disk image that all instances clone from:
 
 1. Generates an ed25519 SSH key pair, stored in the coop data directory.
-2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
+2. Creates a temporary builder VM from an Ubuntu 26.04 LTS cloud image. The Lima YAML template includes a cloud-init provision script and Lima's netplan setting for the first-boot NIC rename.
 3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
 4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
 5. Stops the builder VM and extracts its disk as the golden image.
 6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
 
 The builder VM is deleted after extraction, whether the build succeeds or fails.
+
+Running `coop setup` with a cached Ubuntu 24.04 golden image detects the changed source-image recipe and rebuilds it. New instances then clone the Ubuntu 26.04 image. Existing instance disks keep their current OS; stop/start does not upgrade them. Recreate an instance to use the new image, after saving any data you need from its disk.
 
 ### How instances work
 
