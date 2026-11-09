@@ -722,6 +722,12 @@ coop editor my-project --web --project /workspace/subdir --port 8080
 
 Choose a running VM; code-server installs inside it on first use. Open the URL
 printed in your terminal, then enter the displayed password to sign in.
+
+Use this mode to reduce host exposure when editing an untrusted guest: the editor,
+extensions, and terminals run inside the VM, while your host renders the editor
+in a browser. The browser still processes guest-controlled content. See
+[editor security](editor.md#editor-integration) for the comparison with host editors.
+
 `--project` selects an existing guest directory, defaulting to `/workspace`.
 
 During first use, coop reports installation and download progress. Failures
