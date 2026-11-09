@@ -1,10 +1,9 @@
 # Trust model
 
-This is the engineering-facing trust model for `coop` — the authoritative list
-of trust boundaries, taint sources, and the invariants that hold the isolation
-together. The shared [`review`](../.agents/skills/review/SKILL.md) workflow
-reads this file, and the root [`AGENTS.md`](../AGENTS.md) "Trust model" section
-points here. Apply these checks whenever you build or review a change.
+This document records coop's trust boundaries, taint sources, and isolation
+invariants. It is the security reference for contributors. The
+[`review`](../.agents/skills/review/SKILL.md) workflow and
+[`AGENTS.md`](../AGENTS.md) link to it.
 
 This complements — it does not replace — [`SECURITY.md`](../SECURITY.md), which
 is the vulnerability-disclosure policy. `SECURITY.md` tells outsiders how to
@@ -27,15 +26,12 @@ autonomy *inside* that boundary, so the guest is deliberately permissive:
   `--ask` passes `--permission-mode default` so the guest config does not
   keep always-approve for that session.
 
-This is intentional and correct: there is **no privilege boundary inside the
-guest to protect** — the whole VM is the blast radius. The security model is
-"anything the agent does stays in the VM." Every rule below exists to keep that
-true: to stop guest-authored (therefore untrusted) data from escalating across
-the VM boundary into host code execution, host filesystem escape, or credential
-exposure.
-
-Treat the guest as **untrusted** from the host's point of view, even though the
-user launched it.
+The guest has broad privileges within its VM. Guest execution is isolated
+from the host, but configured channels cross the boundary: live mounts, file
+sync, forwarded credentials, SSH, and host-side services. The rules below bound
+those crossings so guest-authored data cannot become host code execution,
+filesystem escape, or unintended credential exposure. The host treats the
+guest as **untrusted**, even though the user launched it.
 
 ## Trust zones
 
@@ -537,10 +533,6 @@ user `env_forward` entries, and the VM SSH key. The invariants:
     `sandbox-exec` is officially deprecated but still functional and has no CLI
     successor — a pragmatic, aging primitive.
 
-  These match the design's "Cross-platform hardening" note: the Firecracker
-  (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
-  with Seatbelt, with the stated caveats.
-
 ## Browser editor transport
 
 `coop editor --web` runs code-server, extensions, and terminals inside the VM,
@@ -677,19 +669,19 @@ understanding the rationale; do flag a change that *widens* them:
   work around the minimal CI kernel (no nftables, no systemd-resolved). Guest
   config only; no host-side trust impact.
 
-## Stop-and-confirm checklist
+## Changes requiring explicit confirmation
 
-Stop and get explicit human confirmation before merging a change that:
+The following changes require explicit human confirmation before merge:
 
-- adds an outbound URL, a network listener, or an egress/`FORWARD`/NAT rule —
-  name the boundary it crosses and what authenticates it;
-- forwards a new secret into the guest, or makes an existing one persistent
-  inside the guest;
-- runs a host subprocess on tainted (guest-, project-, or fetch-derived)
-  bytes — inspect the full launch context above, including executable lookup,
-  environment, cwd, and tool configuration, as well as shell/argv handling;
-- writes a **host** filesystem path derived from tainted data — validate against
-  traversal first;
-- logs or traces tainted or secret content — that channel becomes an
-  exfiltration path;
-- softens any step of the `coop update` verification chain.
+- An outbound URL, network listener, or egress/`FORWARD`/NAT rule is added;
+  its boundary and authentication require review.
+- A new secret is forwarded into the guest, or an existing one becomes
+  persistent there.
+- A host subprocess receives tainted (guest-, project-, or fetch-derived)
+  input; the full launch context includes executable lookup, environment, cwd,
+  tool configuration, shell behavior, and arguments.
+- A host filesystem path is derived from tainted data; traversal and path
+  resolution require review.
+- Tainted or secret content enters logs or traces, creating an exfiltration
+  channel.
+- Any step of the `coop update` verification chain is weakened.

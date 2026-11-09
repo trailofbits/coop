@@ -11,7 +11,7 @@
 //! but `coop-proxy` applies a provider-specific operation profile as well as a
 //! fixed upstream and authentication scheme. Adding a provider therefore
 //! requires an explicit proxy policy change, not just a host, port, and auth
-//! configuration. See [`docs/design/issue-411-injecting-proxy.md`].
+//! configuration. See [`docs/credential-proxy.md`].
 //!
 //! Binding host loopback + reverse-tunnelling works identically on both
 //! backends (Firecracker and Lima), keeps the listener off every non-loopback

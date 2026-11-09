@@ -3,7 +3,7 @@
 //! Every command that supports `--json` builds a single `Serialize` view
 //! model and hands it to [`render_json`]; the human formatter reads the
 //! same value, so the two representations cannot disagree about the data.
-//! See `docs/json-output-design.md` for the full design.
+//! See `docs/commands.md` for the supported commands and JSON shapes.
 
 use std::io::Write as _;
 

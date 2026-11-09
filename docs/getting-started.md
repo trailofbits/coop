@@ -1,6 +1,11 @@
 # Getting Started
 
-coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. On Linux, it spins up Firecracker microVMs backed by KVM. On macOS, it uses Lima with Apple's Virtualization.framework. Each VM gets its own filesystem, network stack, and Docker daemon. Agent CLIs never touch your host.
+coop runs Claude Code, Codex, and Grok Build inside virtual machines. On
+Linux, it uses Firecracker microVMs backed by KVM; on macOS, it uses Lima with
+Apple's Virtualization.framework. Each VM has its own filesystem, network stack,
+and Docker daemon. Host resources remain accessible through features you choose,
+including [live mounts and file sync](workspaces.md),
+[credential forwarding](credential-proxy.md), and [host editors](editor.md).
 
 ## Prerequisites
 
@@ -233,7 +238,7 @@ The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/
 
 ### Agent integration
 
-Forward your API keys and GitHub credentials into the guest:
+For direct agent authentication and host config imports, use this example:
 
 ```toml
 github = "auto"
@@ -265,7 +270,11 @@ GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-
 coop picks up `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and, in the default Codex
 API-key mode, `OPENAI_API_KEY` from your environment automatically. Setting
 them explicitly under `claude.api_key`, `codex.api_key`, or `grok.api_key`
-also works, but environment variables are preferred.
+also works, but environment variables are preferred. To keep Anthropic or
+OpenAI credentials on the host, use the opt-in
+[credential proxy](credential-proxy.md). [Isolated Firecracker
+mode](firecracker-network-modes.md) requires the proxy for cloud access and
+suppresses direct credential forwarding.
 
 For Codex account or workspace access without OpenAI API billing, set
 `[codex] auth = "chatgpt"` and rebuild any old image with `coop setup
