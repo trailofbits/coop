@@ -1,4 +1,8 @@
 set -euo pipefail
+# The chroot inherits the host's PATH. Hosts with a merged sbin (e.g. Arch)
+# omit /usr/sbin and /sbin, where Ubuntu keeps usermod, useradd, ldconfig, etc.
+# that dpkg and package maintainer scripts expect to find.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
 export DPKG_OPTIONS='--force-confnew'
 APT_OPTS=(-o Dpkg::Options::=--force-confnew)
