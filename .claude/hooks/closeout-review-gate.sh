@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PreToolUse gate: block `gh pr create` until a closeout review has run to a
-# clean verdict on the branch the PR is created FROM, at that branch's current
-# tip. The closeout-review skill records the marker as its final step; this
-# hook only checks it.
+# PreToolUse gate: require a closeout review on the branch the PR is created
+# FROM, at its current tip. The closeout-review skill records the verdict;
+# this hook checks only that a review was completed for that commit.
 #
 # Worktree-aware: the branch under review usually lives in a linked worktree
 # while this hook runs from the main checkout (CLAUDE_PROJECT_DIR). So we
@@ -23,8 +22,8 @@ COMMAND=$(jq -r '.tool_input.command // .tool_input.cmd // .command // .cmd // e
 [ -z "$COMMAND" ] && exit 0
 
 # Only gate PR creation. `pr create` is contiguous (subcommand follows `pr`).
-# POSIX anchors (no `\b`) so detection behaves the same under GNU and BSD grep.
-printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)' || exit 0
+PR_CREATE_RE='(^|[[:space:]])gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)'
+[[ "$COMMAND" =~ $PR_CREATE_RE ]] || exit 0
 
 # Locate the directory the command actually runs git/gh in: an explicit
 # `cd <dir> && ...` prefix wins, else the cwd the hook was invoked with.
@@ -120,22 +119,26 @@ esac
 COMMON_DIR=$(cd "$COMMON_DIR" 2>/dev/null && pwd) || exit 0
 
 MARKER="${COMMON_DIR}/closeout-review/$(echo "$BRANCH" | tr '/' '-')"
-
-if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$HEAD_SHA" ]; then
-  exit 0
+if [ -f "$MARKER" ]; then
+  verdict=$(cat "$MARKER")
+  # Accept an older clean marker containing only the SHA.
+  if [ "$verdict" = "$HEAD_SHA clean" ] ||
+    [ "$verdict" = "$HEAD_SHA blocked" ] ||
+    [ "$verdict" = "$HEAD_SHA" ]; then
+    exit 0
+  fi
 fi
 
 cat >&2 <<EOF
-Closeout gate: a closeout review has not run on this branch at the current
-commit, so this PR cannot be created yet.
+Closeout gate: this branch lacks the review marker required for this PR at its
+current commit.
 
 Branch: ${BRANCH}
 HEAD:   ${HEAD_SHA}
 
-Run the closeout-review skill now (invoke it via the Skill tool). Work the
-diff to a clean verdict — fix in-scope blockers, defer follow-ups. As its
-final step it records the gate marker for this exact commit, after which
-\`gh pr create\` is allowed.
+Run the closeout-review skill now (invoke it via the Skill tool). It records
+the completed review verdict for this exact commit. Follow its guidance on
+draft PRs when the verdict is blocked.
 
 If you commit again after the review, re-run it: the marker is bound to the
 reviewed commit, so new commits re-arm the gate.

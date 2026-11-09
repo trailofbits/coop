@@ -14,7 +14,7 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, or config phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -65,7 +65,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config)
+    lifecycle|workspace|config|features)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -215,6 +215,19 @@ assert_lima_headless() {
         pass "Lima stays headless $phase"
     else
         fail "Lima stays headless $phase" "video.display=${display:-missing}"
+    fi
+}
+
+# Stopped instances omit disk size from status; inspect the host image instead.
+host_disk_bytes() {
+    local inst="$1"
+    if [[ $(uname -s) == Darwin ]]; then
+        local dir="${LIMA_HOME:-$HOME/.lima}/coop-$inst"
+        local disk="$dir/disk"
+        [[ -e "$disk" ]] || disk="$dir/diffdisk"
+        stat -L -f %z "$disk"
+    else
+        stat -c %s "$HOME/.coop/instances/$inst/rootfs.ext4"
     fi
 }
 
@@ -4014,25 +4027,16 @@ test_status_stopped() {
     fi
 }
 
-test_resize_status() {
+test_resize_disk_size() {
     echo ""
-    echo "=== Phase: resize updates status disk size ==="
+    echo "=== Phase: resize updates disk size ==="
 
-    # Get current disk size from status (instance is stopped).
-    # Firecracker status requires a running VM and doesn't show
-    # "Disk: N GiB", so skip this test if status fails or the
-    # disk line is absent (Lima-only feature).
-    if ! coop status "$INSTANCE" 2>/dev/null; then
-        skip "resize updates status disk size" "status unavailable for stopped instance"
+    local old_bytes old_disk
+    if ! old_bytes=$(host_disk_bytes "$INSTANCE"); then
+        fail "inspect disk before resize" "host image size unavailable"
         return
     fi
-    local old_disk
-    old_disk=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-    if [[ -z "$old_disk" || "$old_disk" -eq 0 ]]; then
-        skip "resize updates status disk size" "status does not report disk GiB"
-        return
-    fi
-    pass "status shows disk before resize (${old_disk} GiB)"
+    old_disk=$((old_bytes / 1073741824))
 
     if coop resize "$INSTANCE" --size 1GB; then
         fail "resize rejects decimal GB suffix" "accepted 1GB"
@@ -4056,19 +4060,17 @@ test_resize_status() {
         return
     fi
 
-    # Verify status now reports the larger size
-    if coop status "$INSTANCE" 2>/dev/null; then
-        local new_disk
-        new_disk=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-        local expected_disk=$(( old_disk + 1 ))
+    local new_disk
+    if new_disk=$(host_disk_bytes "$INSTANCE"); then
+        local expected_disk=$((old_bytes + 1073741824))
         if [[ "$new_disk" -eq "$expected_disk" ]]; then
-            pass "status reflects resized disk (${new_disk} GiB)"
+            pass "disk grew by 1 GiB"
         else
-            fail "status reflects resized disk" \
-                "expected ${expected_disk} GiB, got ${new_disk} GiB"
+            fail "disk grew by 1 GiB" \
+                "expected $expected_disk bytes, got $new_disk bytes"
         fi
     else
-        fail "status after resize" "exit code: $?"
+        fail "inspect disk after resize" "host image size unavailable"
     fi
 }
 
@@ -4137,6 +4139,15 @@ test_resize_disk_start() {
     if coop status "$INSTANCE" 2>/dev/null &&
         [[ "$HARNESS_OUT" == *"running"* || "$HARNESS_OUT" == *"Running"* ]]; then
         pass "instance is running after disk-only resize --start"
+        if [[ $(uname -s) == Darwin ]]; then
+            local disk_bytes
+            if disk_bytes=$(host_disk_bytes "$INSTANCE") &&
+                [[ "$HARNESS_OUT" == *"Disk: "*" ($disk_bytes bytes)"* ]]; then
+                pass "status reflects resized disk"
+            else
+                fail "status reflects resized disk" "status does not match host image size"
+            fi
+        fi
     else
         fail "instance is running after disk-only resize --start" \
             "status unavailable for running instance"
@@ -4747,8 +4758,6 @@ test_restore_reprovision() {
     # Grow the disk first, so the reprovision has a non-template size to carry
     # across the swap. `restore_disk` copies the template, which is smaller,
     # so a reprovision that skipped the re-grow would shrink the instance back.
-    # As in test_resize_status, the "Disk: N GiB" line is Lima-only, so an
-    # absent value degrades to a skip rather than a spurious failure.
     local disk_before=""
     if coop stop "$INSTANCE"; then
         pass "stop before disk grow exits 0"
@@ -4758,11 +4767,13 @@ test_restore_reprovision() {
     fi
     if coop resize "$INSTANCE" --size +1G; then
         pass "grow disk before reprovision exits 0"
-        if coop status "$INSTANCE" 2>/dev/null; then
-            disk_before=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
+        if ! disk_before=$(host_disk_bytes "$INSTANCE"); then
+            fail "inspect disk before reprovision" "host image size unavailable"
+            return
         fi
     else
         fail "grow disk before reprovision exits 0" "exit code: $?; stderr: $HARNESS_ERR"
+        return
     fi
     # Not `|| true`: a failed restart silently sends the reprovision down the
     # already-stopped branch instead of the running one, and the phase would
@@ -4948,24 +4959,17 @@ PYEOF
     # A `coop resize --size` must survive the wipe: the image the disk is
     # restored from may be smaller, so the reprovision may have to re-grow it.
     local disk_after=""
-    if coop status "$INSTANCE" 2>/dev/null; then
-        disk_after=$(echo "$HARNESS_OUT" | sed -n 's/.*Disk: \([0-9][0-9]*\) GiB.*/\1/p' | head -1)
-    fi
-    if [[ -z "$disk_before" || -z "$disk_after" ]]; then
-        skip "disk size preserved across reprovision" "status does not report disk GiB"
-    elif [[ "$disk_after" -ge "$disk_before" ]]; then
-        pass "disk size preserved across reprovision (${disk_after} GiB)"
+    if ! disk_after=$(host_disk_bytes "$INSTANCE"); then
+        fail "inspect disk after reprovision" "host image size unavailable"
+    elif [[ "$disk_after" -eq "$disk_before" ]]; then
+        pass "disk size preserved across reprovision ($disk_after bytes)"
     else
         fail "disk size preserved across reprovision" \
-            "before=${disk_before} GiB after=${disk_after} GiB (the reprovision shrank the disk)"
+            "before=$disk_before bytes after=$disk_after bytes"
     fi
 
-    # `coop status` reports the host image file's size, which `resize_disk`
-    # changes with `truncate` (and a matching lima.yaml `disk:`) — the guest
-    # filesystem only grows
-    # when the guest expands the partition on boot. So the host-side check
-    # above cannot tell a real re-grow from a shrunken guest. Compare what the
-    # guest itself sees, in 1K blocks.
+    # A larger host image can still contain a shrunken guest filesystem.
+    # Compare what the guest itself sees, in 1K blocks.
     local guest_fs_after=""
     guest_fs_after=$(coop_exec sh -c "df -Pk / | awk 'NR==2 {print \$2}'") || guest_fs_after=""
     if [[ -z "$guest_fs_before" || -z "$guest_fs_after" ]]; then
@@ -6141,96 +6145,6 @@ test_multi_instance() {
     untrack_instance "$inst_b"
 }
 
-# ── Named images test (--full only) ──────────────────────────
-
-test_named_images() {
-    echo ""
-    echo "=== Phase: named images ==="
-
-    # Build a second image with a different name
-    local img_name="test-img-$$"
-    if coop setup -y --image "$img_name"; then
-        pass "setup --image $img_name exits 0"
-    else
-        fail "setup --image $img_name exits 0" "exit code: $?"
-        echo "stderr: $HARNESS_ERR"
-        return
-    fi
-
-    # List images — should show both default and the new one
-    if coop images; then
-        if echo "$HARNESS_OUT" | grep -q "default"; then
-            pass "images lists 'default'"
-        else
-            fail "images lists 'default'" "output: $HARNESS_OUT"
-        fi
-
-        if echo "$HARNESS_OUT" | grep -q "$img_name"; then
-            pass "images lists '$img_name'"
-        else
-            fail "images lists '$img_name'" "output: $HARNESS_OUT"
-        fi
-    else
-        fail "images exits 0" "exit code: $?"
-    fi
-
-    # Create an instance from the named image
-    local inst_name="${INSTANCE}-img"
-    local img_ws="$tmpdir/${inst_name}-ws"
-    mkdir -p "$img_ws"
-    if coop up "$img_ws" --name "$inst_name" --no-agents --image "$img_name"; then
-        STARTED_INSTANCES+=("$inst_name")
-        pass "up --image $img_name exits 0"
-    else
-        fail "up --image $img_name exits 0" "exit code: $?"
-        coop images --delete "$img_name" 2>/dev/null || true
-        return
-    fi
-
-    # Status should show the image name
-    if coop status; then
-        if echo "$HARNESS_OUT" | grep -q "$img_name"; then
-            pass "status shows image name"
-        else
-            fail "status shows image name" "output: $HARNESS_OUT"
-        fi
-    else
-        fail "status exits 0" "exit code: $?"
-    fi
-
-    # Guest should be functional
-    GUEST_INSTANCE="$inst_name"
-    local hostname
-    hostname=$(guest_exec hostname) || hostname=""
-    unset GUEST_INSTANCE
-
-    if [[ -n "$hostname" ]]; then
-        pass "instance from named image reachable via SSH"
-    else
-        fail "instance from named image reachable via SSH" "no response"
-    fi
-
-    # Clean up instance
-    coop destroy "$inst_name" 2>/dev/null || true
-    untrack_instance "$inst_name"
-
-    # Delete the named image
-    if coop images --delete "$img_name"; then
-        pass "images --delete $img_name exits 0"
-    else
-        fail "images --delete $img_name exits 0" "exit code: $?"
-    fi
-
-    # Verify it's gone
-    if coop images; then
-        if echo "$HARNESS_OUT" | grep -q "$img_name"; then
-            fail "image removed after delete" "still listed"
-        else
-            pass "image removed after delete"
-        fi
-    fi
-}
-
 # ── Custom profiles test (--full only) ───────────────────────
 
 test_custom_profiles() {
@@ -6256,13 +6170,19 @@ CFGEOF
     # Build an image with the custom profile
     local custom_img="custom-test-$$"
     if "$BINARY" --config "$cfg_file" setup -y --image "$custom_img" --profile test-custom 2>"$tmpdir/stderr"; then
-        pass "setup with custom profile exits 0"
+        pass "setup --image with custom profile exits 0"
     else
         local err
         err=$(cat "$tmpdir/stderr")
         fail "setup with custom profile exits 0" "exit code: $? stderr: $err"
         rm -rf "$cfg_dir"
         return
+    fi
+
+    if coop images && [[ "$HARNESS_OUT" == *default* && "$HARNESS_OUT" == *"$custom_img"* ]]; then
+        pass "images lists default and custom named image"
+    else
+        fail "images lists default and custom named image" "output: $HARNESS_OUT"
     fi
 
     # Create instance from custom image
@@ -6276,6 +6196,12 @@ CFGEOF
         fail "up with custom profile image exits 0" "exit code: $?"
         rm -rf "$cfg_dir"
         return
+    fi
+
+    if coop status && [[ "$HARNESS_OUT" == *"$custom_img"* ]]; then
+        pass "status shows custom named image"
+    else
+        fail "status shows custom named image" "output: $HARNESS_OUT"
     fi
 
     # Verify custom profile effects in guest
@@ -6321,7 +6247,16 @@ CFGEOF
     # Clean up
     coop destroy "$inst_name" 2>/dev/null || true
     untrack_instance "$inst_name"
-    coop images --delete "$custom_img" 2>/dev/null || true
+    if coop images --delete "$custom_img"; then
+        pass "images --delete custom named image exits 0"
+    else
+        fail "images --delete custom named image exits 0" "exit code: $?"
+    fi
+    if coop images && [[ "$HARNESS_OUT" != *"$custom_img"* ]]; then
+        pass "custom named image is absent after deletion"
+    else
+        fail "custom named image is absent after deletion" "output: $HARNESS_OUT"
+    fi
     rm -rf "$cfg_dir"
 }
 
@@ -6542,6 +6477,10 @@ test_host_mount() {
         skip "bidirectional mount" "Firecracker uses one-time rsync sync"
         skip "live mount sync" "Firecracker uses one-time rsync sync"
     fi
+
+    # The editor uses the VM's existing filesystem access, including live
+    # Lima shares. Exercise the same lifecycle checks on a mounted workspace.
+    test_web_editor "$mount_instance"
 
     # `restore --reprovision` against a MOUNT-source instance. The main
     # reprovision phase only covers WorkspaceSource::Workspace (the copy
@@ -8757,16 +8696,19 @@ test_provision_failure() {
     # Inject a failure into the provision script via env var.
     # The coop checks COOP_TEST_INJECT_PROVISION_FAILURE and
     # appends 'exit 1' to the provision script before cleanup.
-    # setup --rebuild should fail with a clear error message.
+    # Use a separate image so the already-built default stays available.
+    local failed_image="provision-failure-$$"
     local rc=0
     local err
-    COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" setup -y --rebuild >/dev/null 2>"$tmpdir/pf-stderr" || rc=$?
+    COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" --config "$SUITE_CONFIG" setup -y \
+        --image "$failed_image" >/dev/null 2>"$tmpdir/pf-stderr" || rc=$?
     err=$(cat "$tmpdir/pf-stderr")
 
     if [[ $rc -ne 0 ]]; then
         pass "setup fails when provision script fails (exit $rc)"
     else
         fail "setup fails when provision script fails" "expected non-zero exit, got 0"
+        coop images --delete "$failed_image" >/dev/null 2>&1 || true
         return
     fi
 
@@ -8779,15 +8721,31 @@ test_provision_failure() {
         fail "error message mentions failure" "stderr: $err"
     fi
 
-    # Rebuild the golden image cleanly so subsequent tests work
-    echo "  Rebuilding clean golden image..."
-    if coop setup -y --rebuild; then
-        pass "clean rebuild succeeds after failure"
+    # The failure must not damage the default template. Its normal setup path
+    # should reuse the completed image, and a new VM must still boot from it.
+    if coop setup -y && [[ "$HARNESS_ERR" == *"Template rootfs: up to date"* ]]; then
+        pass "default image remains complete after another image fails"
     else
-        fail "clean rebuild succeeds after failure" "exit code: $?"
-        echo "FATAL: cannot continue without golden image"
-        exit 1
+        fail "default image remains complete after another image fails" \
+            "setup did not reuse the existing image: $HARNESS_ERR"
     fi
+
+    local inst_name="${INSTANCE}-after-provision-failure"
+    local workspace="$tmpdir/$inst_name-ws"
+    mkdir -p "$workspace"
+    if coop up "$workspace" --name "$inst_name" --no-agents; then
+        STARTED_INSTANCES+=("$inst_name")
+        if coop exec "$inst_name" -- true; then
+            pass "default image boots after another image fails"
+        else
+            fail "default image boots after another image fails" "stderr: $HARNESS_ERR"
+        fi
+        coop destroy "$inst_name" >/dev/null 2>&1 || true
+        untrack_instance "$inst_name"
+    else
+        fail "default image boots after another image fails" "stderr: $HARNESS_ERR"
+    fi
+    coop images --delete "$failed_image" >/dev/null 2>&1 || true
 }
 
 # ── Removed devcontainer CLI (pre-VM) ─────────────────────────
@@ -9030,7 +8988,26 @@ test_guest_user_alt() {
     fi
 }
 
+# Emit per-test elapsed time for both local runs and CI shard logs.
+run_timed_test() {
+    local started=$SECONDS
+    "$@"
+    printf 'TIMING test:%s %ds\n' "$1" "$((SECONDS - started))"
+}
+
 # ── Main ──────────────────────────────────────────────────────
+
+test_web_editor() {
+    echo ""
+    echo "=== Phase: web editor ==="
+    local probe name="${1:-$INSTANCE}"
+    probe="$(dirname "$0")/integration-web-editor.py"
+    if python3 "$probe" --binary "$BINARY" --name "$name" --config "$SUITE_CONFIG"; then
+        pass "browser editor installation, authentication, restart and cleanup"
+    else
+        fail "browser editor installation, authentication, restart and cleanup"
+    fi
+}
 
 main() {
     echo "coop integration tests"
@@ -9060,144 +9037,160 @@ EOF
     verify_binary
 
     # Pre-VM tests
-    test_validate
-    test_invalid_names
-    test_mem_floor
-    test_profiles_cli
-    test_completions
-    test_removed_devcontainer_cli
-    test_guest_user_validation
-    test_pull_cli_validation
+    run_timed_test test_validate
+    run_timed_test test_invalid_names
+    run_timed_test test_mem_floor
+    run_timed_test test_profiles_cli
+    run_timed_test test_completions
+    run_timed_test test_removed_devcontainer_cli
+    run_timed_test test_guest_user_validation
+    run_timed_test test_pull_cli_validation
 
     # Setup + primary instance
-    test_setup
+    run_timed_test test_setup
     # Keep the stateful primary-instance sequence together. Extended phases
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
-        test_up_creates_primary_instance
-        test_private_storage
-        test_start_rejects_missing_instance
-        test_duplicate_name
-        test_status_running
-        test_list_running
-        test_running_vm_completions
-        test_auto_resolve_running
-        test_shell_connectivity
-        test_firecracker_vsock_transport
-        test_ssh_alias
-        test_ssh_config
-        test_editor
-        test_exec
-        test_claude_bin_path
-        test_grok_bin_path
-        test_grok_settings_merge
-        test_claude_settings_merge
-        test_claude_onboarding_seed
-        test_codex_bin_path
-        test_codex_account_auth_support
-        test_codex_chatgpt_mode
-        test_codex_sandbox_bypass
-        test_program_status
-        test_agent_update
-        test_github_token_forwarding
-        test_term_handling
-        test_guest_environment
-        test_sudo
-        test_network
-        test_docker
-        test_logs
-        test_profiles
-        test_guest_fingerprint
-        test_vsock_control_without_guest_network
-        test_firecracker_isolated_network_mode
-        test_legacy_firecracker_control_compatibility
+        run_timed_test test_up_creates_primary_instance
+        run_timed_test test_private_storage
+        run_timed_test test_start_rejects_missing_instance
+        run_timed_test test_duplicate_name
+        run_timed_test test_status_running
+        run_timed_test test_list_running
+        run_timed_test test_running_vm_completions
+        run_timed_test test_auto_resolve_running
+        run_timed_test test_shell_connectivity
+        run_timed_test test_firecracker_vsock_transport
+        run_timed_test test_ssh_alias
+        run_timed_test test_ssh_config
+        run_timed_test test_editor
+        run_timed_test test_web_editor
+        run_timed_test test_exec
+        run_timed_test test_claude_bin_path
+        run_timed_test test_grok_bin_path
+        run_timed_test test_grok_settings_merge
+        run_timed_test test_claude_settings_merge
+        run_timed_test test_claude_onboarding_seed
+        run_timed_test test_codex_bin_path
+        run_timed_test test_codex_account_auth_support
+        run_timed_test test_codex_chatgpt_mode
+        run_timed_test test_codex_sandbox_bypass
+        run_timed_test test_program_status
+        run_timed_test test_agent_update
+        run_timed_test test_github_token_forwarding
+        run_timed_test test_term_handling
+        run_timed_test test_guest_environment
+        run_timed_test test_sudo
+        run_timed_test test_network
+        run_timed_test test_docker
+        run_timed_test test_logs
+        run_timed_test test_profiles
+        run_timed_test test_guest_fingerprint
+        run_timed_test test_vsock_control_without_guest_network
+        run_timed_test test_firecracker_isolated_network_mode
+        run_timed_test test_legacy_firecracker_control_compatibility
 
         # Stop + restart + stopped-state verification
-        test_stop_preserves_recent_writes
-        test_stop
-        test_stop_idempotency
-        test_auto_resolve_stopped
-        test_status_stopped
-        test_agent_update_stopped
-        test_list_stopped
-        test_stopped_vm_completions
-        test_resize_status
-        test_resize_retry_firecracker
-        test_resize_disk_start
-        test_reconfigure
-        test_commit_restore
-        test_private_storage
-        test_restart_stopped
-        test_restart_rejects_ignored_flags
-        test_restore_reprovision
-        test_destroy
-        test_auto_resolve_no_instances
-        test_list_empty
+        run_timed_test test_stop_preserves_recent_writes
+        run_timed_test test_stop
+        run_timed_test test_stop_idempotency
+        run_timed_test test_auto_resolve_stopped
+        run_timed_test test_status_stopped
+        run_timed_test test_agent_update_stopped
+        run_timed_test test_list_stopped
+        run_timed_test test_stopped_vm_completions
+        run_timed_test test_resize_disk_size
+        run_timed_test test_resize_retry_firecracker
+        run_timed_test test_resize_disk_start
+        run_timed_test test_reconfigure
+        if [[ "$SHARD" == all ]]; then
+            run_timed_test test_commit_restore
+        fi
+        run_timed_test test_private_storage
+        run_timed_test test_restart_stopped
+        run_timed_test test_restart_rejects_ignored_flags
+        run_timed_test test_restore_reprovision
+        run_timed_test test_destroy
+        run_timed_test test_auto_resolve_no_instances
+        run_timed_test test_list_empty
 
         # Idempotency: re-run commands that should be safe to repeat
-        test_idempotency
+        run_timed_test test_idempotency
 
+    fi
+
+    if [[ "$SHARD" == features ]]; then
+        # Commit/restore needs a stopped primary instance but none of the
+        # preceding lifecycle phases. Keep its image and VM state on this runner.
+        run_timed_test test_up_creates_primary_instance
+        if ! coop stop "$INSTANCE"; then
+            fail "stop primary instance before commit/restore" "$HARNESS_ERR"
+        fi
+        run_timed_test test_commit_restore
+        run_timed_test test_destroy
     fi
 
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
-        test_quickstart
-        test_up_project_workflow
-        test_git_repo
-        test_host_mount
-        test_host_mount_custom_guest_path
-        test_port_forwards
-        test_workspace_sync
-        test_appledouble_sidecars
-        test_multi_instance
-        test_named_images
-        test_guest_user_alt
-        test_custom_profiles
-        test_builtin_profiles
-        test_builtin_profile_plugins
-        test_post_start
-        test_guest_files
-        test_creation_hooks
-        test_creation_hook_cancellation
-        test_creation_failed_descendants
-        test_creation_restart_serialization
+        run_timed_test test_quickstart
+        run_timed_test test_up_project_workflow
+        run_timed_test test_git_repo
+        run_timed_test test_host_mount
+        run_timed_test test_host_mount_custom_guest_path
+        run_timed_test test_port_forwards
+        run_timed_test test_workspace_sync
+        run_timed_test test_appledouble_sidecars
+        run_timed_test test_multi_instance
+        run_timed_test test_custom_profiles
+        run_timed_test test_builtin_profile_plugins
+        run_timed_test test_post_start
+        run_timed_test test_creation_hooks
+        run_timed_test test_creation_hook_cancellation
+        run_timed_test test_creation_failed_descendants
+        run_timed_test test_creation_restart_serialization
 
     fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features ) ]]; then
+        run_timed_test test_builtin_profiles
+        run_timed_test test_guest_files
+        run_timed_test test_config_dir
+    fi
+
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
+        # This image/instance lifecycle is independent of the workspace phases.
+        run_timed_test test_guest_user_alt
+
         # Local marketplace directory copy
-        test_local_marketplace
+        run_timed_test test_local_marketplace
 
         # github = "pat" mode + per-repo token forwarding (uses a stub image)
-        test_github_pat_forwarding
-        test_no_github
-
-        # Config sources: Claude bundles, native discovery, preference refresh/recovery
-        test_config_dir
+        run_timed_test test_github_pat_forwarding
+        run_timed_test test_no_github
 
         # [guest_env] config block + literal-over-forwarded precedence
-        test_guest_env_config
+        run_timed_test test_guest_env_config
 
         # coop model local/remote: local-model wiring lands and reverts
-        test_local_model
+        run_timed_test test_local_model
 
         # credential-injecting proxy (#411): guest wiring, key suppression,
         # capability gate, teardown — Anthropic + OpenAI/Codex
-        test_proxy
+        run_timed_test test_proxy
 
         # Interrupted setup: SIGKILL mid-build, verify clean recovery
-        test_interrupted_setup
+        run_timed_test test_interrupted_setup
 
-        # Provision failure rebuilds the golden image, so run before
-        # destroy --all which removes it entirely.
-        test_provision_failure
+        # Provision failure uses a separate image and checks the default.
+        # Run before destroy --all, which removes all images.
+        run_timed_test test_provision_failure
 
         # destroy --all wipes every coop-managed instance on the host,
         # not just ones this run created. Gate behind an opt-in env var
         # so dev machines aren't silently cleared. Run last because it
         # also removes the golden image.
         if [[ "${COOP_TEST_DESTRUCTIVE:-0}" == "1" ]]; then
-            test_destroy_all
+            run_timed_test test_destroy_all
             echo ""
             echo "NOTE: destroy --all removed the golden image."
             echo "      Run 'coop setup -y' before next use."

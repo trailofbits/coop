@@ -6,7 +6,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 
 **macOS (Lima backend)**
 
-- [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
+- [Lima](https://github.com/lima-vm/lima) installed in a [supported system directory](backends.md#macos--lima)
   (`brew install lima`) — `coop setup` fails without it
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
@@ -46,9 +46,11 @@ gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
 ```
 
 Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
-instead, which it will only do when `gh` is logged in. `install.sh` and `coop
-update` use that API path themselves for releases published without a usable
-bundle.
+instead, which requires a GitHub login. For releases without a usable bundle,
+`coop update` fetches attestations anonymously by SHA-256 digest and verifies
+them locally with `--bundle`. `install.sh` does the same when `jq` is installed;
+without `jq` it retains the authenticated `gh` API path. Both clients also use
+that authenticated path if anonymous API access fails.
 Both paths require the release workflow at the selected tag (including its
 `v` prefix), with attestation generated on a GitHub-hosted runner. An older
 `gh` that does not support these flags fails verification; upgrade it before
@@ -141,6 +143,8 @@ upgrade/removal, or remove that entry and reinstall with `.#coop`.
 
 On macOS, the package includes Lima and the host command-line tools used by
 coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The package embeds Lima's executable and helper paths at build time; changing
+runtime `PATH` cannot redirect Lima lookup.
 The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
 install the [host prerequisites](#prerequisites) separately and keep them on
 `PATH`. VM images are created by `coop setup`.
@@ -569,7 +573,7 @@ coop images --delete python-dev
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
 | `coop logs` | Stream VM serial console logs (`-f` to follow) |
-| `coop editor` | Open VS Code or Zed connected to the guest via SSH |
+| `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |

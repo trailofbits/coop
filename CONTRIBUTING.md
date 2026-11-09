@@ -26,7 +26,8 @@ backend. The sections below note where that applies.
   and Kani in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
-    (`limactl` on your PATH).
+    installed in a supported system directory (for example, `brew install lima`),
+    or use the Nix package.
   - **Linux**: x86_64 or arm64 with KVM access (`/dev/kvm`), `sudo`, and
     `curl`, `tar`, `e2fsprogs`.
 
@@ -124,11 +125,16 @@ routing, and the helpers the command handlers are built from. Test behavior,
 not implementation — a test that breaks under a refactor but not a behavior
 change is testing the wrong thing.
 
+For behavior-preserving refactors, establish a passing baseline, change the
+production code, and investigate existing test failures before changing test
+expectations. See [the refactor testing guidance](docs/testing.md#refactoring-and-tests).
+
 ### Integration tests
 
 The integration suite exercises the full VM lifecycle (setup → start → status
 → shell → guest environment → Docker → stop → destroy). It is too slow for the
-pre-commit hooks, so run it before submitting a change.
+pre-commit hooks, so run it before marking a guest-visible or lifecycle PR
+ready. A draft PR can document an unavailable platform as described below.
 
 Run it on **both platforms** — macOS/Lima and Linux/Firecracker — because the
 two backends share an abstraction but exercise different code paths:
@@ -180,11 +186,19 @@ detail, including the Rust patterns reviewers look for.
 ## Pull requests
 
 1. Branch from the latest `main`.
-2. Make your change, keeping commits focused.
-3. Run the pre-commit hooks and the integration suite on both platforms.
+2. Make your change, keeping commits focused. Assess material user impact and
+   security or reliability trade-offs using [the user-impact guide](docs/user-impact.md).
+3. Run the pre-commit hooks before marking the PR ready. For guest-visible or
+   lifecycle changes, also run the integration suite on both platforms. A
+   draft PR can be opened when an environment lacks a required check. Record
+   each check as passed, failed, or not run; for an unrun check, state why,
+   what remains unverified, what result could change the implementation, and
+   the next action. Keep the PR in draft until the required checks and
+   decisions are complete. A draft can also carry a material user-impact
+   decision for maintainer discussion.
 4. Open a pull request describing what the change does. Describe the code as it
-   stands — not discarded approaches or prior iterations — and use plain,
-   factual language.
+   stands — not discarded implementation attempts — and use plain, factual
+   language. Include material user costs and the decision made or still needed.
 5. A maintainer will review. Address feedback with follow-up commits.
 
 CI must pass before a pull request can merge. The
@@ -201,6 +215,8 @@ CI must pass before a pull request can merge. The
 - **`python3 tests/test-preflight-release.py`** — release gate regression checks.
 - **`python3 tests/test-integration-probes.py`** — regression checks for
   integration probes.
+- **`python3 tests/test-closeout-review-gate.py`** — current-commit closeout
+  review marker checks.
 - **`cargo deny --workspace check`** — advisories, licenses, bans, and sources.
 - **[zizmor](https://github.com/zizmorcore/zizmor)** — GitHub Actions security
   audit.
