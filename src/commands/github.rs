@@ -13,12 +13,17 @@ pub(crate) fn cmd_github(
 ) -> Result<()> {
     match action {
         GithubAction::SetupPat { repo } => {
-            let opts = github_pat::SetupOpts { repo, config_path };
+            let opts = github_pat::SetupOpts {
+                repo,
+                vm: None,
+                config_path,
+            };
             github_pat::run_setup_pat(cfg, &opts)
         }
         GithubAction::RotatePat { repo } => {
             let opts = github_pat::SetupOpts {
                 repo: Some(repo),
+                vm: None,
                 config_path,
             };
             github_pat::run_rotate_pat(cfg, &opts)

@@ -895,7 +895,13 @@ fn restart_confirmed_instance(
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
         && crate::github_assignment::active(cfg, &inst)?.is_none()
     {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
+        pat_prompt::maybe_prompt(
+            cfg,
+            opts.config_path,
+            repo.as_ref(),
+            &inst.name,
+            opts.no_prompt,
+        )?;
     }
 
     // Re-apply the forward set the instance was last started with.
@@ -1048,7 +1054,13 @@ fn start_instance(
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
         && crate::github_assignment::active(cfg, inst)?.is_none()
     {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
+        pat_prompt::maybe_prompt(
+            cfg,
+            opts.config_path,
+            repo.as_ref(),
+            &inst.name,
+            opts.no_prompt,
+        )?;
     }
 
     // Forwards are checked up-front so an in-use host port fails fast,
@@ -2815,7 +2827,13 @@ fn confirm_reprovision(
     if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
         && crate::github_assignment::active(cfg, inst)?.is_none()
     {
-        pat_prompt::maybe_prompt(cfg, opts.config_path, repo.as_ref(), opts.no_prompt)?;
+        pat_prompt::maybe_prompt(
+            cfg,
+            opts.config_path,
+            repo.as_ref(),
+            &inst.name,
+            opts.no_prompt,
+        )?;
     }
     Ok(repo)
 }

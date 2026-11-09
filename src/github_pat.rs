@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use crate::cmd::Cmd;
 use crate::commands::json;
-use crate::config::{CoopConfig, GitHubAuth, resolve_cmd_value};
+use crate::config::{CoopConfig, GitHubAuth, InstanceName, resolve_cmd_value};
 use crate::github_repo::{RepoSlug, detect_workspace_repo};
 use crate::github_submodules::{SubmoduleDiscovery, classify_urls, extract_urls};
 use crate::secret_store::{
@@ -40,6 +40,7 @@ const PAT_NEW_URL: &str = "https://github.com/settings/personal-access-tokens/ne
 /// Options resolved by clap for `coop github setup-pat`.
 pub struct SetupOpts<'a> {
     pub repo: Option<RepoSlug>,
+    pub vm: Option<&'a InstanceName>,
     pub config_path: &'a Path,
 }
 
@@ -50,16 +51,17 @@ pub struct SetupOpts<'a> {
 pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
     let repo = resolve_target_repo(opts.repo.as_ref())?;
 
+    let pat_url = pat_creation_url(&repo, opts.vm);
     let prediscovered = prefetch_submodules(&repo);
-    print_form_instructions(&repo, prediscovered.as_ref());
-    open_browser_best_effort(PAT_NEW_URL);
+    print_form_instructions(&repo, prediscovered.as_ref(), &pat_url);
+    open_browser_best_effort(&pat_url);
 
     let token = read_token_no_echo()?;
     warn_token_format(&token);
     eprintln!("\nValidating token against api.github.com…");
     probe_user(&token)?;
     probe_repo(&token, &repo)?;
-    let token = handle_submodules(token, &repo, prediscovered)?;
+    let token = handle_submodules(token, &repo, prediscovered, &pat_url)?;
 
     let backend = pick_backend()?;
     let account = AccountName::from_repo(&repo);
@@ -404,9 +406,33 @@ fn resolve_target_repo(repo_arg: Option<&RepoSlug>) -> Result<RepoSlug> {
     )
 }
 
-fn print_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscovery>) {
-    eprint!("{}", build_form_instructions(repo, discovery));
+fn print_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscovery>, pat_url: &str) {
+    eprint!("{}", build_form_instructions(repo, discovery, pat_url));
     std::io::stderr().flush().ok();
+}
+
+/// Prefill GitHub's supported fields; repository selection remains manual.
+fn pat_creation_url(repo: &RepoSlug, vm: Option<&InstanceName>) -> String {
+    let mut name = format!("coop-{}-{}", repo.owner(), repo.repo());
+    // RepoSlug is ASCII; GitHub limits token names to 40 characters.
+    name.truncate(40);
+    let description = vm.map_or_else(
+        || "GitHub access for coop".to_owned(),
+        |vm| format!("GitHub access for coop VM {vm}"),
+    );
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([
+            ("name", name.as_str()),
+            ("description", description.as_str()),
+            ("target_name", repo.owner()),
+            ("expires_in", "90"),
+            ("contents", "write"),
+            ("pull_requests", "write"),
+            ("issues", "write"),
+            ("statuses", "read"),
+        ])
+        .finish();
+    format!("{PAT_NEW_URL}?{query}")
 }
 
 /// Render the wizard's form instructions as a string.
@@ -417,23 +443,20 @@ fn print_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscover
 /// paste prompt so the user can plan their token scope up front. With
 /// `None` (no pre-discovery credential available) the original
 /// single-repo instructions are produced.
-fn build_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscovery>) -> String {
+fn build_form_instructions(
+    repo: &RepoSlug,
+    discovery: Option<&SubmoduleDiscovery>,
+    pat_url: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let extras = discovery.map_or(&[][..], |d| d.same_owner.as_slice());
 
-    let _ = writeln!(s, "\nConfigure the form at {PAT_NEW_URL}:");
+    let _ = writeln!(s, "\nOpen the prefilled form at {pat_url}:");
     let _ = writeln!(
         s,
-        "  Token name:        coop-{}-{}",
-        repo.owner(),
-        repo.repo()
+        "  Token name, description, resource owner, and 90-day expiration are prefilled."
     );
-    let _ = writeln!(
-        s,
-        "  Expiration:        (your choice — 90 days is a reasonable default)"
-    );
-    let _ = writeln!(s, "  Resource owner:    {}", repo.owner());
     if extras.is_empty() {
         let _ = writeln!(s, "  Repository access: Only select repositories → {repo}");
     } else {
@@ -443,12 +466,17 @@ fn build_form_instructions(repo: &RepoSlug, discovery: Option<&SubmoduleDiscover
             let _ = writeln!(s, "                       - {slug}");
         }
     }
-    let _ = writeln!(s, "  Repository permissions:");
+    let _ = writeln!(s, "  Suggested repository permissions (prefilled):");
     let _ = writeln!(s, "    Contents:        Read and write");
     let _ = writeln!(s, "    Pull requests:   Read and write");
     let _ = writeln!(s, "    Issues:          Read and write");
     let _ = writeln!(s, "    Commit statuses: Read-only");
     let _ = writeln!(s, "    Metadata:        Read-only (auto-included)");
+    let _ = writeln!(
+        s,
+        "\nIf these read/write permissions suit your needs, only update Repository access.\n\
+         Otherwise, restrict the permissions further to what you need."
+    );
 
     if let Some(d) = discovery {
         if !d.cross_owner.is_empty() {
@@ -848,6 +876,7 @@ fn handle_submodules(
     token: String,
     parent: &RepoSlug,
     prediscovered: Option<SubmoduleDiscovery>,
+    pat_url: &str,
 ) -> Result<String> {
     let source = match prediscovered {
         Some(d) => DiscoverySource::PreDiscovered(d),
@@ -867,7 +896,7 @@ fn handle_submodules(
                 eprintln!("  ✓ all same-owner submodule repos covered");
                 break;
             }
-            print_widen_instructions(parent, &discovery.same_owner, &failed);
+            print_widen_instructions(parent, &discovery.same_owner, &failed, pat_url);
             token = read_token_no_echo()?;
             warn_token_format(&token);
             eprintln!("\nValidating widened token against api.github.com…");
@@ -922,7 +951,12 @@ fn discover_from_pasted_token(token: &str, parent: &RepoSlug) -> Result<Submodul
     Ok(discovery)
 }
 
-fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[RepoSlug]) {
+fn print_widen_instructions(
+    parent: &RepoSlug,
+    expected: &[RepoSlug],
+    failed: &[RepoSlug],
+    pat_url: &str,
+) {
     eprintln!(
         "\n{} submodule repo(s) under '{}' are not covered by this token:",
         failed.len(),
@@ -932,7 +966,7 @@ fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[
         eprintln!("  - {slug}");
     }
     eprintln!(
-        "\nRe-open {PAT_NEW_URL} (or edit the existing token), keep \
+        "\nRe-open {pat_url} (or edit the existing token), keep \
          Resource owner '{}', and under 'Only select repositories' \
          include all of:",
         parent.owner(),
@@ -941,7 +975,10 @@ fn print_widen_instructions(parent: &RepoSlug, expected: &[RepoSlug], failed: &[
     for slug in expected {
         eprintln!("  - {slug}");
     }
-    eprintln!("Generate a fresh token, then paste it below. (Empty input aborts.)");
+    eprintln!(
+        "Restrict permissions to what you need, then generate a fresh token and paste it below. \
+         (Empty input aborts.)"
+    );
 }
 
 /// Prompt the user to choose a secret-storage backend. Shared with
@@ -1464,8 +1501,56 @@ mod tests {
     }
 
     #[test]
+    fn pat_url_prefills_suggested_fields_without_repository_access() {
+        let url = url::Url::parse(&pat_creation_url(&slug("acme/project.v1_test"), None)).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://github.com");
+        assert_eq!(url.path(), "/settings/personal-access-tokens/new");
+        let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        let expected = [
+            ("name", "coop-acme-project.v1_test"),
+            ("description", "GitHub access for coop"),
+            ("target_name", "acme"),
+            ("expires_in", "90"),
+            ("contents", "write"),
+            ("pull_requests", "write"),
+            ("issues", "write"),
+            ("statuses", "read"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .into();
+        assert_eq!(params, expected);
+    }
+
+    #[test]
+    fn pat_url_description_includes_resolved_vm_name() {
+        let repo = slug("acme/parent");
+        let vm = InstanceName::new("parent-2").unwrap();
+        let pat_url = pat_creation_url(&repo, Some(&vm));
+        let url = url::Url::parse(&pat_url).unwrap();
+        let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["description"], "GitHub access for coop VM parent-2");
+        assert_eq!(params["name"], "coop-acme-parent");
+        assert!(build_form_instructions(&repo, None, &pat_url).contains(&pat_url));
+    }
+
+    #[test]
+    fn pat_url_limits_token_name_without_truncating_resource_owner() {
+        let owner = "a".repeat(39);
+        let url =
+            url::Url::parse(&pat_creation_url(&slug(&format!("{owner}/repo")), None)).unwrap();
+        let params: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["name"], format!("coop-{}", "a".repeat(35)));
+        assert_eq!(params["target_name"], owner);
+    }
+
+    #[test]
     fn form_text_without_discovery_uses_single_repo_line() {
-        let text = build_form_instructions(&slug("acme/parent"), None);
+        let pat_url = pat_creation_url(&slug("acme/parent"), None);
+        let text = build_form_instructions(&slug("acme/parent"), None, &pat_url);
+        assert!(text.contains(&pat_url));
+        assert!(text.contains("90-day expiration are prefilled"));
+        assert!(text.contains("only update Repository access"));
+        assert!(text.contains("restrict the permissions further"));
         assert!(text.contains("Only select repositories → acme/parent"));
         assert!(!text.contains("                       - "));
         assert!(!text.contains("setup-pat --repo"));
@@ -1476,7 +1561,7 @@ mod tests {
     #[test]
     fn form_text_lists_same_owner_private_submodules() {
         let d = discovery(&["acme/lib-a", "acme/lib-b"], &[], &[]);
-        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d), PAT_NEW_URL);
         assert!(text.contains("Only select repositories:"));
         assert!(text.contains("- acme/parent"));
         assert!(text.contains("- acme/lib-a"));
@@ -1494,7 +1579,7 @@ mod tests {
             &[("other", &["other/dep"])],
             &["https://gitlab.com/x/y"],
         );
-        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d), PAT_NEW_URL);
 
         let cross_owner_at = text.find("coop github setup-pat --repo other/dep").unwrap();
         let non_github_at = text.find("https://gitlab.com/x/y").unwrap();
@@ -1513,7 +1598,7 @@ mod tests {
         // parent line stays single, yet the cross-owner advice and the
         // depth-1 caveat still appear.
         let d = discovery(&[], &[("other", &["other/dep"])], &[]);
-        let text = build_form_instructions(&slug("acme/parent"), Some(&d));
+        let text = build_form_instructions(&slug("acme/parent"), Some(&d), PAT_NEW_URL);
         assert!(text.contains("Only select repositories → acme/parent"));
         assert!(text.contains("coop github setup-pat --repo other/dep"));
         assert!(text.contains("only depth-1 submodules were checked"));
@@ -1524,8 +1609,8 @@ mod tests {
         // A successful prefetch that found no submodules (empty discovery)
         // must produce the same single-repo form as no prefetch at all.
         let d = discovery(&[], &[], &[]);
-        let with_empty = build_form_instructions(&slug("acme/parent"), Some(&d));
-        let without = build_form_instructions(&slug("acme/parent"), None);
+        let with_empty = build_form_instructions(&slug("acme/parent"), Some(&d), PAT_NEW_URL);
+        let without = build_form_instructions(&slug("acme/parent"), None, PAT_NEW_URL);
         assert_eq!(with_empty, without);
     }
 

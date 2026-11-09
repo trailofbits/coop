@@ -1109,10 +1109,12 @@ coop github <subcommand>
 |------------|--------|
 | `assign-pat --vm NAME --repo owner/name` | Persist selection of an existing stored entry for this VM; `--repo` is the entry key, not its full permission scope. Works while stopped. |
 | `unassign-pat --vm NAME` | Remove only the VM association; leave the shared credential intact. |
-| `setup-pat [--repo owner/name]` | Run the wizard end-to-end: open the GitHub PAT-creation form, validate the pasted token against `api.github.com`, store it in a chosen secret manager (Keychain / Secret Service / 1Password / file), and write a `[github.pat."owner/repo"]` entry. The repo is auto-detected from `git remote get-url origin` when `--repo` is omitted. |
+| `setup-pat [--repo owner/name]` | Run the wizard end-to-end: open the prefilled GitHub PAT-creation form, validate the pasted token against `api.github.com`, store it in a chosen secret manager (Keychain / Secret Service / 1Password / file), and write a `[github.pat."owner/repo"]` entry. The repo is auto-detected from `git remote get-url origin` when `--repo` is omitted. |
 | `rotate-pat --repo owner/name` | Re-run the wizard for an existing entry (FGPATs expire — max 1 year). |
 | `status [--vm NAME] [--probe] [--json]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. Pass `--json` for machine-readable output. |
 | `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
+
+If the suggested read/write permissions suit your needs, only select the repositories under **Repository access** before generating the token. Otherwise, restrict the permissions further. See the [prefilled fields and permissions](configuration.md#fine-grained-pat-github--pat).
 
 Pasted tokens are read without terminal echo and are limited to 64 KiB.
 Confirmation and storage-choice replies are limited to 64 bytes. Redirected

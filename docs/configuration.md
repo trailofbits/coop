@@ -187,7 +187,11 @@ Configure via the wizard:
 coop github setup-pat --repo trailofbits/coop
 ```
 
-The wizard opens the PAT-creation form in your browser, validates the token via `/user` and `/repos/<repo>`, stores the token in a secret manager you choose (macOS Keychain, Linux Secret Service, 1Password, or a `0600` file under `~/.coop/state/github-pat/`), and writes a `[github.pat."owner/repo"]` entry. The token itself is stored only in the chosen secret manager — the config file holds a `cmd:` invocation that retrieves it.
+The wizard opens a prefilled PAT-creation form in your browser, validates the pasted token via `/user` and `/repos/<repo>`, stores the token in a secret manager you choose (macOS Keychain, Linux Secret Service, 1Password, or a `0600` file under `~/.coop/state/github-pat/`), and writes a `[github.pat."owner/repo"]` entry. The token itself is stored only in the chosen secret manager — the config file holds a `cmd:` invocation that retrieves it.
+
+The form prefills the name, description, owner, 90-day expiration, and permissions: **Contents**, **Pull requests**, and **Issues** read/write; **Commit statuses** read-only. GitHub adds read-only **Metadata** automatically. If these permissions suit your needs, only set **Repository access** to **Only select repositories** and choose the listed repos. Otherwise, reduce permissions before generating and pasting the token.
+
+The description includes the VM name during startup or reprovisioning; standalone setup and rotation use a generic description.
 
 #### Submodule discovery
 
@@ -200,7 +204,7 @@ Discovery makes outbound network calls:
 
 The remaining (private) submodules are routed by resource owner:
 
-- **Same owner as the parent** — a single PAT can cover these, so they are added to the form's "Only select repositories" list alongside the parent. The wizard then re-probes the pasted token against each and re-prompts you to widen the token until all are covered.
+- **Same owner as the parent** — a single PAT can cover these, so the wizard lists them alongside the parent for you to select under "Only select repositories". The wizard then re-probes the pasted token against each and re-prompts you to widen the token until all are covered.
 - **Other owners** — a fine-grained PAT is scoped to one resource owner, so each needs its own token. The wizard prints a follow-up `coop github setup-pat --repo <slug>` line per repo, grouped by owner.
 - **Non-GitHub URLs** (e.g. GitLab) — listed as a warning; this token can't cover them.
 
