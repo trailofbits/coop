@@ -2,13 +2,16 @@
 
 `coop editor` connects VS Code or Zed to a running guest VM over SSH. The same SSH config entry works with JetBrains IDEs, Cursor, and any editor that supports SSH remote development. `coop vscode` remains as an alias.
 
-Use `coop editor --web` for a browser editor running inside the guest VM.
+To reduce your host's exposure to an untrusted guest, prefer `coop editor --web`.
+Code-server, its extensions, and terminals run inside the VM; your host runs a
+browser and coop's loopback SSH forward. The browser still renders
+guest-controlled content, so browser vulnerabilities remain possible.
 
-**Security warning for host editors:** The editor runs on your host and processes data from the
-guest. Connecting a host editor to the VM may allow a compromised guest to
-execute commands on your host. Only connect to guests you trust. `coop editor`
-prints this warning before launching VS Code or Zed. For browser editing
-inside the VM, use [`coop editor --web`](commands.md#browser-mode).
+**Security warning for host editors:** VS Code and Zed run native editor
+components on your host and process data from the guest. Connecting a host
+editor to the VM may allow a compromised guest to execute commands on your
+host. Only connect to guests you trust. `coop editor` prints this warning
+before launching either editor.
 
 ## Quick start
 
