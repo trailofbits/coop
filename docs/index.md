@@ -18,6 +18,7 @@ short navigational entrypoint; durable detail lives here.
   reliability trade-offs during implementation and review.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
+- [`web-editor-design.md`](web-editor-design.md) — in-browser file editor.
 
 ## For users
 

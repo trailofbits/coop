@@ -1,11 +1,17 @@
-# Editor Integration (VS Code, Zed)
+# Editor integration
 
 `coop editor` connects VS Code or Zed to a running guest VM over SSH. The same SSH config entry works with JetBrains IDEs, Cursor, and any editor that supports SSH remote development. `coop vscode` remains as an alias.
 
-**Security warning:** The editor runs on your host and processes data from the
-guest. Connecting a host editor to the VM may allow a compromised guest to
-execute commands on your host. Only connect to guests you trust. `coop editor`
-prints this warning before launching VS Code or Zed.
+To reduce your host's exposure to an untrusted guest, prefer `coop editor --web`.
+Code-server, its extensions, and terminals run inside the VM; your host runs a
+browser and coop's loopback SSH forward. The browser still renders
+guest-controlled content, so browser vulnerabilities remain possible.
+
+**Security warning for host editors:** VS Code and Zed run native editor
+components on your host and process data from the guest. Connecting a host
+editor to the VM may allow a compromised guest to execute commands on your
+host. Only connect to guests you trust. `coop editor` prints this warning
+before launching either editor.
 
 ## Quick start
 
@@ -23,20 +29,40 @@ This command:
 
 ```
 coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
+coop editor [NAME] --web [--project PATH] [--port PORT]
 ```
 
 **NAME** is the instance name. Required when multiple instances exist.
 
-**--project** sets the remote directory the editor opens. Defaults to `/workspace`.
+**--project** sets the absolute guest path the editor opens in either mode.
+Defaults to `/workspace`; browser mode requires an existing directory.
 
 **--editor** pins the editor (`code` or `zed`). When omitted, coop tries VS Code first, then Zed. A strategy that cannot be launched at all — binary missing, or present but not executable — counts as a miss, so the chain continues to the next editor. If an editor starts but exits unsuccessfully, coop tries only that editor's remaining strategies and reports the failure instead of opening a different editor.
 
 **--clean** removes the SSH config entry for the specified instance and exits. Useful for manual cleanup without destroying the instance.
 
+**--web** runs code-server inside the VM and prints a URL for your browser.
+It conflicts with `--editor` and `--clean`.
+
+**--port** selects the browser editor's host loopback port. It requires `--web`;
+when omitted, coop selects a free port.
+
 ```bash
 coop editor my-instance --project /workspace/frontend
 coop editor my-instance --editor zed
+coop editor my-instance --web --project /workspace/frontend --port 8080
 ```
+
+### Browser editing
+
+Code-server installs on first use. Open the printed URL and enter the session
+password to sign in. Keep coop running while you edit; Ctrl+C stops the editor
+and its terminals while leaving the VM running. Settings and extensions persist
+in the guest. A repeat invocation joins the active session and opens the
+requested `--project`; it can select a different folder in the same session.
+
+Browser mode does not write a host SSH config entry or launch a native host
+editor. See [browser mode](commands.md#browser-mode) for startup diagnostics.
 
 ### Installing the `code` CLI
 
@@ -85,7 +111,7 @@ Host coop-my-instance
 # coop END
 ```
 
-Each run of `coop editor` replaces the existing block for that instance, or creates one if none exists. To install the same block without launching an editor — for plain `ssh`/`scp`/`rsync` — use [`coop ssh-config`](commands.md#ssh-config).
+Each run of `coop editor` without `--web` replaces the existing block for that instance, or creates one if none exists. To install the same block without launching an editor — for plain `ssh`/`scp`/`rsync` — use [`coop ssh-config`](commands.md#ssh-config).
 
 ### Cleanup
 
@@ -96,7 +122,7 @@ Each run of `coop editor` replaces the existing block for that instance, or crea
 
 ## Other editors
 
-`coop editor` prints the SSH config entry to stderr. Any SSH-capable editor can use it.
+`coop editor` without `--web` prints the SSH config entry to stderr. Any SSH-capable editor can use it.
 
 ### JetBrains (IntelliJ, GoLand, CLion, etc.)
 

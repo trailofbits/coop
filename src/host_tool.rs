@@ -37,6 +37,7 @@ pub(crate) struct TrustedToolPolicy {
     allowed_roots: Vec<PathBuf>,
     allowed_targets: Vec<PathBuf>,
     trusted_uids: Vec<u32>,
+    trusted_writable_gids: Vec<u32>,
 }
 
 impl TrustedToolPolicy {
@@ -44,6 +45,13 @@ impl TrustedToolPolicy {
     /// Path-chain ownership and mode checks still apply to every hop.
     pub(crate) fn with_allowed_target_beneath_anchor(mut self, relative: &str) -> Self {
         self.allowed_targets.push(self.trust_anchor.join(relative));
+        self
+    }
+
+    /// Permit group write only for a named host administrator group.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn with_trusted_writable_gid(mut self, gid: u32) -> Self {
+        self.trusted_writable_gids.push(gid);
         self
     }
 
@@ -57,6 +65,7 @@ impl TrustedToolPolicy {
             allowed_roots: allowed_roots.into_iter().collect(),
             allowed_targets: Vec::new(),
             trusted_uids: vec![expected_uid],
+            trusted_writable_gids: Vec::new(),
         }
     }
 
@@ -77,6 +86,7 @@ impl TrustedToolPolicy {
             allowed_roots: allowed_roots.into_iter().collect(),
             allowed_targets: Vec::new(),
             trusted_uids,
+            trusted_writable_gids: Vec::new(),
         }
     }
 }
@@ -223,6 +233,29 @@ mod tests {
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o775)).unwrap();
         let error = resolve_host_tool(TestTool::Ip, &[candidate], &fixture.policy).unwrap_err();
         assert!(error.to_string().contains("writable by group or other"));
+    }
+
+    #[test]
+    fn trusted_group_writes_apply_only_to_the_selected_group() {
+        let fixture = Fixture::new();
+        let candidate = fixture.executable("ip", "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&fixture.bin, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o775)).unwrap();
+        let gid = fs::metadata(&fixture.bin).unwrap().gid();
+        let wrong_group = fixture
+            .policy
+            .clone()
+            .with_trusted_writable_gid(gid.wrapping_add(1));
+        assert!(
+            resolve_host_tool(TestTool::Ip, std::slice::from_ref(&candidate), &wrong_group)
+                .is_err()
+        );
+
+        let policy = fixture.policy.clone().with_trusted_writable_gid(gid);
+        assert!(resolve_host_tool(TestTool::Ip, std::slice::from_ref(&candidate), &policy).is_ok());
+
+        fs::set_permissions(&fixture.bin, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(resolve_host_tool(TestTool::Ip, &[candidate], &policy).is_err());
     }
 
     #[test]
@@ -668,7 +701,7 @@ fn validate_candidate(
     if metadata.permissions().mode() & 0o111 == 0 {
         return Err("canonical target is not executable".to_string());
     }
-    validate_owner_and_mode(&metadata, &policy.trusted_uids, "canonical target")?;
+    validate_owner_and_mode(&metadata, policy, "canonical target")?;
 
     if matches!(containment, TargetContainment::Explicit) {
         return Ok(canonical_target);
@@ -724,7 +757,7 @@ fn resolve_and_validate(
     if !anchor_metadata.is_dir() {
         return Err("trust anchor is not a directory".to_string());
     }
-    validate_owner_and_mode(&anchor_metadata, &policy.trusted_uids, "trust anchor")?;
+    validate_owner_and_mode(&anchor_metadata, policy, "trust anchor")?;
 
     let mut current = anchor.clone();
     let mut pending = normal_components(relative)?;
@@ -786,7 +819,7 @@ fn resolve_and_validate(
             if !metadata.is_dir() {
                 return Err("non-directory path component".to_string());
             }
-            validate_owner_and_mode(&metadata, &policy.trusted_uids, "path directory")?;
+            validate_owner_and_mode(&metadata, policy, "path directory")?;
         }
         if pending.is_empty() {
             return Ok((current, metadata));
@@ -801,23 +834,26 @@ pub(crate) fn validate_trusted_path(
     policy: &TrustedToolPolicy,
 ) -> Result<(PathBuf, Metadata), String> {
     let (canonical, metadata) = resolve_and_validate(path, policy)?;
-    validate_owner_and_mode(&metadata, &policy.trusted_uids, "path target")?;
+    validate_owner_and_mode(&metadata, policy, "path target")?;
     Ok((canonical, metadata))
 }
 
 fn validate_owner_and_mode(
     metadata: &Metadata,
-    trusted_uids: &[u32],
+    policy: &TrustedToolPolicy,
     what: &str,
 ) -> Result<(), String> {
-    if !trusted_uids.contains(&metadata.uid()) {
+    if !policy.trusted_uids.contains(&metadata.uid()) {
         return Err(format!(
-            "{what} has uid {}, expected one of {trusted_uids:?}",
+            "{what} has uid {}, expected one of {:?}",
             metadata.uid(),
+            policy.trusted_uids,
         ));
     }
     let mode = metadata.permissions().mode();
-    if mode & 0o022 != 0 {
+    if mode & 0o002 != 0
+        || (mode & 0o020 != 0 && !policy.trusted_writable_gids.contains(&metadata.gid()))
+    {
         return Err(format!(
             "{what} is writable by group or other users (mode {:04o})",
             mode & 0o7777

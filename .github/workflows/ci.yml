@@ -169,11 +169,25 @@ jobs:
       - name: Integration tests — update/uninstall policies and release smoke
         run: ./tests/run-policy-integration.sh
 
+  lima-lookup:
+    runs-on: macos-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Lima
+        run: brew install lima
+      - name: Prove production Lima lookup and execution
+        run: cargo test --test lima_lookup
+
   # Preserve the existing required-check name. always() makes a failed,
   # cancelled, or skipped dependency fail this gate instead of skipping it.
   check:
     if: ${{ always() }}
-    needs: [test, policy, musl, lint, regression]
+    needs: [test, policy, musl, lint, regression, lima-lookup]
     runs-on: ubuntu-latest
     steps:
       - name: Require every test job to succeed
@@ -183,12 +197,14 @@ jobs:
           MUSL_RESULT: ${{ needs.musl.result }}
           LINT_RESULT: ${{ needs.lint.result }}
           REGRESSION_RESULT: ${{ needs.regression.result }}
+          LIMA_LOOKUP_RESULT: ${{ needs.lima-lookup.result }}
         run: |
           test "$TEST_RESULT" = success
           test "$POLICY_RESULT" = success
           test "$MUSL_RESULT" = success
           test "$LINT_RESULT" = success
           test "$REGRESSION_RESULT" = success
+          test "$LIMA_LOOKUP_RESULT" = success
 
   kani:
     runs-on: ubuntu-latest
@@ -254,7 +270,7 @@ jobs:
 
       - name: Install cargo-binstall
         if: steps.cache-deny.outputs.cache-hit != 'true'
-        uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # v1.26.0
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 # v1.26.1
 
       - name: Install cargo-deny
         if: steps.cache-deny.outputs.cache-hit != 'true'
@@ -305,6 +321,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
         with:
           advanced-security: false

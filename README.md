@@ -6,11 +6,9 @@ Isolated VM environments for running Claude Code, Codex, and Grok Build.
 
 coop is a Rust CLI that manages disposable virtual machines where Claude Code, Codex, and Grok Build have full tool access: Docker, git, compilers, package managers, all without risk to your host machine. Each VM is isolated, reproducible, and cheap to create and destroy.
 
-You can copy shared dotfiles with
-[`guest_files`](docs/configuration.md#guest-files) and install tools for each new
-VM with a global [`post_create`](docs/configuration.md#creation-hooks) command.
-
 ## Setup
+
+Check the [platform prerequisites](docs/getting-started.md#prerequisites).
 
 Install the latest release:
 
@@ -18,38 +16,21 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/trailofbits/coop/main/install.sh | bash
 ```
 
-Or [install with Homebrew](docs/getting-started.md#homebrew), which builds from
-source and includes Lima on macOS.
-
-Or build from source (requires [Rust](https://rustup.rs/) and CMake):
-
-```shell
-cargo build --workspace --release
-cp target/release/coop target/release/coop-proxy /usr/local/bin/
-```
-
-With Nix, run `nix build` to build both binaries in `result/bin`, or
-`nix run . -- --help` to run the CLI. See [Nix builds](docs/getting-started.md#nix)
-for installation and updates, and [Nix development](CONTRIBUTING.md#nix) for
-the development shell.
-
-Then build the VM template image:
+Build the VM template image:
 
 ```shell
 coop setup
 ```
 
-On Linux, `coop setup` also installs Firecracker and fetches a guest kernel. On macOS, install Lima first (`brew install lima`) — setup fails without it. coop is tested on macOS arm64 (Apple Silicon) and Linux x86_64; Linux arm64 builds are available but untested. Each backend has its own host requirements — see [Prerequisites](docs/getting-started.md#prerequisites).
-
-Keep installer builds updated:
+Keep coop updated:
 
 ```shell
 coop update
 ```
 
-For Homebrew installations, use `brew upgrade trailofbits/coop/coop`.
-
-See [`coop update`](docs/commands.md#update) and the [`updates` config section](docs/configuration.md#updates-section).
+See Getting Started for [building from source](docs/getting-started.md#build-from-source)
+and alternative installation methods: [Homebrew](docs/getting-started.md#homebrew)
+and [Nix](docs/getting-started.md#nix).
 
 ## Usage
 

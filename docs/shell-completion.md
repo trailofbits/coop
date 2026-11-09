@@ -88,6 +88,10 @@ Existing `COMPLETE=<shell>` setup continues to work; only one setup is needed. R
 |----------|--------|
 | Running instance name (`shell`, `claude`, `claude-agents`, `codex`, `push`, `pull`, `exec`, `agent update`) | Running VMs in `~/.coop/instances/` |
 | Stopped instance name (`start`) | Stopped VMs in `~/.coop/instances/` |
-| Other VM arguments (`stop`, `destroy`, `status`, `logs`, `editor`, `resize`, `model`, and management commands) | All registered VMs in `~/.coop/instances/` |
+| Other VM arguments (`stop`, `destroy`, `status`, `logs`, `editor`/`vscode` including `--web`, `resize`, `model`, and management commands) | All registered VMs in `~/.coop/instances/` |
 | `--image` (`up`, `setup`, `start` compatibility flag), `images --delete` | `~/.coop/images/` |
 | `--profile` (`setup`, `up`), `profiles show <name>` | builtin profiles plus `[profiles.*]` from `~/.coop/config.toml` |
+
+`editor` completes all registered instances in every mode, including `--web`;
+`--clean` also works on stopped VMs. Browser editing requires the selected VM
+to be running, but completion does not filter candidates based on `--web`.

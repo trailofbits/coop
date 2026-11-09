@@ -56,7 +56,12 @@ coop shell my-project
 coop shell another-project
 ```
 
-This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`, `pull`, `exec`, `editor`, `resize`, `model`, `claude`, and `codex`.
+This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`,
+`pull`, `exec`, `editor` (including `--web` and the `vscode` alias), `resize`,
+`model`, `claude`, and `codex`.
+
+`coop editor --web` resolves the optional name using all registered instances,
+then requires the selected VM to be running.
 
 ## Checking status
 

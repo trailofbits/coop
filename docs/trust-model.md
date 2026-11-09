@@ -333,6 +333,15 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   is disabled unless the call site constructs a specific coop port or proxy
   forward. The `ssh coop-<name>` alias written for an operator is not a
   coop-owned process and remains subject to the operator's SSH configuration.
+- Lima resolves `limactl` through the shared host-tool validator from fixed system
+  and package-manager paths. Paths must be owned by root or the invoking user;
+  macOS `admin` (GID 80) group write is permitted for Homebrew compatibility.
+  Other group write and all world write remain forbidden. Lima retains its host
+  configuration, with a fixed helper `PATH`. The macOS Nix package instead
+  embeds its exact Lima and helper store paths at build time. That route trusts
+  Nix's immutable runtime closure rather than applying the generic ownership
+  checks to the build-user-writable store directory. It does not add a general
+  `/nix/store` search root or accept runtime path overrides.
 - An exact host-tool setting authorizes only the validated filesystem identity:
   coop does not attest its package provenance, hash, basename, or OpenSSH/rsync
   semantics. Resolution is pathname-based and does not pin an executable
@@ -531,6 +540,16 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   These match the design's "Cross-platform hardening" note: the Firecracker
   (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
   with Seatbelt, with the stated caveats.
+
+## Browser editor transport
+
+`coop editor --web` runs code-server, extensions, and terminals inside the VM,
+reducing exposure through the native host-editor integrations used by `coop editor`.
+Browser vulnerabilities remain part of the attack surface.
+
+Code-server's password login restricts access to the editor, and the host
+browser handles guest-controlled content under a fresh, session-specific
+`.localhost` origin.
 
 ## `coop update` trust chain
 

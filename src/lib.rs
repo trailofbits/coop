@@ -70,6 +70,7 @@ mod update_policy;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod vm;
 mod vsock_proxy;
+mod web_editor;
 mod workspace;
 
 use std::path::PathBuf;
@@ -527,7 +528,7 @@ enum Commands {
         #[arg(required = true, last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Open an editor (VS Code or Zed) connected to the guest VM
+    /// Open a host editor over SSH, or a browser editor with --web
     #[command(alias = "vscode")]
     Editor {
         /// Instance name (required if multiple instances exist)
@@ -545,6 +546,12 @@ enum Commands {
         /// Remove the SSH config entry for this instance and exit
         #[arg(long)]
         clean: bool,
+        /// Run code-server inside the VM and print a browser URL
+        #[arg(long, conflicts_with_all = ["editor", "clean"])]
+        web: bool,
+        /// Browser editor's host loopback port (default: select a free port)
+        #[arg(long, requires = "web")]
+        port: Option<std::num::NonZeroU16>,
     },
     /// Install a `coop-<name>` SSH alias for ad-hoc ssh/scp/rsync
     SshConfig {
@@ -1372,12 +1379,19 @@ pub fn run() -> Result<()> {
             project,
             editor,
             clean,
+            web,
+            port,
         } => {
             if clean {
                 let inst = cfg.resolve_instance(name.as_ref())?;
                 workspace::remove_ssh_config(&inst)?;
                 tracing::info!("Removed SSH config for '{}'", inst.name);
                 return Ok(());
+            }
+            if web {
+                let project = paths::GuestPath::absolute(project)
+                    .context("--project must be an absolute guest path")?;
+                return web_editor::run(&be, &cfg, name.as_ref(), &project, port);
             }
             let running = resolve_running(&be, &cfg, name.as_ref())?;
             workspace::open_editor(&running, Some(&project), editor)
@@ -1594,6 +1608,75 @@ mod tests {
                 Cli::try_parse_from(std::iter::once("coop").chain(args.iter().copied())).is_err(),
                 "expected parse failure for {args:?}"
             );
+        }
+    }
+
+    #[test]
+    fn editor_web_cli_accepts_instance_project_and_port() {
+        let cli = parse(&[
+            "editor",
+            "projects",
+            "--web",
+            "--project",
+            "/workspace/app",
+            "--port",
+            "12345",
+        ]);
+        let crate::Commands::Editor {
+            name,
+            project,
+            web,
+            port,
+            editor,
+            clean,
+        } = cli.command
+        else {
+            panic!("expected web editor")
+        };
+        assert_eq!(name.expect("instance name").as_str(), "projects");
+        assert_eq!(project, "/workspace/app");
+        assert!(web);
+        assert_eq!(port.expect("host port").get(), 12345);
+        assert!(editor.is_none());
+        assert!(!clean);
+        assert!(matches!(
+            parse(&["editor", "--web"]).command,
+            crate::Commands::Editor {
+                name: None,
+                web: true,
+                port: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn editor_web_flags_enforce_mode_constraints() {
+        for args in [
+            vec!["editor", "--web", "--editor", "code"],
+            vec!["editor", "--editor", "zed", "--web"],
+            vec!["editor", "--web", "--clean"],
+            vec!["editor", "--clean", "--web"],
+            vec!["editor", "--port", "12345"],
+            vec!["editor", "--web", "--port", "0"],
+            vec!["editor", "--web", "--port", "65536"],
+            vec!["web-editor"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("coop").chain(args)).is_err());
+        }
+        for command in ["editor", "vscode"] {
+            assert!(matches!(
+                parse(&[command]).command,
+                crate::Commands::Editor {
+                    web: false,
+                    port: None,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                parse(&[command, "--web"]).command,
+                crate::Commands::Editor { web: true, .. }
+            ));
         }
     }
 

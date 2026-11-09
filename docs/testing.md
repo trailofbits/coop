@@ -12,13 +12,15 @@ change the production code. Investigate failures before changing expectations,
 including compiler errors from private interface changes. Update tests to
 express the preserved behavior and verify they still detect a relevant regression.
 
-The `Firecracker integration` workflow runs the full suite across six
-disposable GitHub-hosted x64 runners: three on Ubuntu 24.04 and three on
+The `Firecracker integration` workflow runs the full suite across eight
+disposable GitHub-hosted x64 runners: four on Ubuntu 24.04 and four on
 Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
 dispatch. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
-VM sequence together, `workspace` covers independent workspace/profile phases,
-and `config` covers configuration, proxy, and recovery phases. The `config`
+VM sequence together, `workspace` covers independent workspace phases,
+`config` covers configuration, alternate guest-user, proxy, and setup recovery,
+and `features` covers commit/restore plus independent profile, guest-file, and
+configuration-source phases. The `config`
 shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables
@@ -29,6 +31,10 @@ Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
 integration remains a separate platform gate.
+The runner logs `TIMING build:*` durations, and the suite logs `TIMING test:*`
+durations, so shard logs show which work is on the critical path.
+The KVM matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs that
+host-only gate. Unsharded full runs still include it.
 
 ## Cross-platform compile and lint checks
 
@@ -149,6 +155,14 @@ Lifecycle and guest-visible changes still require both real backends:
 ```
 
 ## Integration tests
+
+The `coop editor --web` phase checks login, default/custom projects, startup
+failure diagnostics and session cleanup, including mounted workspaces.
+For a focused run, use a disposable VM: this fixture stops and restarts it.
+
+```sh
+python3 tests/integration-web-editor.py --binary target/debug/coop --name TEST_VM --config TEST_CONFIG
+```
 
 Generated completion is checked without a VM by
 `cargo test --test shell_completion --test zsh_completion`.
@@ -294,11 +308,13 @@ native release.
 
 ## Host-only bridge isolation test
 
-`./tests/run-integration.sh --full` runs the bridge isolation gate before
-the VM suite, on the selected local or remote host. A failure stops the full
-run; macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables
-both gates. Remote full runs copy the tracked working-tree source and require
-the build and namespace prerequisites below on the remote host.
+`./tests/run-integration.sh --full` runs the bridge isolation gate before the
+VM suite on the selected local or remote host. A failure stops the full run;
+macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables it.
+Remote bridge-gate runs copy the tracked working-tree source and require the
+build and namespace prerequisites below on the remote host. The KVM matrix sets
+`COOP_TEST_SKIP_BRIDGE=1` so its four shards do not repeat the gate already
+run by regular Linux CI.
 
 Run `./tests/integration-network.sh` directly on Linux to test bridge-port
 isolation without KVM or VM images. It builds a library test as the current
@@ -382,6 +398,14 @@ the positive witness to fail. Do this even when the launch code is excluded
 from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
+
+The `lima-lookup` CI job installs Lima on macOS and runs
+`cargo test --test lima_lookup`. This CLI test supplies a hostile `PATH`, requires
+a successful production `limactl --version` probe, and stops setup at SSH key
+generation before creating a VM. The required `check` job depends on this
+positive execution witness. The Darwin Nix install check exercises the packaged
+Lima route; the Linux unit regression separately executes a packaged Lima fixture
+and a helper from its embedded search path. Neither check replaces VM integration.
 
 The trusted-host-tool unit fixtures use a private synthetic filesystem root so
 they do not depend on tools installed on the development host. They cover fixed

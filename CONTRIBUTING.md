@@ -26,7 +26,8 @@ backend. The sections below note where that applies.
   and Kani in `.github/workflows/ci.yml`, so keep those in sync when bumping.
 - To run the full integration suite you need a working backend:
   - **macOS**: Apple Silicon with [Lima](https://github.com/lima-vm/lima)
-    (`limactl` on your PATH).
+    installed in a supported system directory (for example, `brew install lima`),
+    or use the Nix package.
   - **Linux**: x86_64 or arm64 with KVM access (`/dev/kvm`), `sudo`, and
     `curl`, `tar`, `e2fsprogs`.
 

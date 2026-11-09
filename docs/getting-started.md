@@ -6,7 +6,7 @@ coop runs Claude Code, Codex, and Grok Build inside isolated virtual machines. O
 
 **macOS (Lima backend)**
 
-- [Lima](https://github.com/lima-vm/lima) installed with `limactl` on your `PATH`
+- [Lima](https://github.com/lima-vm/lima) installed in a [supported system directory](backends.md#macos--lima)
   (`brew install lima`) — `coop setup` fails without it
 - Apple Silicon (arm64)
 - Rosetta 2 for x86_64 guests on Apple Silicon: `softwareupdate --install-rosetta`
@@ -143,6 +143,8 @@ upgrade/removal, or remove that entry and reinstall with `.#coop`.
 
 On macOS, the package includes Lima and the host command-line tools used by
 coop, so `nix run . -- setup` does not require a separate Homebrew install.
+The package embeds Lima's executable and helper paths at build time; changing
+runtime `PATH` cannot redirect Lima lookup.
 The Apple Silicon and Rosetta prerequisites above still apply. On Linux,
 install the [host prerequisites](#prerequisites) separately and keep them on
 `PATH`. VM images are created by `coop setup`.
@@ -571,7 +573,7 @@ coop images --delete python-dev
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
 | `coop logs` | Stream VM serial console logs (`-f` to follow) |
-| `coop editor` | Open VS Code or Zed connected to the guest via SSH |
+| `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |
