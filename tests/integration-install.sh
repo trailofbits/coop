@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REAL_PATH="$PATH"
+command -v jq >/dev/null || { echo "jq is required for these tests" >&2; exit 1; }
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -63,6 +64,10 @@ if [ "$1 $2" = "release download" ]; then
             *) shift ;;
         esac
     done
+    if [ "${COOP_TEST_AUTH_FAIL:-0}" = 1 ]; then
+        printf partial > "$destination/$pattern"
+        exit 1
+    fi
     cp "$COOP_TEST_FIXTURE/$pattern" "$destination/$pattern"
     exit 0
 fi
@@ -104,14 +109,32 @@ set -eu
 printf '%s\n' "$*" >>"$COOP_TEST_CURL_LOG"
 destination=""
 url=""
+auth=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -o) destination="$2"; shift 2 ;;
+        -H) if [ "$2" = @- ]; then auth=1; cat >/dev/null; fi; shift 2 ;;
         http://*|https://*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
+if [ "$auth" = 1 ] && [ "${COOP_TEST_AUTH_FAIL:-0}" = 1 ]; then
+    [ -z "$destination" ] || printf partial > "$destination"
+    exit 22
+fi
 case "$url" in
+    */attestations/sha256:*)
+        digest="$(cut -d' ' -f1 "$COOP_TEST_FIXTURE/SHA256SUMS")"
+        [ "$url" = "https://api.github.com/repos/trailofbits/coop/attestations/sha256:${digest}?per_page=100" ] || exit 52
+        [ "$auth" = 0 ] || exit 51
+        [ "${COOP_TEST_API_FAIL:-0}" != 1 ] || exit 22
+        cp "$COOP_TEST_FIXTURE/api.json" "$destination"
+        ;;
+    */releases/latest) printf '%s\n' '{"tag_name":"v9.9.9"}' ;;
+    */SHA256SUMS|*.tar.gz)
+        [ "${COOP_TEST_PUBLIC_FAIL:-0}" != 1 ] || exit 22
+        cp "$COOP_TEST_FIXTURE/${url##*/}" "$destination"
+        ;;
     */attestations.jsonl)
         [ "${COOP_TEST_BUNDLE_FAIL:-0}" != "1" ] || exit 22
         cp "$COOP_TEST_FIXTURE/attestations.jsonl" "$destination"
@@ -119,6 +142,7 @@ case "$url" in
     *) exit 45 ;;
 esac
 STUB
+printf '%s\n' '{"attestations":[{"bundle":{"synthetic":true}}]}' > "$FIXTURE/api.json"
 chmod +x "$MOCK_BIN/gh" "$MOCK_BIN/curl"
 
 pass_count=0
@@ -139,7 +163,7 @@ fail() {
 
 run_installer() {
     env PATH="$MOCK_BIN:$REAL_PATH" \
-        VERSION="$VERSION" \
+        VERSION="${COOP_TEST_VERSION-$VERSION}" \
         INSTALL_DIR="$INSTALL_DIR" \
         GITHUB_TOKEN="restricted-token-must-not-reach-bundle-curl" \
         COOP_TEST_FIXTURE="$FIXTURE" \
@@ -147,6 +171,9 @@ run_installer() {
         COOP_TEST_CURL_LOG="$CURL_LOG" \
         COOP_TEST_GH_REQUIRE_BUNDLE="${COOP_TEST_GH_REQUIRE_BUNDLE:-0}" \
         COOP_TEST_GH_VERIFY_FAIL="${COOP_TEST_GH_VERIFY_FAIL:-0}" \
+        COOP_TEST_AUTH_FAIL="${COOP_TEST_AUTH_FAIL:-0}" \
+        COOP_TEST_PUBLIC_FAIL="${COOP_TEST_PUBLIC_FAIL:-0}" \
+        COOP_TEST_API_FAIL="${COOP_TEST_API_FAIL:-0}" \
         COOP_TEST_BUNDLE_FAIL="${COOP_TEST_BUNDLE_FAIL:-0}" \
         bash "$PROJECT_DIR/install.sh"
 }
@@ -209,6 +236,7 @@ fi
 
 echo "==> Test 3: releases without a usable bundle retain API fallback"
 : >"$GH_LOG"
+: >"$CURL_LOG"
 COOP_TEST_BUNDLE_FAIL=1
 export COOP_TEST_BUNDLE_FAIL
 if run_installer >"$TEST_ROOT/t3.log" 2>&1; then
@@ -219,11 +247,13 @@ else
 fi
 unset COOP_TEST_BUNDLE_FAIL
 
-if grep -q 'attestation verify .* --repo trailofbits/coop .* --deny-self-hosted-runners$' "$GH_LOG" \
-    && ! grep -q -- '--bundle' "$GH_LOG"; then
-    pass "legacy fallback verifies through the attestations API"
+expected_digest="$(cut -d' ' -f1 "$FIXTURE/SHA256SUMS")"
+expected_url="https://api.github.com/repos/trailofbits/coop/attestations/sha256:${expected_digest}?per_page=100"
+if grep -q -- '--bundle .*api-attestations.jsonl' "$GH_LOG" \
+    && [[ "$(awk '/\/attestations\/sha256:/ {print $NF}' "$CURL_LOG")" == "$expected_url" ]]; then
+    pass "legacy fallback fetches anonymously and verifies a local bundle"
 else
-    fail "legacy fallback verifies through the attestations API" "gh calls: $(cat "$GH_LOG")"
+    fail "legacy fallback fetches anonymously and verifies a local bundle" "gh calls: $(cat "$GH_LOG")"
 fi
 
 echo "==> Test 3b: API verification failure is fail-closed"
@@ -243,6 +273,67 @@ else
         "$(tail -10 "$TEST_ROOT/t3b.log")"
 fi
 unset COOP_TEST_BUNDLE_FAIL COOP_TEST_GH_VERIFY_FAIL
+
+# Each failed case must preserve the existing installation. The outcome also
+# distinguishes rejection before verification from authenticated API fallback.
+check_installer() {
+    local label="$1" expected="$2" outcome=failure
+    shift 2
+    : > "$GH_LOG"
+    printf '%s\n' keep-existing-install > "$INSTALL_DIR/coop"
+    # Each argument is an explicit NAME=value assignment for this test case.
+    # shellcheck disable=SC2163
+    if (export "$@"; run_installer) >"$TEST_ROOT/case.log" 2>&1; then outcome=success; fi
+    case "$expected" in
+        noverify) ! grep -q '^attestation verify ' "$GH_LOG" || outcome=unexpected; expected=failure ;;
+        api) grep -q '^attestation verify ' "$GH_LOG" && ! grep -q -- '--bundle' "$GH_LOG" || outcome=unexpected; expected=success ;;
+    esac
+    if [[ "$outcome" == "$expected" ]] && {
+        [[ "$expected" == success && "$("$INSTALL_DIR/coop")" == installed-coop ]] \
+        || [[ "$expected" == failure && "$(cat "$INSTALL_DIR/coop")" == keep-existing-install ]];
+    }; then
+        pass "$label"
+    else
+        fail "$label" "$(tail -10 "$TEST_ROOT/case.log")"
+    fi
+}
+
+check_installer "rejected downloads retry anonymously and replace partial files" success COOP_TEST_AUTH_FAIL=1
+check_installer "metadata retries anonymously" success COOP_TEST_AUTH_FAIL=1 COOP_TEST_VERSION=
+check_installer "both download transports failing preserves installation" noverify COOP_TEST_AUTH_FAIL=1 COOP_TEST_PUBLIC_FAIL=1
+for response in '{}' '{"attestations":[]}' '{"attestations":[{"bundle":null}]}' '{"attestations":[{"bundle":{}}]}' 'invalid-json'; do
+    printf '%s\n' "$response" > "$FIXTURE/api.json"
+    check_installer "reject unusable API response: $response" noverify COOP_TEST_BUNDLE_FAIL=1
+done
+printf '%s\n' '{"attestations":[{"bundle":{"synthetic":true}}]}' > "$FIXTURE/api.json"
+check_installer "API transport failure retains authenticated verification" api COOP_TEST_BUNDLE_FAIL=1 COOP_TEST_API_FAIL=1
+check_installer "all provenance transports failing aborts installation" failure COOP_TEST_BUNDLE_FAIL=1 COOP_TEST_API_FAIL=1 COOP_TEST_GH_VERIFY_FAIL=1
+
+# Source only the helpers, then hide jq from has() while retaining all other
+# host tools. This exercises the compatibility branch without changing PATH.
+sed '/^# --- main /,$d' "$PROJECT_DIR/install.sh" > "$TEST_ROOT/helpers.sh"
+: > "$GH_LOG"
+cat > "$TEST_ROOT/no-jq.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$1"
+TMPDIR="$2"
+has() { [ "$1" != jq ] && command -v "$1" >/dev/null 2>&1; }
+verify_attestation "$3" "$4"
+EOF
+if env PATH="$MOCK_BIN:$REAL_PATH" VERSION="$VERSION" \
+    COOP_TEST_GH_LOG="$GH_LOG" COOP_TEST_CURL_LOG="$CURL_LOG" \
+    COOP_TEST_FIXTURE="$FIXTURE" COOP_TEST_BUNDLE_FAIL=1 \
+    bash "$TEST_ROOT/no-jq.sh" "$TEST_ROOT/helpers.sh" "$TEST_ROOT" "$FIXTURE/$TARBALL" \
+    "$(cut -d' ' -f1 "$FIXTURE/SHA256SUMS")" >"$TEST_ROOT/no-jq.log" 2>&1 \
+    && grep -q 'Install jq' "$TEST_ROOT/no-jq.log" \
+    && grep -q '^attestation verify ' "$GH_LOG" \
+    && ! grep -q -- '--bundle' "$GH_LOG"; then
+    pass "missing jq retains authenticated gh verification with guidance"
+else
+    fail "missing jq retains authenticated verification" "$(tail -10 "$TEST_ROOT/no-jq.log")"
+fi
+unset COOP_TEST_BUNDLE_FAIL
 
 echo "==> Test 4: checksum rejection preserves both binaries"
 printf '%s\n' 'keep-existing-install' >"$INSTALL_DIR/coop"
