@@ -399,6 +399,14 @@ from cargo-mutants. Run such checks only in an authorized test environment;
 read-only CI review must report them as unrun when contributor execution is
 forbidden. The concrete forwarding checks above implement this pattern for SSH.
 
+The `lima-lookup` CI job installs Lima on macOS and runs
+`cargo test --test lima_lookup`. This CLI test supplies a hostile `PATH`, requires
+a successful production `limactl --version` probe, and stops setup at SSH key
+generation before creating a VM. The required `check` job depends on this
+positive execution witness. The Darwin Nix install check exercises the packaged
+Lima route; the Linux unit regression separately executes a packaged Lima fixture
+and a helper from its embedded search path. Neither check replaces VM integration.
+
 The trusted-host-tool unit fixtures use a private synthetic filesystem root so
 they do not depend on tools installed on the development host. They cover fixed
 candidate mapping, missing/relative/writable rejection, trusted symlink hops,
