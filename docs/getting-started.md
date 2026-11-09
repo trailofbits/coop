@@ -46,9 +46,11 @@ gh attestation verify coop-<version>-<triple>.tar.gz --repo trailofbits/coop \
 ```
 
 Dropping `--bundle` makes `gh` fetch the attestation from the GitHub API
-instead, which it will only do when `gh` is logged in. `install.sh` and `coop
-update` use that API path themselves for releases published without a usable
-bundle.
+instead, which requires a GitHub login. For releases without a usable bundle,
+`coop update` fetches attestations anonymously by SHA-256 digest and verifies
+them locally with `--bundle`. `install.sh` does the same when `jq` is installed;
+without `jq` it retains the authenticated `gh` API path. Both clients also use
+that authenticated path if anonymous API access fails.
 Both paths require the release workflow at the selected tag (including its
 `v` prefix), with attestation generated on a GitHub-hosted runner. An older
 `gh` that does not support these flags fails verification; upgrade it before
@@ -571,7 +573,7 @@ coop images --delete python-dev
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
 | `coop logs` | Stream VM serial console logs (`-f` to follow) |
-| `coop editor` | Open VS Code or Zed connected to the guest via SSH |
+| `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
 | `coop resize --size 100` | Set a stopped instance's disk to 100 GiB |

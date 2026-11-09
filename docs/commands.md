@@ -691,32 +691,62 @@ older vulnerable release.
 
 ### `editor`
 
-Open an editor (VS Code or Zed) connected to the guest VM over SSH remote.
+Open VS Code or Zed connected to the guest VM over SSH, or use `--web` to run
+a browser editor inside the VM.
 `coop vscode` remains as an alias.
 
 ```
 coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
+coop editor [NAME] --web [--project PATH] [--port PORT]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--project <path>` | Remote path to open in the editor (default: `/workspace`) |
-| `--editor <code\|zed>` | Editor to launch. Omitted: try VS Code first, then Zed. |
+| `--project <path>` | Absolute guest path to open in either mode (default: `/workspace`) |
+| `--editor <code\|zed>` | Host editor to launch. Omitted: try VS Code first, then Zed. |
 | `--clean` | Remove the SSH config entry for this instance and exit |
+| `--web` | Run code-server inside the VM; conflicts with `--editor` and `--clean` |
+| `--port <port>` | Host loopback port for browser editing; requires `--web` (default: select a free port) |
 
 ```
 coop editor
 coop editor my-project --project /workspace/subdir
 coop editor my-project --editor zed
 coop editor my-project --clean
+coop editor my-project --web
+coop editor my-project --web --project /workspace/subdir --port 8080
 ```
+
+#### Browser mode
+
+Choose a running VM; code-server installs inside it on first use. Open the URL
+printed in your terminal, then enter the displayed password to sign in.
+
+Use this mode to reduce host exposure when editing an untrusted guest: the editor,
+extensions, and terminals run inside the VM, while your host renders the editor
+in a browser. The browser still processes guest-controlled content. See
+[editor security](editor.md#editor-integration) for the comparison with host editors.
+
+`--project` selects an existing guest directory, defaulting to `/workspace`.
+
+During first use, coop reports installation and download progress. Failures
+identify download, archive verification, systemd launch, or code-server startup
+when the guest supplies a status. SSH transport failures report the last
+observed stage. The guest `~/.local/share/coop-web-editor/editor.log` is relevant
+only after code-server launch has been acknowledged.
+
+Keep the terminal running while you edit. A second invocation joins the same
+session and can open a different `--project` in that session. Ctrl+C in either
+terminal stops the editor and its terminals while keeping the VM running.
+Settings and extensions persist in the guest. Browser mode does not install a
+host SSH config entry.
 
 ### `ssh-config`
 
 Install a `coop-<name>` alias into `~/.ssh/config` so plain `ssh`, `scp`, and
 `rsync` reach the guest without remembering its host, port, user, or key. This
-is the same SSH config block `coop editor` writes, but without launching an
+is the same SSH config block `coop editor` writes in host-editor mode, without launching an
 editor.
 
 ```
@@ -737,7 +767,8 @@ rsync -az ./dir/ coop-my-project:/workspace/dir/
 coop ssh-config my-project --clean
 ```
 
-The alias is created only when you run `coop ssh-config` (or `coop editor`).
+The alias is created only when you run `coop ssh-config` (or `coop editor`
+without `--web`).
 The lifecycle keeps it tidy: `coop stop` and `coop destroy` remove the block,
 and `coop start` refreshes an already-installed block so it stays valid across
 a restart. On macOS/Lima the forwarded SSH port changes on each start; the

@@ -27,6 +27,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
 dirs = "7.0.0"
+getrandom = "0.4"
 indexmap = "2"
 libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
