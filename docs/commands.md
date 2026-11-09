@@ -41,7 +41,7 @@ coop up [DIR] [FLAGS]
 
 `DIR` defaults to the current directory. coop canonicalizes it and uses it as
 the project identity for instance naming, GitHub PAT
-lookup, and future `coop up DIR` affinity. If a matching instance is already
+lookup, and `coop up DIR` instance matching. If a matching instance is already
 running, `up` reports success without creating another VM. If a matching
 instance is stopped, `up` restarts it. If no matching instance exists, `up`
 creates one. Pass `--new-instance` with `--name` to skip the lookup and create
@@ -128,24 +128,25 @@ the current directory, and launch Claude Code inside it. Runs `setup`, `up`, and
 coop quickstart [FLAGS]
 ```
 
-`quickstart` resolves the workspace to the current directory (unless
-`--no-workspace`) and uses it as the project identity, the same way `coop up`
-does. It then takes one of three branches based on the instance for that
-workspace:
+`quickstart` uses the current directory as the project identity and copies it
+into `/workspace` when creating a new instance, as `coop up` does by default.
+`--no-workspace` skips that copy and project matching. After ensuring the
+default image exists, quickstart takes one of three branches:
 
-- **A running instance exists.** coop reconnects to it and launches Claude Code —
-  no setup, restart, or recreation.
+- **A running instance exists.** coop resumes any pending creation hook, then
+  connects and launches Claude Code without restarting or recreating the VM.
 - **A stopped instance exists.** coop restarts it (reusing the instance's own
   image, not necessarily `default`) and launches Claude Code.
 - **No instance exists.** coop creates one for the workspace, then launches
   Claude Code.
 
-Image setup runs only when the `default` template image is missing; otherwise it
-is skipped. Setup runs non-interactively (no confirmation prompts).
+Quickstart checks for the `default` image before looking up an existing VM. If
+the image is missing, it builds it even when the project already has a running
+instance. Setup runs non-interactively (no confirmation prompts).
 
 | Flag | Description |
 |------|-------------|
-| `--no-workspace` | Skip mounting the current directory as the workspace. Without a workspace there is no instance to match, so quickstart always creates a fresh instance rather than reusing an existing one. |
+| `--no-workspace` | Skip copying the current directory into the VM and skip project matching; quickstart creates a fresh instance. |
 
 ```
 coop quickstart
@@ -155,7 +156,8 @@ coop quickstart --no-workspace
 `quickstart` takes no instance name or per-instance tuning flags. For control
 over profiles, mounts, image, resources, or named instances, use `coop setup`
 and `coop up` directly. When run from your `$HOME` or `/`, coop prompts before
-mounting (or bails in a non-TTY); pass `--no-workspace` to skip the mount.
+using that directory as a workspace (or fails in a non-TTY); pass
+`--no-workspace` to skip the copy.
 
 ### `init`
 
