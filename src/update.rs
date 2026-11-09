@@ -153,17 +153,17 @@ pub(crate) fn latest_release_tag(repo: &str) -> Result<String> {
 /// Selects an auth strategy at call time so changes to `GITHUB_TOKEN` /
 /// `gh auth` between invocations take effect.
 fn fetch_release_metadata(source: &UpdateSource, repo: &str, path_suffix: &str) -> Result<Release> {
-    let body = match select_auth_strategy_from_env(source) {
-        AuthStrategy::Gh => gh_api_capture(&format!("repos/{repo}/releases/{path_suffix}"))?,
-        AuthStrategy::CurlBearer(token) => {
-            let url = source.metadata_url(repo, path_suffix)?;
-            curl_capture(source, &url, Some(&token))?
-        }
-        AuthStrategy::CurlBare => {
-            let url = source.metadata_url(repo, path_suffix)?;
-            curl_capture(source, &url, None)?
-        }
-    };
+    let url = source.metadata_url(repo, path_suffix)?;
+    let strategy = select_auth_strategy_from_env(source);
+    let body = with_anonymous_retry(
+        &strategy,
+        match &strategy {
+            AuthStrategy::Gh => gh_api_capture(&format!("repos/{repo}/releases/{path_suffix}")),
+            AuthStrategy::CurlBearer(token) => curl_capture(source, &url, Some(token)),
+            AuthStrategy::CurlBare => curl_capture(source, &url, None),
+        },
+        || curl_capture(source, &url, None),
+    )?;
     serde_json::from_str(&body).context("Failed to parse GitHub release JSON")
 }
 
@@ -225,6 +225,7 @@ fn gh_authenticated() -> bool {
 fn curl_command(source: &UpdateSource) -> Cmd {
     let (initial, redirects) = source.curl_protocols();
     Cmd::new("curl")
+        .arg("--disable")
         .arg("--proto")
         .arg(initial)
         .arg("--proto-redir")
@@ -235,7 +236,9 @@ fn curl_capture(source: &UpdateSource, url: &Url, bearer_token: Option<&str>) ->
     let mut cmd = curl_command(source)
         .arg("-fsSL")
         .arg("-H")
-        .arg("Accept: application/vnd.github+json");
+        .arg("Accept: application/vnd.github+json")
+        .arg("-H")
+        .arg("X-GitHub-Api-Version: 2022-11-28");
     if let Some(token) = bearer_token {
         // Pass the auth header on stdin via curl's `-H @-` so the secret
         // never touches argv (visible in /proc and `Cmd::describe` logs).
@@ -268,10 +271,41 @@ fn gh_api_command(path: &str) -> Cmd {
 /// Download a release asset, choosing auth strategy at call time.
 ///
 fn download_asset(asset: &ValidatedAsset, dest: &Path) -> Result<()> {
-    match select_auth_strategy_from_env(asset.source()) {
-        AuthStrategy::Gh => gh_release_download(asset.tag(), asset.name(), dest),
-        AuthStrategy::CurlBearer(token) => curl_download(asset, dest, Some(&token)),
-        AuthStrategy::CurlBare => curl_download(asset, dest, None),
+    let strategy = select_auth_strategy_from_env(asset.source());
+    with_anonymous_retry(
+        &strategy,
+        match &strategy {
+            AuthStrategy::Gh => gh_release_download(asset.tag(), asset.name(), dest),
+            AuthStrategy::CurlBearer(token) => curl_download(asset, dest, Some(token)),
+            AuthStrategy::CurlBare => curl_download(asset, dest, None),
+        },
+        || {
+            // Discard any partial authenticated download before the second transfer.
+            if dest.exists() {
+                fs::remove_file(dest).context("Failed to discard partial release download")?;
+            }
+            curl_download(asset, dest, None)
+        },
+    )
+}
+
+/// Retry transport failures once without credentials. gh does not expose a
+/// stable HTTP status for release downloads, so this includes non-auth transfer
+/// failures. Parsing and integrity verification occur outside this retry.
+fn with_anonymous_retry<T>(
+    strategy: &AuthStrategy,
+    result: Result<T>,
+    anonymous: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(first) if !matches!(strategy, AuthStrategy::CurlBare) => {
+            tracing::info!("Authenticated GitHub request failed; retrying anonymously");
+            anonymous().with_context(|| {
+                format!("Authenticated request failed ({first:#}); anonymous retry also failed")
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -475,8 +509,7 @@ impl Provenance {
             }
         };
         format!(
-            " (verified through the GitHub API because {cause}; an HTTP 403 here means your \
-             GitHub credential has no SSO session for {REPO})"
+            " (authenticated API verification used because {cause} and anonymous API retrieval failed)"
         )
     }
 }
@@ -486,14 +519,13 @@ impl Provenance {
 ///
 /// Never fails the update: every problem with the bundle falls back to the
 /// attestations API or skips verification outright.
-fn resolve_provenance(release: &ValidatedRelease, dir: &Path) -> Provenance {
+fn release_provenance(release: &ValidatedRelease, dir: &Path) -> Provenance {
     let asset = match bundle_decision(release, command_exists("gh")) {
         BundleDecision::TestMode => return Provenance::TestMode,
         BundleDecision::NoGh => return Provenance::NoGh,
         BundleDecision::NoAsset => {
             tracing::info!(
-                "Release {} publishes no {BUNDLE_ASSET} — verifying the attestation through the \
-                 GitHub API, for which `gh` needs a credential authorized for {REPO}.",
+                "Release {} publishes no {BUNDLE_ASSET} — using the attestation API fallback.",
                 release.tag()
             );
             return Provenance::Api(ApiReason::NoAsset);
@@ -502,26 +534,18 @@ fn resolve_provenance(release: &ValidatedRelease, dir: &Path) -> Provenance {
     };
 
     let dest = dir.join(BUNDLE_ASSET);
-    // Deliberately not `download_asset`: it routes through
-    // `select_auth_strategy_from_env`, which prefers `gh` and then a
-    // `GITHUB_TOKEN` bearer, re-attaching the credential `--bundle` exists to
-    // avoid. A token with no SSO session for the org would 403 on this one step
-    // and drop the chain back to the API path, failing with the original error.
-    // The bundle is a public release asset, so a bare curl reaches it and keeps
-    // the path credential-free end to end.
+    // Fetch bundles anonymously from the outset, avoiding unnecessary credential
+    // use even though ordinary release downloads can retry anonymously.
     if let Err(err) = curl_download(asset, &dest, None) {
         tracing::warn!(
-            "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — verifying the \
-             attestation through the GitHub API, for which `gh` needs a credential authorized \
-             for {REPO}.",
+            "Failed to download {BUNDLE_ASSET} for release {} ({err:#}) — using the attestation API fallback.",
             release.tag()
         );
         return Provenance::Api(ApiReason::DownloadFailed);
     }
     if !fs::metadata(&dest).is_ok_and(|meta| meta.len() > 0) {
         tracing::warn!(
-            "{BUNDLE_ASSET} for release {} is empty — verifying the attestation through the \
-             GitHub API, for which `gh` needs a credential authorized for {REPO}.",
+            "{BUNDLE_ASSET} for release {} is empty — using the attestation API fallback.",
             release.tag()
         );
         return Provenance::Api(ApiReason::EmptyBundle);
@@ -557,6 +581,60 @@ fn verify_attestation(tarball: &Path, tag: &str, provenance: &Provenance) -> Res
                 provenance.api_fallback_hint()
             )
         })
+}
+
+/// Extract nonempty JSONL bundles, leaving signature and subject checks to gh.
+fn parse_attestation_bundles(body: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Response {
+        attestations: Vec<Attestation>,
+    }
+    #[derive(Deserialize)]
+    struct Attestation {
+        bundle: serde_json::Map<String, serde_json::Value>,
+    }
+    let response: Response =
+        serde_json::from_str(body).context("Invalid GitHub attestations response")?;
+    ensure!(
+        !response.attestations.is_empty(),
+        "GitHub returned no attestations"
+    );
+    let mut jsonl = String::new();
+    for attestation in response.attestations {
+        ensure!(
+            !attestation.bundle.is_empty(),
+            "GitHub returned an empty attestation bundle"
+        );
+        jsonl.push_str(&serde_json::to_string(&attestation.bundle)?);
+        jsonl.push('\n');
+    }
+    Ok(jsonl)
+}
+
+/// Try anonymous API retrieval before the existing authenticated fallback.
+fn resolve_provenance(
+    release: &ValidatedRelease,
+    dir: &Path,
+    digest: &Sha256Hash,
+) -> Result<Provenance> {
+    let provenance = release_provenance(release, dir);
+    if !matches!(provenance, Provenance::Api(_)) {
+        return Ok(provenance);
+    }
+    let source = release.tarball().source();
+    let mut url = source.metadata_url(REPO, "latest")?;
+    url.set_path(&format!("/repos/{REPO}/attestations/sha256:{digest}"));
+    url.set_query(Some("per_page=100"));
+    let Ok(body) = curl_capture(source, &url, None) else {
+        tracing::warn!(
+            "Anonymous attestation API request failed; trying authenticated gh verification"
+        );
+        return Ok(provenance);
+    };
+    let dest = dir.join(BUNDLE_ASSET);
+    fs::write(&dest, parse_attestation_bundles(&body)?)
+        .context("Failed to write downloaded attestation bundle")?;
+    Ok(Provenance::Bundle(dest))
 }
 
 // ── Atomic self-replace ──────────────────────────────────────────────────────
@@ -721,7 +799,7 @@ fn perform_update(release: &ValidatedRelease, triple: &str) -> Result<()> {
         .with_context(|| format!("{tarball_name} not listed in SHA256SUMS"))?;
     verify_sha256(&tarball_path, &expected)?;
 
-    let provenance = resolve_provenance(release, tmp.path());
+    let provenance = resolve_provenance(release, tmp.path(), &expected)?;
     verify_attestation(&tarball_path, release.tag().as_str(), &provenance)?;
 
     // `--no-same-owner --no-same-permissions` ignore embedded uid/mode metadata.
@@ -1147,7 +1225,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(curl_args, ["--proto", "=https", "--proto-redir", "=https"]);
+        assert_eq!(
+            curl_args,
+            ["--disable", "--proto", "=https", "--proto-redir", "=https"]
+        );
         assert!(!curl_args.iter().any(|arg| arg == "--location-trusted"));
 
         let gh_api = gh_api_command("repos/trailofbits/coop/releases/latest").build();
@@ -1459,7 +1540,7 @@ mod tests {
         // either of which re-attaches the credential. A bare curl carries no
         // header and shells out to nothing.
         assert!(
-            bundle_fetch.contains("curl -fsSL")
+            bundle_fetch.contains("curl --disable -fsSL")
                 && !bundle_fetch.contains("-H")
                 && !bundle_fetch.contains("--header")
                 && !bundle_fetch.contains("$(")
@@ -1557,6 +1638,171 @@ mod tests {
         );
         assert_eq!(Provenance::TestMode.api_fallback_hint(), "");
         assert_eq!(Provenance::NoGh.api_fallback_hint(), "");
+    }
+
+    #[test]
+    fn anonymous_retry_runs_only_after_authenticated_failure() {
+        for strategy in [
+            AuthStrategy::Gh,
+            AuthStrategy::CurlBearer("fake-token".into()),
+        ] {
+            assert_eq!(
+                with_anonymous_retry(&strategy, Ok(1), || panic!("unexpected retry")).unwrap(),
+                1
+            );
+            assert_eq!(
+                with_anonymous_retry(&strategy, Err(anyhow::anyhow!("rejected")), || Ok(2))
+                    .unwrap(),
+                2
+            );
+            let error =
+                with_anonymous_retry::<()>(&strategy, Err(anyhow::anyhow!("first")), || {
+                    bail!("second")
+                })
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("first") && message.contains("second"));
+        }
+        assert!(
+            with_anonymous_retry::<()>(
+                &AuthStrategy::CurlBare,
+                Err(anyhow::anyhow!("failed")),
+                || panic!("unexpected retry")
+            )
+            .is_err()
+        );
+    }
+
+    fn write_transport_stubs(dir: &Path) {
+        // Both executables share logging and argument parsing. Unexpected calls
+        // fail loudly so they cannot masquerade as the intended auth rejection.
+        let script = r#"#!/bin/sh
+set -eu
+tool=${0##*/}
+printf '%s %s\n' "$tool" "$*" >> "$COOP_UPDATE_TRANSPORT_CHILD/calls"
+case "$tool:$1 $2" in
+    'gh:auth status') [ "$COOP_TEST_AUTH_MODE" = gh ]; exit $? ;;
+    'gh:api repos/trailofbits/coop/releases/latest') exit 1 ;;
+    'gh:attestation verify') exit 42 ;;
+    'gh:release download'|'curl:--disable --proto') ;;
+    *) touch "$COOP_UPDATE_TRANSPORT_CHILD/unexpected"; exit 99 ;;
+esac
+auth=0; dest=''; url=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -H) [ "$2" != @- ] || auth=1; shift 2 ;;
+        -o|--output) dest="$2"; shift 2 ;;
+        https:*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+if [ "$tool" = gh ] || [ "$auth" = 1 ]; then
+    [ "$auth" = 0 ] || cat >/dev/null
+    [ -z "$dest" ] || printf partial > "$dest"
+    exit 22
+fi
+case "$url" in
+    */releases/latest) printf '%s' '{"tag_name":"v9.9.9","assets":[]}' ;;
+    */attestations/sha256:*)
+        [ ! -e "$COOP_UPDATE_TRANSPORT_CHILD/fail-api" ] || exit 22
+        printf '%s' '{"attestations":[{"bundle":{"synthetic":true}}]}' ;;
+    *.tar.gz) [ ! -e "$dest" ]; printf 'verified bytes' > "$dest" ;;
+    *) touch "$COOP_UPDATE_TRANSPORT_CHILD/unexpected"; exit 99 ;;
+esac
+"#;
+        for tool in ["gh", "curl"] {
+            let path = dir.join(tool);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_retry_real_transports() {
+        const CHILD: &str = "COOP_UPDATE_TRANSPORT_CHILD";
+        if let Ok(directory) = env::var(CHILD) {
+            let dir = Path::new(&directory);
+            let source = UpdateSource::official();
+            let metadata = fetch_release_metadata(&source, REPO, "latest").unwrap();
+            assert_eq!(metadata.tag, "v9.9.9");
+            let release = validated_test_release(&source, "v9.9.9", false);
+            let tarball = dir.join("download");
+            download_asset(release.tarball(), &tarball).unwrap();
+            assert_eq!(fs::read(&tarball).unwrap(), b"verified bytes");
+            let digest = Sha256Hash::of(b"verified bytes");
+            let provenance = resolve_provenance(&release, dir, &digest).unwrap();
+            assert_eq!(
+                fs::read_to_string(provenance.bundle().unwrap()).unwrap(),
+                "{\"synthetic\":true}\n"
+            );
+            // The stub rejects verification. A download retry must not hide it.
+            assert!(verify_attestation(&tarball, "v9.9.9", &provenance).is_err());
+            fs::write(dir.join("fail-api"), b"").unwrap();
+            let fallback = resolve_provenance(&release, dir, &digest).unwrap();
+            assert!(matches!(fallback, Provenance::Api(_)));
+            assert!(verify_attestation(&tarball, "v9.9.9", &fallback).is_err());
+            return;
+        }
+        for mode in ["gh", "bearer"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_transport_stubs(temp.path());
+            let status = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::tests::rejected_credentials_retry_real_transports",
+                    "--nocapture",
+                ])
+                .env(CHILD, temp.path())
+                .env("COOP_TEST_AUTH_MODE", mode)
+                .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+                .env("GITHUB_TOKEN", "fake-test-token")
+                .env_remove("GH_TOKEN")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{mode}");
+            assert!(!temp.path().join("unexpected").exists());
+            let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
+            assert_eq!(calls.matches("gh attestation verify ").count(), 2);
+            let expected_url = format!(
+                "https://api.github.com/repos/trailofbits/coop/attestations/sha256:{}?per_page=100",
+                Sha256Hash::of(b"verified bytes")
+            );
+            let api_calls: Vec<_> = calls
+                .lines()
+                .filter(|line| line.contains("/attestations/sha256:"))
+                .collect();
+            assert_eq!(api_calls.len(), 2);
+            for api in api_calls {
+                assert_eq!(api.split_whitespace().last(), Some(expected_url.as_str()));
+                assert!(api.starts_with("curl --disable ") && !api.contains("@-"));
+            }
+            assert!(!calls.contains("fake-test-token"));
+            assert_eq!(
+                calls.matches("curl --disable ").count(),
+                if mode == "gh" { 4 } else { 6 }
+            );
+        }
+    }
+
+    #[test]
+    fn attestation_api_response_requires_nonempty_object_bundles() {
+        for body in [
+            "",
+            "{}",
+            r#"{"attestations":[]}"#,
+            r#"{"attestations":[{}]}"#,
+            r#"{"attestations":[{"bundle":null}]}"#,
+            r#"{"attestations":[{"bundle":{}}]}"#,
+            r#"{"attestations":[{"bundle":"bad"}]}"#,
+            r#"{"attestations":[{"bundle":{"ok":1}},{"bundle":{}}]}"#,
+        ] {
+            assert!(parse_attestation_bundles(body).is_err(), "{body}");
+        }
+        let bundles = parse_attestation_bundles(
+            r#"{"attestations":[{"bundle":{"first":1}},{"bundle":{"second":2}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(bundles, "{\"first\":1}\n{\"second\":2}\n");
     }
 
     #[test]
