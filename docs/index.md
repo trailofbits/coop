@@ -8,8 +8,8 @@ short navigational entrypoint; durable detail lives here.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, the two-backend design,
   host→guest data flow, architectural invariants.
 - [`trust-model.md`](trust-model.md) — trust boundaries, taint sources, secret
-  handling, `coop update` verification. The authoritative security spec the
-  `review-security` agent reads. (Disclosure policy is [`SECURITY.md`](../SECURITY.md).)
+  handling, and `coop update` verification. Disclosure policy:
+  [`SECURITY.md`](../SECURITY.md).
 - [`code-style.md`](code-style.md) — Rust authoring idioms and the review /
   authoring checklists.
 - [`testing.md`](testing.md) — integration tests, mutation testing (+
@@ -18,7 +18,6 @@ short navigational entrypoint; durable detail lives here.
   reliability trade-offs during implementation and review.
 - [`platform-notes.md`](platform-notes.md) — Firecracker CI-kernel workarounds,
   Docker networking, scp `~` caveat, tracing-to-stderr.
-- [`web-editor-design.md`](web-editor-design.md) — in-browser file editor.
 
 ## For users
 
@@ -33,13 +32,11 @@ short navigational entrypoint; durable detail lives here.
 - [`claude-integration.md`](claude-integration.md),
   [`codex-integration.md`](codex-integration.md),
   [`grok-integration.md`](grok-integration.md) — agent integration.
-- [`credential-proxy.md`](credential-proxy.md) — the opt-in `[proxy]`
-  credential-injecting proxy (issue #411): keeps the raw API key out of the
-  guest.
+- [`credential-proxy.md`](credential-proxy.md) — opt-in host-side credential
+  proxy for Anthropic and OpenAI API keys, Claude setup tokens, and Codex
+  workspace tokens.
 - [`firecracker-network-modes.md`](firecracker-network-modes.md) — restart-gated
   open and no-NIC isolated networking on Linux/Firecracker.
-- [`json-output-design.md`](json-output-design.md) — the `--json` design
-  (a good precedent for design-doc style).
 
 ## Agent tooling
 

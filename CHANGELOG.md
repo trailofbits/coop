@@ -522,8 +522,7 @@
   step, so the human and JSON outputs cannot drift; absence is
   `null`/`[]` rather than sentinel strings. For `devcontainer check` and
   `up`/`start --dry-run` the JSON payload goes to stdout while the human
-  report stays on stderr, so `… --json | jq` stays clean. See
-  `docs/json-output-design.md`.
+  report stays on stderr, so `… --json | jq` stays clean.
 
 ### Fixes
 

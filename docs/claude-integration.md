@@ -72,7 +72,7 @@ type = "http"
 url = "https://mcp.sentry.dev/mcp"
 ```
 
-Every field is optional. An empty `[claude]` section (or omitting it entirely) skips all bootstrap steps.
+Every field is optional. With no `[claude]` section, coop still imports allowlisted files from the default `~/.claude` directory when present and writes managed guest settings on boot. Pass `--no-agents` on `up` or `start` to skip agent bootstrap for that invocation.
 
 ### API key forwarding
 

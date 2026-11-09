@@ -91,8 +91,8 @@ backends.)
 Everything above the trait is **backend-shared**: the entire "shared guest
 operations" surface in `backend.rs` (env/secret forwarding, agent bootstrap,
 Claude/Codex/Grok config injection, git-repo cloning), plus `workspace.rs`,
-`ssh.rs`, `config.rs`, and the `commands/` handlers. When you touch shared
-code, it must hold for **both** backends. Known intentional divergences:
+`ssh.rs`, `config.rs`, and the `commands/` handlers. Shared behavior applies
+to **both** backends. Known intentional divergences:
 
 | Aspect | Firecracker | Lima |
 |--------|-------------|------|
@@ -279,22 +279,24 @@ netfilter modules; the resulting workarounds (iptables-legacy, static
 
 ## Architectural invariants
 
-Hold these when changing the code; the review agents check for their violation:
+These invariants describe the current architecture:
 
 1. **The VM is the isolation boundary.** The guest is untrusted from the host's
    view; guest-authored data must not escalate into host code execution or
    filesystem escape. See [`trust-model.md`](trust-model.md).
-2. **Backend selection is compile-time.** Don't add a runtime backend enum;
-   keep shared code correct for both Firecracker and Lima.
-3. **State-gated operations use probes and locks.** Route VM operations through
+2. **Backend selection is compile-time.** `PlatformBackend` resolves to
+   Firecracker or Lima at compile time; shared code supports both.
+3. **State-gated operations use probes and locks.** VM operations use
    `RunningInstance`/`StoppedInstance` and `boot_preflight`; the stopped token
    holds the operation lock until the disk mutation is complete.
-4. **Value invariants live in constructors.** Parse into a newtype at the
-   boundary; don't re-validate primitives downstream.
-5. **Secrets never touch argv or logs.** Env/`SendEnv`/stdin only; redact in
-   traces.
-6. **Remote commands are built with `RemoteCommand::arg`, host commands with
-   `Cmd::arg`** — no shell-string interpolation of tainted input.
+4. **Value invariants live in constructors.** Boundaries parse values into
+   newtypes, so downstream code receives values with established invariants.
+5. **Secrets use bounded transport and redacted diagnostics.** Env/`SendEnv`/stdin
+   carry most secrets; traces redact them. The macOS `security` and 1Password
+   `op` store commands are documented argv exceptions (see
+   [`trust-model.md`](trust-model.md#secrets-and-how-they-cross-into-the-guest)).
+6. **Remote commands use `RemoteCommand::arg`; host commands use `Cmd::arg`.**
+   Tainted input is not interpolated into shell command strings.
 7. **State is transparent JSON sidecars** written atomically
    (`fs_util::atomic_write_*`) without relaxing permissions.
 

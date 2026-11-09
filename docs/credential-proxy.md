@@ -1,8 +1,8 @@
 # Credential-injecting proxy (`[proxy]`)
 
-Status: **v1 — Anthropic (Claude Code) and OpenAI (Codex); Firecracker and
-Lima.** Opt-in; off by default. Design:
-[`design/issue-411-injecting-proxy.md`](design/issue-411-injecting-proxy.md).
+The proxy keeps Anthropic and OpenAI API keys, Claude setup tokens, and Codex
+workspace tokens on the host. It is opt-in, off by default, and supports
+Firecracker and Lima.
 
 ## What it does
 

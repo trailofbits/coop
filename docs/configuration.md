@@ -670,14 +670,21 @@ Default host-to-guest TCP port forwards applied to every VM startup. Forwards ar
 
 Each entry accepts a bare port (host and guest match), a `"GUEST:HOST"` string, or a table.
 
+These are separate examples. An array can also mix bare ports and strings, as
+shown in the [full config](#full-config). Use the table form separately:
+
 ```toml
 # Bare port: host 3000 ⇒ guest 3000
 forward_ports = [3000]
+```
 
+```toml
 # String form: host 18080 ⇒ guest 8080
 forward_ports = ["8080:18080"]
+```
 
-# Table form (also supports an optional `label` for the user's own bookkeeping)
+```toml
+# Table form (also supports an optional `label` for your own bookkeeping)
 [[forward_ports]]
 guest = 5432
 host = 15432
@@ -730,6 +737,7 @@ data_dir = "~/.coop"
 ssh_port = 22
 firecracker_bin = "~/.coop/firecracker"
 github = "auto"  # must be set explicitly; default is off
+forward_ports = [3000, "8080:18080"]
 
 [vm]
 firecracker_control = "vsock"
@@ -774,6 +782,4 @@ args = ["-y", "@playwright/mcp@latest"]
 [profiles.my-tools]
 apt_packages = ["ripgrep", "fd-find"]
 post_install = "cargo install ast-grep"
-
-forward_ports = [3000, "8080:18080"]
 ```
