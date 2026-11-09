@@ -532,6 +532,16 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   (Linux) story is the stronger one; Lima (macOS) is closable to near-parity
   with Seatbelt, with the stated caveats.
 
+## Browser editor transport
+
+`coop editor --web` runs code-server, extensions, and terminals inside the VM,
+reducing exposure through the native host-editor integrations used by `coop editor`.
+Browser vulnerabilities remain part of the attack surface.
+
+Code-server's password login restricts access to the editor, and the host
+browser handles guest-controlled content under a fresh, session-specific
+`.localhost` origin.
+
 ## `coop update` trust chain
 
 Self-update (`update.rs`) must preserve, in order:
@@ -563,9 +573,9 @@ Self-update (`update.rs`) must preserve, in order:
    The bundle asset is fetched with a deliberately unauthenticated request
    (`curl_download(asset, dest, None)` in `update.rs`, `download_bundle` in
    `install.sh`) rather than through `download_asset` / `gh release download`,
-   which would re-attach the very credential this transport exists to avoid — a
-   SAML-restricted token would then 403 on the fetch and drop the chain back to
-   the API path. Keep both fetches credential-free. It is *not* offline:
+   which first attempts authenticated access. Direct anonymous retrieval avoids
+   unnecessary credential use and authorization failures. Keep both bundle
+   fetches credential-free. It is *not* offline:
    without `--custom-trusted-root`, `gh` still reaches `tuf-repo.github.com`
    and the Sigstore public-good CDN for the trust root (one-day cache) and
    fails if neither is reachable.
@@ -593,11 +603,17 @@ Self-update (`update.rs`) must preserve, in order:
    digest: moving a tag and rerunning the release workflow is not prevented
    by this policy.
 
-   A release that publishes no bundle asset — or one whose download fails, or
-   whose bundle is empty — falls back to the API path, where `gh` requires a
-   credential authorized for the org even though the store itself is
-   anonymously readable. `update.rs` and `install.sh` treat all three
-   identically, because for a client they are one situation: no bundle to read.
+   A release that publishes no bundle asset, or whose bundle download fails or
+   is empty, falls back to an anonymous request to the repository attestations
+   API keyed by the verified tarball's SHA-256 digest. The updater extracts
+   nonempty bundle objects into JSONL and runs the same pinned `gh --bundle`
+   verification. The installer uses `jq` for this extraction when available;
+   without `jq` it retains the authenticated `gh` API transport and explains
+   how to enable anonymous retrieval. If the anonymous API transfer fails, both
+   clients retain authenticated `gh` verification for private resources and
+   anonymous rate limits. Parsing and verification failures abort installation. The request asks for up to
+   100 attestations; verification fails closed if none of those satisfy the
+   signer policy.
    An empty bundle is
    rejected rather than passed through because `gh` before 2.56.0
    (cli/cli#9541) reports success on one, having verified nothing;
@@ -613,6 +629,15 @@ Self-update (`update.rs`) must preserve, in order:
    floor.
 5. Extraction with `tar -xzf --no-same-owner --no-same-permissions` (path-escape
    safe), then an atomic `rename`-over-self.
+
+Release metadata and asset downloads prefer the existing authenticated
+transport, then retry a failed transfer once anonymously. The installer can
+try both `gh` and an explicit token before its anonymous attempt. Since
+`gh release download` does not expose a structured HTTP status, transfer
+failures are retried without guessing whether they are authorization, rate
+limit, or network failures. Parsing and integrity failures are never retried.
+Partial asset files are removed before retrying. Curl's default config file
+is disabled so it cannot silently add authentication to an anonymous request.
 
 Production curl transfers restrict both initial and redirected protocols to
 HTTPS and retain curl's default refusal to forward authorization headers across
