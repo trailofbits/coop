@@ -12,6 +12,8 @@ set -euo pipefail
 # the matching musl binary, copies it and the test script, and runs tests there.
 #
 # --full also runs integration-network.sh on the test host before the VM suite.
+# COOP_TEST_SKIP_BRIDGE=1 avoids that duplicate gate in the KVM matrix, where
+# regular CI already runs it on pull requests and pushes.
 # --require-proxy requires full mode and fails if proxy prerequisites or the
 # proxy phase are missing. Other flags besides --remote reach integration.sh.
 
@@ -41,17 +43,20 @@ fi
 # ── Local mode ───────────────────────────────────────────────────
 
 if [[ -z "$REMOTE_HOST" ]]; then
-    if [[ "$FULL" == "1" ]]; then
+    if [[ "$FULL" == "1" && "${COOP_TEST_SKIP_BRIDGE:-0}" != 1 ]]; then
         echo "Running bridge isolation integration test..."
         "$SCRIPT_DIR/integration-network.sh"
     fi
 
     echo "Building coop (release)..."
+    build_started=$SECONDS
     cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
+    printf 'TIMING build:coop %ds\n' "$((SECONDS - build_started))"
 
     # coop-proxy (issue #411) is a separate workspace member — it needs cmake
     # (aws-lc-rs), so it is intentionally not a default member. Build it
     # best-effort for developer runs; release runs require it to build.
+    build_started=$SECONDS
     if ! cargo build --release -p coop-proxy --manifest-path "$PROJECT_DIR/Cargo.toml"; then
         if [[ "$REQUIRE_PROXY" == 1 ]]; then
             echo "ERROR: coop-proxy is required for this integration run" >&2
@@ -59,6 +64,7 @@ if [[ -z "$REMOTE_HOST" ]]; then
         fi
         echo "warning: coop-proxy build failed (cmake missing?) — proxy phase will skip" >&2
     fi
+    printf 'TIMING build:coop-proxy %ds\n' "$((SECONDS - build_started))"
 
     BINARY="$PROJECT_DIR/target/release/coop"
     COOP_TEST_REQUIRE_PROXY="$REQUIRE_PROXY" exec "$TEST_SCRIPT" --binary "$BINARY" "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"
@@ -78,8 +84,10 @@ case "$REMOTE_OS-$REMOTE_ARCH" in
 esac
 
 echo "Cross-compiling coop for $TARGET..."
+build_started=$SECONDS
 cargo build --release --target "$TARGET" \
     --manifest-path "$PROJECT_DIR/Cargo.toml"
+printf 'TIMING build:coop %ds\n' "$((SECONDS - build_started))"
 
 LOCAL_BINARY="$PROJECT_DIR/target/$TARGET/release/coop"
 LOCAL_PROXY="$PROJECT_DIR/target/$TARGET/release/coop-proxy"
@@ -91,6 +99,7 @@ LOCAL_PROXY="$PROJECT_DIR/target/$TARGET/release/coop-proxy"
 # binary lands next to coop so `coop` can spawn it. Developer runs may skip
 # the proxy phase if neither build succeeds; required mode fails instead.
 build_proxy_on_remote=1
+build_started=$SECONDS
 if cargo build --release --target "$TARGET" -p coop-proxy \
     --manifest-path "$PROJECT_DIR/Cargo.toml" && [[ -f "$LOCAL_PROXY" ]]; then
     build_proxy_on_remote=0
@@ -98,6 +107,7 @@ if cargo build --release --target "$TARGET" -p coop-proxy \
 else
     echo "Local coop-proxy cross-build unavailable — will build it natively on the remote."
 fi
+printf 'TIMING build:coop-proxy-local %ds\n' "$((SECONDS - build_started))"
 
 REMOTE_DIR=$(ssh "$REMOTE_HOST" mktemp -d)
 source_archive=""
@@ -107,9 +117,9 @@ echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
 scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$PROJECT_DIR/src/seatbelt-proxy.sb" "$REMOTE_HOST:$REMOTE_DIR/"
 scp -q "$PROJECT_DIR/tests/integration-web-editor.py" "$REMOTE_HOST:$REMOTE_DIR/"
 
-# The full network gate builds on the remote, as does the proxy fallback.
-# Include tracked working-tree edits so the gate tests the same code as coop.
-if [[ "$FULL" == "1" || "$build_proxy_on_remote" == "1" ]]; then
+# The full network gate and proxy fallback build on the remote. Include tracked
+# working-tree edits so those gates test the same code as coop.
+if [[ "$build_proxy_on_remote" == "1" || ( "$FULL" == "1" && "${COOP_TEST_SKIP_BRIDGE:-0}" != 1 ) ]]; then
     source_archive=$(mktemp "${TMPDIR:-/tmp}/coop-integration-src.XXXXXX.tar.gz")
     (
         cd "$PROJECT_DIR"
@@ -122,7 +132,7 @@ if [[ "$FULL" == "1" || "$build_proxy_on_remote" == "1" ]]; then
     ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR/src' && tar xzf '$REMOTE_DIR/coop-src.tar.gz' -C '$REMOTE_DIR/src'"
 fi
 
-if [[ "$FULL" == "1" ]]; then
+if [[ "$FULL" == "1" && "${COOP_TEST_SKIP_BRIDGE:-0}" != 1 ]]; then
     echo "Running bridge isolation integration test on $REMOTE_HOST..."
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
     ssh "$REMOTE_HOST" "
@@ -138,6 +148,7 @@ if [[ "$build_proxy_on_remote" == "0" ]]; then
 else
     # The proxy fallback requires cargo + cmake + a C compiler.
     echo "Building coop-proxy natively on $REMOTE_HOST..."
+    build_started=$SECONDS
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path; expand client-side
     ssh "$REMOTE_HOST" "
         set -e
@@ -152,6 +163,7 @@ else
         fi
         echo "warning: coop-proxy build on remote failed (needs cargo + cmake + cc) — proxy phase will skip" >&2
     }
+    printf 'TIMING build:coop-proxy-remote %ds\n' "$((SECONDS - build_started))"
 fi
 
 # Build the remote command as an array, then printf %q to safely quote for ssh.
