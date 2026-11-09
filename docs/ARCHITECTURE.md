@@ -249,8 +249,12 @@ trusted; existing healthy instances remain available through normal lookup.
 from the fixed `https://api.github.com/repos/trailofbits/coop/releases` source,
 validate the canonical release tag and exact GitHub identity of the platform
 tarball, `SHA256SUMS`, and optional `attestations.jsonl` before download, verify the checksum (mandatory), verify the Sigstore
-attestation via `gh` against that bundle, falling back to the attestations API
-when the release publishes no usable one (best-effort). Both paths pin the
+attestation via `gh` against that bundle, fetching a bundle anonymously from
+the attestations API by digest when the release publishes no usable one. The
+installer uses `jq` for API extraction and retains the authenticated API path
+when `jq` is absent. Both clients retain authenticated verification if the
+anonymous API transfer fails. Verification is skipped only when `gh` is absent or the
+explicit test policy disables it. Both verification paths pin the
 signer to `.github/workflows/release.yml` at the selected tag, require that
 source ref, and reject attestations generated on self-hosted runners. Then
 extract with path-escape-safe `tar` flags, and atomically `rename` the new
