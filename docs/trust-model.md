@@ -28,10 +28,11 @@ autonomy *inside* that boundary, so the guest is deliberately permissive:
 
 The guest has broad privileges within its VM. Guest execution is isolated
 from the host, but configured channels cross the boundary: live mounts, file
-sync, forwarded credentials, SSH, and host-side services. The rules below bound
-those crossings so guest-authored data cannot become host code execution,
-filesystem escape, or unintended credential exposure. The host treats the
-guest as **untrusted**, even though the user launched it.
+sync, forwarded credentials, SSH, and host-side services. The controls below
+limit how guest-authored data can affect host execution, filesystem paths, and
+credentials. They do not make guest-controlled content safe for host tools to
+process. The host treats the guest as **untrusted**, even though the user
+launched it.
 
 ## Trust zones
 

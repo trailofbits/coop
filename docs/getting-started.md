@@ -5,7 +5,9 @@ Linux, it uses Firecracker microVMs backed by KVM; on macOS, it uses Lima with
 Apple's Virtualization.framework. Each VM has its own filesystem, network stack,
 and Docker daemon. Host resources remain accessible through features you choose,
 including [live mounts and file sync](workspaces.md),
-[credential forwarding](credential-proxy.md), and [host editors](editor.md).
+[direct credential forwarding](#agent-integration), and [host editors](editor.md).
+The optional [credential proxy](credential-proxy.md) keeps supported raw
+credentials on the host.
 
 ## Prerequisites
 
