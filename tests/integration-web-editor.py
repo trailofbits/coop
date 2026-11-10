@@ -155,24 +155,29 @@ else:
 
 def owner_death_before_ready(command, name, launch, project):
     # Suppress readiness while the real code-server and its sockets are live.
+    # The guest script resets PATH, so intercept its first trusted curl location.
     fixture = f"/tmp/coop-editor-curl-{secrets.token_hex(12)}"
     curl_wrapper = r'''
 set -euo pipefail
-wrapper="$HOME/.local/bin/curl"
+wrapper=/usr/local/bin/curl
+backup="$1.original"
+staged="$1.new"
 if [[ $2 == setup ]]; then
-    mkdir -p -- "${wrapper%/*}"
-    [[ ! -e $wrapper && ! -L $wrapper ]] || mv -- "$wrapper" "$1"
-    cat > "$wrapper" <<'EOF'
+    [[ ! -e $backup && ! -L $backup ]]
+    [[ ! -e $wrapper && ! -L $wrapper ]] || sudo -n mv -- "$wrapper" "$backup"
+    cat > "$staged" <<'EOF'
 #!/bin/sh
 for arg do
     [ "$arg" != http://localhost/healthz ] || exit 22
 done
 exec /usr/bin/curl "$@"
 EOF
-    chmod 700 -- "$wrapper"
+    sudo -n install -o root -g root -m 755 -- "$staged" "$wrapper"
+    rm -f -- "$staged"
 else
-    rm -f -- "$wrapper"
-    [[ ! -e $1 && ! -L $1 ]] || mv -- "$1" "$wrapper"
+    sudo -n rm -f -- "$wrapper"
+    [[ ! -e $backup && ! -L $backup ]] || sudo -n mv -- "$backup" "$wrapper"
+    rm -f -- "$staged"
 fi
 '''
     child = None
