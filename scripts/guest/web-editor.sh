@@ -71,11 +71,11 @@ observe_launch() {
     fi
 }
 
-version=4.145.0
+version=4.145.2
 reason=unsupported_architecture
 case $(uname -m) in
-    x86_64) arch=amd64; checksum=771bf6038658034d7caf509fcc44af50f0b8bdac5e738177b6cf9c4181dd3382 ;;
-    aarch64|arm64) arch=arm64; checksum=425d3bc5167c85dc070427d2aa93760083b02aec852ea9ce75c2906c99138f45 ;;
+    x86_64) arch=amd64; checksum=2f6db6c3e8b733dd6b3aeee83532e148b2bae2e392353ba85452d03572348962 ;;
+    aarch64|arm64) arch=arm64; checksum=e867a34416e2da4a83496b09580001893e7a4e5bb58a0624c4fcd22819e7d53d ;;
     *) exit 64 ;;
 esac
 reason=project_missing
