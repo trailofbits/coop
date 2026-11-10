@@ -181,7 +181,97 @@ impl<R: Read> Reader<R> {
 mod tests {
     use std::io::{Cursor, Error, ErrorKind, Read};
 
-    use crate::web_editor::status::{Event, Poll, Reader, Stage};
+    use crate::web_editor::status::{Event, Poll, Reader, Stage, parse};
+
+    #[test]
+    fn stages_have_stable_labels_and_only_ready_is_ready() {
+        for (stage, ready, label) in [
+            (
+                Stage::SshSetup,
+                false,
+                "SSH connection and local port forwarding",
+            ),
+            (Stage::Preparing, false, "guest preparation"),
+            (Stage::Installing, false, "code-server installation"),
+            (Stage::Starting, false, "guest systemd launch"),
+            (Stage::Launched, false, "code-server startup"),
+            (Stage::Ready, true, "the running editor session"),
+        ] {
+            assert_eq!(stage.ready(), ready, "stage {stage:?}");
+            assert_eq!(stage.label(), label, "stage {stage:?}");
+        }
+    }
+
+    #[test]
+    fn every_guest_failure_token_maps_to_fixed_host_authored_text() {
+        for (line, message) in [
+            (
+                "failed preparing unsupported_architecture",
+                "Guest architecture is unsupported by the browser editor",
+            ),
+            (
+                "failed preparing project_missing",
+                "Guest project directory is missing; choose an existing --project directory in the VM",
+            ),
+            (
+                "failed preparing setup_failed",
+                "Guest editor preparation failed; check guest storage and permissions",
+            ),
+            (
+                "failed installing lock_timeout",
+                "Guest editor install lock timed out; another installation may still be running",
+            ),
+            (
+                "failed installing setup_failed",
+                "Guest editor installation failed; check guest storage and permissions",
+            ),
+            (
+                "failed download timeout",
+                "Guest code-server download timed out; check VM connectivity to GitHub and retry",
+            ),
+            (
+                "failed download dns",
+                "Guest code-server download failed DNS resolution; check the VM's DNS configuration",
+            ),
+            (
+                "failed download connection",
+                "Guest code-server download could not connect; check VM connectivity to GitHub",
+            ),
+            (
+                "failed download http",
+                "GitHub rejected the guest code-server download; check release availability and VM network access",
+            ),
+            (
+                "failed download tls",
+                "Guest code-server download failed TLS verification or negotiation; check guest certificates and proxy configuration",
+            ),
+            (
+                "failed download transfer_failed",
+                "Guest code-server download failed; check VM connectivity and guest disk space",
+            ),
+            (
+                "failed verification checksum_mismatch",
+                "Guest code-server archive failed SHA-256 verification; retry the download",
+            ),
+            (
+                "failed extraction archive_invalid",
+                "Guest code-server archive could not be installed; check guest disk space and archive contents",
+            ),
+            (
+                "failed systemd_launch launch_failed",
+                "Guest systemd could not launch code-server; check passwordless sudo, systemd and guest storage",
+            ),
+            (
+                "failed code_server exited",
+                "Guest editor service exited; inspect ~/.local/share/coop-web-editor/editor.log in the VM",
+            ),
+        ] {
+            assert!(
+                matches!(parse(line.as_bytes()), Ok(Event::Failed(actual)) if actual == message),
+                "failure token {line:?} should map to fixed host-authored text"
+            );
+        }
+    }
 
     #[test]
     fn reads_coalesced_statuses_and_failure_before_eof() {
