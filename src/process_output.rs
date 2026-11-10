@@ -204,14 +204,16 @@ fn run_bounded_with_shutdown(
         // Do not reap the group leader while a detached descendant still
         // holds a pipe open. Its unreaped PID pins the numeric group ID used
         // for timeout and cancellation cleanup.
-        if stdout_eof && stderr_eof && status.is_none() {
-            match child.try_wait() {
-                Ok(observed) => status = observed,
-                Err(error) => break Some(CaptureError::Io(error)),
+        if stdout_eof && stderr_eof {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(observed) => status = observed,
+                    Err(error) => break Some(CaptureError::Io(error)),
+                }
             }
-        }
-        if status.is_some() && stdout_eof && stderr_eof {
-            break None;
+            if status.is_some() {
+                break None;
+            }
         }
         if let CompletionPolicy::Deadline(timeout) = policy.completion
             && started.elapsed() >= timeout
@@ -551,6 +553,43 @@ mod tests {
             assert!(output.status.success());
             assert!(started.elapsed() >= Duration::from_millis(150));
         }
+    }
+
+    #[test]
+    fn detached_pipe_holder_keeps_the_group_leader_unreaped_until_eof() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let pid_file = temp.path().join("leader-pid");
+        let mut command = shell(&format!(
+            "echo $$ > {}; (exec 2>&-; sleep 0.2; printf descendant) & exit 0",
+            crate::shell::shell_escape(&pid_file.to_string_lossy())
+        ));
+        let leader_reaped_early = std::cell::Cell::new(false);
+        let started = Instant::now();
+
+        let output = run_bounded_with_shutdown(&mut command, policy(64), || {
+            let Ok(pid) = std::fs::read_to_string(&pid_file) else {
+                return false;
+            };
+            let Ok(pid) = pid.trim().parse() else {
+                return false;
+            };
+            // SAFETY: signal 0 only probes the PID written by this test's fixture.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                leader_reaped_early.set(true);
+            }
+            false
+        })
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"descendant");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            !leader_reaped_early.get(),
+            "group leader was reaped while a descendant still held stdout open"
+        );
     }
 
     #[test]
