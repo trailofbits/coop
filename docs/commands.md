@@ -200,6 +200,8 @@ coop setup --image ml-dev --profile python --extra-packages libopenblas-dev
 ```
 
 The second example is Linux/Firecracker only.
+On Firecracker, setup stops if an old staging disk is mounted, open by another
+process, or cannot be removed. Resolve the host holder before retrying.
 
 ### `start`
 
@@ -873,6 +875,8 @@ coop resize my-project --mem 4096 --start
 ### `commit`
 
 Save a stopped instance's filesystem as a reusable image, like `docker container commit`. The committed image is an ordinary coop image: `coop images` lists it and `coop up --image <name>` launches new instances from it. The instance must be stopped first so the filesystem is consistent.
+On Firecracker, a mounted or open source or staging disk blocks the copy;
+an existing image remains in place if stale staging cleanup fails.
 
 ```
 coop commit [NAME] --image <name> [FLAGS]
