@@ -3679,7 +3679,8 @@ mod tests {
             Some(crate::process_output::CaptureError::Spawn(_))
         ));
 
-        let exit = curl_output(&Cmd::new("/bin/false"), Duration::from_secs(1), 32).unwrap_err();
+        let exit =
+            curl_output(&Cmd::new("/usr/bin/false"), Duration::from_secs(1), 32).unwrap_err();
         assert!(exit.to_string().contains("curl exited"));
         assert!(
             exit.downcast_ref::<crate::process_output::CaptureError>()

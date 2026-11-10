@@ -460,7 +460,7 @@ pub(crate) enum SetupTool {
     Tee,
     Chroot,
     #[cfg_attr(
-        target_os = "macos",
+        all(target_os = "macos", not(test)),
         expect(dead_code, reason = "Firecracker-only cleanup")
     )]
     Rmdir,

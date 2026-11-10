@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn status_runner_distinguishes_exit_timeout_and_cancellation() {
         let success = run_status_bounded_with_shutdown(
-            &mut Command::new("/bin/true"),
+            &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             None,
             || false,
@@ -319,7 +319,7 @@ mod tests {
         assert!(success.success());
 
         let exit = run_status_bounded_with_shutdown(
-            &mut Command::new("/bin/false"),
+            &mut Command::new("/usr/bin/false"),
             Duration::from_secs(1),
             None,
             || false,
@@ -362,7 +362,7 @@ mod tests {
         assert!(status.success());
         assert_eq!(std::fs::read(&target).unwrap(), b"fixed payload");
         let too_long = run_status_bounded_with_shutdown(
-            &mut Command::new("/bin/true"),
+            &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             Some(&[0; 4097]),
             || false,
