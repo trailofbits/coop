@@ -69,6 +69,23 @@ exclude_re = [
   # and deliberate-break probe exercise this IO adapter. Directive parsing
   # and include-path decisions remain mutation-scoped.
   "src/setup_tool\\.rs:.*\\bread_apt_configuration\\b",
+  # These wrappers resolve real Linux system tools and /etc/apt. Their host
+  # behavior is covered by the Linux setup integration path; the parser and
+  # trusted-tree traversal they invoke remain mutation-scoped below.
+  "src/setup_tool\\.rs:.*\\bvalidate_apt_configuration\\b",
+  "src/setup_tool\\.rs:.*SetupTool::sudo_command",
+  # Reversing or zeroing these byte-scanner cursor advances makes the focused
+  # boundary tests loop forever, so cargo-mutants can only classify them by its
+  # outer timeout. Exclude only those non-progressing operator mutations.
+  "src/setup_tool\\.rs:.*replace \\+= with (\\*=|-=) in apt_(block_comment_end|first_newline|directive_has_separator|directive_body|include_paths)",
+  "src/setup_tool\\.rs:.*replace apt_block_comment_end -> Option<usize> with Some\\(0\\)",
+  "src/setup_tool\\.rs:.*replace apt_quoted_advance -> usize with 0",
+  "src/setup_tool\\.rs:.*replace \\+ with \\* in apt_quoted_advance",
+  "src/setup_tool\\.rs:.*replace != with == in apt_include_paths",
+  # These mutations add one redundant empty/newline iteration; prefix-safe
+  # scanning then reaches the same cursor and returns the same result.
+  "src/setup_tool\\.rs:.*replace \\+ with \\* in apt_directive_has_separator",
+  "src/setup_tool\\.rs:.*replace < with <= in apt_include_paths",
   # Ambient stdin/stderr adapters are covered through their injected helpers;
   # the bounded parsing and terminal-control logic remains mutation-scoped.
   "src/prompt\\.rs:.*\\bconfirm\\b",
