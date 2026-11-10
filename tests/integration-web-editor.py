@@ -155,24 +155,29 @@ else:
 
 def owner_death_before_ready(command, name, launch, project):
     # Suppress readiness while the real code-server and its sockets are live.
-    fixture = f"/tmp/coop-editor-curlrc-{secrets.token_hex(12)}"
-    curl_config = r'''
+    fixture = f"/tmp/coop-editor-curl-{secrets.token_hex(12)}"
+    curl_wrapper = r'''
 set -euo pipefail
-config="$HOME/.curlrc"
-[[ -z ${XDG_CONFIG_HOME:-} ]] || config="$XDG_CONFIG_HOME/curlrc"
-[[ -z ${CURL_HOME:-} ]] || config="$CURL_HOME/.curlrc"
+wrapper="$HOME/.local/bin/curl"
 if [[ $2 == setup ]]; then
-    mkdir -p -- "${config%/*}"
-    [[ ! -e $config && ! -L $config ]] || mv -- "$config" "$1"
-    printf 'proto = "=https"\n' > "$config"
+    mkdir -p -- "${wrapper%/*}"
+    [[ ! -e $wrapper && ! -L $wrapper ]] || mv -- "$wrapper" "$1"
+    cat > "$wrapper" <<'EOF'
+#!/bin/sh
+for arg do
+    [ "$arg" != http://localhost/healthz ] || exit 22
+done
+exec /usr/bin/curl "$@"
+EOF
+    chmod 700 -- "$wrapper"
 else
-    rm -f -- "$config"
-    [[ ! -e $1 && ! -L $1 ]] || mv -- "$1" "$config"
+    rm -f -- "$wrapper"
+    [[ ! -e $1 && ! -L $1 ]] || mv -- "$1" "$wrapper"
 fi
 '''
     child = None
     try:
-        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_config, "bash", fixture, "setup"],
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_wrapper, "bash", fixture, "setup"],
                        check=True, capture_output=True, timeout=30)
         child = subprocess.Popen(launch, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
@@ -181,7 +186,7 @@ fi
             assert child.poll() is None, child.communicate()[1]
             try:
                 guest_config, cgroup = inspect_guest_editor(command, name, None, project)
-                subprocess.run(command + ["exec", name, "--", "curl", "-q", "--silent", "--fail",
+                subprocess.run(command + ["exec", name, "--", "/usr/bin/curl", "-q", "--silent", "--fail",
                                "--max-time", "1", "--unix-socket", str(Path(guest_config).parent / "editor.sock"),
                                "http://localhost/healthz"], check=True, capture_output=True, timeout=5)
                 break
@@ -199,7 +204,7 @@ fi
         if child is not None and child.poll() is None:
             child.kill()
             child.wait(timeout=5)
-        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_config, "bash", fixture, "restore"],
+        subprocess.run(command + ["exec", name, "--", "bash", "-c", curl_wrapper, "bash", fixture, "restore"],
                        check=True, capture_output=True, timeout=30)
 
 
