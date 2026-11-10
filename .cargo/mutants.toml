@@ -57,6 +57,14 @@ exclude_re = [
   # pure capture/limit decisions remain in mutation scope.
   "src/process_output\\.rs:.*\\brun_status_bounded\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
+  # Treating every read error as EINTR, or removing O_NONBLOCK, makes other
+  # process tests block forever before libtest can report the focused unit-test
+  # failure. Exclude only those structurally hanging mutations; the hard-error
+  # classifier and nonblocking flag composition remain directly tested.
+  "src/process_output\\.rs:.*replace match guard error\\.kind\\(\\) == std::io::ErrorKind::Interrupted with true in drain_available",
+  "src/process_output\\.rs:.*replace set_nonblocking -> std::io::Result<\\(\\)> with Ok\\(\\(\\)\\)",
+  "src/process_output\\.rs:.*replace \\| with & in with_nonblocking",
+  "src/process_output\\.rs:.*replace with_nonblocking -> i32 with [01]",
   # Root-only apt fragments use bounded sudo/cat; the private-fragment test
   # and deliberate-break probe exercise this IO adapter. Directive parsing
   # and include-path decisions remain mutation-scoped.
