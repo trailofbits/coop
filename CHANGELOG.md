@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## v0.10.0
+
+### Upgrading from v0.9.2
+
+- On Linux, stop and restart every running Firecracker VM after upgrading. The
+  new bridge-port isolation is applied when an open-network VM starts, and one
+  VM left running from an older release leaves peer traffic possible for the
+  whole shared bridge.
+- The new no-NIC `isolated` network mode requires a current image with the
+  vsock SSH listener and an instance created with
+  `firecracker_control = "vsock"`. Existing legacy-TCP instances are not
+  migrated automatically.
+
+### Security
+
+- Isolate open-network Firecracker guests from each other at both the bridge
+  and forwarding layers. Add an opt-in persistent `isolated` network mode that
+  boots without a guest NIC or TAP, keeps coop control and managed Anthropic or
+  OpenAI proxies on vsock-backed SSH, and suppresses raw credentials.
+- Harden host-side process execution: resolve Firecracker setup tools and Lima
+  through trusted paths, fail closed on unreadable setup confirmation, close
+  child stdin by default, bound configurable input and output, hide secret
+  prompts, restrict credential-proxy arguments, and match Firecracker PIDs to
+  the expected instance launch.
+- Redact malformed guest-environment values from CLI diagnostics and require a
+  real instance before preparing any guest session.
+
+### New features
+
+- Add `coop editor --web`, which installs and runs code-server inside a running
+  VM and exposes it through a password-protected host-loopback URL. Projects,
+  settings, extensions, and terminals stay in the guest; repeated invocations
+  attach to the active session.
+- Add Homebrew installation support for `coop`, `coop-proxy`, shell
+  completions, and Lima on macOS. Homebrew builds delegate upgrades and
+  uninstall operations back to Homebrew.
+- Report agent-session state to supporting terminals with OSC 7501 sequences.
+
+### Changed
+
+- Release the per-instance operation lock while a creation hook runs so other
+  coop operations are not blocked for the duration of user-provided setup.
+- Batch Lima inventory queries and Claude managed-settings directory creation
+  to reduce command and bootstrap latency.
+
+### Fixed
+
+- Recover interrupted Firecracker template mounts and serialize disk
+  operations against active rootfs mounts, including failed-start cleanup.
+- Preserve the requested machine specification and lifecycle proofs across
+  failed or disk-only resize starts, and propagate probe failures during
+  automatic instance selection instead of treating them as a missing VM.
+- Retry public update downloads without ambient GitHub credentials and fetch
+  legacy release attestations anonymously by artifact digest when a bundled
+  attestation is unavailable.
+- Resolve `limactl` from supported trusted installation paths and update the
+  browser editor to code-server 4.145.2.
+
 ## v0.9.2
 
 ### Security
