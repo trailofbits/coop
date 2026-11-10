@@ -20,6 +20,7 @@ use crate::host_tool::{
 const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 const APT_CONFIG_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+const APT_CONFIG_ENTRY_LIMIT: usize = 4096;
 const APT_CONFIG_READ_DEADLINE: Duration = Duration::from_secs(30);
 
 fn apt_block_comment_end(input: &[u8]) -> Option<usize> {
@@ -197,12 +198,7 @@ fn validate_apt_configuration_at(
     let mut visited = HashSet::new();
     let mut entries = 0usize;
     while let Some((path, scan_config)) = pending.pop() {
-        entries += 1;
-        if entries > 4096 {
-            return Err(SetupToolError::AptConfiguration {
-                reason: "configuration tree exceeds 4096 entries".into(),
-            });
-        }
+        record_apt_configuration_entry(&mut entries)?;
         let (canonical, metadata) = crate::host_tool::validate_trusted_path(&path, policy)
             .map_err(|reason| SetupToolError::AptConfiguration { reason })?;
         if !visited.insert((canonical.clone(), scan_config)) {
@@ -235,6 +231,16 @@ fn validate_apt_configuration_at(
                 pending.push((included, true));
             }
         }
+    }
+    Ok(())
+}
+
+fn record_apt_configuration_entry(entries: &mut usize) -> Result<(), SetupToolError> {
+    *entries += 1;
+    if *entries > APT_CONFIG_ENTRY_LIMIT {
+        return Err(SetupToolError::AptConfiguration {
+            reason: format!("configuration tree exceeds {APT_CONFIG_ENTRY_LIMIT} entries"),
+        });
     }
     Ok(())
 }
@@ -726,6 +732,29 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn apt_configuration_limits_preserve_the_exact_boundaries() {
+        assert_eq!(APT_CONFIG_CAPTURE_LIMIT, 16 * 1024 * 1024);
+
+        let mut entries = APT_CONFIG_ENTRY_LIMIT - 1;
+        assert!(record_apt_configuration_entry(&mut entries).is_ok());
+        assert_eq!(entries, APT_CONFIG_ENTRY_LIMIT);
+
+        let result = record_apt_configuration_entry(&mut entries);
+        assert_eq!(entries, APT_CONFIG_ENTRY_LIMIT + 1);
+        match result {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("configuration tree exceeds 4096 entries")
+            ),
+            Ok(()) => assert!(
+                entries <= APT_CONFIG_ENTRY_LIMIT,
+                "entry beyond the limit should fail"
+            ),
+        }
+    }
 
     #[test]
     fn apt_byte_scans_preserve_short_input_boundaries() {
