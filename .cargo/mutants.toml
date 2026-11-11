@@ -92,6 +92,13 @@ exclude_re = [
   "src/prompt\\.rs:.*\\bread_line\\b",
   "src/prompt\\.rs:.*\\bread_line_any\\b",
   "src/prompt\\.rs:.*\\bread_secret\\b",
+  # PAT prompt adapters inspect ambient terminal state, write user guidance,
+  # invoke the interactive wizard, or update the config file. Keep the pure
+  # prompt-decision logic in mutation scope.
+  "src/pat_prompt\\.rs:.*\\bmaybe_prompt\\b",
+  "src/pat_prompt\\.rs:.*\\brefresh_github_from_disk\\b",
+  "src/pat_prompt\\.rs:.*\\brun_wizard_or_recover\\b",
+  "src/pat_prompt\\.rs:.*\\bexplain_probe_failure\\b",
   # Best-effort fallback for unwinding after an early return. Explicit restore
   # and PTY tests cover the ordinary success/error paths.
   "src/prompt\\.rs:.*<impl Drop for EchoGuard",
