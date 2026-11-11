@@ -488,6 +488,66 @@ mod tests {
     }
 
     #[test]
+    fn terminate_group_signals_descendants_before_forced_cleanup() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let term_file = temp.path().join("descendant-terminated");
+        let pid_file = temp.path().join("descendant-pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                concat!(
+                    "trap '' TERM; ",
+                    "(trap 'printf terminated > \"$1\"; exit 0' TERM; ",
+                    "while :; do sleep 1; done) & ",
+                    "descendant=$!; ",
+                    "printf '%s\n' \"$descendant\" > \"$2.tmp\"; ",
+                    "mv \"$2.tmp\" \"$2\"; ",
+                    "wait \"$descendant\"",
+                ),
+                "sh",
+            ])
+            .arg(&term_file)
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let mut descendant_pid = None;
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                descendant_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(descendant_pid) = descendant_pid else {
+            kill_group(pid, &mut child);
+            let _ = child.wait();
+            panic!("fixture did not publish its descendant PID");
+        };
+
+        terminate_group(pid, &mut child);
+        let child_reaped = child.try_wait().unwrap().is_some();
+        let descendant_received_term =
+            std::fs::read(&term_file).is_ok_and(|bytes| bytes == b"terminated");
+
+        // Keep deliberate terminate_group mutants from leaking the fixture.
+        kill_group(pid, &mut child);
+        let _ = child.wait();
+        assert!(child_reaped, "the process-group leader was not reaped");
+        assert!(
+            descendant_received_term,
+            "SIGTERM did not reach the process-group descendant"
+        );
+        assert_pid_gone(descendant_pid);
+    }
+
+    #[test]
     fn concurrently_drains_both_streams_at_the_exact_limit() {
         let mut command = shell("(head -c 65536 /dev/zero >&2) & head -c 65536 /dev/zero; wait");
         let output = run_bounded(&mut command, policy(65_536)).unwrap();
