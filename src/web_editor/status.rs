@@ -316,6 +316,14 @@ mod tests {
         }
     }
 
+    struct PermissionDenied;
+
+    impl Read for PermissionDenied {
+        fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        }
+    }
+
     #[test]
     fn preserves_partial_lines_across_nonblocking_polls() {
         let mut reader = Reader::new(Fragmented {
@@ -339,6 +347,15 @@ mod tests {
                 Event::Stage(Stage::Launched),
                 Event::Stage(Stage::Ready)
             ]
+        );
+    }
+
+    #[test]
+    fn preserves_hard_read_errors() {
+        let error = Reader::new(PermissionDenied).poll().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Error>().unwrap().kind(),
+            ErrorKind::PermissionDenied
         );
     }
 
