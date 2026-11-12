@@ -2251,14 +2251,23 @@ fn instance_status<'a>(
     cfg: &config::CoopConfig,
     inst: &'a config::Instance,
 ) -> Result<json::InstanceStatus<'a>> {
-    let (state, usage) = match be.as_running(cfg, inst.clone())? {
+    let running = be.as_running(cfg, inst.clone())?;
+    Ok(instance_status_from_running(be, inst, running))
+}
+
+fn instance_status_from_running<'a>(
+    be: &backend::PlatformBackend,
+    inst: &'a config::Instance,
+    running: Option<backend::RunningInstance>,
+) -> json::InstanceStatus<'a> {
+    let (state, usage) = match running {
         Some(running) => (
             json::InstanceState::Running,
             backend::query_resource_usage(running.target()),
         ),
         None => (json::InstanceState::Stopped, None),
     };
-    Ok(json::InstanceStatus {
+    json::InstanceStatus {
         name: &inst.name,
         state,
         image: &inst.image,
@@ -2267,7 +2276,7 @@ fn instance_status<'a>(
             .supports_firecracker_network_mode()
             .then_some(inst.firecracker_network()),
         usage,
-    })
+    }
 }
 
 pub(crate) fn cmd_status(
@@ -2299,10 +2308,22 @@ pub(crate) fn cmd_status(
     } else {
         let instances = cfg.list_instances()?;
         if json_out {
-            let statuses = instances
-                .iter()
-                .map(|inst| instance_status(be, cfg, inst))
-                .collect::<Result<Vec<_>>>()?;
+            let mut statuses = Vec::with_capacity(instances.len());
+            be.visit_running_for_status(cfg, &instances, &mut |index, running| {
+                anyhow::ensure!(
+                    index == statuses.len(),
+                    "Backend returned out-of-order instance status"
+                );
+                let inst = instances
+                    .get(index)
+                    .context("Backend returned an extra instance status")?;
+                statuses.push(instance_status_from_running(be, inst, running));
+                Ok(())
+            })?;
+            anyhow::ensure!(
+                statuses.len() == instances.len(),
+                "Backend returned an incomplete instance status inventory"
+            );
             return json::render_json(&statuses);
         }
         if instances.is_empty() {
@@ -2310,8 +2331,16 @@ pub(crate) fn cmd_status(
                 .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
             return Ok(());
         }
-        for inst in &instances {
-            let (state, usage_str) = match be.as_running(cfg, inst.clone())? {
+        let mut next = 0;
+        be.visit_running_for_status(cfg, &instances, &mut |index, running| {
+            anyhow::ensure!(
+                index == next,
+                "Backend returned out-of-order instance status"
+            );
+            let inst = instances
+                .get(index)
+                .context("Backend returned an extra instance status")?;
+            let (state, usage_str) = match running {
                 Some(running) => {
                     let usage = backend::query_resource_usage(running.target())
                         .map(|u| format!("  {}", u.summary()))
@@ -2334,7 +2363,13 @@ pub(crate) fn cmd_status(
                 be,
             )
             .map_err(|e| anyhow::anyhow!("Failed to write status: {e}"))?;
-        }
+            next += 1;
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            next == instances.len(),
+            "Backend returned an incomplete instance status inventory"
+        );
     }
     Ok(())
 }

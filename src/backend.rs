@@ -168,7 +168,7 @@ impl RunningInstance {
     /// Mint a `RunningInstance` after a successful live-state probe.
     ///
     /// Crate-private so only backend impls can construct one. Callers
-    /// use [`VmBackend::as_running`] (which delegates here).
+    /// use [`VmBackend::as_running`] or [`VmBackend::visit_running_for_status`].
     pub(crate) fn new(inst: Instance, target: SshTarget) -> Self {
         Self { inst, target }
     }
@@ -1182,9 +1182,9 @@ pub trait VmBackend: std::fmt::Display {
     /// different instance by omission.
     fn probe_running_states(&self, instances: &[Instance]) -> Result<Vec<bool>>;
     /// Probe the live state of `inst`, returning a `RunningInstance`
-    /// when it is up. This is the single chokepoint for "is this VM
-    /// alive?" — call sites that need to operate on a running VM
-    /// should ask via this method rather than open-coding the check.
+    /// when it is up. Call sites that need to operate on a running VM
+    /// should ask via this method rather than open-coding the check; on Lima,
+    /// unnamed status uses [`Self::visit_running_for_status`] to share one inventory.
     ///
     /// The two failure modes are kept distinct so callers probe once
     /// and never conflate them: `Ok(None)` means the instance is
@@ -1194,6 +1194,20 @@ pub trait VmBackend: std::fmt::Display {
     /// consumed; callers that need it in the not-running branch can
     /// clone before calling.
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>>;
+    /// Visit instances for an unnamed status report in input order. The
+    /// default preserves per-row output on Firecracker; Lima can share one
+    /// inventory while retaining the stopped/uncertain distinction.
+    fn visit_running_for_status(
+        &self,
+        cfg: &CoopConfig,
+        instances: &[Instance],
+        visit: &mut dyn FnMut(usize, Option<RunningInstance>) -> Result<()>,
+    ) -> Result<()> {
+        for (index, inst) in instances.iter().enumerate() {
+            visit(index, self.as_running(cfg, inst.clone())?)?;
+        }
+        Ok(())
+    }
     /// Probe the live state of `inst` and return a [`StoppedInstance`]
     /// only when it is confirmed stopped. The dual of [`Self::as_running`] — used
     /// to gate operations (like `resize_disk`) that require the VM to
@@ -1825,6 +1839,23 @@ impl VmBackend for LimaBackend {
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
         crate::lima::running_ssh_target(cfg, &inst)
             .map(|target| target.map(|target| RunningInstance::new(inst, target)))
+    }
+
+    fn visit_running_for_status(
+        &self,
+        cfg: &CoopConfig,
+        instances: &[Instance],
+        visit: &mut dyn FnMut(usize, Option<RunningInstance>) -> Result<()>,
+    ) -> Result<()> {
+        crate::lima::visit_running_ssh_targets(cfg, instances, &mut |index, target| {
+            let inst = instances
+                .get(index)
+                .context("Lima returned an extra instance status")?;
+            visit(
+                index,
+                target.map(|target| RunningInstance::new(inst.clone(), target)),
+            )
+        })
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
