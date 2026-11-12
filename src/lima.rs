@@ -941,11 +941,70 @@ pub(crate) fn running_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<Op
     let Some(info) = limactl_list_entry_optional(&lima_name(inst))? else {
         bail!("Lima instance '{}' is absent", inst.name);
     };
+    running_ssh_target_from_info(cfg, inst, &info)
+}
+
+/// Resolve an unnamed status report from one Lima inventory. The first entry
+/// for each instance wins, matching the single-instance lookup.
+pub(crate) fn visit_running_ssh_targets(
+    cfg: &CoopConfig,
+    instances: &[Instance],
+    visit: &mut dyn FnMut(usize, Option<SshTarget>) -> Result<()>,
+) -> Result<()> {
+    let Some(first) = instances.first() else {
+        return Ok(());
+    };
+    let home = lima_home()?;
+    seal_instance_storage(&home.join(lima_name(first)))?;
+
+    let names: std::collections::HashSet<_> = instances.iter().map(lima_name).collect();
+    let output = limactl_list_output()?;
+    let mut entries = std::collections::HashMap::new();
+    let mut parse_error = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        if entries.len() == names.len() {
+            break;
+        }
+        let info: serde_json::Value = match serde_json::from_str(line) {
+            Ok(info) => info,
+            Err(error) => {
+                parse_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("Failed to parse limactl JSON output: {line}")),
+                );
+                break;
+            }
+        };
+        if let Some(name) = info["name"].as_str().filter(|name| names.contains(*name)) {
+            entries.entry(name.to_owned()).or_insert(info);
+        }
+    }
+
+    for (index, inst) in instances.iter().enumerate() {
+        if index != 0 {
+            seal_instance_storage(&home.join(lima_name(inst)))?;
+        }
+        let Some(info) = entries.get(&lima_name(inst)) else {
+            if let Some(error) = parse_error {
+                return Err(error);
+            }
+            bail!("Lima instance '{}' is absent", inst.name);
+        };
+        visit(index, running_ssh_target_from_info(cfg, inst, info)?)?;
+    }
+    Ok(())
+}
+
+fn running_ssh_target_from_info(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    info: &serde_json::Value,
+) -> Result<Option<SshTarget>> {
     let status = info["status"]
         .as_str()
         .context("Lima status is missing or invalid")?;
     match LimaState::from_status_str(status) {
-        LimaState::Running => ssh_target_from_info(cfg, inst, &info).map(Some),
+        LimaState::Running => ssh_target_from_info(cfg, inst, info).map(Some),
         LimaState::Stopped => Ok(None),
         state => bail!(
             "Lima instance '{}' is {state}; running state is unknown",
@@ -2765,6 +2824,205 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("count")).unwrap(), "");
         fs::remove_file(root.join("limactl")).unwrap();
         assert_eq!(list_running(&instances), vec![false; 3]);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated Lima fixture covers the status call path and batch failure states"
+    )]
+    fn batch_running_lookup_uses_one_inventory_and_preserves_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Ok(root) = std::env::var("COOP_TEST_BATCH_RUNNING_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let shim = root.path().join("limactl");
+            fs::write(
+                &shim,
+                "#!/bin/sh\nprintf 'list --json\\n' >> \"$COOP_TEST_BATCH_RUNNING_ROOT/calls\"\n[ ! -f \"$COOP_TEST_BATCH_RUNNING_ROOT/fail\" ] || exit 2\n/bin/cat \"$COOP_TEST_BATCH_RUNNING_ROOT/inventory\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "lima::tests::batch_running_lookup_uses_one_inventory_and_preserves_failures",
+                ])
+                .env("COOP_TEST_BATCH_RUNNING_ROOT", root.path())
+                .env("LIMA_HOME", root.path().join("lima"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let root = Path::new(&root);
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(root.join("data")),
+            ..CoopConfig::default()
+        };
+        let backend = crate::backend::LimaBackend::new();
+        let instances: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| Instance {
+                name: InstanceName::new(name).unwrap(),
+                index: crate::config::InstanceIndex::new(0).unwrap(),
+                dir: root.join(name),
+                image: ImageName::new("default").unwrap(),
+                firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+            })
+            .collect();
+        let observe = |instances: &[Instance]| {
+            let mut running = Vec::new();
+            backend.visit_running_for_status(&cfg, instances, &mut |_, state| {
+                running.push(state);
+                Ok(())
+            })?;
+            Ok::<_, anyhow::Error>(running)
+        };
+        let calls = root.join("calls");
+        let inventory = root.join("inventory");
+
+        fs::write(&inventory, "").unwrap();
+        assert!(observe(&[]).unwrap().is_empty());
+        assert!(!calls.exists(), "empty status queried Lima");
+
+        fs::write(
+            &inventory,
+            "{\"name\":\"coop-alpha\",\"status\":\"Running\",\"sshLocalPort\":2222}\n{\"name\":\"coop-alpha\",\"status\":\"Running\",\"sshLocalPort\":9999}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+        )
+        .unwrap();
+        let running = observe(&instances).unwrap();
+        assert_eq!(running.len(), 2);
+        assert_eq!(
+            running[0]
+                .as_ref()
+                .unwrap()
+                .target()
+                .connection_description(),
+            "127.0.0.1:2222"
+        );
+        assert!(running[1].is_none());
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+        #[cfg(target_os = "macos")]
+        {
+            let instance_root = cfg.instances_dir();
+            for (index, name) in ["alpha", "beta"].into_iter().enumerate() {
+                let dir = instance_root.join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("instance.json"),
+                    format!(r#"{{"name":"{name}","index":{index}}}"#),
+                )
+                .unwrap();
+            }
+            assert_eq!(cfg.list_instances().unwrap().len(), 2);
+            fs::write(
+                &inventory,
+                "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+            )
+            .unwrap();
+            fs::write(&calls, "").unwrap();
+            crate::commands::cmd_status(&backend, &cfg, None, true).unwrap();
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap().lines().count(),
+                1,
+                "unnamed JSON status queried Lima per instance"
+            );
+            fs::write(&calls, "").unwrap();
+            crate::commands::cmd_status(&backend, &cfg, None, false).unwrap();
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap().lines().count(),
+                1,
+                "unnamed human status queried Lima per instance"
+            );
+        }
+
+        for (data, expected, prior_rows) in [
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n",
+                "absent",
+                1,
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n{\"name\":\"coop-beta\",\"status\":\"Broken\"}\n",
+                "Broken",
+                1,
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+                "sshLocalPort",
+                0,
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\nbad json\n",
+                "Failed to parse limactl JSON output",
+                1,
+            ),
+            (
+                "{\"name\":\"coop-alpha\",\"status\":\"Broken\"}\nbad json\n",
+                "Broken",
+                0,
+            ),
+        ] {
+            fs::write(&inventory, data).unwrap();
+            fs::write(&calls, "").unwrap();
+            let mut visited = 0;
+            let error = backend
+                .visit_running_for_status(&cfg, &instances, &mut |_, _| {
+                    visited += 1;
+                    Ok(())
+                })
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(visited, prior_rows, "lost earlier status rows");
+            assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        }
+
+        fs::create_dir(root.join("lima")).unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        let unsafe_beta = root.join("lima/coop-beta");
+        std::os::unix::fs::symlink(root.join("outside"), &unsafe_beta).unwrap();
+        fs::write(
+            &inventory,
+            "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n",
+        )
+        .unwrap();
+        fs::write(&calls, "").unwrap();
+        let mut visited = 0;
+        assert!(
+            backend
+                .visit_running_for_status(&cfg, &instances, &mut |_, _| {
+                    visited += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(visited, 1, "lost earlier status row on storage error");
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        fs::remove_file(unsafe_beta).unwrap();
+
+        fs::write(root.join("fail"), "").unwrap();
+        fs::write(&calls, "").unwrap();
+        assert!(observe(&instances).is_err());
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
 
     #[test]
