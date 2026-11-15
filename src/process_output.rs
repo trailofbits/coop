@@ -204,14 +204,16 @@ fn run_bounded_with_shutdown(
         // Do not reap the group leader while a detached descendant still
         // holds a pipe open. Its unreaped PID pins the numeric group ID used
         // for timeout and cancellation cleanup.
-        if stdout_eof && stderr_eof && status.is_none() {
-            match child.try_wait() {
-                Ok(observed) => status = observed,
-                Err(error) => break Some(CaptureError::Io(error)),
+        if stdout_eof && stderr_eof {
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(observed) => status = observed,
+                    Err(error) => break Some(CaptureError::Io(error)),
+                }
             }
-        }
-        if status.is_some() && stdout_eof && stderr_eof {
-            break None;
+            if status.is_some() {
+                break None;
+            }
         }
         if let CompletionPolicy::Deadline(timeout) = policy.completion
             && started.elapsed() >= timeout
@@ -486,6 +488,66 @@ mod tests {
     }
 
     #[test]
+    fn terminate_group_signals_descendants_before_forced_cleanup() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let term_file = temp.path().join("descendant-terminated");
+        let pid_file = temp.path().join("descendant-pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                concat!(
+                    "trap '' TERM; ",
+                    "(trap 'printf terminated > \"$1\"; exit 0' TERM; ",
+                    "while :; do sleep 1; done) & ",
+                    "descendant=$!; ",
+                    "printf '%s\n' \"$descendant\" > \"$2.tmp\"; ",
+                    "mv \"$2.tmp\" \"$2\"; ",
+                    "wait \"$descendant\"",
+                ),
+                "sh",
+            ])
+            .arg(&term_file)
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let mut descendant_pid = None;
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                descendant_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(descendant_pid) = descendant_pid else {
+            kill_group(pid, &mut child);
+            let _ = child.wait();
+            panic!("fixture did not publish its descendant PID");
+        };
+
+        terminate_group(pid, &mut child);
+        let child_reaped = child.try_wait().unwrap().is_some();
+        let descendant_received_term =
+            std::fs::read(&term_file).is_ok_and(|bytes| bytes == b"terminated");
+
+        // Keep deliberate terminate_group mutants from leaking the fixture.
+        kill_group(pid, &mut child);
+        let _ = child.wait();
+        assert!(child_reaped, "the process-group leader was not reaped");
+        assert!(
+            descendant_received_term,
+            "SIGTERM did not reach the process-group descendant"
+        );
+        assert_pid_gone(descendant_pid);
+    }
+
+    #[test]
     fn concurrently_drains_both_streams_at_the_exact_limit() {
         let mut command = shell("(head -c 65536 /dev/zero >&2) & head -c 65536 /dev/zero; wait");
         let output = run_bounded(&mut command, policy(65_536)).unwrap();
@@ -551,6 +613,43 @@ mod tests {
             assert!(output.status.success());
             assert!(started.elapsed() >= Duration::from_millis(150));
         }
+    }
+
+    #[test]
+    fn detached_pipe_holder_keeps_the_group_leader_unreaped_until_eof() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let pid_file = temp.path().join("leader-pid");
+        let mut command = shell(&format!(
+            "echo $$ > {}; (exec 2>&-; sleep 0.2; printf descendant) & exit 0",
+            crate::shell::shell_escape(&pid_file.to_string_lossy())
+        ));
+        let leader_reaped_early = std::cell::Cell::new(false);
+        let started = Instant::now();
+
+        let output = run_bounded_with_shutdown(&mut command, policy(64), || {
+            let Ok(pid) = std::fs::read_to_string(&pid_file) else {
+                return false;
+            };
+            let Ok(pid) = pid.trim().parse() else {
+                return false;
+            };
+            // SAFETY: signal 0 only probes the PID written by this test's fixture.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                leader_reaped_early.set(true);
+            }
+            false
+        })
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"descendant");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            !leader_reaped_early.get(),
+            "group leader was reaped while a descendant still held stdout open"
+        );
     }
 
     #[test]

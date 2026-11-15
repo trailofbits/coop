@@ -85,3 +85,103 @@ pub fn check_shutdown() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HELPER: &str = "COOP_SIGNAL_GUARD_HELPER";
+
+    extern "C" fn sentinel_int(_signal: libc::c_int) {}
+    extern "C" fn sentinel_term(_signal: libc::c_int) {}
+
+    fn run_nested_guard_assertions() -> anyhow::Result<()> {
+        // SAFETY: this helper runs in an isolated child process and restores
+        // both handlers before returning.
+        let original = unsafe {
+            (
+                libc::signal(
+                    libc::SIGINT,
+                    sentinel_int as *const () as libc::sighandler_t,
+                ),
+                libc::signal(
+                    libc::SIGTERM,
+                    sentinel_term as *const () as libc::sighandler_t,
+                ),
+            )
+        };
+        anyhow::ensure!(
+            original.0 != libc::SIG_ERR,
+            "failed to install SIGINT sentinel"
+        );
+        anyhow::ensure!(
+            original.1 != libc::SIG_ERR,
+            "failed to install SIGTERM sentinel"
+        );
+
+        let first = install_handlers();
+        let second = install_handlers();
+        {
+            let state = handler_state();
+            anyhow::ensure!(state.users == 2, "both guards should be registered");
+            anyhow::ensure!(state.previous.is_some(), "sentinels should be saved");
+        }
+
+        drop(first);
+        {
+            let state = handler_state();
+            anyhow::ensure!(state.users == 1, "one guard should remain registered");
+            anyhow::ensure!(state.previous.is_some(), "sentinels should remain saved");
+        }
+
+        drop(second);
+        {
+            let state = handler_state();
+            anyhow::ensure!(state.users == 0, "all guards should be unregistered");
+            anyhow::ensure!(
+                state.previous.is_none(),
+                "saved sentinels should be cleared"
+            );
+        }
+
+        // SAFETY: querying with signal() returns the current handler and
+        // restores the process's original handler in the same operation.
+        let restored = unsafe {
+            (
+                libc::signal(libc::SIGINT, original.0),
+                libc::signal(libc::SIGTERM, original.1),
+            )
+        };
+        anyhow::ensure!(
+            restored
+                == (
+                    sentinel_int as *const () as libc::sighandler_t,
+                    sentinel_term as *const () as libc::sighandler_t,
+                ),
+            "sentinel handlers should be restored after the last guard"
+        );
+        Ok(())
+    }
+
+    fn run_isolated_helper() -> anyhow::Result<()> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "signal::tests::nested_guards_restore_handlers_only_after_the_last_drop",
+            ])
+            .env(HELPER, "1")
+            .status()?;
+        anyhow::ensure!(status.success(), "isolated signal-handler helper failed");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_guards_restore_handlers_only_after_the_last_drop() {
+        let result = if std::env::var_os(HELPER).is_some() {
+            run_nested_guard_assertions()
+        } else {
+            run_isolated_helper()
+        };
+        assert!(result.is_ok(), "{result:?}");
+    }
+}

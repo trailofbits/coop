@@ -8693,6 +8693,22 @@ test_provision_failure() {
     echo ""
     echo "=== Phase: provision failure detection ==="
 
+    # Reuse the exact default-image definition built by test_setup. Omitting
+    # the suite profiles here changes the provision hash and legitimately makes
+    # the Lima image stale, which cannot be attributed to the named failure.
+    local default_setup=(setup -y)
+    if [[ -n "$PROFILES" ]]; then
+        default_setup+=(--profile "$PROFILES")
+    fi
+    if coop "${default_setup[@]}" \
+        && [[ "$HARNESS_ERR" == *"Template rootfs: up to date"* \
+            || "$HARNESS_ERR" == *"Golden image 'default': up to date"* ]]; then
+        pass "default image is complete before another image fails"
+    else
+        fail "default image is complete before another image fails" \
+            "setup did not reuse the existing image: $HARNESS_ERR"
+    fi
+
     # Inject a failure into the provision script via env var.
     # The coop checks COOP_TEST_INJECT_PROVISION_FAILURE and
     # appends 'exit 1' to the provision script before cleanup.
@@ -8723,7 +8739,9 @@ test_provision_failure() {
 
     # The failure must not damage the default template. Its normal setup path
     # should reuse the completed image, and a new VM must still boot from it.
-    if coop setup -y && [[ "$HARNESS_ERR" == *"Template rootfs: up to date"* ]]; then
+    if coop "${default_setup[@]}" \
+        && [[ "$HARNESS_ERR" == *"Template rootfs: up to date"* \
+            || "$HARNESS_ERR" == *"Golden image 'default': up to date"* ]]; then
         pass "default image remains complete after another image fails"
     else
         fail "default image remains complete after another image fails" \
