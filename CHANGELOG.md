@@ -6,10 +6,6 @@
 
 ### Upgrading from v0.9.2
 
-- On Linux, stop and restart every running Firecracker VM after upgrading. The
-  new bridge-port isolation is applied when an open-network VM starts, and one
-  VM left running from an older release leaves peer traffic possible for the
-  whole shared bridge.
 - The new no-NIC `isolated` network mode requires a current image with the
   vsock SSH listener and an instance created with
   `firecracker_control = "vsock"`. Existing legacy-TCP instances are not
@@ -17,9 +13,8 @@
 
 ### Security
 
-- Isolate open-network Firecracker guests from each other at both the bridge
-  and forwarding layers. Add an opt-in persistent `isolated` network mode that
-  boots without a guest NIC or TAP, keeps coop control and managed Anthropic or
+- Add an opt-in persistent Firecracker `isolated` network mode that boots
+  without a guest NIC or TAP, keeps coop control and managed Anthropic or
   OpenAI proxies on vsock-backed SSH, and suppresses raw credentials.
 - Harden host-side process execution: resolve Firecracker setup tools and Lima
   through trusted paths, fail closed on unreadable setup confirmation, close
