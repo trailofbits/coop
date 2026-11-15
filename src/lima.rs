@@ -932,6 +932,33 @@ fn print_log_line(line: &str) -> Result<()> {
 pub fn ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
     let info = limactl_info(&inst.name)?;
 
+    ssh_target_from_info(cfg, inst, &info)
+}
+
+/// Verify a running VM and build its SSH target from the same Lima inventory
+/// entry, avoiding a second `limactl list --json` invocation.
+pub(crate) fn running_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<Option<SshTarget>> {
+    let Some(info) = limactl_list_entry_optional(&lima_name(inst))? else {
+        bail!("Lima instance '{}' is absent", inst.name);
+    };
+    let status = info["status"]
+        .as_str()
+        .context("Lima status is missing or invalid")?;
+    match LimaState::from_status_str(status) {
+        LimaState::Running => ssh_target_from_info(cfg, inst, &info).map(Some),
+        LimaState::Stopped => Ok(None),
+        state => bail!(
+            "Lima instance '{}' is {state}; running state is unknown",
+            inst.name
+        ),
+    }
+}
+
+fn ssh_target_from_info(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    info: &serde_json::Value,
+) -> Result<SshTarget> {
     let port = info["sshLocalPort"]
         .as_u64()
         .context("Lima instance has no sshLocalPort")?;
@@ -2912,9 +2939,28 @@ mod tests {
             assert!(stopped.is_err(), "{mode} minted StoppedInstance");
             assert_eq!(std::fs::read_to_string(&disk).unwrap(), "disk sentinel");
         }
+        let calls_path = PathBuf::from(std::env::var("COOP_TEST_LIMA_CALLS").unwrap());
+        let before = std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .filter(|call| *call == "list --json")
+            .count();
         let running = backend.as_running(&cfg, inst.clone());
+        let after = std::fs::read_to_string(&calls_path)
+            .unwrap()
+            .lines()
+            .filter(|call| *call == "list --json")
+            .count();
+        assert_eq!(
+            after - before,
+            1,
+            "{mode}: running lookup queried Lima twice"
+        );
         match mode {
-            "Running" => assert!(running.unwrap().is_some()),
+            "Running" => assert_eq!(
+                running.unwrap().unwrap().target().connection_description(),
+                "127.0.0.1:2222"
+            ),
             "Stopped" => assert!(running.unwrap().is_none()),
             "absent" => {
                 let error = running.err().unwrap().to_string();

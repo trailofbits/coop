@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{CoopConfig, GitHubAuth};
+use crate::config::{CoopConfig, GitHubAuth, InstanceName};
 use crate::github_pat::{self, ProbeError, SetupOpts};
 use crate::github_repo::RepoSlug;
 
@@ -86,6 +86,7 @@ pub fn maybe_prompt(
     cfg: &mut CoopConfig,
     config_path: &Path,
     repo: Option<&RepoSlug>,
+    vm: &InstanceName,
     no_prompt_flag: bool,
 ) -> Result<()> {
     let ctx = PromptContext {
@@ -130,7 +131,7 @@ pub fn maybe_prompt(
     .unwrap_or_default();
     match answer.to_ascii_lowercase().as_str() {
         "y" | "yes" => {
-            run_wizard_or_recover(cfg, config_path, slug)?;
+            run_wizard_or_recover(cfg, config_path, slug, vm)?;
             refresh_github_from_disk(cfg, config_path)?;
             Ok(())
         }
@@ -155,9 +156,15 @@ fn refresh_github_from_disk(cfg: &mut CoopConfig, config_path: &Path) -> Result<
     Ok(())
 }
 
-fn run_wizard_or_recover(cfg: &CoopConfig, config_path: &Path, repo: &RepoSlug) -> Result<()> {
+fn run_wizard_or_recover(
+    cfg: &CoopConfig,
+    config_path: &Path,
+    repo: &RepoSlug,
+    vm: &InstanceName,
+) -> Result<()> {
     let opts = SetupOpts {
         repo: Some(repo.clone()),
+        vm: Some(vm),
         config_path,
     };
     match github_pat::run_setup_pat(cfg, &opts) {
