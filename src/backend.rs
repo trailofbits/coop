@@ -1823,17 +1823,8 @@ impl VmBackend for LimaBackend {
     }
 
     fn as_running(&self, cfg: &CoopConfig, inst: Instance) -> Result<Option<RunningInstance>> {
-        match crate::lima::probe_state(&inst)? {
-            Some(crate::lima::LimaState::Running) => {}
-            Some(crate::lima::LimaState::Stopped) => return Ok(None),
-            None => bail!("Lima instance '{}' is absent", inst.name),
-            Some(state) => bail!(
-                "Lima instance '{}' is {state}; running state is unknown",
-                inst.name
-            ),
-        }
-        let target = crate::lima::ssh_target(cfg, &inst)?;
-        Ok(Some(RunningInstance::new(inst, target)))
+        crate::lima::running_ssh_target(cfg, &inst)
+            .map(|target| target.map(|target| RunningInstance::new(inst, target)))
     }
 
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance> {
