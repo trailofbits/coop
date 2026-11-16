@@ -248,9 +248,8 @@ fn apply_to_running(
     let Some(running) = be.as_running(cfg, inst.clone())? else {
         return Ok(false);
     };
-    let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    let session = super::prepare_session_from_target(cfg, &inst, target, repo.as_ref())?;
+    let session = super::prepare_session_from_target(cfg, &inst, target)?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(
         &session,

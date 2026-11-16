@@ -201,6 +201,7 @@ The `github` field controls how coop obtains a `GITHUB_TOKEN` for the guest. Thi
 | `"auto"` | Check the `GITHUB_TOKEN` env var first. If unset, run `gh auth token` on the host to extract a token from the GitHub CLI. |
 | `"env"`  | Require `GITHUB_TOKEN` in the host environment. Warns if missing. |
 | `"off"`  | Skip GitHub token forwarding entirely. This is the default when `github` is unset. |
+| `"pat"`  | Forward only the PAT entry explicitly bound to this VM; a workspace origin does not select one. See [VM PAT assignments](configuration.md#assign-an-existing-pat-to-a-vm). |
 
 When a token is available, coop runs `gh auth setup-git` in the guest during bootstrap.
 

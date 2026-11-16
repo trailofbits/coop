@@ -73,6 +73,7 @@ pub(crate) fn cmd_quickstart(
                 be,
                 cfg,
                 &StartOpts {
+                    pat_entry: None,
                     name: Some(&inst.name),
                     workspace_dir: None,
                     git_repo: None,
@@ -113,6 +114,7 @@ fn quickstart_fresh_start(
         .transpose()?;
 
     let start_opts = StartOpts {
+        pat_entry: None,
         name: None,
         workspace_dir: workspace_str,
         git_repo: None,

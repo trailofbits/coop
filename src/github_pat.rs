@@ -70,16 +70,25 @@ pub fn run_setup_pat(cfg: &CoopConfig, opts: &SetupOpts<'_>) -> Result<()> {
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
 
     let cmd_token = store_secret(backend, SERVICE, &account, &token, &state_dir)
-        .context("Failed to store secret in chosen backend")?;
+        .context("Failed to store secret in chosen backend; the PAT may still exist on GitHub and may need revocation")?;
 
-    upsert_pat_entry(opts.config_path, &repo, &cmd_token.to_string())?;
+    upsert_pat_entry(opts.config_path, &repo, &cmd_token.to_string()).context(
+        "PAT was stored, but global config was not updated; the token may need revocation",
+    )?;
 
+    let display_path = format!("{:?}", opts.config_path.display().to_string());
     eprintln!(
-        "\nWrote {}:\n  github.mode = \"pat\"\n  [github.pat.\"{repo}\"]\n  token = \"{}\"",
-        opts.config_path.display(),
-        cmd_token,
+        "\nWrote {display_path}:\n  github.mode = \"pat\"\n  [github.pat.\"{repo}\"]\n  token = \"{cmd_token}\"",
     );
-    eprintln!("\nDone. VM startups for https://github.com/{repo} will use this token.");
+    if let Some(vm) = opts.vm {
+        eprintln!(
+            "\nPAT entry stored. Binding to VM {vm} is the next write; if it fails, retry with: coop github assign-pat --vm {vm} --repo {repo}"
+        );
+    } else {
+        eprintln!(
+            "\nPAT entry stored. No VM was bound; use coop github assign-pat --vm NAME --repo {repo} to select it for a VM."
+        );
+    }
     Ok(())
 }
 
@@ -113,7 +122,7 @@ pub fn run_status(
     inst: Option<&crate::config::Instance>,
 ) -> Result<()> {
     let mut view = build_status(cfg, probe)?;
-    view.vm = inst.map(|inst| build_vm_status(cfg, inst)).transpose()?;
+    view.vm = inst.map(|inst| build_vm_status(cfg, inst));
     if json_out {
         return json::render_json(&view);
     }
@@ -246,24 +255,21 @@ fn build_status(cfg: &CoopConfig, probe: bool) -> Result<GithubStatus<'_>> {
     })
 }
 
-/// Render the status view as the plain-text report (unchanged output).
+/// Render the status view as the plain-text report.
 fn format_status(view: &GithubStatus<'_>) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     if let Some(vm) = &view.vm {
         let _ = writeln!(
             s,
-            "VM {}: selection {:?}; assigned entry: {}",
+            "VM {}: selection {:?}; assigned entry: {}; effective entry: {}",
             vm.name,
             vm.source,
-            vm.assigned_entry.as_ref().map_or("none", RepoSlug::as_str)
+            vm.assigned_entry.as_ref().map_or("none", RepoSlug::as_str),
+            vm.effective_entry.as_ref().map_or("none", RepoSlug::as_str)
         );
-        if vm.source == SelectionSource::MissingAssignment {
-            let _ = writeln!(
-                s,
-                "  Assigned entry unavailable: restore it with setup-pat or use unassign-pat --vm {}",
-                vm.name
-            );
+        if let Some(guidance) = &vm.guidance {
+            let _ = writeln!(s, "{guidance}");
         }
     }
     if view.mode != GithubMode::Pat {
@@ -299,58 +305,76 @@ fn format_status(view: &GithubStatus<'_>) -> String {
 pub(crate) enum SelectionSource {
     Assignment,
     MissingAssignment,
-    Repository,
+    Corrupt,
+    Unbound,
+    Disabled,
     Auto,
     Env,
     Off,
-    NoMatchingEntry,
 }
 
 #[derive(serde::Serialize)]
 pub(crate) struct VmPatStatus {
     name: String,
     assigned_entry: Option<RepoSlug>,
+    effective_entry: Option<RepoSlug>,
+    suggested_entry: Option<RepoSlug>,
+    suggestion_source: String,
+    recorded_target: String,
     source: SelectionSource,
+    guidance: Option<String>,
 }
 
-fn build_vm_status(cfg: &CoopConfig, inst: &crate::config::Instance) -> Result<VmPatStatus> {
-    let assignment = crate::github_assignment::Assignment::load(inst)?;
-    let repo = if assignment.is_none() {
-        crate::backend::detect_instance_repo(inst)
-    } else {
-        None
-    };
-    let source = selection_source(cfg, assignment.as_ref(), repo.as_ref());
-    Ok(VmPatStatus {
-        name: inst.name.to_string(),
-        assigned_entry: assignment.map(|a| a.repo),
-        source,
-    })
-}
-
-fn selection_source(
-    cfg: &CoopConfig,
-    assignment: Option<&crate::github_assignment::Assignment>,
-    repo: Option<&RepoSlug>,
-) -> SelectionSource {
-    if let Some(assignment) = assignment {
-        return if assignment.available(cfg) {
-            SelectionSource::Assignment
-        } else {
-            SelectionSource::MissingAssignment
-        };
-    }
-    match cfg.github.as_ref() {
-        Some(GitHubAuth::Auto) => SelectionSource::Auto,
-        Some(GitHubAuth::Env) => SelectionSource::Env,
-        Some(GitHubAuth::Pat(auth)) => {
-            if repo.is_some_and(|repo| auth.entries.contains_key(repo)) {
-                SelectionSource::Repository
-            } else {
-                SelectionSource::NoMatchingEntry
-            }
+fn build_vm_status(cfg: &CoopConfig, inst: &crate::config::Instance) -> VmPatStatus {
+    use crate::github_assignment::GitHubSelection;
+    let hint = crate::pat_prompt::RepoHint::for_instance(inst)
+        .unwrap_or_else(|_| crate::pat_prompt::RepoHint::unrecorded());
+    let assignment = crate::github_assignment::Assignment::load(inst);
+    let selection = crate::github_assignment::select(cfg, inst);
+    let (source, effective_entry) = match selection {
+        Ok(GitHubSelection::Disabled) => (SelectionSource::Disabled, None),
+        Ok(GitHubSelection::Off) => (SelectionSource::Off, None),
+        Ok(GitHubSelection::Auto) => (SelectionSource::Auto, None),
+        Ok(GitHubSelection::Env) => (SelectionSource::Env, None),
+        Ok(GitHubSelection::Unbound) => (SelectionSource::Unbound, None),
+        Ok(GitHubSelection::Bound(binding)) => {
+            (SelectionSource::Assignment, Some(binding.repo().clone()))
         }
-        _ => SelectionSource::Off,
+        Err(_)
+            if assignment
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|a| !a.available(cfg)) =>
+        {
+            (SelectionSource::MissingAssignment, None)
+        }
+        Err(_) => (SelectionSource::Corrupt, None),
+    };
+    let suggestion_source = hint.source_label().to_string();
+    let recorded_target = hint.target().to_string();
+    let assigned_entry = assignment.ok().flatten().map(|a| a.repo);
+    let guidance = match source {
+        SelectionSource::Unbound => Some(crate::pat_prompt::unbound_guidance(cfg, inst, &hint)),
+        SelectionSource::MissingAssignment => assigned_entry.as_ref().map(|key| format!(
+            "Assigned entry {key} unavailable; restore it with coop github setup-pat --repo {key} or run coop github unassign-pat --vm {}",
+            inst.name
+        )),
+        SelectionSource::Corrupt => Some(format!(
+            "PAT binding is corrupt or unreadable; inspect host-private state, then run coop github unassign-pat --vm {}",
+            inst.name
+        )),
+        _ => None,
+    };
+    VmPatStatus {
+        name: inst.name.to_string(),
+        assigned_entry,
+        effective_entry,
+        suggested_entry: hint.repo,
+        suggestion_source,
+        recorded_target,
+        source,
+        guidance,
     }
 }
 
@@ -1101,44 +1125,6 @@ fn remove_pat_entry(path: &Path, repo: &RepoSlug) -> Result<()> {
     write_doc(path, &doc)
 }
 
-/// Mark `repo` in `[github] skip`. Used by the auto-prompt's `never` answer.
-///
-/// Always forces `mode = "pat"`. Without this, a skip marker recorded
-/// against `github = "off"` (or unset) would be silently dropped on the
-/// next config load: the deserializer only reads the `skip` field for
-/// pat-mode. The prompt itself is gated to only fire when the mode is
-/// already "off" / unset / "pat" with no entry, so promoting to "pat"
-/// (with no entries) here is a no-op for token forwarding — pat-mode
-/// with no entries forwards no token, same as "off" — while making
-/// per-repo skip state survive a config reload.
-pub fn add_skip_marker(path: &Path, repo: &RepoSlug) -> Result<()> {
-    let _lock = crate::fs_util::lock_sibling(path)?;
-    let mut doc = read_or_init_doc(path)?;
-    let github = doc
-        .as_table_mut()
-        .context("Config root is not a table")?
-        .entry("github".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if !github.is_table() {
-        *github = toml::Value::Table(toml::Table::new());
-    }
-    let github_tbl = github
-        .as_table_mut()
-        .context("github value is not a table")?;
-    github_tbl.insert("mode".to_string(), toml::Value::String("pat".to_string()));
-    let skip = github_tbl
-        .entry("skip".to_string())
-        .or_insert_with(|| toml::Value::Array(Vec::new()));
-    if !skip.is_array() {
-        *skip = toml::Value::Array(Vec::new());
-    }
-    let arr = skip.as_array_mut().context("github.skip is not an array")?;
-    if !arr.iter().any(|v| v.as_str() == Some(repo.as_str())) {
-        arr.push(toml::Value::String(repo.as_str().to_string()));
-    }
-    write_doc(path, &doc)
-}
-
 fn read_or_init_doc(path: &Path) -> Result<toml::Value> {
     if path.exists() {
         let s = fs::read_to_string(path)
@@ -1236,29 +1222,17 @@ mod tests {
         };
         assignment.save(&cfg, &inst).unwrap();
         assert_eq!(
-            selection_source(&cfg, None, Some(&assignment.repo)),
-            SelectionSource::Repository
-        );
-        assert_eq!(
-            selection_source(&cfg, None, Some(&RepoSlug::new("org/unknown").unwrap())),
-            SelectionSource::NoMatchingEntry
-        );
-        assert_eq!(
-            selection_source(
-                &cfg,
-                Some(&assignment),
-                Some(&RepoSlug::new("org/unknown").unwrap())
-            ),
+            build_vm_status(&cfg, &inst).source,
             SelectionSource::Assignment
         );
 
         let mut view = build_status(&cfg, false).unwrap();
-        view.vm = Some(build_vm_status(&cfg, &inst).unwrap());
+        view.vm = Some(build_vm_status(&cfg, &inst));
         let json = serde_json::to_value(&view).unwrap();
-        assert_eq!(
-            json["vm"],
-            serde_json::json!({"name":"projects", "assigned_entry":"org/entry", "source":"assignment"})
-        );
+        assert_eq!(json["vm"]["name"], "projects");
+        assert_eq!(json["vm"]["assigned_entry"], "org/entry");
+        assert_eq!(json["vm"]["effective_entry"], "org/entry");
+        assert_eq!(json["vm"]["source"], "assignment");
         assert_eq!(json["entries"][0]["repo"], "org/entry");
         assert!(!json.to_string().contains("never_print"));
         let text = format_status(&view);
@@ -1267,28 +1241,50 @@ mod tests {
         );
         cfg.github = None;
         let mut view = build_status(&cfg, false).unwrap();
-        view.vm = Some(build_vm_status(&cfg, &inst).unwrap());
-        assert_eq!(
-            serde_json::to_value(&view).unwrap()["vm"]["source"],
-            "missing_assignment"
-        );
-        assert!(format_status(&view).contains("unassign-pat --vm projects"));
+        view.vm = Some(build_vm_status(&cfg, &inst));
+        assert_eq!(serde_json::to_value(&view).unwrap()["vm"]["source"], "off");
+        assert!(format_status(&view).contains("effective entry: none"));
         crate::github_assignment::Assignment::remove(&inst).unwrap();
-        assert_eq!(
-            build_vm_status(&cfg, &inst).unwrap().source,
-            SelectionSource::Off
-        );
+        assert_eq!(build_vm_status(&cfg, &inst).source, SelectionSource::Off);
         for (auth, source) in [
             (GitHubAuth::Auto, SelectionSource::Auto),
             (GitHubAuth::Env, SelectionSource::Env),
             (
                 GitHubAuth::Pat(crate::config::PatConfig::default()),
-                SelectionSource::NoMatchingEntry,
+                SelectionSource::Unbound,
             ),
         ] {
             cfg.github = Some(auth);
-            assert_eq!(build_vm_status(&cfg, &inst).unwrap().source, source);
+            assert_eq!(build_vm_status(&cfg, &inst).source, source);
         }
+    }
+
+    #[test]
+    fn vm_status_distinguishes_missing_and_corrupt_binding() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg: CoopConfig = toml::from_str(
+            "[github]\nmode = 'pat'\n[github.pat.'org/entry']\ntoken = 'github_pat_example'\n",
+        )
+        .unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(tmp.path());
+        let inst = cfg
+            .allocate_instance(
+                Some(&crate::config::InstanceName::new("status").unwrap()),
+                &crate::config::ImageName::new("default").unwrap(),
+                None,
+            )
+            .unwrap();
+        crate::github_assignment::assign(&cfg, &inst, slug("org/entry")).unwrap();
+        cfg.github = Some(GitHubAuth::Pat(crate::config::PatConfig::default()));
+        let missing = build_vm_status(&cfg, &inst);
+        assert_eq!(missing.source, SelectionSource::MissingAssignment);
+        assert_eq!(missing.effective_entry, None);
+        std::fs::write(inst.dir.join("github_pat.json"), "{").unwrap();
+        let corrupt = build_vm_status(&cfg, &inst);
+        assert_eq!(corrupt.source, SelectionSource::Corrupt);
+        assert_eq!(corrupt.effective_entry, None);
+        cfg.github = Some(GitHubAuth::Off);
+        assert_eq!(build_vm_status(&cfg, &inst).source, SelectionSource::Off);
     }
 
     #[test]
@@ -1421,55 +1417,6 @@ mod tests {
         std::fs::write(&path, "[github]\nmode = \"pat\"\npat = \"garbage\"\n").unwrap();
         upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
         let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert!(cfg.entries.contains_key(&slug("a/b")));
-    }
-
-    #[test]
-    fn skip_marker_replaces_non_array_skip_value() {
-        // A pre-existing `github.skip` that isn't an array must be replaced
-        // with one before the marker is appended.
-        let tmp = crate::test_support::private_tempdir().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[github]\nmode = \"pat\"\nskip = \"garbage\"\n").unwrap();
-        add_skip_marker(&path, &slug("a/b")).unwrap();
-        let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec![slug("a/b")]);
-    }
-
-    #[test]
-    fn skip_marker_added_idempotent() {
-        let tmp = crate::test_support::private_tempdir().unwrap();
-        let path = tmp.path().join("config.toml");
-        add_skip_marker(&path, &slug("a/b")).unwrap();
-        add_skip_marker(&path, &slug("a/b")).unwrap();
-        let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec![slug("a/b")]);
-    }
-
-    #[test]
-    fn skip_marker_survives_when_starting_mode_is_off() {
-        // Regression: previously the marker was written under
-        // `[github] mode = "off"`, and the deserializer dropped it.
-        let tmp = crate::test_support::private_tempdir().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "github = \"off\"\n").unwrap();
-        add_skip_marker(&path, &slug("a/b")).unwrap();
-        let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert_eq!(cfg.skip, vec![slug("a/b")]);
-    }
-
-    #[test]
-    fn upsert_removes_skip_marker_after_starting_from_off() {
-        // Regression: full sequence — start at "off", record skip, then
-        // run setup-pat. The skip marker must be cleared, and the new
-        // entry must be present.
-        let tmp = crate::test_support::private_tempdir().unwrap();
-        let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "github = \"off\"\n").unwrap();
-        add_skip_marker(&path, &slug("a/b")).unwrap();
-        upsert_pat_entry(&path, &slug("a/b"), "cmd:echo x").unwrap();
-        let cfg = pat_config_at(&path).unwrap().unwrap();
-        assert!(!cfg.skip.contains(&slug("a/b")));
         assert!(cfg.entries.contains_key(&slug("a/b")));
     }
 

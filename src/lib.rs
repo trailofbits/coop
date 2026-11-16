@@ -168,6 +168,9 @@ enum Commands {
         /// Clone a git repository into /workspace instead of copying a local project directory
         #[arg(long, conflicts_with_all = ["dir", "copy", "mount"])]
         git_repo: Option<String>,
+        /// Bind this stored PAT entry to a newly created VM before its first clone
+        #[arg(long, value_parser = github_repo::RepoSlug::parse_cli, conflicts_with = "no_github")]
+        pat_entry: Option<github_repo::RepoSlug>,
         /// Number of vCPUs (overrides config when creating a new instance)
         #[arg(long)]
         vcpus: Option<u8>,
@@ -200,8 +203,7 @@ enum Commands {
         /// Skip `.git/` when copying/syncing local directories
         #[arg(long)]
         exclude_git: bool,
-        /// Suppress the interactive prompt to set up a scoped GitHub PAT
-        /// when one is missing for the resolved repo.
+        /// Suppress the interactive VM PAT binding prompt; keep an existing binding
         #[arg(long)]
         no_prompt: bool,
         /// Forward a guest port to the host (`GUEST[:HOST]`, repeatable).
@@ -299,8 +301,7 @@ enum Commands {
         /// `--forward-port 3000:3001` forwards guest 3000 to host 3001.
         #[arg(long, value_parser = config::PortForward::parse)]
         forward_port: Vec<config::PortForward>,
-        /// Suppress the interactive prompt to set up a scoped GitHub PAT
-        /// when one is missing for the resolved repo.
+        /// Suppress the interactive VM PAT binding prompt; keep an existing binding
         #[arg(long)]
         no_prompt: bool,
         /// Shell command to run inside the guest after boot (overrides
@@ -1139,6 +1140,7 @@ pub fn run() -> Result<()> {
             mount,
             extra_mount,
             git_repo,
+            pat_entry,
             vcpus,
             mem,
             disk,
@@ -1176,6 +1178,7 @@ pub fn run() -> Result<()> {
                 transport,
                 extra_mount,
                 git_repo: git_repo.as_deref(),
+                pat_entry: pat_entry.as_ref(),
                 vcpus,
                 mem,
                 disk,
@@ -1249,6 +1252,7 @@ pub fn run() -> Result<()> {
                 name: name.as_ref(),
                 workspace_dir: workspace.as_deref(),
                 git_repo: None,
+                pat_entry: None,
                 no_agents,
                 no_prompt,
                 disk: None,
@@ -1778,11 +1782,13 @@ mod tests {
                 assert_eq!(
                     Decision::resolve(
                         &cfg,
-                        Some(&repo),
+                        &crate::pat_prompt::RepoHint::for_start(Some(repo.clone()), None, None),
+                        false,
+                        false,
                         PromptContext {
                             is_tty: true,
                             is_ci: false,
-                            no_prompt_flag: false,
+                            no_prompt: false,
                         },
                     ),
                     Decision::Skip,
@@ -1804,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn no_github_preserves_pat_forwarding_without_the_flag() {
+    fn unbound_pat_mode_never_forwards_without_the_flag() {
         let mut cfg: crate::config::CoopConfig = toml::from_str(
             r#"[github]
 mode = "pat"
@@ -1818,7 +1824,7 @@ token = "test-pat"
             parse(&[command]).command.apply_github_override(&mut cfg);
             let env =
                 crate::backend::prepare_env_forwarding(&cfg, Some(&repo), false, false).unwrap();
-            assert!(env.contains("GITHUB_TOKEN"));
+            assert!(!env.contains("GITHUB_TOKEN"));
         }
     }
 
@@ -2779,6 +2785,32 @@ token = "test-pat"
         assert_eq!(
             git_repo.as_deref(),
             Some("https://github.com/trailofbits/coop.git")
+        );
+    }
+
+    #[test]
+    fn up_pat_entry_is_validated_and_conflicts_with_no_github() {
+        let cli = parse(&[
+            "up",
+            "--git-repo",
+            "https://github.com/a/b.git",
+            "--pat-entry",
+            "a/b",
+        ]);
+        let super::Commands::Up { pat_entry, .. } = cli.command else {
+            panic!("expected Up")
+        };
+        assert_eq!(
+            pat_entry.as_ref().map(super::github_repo::RepoSlug::as_str),
+            Some("a/b")
+        );
+        assert!(
+            parse_err(&["up", "--pat-entry", "invalid"]).kind()
+                == clap::error::ErrorKind::ValueValidation
+        );
+        assert!(
+            parse_err(&["up", "--pat-entry", "a/b", "--no-github"]).kind()
+                == clap::error::ErrorKind::ArgumentConflict
         );
     }
 

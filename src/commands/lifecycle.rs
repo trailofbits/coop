@@ -20,6 +20,7 @@ pub(crate) struct UpOpts<'a> {
     pub(crate) transport: ProjectTransport,
     pub(crate) extra_mount: Vec<config::Mount>,
     pub(crate) git_repo: Option<&'a str>,
+    pub(crate) pat_entry: Option<&'a github_repo::RepoSlug>,
     pub(crate) vcpus: Option<u8>,
     pub(crate) mem: Option<config::VmMemory>,
     pub(crate) disk: Option<config::GiB>,
@@ -115,6 +116,12 @@ pub(crate) fn cmd_up(
     if !opts.new_instance
         && let Some(inst) = find_workspace_instance(cfg, &project_dir)?
     {
+        if opts.pat_entry.is_some() {
+            bail!(
+                "--pat-entry applies only when creating a VM; use coop github assign-pat --vm {} --repo OWNER/REPO",
+                inst.name
+            );
+        }
         ensure_up_project_name_matches(&inst, &project_dir, opts)?;
         ensure_up_existing_inputs_are_compatible(&inst, transport, opts)?;
         if be.is_running(&inst) {
@@ -146,15 +153,26 @@ fn cmd_up_git_repo(
     opts: &UpOpts<'_>,
     repo_url: &str,
 ) -> Result<()> {
+    backend::validate_clone_url(repo_url)?;
     if !opts.new_instance
         && let Some(inst) = find_git_repo_instance(cfg, repo_url)?
     {
+        if opts.pat_entry.is_some() {
+            bail!(
+                "--pat-entry applies only when creating a VM; use coop github assign-pat --vm {} --repo OWNER/REPO",
+                inst.name
+            );
+        }
         ensure_up_git_repo_name_matches(&inst, repo_url, opts)?;
         ensure_up_existing_inputs_are_compatible_for_git_repo(&inst, opts)?;
         if be.is_running(&inst) {
             reject_running_up_restart_inputs(&inst, opts)?;
             resume_running_creation(be, cfg, &inst)?;
-            tracing::info!("Instance '{}' is already running for {repo_url}", inst.name);
+            tracing::info!(
+                "Instance '{}' is already running for {}",
+                inst.name,
+                backend::safe_clone_url(repo_url)
+            );
             return Ok(());
         }
 
@@ -196,6 +214,7 @@ fn create_up_instance(
         name: None,
         workspace_dir: workspace_dir.as_deref(),
         git_repo: None,
+        pat_entry: opts.pat_entry,
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
@@ -236,6 +255,7 @@ fn create_git_repo_instance(
         name: None,
         workspace_dir: None,
         git_repo: Some(repo_url),
+        pat_entry: opts.pat_entry,
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
@@ -315,6 +335,7 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         name: None,
         workspace_dir: None,
         git_repo: None,
+        pat_entry: None,
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
         disk: None,
@@ -489,7 +510,8 @@ fn ensure_up_git_repo_name_matches(
     if let Some(name) = opts.name {
         anyhow::ensure!(
             &inst.name == name,
-            "Git repo {repo_url} is already associated with instance '{}', not '{}'.",
+            "Git repo {} is already associated with instance '{}', not '{}'.",
+            backend::safe_clone_url(repo_url),
             inst.name,
             name,
         );
@@ -578,9 +600,10 @@ fn find_git_repo_instance(
         _ => {
             let names: Vec<_> = matching.iter().map(|i| i.name.as_str()).collect();
             bail!(
-                "Multiple instances share git repo {repo_url}:\n  {}\n\
+                "Multiple instances share git repo {}:\n  {}\n\
                  Pick one explicitly with `coop start <name>` (for a stopped\n\
                  instance) or `coop claude <name>` (for a running one).",
+                backend::safe_clone_url(repo_url),
                 names.join(", "),
             )
         }
@@ -609,8 +632,9 @@ pub(crate) struct StartOpts<'a> {
     pub(crate) name: Option<&'a config::InstanceName>,
     pub(crate) workspace_dir: Option<&'a str>,
     pub(crate) git_repo: Option<&'a str>,
+    pub(crate) pat_entry: Option<&'a github_repo::RepoSlug>,
     pub(crate) no_agents: bool,
-    /// Skip the interactive PAT auto-prompt unconditionally.
+    /// Skip the interactive VM PAT binding prompt.
     pub(crate) no_prompt: bool,
     pub(crate) disk: Option<config::GiB>,
     pub(crate) mounts: Vec<config::Mount>,
@@ -619,7 +643,7 @@ pub(crate) struct StartOpts<'a> {
     /// `cfg.forward_ports` at start time (CLI overrides on guest-port
     /// collision).
     pub(crate) forward_ports: Vec<config::PortForward>,
-    /// Path to the on-disk config file. Re-read after the auto-prompt
+    /// Path to the on-disk config file. Re-read after the binding prompt
     /// in case the wizard added a new `[github.pat."..."]` entry.
     pub(crate) config_path: &'a Path,
     /// CLI override for `post_start` from `config.toml`. `None` means
@@ -883,26 +907,36 @@ fn restart_confirmed_instance(
     stopped: backend::StoppedInstance,
     opts: &StartOpts<'_>,
 ) -> Result<backend::InstanceOperationGuard> {
-    let inst = stopped.instance().clone();
+    let mut inst = stopped.instance().clone();
     tracing::info!("Restarting stopped instance '{}'", inst.name);
     preflight_isolated_bootstrap(cfg, &inst, opts.no_agents, backend::BootMode::Restart)?;
 
     let _guard = signal::install_handlers();
 
-    // Pre-flight: same auto-prompt as a fresh start. Uses the instance's
-    // recorded workspace-state to recover the repo slug.
-    let repo = backend::detect_instance_repo(&inst);
-    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
-        && crate::github_assignment::active(cfg, &inst)?.is_none()
-    {
-        pat_prompt::maybe_prompt(
-            cfg,
-            opts.config_path,
-            repo.as_ref(),
-            &inst.name,
-            opts.no_prompt,
-        )?;
+    // Binding a VM takes the operation lock. Release the stopped proof while
+    // asking, then re-check both the VM incarnation and current metadata
+    // before booting. The provisioning lock still serializes coop starts.
+    drop(stopped);
+
+    // The recorded workspace supplies a suggestion, never credential authority.
+    let hint = if pat_prompt::RepoHint::needed(cfg, &inst) {
+        pat_prompt::RepoHint::for_instance(&inst)
+            .unwrap_or_else(|_| pat_prompt::RepoHint::unrecorded())
+    } else {
+        pat_prompt::RepoHint::unrecorded()
+    };
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
+        pat_prompt::maybe_prompt(cfg, opts.config_path, &inst, &hint, opts.no_prompt, None)?;
     }
+    let mut stopped = be.as_stopped(inst.clone())?;
+    let current = config::Instance::load(&inst.dir)?;
+    anyhow::ensure!(
+        current.generation == inst.generation,
+        "VM was replaced while preparing restart"
+    );
+    *stopped.instance_mut() = current.clone();
+    inst = current;
+    preflight_isolated_bootstrap(cfg, &inst, opts.no_agents, backend::BootMode::Restart)?;
 
     // Re-apply the forward set the instance was last started with.
     // CLI `--forward-port` on a restart appends/overrides; otherwise the
@@ -934,9 +968,7 @@ fn restart_confirmed_instance(
         &backend::persisted_guest_user(cfg, &inst.image),
         &[],
     )?;
-    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
-        crate::github_assignment::active(cfg, &inst)?;
-    }
+    crate::github_assignment::select(cfg, &inst)?;
     crate::creation_hooks::set_preparation(&inst, crate::creation_hooks::Preparation::Waiting)?;
     let operation = be.start_confirmed_stopped(cfg, stopped)?;
 
@@ -973,7 +1005,6 @@ fn restart_confirmed_instance(
         cfg,
         &inst,
         &target,
-        repo.as_ref(),
         opts.no_agents,
         backend::BootMode::Restart,
     )?;
@@ -983,7 +1014,7 @@ fn restart_confirmed_instance(
     // hook. Reacquire and revalidate before reporting restart success.
     drop(operation);
     let command = creation_post_start(be, cfg, &inst, opts.post_start_override)?;
-    run_configured_post_start(cfg, &inst, &target, repo.as_ref(), command.as_deref())?;
+    run_configured_post_start(cfg, &inst, &target, command.as_deref())?;
 
     let operation = backend::InstanceOperationGuard::acquire(&inst)?;
     anyhow::ensure!(
@@ -1006,9 +1037,8 @@ fn restart_confirmed_instance(
 /// `--mount` host path's `.git/config` origin → `None`.
 ///
 /// The mount fallback matches the "first mount is the workspace"
-/// convention used by `push`/`pull`, so the slug a user sees here is the
-/// same one `detect_instance_repo` will recover on `coop shell` / `exec`
-/// / `restart`.
+/// convention used by `push`/`pull`. The result is only a prompt hint;
+/// session and clone credentials require a VM binding.
 fn resolve_start_repo(opts: &StartOpts<'_>) -> Result<Option<github_repo::RepoSlug>> {
     if let Some(url) = opts.git_repo
         && let Some(slug) = github_repo::parse_repo_slug_from_url(url)
@@ -1049,21 +1079,26 @@ fn start_instance(
              clone on the host and use workspace copy, prepare the image, or switch to open"
         );
     }
-    // Derive the GitHub repo slug as early as possible so the auto-prompt
-    // can fire before any VM cost is incurred, and so pat-mode token
-    // forwarding works at bootstrap time.
-    let repo = resolve_start_repo(opts)?;
-    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
-        && crate::github_assignment::active(cfg, inst)?.is_none()
-    {
-        pat_prompt::maybe_prompt(
-            cfg,
-            opts.config_path,
-            repo.as_ref(),
-            &inst.name,
-            opts.no_prompt,
-        )?;
-    }
+    // Read a Git origin only to suggest an entry for an interactive binding.
+    let hint = if !pat_prompt::RepoHint::needed(cfg, inst) || opts.pat_entry.is_some() {
+        pat_prompt::RepoHint::unrecorded()
+    } else {
+        pat_prompt::RepoHint::for_start(
+            resolve_start_repo(opts)?,
+            opts.git_repo,
+            opts.workspace_dir
+                .map(Path::new)
+                .or_else(|| opts.mounts.first().map(|m| m.host_path.as_path())),
+        )
+    };
+    pat_prompt::maybe_prompt(
+        cfg,
+        opts.config_path,
+        inst,
+        &hint,
+        opts.no_prompt,
+        opts.pat_entry,
+    )?;
 
     // Forwards are checked up-front so an in-use host port fails fast,
     // before any VM cost is incurred. The actual `-L` tunnels are
@@ -1090,7 +1125,7 @@ fn start_instance(
         post_start_override: opts.post_start_override,
         persisted_guest_env: &opts.persisted_guest_env,
     };
-    provision_first_boot(be, cfg, inst, &inputs, repo.as_ref(), &payload)
+    provision_first_boot(be, cfg, inst, &inputs, &payload)
 }
 
 struct BootPayload {
@@ -1164,7 +1199,6 @@ fn provision_first_boot(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
     inputs: &FirstBootInputs<'_>,
-    repo: Option<&github_repo::RepoSlug>,
     payload: &BootPayload,
 ) -> Result<()> {
     let forwards = payload.forwards.as_slice();
@@ -1202,7 +1236,6 @@ fn provision_first_boot(
         cfg,
         inst,
         &target,
-        repo,
         inputs.no_agents,
         backend::BootMode::FirstBoot,
     )?;
@@ -1234,13 +1267,8 @@ fn provision_first_boot(
         state.save(inst)?;
         Some(state)
     } else if let FirstBootSource::GitRepo(repo_url) = inputs.source {
-        let assignment = crate::github_assignment::active(cfg, inst)?;
-        backend::clone_git_repo(
-            &target,
-            cfg.github.as_ref(),
-            repo_url,
-            assignment.as_ref().map(|a| &a.repo),
-        )?;
+        let selection = crate::github_assignment::select(cfg, inst)?;
+        backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url, &selection)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1278,7 +1306,7 @@ fn provision_first_boot(
     }
 
     let command = creation_post_start(be, cfg, inst, inputs.post_start_override)?;
-    run_configured_post_start(cfg, inst, &target, repo, command.as_deref())?;
+    run_configured_post_start(cfg, inst, &target, command.as_deref())?;
 
     tracing::info!(
         "Instance '{}' started — SSH: {}",
@@ -1509,9 +1537,8 @@ pub(crate) fn open_ssh_session(
     name: Option<&config::InstanceName>,
 ) -> Result<backend::SshSession> {
     let running = resolve_running(be, cfg, name)?;
-    let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1571,9 +1598,8 @@ pub(crate) fn open_agent_session(
         agent,
         ProxyReadiness::Running(running.target()),
     )?;
-    let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    prepare_session_from_target(cfg, &inst, target, repo.as_ref())
+    prepare_session_from_target(cfg, &inst, target)
 }
 
 fn ensure_isolated_agent_supported(
@@ -1739,8 +1765,7 @@ pub(super) fn resume_running_creation(
         resume_creation(be, cfg, inst)?
     {
         let target = be.ssh_target(cfg, inst)?;
-        let repo = backend::detect_instance_repo(inst);
-        run_configured_post_start(cfg, inst, &target, repo.as_ref(), command.as_deref())?;
+        run_configured_post_start(cfg, inst, &target, command.as_deref())?;
     }
     Ok(())
 }
@@ -1755,9 +1780,8 @@ fn resume_creation(
             return Ok(crate::creation_hooks::CreationProgress::Unchanged);
         }
         let _guard = signal::install_handlers();
-        let repo = backend::detect_instance_repo(inst);
         let target = be.ssh_target(cfg, inst)?;
-        let session = prepare_session_from_target(cfg, inst, target, repo.as_ref())?;
+        let session = prepare_session_from_target(cfg, inst, target)?;
         crate::creation_hooks::run_pending(inst, &session, || {
             Ok(be.as_running(cfg, inst.clone())?.is_some())
         })
@@ -1771,7 +1795,6 @@ fn bootstrap_on_boot(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
     target: &backend::SshTarget,
-    repo: Option<&github_repo::RepoSlug>,
     no_agents: bool,
     mode: backend::BootMode,
 ) -> Result<()> {
@@ -1802,18 +1825,13 @@ fn bootstrap_on_boot(
         tracing::warn!("{}", NO_AGENTS_CHATGPT_WARNING);
     }
     if no_agents {
-        if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
-            && let Some(assignment) = crate::github_assignment::active(cfg, inst)?
-        {
-            backend::resolve_pat_token(cfg.github.as_ref(), &assignment.repo)?;
-        }
         tracing::info!("Skipping guest agent bootstrap (--no-agents)");
         return Ok(());
     }
     // Bootstrap uses this instance's proxy policy and persisted overlays too;
     // omitting them would forward the raw ANTHROPIC_API_KEY during bootstrap
     // and defeat proxy-mode non-exposure (issue #411).
-    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
+    let session = prepare_session_from_target(cfg, inst, target.clone())?;
     let guest_host = be.guest_host_address(&cfg.network);
     backend::bootstrap_agents(&session, cfg, inst, mode, &guest_host)?;
     Ok(())
@@ -1824,7 +1842,6 @@ fn run_configured_post_start(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
     target: &backend::SshTarget,
-    repo: Option<&github_repo::RepoSlug>,
     command: Option<&str>,
 ) -> Result<()> {
     let Some(command) = command else {
@@ -1832,7 +1849,7 @@ fn run_configured_post_start(
     };
     signal::check_shutdown()?;
     // Bootstrap may mint a proxy capability token; construct this session afterward.
-    let session = prepare_session_from_target(cfg, inst, target.clone(), repo)?;
+    let session = prepare_session_from_target(cfg, inst, target.clone())?;
     backend::run_post_start(&session, command);
     Ok(())
 }
@@ -1876,7 +1893,6 @@ pub(crate) fn prepare_session_from_target(
     cfg: &config::CoopConfig,
     inst: &config::Instance,
     target: backend::SshTarget,
-    repo: Option<&github_repo::RepoSlug>,
 ) -> Result<backend::SshSession> {
     // Load the per-instance model selection once: it decides both the
     // proxy-mode key suppression and the Codex local-key forwarding below.
@@ -1917,13 +1933,8 @@ pub(crate) fn prepare_session_from_target(
         tracing::warn!("{}", backend::codex_chatgpt_proxy_conflict_message());
     }
 
-    let assignment = if isolated {
-        None
-    } else {
-        crate::github_assignment::active(cfg, inst)?
-    };
-    let repo = assignment.as_ref().map(|a| &a.repo).or(repo);
-    let mut env = backend::prepare_env_forwarding_for_network(cfg, repo, forwarding_policy)?;
+    let selection = crate::github_assignment::select(cfg, inst)?;
+    let mut env = backend::prepare_env_forwarding_for_network(cfg, &selection, forwarding_policy)?;
     if let Some(state) = guest_env_state::GuestEnvState::try_load(inst)? {
         for (name, value) in &state.entries {
             // A raw provider key snapshotted via `coop start --env` must
@@ -2150,6 +2161,7 @@ fn network_restart_options<'a>(
         name: Some(name),
         workspace_dir: None,
         git_repo: None,
+        pat_entry: None,
         no_agents,
         no_prompt: false,
         disk: None,
@@ -2556,7 +2568,7 @@ pub(crate) struct ReprovisionOpts<'a> {
     pub(crate) yes: bool,
     pub(crate) no_agents: bool,
     pub(crate) no_prompt: bool,
-    /// Path to the on-disk config file, forwarded to the PAT auto-prompt.
+    /// Path to the on-disk config file, forwarded to the PAT binding prompt.
     pub(crate) config_path: &'a Path,
 }
 
@@ -2678,7 +2690,7 @@ fn reprovision_instance(
     crate::lima::check_requested_mounts(cfg, &ws_inputs.mounts)?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
 
-    let repo = confirm_reprovision(cfg, &inst, &image, workspace_state.as_ref(), opts)?;
+    confirm_reprovision(cfg, &inst, &image, workspace_state.as_ref(), opts)?;
 
     // Interactive work is complete. Snapshot the selected image contract and
     // keep its publication lock through stop, copy, and lineage publication so
@@ -2803,7 +2815,7 @@ fn reprovision_instance(
     };
 
     be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &inputs, repo.as_ref(), &payload).with_context(partial)?;
+    provision_first_boot(be, cfg, &inst, &inputs, &payload).with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
     Ok(())
@@ -2846,7 +2858,7 @@ fn confirm_reprovision(
     image: &config::ImageName,
     workspace_state: Option<&workspace::WorkspaceState>,
     opts: &ReprovisionOpts<'_>,
-) -> Result<Option<github_repo::RepoSlug>> {
+) -> Result<()> {
     if !opts.yes
         && !prompt::confirm(&reprovision_confirmation(
             &inst.name,
@@ -2862,19 +2874,16 @@ fn confirm_reprovision(
         );
     }
 
-    let repo = backend::detect_instance_repo(inst);
-    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated
-        && crate::github_assignment::active(cfg, inst)?.is_none()
-    {
-        pat_prompt::maybe_prompt(
-            cfg,
-            opts.config_path,
-            repo.as_ref(),
-            &inst.name,
-            opts.no_prompt,
-        )?;
+    let hint = if pat_prompt::RepoHint::needed(cfg, inst) {
+        pat_prompt::RepoHint::for_instance(inst)
+            .unwrap_or_else(|_| pat_prompt::RepoHint::unrecorded())
+    } else {
+        pat_prompt::RepoHint::unrecorded()
+    };
+    if inst.firecracker_network() != config::FirecrackerNetworkMode::Isolated {
+        pat_prompt::maybe_prompt(cfg, opts.config_path, inst, &hint, opts.no_prompt, None)?;
     }
-    Ok(repo)
+    Ok(())
 }
 
 /// Reject a recorded workspace association that a reprovision could not act
@@ -2887,6 +2896,13 @@ fn check_reprovision_workspace_source(
     network: config::FirecrackerNetworkMode,
     state: Option<&workspace::WorkspaceState>,
 ) -> Result<()> {
+    if let Some(workspace::WorkspaceState {
+        source: workspace::WorkspaceSource::GitRepo { url },
+        ..
+    }) = state
+    {
+        backend::validate_clone_url(url.as_str())?;
+    }
     if network == config::FirecrackerNetworkMode::Isolated
         && state.is_some_and(|state| {
             matches!(&state.source, workspace::WorkspaceSource::GitRepo { .. })
@@ -3728,7 +3744,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
         let error =
-            super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
+            super::run_configured_post_start(&cfg, &inst, &target, cfg.post_start.as_deref())
                 .unwrap_err();
         assert!(format!("{error:#}").contains("model.json"), "{error:#}");
         let _signals = super::signal::install_handlers();
@@ -3737,12 +3753,11 @@ mod tests {
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         assert!(super::signal::shutdown_requested());
         let error =
-            super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
+            super::run_configured_post_start(&cfg, &inst, &target, cfg.post_start.as_deref())
                 .unwrap_err();
         assert_eq!(error.to_string(), "Interrupted by signal — cleaning up");
         cfg.post_start = None;
-        super::run_configured_post_start(&cfg, &inst, &target, None, cfg.post_start.as_deref())
-            .unwrap();
+        super::run_configured_post_start(&cfg, &inst, &target, cfg.post_start.as_deref()).unwrap();
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
@@ -3774,6 +3789,7 @@ mod tests {
             name: None,
             workspace_dir: None,
             git_repo: None,
+            pat_entry: None,
             no_agents: false,
             no_prompt: true,
             disk: None,
@@ -3794,6 +3810,7 @@ mod tests {
             transport: super::ProjectTransport::Copy,
             extra_mount: Vec::new(),
             git_repo: None,
+            pat_entry: None,
             vcpus: None,
             mem: None,
             disk: None,
@@ -4031,8 +4048,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session =
-            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
+        let session = super::prepare_session_from_target(&cfg, &inst, target).expect("session");
 
         let ssh = session
             .command(&[], "/usr/bin/printenv PATH")
@@ -4110,8 +4126,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session =
-            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
+        let session = super::prepare_session_from_target(&cfg, &inst, target).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4160,8 +4175,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session =
-            super::prepare_session_from_target(&cfg, &inst, target, None).expect("session");
+        let session = super::prepare_session_from_target(&cfg, &inst, target).expect("session");
 
         let envs = session.env.guest_values();
         assert!(
@@ -4204,7 +4218,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
         let with_snapshot =
-            super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
+            super::prepare_session_from_target(&cfg, &inst, target.clone()).unwrap();
         assert_eq!(
             with_snapshot
                 .env
@@ -4215,8 +4229,7 @@ mod tests {
         );
 
         std::fs::remove_file(inst.guest_env_state_path()).unwrap();
-        let without_snapshot =
-            super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
+        let without_snapshot = super::prepare_session_from_target(&cfg, &inst, target).unwrap();
         assert!(!without_snapshot.env.contains("CODEX_ACCESS_TOKEN"));
     }
 
@@ -4253,7 +4266,7 @@ mod tests {
         // session on the same instance must still come up. `coop codex` and
         // the agent bootstrap are what fail hard, via
         // `backend::ensure_codex_remote_auth_consistent`.
-        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target)
             .expect("session must still be usable for non-Codex commands");
 
         assert!(
@@ -4313,7 +4326,7 @@ mod tests {
                     cfg.ssh.host_tools.clone(),
                 );
                 let session =
-                    super::prepare_session_from_target(&cfg, &inst, target.clone(), None).unwrap();
+                    super::prepare_session_from_target(&cfg, &inst, target.clone()).unwrap();
                 assert!(!session.env.contains("CODEX_ACCESS_TOKEN"));
                 assert_eq!(
                     session
@@ -4328,7 +4341,7 @@ mod tests {
                     ..Default::default()
                 };
                 model.save(&inst).unwrap();
-                let local = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
+                let local = super::prepare_session_from_target(&cfg, &inst, target).unwrap();
                 assert_eq!(
                     local
                         .env
@@ -4421,7 +4434,7 @@ mod tests {
             tmp.path().join("id_test"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = super::prepare_session_from_target(&cfg, &inst, target, None).unwrap();
+        let session = super::prepare_session_from_target(&cfg, &inst, target).unwrap();
 
         for name in [
             "ANTHROPIC_API_KEY",
@@ -4482,7 +4495,7 @@ mod tests {
             cfg.ssh.host_tools.clone(),
         );
 
-        let session = super::prepare_session_from_target(&cfg, &inst, target, None)
+        let session = super::prepare_session_from_target(&cfg, &inst, target)
             .expect("ChatGPT account auth must not break session preparation");
 
         let envs = session.env.guest_values();

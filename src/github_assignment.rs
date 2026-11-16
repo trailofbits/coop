@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CoopConfig, Instance};
+use crate::config::{CoopConfig, FirecrackerNetworkMode, GitHubAuth, Instance};
 use crate::github_repo::RepoSlug;
 use crate::guest_env_state::GuestEnvState;
 
@@ -15,6 +15,48 @@ use crate::guest_env_state::GuestEnvState;
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub repo: RepoSlug,
+}
+
+/// The only PAT key permitted to authorize a VM credential operation.
+/// Neither a Git origin nor a clone URL can construct this value.
+#[derive(Debug, Clone)]
+pub struct BoundPatEntry {
+    repo: RepoSlug,
+}
+
+impl BoundPatEntry {
+    pub fn repo(&self) -> &RepoSlug {
+        &self.repo
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GitHubSelection {
+    Disabled,
+    Off,
+    Auto,
+    Env,
+    Unbound,
+    Bound(BoundPatEntry),
+}
+
+/// One effective decision for session forwarding, clone, and status.
+/// This never resolves a `cmd:` token; the caller does that only when needed.
+pub fn select(cfg: &CoopConfig, inst: &Instance) -> Result<GitHubSelection> {
+    if cfg.github_disabled || inst.firecracker_network() == FirecrackerNetworkMode::Isolated {
+        return Ok(GitHubSelection::Disabled);
+    }
+    match cfg.github.as_ref() {
+        None | Some(GitHubAuth::Off) => Ok(GitHubSelection::Off),
+        Some(GitHubAuth::Auto) => Ok(GitHubSelection::Auto),
+        Some(GitHubAuth::Env) => Ok(GitHubSelection::Env),
+        Some(GitHubAuth::Pat(_)) => match active(cfg, inst)? {
+            Some(assignment) => Ok(GitHubSelection::Bound(BoundPatEntry {
+                repo: assignment.repo,
+            })),
+            None => Ok(GitHubSelection::Unbound),
+        },
+    }
 }
 
 impl Assignment {
@@ -199,7 +241,7 @@ mod tests {
     fn session_token(
         cfg: &CoopConfig,
         inst: &Instance,
-        repo: Option<&RepoSlug>,
+        _repo: Option<&RepoSlug>,
     ) -> anyhow::Result<Option<String>> {
         let target = SshTarget::tcp(
             Hostname::new("127.0.0.1").unwrap(),
@@ -208,7 +250,7 @@ mod tests {
             inst.dir.join("unused"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = crate::commands::prepare_session_from_target(cfg, inst, target, repo)?;
+        let session = crate::commands::prepare_session_from_target(cfg, inst, target)?;
         Ok(session.env.guest_values().get("GITHUB_TOKEN").cloned())
     }
 
@@ -225,7 +267,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             session_token(&cfg, &inst, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         assign(&cfg, &inst);
         for context in [None, Some(&repo)] {
@@ -236,7 +278,7 @@ mod tests {
         }
         assert_eq!(
             session_token(&cfg, &other, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         let crate::config::GitHubAuth::Pat(auth) = cfg.github.as_mut().unwrap() else {
             panic!()
@@ -267,7 +309,7 @@ mod tests {
         assert!(Assignment::load(&inst).unwrap().is_none());
         assert_eq!(
             session_token(&cfg, &inst, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         assert!(
             cfg.github
@@ -543,5 +585,114 @@ mod tests {
                     .unwrap();
             }
         });
+    }
+
+    #[test]
+    fn changing_workspace_origin_never_changes_pat_authority() {
+        use crate::workspace::{WorkspaceSource, WorkspaceState};
+        let (tmp, cfg, inst) = fixture();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/workspace.git",
+        ]);
+        WorkspaceState {
+            guest_path: crate::workspace::default_workspace_path(),
+            source: WorkspaceSource::Mount {
+                host_path: project.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        assert_eq!(session_token(&cfg, &inst, None).unwrap(), None);
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/assigned.git",
+        ]);
+        assert_eq!(session_token(&cfg, &inst, None).unwrap(), None);
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/workspace").unwrap())
+            .unwrap();
+        assert_eq!(
+            session_token(&cfg, &inst, None).unwrap().as_deref(),
+            Some("github_pat_default")
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/assigned.git",
+        ]);
+        assert_eq!(
+            session_token(&cfg, &inst, None).unwrap().as_deref(),
+            Some("github_pat_default")
+        );
+    }
+
+    #[test]
+    fn selector_decision_table_suppresses_before_binding_lookup() {
+        use crate::config::{FirecrackerControlMode, GitHubAuth};
+        use crate::github_assignment::{GitHubSelection, select};
+        let (_tmp, mut cfg, mut inst) = fixture();
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Unbound
+        ));
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/assigned").unwrap())
+            .unwrap();
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Bound(_)
+        ));
+        cfg.github_disabled = true;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
+        cfg.github_disabled = false;
+        inst.firecracker_control = FirecrackerControlMode::VsockIsolated;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
+        inst.firecracker_control = FirecrackerControlMode::LegacyTcp;
+        let pat = cfg.github.take();
+        for (mode, expected) in [
+            (GitHubAuth::Off, "off"),
+            (GitHubAuth::Auto, "auto"),
+            (GitHubAuth::Env, "env"),
+        ] {
+            cfg.github = Some(mode);
+            let selected = select(&cfg, &inst).unwrap();
+            let label = match selected {
+                GitHubSelection::Off => "off",
+                GitHubSelection::Auto => "auto",
+                GitHubSelection::Env => "env",
+                _ => "wrong",
+            };
+            assert_eq!(label, expected);
+        }
+        cfg.github = pat;
+        std::fs::write(inst.dir.join("github_pat.json"), "{").unwrap();
+        assert!(select(&cfg, &inst).is_err());
+        cfg.github_disabled = true;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
     }
 }
