@@ -845,7 +845,7 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
     );
 
     if matches!(state, LimaState::Running)
-        && let Ok(target) = ssh_target(cfg, inst)
+        && let Ok(target) = ssh_target_from_info(cfg, inst, &info)
         && let Some(usage) = crate::backend::query_resource_usage(&target)
     {
         use std::fmt::Write as _;
@@ -3061,9 +3061,12 @@ mod tests {
             "{mode}: running lookup queried Lima twice"
         );
         match mode {
-            "Running" => assert_eq!(
-                running.unwrap().unwrap().target().connection_description(),
-                "127.0.0.1:2222"
+            "Running" => assert_named_status_uses_one_inventory(
+                &backend,
+                &cfg,
+                &running.unwrap().unwrap(),
+                &calls_path,
+                after,
             ),
             "Stopped" => assert!(running.unwrap().is_none()),
             "absent" => {
@@ -3092,6 +3095,28 @@ mod tests {
             assert!(destroyed.is_ok(), "{mode}: {destroyed:?}");
             assert!(!metadata.exists());
         }
+    }
+
+    fn assert_named_status_uses_one_inventory(
+        backend: &crate::backend::LimaBackend,
+        cfg: &CoopConfig,
+        running: &crate::backend::RunningInstance,
+        calls_path: &Path,
+        before: usize,
+    ) {
+        assert_eq!(running.target().connection_description(), "127.0.0.1:2222");
+        let report = backend.status(cfg, running).unwrap();
+        assert!(report.contains("SSH: localhost:2222"), "{report}");
+        let after = std::fs::read_to_string(calls_path)
+            .unwrap()
+            .lines()
+            .filter(|call| *call == "list --json")
+            .count();
+        assert_eq!(
+            after - before,
+            1,
+            "named status queried Lima more than once"
+        );
     }
 
     #[cfg(target_os = "macos")]
