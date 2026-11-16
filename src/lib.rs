@@ -1090,10 +1090,6 @@ pub fn run() -> Result<()> {
             | Commands::List { .. }
             | Commands::Status { .. }
     );
-    #[cfg(target_os = "macos")]
-    if !recovery_command {
-        lima::preflight_config_load(&cli.config)?;
-    }
     let mut cfg = config::CoopConfig::load(&cli.config)?;
     #[cfg(target_os = "macos")]
     if !recovery_command {

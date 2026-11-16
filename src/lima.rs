@@ -82,7 +82,7 @@ pub fn create_and_start(
     disk_gib: Option<crate::config::GiB>,
     mounts: &[crate::config::Mount],
 ) -> Result<()> {
-    check_writable_mounts(cfg, mounts)?;
+    check_requested_mounts(cfg, mounts)?;
     let name = lima_name(inst);
     seal_instance_storage(&lima_home()?.join(&name))?;
     crate::private_storage::prepare_directory(&cfg.image_dir(&inst.image))?;
@@ -210,7 +210,6 @@ fn instance_template(
 
 /// Start an existing stopped Lima instance (no template — resumes in place).
 pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
-    check_writable_mounts(cfg, &[])?;
     let name = lima_name(inst);
 
     match lima_state(&inst.name)? {
@@ -1330,6 +1329,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
+    check_writable_mounts(cfg, &[])?;
     let mut command = headless_limactl_start()?;
     if let Some(timeout) = builder_timeout {
         command
@@ -2460,21 +2460,6 @@ fn lima_home() -> Result<PathBuf> {
     Ok(home.join(".lima"))
 }
 
-/// Check saved mounts before parsing config whose `cmd:` values can later run
-/// on the host. The custom data directory is checked after loading it.
-#[cfg(target_os = "macos")]
-pub fn preflight_config_load(config: &Path) -> Result<()> {
-    let control = lima_home()?;
-    let default_data = CoopConfig::default().data_dir;
-    let protected = protected_path_views([
-        ("effective config", config),
-        ("default coop data", default_data.as_ref()),
-        ("Lima control state", control.as_path()),
-    ])?;
-    let sources = check_saved_mounts(&control, &protected)?;
-    reject_overlapping_sources(&sources)
-}
-
 /// Lima opens mount source paths by name during start. Inspect both the new
 /// mount set and saved Lima specifications before allowing any guest to run.
 /// A saved specification can be reused by start, resize, restore, or
@@ -2493,13 +2478,30 @@ pub(crate) fn check_writable_mounts(
     reject_overlapping_sources(&sources)
 }
 
+/// Reject an unsafe requested mount before lifecycle work begins. The saved
+/// Lima specification is checked at the CLI boundary and again before boot.
+pub(crate) fn check_requested_mounts(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+) -> Result<()> {
+    let control = lima_home()?;
+    let protected = protected_mount_paths(cfg, &control)?;
+    let sources = requested
+        .iter()
+        .map(|mount| check_mount_source(&mount.host_path, &protected))
+        .collect::<Result<Vec<_>>>()?;
+    reject_overlapping_sources(&sources)
+}
+
 fn protected_mount_paths(cfg: &CoopConfig, control: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
     let config = cfg
         .loaded_from
         .as_deref()
         .map_or_else(CoopConfig::default_path, Path::to_path_buf);
+    let default_data = CoopConfig::default().data_dir;
     protected_path_views([
         ("coop data and secret state", cfg.data_dir.as_ref()),
+        ("default coop data", default_data.as_ref()),
         ("effective config", config.as_path()),
         ("Lima control state", control),
     ])
@@ -2800,7 +2802,13 @@ mod tests {
             ..CoopConfig::default()
         };
         let protected = protected_mount_paths(&cfg, &control).unwrap();
-        for source in [&custom, &config, &control] {
+        let default_data = CoopConfig::default().data_dir;
+        for source in [
+            custom.as_path(),
+            config.as_path(),
+            control.as_path(),
+            default_data.as_ref(),
+        ] {
             assert!(check_mount_source(source, &protected).is_err());
         }
         let safe = root.path().join("project");
