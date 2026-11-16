@@ -33,7 +33,8 @@ libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde-saphyr = { version = "2.0.0", default-features = false, features = [
-  "serialize", "deserialize",
+  "serialize",
+  "deserialize",
 ] }
 toml = "1.1.2"
 tracing = "0.1"
