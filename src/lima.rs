@@ -2609,6 +2609,15 @@ fn mount_sources_from_yaml(
 ) -> Result<Vec<WritableHostMount>> {
     let parsed: serde_json::Value =
         serde_saphyr::from_str(yaml).context("Cannot parse Lima mount specification")?;
+    // Lima merges `base` imports and expands Go templates before opening
+    // mount sources. The literal YAML path is not enough to validate either.
+    if parsed.get("base").is_some_and(|base| {
+        !base.is_null() && base.as_array().is_none_or(|entries| !entries.is_empty())
+    }) {
+        bail!(
+            "Lima mount specification imports a base template; remove the import before starting a VM"
+        );
+    }
     let mounts = match parsed.get("mounts") {
         Some(serde_json::Value::Array(mounts)) => mounts,
         None | Some(serde_json::Value::Null) if !required => return Ok(Vec::new()),
@@ -2623,6 +2632,11 @@ fn mount_sources_from_yaml(
             .get("location")
             .and_then(serde_json::Value::as_str)
             .context("Saved writable Lima mount has no source path")?;
+        if source.contains("{{") || source.contains("}}") {
+            bail!(
+                "Saved writable Lima mount uses a path template; use an explicit host path before starting a VM"
+            );
+        }
         let expanded = crate::shell::expand_tilde(Path::new(source));
         sources.push(check_mount_source(&expanded, protected)?);
     }
@@ -2885,6 +2899,28 @@ mod tests {
         let protected = [("data", resolved_host_path(&home.join(".coop")).unwrap())];
         let yaml = "mounts:\n- location: '~'\n  writable: true\n";
         assert!(mount_sources_from_yaml(yaml, &protected, false).is_err());
+    }
+
+    #[test]
+    fn saved_mount_guard_rejects_sources_lima_can_expand_or_import() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let protected = [("data", root.path().join("data"))];
+        for yaml in [
+            "mounts:\n- location: '/Users/{{.User}}'\n  writable: true\n",
+            "mounts:\n- location: '/Users/{{.User}}'\n  writable: false\n- location: '/tmp/project'\n  writable: true\n",
+            "base: ./unsafe.yaml\nmounts: []\n",
+            "base:\n- ./unsafe.yaml\n",
+        ] {
+            let result = mount_sources_from_yaml(yaml, &protected, false);
+            // A read-only template cannot expose host secrets through a
+            // writable mount; the writable source is still checked.
+            if yaml.contains("writable: false") {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.is_err(), "{yaml}");
+            }
+        }
+        assert!(mount_sources_from_yaml("base: []\nmounts: []\n", &protected, false).is_ok());
     }
 
     #[test]

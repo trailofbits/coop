@@ -6600,13 +6600,26 @@ test_lima_mount_state_boundary() {
         untrack_instance "$replay"
         return
     fi
+    if coop status "$replay" >/dev/null && coop list >/dev/null \
+            && coop stop "$replay" >/dev/null; then
+        pass "Lima recovery commands work with an unsafe saved mount"
+    else
+        fail "Lima recovery commands work with an unsafe saved mount" "$HARNESS_ERR"
+    fi
     if limactl edit --tty=false --set '.mounts=[]' "coop-$replay" >/dev/null 2>&1 \
             && coop start "$replay" --no-agents; then
         pass "Lima starts after saved mount is repaired"
     else
         fail "Lima starts after saved mount is repaired" "$HARNESS_ERR"
     fi
-    coop destroy "$replay" 2>/dev/null || true
+    if coop stop "$replay" >/dev/null && limactl edit --tty=false \
+            --set ".mounts=[{\"location\":\"$HOME\",\"writable\":true}]" \
+            "coop-$replay" >/dev/null 2>&1 && coop destroy "$replay" 2>/dev/null; then
+        pass "Lima destroy works with an unsafe saved mount"
+    else
+        fail "Lima destroy works with an unsafe saved mount" "$HARNESS_ERR"
+        limactl delete --force "coop-$replay" >/dev/null 2>&1 || true
+    fi
     untrack_instance "$replay"
 }
 
