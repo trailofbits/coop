@@ -2751,6 +2751,51 @@ mod tests {
                 1
             );
         }
+        let cfg = CoopConfig::default();
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        let mut visited = Vec::new();
+        crate::backend::LimaBackend
+            .visit_running_for_status(&cfg, &instances[..2], &mut |index, running| {
+                visited.push((index, running.is_some()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, [(0, false), (1, false)]);
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\ninvalid\n",
+        )
+        .unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        visited.clear();
+        let error = crate::backend::LimaBackend
+            .visit_running_for_status(&cfg, &instances[..2], &mut |index, running| {
+                visited.push((index, running.is_some()));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to parse limactl JSON output")
+        );
+        assert_eq!(visited, [(0, false)]);
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
         fs::write(root.join("count"), "").unwrap();
         assert_eq!(
