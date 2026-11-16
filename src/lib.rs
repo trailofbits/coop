@@ -1079,7 +1079,11 @@ pub fn run() -> Result<()> {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    lima::preflight_config_load(&cli.config)?;
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    #[cfg(target_os = "macos")]
+    lima::check_writable_mounts(&cfg, &[])?;
     #[cfg(target_os = "linux")]
     if matches!(&cli.command, Commands::Setup { .. }) {
         setup::preflight_bootstrap(&cfg)?;

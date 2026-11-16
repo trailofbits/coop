@@ -863,6 +863,10 @@ impl NetworkHostToolsConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CoopConfig {
+    /// Effective CLI config path, retained for Lima mount preflight. This is
+    /// invocation state and must never be written into the config file.
+    #[serde(skip)]
+    pub(crate) loaded_from: Option<PathBuf>,
     /// Invocation-only opt-out; never persisted.
     #[serde(skip)]
     pub github_disabled: bool,
@@ -2241,6 +2245,7 @@ impl CoopConfig {
             Self::default()
         };
         cfg.expand_user_paths();
+        cfg.loaded_from = Some(path.to_path_buf());
         Ok(cfg)
     }
 
@@ -2719,6 +2724,7 @@ impl CoopConfig {
 impl Default for CoopConfig {
     fn default() -> Self {
         Self {
+            loaded_from: None,
             data_dir: default_data_dir(),
             vm: VmConfig::default(),
             network: NetworkConfig::default(),
