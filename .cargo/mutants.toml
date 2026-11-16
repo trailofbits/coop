@@ -352,8 +352,9 @@ exclude_re = [
   # current_disk_bytes stats the disk image; GiB::from_bytes_ceil is the
   # pure conversion kernel (kept in scope, unit-tested).
   "\\bcurrent_disk_bytes\\b",
-  # instance_status (#385) queries usage over SSH.
+  # Status shape builders query usage over SSH.
   "\\binstance_status\\b",
+  "\\binstance_status_from_running\\b",
   # Network-mode lifecycle wrappers hold backend locks, drive cleanup/start,
   # or write stdout. Their extracted policy enums remain mutation-scoped.
   "\\bensure_isolated_agent_supported\\b",

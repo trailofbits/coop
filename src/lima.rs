@@ -941,11 +941,70 @@ pub(crate) fn running_ssh_target(cfg: &CoopConfig, inst: &Instance) -> Result<Op
     let Some(info) = limactl_list_entry_optional(&lima_name(inst))? else {
         bail!("Lima instance '{}' is absent", inst.name);
     };
+    running_ssh_target_from_info(cfg, inst, &info)
+}
+
+/// Resolve an unnamed status report from one Lima inventory. The first entry
+/// for each instance wins, matching the single-instance lookup.
+pub(crate) fn visit_running_ssh_targets(
+    cfg: &CoopConfig,
+    instances: &[Instance],
+    visit: &mut dyn FnMut(usize, Option<SshTarget>) -> Result<()>,
+) -> Result<()> {
+    let Some(first) = instances.first() else {
+        return Ok(());
+    };
+    let home = lima_home()?;
+    seal_instance_storage(&home.join(lima_name(first)))?;
+
+    let names: std::collections::HashSet<_> = instances.iter().map(lima_name).collect();
+    let output = limactl_list_output()?;
+    let mut entries = std::collections::HashMap::new();
+    let mut parse_error = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        if entries.len() == names.len() {
+            break;
+        }
+        let info: serde_json::Value = match serde_json::from_str(line) {
+            Ok(info) => info,
+            Err(error) => {
+                parse_error = Some(
+                    anyhow::Error::new(error)
+                        .context(format!("Failed to parse limactl JSON output: {line}")),
+                );
+                break;
+            }
+        };
+        if let Some(name) = info["name"].as_str().filter(|name| names.contains(*name)) {
+            entries.entry(name.to_owned()).or_insert(info);
+        }
+    }
+
+    for (index, inst) in instances.iter().enumerate() {
+        if index != 0 {
+            seal_instance_storage(&home.join(lima_name(inst)))?;
+        }
+        let Some(info) = entries.get(&lima_name(inst)) else {
+            if let Some(error) = parse_error {
+                return Err(error);
+            }
+            bail!("Lima instance '{}' is absent", inst.name);
+        };
+        visit(index, running_ssh_target_from_info(cfg, inst, info)?)?;
+    }
+    Ok(())
+}
+
+fn running_ssh_target_from_info(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    info: &serde_json::Value,
+) -> Result<Option<SshTarget>> {
     let status = info["status"]
         .as_str()
         .context("Lima status is missing or invalid")?;
     match LimaState::from_status_str(status) {
-        LimaState::Running => ssh_target_from_info(cfg, inst, &info).map(Some),
+        LimaState::Running => ssh_target_from_info(cfg, inst, info).map(Some),
         LimaState::Stopped => Ok(None),
         state => bail!(
             "Lima instance '{}' is {state}; running state is unknown",
@@ -2692,6 +2751,51 @@ mod tests {
                 1
             );
         }
+        let cfg = CoopConfig::default();
+        fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        let mut visited = Vec::new();
+        crate::backend::LimaBackend
+            .visit_running_for_status(&cfg, &instances[..2], &mut |index, running| {
+                visited.push((index, running.is_some()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, [(0, false), (1, false)]);
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        fs::write(
+            root.join("inventory"),
+            "{\"name\":\"coop-alpha\",\"status\":\"Stopped\"}\ninvalid\n",
+        )
+        .unwrap();
+        fs::write(root.join("count"), "").unwrap();
+        visited.clear();
+        let error = crate::backend::LimaBackend
+            .visit_running_for_status(&cfg, &instances[..2], &mut |index, running| {
+                visited.push((index, running.is_some()));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to parse limactl JSON output")
+        );
+        assert_eq!(visited, [(0, false)]);
+        assert_eq!(
+            fs::read_to_string(root.join("count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         fs::write(root.join("inventory"), "{\"name\":\"coop-alpha\",\"status\":\"Running\"}\n{\"name\":\"coop-beta\",\"status\":\"Stopped\"}\n").unwrap();
         fs::write(root.join("count"), "").unwrap();
         assert_eq!(
