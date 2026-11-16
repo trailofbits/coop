@@ -2519,13 +2519,17 @@ fn protected_path_views<const N: usize>(
 fn reject_overlapping_sources(sources: &[WritableHostMount]) -> Result<()> {
     for (index, source) in sources.iter().enumerate() {
         for other in sources.iter().skip(index + 1) {
-            if source.resolved != other.resolved
-                && (source.requested.starts_with(&other.resolved)
-                    || other.requested.starts_with(&source.resolved))
-            {
-                bail!(
-                    "Writable Lima mounts overlap at a host source path that a guest can replace. Narrow the mounts before retrying"
-                );
+            if source.requested == other.requested && source.resolved == other.resolved {
+                continue;
+            }
+            for left in [&source.requested, &source.resolved] {
+                for right in [&other.requested, &other.resolved] {
+                    if left.starts_with(right) || right.starts_with(left) {
+                        bail!(
+                            "Writable Lima mounts overlap at a host source path that a guest can replace. Narrow the mounts before retrying"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2828,6 +2832,20 @@ mod tests {
         .unwrap();
         let result = check_saved_mounts(&control, &protected);
         assert!(result.is_ok(), "{result:?}");
+        fs::create_dir(project.join("inner")).unwrap();
+        let alias = root.path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        fs::write(
+            instance.join("lima.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n- location: '{}'\n  writable: true\n",
+                alias.display(),
+                alias.join("inner").display()
+            ),
+        )
+        .unwrap();
+        let sources = check_saved_mounts(&control, &protected).unwrap();
+        assert!(reject_overlapping_sources(&sources).is_err());
         fs::write(
             instance.join("lima.yaml"),
             format!(
@@ -2884,6 +2902,14 @@ mod tests {
         assert!(reject_overlapping_sources(std::slice::from_ref(&inner)).is_ok());
         let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
         assert!(reject_overlapping_sources(&[outer, inner]).is_err());
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        let duplicate = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, duplicate]).is_ok());
+        std::os::unix::fs::symlink(root.path().join("outer"), root.path().join("outer/self"))
+            .unwrap();
+        let self_alias = check_mount_source(&root.path().join("outer/self"), &[]).unwrap();
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, self_alias]).is_err());
         std::os::unix::fs::symlink(root.path().join("separate"), root.path().join("outer/link"))
             .unwrap();
         let alias = check_mount_source(&root.path().join("outer/link"), &[]).unwrap();
