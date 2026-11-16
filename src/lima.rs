@@ -817,10 +817,23 @@ fn parse_completion_instance_names(output: &str) -> Result<CompletionInstanceNam
     Ok(names)
 }
 
-/// Get a human-readable status string.
-pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
-    let info = limactl_info(&inst.name)?;
+/// Probe and report named status from the same Lima inventory entry.
+pub(crate) fn status_named(cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>> {
+    let Some(info) = limactl_list_entry_optional(&lima_name(inst))? else {
+        bail!("Lima instance '{}' is absent", inst.name);
+    };
+    let Some(target) = running_ssh_target_from_info(cfg, inst, &info)? else {
+        return Ok(None);
+    };
+    Ok(Some(status_from_info(cfg, inst, &info, &target)))
+}
 
+fn status_from_info(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    info: &serde_json::Value,
+    target: &SshTarget,
+) -> String {
     let state = LimaState::from_status_str(info["status"].as_str().unwrap_or("Unknown"));
     let arch = info["arch"].as_str().unwrap_or("unknown");
     let cpus = info["cpus"].as_u64().unwrap_or(0);
@@ -844,15 +857,12 @@ pub fn status(cfg: &CoopConfig, inst: &Instance) -> Result<String> {
         cfg.ssh_key_path().display(),
     );
 
-    if matches!(state, LimaState::Running)
-        && let Ok(target) = ssh_target_from_info(cfg, inst, &info)
-        && let Some(usage) = crate::backend::query_resource_usage(&target)
-    {
+    if let Some(usage) = crate::backend::query_resource_usage(target) {
         use std::fmt::Write as _;
         let _ = write!(out, "\n  {usage}");
     }
 
-    Ok(out)
+    out
 }
 
 /// Stream Lima instance logs.
@@ -3061,12 +3071,9 @@ mod tests {
             "{mode}: running lookup queried Lima twice"
         );
         match mode {
-            "Running" => assert_named_status_uses_one_inventory(
-                &backend,
-                &cfg,
-                &running.unwrap().unwrap(),
-                &calls_path,
-                after,
+            "Running" => assert_eq!(
+                running.unwrap().unwrap().target().connection_description(),
+                "127.0.0.1:2222"
             ),
             "Stopped" => assert!(running.unwrap().is_none()),
             "absent" => {
@@ -3079,6 +3086,7 @@ mod tests {
             }
             _ => assert!(running.is_err(), "{mode} was treated as stopped"),
         }
+        assert_named_status_uses_one_inventory(&backend, &cfg, &inst, &calls_path, mode);
 
         let destroyed = backend.destroy_instance(&cfg, &inst);
         if matches!(
@@ -3100,23 +3108,30 @@ mod tests {
     fn assert_named_status_uses_one_inventory(
         backend: &crate::backend::LimaBackend,
         cfg: &CoopConfig,
-        running: &crate::backend::RunningInstance,
+        inst: &Instance,
         calls_path: &Path,
-        before: usize,
+        mode: &str,
     ) {
-        assert_eq!(running.target().connection_description(), "127.0.0.1:2222");
-        let report = backend.status(cfg, running).unwrap();
-        assert!(report.contains("SSH: localhost:2222"), "{report}");
+        let before = std::fs::read_to_string(calls_path)
+            .unwrap()
+            .lines()
+            .filter(|call| *call == "list --json")
+            .count();
+        let report = backend.status_named(cfg, inst);
         let after = std::fs::read_to_string(calls_path)
             .unwrap()
             .lines()
             .filter(|call| *call == "list --json")
             .count();
-        assert_eq!(
-            after - before,
-            1,
-            "named status queried Lima more than once"
-        );
+        assert_eq!(after - before, 1, "{mode}: named status queried Lima twice");
+        match mode {
+            "Running" => {
+                let report = report.unwrap().unwrap();
+                assert!(report.contains("SSH: localhost:2222"), "{report}");
+            }
+            "Stopped" => assert!(report.unwrap().is_none()),
+            _ => assert!(report.is_err(), "{mode} was treated as stopped"),
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -1213,11 +1213,10 @@ pub trait VmBackend: std::fmt::Display {
     /// to gate operations (like `resize_disk`) that require the VM to
     /// be stopped. Returns `Err` for running, absent, unknown, or failed probes.
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance>;
-    /// Render a human-readable status report for a running instance.
-    /// Takes `&RunningInstance` so the precondition is part of the
-    /// signature — status reporting probes the live guest (load,
-    /// memory) and only makes sense while the VM is up.
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String>;
+    /// Probe and render a named human status report. `None` means the instance
+    /// is confirmed stopped; an uncertain state remains an error. Lima shares
+    /// one inventory entry between the state probe and report construction.
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>>;
     /// Stream logs from a running instance.
     ///
     /// Takes `&RunningInstance` so the running precondition is part
@@ -1632,9 +1631,12 @@ impl VmBackend for FirecrackerBackend {
         Ok(StoppedInstance::new(inst, lock))
     }
 
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>> {
+        let Some(running) = self.as_running(cfg, inst.clone())? else {
+            return Ok(None);
+        };
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
-        vm.status()
+        vm.status().map(Some)
     }
 
     fn stream_logs(
@@ -1869,8 +1871,8 @@ impl VmBackend for LimaBackend {
         Ok(StoppedInstance::new(inst, lock))
     }
 
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
-        crate::lima::status(cfg, running.instance())
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>> {
+        crate::lima::status_named(cfg, inst)
     }
 
     fn stream_logs(
