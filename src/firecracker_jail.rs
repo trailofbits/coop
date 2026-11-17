@@ -3,7 +3,7 @@
 //! before exec.
 
 use std::fs;
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, symlink};
@@ -434,13 +434,21 @@ pub(crate) fn open_log(inst: &Instance) -> Result<fs::File> {
         Ok(_) => bail!("Firecracker log path is not a regular file or managed jail link"),
         Err(error) => return Err(error).context("Cannot inspect Firecracker log path"),
     };
+    open_regular_log(&target).context("Cannot open pinned Firecracker log")
+}
+
+fn open_regular_log(path: &Path) -> io::Result<fs::File> {
+    // A dead VMM may leave a FIFO in its writable jail root. Open without
+    // waiting for a writer, then reject anything that is not a regular file.
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&target)
-        .context("Cannot open pinned Firecracker log")?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
     if !file.metadata()?.is_file() {
-        bail!("Firecracker log changed away from a regular file");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firecracker log changed away from a regular file",
+        ));
     }
     Ok(file)
 }
@@ -743,18 +751,11 @@ fn preserve_log(inst: &Instance, jail_root: &Path, generation: &str) -> Result<(
     let source = jail_root.join("firecracker.log");
     let mut staged = tempfile::NamedTempFile::new_in(&inst.dir)
         .context("Cannot stage stopped Firecracker log")?;
-    match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&source)
-    {
+    match open_regular_log(&source) {
         Ok(mut input) => {
             let metadata = input
                 .metadata()
                 .context("Cannot inspect stopped Firecracker log")?;
-            if !metadata.is_file() {
-                bail!("Stopped Firecracker log is not a regular file");
-            }
             if metadata.len() == 0 {
                 match saved_journal(inst, generation, usize::try_from(MAX_SAVED_LOG)?) {
                     Ok(journal) => staged.write_all(&journal)?,
@@ -867,6 +868,35 @@ mod tests {
         assert_eq!(candidate_uid(&digest, 0).unwrap(), first);
         assert_ne!(candidate_uid(&digest, 1).unwrap(), first);
         assert!((200_000..2_000_200_000).contains(&first));
+    }
+
+    #[test]
+    fn log_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = Instance {
+            name: InstanceName::new("jail-log-test").unwrap(),
+            index: InstanceIndex::new(0).unwrap(),
+            dir: root.path().to_path_buf(),
+            image: ImageName::new("default").unwrap(),
+            firecracker_control: FirecrackerControlMode::Vsock,
+        };
+        let path = inst.log_path();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a NUL-terminated path in a private temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let writer_path = path.clone();
+        let delayed_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(writer_path)
+                .unwrap()
+        });
+        let started = std::time::Instant::now();
+        assert!(open_regular_log(&path).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        delayed_writer.join().unwrap();
     }
 
     #[test]
