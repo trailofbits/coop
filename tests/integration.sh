@@ -942,10 +942,22 @@ EOF
         return
     fi
     local failed_dir="$HOME/.coop/instances/$failed_name"
-    local failed_index
-    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    local runtime_state="$failed_dir/firecracker.runtime.json"
     local disk_identity
     disk_identity=$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")
+    local failed_index
+    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    printf '%s\n' '{"version":2,"launcher":"jailer"}' > "$runtime_state"
+    if coop start "$failed_name" --no-agents; then
+        fail "unknown Firecracker runtime version blocks launch" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Unsupported Firecracker runtime state"* \
+        && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" ]]; then
+        pass "unknown Firecracker runtime version blocks launch without replacing disk"
+    else
+        fail "unknown Firecracker runtime version blocks launch" "$HARNESS_ERR"
+    fi
+    rm -f "$runtime_state" # Model a stopped instance created before jailed launch.
     local broken_bridge_cfg="$tmpdir/broken-bridge.toml"
     cp "$SUITE_CONFIG" "$broken_bridge_cfg"
     printf '\n[network.host_tools]\nbridge = "/bin/false"\n' >> "$broken_bridge_cfg"
@@ -967,10 +979,13 @@ EOF
         fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
     fi
 
-    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" ]]; then
-        pass "failed Firecracker boot retains instance disk and clears PID"
+    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(jq -r '.version | tostring' "$runtime_state" 2>/dev/null)" == 1 \
+        && "$(jq -r '.launcher' "$runtime_state" 2>/dev/null)" == jailer ]]; then
+        pass "failed Firecracker boot retains disk and publishes atomic jailed state"
     else
-        fail "failed Firecracker boot retains instance disk and clears PID"
+        fail "failed Firecracker boot retains disk and publishes atomic jailed state"
     fi
     if [[ -f "$failed_dir/instance.json" ]]; then
         if ! ip link show "tap${failed_index}" >/dev/null 2>&1; then
@@ -4137,7 +4152,7 @@ test_stop() {
     echo ""
     echo "=== Phase: stop ==="
 
-    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0
+    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0 vmm_uid=""
     if [[ "$(uname -s)" == Linux ]]; then
         ip=$(guest_ip_of "$INSTANCE") || ip=""
         if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
@@ -4156,6 +4171,7 @@ test_stop() {
         # base vsock socket inode into the private instance directory. Kill
         # the VMM without graceful cleanup to test abandoned mount recovery.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$fc_pid/status" 2>/dev/null || true)
         instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
         vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
