@@ -15,6 +15,9 @@ use crate::sha256_hash::Sha256Hash;
 
 const START_DEADLINE: Duration = Duration::from_secs(30);
 const UNIT_SUFFIX: &str = ".service";
+// The Ubuntu 24.04 host and CI runner use 255. Earlier releases have not
+// been qualified for our JSON unit listing and transient service contract.
+const MIN_SYSTEMD_VERSION: u32 = 255;
 
 #[derive(Debug, Deserialize)]
 struct ListedUnit {
@@ -127,8 +130,20 @@ pub(crate) fn require_system_manager() -> Result<()> {
         .args(["--system", "show", "--property=Version", "--value"])
         .capture()
         .context("A running systemd system manager is required to start Firecracker")?;
-    if version.trim().is_empty() {
-        bail!("A running systemd system manager is required to start Firecracker");
+    require_supported_version(&version)
+}
+
+fn require_supported_version(version: &str) -> Result<()> {
+    let number = version
+        .trim()
+        .split_once(|c: char| !c.is_ascii_digit())
+        .map_or(version.trim(), |(number, _)| number)
+        .parse::<u32>()
+        .context("Cannot read the running systemd manager version")?;
+    if number < MIN_SYSTEMD_VERSION {
+        bail!(
+            "Firecracker requires a running systemd system manager version {MIN_SYSTEMD_VERSION} or newer (found {version}); upgrade the host before starting this VM"
+        );
     }
     Ok(())
 }
@@ -363,6 +378,15 @@ pub(crate) fn contains_pid(service: &ActiveService) -> Result<bool> {
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_manager_version_is_checked_before_launch() {
+        assert!(require_supported_version("255.4-1ubuntu8").is_ok());
+        assert!(require_supported_version("256").is_ok());
+        assert!(require_supported_version("254").is_err());
+        assert!(require_supported_version("").is_err());
+        assert!(require_supported_version("unknown").is_err());
+    }
 
     #[test]
     fn instance_namespace_depends_on_absolute_directory_and_uid() {
