@@ -99,7 +99,7 @@ pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
     let managed = firecracker_path();
     if path != managed {
         bail!(
-            "Custom firecracker_bin '{}' cannot be used for a jailed Firecracker VM. Remove that override and run `coop setup` to install the verified matching Firecracker/jailer pair at '{}'.",
+            "Custom firecracker_bin '{}' cannot be used for a managed Firecracker launch. Remove that override and run `coop setup` to install the verified matching Firecracker/jailer pair at '{}'.",
             path.display(),
             managed.display()
         );
