@@ -150,7 +150,8 @@ Creating an instance (`coop up`) follows this sequence:
    before treating a new launch as running.
    Firecracker logs and guest serial output go to journald through a rate-limited
    systemd stream. `coop logs` reads the active unit's journal; stopped cleanup
-   saves at most 16 MiB of recent output in the instance directory. A stopped
+   saves at most 16 MiB of recent output in the instance directory, available
+   through `coop logs NAME` after a failed boot. A stopped
    guest cannot block jail removal by changing its writable log placeholder;
    cleanup reads the system journal and revokes disk access even if that
    placeholder has been replaced.

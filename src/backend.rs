@@ -1228,6 +1228,11 @@ pub trait VmBackend: std::fmt::Display {
     /// is producing new output.
     fn stream_logs(&self, cfg: &CoopConfig, running: &RunningInstance, mode: LogMode)
     -> Result<()>;
+    /// Show a bounded snapshot after a confirmed stop. Following a stopped VM
+    /// has no meaning, so this path has no `LogMode` parameter.
+    fn snapshot_stopped_logs(&self, _stopped: &StoppedInstance) -> Result<()> {
+        bail!("Saved logs are unavailable for this stopped VM backend")
+    }
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
     /// The address the guest uses to reach a server running on the host,
@@ -1686,6 +1691,10 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<()> {
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
         vm.stream_logs(mode)
+    }
+
+    fn snapshot_stopped_logs(&self, stopped: &StoppedInstance) -> Result<()> {
+        crate::firecracker_jail::snapshot_stopped_log(stopped.instance())
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {

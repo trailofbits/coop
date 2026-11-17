@@ -632,7 +632,9 @@ supported agent paths, maintenance, persistence, and limitations.
 
 ### `logs`
 
-Stream the VM serial console output.
+Show the VM serial console output. On Linux, a stopped Firecracker VM can
+show its saved recent log with `coop logs NAME`; use this after a failed boot
+without restarting the VM. `--follow` requires a running VM.
 
 ```
 coop logs [NAME] [FLAGS]

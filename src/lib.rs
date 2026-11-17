@@ -1376,13 +1376,30 @@ pub fn run() -> Result<()> {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
         Commands::Logs { name, follow } => {
-            let running = resolve_running(&be, &cfg, name.as_ref())?;
-            let mode = if follow {
-                backend::LogMode::Follow
+            if follow {
+                let running = resolve_running(&be, &cfg, name.as_ref())?;
+                be.stream_logs(&cfg, &running, backend::LogMode::Follow)
             } else {
-                backend::LogMode::Snapshot
-            };
-            be.stream_logs(&cfg, &running, mode)
+                let mut instances = cfg.list_instances()?;
+                let selected = if let Some(name) = name.as_ref() {
+                    instances.into_iter().find(|inst| &inst.name == name)
+                } else if instances.len() == 1 {
+                    instances.pop()
+                } else {
+                    None
+                };
+                if let Some(inst) = selected {
+                    if let Some(running) = be.as_running(&cfg, inst.clone())? {
+                        be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                    } else {
+                        let stopped = be.as_stopped(inst)?;
+                        be.snapshot_stopped_logs(&stopped)
+                    }
+                } else {
+                    let running = resolve_running(&be, &cfg, name.as_ref())?;
+                    be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                }
+            }
         }
         Commands::Push {
             name,

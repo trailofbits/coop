@@ -3,7 +3,7 @@
 //! before exec.
 
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, symlink};
@@ -435,6 +435,39 @@ pub(crate) fn open_log(inst: &Instance) -> Result<fs::File> {
         Err(error) => return Err(error).context("Cannot inspect Firecracker log path"),
     };
     open_regular_log(&target).context("Cannot open pinned Firecracker log")
+}
+
+/// Read a stopped instance's saved log, or its last service generation's
+/// journal if cleanup has not yet replaced the managed link.
+pub(crate) fn snapshot_stopped_log(inst: &Instance) -> Result<()> {
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let link = inst.log_path();
+    let metadata = fs::symlink_metadata(&link)
+        .with_context(|| format!("No saved Firecracker log for instance '{}'", inst.name))?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(&link).context("Cannot read stopped Firecracker log link")?;
+        let target = checked_log_target(inst, &target)?;
+        let id = target
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .context("Stopped Firecracker log has no service generation")?;
+        let generation = id
+            .rsplit_once('-')
+            .map(|(_, generation)| generation)
+            .context("Stopped Firecracker log has no generation suffix")?;
+        let journal = saved_journal(inst, generation, usize::try_from(LIMIT)?)
+            .context("Cannot read the stopped VM journal; check the host system journal")?;
+        io::stdout().lock().write_all(&journal)?;
+        return Ok(());
+    }
+    let mut file = open_regular_log(&link).context("Cannot open saved Firecracker log")?;
+    let start = file.metadata()?.len().saturating_sub(LIMIT);
+    file.seek(io::SeekFrom::Start(start))?;
+    io::copy(&mut file.take(LIMIT), &mut io::stdout().lock())
+        .context("Cannot print saved Firecracker log")?;
+    Ok(())
 }
 
 fn open_regular_log(path: &Path) -> io::Result<fs::File> {

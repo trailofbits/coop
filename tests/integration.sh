@@ -982,6 +982,11 @@ EOF
     else
         fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
     fi
+    if coop logs "$failed_name" && [[ -n "$HARNESS_OUT" ]]; then
+        pass "stopped Firecracker VM exposes its saved boot diagnostics through coop logs"
+    else
+        fail "stopped Firecracker VM exposes its saved boot diagnostics through coop logs" "$HARNESS_ERR"
+    fi
 
     if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" \
         && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
