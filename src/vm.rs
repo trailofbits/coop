@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, FirecrackerNetworkMode, Instance, MiB};
+#[cfg(not(target_os = "macos"))]
 use crate::host_tool::TrustedLaunchContext;
+#[cfg(not(target_os = "macos"))]
 use crate::setup_tool::SetupTool;
 
 // ── Typestate markers ─────────────────────────────────────────

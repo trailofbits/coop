@@ -465,7 +465,9 @@ pub(crate) enum SetupTool {
     Mkdir,
     Install,
     Mv,
+    #[cfg(not(target_os = "macos"))]
     Mktemp,
+    #[cfg(not(target_os = "macos"))]
     Sh,
     Tee,
     Chroot,
@@ -507,7 +509,9 @@ impl SetupTool {
             Self::Mkdir => "mkdir",
             Self::Install => "install",
             Self::Mv => "mv",
+            #[cfg(not(target_os = "macos"))]
             Self::Mktemp => "mktemp",
+            #[cfg(not(target_os = "macos"))]
             Self::Sh => "sh",
             Self::Tee => "tee",
             Self::Chroot => "chroot",
@@ -566,7 +570,6 @@ impl SetupTool {
             | Self::Mkdir
             | Self::Install
             | Self::Mv
-            | Self::Mktemp
             | Self::Tee
             | Self::Chroot
             | Self::Rmdir
@@ -575,6 +578,10 @@ impl SetupTool {
                 "usr/lib/cargo/bin/coreutils/{}",
                 self.name()
             )),
+            #[cfg(not(target_os = "macos"))]
+            Self::Mktemp => {
+                policy.with_allowed_target_beneath_anchor("usr/lib/cargo/bin/coreutils/mktemp")
+            }
             _ => policy,
         }
     }
@@ -1179,6 +1186,7 @@ mod tests {
             SetupTool::Mkdir,
             SetupTool::Install,
             SetupTool::Mv,
+            #[cfg(not(target_os = "macos"))]
             SetupTool::Mktemp,
             SetupTool::Tee,
             SetupTool::Chroot,
