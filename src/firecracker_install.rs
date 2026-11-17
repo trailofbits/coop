@@ -121,6 +121,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_release_paths_and_archive_digest_are_pinned() {
+        assert_eq!(install_root(), Path::new("/var/lib/coop/firecracker"));
+        assert_eq!(
+            release_dir(),
+            PathBuf::from("/var/lib/coop/firecracker/v1.18.0")
+        );
+        assert_eq!(
+            firecracker_path(),
+            PathBuf::from("/var/lib/coop/firecracker/v1.18.0/firecracker")
+        );
+        let expected = match std::env::consts::ARCH {
+            "x86_64" => X86_64_ARCHIVE,
+            "aarch64" => AARCH64_ARCHIVE,
+            _ => return,
+        };
+        assert_eq!(expected_archive_hash().unwrap(), expected.parse().unwrap());
+        let (vmm, jailer) = match std::env::consts::ARCH {
+            "x86_64" => (X86_64_VMM, X86_64_JAILER),
+            "aarch64" => (AARCH64_VMM, AARCH64_JAILER),
+            _ => return,
+        };
+        assert_eq!(
+            expected_pair_hashes().unwrap(),
+            (vmm.parse().unwrap(), jailer.parse().unwrap())
+        );
+    }
+
+    #[test]
     fn managed_path_rejects_custom_binary_without_running_it() {
         assert_eq!(
             require_managed_path(&firecracker_path()).unwrap(),
