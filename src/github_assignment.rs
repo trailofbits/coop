@@ -2,6 +2,7 @@
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::io::Read as _;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -36,9 +37,9 @@ impl Assignment {
         )
     }
 
-    pub fn save(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    pub(crate) fn save(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         self.validate(cfg)?;
-        crate::fs_util::PrivateDir::create(&inst.dir)?.write_atomic_private(
+        crate::fs_util::PrivateDir::open_existing(&inst.dir)?.write_atomic_private(
             OsStr::new("github_pat.json"),
             serde_json::to_string(self)?.as_bytes(),
             0o600,
@@ -77,6 +78,33 @@ impl Assignment {
     }
 }
 
+/// Serialize assignment with VM destruction. Resolve the name under the
+/// operation lock so a command cannot recreate a directory after destroy.
+pub fn assign(cfg: &CoopConfig, inst: &Instance, repo: RepoSlug) -> Result<()> {
+    let _operation = crate::backend::lock_instance_operation(inst)?;
+    let _selection = lock_selection(inst)?;
+    let current = cfg.resolve_instance(Some(&inst.name))?;
+    Assignment { repo }.save(cfg, &current)
+}
+
+pub fn unassign(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    let _operation = crate::backend::lock_instance_operation(inst)?;
+    let _selection = lock_selection(inst)?;
+    let current = cfg.resolve_instance(Some(&inst.name))?;
+    Assignment::remove(&current)
+}
+
+/// Atomic replacement briefly unlinks the old sidecar. `open_regular` rejects
+/// that inode, so serialize credential readers with assignment replacement.
+pub(crate) fn lock_selection(inst: &Instance) -> Result<crate::fs_util::FileLock> {
+    crate::fs_util::lock_sibling_bounded(
+        &inst
+            .dir
+            .with_file_name(format!("{}.github-selection", inst.name)),
+        Duration::from_secs(30),
+    )
+}
+
 fn is_missing(error: &anyhow::Error) -> bool {
     error
         .root_cause()
@@ -89,7 +117,10 @@ pub fn active(cfg: &CoopConfig, inst: &Instance) -> Result<Option<Assignment>> {
     if cfg.github_disabled {
         return Ok(None);
     }
-    let assignment = Assignment::load(inst)?;
+    let assignment = {
+        let _selection = lock_selection(inst)?;
+        Assignment::load(inst)?
+    };
     if let Some(assignment) = &assignment {
         assignment.validate(cfg)?;
         reject_overrides(cfg.guest_env.keys().map(AsRef::as_ref))?;
@@ -125,10 +156,11 @@ pub fn reject_overrides<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     use crate::backend::{Hostname, SshTarget, SshUser};
     use crate::config::{ConfigPath, CoopConfig, Instance, InstanceName};
-    use crate::github_assignment::{Assignment, active, reject_overrides};
+    use crate::github_assignment::{Assignment, active, lock_selection, reject_overrides};
     use crate::github_repo::RepoSlug;
     use crate::guest_env_state::{EnvVarName, GuestEnvState};
 
@@ -385,5 +417,131 @@ mod tests {
                 assert!(!err.contains("not-printed"));
             }
         }
+    }
+
+    #[test]
+    fn assignment_waits_for_destroy_and_does_not_recreate_the_vm() {
+        let (_tmp, cfg, inst) = fixture();
+        let operation = crate::backend::lock_instance_operation(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::assign(
+                        &cfg,
+                        &inst,
+                        RepoSlug::new("org/assigned").unwrap(),
+                    ))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            std::fs::remove_dir_all(&inst.dir).unwrap();
+            drop(operation);
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+        });
+        assert!(!inst.dir.exists());
+    }
+
+    #[test]
+    fn unassignment_waits_for_the_vm_operation_lock() {
+        let (_tmp, cfg, inst) = fixture();
+        assign(&cfg, &inst);
+        let operation = crate::backend::lock_instance_operation(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::unassign(&cfg, &inst))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            drop(operation);
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        });
+        assert!(Assignment::load(&inst).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_rebind_reads_complete_atomic_choice() {
+        let (_tmp, cfg, inst) = fixture();
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/assigned").unwrap())
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 0..30 {
+                    let key = if n % 2 == 0 {
+                        "org/workspace"
+                    } else {
+                        "org/assigned"
+                    };
+                    crate::github_assignment::assign(&cfg, &inst, RepoSlug::new(key).unwrap())
+                        .unwrap();
+                }
+            });
+            for _ in 0..30 {
+                let selected = active(&cfg, &inst).unwrap().unwrap();
+                assert!(matches!(
+                    selected.repo.as_str(),
+                    "org/workspace" | "org/assigned"
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn credential_selection_and_rebind_wait_for_selection_lock() {
+        let (_tmp, cfg, inst) = fixture();
+        assign(&cfg, &inst);
+        let held = lock_selection(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cfg_ref = &cfg;
+            let inst_ref = &inst;
+            let started = started_tx.clone();
+            let done = done_tx.clone();
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                done.send(active(cfg_ref, inst_ref).map(|_| ())).unwrap();
+            });
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::assign(
+                        cfg_ref,
+                        inst_ref,
+                        RepoSlug::new("org/workspace").unwrap(),
+                    ))
+                    .unwrap();
+            });
+            for _ in 0..2 {
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "selection or rebind completed while its selection lock was held"
+            );
+            drop(held);
+            for _ in 0..2 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            }
+        });
     }
 }

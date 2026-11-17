@@ -1482,6 +1482,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        let _selection = crate::github_assignment::lock_selection(inst)?;
         if inst.probe_liveness()? {
             crate::web_editor::stop(inst)?;
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
@@ -1745,6 +1746,7 @@ impl VmBackend for LimaBackend {
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        let _selection = crate::github_assignment::lock_selection(inst)?;
         crate::web_editor::stop(inst)?;
         crate::lima::destroy(inst)?;
         if inst.dir.exists()
