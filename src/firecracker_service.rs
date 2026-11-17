@@ -15,9 +15,9 @@ use crate::sha256_hash::Sha256Hash;
 
 const START_DEADLINE: Duration = Duration::from_secs(30);
 const UNIT_SUFFIX: &str = ".service";
-// The Ubuntu 24.04 host and CI runner use 255. Earlier releases have not
-// been qualified for our JSON unit listing and transient service contract.
-const MIN_SYSTEMD_VERSION: u32 = 255;
+// Version 252 supports JSON unit listing and the transient service options
+// used here. The integration matrix exercises newer Ubuntu managers.
+const MIN_SYSTEMD_VERSION: u32 = 252;
 
 #[derive(Debug, Deserialize)]
 struct ListedUnit {
@@ -381,9 +381,10 @@ mod tests {
 
     #[test]
     fn running_manager_version_is_checked_before_launch() {
+        assert!(require_supported_version("252.0-1debian").is_ok());
         assert!(require_supported_version("255.4-1ubuntu8").is_ok());
         assert!(require_supported_version("256").is_ok());
-        assert!(require_supported_version("254").is_err());
+        assert!(require_supported_version("251").is_err());
         assert!(require_supported_version("").is_err());
         assert!(require_supported_version("unknown").is_err());
     }

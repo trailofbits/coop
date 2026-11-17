@@ -25,7 +25,7 @@ credentials on the host.
 - `sudo` privileges (coop starts the Firecracker VMM as root in a systemd
   system service and uses privileged host operations for networking and disk
   setup; it does not launch the VMM through the jailer)
-- A running systemd system manager version 255 or newer with trusted `systemd-run` and `systemctl`
+- A running systemd system manager version 252 or newer with trusted `systemd-run` and `systemctl`
   executables for VM startup
 - A root-owned `/var/lib/coop` installation area for the verified Firecracker
   and jailer pair; `coop setup` creates it with `sudo`
