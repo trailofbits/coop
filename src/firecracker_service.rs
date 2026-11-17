@@ -101,6 +101,15 @@ pub(crate) fn jail_id(inst: &Instance, unit: &str) -> Result<String> {
     Ok(format!("{}-{generation}", &digest[..16]))
 }
 
+pub(crate) fn unit_for_generation(inst: &Instance, generation: &str) -> Result<String> {
+    let namespace = prefix(inst)?;
+    let unit = format!("{namespace}{generation}{UNIT_SUFFIX}");
+    if !valid_unit(&unit, &namespace) {
+        bail!("Firecracker jail has an invalid service generation");
+    }
+    Ok(unit)
+}
+
 fn systemctl_query() -> Result<Cmd> {
     let systemctl = SetupTool::Systemctl.resolve()?;
     Ok(SetupTool::Timeout
@@ -233,6 +242,31 @@ fn parse_active_service(unit: &str, show: &str) -> Result<ActiveService> {
     })
 }
 
+fn verify_journal_policy(unit: &str) -> Result<()> {
+    let show = systemctl_query()?
+        .args([
+            "--system",
+            "--no-pager",
+            "show",
+            "--property=Id,StandardOutput,StandardError,LogRateLimitIntervalUSec,LogRateLimitBurst",
+        ])
+        .arg(unit)
+        .capture_bounded(Duration::from_secs(5), 1024)
+        .context("Cannot inspect Firecracker service output limits")?;
+    for expected in [
+        format!("Id={unit}"),
+        "StandardOutput=journal".to_owned(),
+        "StandardError=journal".to_owned(),
+        "LogRateLimitIntervalUSec=30s".to_owned(),
+        "LogRateLimitBurst=1000".to_owned(),
+    ] {
+        if !show.lines().any(|line| line == expected) {
+            bail!("Firecracker service did not apply its bounded journal output policy");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn launch(
     inst: &Instance,
     firecracker: &VerifiedFirecracker,
@@ -277,7 +311,7 @@ pub(crate) fn launch(
             "--property=TimeoutStopSec=15s",
             "--property=Restart=no",
             "--property=UMask=0111",
-            "--property=StandardOutput=null",
+            "--property=StandardOutput=journal",
             "--property=StandardError=journal",
             "--property=LogRateLimitIntervalSec=30s",
             "--property=LogRateLimitBurst=1000",
@@ -305,10 +339,7 @@ pub(crate) fn launch(
         .arg(&jail.base)
         .arg("--")
         .args(["--no-api", "--config-file"])
-        .arg("/config.json")
-        .arg("--log-path")
-        .arg("/firecracker.log")
-        .args(["--level", "Info"]);
+        .arg("/config.json");
     let status =
         crate::process_output::run_status_bounded(&mut launch.build(), START_DEADLINE, None)
             .with_context(|| format!("Firecracker service {unit} launch outcome is uncertain"))?;
@@ -318,7 +349,10 @@ pub(crate) fn launch(
         );
     }
     match inspect_state(&unit)? {
-        ServiceProbe::Active(service) => Ok(service),
+        ServiceProbe::Active(service) => {
+            verify_journal_policy(service.unit())?;
+            Ok(service)
+        }
         ServiceProbe::None => {
             bail!(
                 "Firecracker VMM exited after systemd exec in service {unit}; inspect `sudo journalctl -u {unit}`"
@@ -457,6 +491,8 @@ mod tests {
             )
         );
         assert!(jail_id(&inst, "other.service").is_err());
+        assert_eq!(unit_for_generation(&inst, &"a".repeat(32)).unwrap(), unit);
+        assert!(unit_for_generation(&inst, "not-a-generation").is_err());
     }
 
     #[test]

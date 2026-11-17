@@ -548,8 +548,35 @@ impl<'a> FirecrackerVm<'a, Running> {
         Ok(out)
     }
 
-    /// Stream the Firecracker log file to stdout.
+    /// Stream the active VMM's journal or legacy log file to stdout.
     pub fn stream_logs(&self, mode: LogMode) -> Result<()> {
+        if crate::firecracker_jail::has_jailed_log_link(self.inst)? {
+            let service = match crate::firecracker_service::probe(self.inst)? {
+                crate::firecracker_service::ServiceProbe::Active(service) => service,
+                crate::firecracker_service::ServiceProbe::None => {
+                    bail!("Jailed Firecracker service exited before logs could be read")
+                }
+                crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            };
+            let journalctl = crate::setup_tool::SetupTool::Journalctl.resolve()?;
+            let command = crate::setup_tool::SetupTool::Sudo
+                .command()?
+                .arg("--")
+                .arg(journalctl.launch_path())
+                .args([
+                    "--no-pager",
+                    "--quiet",
+                    "--output=cat",
+                    "--unit",
+                    service.unit(),
+                ]);
+            return match mode {
+                LogMode::Follow => command.args(["--follow", "--lines=10"]).run(),
+                LogMode::Snapshot => command
+                    .arg("--lines=1000")
+                    .run_bounded(Duration::from_secs(30)),
+            };
+        }
         let mut file = crate::firecracker_jail::open_log(self.inst)?;
 
         match mode {

@@ -148,6 +148,9 @@ Creating an instance (`coop up`) follows this sequence:
    Systemd owns the service identity and process group; coop verifies the main
    PID, cgroup, UID/GID, effective capabilities, seccomp mode, and jail root
    before treating a new launch as running.
+   Firecracker logs and guest serial output go to journald through a rate-limited
+   systemd stream. `coop logs` reads the active unit's journal; stopped cleanup
+   saves at most 16 MiB of recent output in the instance directory.
 7. Records the systemd main PID for compatibility and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;
@@ -252,7 +255,7 @@ the intentional setup and mount differences listed below:
 | `coop stop` | `limactl stop` | Guest reboot over persisted SSH transport, then stop the systemd service and its cgroup; legacy direct processes retain the SIGTERM/SIGKILL fallback |
 | `coop destroy` | `limactl delete --force` | Kill process, remove any prior TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Queries systemd service and main PID (or legacy PID), then the guest via SSH |
-| `coop logs` | Reads Lima's `serial.log` | Reads Firecracker log file |
+| `coop logs` | Reads Lima's `serial.log` | Reads the active Firecracker unit's journal, or a legacy log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH over the instance's persisted control mode: guest IP for `legacy_tcp`, Firecracker vsock ProxyCommand for `vsock` |
 | `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: extends rootfs image if needed, then runs fsck + resize2fs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |

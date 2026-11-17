@@ -25,8 +25,8 @@ credentials on the host.
 - `sudo` privileges (coop uses privileged host operations for networking,
   jail staging, and disk setup; the matching jailer drops the systemd-managed
   Firecracker VMM to its own unprivileged UID/GID)
-- A running systemd system manager version 252 or newer with trusted `systemd-run` and `systemctl`
-  executables for VM startup
+- A running systemd system manager version 252 or newer and journal with trusted `systemd-run`,
+  `systemctl`, and `journalctl` executables for VM startup and logs
 - `setfacl` from the host ACL package and trusted `mount`/`umount` utilities
   for jail staging and stopped-VM cleanup
 - A root-owned `/var/lib/coop` installation area for the verified Firecracker

@@ -35,6 +35,7 @@ pub(crate) fn require_jail_tools() -> Result<()> {
         SetupTool::Umount,
         SetupTool::Cat,
         SetupTool::Stat,
+        SetupTool::Journalctl,
     ] {
         tool.resolve()
             .with_context(|| format!("Firecracker jail requires trusted {}", tool.name()))?;
@@ -690,7 +691,7 @@ pub(crate) fn cleanup_stopped(inst: &Instance) -> Result<()> {
         if jail_root.exists() {
             grant_owner_root_access(&jail_root, owner)?;
         }
-        preserve_log(inst, &jail_root)?;
+        preserve_log(inst, &jail_root, generation)?;
         SetupTool::Rm
             .elevated_with_deadline(DEADLINE)?
             .args(["-rf", "--"])
@@ -717,7 +718,7 @@ fn revoke_disk_acl(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-fn preserve_log(inst: &Instance, jail_root: &Path) -> Result<()> {
+fn preserve_log(inst: &Instance, jail_root: &Path, generation: &str) -> Result<()> {
     const MAX_SAVED_LOG: u64 = 16 * 1024 * 1024;
     let link = inst.log_path();
     let metadata = match fs::symlink_metadata(&link) {
@@ -745,11 +746,20 @@ fn preserve_log(inst: &Instance, jail_root: &Path) -> Result<()> {
             if !metadata.is_file() {
                 bail!("Stopped Firecracker log is not a regular file");
             }
-            input.seek(std::io::SeekFrom::Start(
-                metadata.len().saturating_sub(MAX_SAVED_LOG),
-            ))?;
-            std::io::copy(&mut input.take(MAX_SAVED_LOG), &mut staged)
-                .context("Cannot preserve stopped Firecracker log")?;
+            if metadata.len() == 0 {
+                match saved_journal(inst, generation, usize::try_from(MAX_SAVED_LOG)?) {
+                    Ok(journal) => staged.write_all(&journal)?,
+                    Err(error) => tracing::warn!(
+                        "Cannot preserve stopped Firecracker journal; live journal remains available: {error:#}"
+                    ),
+                }
+            } else {
+                input.seek(std::io::SeekFrom::Start(
+                    metadata.len().saturating_sub(MAX_SAVED_LOG),
+                ))?;
+                std::io::copy(&mut input.take(MAX_SAVED_LOG), &mut staged)
+                    .context("Cannot preserve stopped Firecracker log")?;
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Cannot open stopped Firecracker log"),
@@ -760,6 +770,34 @@ fn preserve_log(inst: &Instance, jail_root: &Path) -> Result<()> {
         .map_err(|error| error.error)
         .context("Cannot publish stopped Firecracker log")?;
     Ok(())
+}
+
+fn saved_journal(inst: &Instance, generation: &str, limit: usize) -> Result<Vec<u8>> {
+    let unit = crate::firecracker_service::unit_for_generation(inst, generation)?;
+    let mut command = SetupTool::Journalctl
+        .elevated_with_deadline(DEADLINE)?
+        .args([
+            "--no-pager",
+            "--quiet",
+            "--output=cat",
+            "--unit",
+            &unit,
+            "--lines=1000",
+        ])
+        .build();
+    let output = crate::process_output::run_bounded(
+        &mut command,
+        crate::process_output::CapturePolicy {
+            stdout_max: limit,
+            stderr_max: 4096,
+            completion: crate::process_output::CompletionPolicy::Deadline(DEADLINE),
+        },
+    )
+    .context("Cannot read a bounded Firecracker journal snapshot")?;
+    if !output.status.success() {
+        bail!("Firecracker journal snapshot command failed");
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(test)]

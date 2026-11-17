@@ -471,6 +471,7 @@ pub(crate) enum SetupTool {
     Umount,
     Systemctl,
     SystemdRun,
+    Journalctl,
     Tee,
     Chroot,
     #[cfg_attr(
@@ -517,6 +518,7 @@ impl SetupTool {
             Self::Umount => "umount",
             Self::Systemctl => "systemctl",
             Self::SystemdRun => "systemd-run",
+            Self::Journalctl => "journalctl",
             Self::Tee => "tee",
             Self::Chroot => "chroot",
             Self::Rmdir => "rmdir",

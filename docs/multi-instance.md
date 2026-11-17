@@ -172,7 +172,7 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `rootfs.ext4` | Instance root filesystem (Firecracker) |
 | `firecracker.pid` | PID of the running Firecracker process |
 | `firecracker.socket` | Legacy Firecracker API socket (only for VMs started by older versions) |
-| `firecracker.log` | Link to the active jailed VMM log; a bounded saved copy after stop |
+| `firecracker.log` | Active jail marker; a bounded recent journal copy after stop (legacy VMs retain their file log) |
 | `vm_config.json` | Firecracker VM configuration |
 | `workspace.json` | Workspace sync state (host path, guest path, source) |
 | `vsock.sock` | Bind mount of the pinned Firecracker base vsock socket inode in the current jail generation |

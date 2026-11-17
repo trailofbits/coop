@@ -386,6 +386,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   runtime entries are unlinked through the pinned private directory;
   root-owned jail generations are removed only after service process death is
   confirmed.
+- A newly jailed Firecracker sends its guest-influenced serial output and VMM
+  logs to systemd's journal stream. Coop verifies the unit's journal routing
+  and 30-second/1000-message rate limit after launch; it creates no growing
+  live VMM log file or launcher pipe. `coop logs` reads the active unit through
+  a trusted `journalctl` executable, and stopped cleanup saves at most 16 MiB
+  of recent output. Journal retention follows the host's journald policy.
 - A Firecracker instance's control mode is persisted at creation. `vsock`
   mode never silently retries TCP: readiness, shutdown, shell, file transfer,
   forwarding, and generated SSH configuration all derive the same target from

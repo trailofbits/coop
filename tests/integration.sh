@@ -814,6 +814,19 @@ EOF
             fail "Firecracker PID belongs to its systemd service and cgroup" \
                 "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
         fi
+        local journal_policy
+        journal_policy=$(systemctl show \
+            --property=StandardOutput,StandardError,LogRateLimitIntervalUSec,LogRateLimitBurst \
+            "$service_unit" 2>/dev/null || true)
+        if [[ "$journal_policy" == *"StandardOutput=journal"* \
+            && "$journal_policy" == *"StandardError=journal"* \
+            && "$journal_policy" == *"LogRateLimitIntervalUSec=30s"* \
+            && "$journal_policy" == *"LogRateLimitBurst=1000"* ]]; then
+            pass "supervised VMM output uses rate-limited journald streams"
+        else
+            fail "supervised VMM output uses rate-limited journald streams" \
+                "systemd output policy differs from the launch contract"
+        fi
 
         local jail_root="" host_uid vmm_uid vmm_gid vmm_groups vmm_caps vmm_bounding vmm_nnp vmm_seccomp
         host_uid=$(id -u)
@@ -3049,7 +3062,9 @@ test_logs() {
     fi
 
     # Logs should contain something (boot messages, kernel output, etc.)
-    if [[ -n "$HARNESS_OUT" ]]; then
+    if [[ "$(uname -s)" == Linux && -z "$HARNESS_OUT" ]]; then
+        fail "jailed Firecracker journal produces log output" "stdout was empty"
+    elif [[ -n "$HARNESS_OUT" ]]; then
         pass "logs produces output"
     else
         # Lima logs go to stderr, so check both
@@ -4182,6 +4197,17 @@ test_stop() {
         pass "stop exits 0"
     else
         fail "stop exits 0" "exit code: $?"
+    fi
+    if [[ "$(uname -s)" == Linux ]]; then
+        local saved_log="$HOME/.coop/instances/$INSTANCE/firecracker.log" saved_bytes
+        saved_bytes=$(stat -c %s "$saved_log" 2>/dev/null || echo 0)
+        if [[ -f "$saved_log" && "$saved_bytes" -gt 0 \
+            && "$saved_bytes" -le 16777216 ]]; then
+            pass "stopped VMM retains a bounded journal snapshot"
+        else
+            fail "stopped VMM retains a bounded journal snapshot" \
+                "saved log bytes=$saved_bytes"
+        fi
     fi
     if [[ -n "$tap" ]]; then
         if [[ -e "/sys/class/net/$tap" ]]; then
