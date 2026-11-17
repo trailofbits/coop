@@ -76,6 +76,8 @@ exclude_re = [
   "src/firecracker_jail\\.rs:.*\\brevoke_disk_acl\\b",
   "src/firecracker_jail\\.rs:.*\\bpreserve_log\\b",
   "src/firecracker_jail\\.rs:.*\\bsaved_journal\\b",
+  # Migration state publication is host IO; its version parser stays in scope.
+  "src/firecracker_runtime\\.rs:.*\\bensure_jailed\\b",
   # Systemd queries and mutations are host IO. Parsers and unit-name guards
   # remain in scope.
   "src/firecracker_service\\.rs:.*\\bnew_unit\\b",

@@ -243,10 +243,11 @@ impl<'a> FirecrackerVm<'a, Configured> {
         if self.inst.probe_liveness()? {
             bail!("Instance '{}' is already running", self.inst.name);
         }
-        cleanup_runtime_paths(self.inst)?;
-        crate::firecracker_jail::cleanup_stopped(self.inst)?;
         let firecracker =
             crate::firecracker_install::configured_firecracker(&self.cfg.firecracker_bin)?;
+        crate::firecracker_runtime::ensure_jailed(self.inst)?;
+        cleanup_runtime_paths(self.inst)?;
+        crate::firecracker_jail::cleanup_stopped(self.inst)?;
 
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without

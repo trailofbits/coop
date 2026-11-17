@@ -15,6 +15,8 @@ mod creation_hooks;
 mod firecracker_install;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod firecracker_jail;
+#[cfg(target_os = "linux")]
+mod firecracker_runtime;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod firecracker_service;
 mod fs_util;

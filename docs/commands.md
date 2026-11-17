@@ -218,6 +218,9 @@ coop start [NAME] [FLAGS]
 create or reconnect to a project environment. Without `NAME`, `start` restarts
 the only stopped instance if exactly one exists; with multiple stopped
 instances, pass the instance name.
+On Linux, the first start after upgrading a stopped legacy Firecracker instance
+records the jailed launch version without replacing its disk. An unsupported
+runtime version blocks startup and retains the disk for inspection.
 
 | Flag | Description |
 |------|-------------|

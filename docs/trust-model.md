@@ -386,6 +386,11 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   runtime entries are unlinked through the pinned private directory;
   root-owned jail generations are removed only after service process death is
   confirmed.
+- An absent `firecracker.runtime.json` denotes a legacy instance. After
+  confirming it is stopped and verifying the managed binary pair, coop
+  atomically publishes version 1 with the jailed launcher. The operation does
+  not copy or replace the guest disk; a failed publication blocks startup,
+  and an unknown version never falls back to direct root launch.
 - A newly jailed Firecracker sends its guest-influenced serial output and VMM
   logs to systemd's journal stream. Coop verifies the unit's journal routing
   and 30-second/1000-message rate limit after launch; it creates no growing

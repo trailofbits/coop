@@ -157,10 +157,17 @@ Creating an instance (`coop up`) follows this sequence:
    use `coop pull --dir <new-directory>` to retrieve guest changes for review.
 
 A running legacy root VMM, whether directly launched or already supervised,
-remains manageable until it stops. Its next start uses the jailer. Stopped
-instances retain the same disk, image lineage, settings, and sidecars; the disk
-is bound into a new jail rather than copied. A failed start or guest boot timeout
-retains that disk. If systemd cannot confirm a service's process state, coop
+remains manageable until it stops. Its next start atomically publishes
+`firecracker.runtime.json` version 1 before using the jailer. An interrupted
+publication leaves either the absent legacy marker or the complete jailed
+marker, and retry always uses the jailer. Stopped instances retain the same
+disk inode, image lineage, settings, and sidecars; the disk is bound into a
+new jail rather than copied. A failed start or guest boot timeout retains that
+disk. Unknown runtime versions stop startup before launch. In-place downgrade
+is unsupported: older coop releases may ignore this marker and launch
+Firecracker directly as root. Stop VMs and back up their complete instance
+directories before any manual export to an older release.
+If systemd cannot confirm a service's process state, coop
 leaves the jail, PID, sockets, TAP, and disk for inspection instead of treating
 the VM as stopped. Confirmed-dead jail generations are removed on stop, restart,
 or destroy. The service unit name appears in `coop status` while a managed VMM
