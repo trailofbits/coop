@@ -4,9 +4,13 @@
 
 use std::fs;
 use std::io::{self, Read as _, Seek as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
+#[cfg(not(target_os = "macos"))]
+use std::os::fd::FromRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, symlink};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::os::unix::fs::{OpenOptionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
