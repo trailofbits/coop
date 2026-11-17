@@ -190,6 +190,15 @@ impl PreparedJail {
             .arg(self.root.join("kernel"))
             .run_bounded_with_file(kernel, DEADLINE)
             .context("Cannot copy guest kernel into jail")?;
+        // The jailer opens an existing destination without truncating or
+        // chmodding it. Precreate an empty executable so the service umask
+        // cannot strip its execute bit when the jailer copies Firecracker.
+        SetupTool::Install
+            .elevated_with_deadline(DEADLINE)?
+            .args(["-m", "0700", "/dev/null"])
+            .arg(self.root.join("firecracker"))
+            .run_bounded(DEADLINE)
+            .context("Cannot stage jailed Firecracker executable")?;
         for name in ["rootfs.ext4", "firecracker.log"] {
             SetupTool::Install
                 .elevated_with_deadline(DEADLINE)?
@@ -884,15 +893,18 @@ mod tests {
                 fs::read(jail.root.join("kernel")).unwrap(),
                 fs::read(jail.root.join("config.json")).unwrap(),
                 fs::read_link(inst.log_path()).unwrap(),
+                fs::metadata(jail.root.join("firecracker")).unwrap(),
             )
         });
         jail.cleanup_unstarted(&inst).unwrap();
         release_identity(&inst).unwrap();
         staged.unwrap();
-        let (kernel_bytes, config_bytes, log) = evidence.unwrap();
+        let (kernel_bytes, config_bytes, log, executable) = evidence.unwrap();
         assert_eq!(kernel_bytes, b"kernel witness");
         assert_eq!(config_bytes, b"{\"boot-source\":{}}");
         assert_eq!(log, jail.root.join("firecracker.log"));
+        assert_eq!(executable.mode() & 0o777, 0o700);
+        assert_eq!(executable.len(), 0);
         assert!(!jail.root.exists());
         assert!(!inst.vsock_path().exists());
     }
