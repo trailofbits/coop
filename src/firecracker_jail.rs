@@ -860,6 +860,8 @@ fn saved_journal(inst: &Instance, generation: &str, limit: usize) -> Result<Vec<
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+
     use super::*;
 
     #[test]
