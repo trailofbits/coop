@@ -397,8 +397,8 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   journald may multiply the effective burst based on available disk space.
   Coop creates no growing live VMM log file or launcher pipe. `coop logs`
   uses a trusted `journalctl` executable for the active unit, and stopped
-  cleanup saves at most 16 MiB of recent output. Journal retention follows
-  the host's journald policy.
+  cleanup saves at most 16 MiB of recent output for later `coop logs`
+  snapshots. Journal retention follows the host's journald policy.
 - A Firecracker instance's control mode is persisted at creation. `vsock`
   mode never silently retries TCP: readiness, shutdown, shell, file transfer,
   forwarding, and generated SSH configuration all derive the same target from

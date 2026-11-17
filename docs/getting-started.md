@@ -599,7 +599,7 @@ coop images --delete python-dev
 | Command | Description |
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
-| `coop logs` | Stream VM serial console logs (`-f` to follow) |
+| `coop logs` | Show VM console logs, including saved logs from a stopped Firecracker VM (`-f` follows a running VM) |
 | `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |
