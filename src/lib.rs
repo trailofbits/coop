@@ -12,6 +12,7 @@ mod commands;
 mod completions;
 pub mod config;
 mod creation_hooks;
+mod firecracker_install;
 mod fs_util;
 mod github_assignment;
 mod github_pat;

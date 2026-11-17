@@ -3268,8 +3268,8 @@ impl Instance {
     }
 }
 
-/// Identify the VMM by its instance-specific launch argument, not its binary
-/// name: `firecracker_bin` may point to a custom-named executable.
+/// Identify the VMM by its instance-specific launch argument. A stale process
+/// may predate the managed-binary requirement and use another executable name.
 /// `/proc/<pid>/cmdline` is NUL-delimited and paths need not be UTF-8, so compare
 /// raw argument bytes and reject ambiguous duplicate `--config-file` flags.
 fn firecracker_cmdline_matches_instance(cmdline: &[u8], config_path: &Path) -> bool {
@@ -3470,7 +3470,7 @@ fn default_ssh_port() -> NonZeroU16 {
 }
 
 fn default_firecracker_bin() -> ConfigPath {
-    ConfigPath::new(default_data_dir().join("firecracker"))
+    ConfigPath::new(crate::firecracker_install::firecracker_path())
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
@@ -6007,7 +6007,7 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert_eq!(default_kernel_path(), ConfigPath::new(data.join("vmlinux")));
         assert_eq!(
             default_firecracker_bin(),
-            ConfigPath::new(data.join("firecracker"))
+            ConfigPath::new(crate::firecracker_install::firecracker_path())
         );
     }
 

@@ -688,6 +688,53 @@ test_setup() {
         echo "FATAL: setup failed, cannot continue"
         exit 1
     fi
+
+    if [[ "$(uname -s)" == Linux ]]; then
+        if python3 - <<'PYPAIR'
+import hashlib
+import os
+import pathlib
+import stat
+
+root = pathlib.Path('/var/lib/coop/firecracker/v1.18.0')
+expected = {
+    'x86_64': (
+        'b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba',
+        'ddadbaa15b5c942271a83b7040ca7259c8ccf92a9e08d44cce0b86fa407ba460',
+    ),
+    'aarch64': (
+        '6f9e08df0a0072e3e7086c51ff434c034d705845e349175a01beb3f9cc025ce3',
+        '7ea8f46abdc6f1d1a0b58ce89ce6ca38be8a292a43d7e61cf88275318263c540',
+    ),
+}[os.uname().machine]
+for path in [pathlib.Path('/var/lib/coop'), root.parent, root]:
+    info = path.lstat()
+    assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o022 == 0, path
+for name, digest in zip(('firecracker', 'jailer'), expected):
+    path = root / name
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o111 != 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o022 == 0, path
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
+PYPAIR
+        then
+            pass "managed Firecracker and jailer are a root-owned matching pair"
+        else
+            fail "managed Firecracker and jailer are a root-owned matching pair"
+        fi
+
+        local custom_vmm_cfg="$tmpdir/custom-vmm-config.toml"
+        printf 'firecracker_bin = "/bin/false"\n' > "$custom_vmm_cfg"
+        if coop --config "$custom_vmm_cfg" setup -y; then
+            fail "custom Firecracker binary fails setup preflight" "setup unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Custom firecracker_bin"* ]]; then
+            pass "custom Firecracker binary fails setup preflight"
+        else
+            fail "custom Firecracker binary fails setup preflight" "$HARNESS_ERR"
+        fi
+    fi
 }
 
 # ── Primary instance lifecycle ────────────────────────────────

@@ -425,7 +425,7 @@ coop destroy [NAME] [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--all` | Remove all instances, templates, kernel, Firecracker binary, and SSH keys |
+| `--all` | Remove all instances, templates, kernel, legacy data-directory Firecracker copies, and SSH keys; retain the shared root-owned managed pair |
 
 ```
 coop destroy my-project
@@ -1046,6 +1046,10 @@ See also the [`updates` section](configuration.md#updates-section) of the config
 ### `uninstall`
 
 Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
+
+On Linux, uninstall leaves the shared root-owned Firecracker/jailer pair under
+`/var/lib/coop/firecracker/v1.18.0/`. An administrator can remove that release
+directory once no user has a VM depending on it.
 
 ```
 coop uninstall [FLAGS]

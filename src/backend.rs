@@ -1045,6 +1045,8 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    crate::firecracker_install::require_managed_path(&cfg.firecracker_bin)?;
     cfg.validate().map(drop)
 }
 
@@ -1271,6 +1273,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
+    crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
@@ -1407,6 +1410,7 @@ impl VmBackend for FirecrackerBackend {
             bail!("Instance '{}' is already running", inst.name);
         }
         boot_preflight(cfg)?;
+        crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1511,19 +1515,17 @@ impl VmBackend for FirecrackerBackend {
         }
 
         crate::network::teardown_all(&cfg.network);
-        tracing::info!("Removing kernel and Firecracker binary");
-        for path in [cfg.vm.kernel_path.clone(), cfg.firecracker_bin.clone()] {
+        tracing::info!("Removing kernel and legacy data-directory Firecracker binaries");
+        for path in [
+            cfg.vm.kernel_path.to_path_buf(),
+            cfg.data_dir.join("firecracker"),
+            cfg.data_dir.join("jailer"),
+        ] {
             if path.exists()
                 && let Err(e) = Cmd::new("rm").arg("-f").arg(&path).sudo().run()
             {
                 tracing::debug!("Failed to remove {} (non-fatal): {e}", path.display());
             }
-        }
-        let jailer = cfg.data_dir.join("jailer");
-        if jailer.exists()
-            && let Err(e) = Cmd::new("rm").arg("-f").arg(&jailer).sudo().run()
-        {
-            tracing::debug!("Failed to remove jailer (non-fatal): {e}");
         }
     }
 
@@ -5494,6 +5496,17 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn boot_preflight_rejects_custom_vmm_before_instance_mutation() {
+        let cfg = CoopConfig {
+            firecracker_bin: crate::config::ConfigPath::new("/bin/false"),
+            ..CoopConfig::default()
+        };
+        let error = boot_preflight(&cfg).unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"));
     }
 
     #[test]

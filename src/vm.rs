@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::backend::LogMode;
 use crate::cmd::Cmd;
 use crate::config::{CoopConfig, FirecrackerNetworkMode, Instance, MiB};
+use crate::host_tool::TrustedLaunchContext;
+use crate::setup_tool::SetupTool;
 
 // ── Typestate markers ─────────────────────────────────────────
 
@@ -241,6 +243,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
         if self.inst.probe_liveness()? {
             bail!("Instance '{}' is already running", self.inst.name);
         }
+        let firecracker =
+            crate::firecracker_install::configured_firecracker(&self.cfg.firecracker_bin)?;
 
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without
@@ -254,20 +258,30 @@ impl<'a> FirecrackerVm<'a, Configured> {
             })?;
         }
 
-        // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
-        // rather than sudo's wrapper. Paths ride as positional argv ($1,
-        // $@), so nothing is interpolated into the shell string.
-        let fc_cmd = Cmd::new("sh")
+        // The existing PID trampoline records the VMM rather than sudo's
+        // wrapper. Every root-executed tool is resolved through the trusted
+        // system-tool policy; paths remain positional shell arguments.
+        let sudo = SetupTool::Sudo.resolve()?;
+        let shell = SetupTool::Sh.resolve()?;
+        let rm = SetupTool::Rm.resolve()?;
+        let mktemp = SetupTool::Mktemp.resolve()?;
+        let chmod = SetupTool::Chmod.resolve()?;
+        let mv = SetupTool::Mv.resolve()?;
+        let fc_cmd = TrustedLaunchContext::system()
+            .elevated(&sudo, &shell)
             .args(["-c", PID_TRAMPOLINE, "sh"])
             .arg(&pid_path)
-            .arg(&self.cfg.firecracker_bin)
+            .arg(rm.launch_path())
+            .arg(mktemp.launch_path())
+            .arg(chmod.launch_path())
+            .arg(mv.launch_path())
+            .arg(&firecracker)
             .arg("--no-api")
             .arg("--config-file")
             .arg(&config_path)
             .arg("--log-path")
             .arg(&log_path)
-            .args(["--level", "Info"])
-            .sudo();
+            .args(["--level", "Info"]);
         let _child = fc_cmd
             .build()
             .stdin(Stdio::null())
@@ -567,19 +581,19 @@ pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()
 /// atomically publishing it, so startup never observes an unreadable file.
 /// Staging beside the destination keeps the rename on the same filesystem.
 const PID_TRAMPOLINE: &str = concat!(
-    r#"rm -f -- "$1" || exit 1; "#,
-    r#"pid_tmp=$(mktemp -- "$1.XXXXXX") || exit 1; "#,
-    r#"trap 'rm -f -- "$pid_tmp"' EXIT; "#,
+    r#""$2" -f -- "$1" || exit 1; "#,
+    r#"pid_tmp=$("$3" -- "$1.XXXXXX") || exit 1; "#,
+    r#"trap '"$2" -f -- "$pid_tmp"' EXIT; "#,
     r#"trap 'exit 1' HUP INT TERM; "#,
     r#"echo $$ > "$pid_tmp" || exit 1; "#,
-    r#"chmod 644 "$pid_tmp" || exit 1; "#,
-    r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
+    r#""$4" 644 "$pid_tmp" || exit 1; "#,
+    r#""$5" -f -- "$pid_tmp" "$1" || exit 1; "#,
     r#"trap - EXIT HUP INT TERM; "#,
     // Firecracker creates the base vsock socket as root. Its containing
     // instance directory is user-owned mode 0700, so mode 0666 grants the
     // invoking user access without exposing the socket to other users.
     r#"umask 0111 || exit 1; "#,
-    r#"shift; exec "$@""#,
+    r#"shift 5; exec "$@""#,
 );
 
 /// Poll for the PID file until its contents parse as a PID.
@@ -1211,6 +1225,7 @@ mod tests {
             ))
             .arg("sh")
             .arg(&path)
+            .args(["rm", "mktemp", "chmod", "mv"])
             .args(["sleep", "30"])
             .spawn()
             .unwrap();
@@ -1271,6 +1286,7 @@ mod tests {
         let result = std::process::Command::new("sh")
             .args(["-c", crate::vm::PID_TRAMPOLINE, "sh"])
             .arg(&path)
+            .args(["rm", "mktemp", "chmod", "mv"])
             .arg("true")
             .output()
             .unwrap();
@@ -1307,6 +1323,7 @@ mod tests {
                 "sh",
             ])
             .arg(&path)
+            .args(["rm", "mktemp", "chmod", "mv"])
             .arg("true")
             .output()
             .unwrap();

@@ -110,8 +110,8 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 - **KVM access**: `/dev/kvm` must exist and be readable/writable by the current user. Setup checks this and offers to fix permissions via `setfacl` or by adding the user to the `kvm` group.
 - **x86_64 or arm64 architecture**: The Firecracker backend supports both. x86_64 is the primary test target; arm64 builds are produced but less exercised.
-- **curl and host utilities**: Firecracker setup uses root-owned executables from `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`, and `/usr/local/sbin`. It checks the complete Coop-selected bootstrap family before setup changes storage, and checks the image-build family after any package installation but before downloading artifacts. A missing or rejected tool stops setup with its role and a repair hint. Setup does not search the invoking `PATH`.
-- **System packages**: Setup checks trusted `setfacl`, `unsquashfs`, and `mkfs.ext4` paths, plus resolved `ssh`, `scp`, and `rsync` clients. If tools are absent, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using a trusted system `apt-get`. It checks ownership and writability of `/etc/apt` and files reached through apt configuration includes before automatic installation. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If trusted `apt-get` is unavailable, install the packages with your host's package manager, then rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
+- **curl and host utilities**: Firecracker setup uses root-owned executables from `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`, `/usr/local/sbin`, and the NixOS system profile or sudo wrapper directories under `/run`. It checks the complete Coop-selected bootstrap family before setup changes storage, and checks the image-build family after any package installation but before downloading artifacts. A missing or rejected tool stops setup with its role and a repair hint. Setup does not search the invoking `PATH`.
+- **System packages**: Setup checks trusted `setfacl`, `unsquashfs`, and `mkfs.ext4` paths, plus resolved `ssh`, `scp`, and `rsync` clients. It also requires trusted `install` and `mv` tools to publish the managed binary pair. If tools are absent, it offers to install their Debian/Ubuntu packages (`acl`, `squashfs-tools`, `e2fsprogs`, `openssh-client`, and `rsync`) using a trusted system `apt-get`. It checks ownership and writability of `/etc/apt` and files reached through apt configuration includes before automatic installation. Non-FHS OpenSSH/rsync installations can be selected with `[ssh.host_tools]`; see [configuration](configuration.md#ssh-section). If trusted `apt-get` is unavailable, install the packages with your host's package manager, then rerun `coop setup`. The guest remains Ubuntu regardless of the host distribution.
 - **Network control-plane tools**: `sudo`, `ip`, `bridge`, `iptables`, and
   `sysctl` use validated absolute system paths. Non-FHS hosts can provide exact
   per-tool paths under `[network.host_tools]`; see
@@ -121,11 +121,11 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 `coop setup` prepares three artifacts:
 
-1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. Setup attempts to extract the matching jailer alongside it, but currently treats jailer extraction or publication failure as nonfatal. The launch path does not use the jailer.
-2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
+1. **Firecracker and jailer**: Setup downloads the pinned production v1.18.0 release, checks the architecture-specific archive digest, extracts both binaries, and publishes them together under `/var/lib/coop/firecracker/v1.18.0/`. That directory and its ancestors must be root-owned and not writable by unprivileged users. Setup and launch verify both installed files against pinned digests. The VMM still starts directly as root at this stage; the installed jailer is not yet used.
+2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. The search starts at the managed release's minor version and can fall back to an older CI bucket when assets lag.
 3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Newly created instances persist `[vm].firecracker_control`; `vsock` is opt-in, while existing and untagged instances retain `legacy_tcp`. Image metadata records whether the listener is present, so selecting or restoring an older image in vsock mode fails before disk or instance state is changed and tells the user to rebuild it. Because committed disks contain guest-authored state, Firecracker commit repairs and verifies a staging disk before publishing fresh capability metadata. Both setup and commit mark publication incomplete before replacing the live disk; the marker prevents consumers from using mismatched disk and metadata. Plain `coop setup --image X` refuses an image with this marker. Retry an interrupted commit from its source instance with `coop commit --image X --force`, or explicitly rebuild an interrupted base image with `coop setup --image X --rebuild`. A Firecracker image with metadata lacking the vsock listener capability needs explicit `--rebuild` even if its recipe hashes differ. Rebuilding a committed checkpoint discards its contents.
 
-All three steps are idempotent. If the artifact already exists and is up to date, setup skips it.
+All three steps are idempotent. Setup reuses a verified managed binary pair and does not overwrite an incomplete or modified root-owned release directory. If that directory fails verification, stop VMs using it, have an administrator remove that release directory, and rerun `coop setup`. An interrupted publication leaves a staging directory that a later setup removes after its timeout window; it does not replace a published pair. When coop pins a newer release, setup installs a separate versioned directory. Existing running VMs keep their executable, and stopped instance disks and image metadata are unchanged. Rolling back coop reuses the older installed pair if it still verifies. A custom or legacy `firecracker_bin` override must be removed before setup or launch. Older user-data-directory copies are no longer launched.
 
 ### How instances work
 
@@ -136,7 +136,8 @@ Creating an instance (`coop up`) follows this sequence:
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
 4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, vsock device, and either the open-mode network interface or an empty interface list.
 5. In `open` mode, creates and attaches a TAP device to the bridge (see TAP networking below). Isolated mode skips all per-instance host networking setup.
-6. Starts the Firecracker process directly with `sudo` and `--no-api`. This is
+6. Verifies the installed root-owned Firecracker/jailer pair, then starts the
+   Firecracker process directly with `sudo` and `--no-api`. This is
    coop's current launch method, not a requirement that KVM or a provisioned
    TAP always needs a root VMM. The process is not jailed; coop does not expose
    its control API socket. Firecracker's production binary supplies its default
@@ -202,6 +203,12 @@ The current Firecracker backend uses `sudo` for several operations:
 - Managing iptables rules
 - Rootfs operations during setup (chroot, mount, filesystem tools)
 - Destroying instance directories (files owned by the root-owned Firecracker process)
+
+The managed binary pair remains in `/var/lib/coop/firecracker/v1.18.0/` after
+`coop destroy --all` or `coop uninstall`, because it may be shared by other
+users or installations. An administrator can remove it after all users have
+stopped VMs that depend on it. Uninstall removes legacy copies from the user's
+data directory; it does not remove an arbitrary `firecracker_bin` override.
 
 ## Cross-compilation
 
