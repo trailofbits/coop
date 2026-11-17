@@ -190,7 +190,7 @@ It does not erase credentials already stored in the guest. Later invocations
 
 ### Fine-grained PAT (`github = "pat"`)
 
-In PAT mode coop forwards a fine-grained personal access token only when the host user has explicitly bound a `[github.pat]` entry to the VM. The saved entry key and immutable VM generation identify the choice; Git origin and clone URL can suggest an entry but cannot authorize one. GitHub enforces the actual repositories and permissions recorded for the token server-side. The entry key alone does not establish that scope.
+In PAT mode coop forwards a fine-grained personal access token only when the host user has explicitly bound a `[github.pat]` entry to the VM. The saved entry key identifies the choice; Git origin and clone URL can suggest an entry but cannot authorize one. GitHub enforces the actual repositories and permissions recorded for the token server-side. The entry key alone does not establish that scope.
 
 Configure via the wizard:
 
@@ -288,10 +288,12 @@ may also authorize `myorg/backend`; assigning it to a VM whose workspace is a
 plain parent directory works without detecting either child repository.
 Different VMs can select different entries for the same workspace.
 
-Assignment is explicit opt-in. Only the validated key and the VM generation
-are saved in owner-only, atomically written `<instance>/github_pat.json`;
+Assignment is explicit opt-in. Only the validated key is saved in owner-only,
+atomically written `<instance>/github_pat.json`;
 the shared secret is resolved again for each subsequent session or clone.
-Assignment and removal take the VM operation lock and reject stale VM generations.
+Assignment and removal use the VM operation lock, so they cannot race with
+destroy. A same-name replacement has no assignment unless it is explicitly
+bound after creation. Credential reads wait for any sidecar replacement.
 Restart/bootstrap, shell, exec, agent sessions, and restore/reprovision use it.
 Existing shells, agents, and background processes are not updated. Restart
 without `--no-agents` to establish the git credential helper on a guest that

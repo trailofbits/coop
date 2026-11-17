@@ -914,7 +914,7 @@ fn restart_confirmed_instance(
     let _guard = signal::install_handlers();
 
     // Binding a VM takes the operation lock. Release the stopped proof while
-    // asking, then re-check both the VM incarnation and current metadata
+    // asking, then re-read the selected name under the new stopped proof
     // before booting. The provisioning lock still serializes coop starts.
     drop(stopped);
 
@@ -929,11 +929,7 @@ fn restart_confirmed_instance(
         pat_prompt::maybe_prompt(cfg, opts.config_path, &inst, &hint, opts.no_prompt, None)?;
     }
     let mut stopped = be.as_stopped(inst.clone())?;
-    let current = config::Instance::load(&inst.dir)?;
-    anyhow::ensure!(
-        current.generation == inst.generation,
-        "VM was replaced while preparing restart"
-    );
+    let current = cfg.resolve_instance(Some(&inst.name))?;
     *stopped.instance_mut() = current.clone();
     inst = current;
     preflight_isolated_bootstrap(cfg, &inst, opts.no_agents, backend::BootMode::Restart)?;
