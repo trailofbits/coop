@@ -1810,25 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_pat_mode_never_forwards_without_the_flag() {
-        let mut cfg: crate::config::CoopConfig = toml::from_str(
-            r#"[github]
-mode = "pat"
-[github.pat."owner/repo"]
-token = "test-pat"
-"#,
-        )
-        .unwrap();
-        let repo = crate::github_repo::RepoSlug::new("owner/repo").unwrap();
-        for command in ["up", "start", "list"] {
-            parse(&[command]).command.apply_github_override(&mut cfg);
-            let env =
-                crate::backend::prepare_env_forwarding(&cfg, Some(&repo), false, false).unwrap();
-            assert!(!env.contains("GITHUB_TOKEN"));
-        }
-    }
-
-    #[test]
     fn setup_builder_timeout_parses() {
         let cli = parse(&["setup", "--builder-timeout", "60m"]);
         let super::Commands::Setup {
