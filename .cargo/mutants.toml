@@ -66,6 +66,7 @@ exclude_re = [
   "src/firecracker_jail\\.rs:.*\\brelease_identity\\b",
   "src/firecracker_jail\\.rs:.*\\bhas_jailed_log_link\\b",
   "src/firecracker_jail\\.rs:.*\\bopen_log\\b",
+  "src/firecracker_jail\\.rs:.*\\bsnapshot_stopped_log\\b",
   "src/firecracker_jail\\.rs:.*\\bpublish_vsock_mount\\b",
   "src/firecracker_jail\\.rs:.*\\bunmount_vsock\\b",
   "src/firecracker_jail\\.rs:.*\\bis_mountpoint\\b",
