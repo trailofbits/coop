@@ -3441,13 +3441,14 @@ CFGEOF
 
         local boot_fail_cfg="$tmpdir/isolated-boot-fail-config.toml"
         cp "$new_cfg" "$boot_fail_cfg"
-        sed -i.bak '1i\
-firecracker_bin = "/bin/false"\
-' "$boot_fail_cfg"
+        local bad_kernel="$tmpdir/isolated-not-a-kernel"
+        printf 'not a kernel\n' > "$bad_kernel"
+        printf 'kernel_path = "%s"\n' "$bad_kernel" >> "$boot_fail_cfg"
         if coop --config "$boot_fail_cfg" network "$new_name" open --restart --no-agents; then
             fail "target VMM boot failure leaves requested mode stopped and cleaned" \
                 "transition unexpectedly succeeded"
-        elif grep -q '"firecracker_control": "vsock"' "$new_state" \
+        elif [[ "$HARNESS_ERR" == *"Firecracker"* && "$HARNESS_ERR" == *"exited"* ]] \
+            && grep -q '"firecracker_control": "vsock"' "$new_state" \
             && ! test -f "$HOME/.coop/instances/$new_name/firecracker.pid" \
             && ! ip link show "$new_tap" >/dev/null 2>&1; then
             pass "target VMM boot failure leaves requested mode stopped and cleaned"
