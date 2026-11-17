@@ -22,7 +22,9 @@ credentials on the host.
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
-- `sudo` privileges (Firecracker uses jailer and TAP networking)
+- `sudo` privileges (coop currently starts the Firecracker VMM as root and uses
+  privileged host operations for networking and disk setup; it does not launch
+  the VMM through the jailer)
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
 - Setup also checks trusted system paths for `setfacl` and `unsquashfs`, plus resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires a trusted system `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 

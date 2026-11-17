@@ -121,7 +121,7 @@ The Firecracker backend runs [Firecracker microVMs](https://firecracker-microvm.
 
 `coop setup` prepares three artifacts:
 
-1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. The jailer binary is extracted alongside it.
+1. **Firecracker binary**: Downloaded from the latest GitHub release and stored in the data directory. Setup attempts to extract the matching jailer alongside it, but currently treats jailer extraction or publication failure as nonfatal. The launch path does not use the jailer.
 2. **Guest kernel**: Fetched from Firecracker's CI S3 bucket. This is a minimal `vmlinux` image matching the Firecracker release version.
 3. **Template rootfs**: Built by downloading the Firecracker CI squashfs rootfs (Ubuntu-based), unpacking it, creating an ext4 image at the configured template size, and running an install script inside a chroot. The script installs Docker, GitHub CLI, Claude Code, Codex, Grok Build, and profile packages. It configures the `ubuntu` user with SSH keys and sets up systemd-networkd plus a socket-activated AF_VSOCK listener that forwards to loopback SSH. Newly created instances persist `[vm].firecracker_control`; `vsock` is opt-in, while existing and untagged instances retain `legacy_tcp`. Image metadata records whether the listener is present, so selecting or restoring an older image in vsock mode fails before disk or instance state is changed and tells the user to rebuild it. Because committed disks contain guest-authored state, Firecracker commit repairs and verifies a staging disk before publishing fresh capability metadata. Both setup and commit mark publication incomplete before replacing the live disk; the marker prevents consumers from using mismatched disk and metadata. Plain `coop setup --image X` refuses an image with this marker. Retry an interrupted commit from its source instance with `coop commit --image X --force`, or explicitly rebuild an interrupted base image with `coop setup --image X --rebuild`. A Firecracker image with metadata lacking the vsock listener capability needs explicit `--rebuild` even if its recipe hashes differ. Rebuilding a committed checkpoint discards its contents.
 
@@ -136,7 +136,11 @@ Creating an instance (`coop up`) follows this sequence:
 3. Optionally resizes the rootfs if a larger disk was requested (truncate + e2fsck + resize2fs).
 4. Writes a Firecracker JSON config specifying the kernel, rootfs drive, vCPU/memory allocation, vsock device, and either the open-mode network interface or an empty interface list.
 5. In `open` mode, creates and attaches a TAP device to the bridge (see TAP networking below). Isolated mode skips all per-instance host networking setup.
-6. Starts the Firecracker process with `sudo` and `--no-api`. Firecracker requires root for KVM and TAP access; coop does not expose its control API socket.
+6. Starts the Firecracker process directly with `sudo` and `--no-api`. This is
+   coop's current launch method, not a requirement that KVM or a provisioned
+   TAP always needs a root VMM. The process is not jailed; coop does not expose
+   its control API socket. Firecracker's production binary supplies its default
+   seccomp filters, but those filters do not provide jailer confinement.
 7. Records the Firecracker PID and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;
@@ -189,9 +193,10 @@ Memory and vCPU changes edit the `machine-config` block of the instance's per-in
 
 ### Resource ownership
 
-Firecracker requires `sudo` for several operations:
+The current Firecracker backend uses `sudo` for several operations:
 
-- Starting the VM (KVM device access, TAP device creation)
+- Starting the root-run VMM; creating an open-mode TAP is a separate privileged
+  host operation
 - Stopping the VM (the Firecracker process runs as root)
 - Creating and manipulating TAP devices and bridge interfaces
 - Managing iptables rules
