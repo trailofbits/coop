@@ -869,6 +869,24 @@ EOF
         fail "prepare stopped instance for failed boot" "$HARNESS_ERR"
         return
     fi
+    local failed_dir="$HOME/.coop/instances/$failed_name"
+    local failed_index
+    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    local disk_identity
+    disk_identity=$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")
+    local broken_bridge_cfg="$tmpdir/broken-bridge.toml"
+    cp "$SUITE_CONFIG" "$broken_bridge_cfg"
+    printf '\n[network.host_tools]\nbridge = "/bin/false"\n' >> "$broken_bridge_cfg"
+    if coop --config "$broken_bridge_cfg" start "$failed_name" --no-agents; then
+        fail "partial TAP setup rolls back on stopped restart" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Failed to isolate TAP"* \
+        && ! -e "/sys/class/net/tap${failed_index}" \
+        && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" ]]; then
+        pass "partial TAP setup rolls back on stopped restart"
+    else
+        fail "partial TAP setup rolls back on stopped restart" "$HARNESS_ERR"
+    fi
     if coop --config "$failed_cfg" start "$failed_name" --no-agents; then
         fail "invalid kernel fails after Firecracker service exec" "start unexpectedly succeeded"
     elif [[ "$HARNESS_ERR" == *"Firecracker VMM exited"* ]]; then
@@ -877,15 +895,12 @@ EOF
         fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
     fi
 
-    local failed_dir="$HOME/.coop/instances/$failed_name"
     if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" ]]; then
         pass "failed Firecracker boot retains instance disk and clears PID"
     else
         fail "failed Firecracker boot retains instance disk and clears PID"
     fi
     if [[ -f "$failed_dir/instance.json" ]]; then
-        local failed_index
-        failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
         if ! ip link show "tap${failed_index}" >/dev/null 2>&1; then
             pass "failed Firecracker boot removes its TAP after confirmed exit"
         else
