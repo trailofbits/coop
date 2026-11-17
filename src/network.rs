@@ -823,7 +823,14 @@ fn bridge_exists(ip: Cmd) -> bool {
 fn bridge_is_empty(ip: Cmd) -> bool {
     let output = ip.args(["link", "show", "master", BRIDGE_NAME]).output();
     match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Ok(o) => {
+            tracing::warn!(
+                "Cannot inspect bridge ports before teardown: ip exited with {}",
+                o.status
+            );
+            false
+        }
         // A failed listing cannot prove that removing a shared bridge is safe.
         Err(error) => {
             tracing::warn!("Cannot inspect bridge ports before teardown: {error:#}");
@@ -870,6 +877,17 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn failed_bridge_port_listing_does_not_remove_shared_bridge() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let ip = temp.path().join("ip");
+        fs::write(&ip, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!bridge_is_empty(Cmd::new(&ip)));
+        fs::write(&ip, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(bridge_is_empty(Cmd::new(&ip)));
+    }
 
     #[test]
     fn failed_tap_configuration_removes_the_created_device() {
