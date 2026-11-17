@@ -82,6 +82,7 @@ pub fn create_and_start(
     disk_gib: Option<crate::config::GiB>,
     mounts: &[crate::config::Mount],
 ) -> Result<()> {
+    check_requested_mounts(cfg, mounts)?;
     let name = lima_name(inst);
     seal_instance_storage(&lima_home()?.join(&name))?;
     crate::private_storage::prepare_directory(&cfg.image_dir(&inst.image))?;
@@ -134,6 +135,7 @@ pub fn create_and_start(
     tracing::info!("Creating Lima instance '{name}'");
 
     let mem_gib = cfg.vm.mem_size_mib.get().as_gib_f64();
+    check_writable_mounts(cfg, mounts)?;
     let mut child = headless_limactl_start()?
         .arg(&effective_template)
         .arg(format!("--name={name}"))
@@ -218,6 +220,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
 
     tracing::info!("Restarting stopped Lima instance '{name}'");
 
+    check_writable_mounts(cfg, &[])?;
     let mut child = headless_limactl_start()?
         .arg(&name)
         .stdout(Stdio::null())
@@ -1336,6 +1339,7 @@ fn run_builder_vm(
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
     eprintln!("  Starting builder VM and installing packages...");
+    check_writable_mounts(cfg, &[])?;
     let mut command = headless_limactl_start()?;
     if let Some(timeout) = builder_timeout {
         command
@@ -2466,6 +2470,242 @@ fn lima_home() -> Result<PathBuf> {
     Ok(home.join(".lima"))
 }
 
+/// Lima opens mount source paths by name during start. Inspect both the new
+/// mount set and saved Lima specifications before allowing any guest to run.
+/// A saved specification can be reused by start, resize, restore, or
+/// reprovision without passing through `instance_template` again.
+pub(crate) fn check_writable_mounts(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+) -> Result<()> {
+    let control = lima_home()?;
+    let protected = protected_mount_paths(cfg, &control)?;
+    let mut sources = requested
+        .iter()
+        .map(|mount| check_mount_source(&mount.host_path, &protected))
+        .collect::<Result<Vec<_>>>()?;
+    sources.extend(check_saved_mounts(&control, &protected)?);
+    reject_overlapping_sources(&sources)
+}
+
+/// Reject an unsafe requested mount before lifecycle work begins. The saved
+/// Lima specification is checked at the CLI boundary and again before boot.
+pub(crate) fn check_requested_mounts(
+    cfg: &CoopConfig,
+    requested: &[crate::config::Mount],
+) -> Result<()> {
+    let control = lima_home()?;
+    let protected = protected_mount_paths(cfg, &control)?;
+    let sources = requested
+        .iter()
+        .map(|mount| check_mount_source(&mount.host_path, &protected))
+        .collect::<Result<Vec<_>>>()?;
+    reject_overlapping_sources(&sources)
+}
+
+fn protected_mount_paths(cfg: &CoopConfig, control: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
+    let config = cfg
+        .loaded_from
+        .as_deref()
+        .map_or_else(CoopConfig::default_path, Path::to_path_buf);
+    let default_data = CoopConfig::default().data_dir;
+    protected_path_views([
+        ("coop data and secret state", cfg.data_dir.as_ref()),
+        ("default coop data", default_data.as_ref()),
+        ("effective config", config.as_path()),
+        ("Lima control state", control),
+    ])
+}
+
+fn protected_path_views<const N: usize>(
+    paths: [(&'static str, &Path); N],
+) -> Result<Vec<(&'static str, PathBuf)>> {
+    let mut views = Vec::with_capacity(N * 2);
+    for (kind, path) in paths {
+        views.push((kind, std::path::absolute(path)?));
+        views.push((kind, resolved_host_path(path)?));
+    }
+    Ok(views)
+}
+
+fn reject_overlapping_sources(sources: &[WritableHostMount]) -> Result<()> {
+    for (index, source) in sources.iter().enumerate() {
+        for other in sources.iter().skip(index + 1) {
+            if source.requested == other.requested && source.resolved == other.resolved {
+                continue;
+            }
+            for left in [&source.requested, &source.resolved] {
+                for right in [&other.requested, &other.resolved] {
+                    if left.starts_with(right) || right.starts_with(left) {
+                        bail!(
+                            "Writable Lima mounts overlap at a host source path that a guest can replace. Narrow the mounts before retrying"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct WritableHostMount {
+    requested: PathBuf,
+    resolved: PathBuf,
+}
+
+fn check_saved_mounts(
+    control: &Path,
+    protected: &[(&str, PathBuf)],
+) -> Result<Vec<WritableHostMount>> {
+    let mut sources = Vec::new();
+    let global = control.join("_config");
+    if global.exists() {
+        let directory = PrivateDir::open_existing(&global)?;
+        for name in ["base.yaml", "default.yaml", "override.yaml"] {
+            let yaml = match directory.read_to_string(OsStr::new(name)) {
+                Ok(yaml) => yaml,
+                Err(error)
+                    if error
+                        .root_cause()
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|io| io.kind() == io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error).context("Cannot inspect global Lima mounts"),
+            };
+            sources.extend(mount_sources_from_yaml(&yaml, protected, false)?);
+        }
+    }
+    // Inspect every coop-managed specification, including stopped VMs. A
+    // stopped VM must not be restarted with a mount that can expose state;
+    // an existing live exposure makes that state untrustworthy right now.
+    let entries = match std::fs::read_dir(control) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(sources),
+        Err(error) => return Err(error).context("Cannot inspect Lima control directory"),
+    };
+    for entry in entries {
+        let entry = entry.context("Cannot inspect Lima control directory entry")?;
+        if !entry.file_name().to_string_lossy().starts_with(LIMA_PREFIX) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            bail!("Unexpected coop Lima control entry; inspect Lima state before starting a VM");
+        }
+        let directory = PrivateDir::open_existing(&entry.path())?;
+        let yaml = match directory.read_to_string(OsStr::new("lima.yaml")) {
+            Ok(yaml) => yaml,
+            Err(error)
+                if error
+                    .root_cause()
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() == io::ErrorKind::NotFound) =>
+            {
+                bail!(
+                    "Coop Lima instance has no saved mount specification; inspect or remove its control directory before retrying"
+                );
+            }
+            Err(error) => return Err(error).context("Cannot inspect saved Lima mounts"),
+        };
+        sources.extend(mount_sources_from_yaml(&yaml, protected, true)?);
+    }
+    Ok(sources)
+}
+
+fn mount_sources_from_yaml(
+    yaml: &str,
+    protected: &[(&str, PathBuf)],
+    required: bool,
+) -> Result<Vec<WritableHostMount>> {
+    let parsed: serde_json::Value =
+        serde_saphyr::from_str(yaml).context("Cannot parse Lima mount specification")?;
+    // Lima merges `base` imports and expands Go templates before opening
+    // mount sources. The literal YAML path is not enough to validate either.
+    if parsed.get("base").is_some_and(|base| {
+        !base.is_null() && base.as_array().is_none_or(|entries| !entries.is_empty())
+    }) {
+        bail!(
+            "Lima mount specification imports a base template; remove the import before starting a VM"
+        );
+    }
+    let mounts = match parsed.get("mounts") {
+        Some(serde_json::Value::Array(mounts)) => mounts,
+        None | Some(serde_json::Value::Null) if !required => return Ok(Vec::new()),
+        _ => bail!("Lima mount specification has no valid mount list"),
+    };
+    let mut sources = Vec::new();
+    for mount in mounts {
+        if mount.get("writable").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let source = mount
+            .get("location")
+            .and_then(serde_json::Value::as_str)
+            .context("Saved writable Lima mount has no source path")?;
+        if source.contains("{{") || source.contains("}}") {
+            bail!(
+                "Saved writable Lima mount uses a path template; use an explicit host path before starting a VM"
+            );
+        }
+        let expanded = crate::shell::expand_tilde(Path::new(source));
+        sources.push(check_mount_source(&expanded, protected)?);
+    }
+    Ok(sources)
+}
+
+fn check_mount_source(source: &Path, protected: &[(&str, PathBuf)]) -> Result<WritableHostMount> {
+    if !source.is_absolute() {
+        bail!("Writable Lima mount source is not an absolute host path");
+    }
+    if source.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        bail!("Writable Lima mount source contains a dot path component");
+    }
+    let requested = std::path::absolute(source)?;
+    let resolved = resolved_host_path(source)?;
+    for (kind, path) in protected {
+        if requested.starts_with(path)
+            || path.starts_with(&requested)
+            || resolved.starts_with(path)
+            || path.starts_with(&resolved)
+        {
+            bail!(
+                "Writable Lima mount exposes {kind}. Narrow the mount or relocate protected host state, then inspect or repair exposed state before retrying"
+            );
+        }
+    }
+    Ok(WritableHostMount {
+        requested,
+        resolved,
+    })
+}
+
+/// Resolve existing symlinks and normalize a missing final component, such
+/// as a config file that has not been created yet.
+fn resolved_host_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Cannot locate current host directory")?
+            .join(path)
+    };
+    match absolute.symlink_metadata() {
+        Ok(_) => return absolute.canonicalize().context("Cannot resolve host path"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Cannot inspect host path"),
+    }
+    let parent = absolute.parent().context("Host path has no parent")?;
+    let name = absolute.file_name().context("Host path has no file name")?;
+    Ok(resolved_host_path(parent)?.join(name))
+}
+
 /// Get the lifecycle state for a Lima instance. Absence is distinct from
 /// malformed output and a failed `limactl` probe.
 fn lima_state(name: &InstanceName) -> Result<Option<LimaState>> {
@@ -2535,6 +2775,201 @@ mod tests {
     use super::*;
     use crate::backend::VmBackend as _;
     use std::fs;
+
+    #[test]
+    fn writable_mount_guard_rejects_protected_state_and_symlink_aliases() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = home.join("project");
+        let data = home.join(".coop");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("config.toml"), "").unwrap();
+        std::os::unix::fs::symlink(&home, root.path().join("alias")).unwrap();
+        let protected = [
+            ("data", resolved_host_path(&data).unwrap()),
+            (
+                "config",
+                resolved_host_path(&data.join("config.toml")).unwrap(),
+            ),
+        ];
+        assert!(check_mount_source(&project, &protected).is_ok());
+        for source in [&home, &data, &root.path().join("alias/.coop")] {
+            let error = check_mount_source(source, &protected).unwrap_err();
+            assert!(error.to_string().contains("Writable Lima mount exposes"));
+        }
+    }
+
+    #[test]
+    fn mount_guard_uses_custom_data_and_effective_config_paths() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let custom = root.path().join("custom-data");
+        let config = root.path().join("other-config.toml");
+        let control = root.path().join("lima");
+        let cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(&custom),
+            loaded_from: Some(config.clone()),
+            ..CoopConfig::default()
+        };
+        let protected = protected_mount_paths(&cfg, &control).unwrap();
+        let default_data = CoopConfig::default().data_dir;
+        for source in [
+            custom.as_path(),
+            config.as_path(),
+            control.as_path(),
+            default_data.as_ref(),
+        ] {
+            assert!(check_mount_source(source, &protected).is_err());
+        }
+        let safe = root.path().join("project");
+        fs::create_dir_all(&safe).unwrap();
+        assert!(check_mount_source(&safe, &protected).is_ok());
+    }
+
+    #[test]
+    fn mount_guard_checks_reopened_symlink_path_and_resolved_target() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let project = root.path().join("project");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_config = outside.join("config.toml");
+        fs::write(&outside_config, "").unwrap();
+        let config = project.join("config.toml");
+        std::os::unix::fs::symlink(&outside_config, &config).unwrap();
+        let protected = protected_path_views([("config", config.as_path())]).unwrap();
+        assert!(check_mount_source(&project, &protected).is_err());
+        assert!(check_mount_source(&outside, &protected).is_err());
+    }
+
+    #[test]
+    fn saved_lima_mount_guard_checks_replayed_yaml() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let control = root.path().join("lima");
+        let instance = control.join("coop-project");
+        let data = root.path().join("data");
+        let project = root.path().join("project");
+        crate::fs_util::private_dir(&instance).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let protected = [("data", resolved_host_path(&data).unwrap())];
+        assert!(check_saved_mounts(&control, &protected).is_err());
+        fs::write(
+            instance.join("lima.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        let result = check_saved_mounts(&control, &protected);
+        assert!(result.is_ok(), "{result:?}");
+        fs::create_dir(project.join("inner")).unwrap();
+        let alias = root.path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        fs::write(
+            instance.join("lima.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n- location: '{}'\n  writable: true\n",
+                alias.display(),
+                alias.join("inner").display()
+            ),
+        )
+        .unwrap();
+        let sources = check_saved_mounts(&control, &protected).unwrap();
+        assert!(reject_overlapping_sources(&sources).is_err());
+        fs::write(
+            instance.join("lima.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(check_saved_mounts(&control, &protected).is_err());
+    }
+
+    #[test]
+    fn global_lima_override_mount_is_checked_before_selection() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let control = root.path().join("lima");
+        let global = control.join("_config");
+        let data = root.path().join("data");
+        crate::fs_util::private_dir(&global).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let protected = [("data", resolved_host_path(&data).unwrap())];
+        fs::write(global.join("default.yaml"), "mountType: virtiofs\n").unwrap();
+        assert!(check_saved_mounts(&control, &protected).is_ok());
+        fs::write(
+            global.join("override.yaml"),
+            format!(
+                "mounts:\n- location: '{}'\n  writable: true\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        assert!(check_saved_mounts(&control, &protected).is_err());
+    }
+
+    #[test]
+    fn writable_lima_home_alias_cannot_hide_protected_state() {
+        let home = dirs::home_dir().unwrap();
+        let protected = [("data", resolved_host_path(&home.join(".coop")).unwrap())];
+        let yaml = "mounts:\n- location: '~'\n  writable: true\n";
+        assert!(mount_sources_from_yaml(yaml, &protected, false).is_err());
+    }
+
+    #[test]
+    fn saved_mount_guard_rejects_sources_lima_can_expand_or_import() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let protected = [("data", root.path().join("data"))];
+        for yaml in [
+            "mounts:\n- location: '/Users/{{.User}}'\n  writable: true\n",
+            "mounts:\n- location: '/Users/{{.User}}'\n  writable: false\n- location: '/tmp/project'\n  writable: true\n",
+            "base: ./unsafe.yaml\nmounts: []\n",
+            "base:\n- ./unsafe.yaml\n",
+        ] {
+            let result = mount_sources_from_yaml(yaml, &protected, false);
+            // A read-only template cannot expose host secrets through a
+            // writable mount; the writable source is still checked.
+            if yaml.contains("writable: false") {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.is_err(), "{yaml}");
+            }
+        }
+        assert!(mount_sources_from_yaml("base: []\nmounts: []\n", &protected, false).is_ok());
+    }
+
+    #[test]
+    fn writable_mount_sources_cannot_replace_another_sources_ancestor() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let outer = root.path().join("outer");
+        let inner = outer.join("inner");
+        let separate = root.path().join("separate");
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(&separate).unwrap();
+        let outer = check_mount_source(&outer, &[]).unwrap();
+        let inner = check_mount_source(&inner, &[]).unwrap();
+        let separate = check_mount_source(&separate, &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, separate]).is_ok());
+        assert!(reject_overlapping_sources(std::slice::from_ref(&inner)).is_ok());
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, inner]).is_err());
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        let duplicate = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, duplicate]).is_ok());
+        std::os::unix::fs::symlink(root.path().join("outer"), root.path().join("outer/self"))
+            .unwrap();
+        let self_alias = check_mount_source(&root.path().join("outer/self"), &[]).unwrap();
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, self_alias]).is_err());
+        std::os::unix::fs::symlink(root.path().join("separate"), root.path().join("outer/link"))
+            .unwrap();
+        let alias = check_mount_source(&root.path().join("outer/link"), &[]).unwrap();
+        let outer = check_mount_source(&root.path().join("outer"), &[]).unwrap();
+        assert!(reject_overlapping_sources(&[outer, alias]).is_err());
+    }
 
     #[test]
     fn packaged_lima_executes_with_its_helper_path() {

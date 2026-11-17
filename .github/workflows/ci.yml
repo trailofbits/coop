@@ -180,8 +180,8 @@ jobs:
           persist-credentials: false
       - name: Install Lima
         run: brew install lima
-      - name: Prove production Lima lookup and execution
-        run: cargo test --test lima_lookup
+      - name: Prove production Lima lookup and mount guard
+        run: cargo test --test lima_lookup --test lima_mount_guard
 
   # Preserve the existing required-check name. always() makes a failed,
   # cancelled, or skipped dependency fail this gate instead of skipping it.

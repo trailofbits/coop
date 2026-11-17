@@ -239,7 +239,14 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   paths rather than inherited descriptors, so its own path resolution remains
   within the trusted host-tool boundary. Lima uses a private child umask, reseals disks after startup, and protects
   its coop directories separately from `data_dir`. See
-  [private host storage](configuration.md#private-host-storage). A host
+  [private host storage](configuration.md#private-host-storage).
+  Lima boot checks requested and saved writable mounts, including Lima's global
+  base, default, and override configuration, against the effective
+  config, coop data/secret state, and Lima control directory. A mount covering
+  one of these host paths is rejected before `limactl start`; a previously
+  exposed state needs host inspection because current path checks cannot prove
+  what a guest changed in the past. A host process that can rewrite source
+  paths concurrently remains in the trusted host-user boundary. A host
   `~/.grok/auth.json` copied into an open-mode guest is `chmod 0600` after
   `scp` (`backend.rs:restrict_guest_grok_auth`). Isolated bootstrap makes no
   new auth-file copy and does not sanitize a copy retained on the guest disk.
