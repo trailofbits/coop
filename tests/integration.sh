@@ -857,8 +857,20 @@ config_dir = false
 firecracker_control = "vsock"
 kernel_path = "$bad_kernel"
 EOF
-    if coop --config "$failed_cfg" up "$failed_ws" --name "$failed_name" --no-agents; then
-        fail "invalid kernel fails after Firecracker service exec" "up unexpectedly succeeded"
+    if ! coop up "$failed_ws" --name "$failed_name" --no-agents; then
+        fail "prepare stopped instance for failed boot" "$HARNESS_ERR"
+        if [[ -d "$HOME/.coop/instances/$failed_name" ]]; then
+            STARTED_INSTANCES+=("$failed_name")
+        fi
+        return
+    fi
+    STARTED_INSTANCES+=("$failed_name")
+    if ! coop stop "$failed_name"; then
+        fail "prepare stopped instance for failed boot" "$HARNESS_ERR"
+        return
+    fi
+    if coop --config "$failed_cfg" start "$failed_name" --no-agents; then
+        fail "invalid kernel fails after Firecracker service exec" "start unexpectedly succeeded"
     elif [[ "$HARNESS_ERR" == *"Firecracker VMM exited"* ]]; then
         pass "invalid kernel fails after Firecracker service exec"
     else
@@ -866,9 +878,6 @@ EOF
     fi
 
     local failed_dir="$HOME/.coop/instances/$failed_name"
-    if [[ -d "$failed_dir" ]]; then
-        STARTED_INSTANCES+=("$failed_name")
-    fi
     if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" ]]; then
         pass "failed Firecracker boot retains instance disk and clears PID"
     else
@@ -912,7 +921,7 @@ test_abrupt_launcher_exit_keeps_supervised_vm_manageable() {
         > "$tmpdir/abrupt-launch.log" 2>&1 &
     local launcher_pid=$!
     local vmm_pid="" service_unit=""
-    for _ in {1..150}; do
+    for _ in {1..600}; do
         vmm_pid=$(cat "$abrupt_dir/firecracker.pid" 2>/dev/null || true)
         if [[ "$vmm_pid" =~ ^[1-9][0-9]*$ ]]; then
             service_unit=$(systemctl whoami "$vmm_pid" 2>/dev/null || true)
