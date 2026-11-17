@@ -1230,8 +1230,8 @@ pub trait VmBackend: std::fmt::Display {
     -> Result<()>;
     /// Show a bounded snapshot after a confirmed stop. Following a stopped VM
     /// has no meaning, so this path has no `LogMode` parameter.
-    fn snapshot_stopped_logs(&self, _stopped: &StoppedInstance) -> Result<()> {
-        bail!("Saved logs are unavailable for this stopped VM backend")
+    fn snapshot_stopped_logs(&self, _inst: &Instance) -> Result<()> {
+        bail!("This VM is stopped and has no saved logs; run `coop logs` while it is running")
     }
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
@@ -1693,8 +1693,15 @@ impl VmBackend for FirecrackerBackend {
         vm.stream_logs(mode)
     }
 
-    fn snapshot_stopped_logs(&self, stopped: &StoppedInstance) -> Result<()> {
-        crate::firecracker_jail::snapshot_stopped_log(stopped.instance())
+    fn snapshot_stopped_logs(&self, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        if inst.probe_liveness()? {
+            bail!(
+                "Instance '{}' started while reading its saved logs; retry `coop logs`",
+                inst.name
+            );
+        }
+        crate::firecracker_jail::snapshot_stopped_log(inst)
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {

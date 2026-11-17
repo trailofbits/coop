@@ -266,7 +266,7 @@ the intentional setup and mount differences listed below:
 | `coop stop` | `limactl stop` | Guest reboot over persisted SSH transport, then stop the systemd service and its cgroup; legacy direct processes retain the SIGTERM/SIGKILL fallback |
 | `coop destroy` | `limactl delete --force` | Kill process, remove any prior TAP, delete instance dir |
 | `coop status` | Queries `limactl list --json` | Queries systemd service and main PID (or legacy PID), then the guest via SSH |
-| `coop logs` | Reads Lima's `serial.log` | Reads the active Firecracker unit's journal, or a legacy log file |
+| `coop logs` | Reads Lima's `serial.log` while running | Reads the active Firecracker unit's journal or a stopped VM's saved snapshot; legacy VMs use their log file |
 | `coop shell` | SSH to localhost on Lima-assigned port | SSH over the instance's persisted control mode: guest IP for `legacy_tcp`, Firecracker vsock ProxyCommand for `vsock` |
 | `coop resize` | Disk: truncates Lima disk and updates `lima.yaml` `disk:`. Mem/vCPU: edits `lima.yaml`, validated via start | Disk: extends rootfs image if needed, then runs fsck + resize2fs. Mem/vCPU: edits per-instance JSON |
 | Resource monitoring | SSH query to guest | SSH query to guest |

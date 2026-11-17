@@ -457,8 +457,10 @@ pub(crate) fn snapshot_stopped_log(inst: &Instance) -> Result<()> {
             .rsplit_once('-')
             .map(|(_, generation)| generation)
             .context("Stopped Firecracker log has no generation suffix")?;
-        let journal = saved_journal(inst, generation, usize::try_from(LIMIT)?)
-            .context("Cannot read the stopped VM journal; check the host system journal")?;
+        let unit = crate::firecracker_service::unit_for_generation(inst, generation)?;
+        let journal = saved_journal(inst, generation, usize::try_from(LIMIT)?).with_context(|| {
+            format!("Cannot read the stopped VM journal; try `sudo journalctl -u {unit}` on the host")
+        })?;
         io::stdout().lock().write_all(&journal)?;
         return Ok(());
     }
@@ -807,8 +809,10 @@ fn preserve_log(inst: &Instance, jail_root: &Path, generation: &str) -> Result<(
         Ok(journal) => staged.write_all(&journal)?,
         Err(error) => {
             tracing::warn!("Cannot preserve stopped Firecracker journal: {error:#}");
-            staged.write_all(
-                b"Could not save the stopped Firecracker journal. Check the host system journal for this VM's service.\n",
+            let unit = crate::firecracker_service::unit_for_generation(inst, generation)?;
+            writeln!(
+                staged,
+                "Could not save the stopped Firecracker journal. Try `sudo journalctl -u {unit}` on the host."
             )?;
         }
     }

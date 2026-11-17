@@ -471,7 +471,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ModelAction>,
     },
-    /// Stream VM serial console logs
+    /// Show VM console logs
     Logs {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -479,7 +479,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Follow log output
+        /// Follow log output (requires a running VM)
         #[arg(short, long)]
         follow: bool,
     },
@@ -1392,8 +1392,7 @@ pub fn run() -> Result<()> {
                     if let Some(running) = be.as_running(&cfg, inst.clone())? {
                         be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
                     } else {
-                        let stopped = be.as_stopped(inst)?;
-                        be.snapshot_stopped_logs(&stopped)
+                        be.snapshot_stopped_logs(&inst)
                     }
                 } else {
                     let running = resolve_running(&be, &cfg, name.as_ref())?;

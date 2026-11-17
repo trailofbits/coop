@@ -982,11 +982,16 @@ EOF
     else
         fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
     fi
-    if coop logs "$failed_name" && [[ -n "$HARNESS_OUT" ]]; then
+    printf 'not json\n' > "$failed_dir/web-editor.json"
+    if coop logs "$failed_name" \
+        && [[ -n "$HARNESS_OUT" \
+        && "$HARNESS_OUT" != *"Could not save the stopped Firecracker journal"* \
+        && "$(cat "$failed_dir/web-editor.json")" == 'not json' ]]; then
         pass "stopped Firecracker VM exposes its saved boot diagnostics through coop logs"
     else
         fail "stopped Firecracker VM exposes its saved boot diagnostics through coop logs" "$HARNESS_ERR"
     fi
+    rm -f "$failed_dir/web-editor.json"
 
     if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" \
         && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
