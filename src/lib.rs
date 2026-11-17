@@ -1079,7 +1079,22 @@ pub fn run() -> Result<()> {
         );
     }
 
+    // Recovery must remain available when a saved Lima specification is
+    // unsafe or damaged. These commands do not start a guest or resolve
+    // `cmd:` credentials from the configuration.
+    #[cfg(target_os = "macos")]
+    let recovery_command = matches!(
+        &cli.command,
+        Commands::Stop { .. }
+            | Commands::Destroy { all: false, .. }
+            | Commands::List { .. }
+            | Commands::Status { .. }
+    );
     let mut cfg = config::CoopConfig::load(&cli.config)?;
+    #[cfg(target_os = "macos")]
+    if !recovery_command {
+        lima::check_writable_mounts(&cfg, &[])?;
+    }
     #[cfg(target_os = "linux")]
     if matches!(&cli.command, Commands::Setup { .. }) {
         setup::preflight_bootstrap(&cfg)?;
@@ -1089,7 +1104,9 @@ pub fn run() -> Result<()> {
         private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
     }
     #[cfg(target_os = "macos")]
-    private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
+    if !recovery_command {
+        private_storage::prepare(&cfg).context("Failed to prepare private coop storage")?;
+    }
     cli.command.apply_github_override(&mut cfg);
     update::maybe_print_notify(&cfg.updates);
     #[cfg(target_os = "linux")]

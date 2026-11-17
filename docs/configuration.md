@@ -29,6 +29,17 @@ private temporary files before writing their contents. Lima runs with a `077`
 child umask, reapplies disk modes after startup, and protects its coop instance directories under `LIMA_HOME` (or
 `~/.lima`).
 
+On Lima, coop rejects writable mounts that cover the effective `--config`
+file, `data_dir` (including file-backed secrets), or Lima control state. This
+applies to requested mounts and saved mount configuration, including Lima's
+global base, default, and override files. Choose a narrower project mount or move
+protected state to a host-only directory. If an older live mount exposed
+state, inspect or restore it and rotate exposed credentials before retrying.
+Saved writable mount locations using Lima path templates and saved specifications
+with `base` imports are refused at boot because their effective host sources
+cannot be checked from the literal YAML. `coop stop`, instance `destroy`, `list`, and
+`status` remain available so an unsafe specification can be repaired or removed.
+
 Commands seal shared storage roots and migrate existing entries without walking
 mounted guest filesystems or workspaces. Entries removed during migration are
 ignored; unsafe instance or image entries are reported without blocking unrelated

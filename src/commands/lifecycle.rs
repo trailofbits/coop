@@ -1038,6 +1038,8 @@ fn start_instance(
     opts: &StartOpts<'_>,
     image_to_consume: Option<&config::ImageName>,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    crate::lima::check_requested_mounts(cfg, &opts.mounts)?;
     preflight_isolated_bootstrap(cfg, inst, opts.no_agents, backend::BootMode::FirstBoot)?;
     if inst.firecracker_network() == config::FirecrackerNetworkMode::Isolated
         && opts.git_repo.is_some()
@@ -2672,6 +2674,8 @@ fn reprovision_instance(
     // Resolved here rather than at the point of use: `Mount::from_parts`
     // canonicalizes and rejects a missing host directory.
     let ws_inputs = reprovision_workspace_inputs(workspace_state.as_ref())?;
+    #[cfg(target_os = "macos")]
+    crate::lima::check_requested_mounts(cfg, &ws_inputs.mounts)?;
     let forwards = config::merge_forward_ports(&cfg.forward_ports, &saved_forwards);
 
     let repo = confirm_reprovision(cfg, &inst, &image, workspace_state.as_ref(), opts)?;

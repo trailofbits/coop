@@ -54,6 +54,11 @@ By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
 macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
 one-time sync. `--copy` is accepted as an explicit spelling of the default.
+On Lima, a writable project or extra mount is refused if it contains the
+effective config file, coop data and secret state, or Lima control state.
+The check also applies to saved mounts on later starts. Narrow the mount or
+relocate the protected host state before retrying; inspect state and rotate
+credentials if a previous live mount already exposed it.
 Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 `/workspace` inside the guest.
 

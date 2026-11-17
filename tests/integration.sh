@@ -6551,6 +6551,78 @@ test_host_mount() {
     rm -rf "$mount_dir"
 }
 
+test_lima_mount_state_boundary() {
+    if [[ "$(uname -s)" != Darwin ]]; then
+        skip "Lima writable mount state boundary" "macOS only"
+        return
+    fi
+
+    local workspace="$tmpdir/mount-boundary-workspace"
+    local instance="${INSTANCE}-mount-boundary"
+    mkdir -p "$workspace"
+    if coop_fails up "$workspace" --name "$instance" --no-agents \
+            --extra-mount "$HOME:/host-home"; then
+        if [[ "$HARNESS_ERR" == *"Writable Lima mount exposes"* ]]; then
+            pass "Lima refuses a writable home mount exposing host state"
+        else
+            fail "Lima mount boundary reports the protected state" "$HARNESS_ERR"
+        fi
+    else
+        fail "Lima refuses a writable home mount exposing host state" \
+            "the VM was allowed to start"
+        limactl delete --force "coop-$instance" >/dev/null 2>&1 || true
+    fi
+    coop destroy "$instance" 2>/dev/null || true
+
+    local replay="${INSTANCE}-mount-replay"
+    if ! coop up "$workspace" --name "$replay" --no-agents; then
+        fail "Lima saved-mount replay fixture starts" "$HARNESS_ERR"
+        return
+    fi
+    STARTED_INSTANCES+=("$replay")
+    if ! coop stop "$replay"; then
+        fail "Lima saved-mount replay fixture stops" "$HARNESS_ERR"
+        return
+    fi
+    if ! limactl edit --tty=false \
+            --set ".mounts=[{\"location\":\"$HOME\",\"writable\":true}]" \
+            "coop-$replay" >/dev/null 2>&1; then
+        fail "Lima saved-mount replay fixture is edited" "limactl edit failed"
+        return
+    fi
+    if coop_fails start "$replay" --no-agents \
+            && [[ "$HARNESS_ERR" == *"Writable Lima mount exposes"* ]]; then
+        pass "Lima refuses unsafe saved mount on restart"
+    else
+        fail "Lima refuses unsafe saved mount on restart" "$HARNESS_ERR"
+        limactl delete --force "coop-$replay" >/dev/null 2>&1 || true
+        coop destroy "$replay" 2>/dev/null || true
+        untrack_instance "$replay"
+        return
+    fi
+    if coop status "$replay" >/dev/null && coop list >/dev/null \
+            && coop stop "$replay" >/dev/null; then
+        pass "Lima recovery commands work with an unsafe saved mount"
+    else
+        fail "Lima recovery commands work with an unsafe saved mount" "$HARNESS_ERR"
+    fi
+    if limactl edit --tty=false --set '.mounts=[]' "coop-$replay" >/dev/null 2>&1 \
+            && coop start "$replay" --no-agents; then
+        pass "Lima starts after saved mount is repaired"
+    else
+        fail "Lima starts after saved mount is repaired" "$HARNESS_ERR"
+    fi
+    if coop stop "$replay" >/dev/null && limactl edit --tty=false \
+            --set ".mounts=[{\"location\":\"$HOME\",\"writable\":true}]" \
+            "coop-$replay" >/dev/null 2>&1 && coop destroy "$replay" 2>/dev/null; then
+        pass "Lima destroy works with an unsafe saved mount"
+    else
+        fail "Lima destroy works with an unsafe saved mount" "$HARNESS_ERR"
+        limactl delete --force "coop-$replay" >/dev/null 2>&1 || true
+    fi
+    untrack_instance "$replay"
+}
+
 test_host_mount_custom_guest_path() {
     echo ""
     echo "=== Phase: host mount (custom guest path) ==="
@@ -9154,6 +9226,7 @@ EOF
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
         run_timed_test test_host_mount
+        run_timed_test test_lima_mount_state_boundary
         run_timed_test test_host_mount_custom_guest_path
         run_timed_test test_port_forwards
         run_timed_test test_workspace_sync
