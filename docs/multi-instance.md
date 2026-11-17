@@ -178,7 +178,8 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `vsock.sock` | Firecracker base vsock socket (inside the private instance directory) |
 
 Older stopped Firecracker VMs can retain root-owned API and base vsock socket
-entries after their PID file is removed. Coop checks both with a privileged,
+entries after their PID file is removed. Coop checks systemd service state and
+both sockets with a privileged,
 nonblocking connection probe. It removes them on the next start or stopped-VM
 cleanup only when neither socket is listening. A live listener, a non-socket
 entry, or an uncertain probe blocks the operation. In that case, inspect the

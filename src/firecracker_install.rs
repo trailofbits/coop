@@ -108,13 +108,22 @@ pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
     Ok(managed)
 }
 
+/// A pinned pair that passed root ownership and byte verification at launch.
+pub(crate) struct VerifiedFirecracker(PathBuf);
+
+impl VerifiedFirecracker {
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn configured_firecracker(path: &Path) -> Result<PathBuf> {
+pub(crate) fn configured_firecracker(path: &Path) -> Result<VerifiedFirecracker> {
     let managed = require_managed_path(path)?;
     verify_pair().context(
         "The managed Firecracker installation is incomplete or changed. Stop VMs using it, then ask an administrator to remove its versioned release directory and rerun `coop setup`",
     )?;
-    Ok(managed)
+    Ok(VerifiedFirecracker(managed))
 }
 
 #[cfg(test)]

@@ -798,6 +798,22 @@ EOF
             fail "new opt-in Firecracker instance persists vsock control mode" \
                 "state: $(cat "$instance_state" 2>/dev/null)"
         fi
+
+        local firecracker_pid service_unit service_pid service_cgroup
+        firecracker_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        service_unit=$(systemctl whoami "$firecracker_pid" 2>/dev/null || true)
+        service_pid=$(systemctl show --property=MainPID --value "$service_unit" 2>/dev/null || true)
+        service_cgroup=$(systemctl show --property=ControlGroup --value "$service_unit" 2>/dev/null || true)
+        if [[ "$firecracker_pid" =~ ^[1-9][0-9]*$ \
+            && "$service_unit" == coop-vmm-*.service \
+            && "$service_pid" == "$firecracker_pid" \
+            && "$service_cgroup" == "/system.slice/$service_unit" ]] \
+            && grep -Fq "$service_cgroup" "/proc/$firecracker_pid/cgroup"; then
+            pass "Firecracker PID belongs to its systemd service and cgroup"
+        else
+            fail "Firecracker PID belongs to its systemd service and cgroup" \
+                "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
+        fi
     fi
 
     local copied_file="" env_value=""
@@ -820,6 +836,114 @@ EOF
     else
         fail "up ignores discovered devcontainer postStartCommand and postCreateCommand" \
             "marker exists or guest check failed: $(guest_stderr)"
+    fi
+}
+
+test_failed_firecracker_exec_preserves_disk_and_cleans_tap() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: failed Firecracker boot cleanup ==="
+
+    local failed_name="${INSTANCE}-bad-kernel"
+    local failed_ws="$tmpdir/bad-kernel-ws"
+    local failed_cfg="$tmpdir/bad-kernel.toml"
+    local bad_kernel="$tmpdir/not-a-kernel"
+    mkdir -p "$failed_ws"
+    printf 'not a kernel\n' > "$bad_kernel"
+    cat > "$failed_cfg" <<EOF
+[grok]
+config_dir = false
+[vm]
+firecracker_control = "vsock"
+kernel_path = "$bad_kernel"
+EOF
+    if coop --config "$failed_cfg" up "$failed_ws" --name "$failed_name" --no-agents; then
+        fail "invalid kernel fails after Firecracker service exec" "up unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Firecracker VMM exited"* ]]; then
+        pass "invalid kernel fails after Firecracker service exec"
+    else
+        fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
+    fi
+
+    local failed_dir="$HOME/.coop/instances/$failed_name"
+    if [[ -d "$failed_dir" ]]; then
+        STARTED_INSTANCES+=("$failed_name")
+    fi
+    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" ]]; then
+        pass "failed Firecracker boot retains instance disk and clears PID"
+    else
+        fail "failed Firecracker boot retains instance disk and clears PID"
+    fi
+    if [[ -f "$failed_dir/instance.json" ]]; then
+        local failed_index
+        failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+        if ! ip link show "tap${failed_index}" >/dev/null 2>&1; then
+            pass "failed Firecracker boot removes its TAP after confirmed exit"
+        else
+            fail "failed Firecracker boot removes its TAP after confirmed exit"
+        fi
+    fi
+
+    if coop start "$failed_name" --no-agents; then
+        pass "failed Firecracker boot retries with the preserved disk"
+        if ! coop stop "$failed_name"; then
+            fail "stop retried Firecracker instance" "$HARNESS_ERR"
+        fi
+    else
+        fail "failed Firecracker boot retries with the preserved disk" "$HARNESS_ERR"
+    fi
+    if coop destroy "$failed_name"; then
+        untrack_instance "$failed_name"
+    else
+        fail "destroy failed-boot instance" "$HARNESS_ERR"
+    fi
+}
+
+test_abrupt_launcher_exit_keeps_supervised_vm_manageable() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: abrupt launcher exit ==="
+
+    local abrupt_name="${INSTANCE}-abrupt"
+    local abrupt_ws="$tmpdir/abrupt-ws"
+    local abrupt_dir="$HOME/.coop/instances/$abrupt_name"
+    mkdir -p "$abrupt_ws"
+    "$BINARY" --config "$SUITE_CONFIG" up "$abrupt_ws" --name "$abrupt_name" --no-agents \
+        > "$tmpdir/abrupt-launch.log" 2>&1 &
+    local launcher_pid=$!
+    local vmm_pid="" service_unit=""
+    for _ in {1..150}; do
+        vmm_pid=$(cat "$abrupt_dir/firecracker.pid" 2>/dev/null || true)
+        if [[ "$vmm_pid" =~ ^[1-9][0-9]*$ ]]; then
+            service_unit=$(systemctl whoami "$vmm_pid" 2>/dev/null || true)
+            [[ "$service_unit" == coop-vmm-*.service ]] && break
+        fi
+        if ! kill -0 "$launcher_pid" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+    if [[ "$service_unit" != coop-vmm-*.service ]]; then
+        fail "launcher reaches a supervised Firecracker service" "service=$service_unit"
+        kill -TERM "$launcher_pid" 2>/dev/null || true
+        wait "$launcher_pid" 2>/dev/null || true
+        coop destroy "$abrupt_name" || true
+        return
+    fi
+    kill -KILL "$launcher_pid" 2>/dev/null || true
+    wait "$launcher_pid" 2>/dev/null || true
+    STARTED_INSTANCES+=("$abrupt_name")
+    if coop status "$abrupt_name" \
+        && [[ "$HARNESS_OUT" == *"Service: $service_unit"* ]] \
+        && [[ -f "$abrupt_dir/rootfs.ext4" ]]; then
+        pass "supervised VMM survives launcher SIGKILL with its disk"
+    else
+        fail "supervised VMM survives launcher SIGKILL with its disk" \
+            "status=$HARNESS_OUT stderr=$HARNESS_ERR"
+    fi
+    if coop stop "$abrupt_name" && coop destroy "$abrupt_name"; then
+        pass "coop stops and destroys VMM after launcher SIGKILL"
+        untrack_instance "$abrupt_name"
+    else
+        fail "coop stops and destroys VMM after launcher SIGKILL" "$HARNESS_ERR"
     fi
 }
 
@@ -3867,9 +3991,30 @@ os.sync()
         fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
         return
     fi
+    local service_unit=""
+    if [[ "$(uname -s)" == Linux ]]; then
+        local before_pid
+        before_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        service_unit=$(systemctl whoami "$before_pid" 2>/dev/null || true)
+        if [[ "$service_unit" != coop-vmm-*.service ]]; then
+            fail "stop fixture has a supervised Firecracker VMM" "unit=$service_unit"
+            return
+        fi
+    fi
     if ! coop stop "$INSTANCE"; then
         fail "stop after recent writes" "stderr: $HARNESS_ERR"
         return
+    fi
+    if [[ -n "$service_unit" ]]; then
+        local stopped_pid stopped_tasks
+        stopped_pid=$(systemctl show --property=MainPID --value "$service_unit" 2>/dev/null || true)
+        stopped_tasks=$(systemctl show --property=TasksCurrent --value "$service_unit" 2>/dev/null || true)
+        if [[ "$stopped_pid" == 0 && ( "$stopped_tasks" == 0 || "$stopped_tasks" == "[not set]" ) ]]; then
+            pass "stop reaps the Firecracker systemd service and cgroup"
+        else
+            fail "stop reaps the Firecracker systemd service and cgroup" \
+                "unit=$service_unit main_pid=$stopped_pid tasks=$stopped_tasks"
+        fi
     fi
     if ! coop start "$INSTANCE" --no-agents; then
         fail "restart after recent writes" "stderr: $HARNESS_ERR"
@@ -9214,6 +9359,8 @@ EOF
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
         run_timed_test test_up_creates_primary_instance
+        run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
+        run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
         run_timed_test test_private_storage
         run_timed_test test_start_rejects_missing_instance
         run_timed_test test_duplicate_name

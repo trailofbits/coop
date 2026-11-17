@@ -396,10 +396,11 @@ Gracefully stop a running VM. The instance disk is preserved. Use `start` to rel
 
 On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
 guest finishes shutting down. coop allows 10 seconds for this request and exit,
-then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
-wait. A guest that cannot shut down within the grace period can lose recent
-writes during forced termination. If termination cannot be confirmed, coop
-retains the PID file and socket so you can retry.
+then stops the systemd service and its cgroup. A legacy direct-launch VM retains
+the SIGTERM/SIGKILL fallback. A guest that cannot shut down within the grace
+period can lose recent writes during forced termination. If process death
+cannot be confirmed, coop retains the service evidence, PID file, socket, and
+TAP so you can inspect and retry.
 
 ```
 coop stop [NAME]

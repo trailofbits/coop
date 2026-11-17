@@ -1274,13 +1274,44 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     }
     boot_preflight(cfg)?;
     crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+    crate::firecracker_service::require_system_manager()?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
         crate::network::setup_tap(&cfg.network, inst)?;
     }
-    let running = vm.start()?;
-    running.wait_for_boot()
+    start_firecracker_with_cleanup(cfg, inst, vm)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_firecracker_with_cleanup(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    vm: crate::vm::FirecrackerVm<'_, crate::vm::Configured>,
+) -> Result<()> {
+    let result = vm.start().and_then(|running| running.wait_for_boot());
+    let Err(error) = result else { return Ok(()) };
+    match inst.probe_liveness() {
+        Ok(false) => {
+            let runtime = crate::vm::cleanup_runtime_paths(inst);
+            let network = crate::network::teardown_tap(&cfg.network, inst);
+            match (runtime, network) {
+                (Ok(()), Ok(())) => Err(error.context("Firecracker is confirmed stopped")),
+                (Err(cleanup), Ok(())) | (Ok(()), Err(cleanup)) => {
+                    Err(error.context(format!("Stopped Firecracker cleanup failed: {cleanup:#}")))
+                }
+                (Err(runtime), Err(network)) => Err(error.context(format!(
+                    "Stopped Firecracker runtime and TAP cleanup failed: {runtime:#}; {network:#}"
+                ))),
+            }
+        }
+        Ok(true) => Err(error.context(
+            "Firecracker service remains running; inspect it before stopping or retrying",
+        )),
+        Err(probe) => Err(error.context(format!(
+            "Firecracker process state is uncertain ({probe:#}); PID, sockets, TAP, and disk retained"
+        ))),
+    }
 }
 
 /// A failed readiness wait does not prove the VM stopped. Only roll back a
@@ -1411,6 +1442,7 @@ impl VmBackend for FirecrackerBackend {
         }
         boot_preflight(cfg)?;
         crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+        crate::firecracker_service::require_system_manager()?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1425,8 +1457,7 @@ impl VmBackend for FirecrackerBackend {
         if inst.firecracker_network() == FirecrackerNetworkMode::Open {
             crate::network::setup_tap(&cfg.network, inst)?;
         }
-        let running = vm.start()?;
-        running.wait_for_boot()
+        start_firecracker_with_cleanup(cfg, inst, vm)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
