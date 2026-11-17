@@ -3,7 +3,7 @@
 //! before exec.
 
 use std::fs;
-use std::io::{self, Read as _, Seek as _, Write as _};
+use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, symlink};
@@ -563,32 +563,7 @@ pub(crate) fn verify_vmm(inst: &Instance, service: &ActiveService) -> Result<()>
         .arg(format!("/proc/{pid}/status"))
         .capture()
         .context("Cannot inspect jailed VMM credentials")?;
-    for key in ["Uid", "Gid"] {
-        let values = status
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}:")))
-            .context("Jailed VMM status lacks UID/GID")?;
-        let fields: Vec<_> = values.split_whitespace().collect();
-        let expected = uid.to_string();
-        if fields.len() != 4 || fields.iter().any(|value| *value != expected) {
-            bail!("Firecracker VMM {key} did not drop to its instance identity");
-        }
-    }
-    for (key, expected) in [
-        ("Groups", ""),
-        ("CapEff", "0000000000000000"),
-        ("NoNewPrivs", "1"),
-        ("Seccomp", "2"),
-    ] {
-        let value = status
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}:")))
-            .context("Jailed VMM status lacks a security field")?
-            .trim();
-        if value != expected {
-            bail!("Firecracker VMM {key} does not match its jail policy");
-        }
-    }
+    verify_vmm_status(&status, uid)?;
     let id = crate::firecracker_service::jail_id(inst, service.unit())?;
     // SAFETY: geteuid only reads the current process credential.
     let owner = unsafe { libc::geteuid() };
@@ -609,6 +584,37 @@ pub(crate) fn verify_vmm(inst: &Instance, service: &ActiveService) -> Result<()>
     let expected_root = inode(&expected_root)?;
     if actual_root.trim() != expected_root.trim() {
         bail!("Firecracker VMM root is outside its expected jail generation");
+    }
+    Ok(())
+}
+
+fn verify_vmm_status(status: &str, uid: u32) -> Result<()> {
+    for key in ["Uid", "Gid"] {
+        let values = status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .context("Jailed VMM status lacks UID/GID")?;
+        let fields: Vec<_> = values.split_whitespace().collect();
+        let expected = uid.to_string();
+        if fields.len() != 4 || fields.iter().any(|value| *value != expected) {
+            bail!("Firecracker VMM {key} did not drop to its instance identity");
+        }
+    }
+    for (key, expected) in [
+        ("Groups", ""),
+        ("CapEff", "0000000000000000"),
+        ("CapBnd", "0000000000000000"),
+        ("NoNewPrivs", "1"),
+        ("Seccomp", "2"),
+    ] {
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .context("Jailed VMM status lacks a security field")?
+            .trim();
+        if value != expected {
+            bail!("Firecracker VMM {key} does not match its jail policy");
+        }
     }
     Ok(())
 }
@@ -748,31 +754,19 @@ fn preserve_log(inst: &Instance, jail_root: &Path, generation: &str) -> Result<(
     {
         return Ok(());
     }
-    let source = jail_root.join("firecracker.log");
     let mut staged = tempfile::NamedTempFile::new_in(&inst.dir)
         .context("Cannot stage stopped Firecracker log")?;
-    match open_regular_log(&source) {
-        Ok(mut input) => {
-            let metadata = input
-                .metadata()
-                .context("Cannot inspect stopped Firecracker log")?;
-            if metadata.len() == 0 {
-                match saved_journal(inst, generation, usize::try_from(MAX_SAVED_LOG)?) {
-                    Ok(journal) => staged.write_all(&journal)?,
-                    Err(error) => tracing::warn!(
-                        "Cannot preserve stopped Firecracker journal; live journal remains available: {error:#}"
-                    ),
-                }
-            } else {
-                input.seek(std::io::SeekFrom::Start(
-                    metadata.len().saturating_sub(MAX_SAVED_LOG),
-                ))?;
-                std::io::copy(&mut input.take(MAX_SAVED_LOG), &mut staged)
-                    .context("Cannot preserve stopped Firecracker log")?;
-            }
+    // The jailed path is writable by the VMM and may have been replaced with
+    // a FIFO, symlink, or device. Its stderr is sent to the system journal,
+    // which is the authoritative source for this generation's logs.
+    match saved_journal(inst, generation, usize::try_from(MAX_SAVED_LOG)?) {
+        Ok(journal) => staged.write_all(&journal)?,
+        Err(error) => {
+            tracing::warn!("Cannot preserve stopped Firecracker journal: {error:#}");
+            staged.write_all(
+                b"Could not save the stopped Firecracker journal. Check the host system journal for this VM's service.\n",
+            )?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("Cannot open stopped Firecracker log"),
     }
     fs::remove_file(&link).context("Cannot unlink jailed Firecracker log link")?;
     staged
@@ -814,6 +808,15 @@ fn saved_journal(inst: &Instance, generation: &str, limit: usize) -> Result<Vec<
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmm_status_requires_empty_capability_bounding_set() {
+        let status = "Uid:\t123 123 123 123\nGid:\t123 123 123 123\nGroups:\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n";
+        verify_vmm_status(status, 123).unwrap();
+        let unbounded = status.replace("CapBnd:\t0000000000000000", "CapBnd:\t000001ffffffffff");
+        assert!(verify_vmm_status(&unbounded, 123).is_err());
+        assert!(verify_vmm_status(&status.replace("Seccomp:\t2", "Seccomp:\t0"), 123).is_err());
+    }
     use crate::config::{FirecrackerControlMode, ImageName, InstanceIndex, InstanceName};
 
     #[test]
@@ -958,6 +961,22 @@ mod tests {
         let unit = format!("coop-vmm-{owner}-{digest}-{}.service", "b".repeat(32));
         let jail = PreparedJail::new(&inst, &unit, &kernel).unwrap();
         jail.prepare(&inst, b"{}").unwrap();
+        // A stopped guest may replace its writable log with an arbitrary
+        // object. Recovery must still reap the jail and revoke disk access.
+        SetupTool::Rm
+            .elevated_with_deadline(DEADLINE)
+            .unwrap()
+            .args(["-f", "--"])
+            .arg(jail.root.join("firecracker.log"))
+            .run_bounded(DEADLINE)
+            .unwrap();
+        SetupTool::Ln
+            .elevated_with_deadline(DEADLINE)
+            .unwrap()
+            .args(["-s", "--", "/etc/passwd"])
+            .arg(jail.root.join("firecracker.log"))
+            .run_bounded(DEADLINE)
+            .unwrap();
         cleanup_stopped(&inst).unwrap();
         SetupTool::Setfacl
             .elevated_with_deadline(DEADLINE)

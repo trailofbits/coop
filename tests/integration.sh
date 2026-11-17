@@ -945,6 +945,8 @@ EOF
     local runtime_state="$failed_dir/firecracker.runtime.json"
     local disk_identity
     disk_identity=$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")
+    local config_before
+    config_before=$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)
     local failed_index
     failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
     printf '%s\n' '{"version":2,"launcher":"jailer"}' > "$runtime_state"
@@ -952,8 +954,10 @@ EOF
         fail "unknown Firecracker runtime version blocks launch" "start unexpectedly succeeded"
     elif [[ "$HARNESS_ERR" == *"Unsupported Firecracker runtime state"* \
         && ! -e "$failed_dir/firecracker.pid" \
-        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" ]]; then
-        pass "unknown Firecracker runtime version blocks launch without replacing disk"
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)" == "$config_before" \
+        && ! -e "/sys/class/net/tap${failed_index}" ]]; then
+        pass "unknown Firecracker runtime version blocks launch before config or TAP changes"
     else
         fail "unknown Firecracker runtime version blocks launch" "$HARNESS_ERR"
     fi

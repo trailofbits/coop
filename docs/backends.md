@@ -146,11 +146,14 @@ Creating an instance (`coop up`) follows this sequence:
    privileges and executes Firecracker with `--no-api` and its production
    seccomp filters. No new Firecracker process receives `CAP_NET_ADMIN`.
    Systemd owns the service identity and process group; coop verifies the main
-   PID, cgroup, UID/GID, effective capabilities, seccomp mode, and jail root
+   PID, cgroup, UID/GID, effective and bounding capabilities, seccomp mode, and jail root
    before treating a new launch as running.
    Firecracker logs and guest serial output go to journald through a rate-limited
    systemd stream. `coop logs` reads the active unit's journal; stopped cleanup
-   saves at most 16 MiB of recent output in the instance directory.
+   saves at most 16 MiB of recent output in the instance directory. A stopped
+   guest cannot block jail removal by changing its writable log placeholder;
+   cleanup reads the system journal and revokes disk access even if that
+   placeholder has been replaced.
 7. Records the systemd main PID for compatibility and waits for SSH to become reachable.
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;

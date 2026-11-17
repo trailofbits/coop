@@ -1276,6 +1276,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
     crate::firecracker_service::require_system_manager()?;
     crate::firecracker_jail::require_jail_tools()?;
+    crate::firecracker_runtime::ensure_jailed(inst)?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
