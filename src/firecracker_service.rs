@@ -398,6 +398,10 @@ mod tests {
             prefix
         ));
         assert!(!valid_unit(
+            "coop-vmm-1000-0123456789abcdef-0123456789abcdef0123456789abcdeg.service",
+            prefix
+        ));
+        assert!(!valid_unit(
             "coop-vmm-1000-0123456789abcdef-0123456789abcdef0123456789abcdef.socket",
             prefix
         ));
@@ -419,6 +423,19 @@ mod tests {
         assert!(parse_active_service(unit, &show.replace("MainPID=123", "MainPID=0")).is_err());
         assert!(parse_active_service(unit, &show.replace("active", "failed")).is_err());
         assert!(parse_active_service(unit, &show.replace(unit, "other.service")).is_err());
+        assert!(
+            parse_active_service(unit, &show.replace("/system.slice/", "/user.slice/")).is_err()
+        );
+        assert!(
+            parse_active_service(
+                unit,
+                &show.replace(
+                    &format!("ControlGroup=/system.slice/{unit}"),
+                    "ControlGroup=/system.slice/other.service"
+                )
+            )
+            .is_err()
+        );
     }
 
     #[test]
