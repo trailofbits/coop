@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::marker::PhantomData;
 use std::num::NonZeroU8;
 use std::path::Path;
@@ -243,6 +243,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
         if self.inst.probe_liveness()? {
             bail!("Instance '{}' is already running", self.inst.name);
         }
+        cleanup_runtime_paths(self.inst)?;
+        crate::firecracker_jail::cleanup_stopped(self.inst)?;
         let firecracker =
             crate::firecracker_install::configured_firecracker(&self.cfg.firecracker_bin)?;
 
@@ -258,8 +260,23 @@ impl<'a> FirecrackerVm<'a, Configured> {
             })?;
         }
 
-        let service =
-            crate::firecracker_service::launch(self.inst, &firecracker, &config_path, &log_path)?;
+        let mut jailed_config = build_config(self.cfg, self.inst);
+        if let Some(existing) = read_machine_config(&config_path) {
+            jailed_config.machine_config = existing;
+        }
+        "/kernel".clone_into(&mut jailed_config.boot_source.kernel_image_path);
+        "/rootfs.ext4".clone_into(&mut jailed_config.drives[0].path_on_host);
+        if let Some(vsock) = &mut jailed_config.vsock {
+            "/vsock.sock".clone_into(&mut vsock.uds_path);
+        }
+        let jail_config = serde_json::to_vec(&jailed_config)
+            .context("Cannot serialize jail-relative Firecracker config")?;
+        let service = crate::firecracker_service::launch(
+            self.inst,
+            &firecracker,
+            &self.cfg.vm.kernel_path,
+            &jail_config,
+        )?;
         let pid = service.pid();
         if let Err(write_error) =
             crate::fs_util::atomic_write_with_mode(&pid_path, &pid.to_string(), 0o644)
@@ -291,7 +308,12 @@ impl<'a> FirecrackerVm<'a, Configured> {
             crate::firecracker_service::ServiceProbe::Active(observed)
                 if observed.unit() == service.unit()
                     && observed.pid() == service.pid()
-                    && crate::firecracker_service::contains_pid(&observed)? => {}
+                    && crate::firecracker_service::contains_pid(&observed)? =>
+            {
+                crate::firecracker_jail::verify_vmm(self.inst, &observed)?;
+                crate::firecracker_jail::grant_owner_access(self.inst, &observed)?;
+                crate::firecracker_jail::publish_vsock_mount(self.inst, &observed)?;
+            }
             crate::firecracker_service::ServiceProbe::None => {
                 bail!(
                     "Firecracker VMM exited immediately in service {}",
@@ -391,9 +413,8 @@ impl<'a> FirecrackerVm<'a, Running> {
         if !crate::firecracker_service::wait_for_exit(self.inst, Duration::from_secs(5))? {
             bail!("Firecracker service {} did not stop", service.unit());
         }
-        if let Err(error) = cleanup_runtime_paths(self.inst) {
-            tracing::debug!("Failed to remove stopped Firecracker runtime paths: {error:#}");
-        }
+        cleanup_runtime_paths(self.inst)?;
+        crate::firecracker_jail::cleanup_stopped(self.inst)?;
         Ok(())
     }
 
@@ -529,28 +550,47 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     /// Stream the Firecracker log file to stdout.
     pub fn stream_logs(&self, mode: LogMode) -> Result<()> {
-        let log_path = self.inst.log_path();
-        if !log_path.exists() {
-            bail!("No log file found at {}", log_path.display());
-        }
+        let mut file = crate::firecracker_jail::open_log(self.inst)?;
 
         match mode {
             LogMode::Follow => {
-                let mut child = Command::new("tail")
-                    .arg("-f")
-                    .arg(&log_path)
-                    .stdin(Stdio::null())
-                    .spawn()
-                    .context("Failed to tail log file")?;
-                child.wait().context("Log streaming interrupted")?;
+                const TAIL_WINDOW: u64 = 64 * 1024;
+                let length = file.metadata()?.len();
+                let start = length.saturating_sub(TAIL_WINDOW);
+                file.seek(std::io::SeekFrom::Start(start))?;
+                let mut tail = Vec::new();
+                (&mut file).take(TAIL_WINDOW).read_to_end(&mut tail)?;
+                let mut lines = 0;
+                let mut offset = 0;
+                for (index, byte) in tail.iter().enumerate().rev() {
+                    if *byte == b'\n' && index + 1 != tail.len() {
+                        lines += 1;
+                        if lines == 10 {
+                            offset = index + 1;
+                            break;
+                        }
+                    }
+                }
+                file.seek(std::io::SeekFrom::Start(start + u64::try_from(offset)?))?;
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    match file.read(&mut buffer)? {
+                        0 => {
+                            if file.metadata()?.len() < file.stream_position()? {
+                                file.seek(std::io::SeekFrom::Start(0))?;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        size => {
+                            std::io::stdout().write_all(&buffer[..size])?;
+                            std::io::stdout().flush()?;
+                        }
+                    }
+                }
             }
             LogMode::Snapshot => {
-                let file = fs::File::open(&log_path).context("Failed to open log file")?;
-                let reader = BufReader::new(file);
-                for line in reader.lines() {
-                    let line = line.context("Failed to read log line")?;
-                    writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
-                }
+                std::io::copy(&mut file, &mut std::io::stdout().lock())
+                    .context("Failed to write Firecracker log")?;
             }
         }
         Ok(())
@@ -564,6 +604,8 @@ impl<'a> FirecrackerVm<'a, Running> {
 /// The checked parent descriptor keeps cleanup inside the private instance
 /// directory even if an untrusted guest caused an abrupt exit.
 pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    crate::firecracker_jail::unmount_vsock(inst)?;
     let mut first_error = None;
     let mut additional_errors = Vec::new();
     for stale in [

@@ -14,6 +14,8 @@ pub mod config;
 mod creation_hooks;
 mod firecracker_install;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
+mod firecracker_jail;
+#[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod firecracker_service;
 mod fs_util;
 mod github_assignment;

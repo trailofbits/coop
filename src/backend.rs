@@ -1275,6 +1275,7 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
     boot_preflight(cfg)?;
     crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
     crate::firecracker_service::require_system_manager()?;
+    crate::firecracker_jail::require_jail_tools()?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
@@ -1293,7 +1294,8 @@ fn start_firecracker_with_cleanup(
     let Err(error) = result else { return Ok(()) };
     match inst.probe_liveness() {
         Ok(false) => {
-            let runtime = crate::vm::cleanup_runtime_paths(inst);
+            let runtime = crate::vm::cleanup_runtime_paths(inst)
+                .and_then(|()| crate::firecracker_jail::cleanup_stopped(inst));
             let network = crate::network::teardown_tap(&cfg.network, inst);
             match (runtime, network) {
                 (Ok(()), Ok(())) => Err(error.context("Firecracker is confirmed stopped")),
@@ -1443,6 +1445,7 @@ impl VmBackend for FirecrackerBackend {
         boot_preflight(cfg)?;
         crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
         crate::firecracker_service::require_system_manager()?;
+        crate::firecracker_jail::require_jail_tools()?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1504,7 +1507,8 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
-        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance());
+        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance())
+            .and_then(|()| crate::firecracker_jail::cleanup_stopped(stopped.instance()));
         let network = crate::network::teardown_tap(&cfg.network, stopped.instance());
         match (runtime, network) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1522,18 +1526,21 @@ impl VmBackend for FirecrackerBackend {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
+        crate::vm::cleanup_runtime_paths(inst)?;
+        crate::firecracker_jail::cleanup_stopped(inst)?;
         crate::network::teardown_tap(&cfg.network, inst)?;
         if inst.dir.exists() {
             // A failed patch-time unmount must not let rm descend into the
             // guest filesystem or unlink its still-mounted backing file.
             crate::privileged_disk::ensure_disk_unmounted(&inst.rootfs_path())?;
-            if let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&inst.dir).sudo().run() {
-                tracing::debug!(
-                    "Failed to remove instance dir {} (non-fatal): {e}",
-                    inst.dir.display()
-                );
-            }
+            Cmd::new("rm")
+                .args(["-rf"])
+                .arg(&inst.dir)
+                .sudo()
+                .run()
+                .context("Cannot remove destroyed Firecracker instance data")?;
         }
+        crate::firecracker_jail::release_identity(inst)?;
         Ok(())
     }
 

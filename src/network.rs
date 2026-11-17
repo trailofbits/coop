@@ -392,7 +392,15 @@ fn setup_tap_with_tools(
 
     tools
         .ip()
-        .args(["tuntap", "add", &tap, "mode", "tap"])
+        .args([
+            "tuntap",
+            "add",
+            &tap,
+            "mode",
+            "tap",
+            "user",
+            &crate::firecracker_jail::PreparedJail::uid_for_instance(inst)?.to_string(),
+        ])
         .run()
         .context("Failed to create TAP device")?;
     let result = (|| {

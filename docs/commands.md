@@ -417,7 +417,9 @@ coop stop my-project
 
 ### `destroy`
 
-Stop the VM and remove its resources: disk, config, and SSH entries. Templates and the kernel are preserved unless you pass `--all`.
+Stop the VM and remove its resources: disk, config, SSH entries, and any stopped
+Firecracker jail generations and per-instance VMM identity. Templates and the
+kernel are preserved unless you pass `--all`.
 
 ```
 coop destroy [NAME] [FLAGS]
@@ -1048,9 +1050,10 @@ See also the [`updates` section](configuration.md#updates-section) of the config
 
 Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
 
-On Linux, uninstall leaves the shared root-owned Firecracker/jailer pair under
-`/var/lib/coop/firecracker/v1.18.0/`. An administrator can remove that release
-directory once no user has a VM depending on it.
+On Linux, removing data also reaps each instance's stopped Firecracker jail and
+VMM identity. Uninstall leaves the shared root-owned Firecracker/jailer pair
+under `/var/lib/coop/firecracker/v1.18.0/`. An administrator can remove that
+release directory once no user has a VM depending on it.
 
 ```
 coop uninstall [FLAGS]

@@ -22,11 +22,13 @@ credentials on the host.
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
-- `sudo` privileges (coop starts the Firecracker VMM as root in a systemd
-  system service and uses privileged host operations for networking and disk
-  setup; it does not launch the VMM through the jailer)
+- `sudo` privileges (coop uses privileged host operations for networking,
+  jail staging, and disk setup; the matching jailer drops the systemd-managed
+  Firecracker VMM to its own unprivileged UID/GID)
 - A running systemd system manager version 252 or newer with trusted `systemd-run` and `systemctl`
   executables for VM startup
+- `setfacl` from the host ACL package and trusted `mount`/`umount` utilities
+  for jail staging and stopped-VM cleanup
 - A root-owned `/var/lib/coop` installation area for the verified Firecracker
   and jailer pair; `coop setup` creates it with `sudo`
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)

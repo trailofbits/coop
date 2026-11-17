@@ -814,6 +814,65 @@ EOF
             fail "Firecracker PID belongs to its systemd service and cgroup" \
                 "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
         fi
+
+        local jail_root="" host_uid vmm_uid vmm_gid vmm_groups vmm_caps vmm_bounding vmm_nnp vmm_seccomp
+        host_uid=$(id -u)
+        if [[ "$service_unit" =~ ^coop-vmm-[0-9]+-([0-9a-f]{64})-([0-9a-f]{32})\.service$ ]]; then
+            jail_root="/var/lib/coop/j/$host_uid/firecracker/${BASH_REMATCH[1]:0:16}-${BASH_REMATCH[2]}/root"
+        fi
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_gid=$(sudo awk '/^Gid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_groups=$(sudo awk '/^Groups:/ {$1=""; gsub(/[[:space:]]/, ""); print}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_caps=$(sudo awk '/^CapEff:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_bounding=$(sudo awk '/^CapBnd:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_nnp=$(sudo awk '/^NoNewPrivs:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_seccomp=$(sudo awk '/^Seccomp:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        local cap_net_admin=-1
+        if [[ "$vmm_bounding" =~ ^[0-9a-fA-F]+$ ]]; then
+            cap_net_admin=$((16#$vmm_bounding & (1 << 12)))
+        fi
+        if [[ "$vmm_uid" =~ ^[1-9][0-9]*$ \
+            && "$vmm_uid" == "$vmm_gid" \
+            && "$vmm_uid" != "$host_uid" \
+            && -z "$vmm_groups" \
+            && "$vmm_caps" == 0000000000000000 \
+            && "$vmm_nnp" == 1 \
+            && "$vmm_seccomp" == 2 \
+            && "$cap_net_admin" == 0 ]]; then
+            pass "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp"
+        else
+            fail "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp" \
+                "uid=$vmm_uid gid=$vmm_gid groups=$vmm_groups caps=$vmm_caps bounding=$vmm_bounding nnp=$vmm_nnp seccomp=$vmm_seccomp"
+        fi
+        if [[ -d "$jail_root" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root" 2>/dev/null)" == "$(sudo stat -Lc '%d:%i' "$jail_root" 2>/dev/null)" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root/rootfs.ext4" 2>/dev/null)" == "$(stat -Lc '%d:%i' "$HOME/.coop/instances/$INSTANCE/rootfs.ext4" 2>/dev/null)" \
+            && -f "$jail_root/kernel" \
+            && ! -e "$jail_root/etc/shadow" \
+            && ! -e "$jail_root/var/lib/coop" ]]; then
+            pass "jailed VMM root and disk binding exclude host and peer files"
+        else
+            fail "jailed VMM root and disk binding exclude host and peer files" "jail_root=$jail_root"
+        fi
+        local all_threads_filtered=true task_status
+        for task_status in /proc/"$firecracker_pid"/task/*/status; do
+            if [[ "$(sudo awk '/^Seccomp:/ {print $2}' "$task_status" 2>/dev/null)" != 2 ]]; then
+                all_threads_filtered=false
+            fi
+        done
+        if [[ "$all_threads_filtered" == true ]]; then
+            pass "Firecracker applies seccomp to every observed VMM thread"
+        else
+            fail "Firecracker applies seccomp to every observed VMM thread"
+        fi
+        local instance_index tap_owner
+        instance_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$instance_state")
+        tap_owner=$(ip tuntap show dev "tap${instance_index}" 2>/dev/null || true)
+        if [[ "$tap_owner" == *"user $vmm_uid"* ]]; then
+            pass "persistent TAP is owned by the jailed VMM identity"
+        else
+            fail "persistent TAP is owned by the jailed VMM identity" "tap=$tap_owner uid=$vmm_uid"
+        fi
     fi
 
     local copied_file="" env_value=""
@@ -4078,20 +4137,24 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker runs without an API socket. Its base vsock socket is
-        # mode 0666 so coop can connect through the user-owned mode-0700
-        # instance directory. Kill the VMM without graceful cleanup so
-        # `coop stop` must recognize and remove the abandoned socket.
+        # Firecracker runs without an API socket. Coop bind-mounts its jailed
+        # base vsock socket inode into the private instance directory. Kill
+        # the VMM without graceful cleanup to test abandoned mount recovery.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
         instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
         vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
         directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
-        vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
+        vsock_metadata=$(stat -c '%u:%a' "$vsock_path" 2>/dev/null || true)
+        jailed_socket_inode=$(sudo -n stat -Lc '%d:%i' "/proc/$fc_pid/root/vsock.sock" 2>/dev/null || true)
+        published_socket_inode=$(stat -Lc '%d:%i' "$vsock_path" 2>/dev/null || true)
         if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
             && "$directory_metadata" == "$(id -un):700" \
-            && "$vsock_metadata" == "root:666" ]]; then
-            pass "Firecracker has no API socket and contains vsock in the private instance directory"
+            && "$vsock_metadata" == "$vmm_uid:666" \
+            && -n "$jailed_socket_inode" \
+            && "$jailed_socket_inode" == "$published_socket_inode" ]] \
+            && mountpoint -q "$vsock_path"; then
+            pass "Firecracker has no API socket and pins the jailed vsock socket at the instance path"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -4101,16 +4164,16 @@ test_stop() {
                     sleep 0.1
                 done
                 if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
+                    pass "unexpected Firecracker exit leaves the pinned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                    fail "unexpected Firecracker exit leaves the pinned vsock socket" \
                         "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+            fail "Firecracker stop fixture has no API and a pinned mode-0666 vsock socket" \
                 "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi

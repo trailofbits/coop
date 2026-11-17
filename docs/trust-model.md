@@ -40,7 +40,7 @@ launched it.
 |------|-------|-------|
 | Host user + `config.toml` | Trusted | `config.toml` `cmd:` values run arbitrary `sh -c` on the host (`config.rs:resolve_cmd_value`). The config file is a host code-execution surface; only the owner should write it. |
 | Project files (local or fetched) | **Untrusted** | Opting into project configuration authorizes guest configuration, not host code execution. |
-| coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs privileged host tools via `sudo`. Linux launch requires the pinned root-owned Firecracker/jailer pair and supervises the VMM in a systemd system service, but the VMM still runs as root without the upstream jailer; Firecracker's default production seccomp does not change that host identity. |
+| coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs privileged host tools via `sudo`. Linux launch requires the pinned root-owned Firecracker/jailer pair and supervises the jailer in a systemd system service. The jailer confines Firecracker to a fresh root and drops it to a distinct unprivileged UID/GID. Coop validates the effective UID/GID, capabilities, seccomp mode, cgroup, and jail root after exec. |
 | The guest VM | **Untrusted** | Agent-controlled. Anything it emits — file contents, paths, archive members, command output — is a taint source once it crosses back to the host. |
 | GitHub API / model endpoints / DNS | External | `api.github.com` (PAT probe, release metadata), the model endpoint, `8.8.8.8`. Reached over the network; authenticated where applicable. |
 
@@ -372,15 +372,20 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   bounded `CONNECT <port>` request, validates one bounded `OK <port>` response,
   and then relays bytes. Firecracker starts with `--no-api`, so newly started
   VMs have no API socket. Its process umask makes the base vsock socket mode
-  0666 inside the user-owned mode-0700 instance directory; other users cannot
-  reach it through the directory. This grants the invoking user access to the
-  guest transport, not a Firecracker control API. A process started before
+  0666 inside a fresh jail root beneath a root-owned, per-host-user private
+  directory. Coop grants the invoking host user directory traversal and bind
+  mounts a pinned socket inode at the instance's `vsock.sock` path; other users
+  cannot traverse the private jail ancestor. This grants the invoking user
+  access to the guest transport, not a Firecracker control API. A process started before
   `--no-api` may retain an API socket until stopped. Without a verified PID,
   coop uses a privileged, nonblocking connection probe on the API and base
-  vsock socket entries. Only a refused or missing socket permits cleanup;
-  a live listener, non-socket entry, or uncertain result blocks it. Coop never
-  kills a process found through a socket lookup. Confirmed stale entries are
-  unlinked through the pinned private directory rather than a root shell command.
+  vsock socket entries, checking the instance's pinned mount for new launches.
+  Only a refused or missing socket permits cleanup; a live listener,
+  non-socket entry, or uncertain result blocks it. Coop never kills a process
+  found through a socket lookup. Confirmed stale mounts are unmounted, then
+  runtime entries are unlinked through the pinned private directory;
+  root-owned jail generations are removed only after service process death is
+  confirmed.
 - A Firecracker instance's control mode is persisted at creation. `vsock`
   mode never silently retries TCP: readiness, shutdown, shell, file transfer,
   forwarding, and generated SSH configuration all derive the same target from

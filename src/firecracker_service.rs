@@ -85,6 +85,22 @@ fn new_unit(inst: &Instance) -> Result<String> {
     ))
 }
 
+pub(crate) fn jail_id(inst: &Instance, unit: &str) -> Result<String> {
+    let namespace = prefix(inst)?;
+    if !valid_unit(unit, &namespace) {
+        bail!("Firecracker service does not belong to this instance");
+    }
+    let generation = unit
+        .strip_prefix(&namespace)
+        .and_then(|value| value.strip_suffix(UNIT_SUFFIX))
+        .context("Firecracker service generation is missing")?;
+    let digest = namespace
+        .strip_prefix(&format!("coop-vmm-{}-", unsafe { libc::geteuid() }))
+        .and_then(|value| value.strip_suffix('-'))
+        .context("Firecracker service namespace is malformed")?;
+    Ok(format!("{}-{generation}", &digest[..16]))
+}
+
 fn systemctl_query() -> Result<Cmd> {
     let systemctl = SetupTool::Systemctl.resolve()?;
     Ok(SetupTool::Timeout
@@ -220,8 +236,8 @@ fn parse_active_service(unit: &str, show: &str) -> Result<ActiveService> {
 pub(crate) fn launch(
     inst: &Instance,
     firecracker: &VerifiedFirecracker,
-    config: &Path,
-    log: &Path,
+    kernel: &Path,
+    config: &[u8],
 ) -> Result<ActiveService> {
     require_system_manager()?;
     if !matches!(probe(inst)?, ServiceProbe::None) {
@@ -241,8 +257,17 @@ pub(crate) fn launch(
         }
     }
     let unit = new_unit(inst)?;
-    // Firecracker creates its vsock socket as root in the user's private
-    // instance directory. The invoking user needs write access to connect.
+    let jail = crate::firecracker_jail::PreparedJail::new(inst, &unit, kernel)?;
+    if let Err(error) = jail.prepare(inst, config) {
+        return match jail.cleanup_unstarted(inst) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "Unstarted Firecracker jail rollback also failed: {cleanup:#}"
+            ))),
+        };
+    }
+    // Firecracker creates its base vsock socket inside the jail. The invoking
+    // user connects through a bind-mounted socket inode after launch.
     let launch = SetupTool::SystemdRun
         .elevated_with_deadline(START_DEADLINE + Duration::from_secs(5))?
         .args([
@@ -254,15 +279,35 @@ pub(crate) fn launch(
             "--property=UMask=0111",
             "--property=StandardOutput=null",
             "--property=StandardError=journal",
+            "--property=LogRateLimitIntervalSec=30s",
+            "--property=LogRateLimitBurst=1000",
+            "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=~CAP_NET_ADMIN",
             "--working-directory=/",
         ])
+        .arg(format!(
+            "--property=BindPaths=\"{}\":\"{}\"",
+            jail.disk_descriptor_path(),
+            jail.root.join("rootfs.ext4").display()
+        ))
         .arg(format!("--unit={unit}"))
         .arg("--")
+        .arg(firecracker.jailer_path())
+        .args(["--id", &jail.id, "--exec-file"])
         .arg(firecracker.path())
+        .args([
+            "--uid",
+            &jail.uid.to_string(),
+            "--gid",
+            &jail.gid.to_string(),
+            "--chroot-base-dir",
+        ])
+        .arg(&jail.base)
+        .arg("--")
         .args(["--no-api", "--config-file"])
-        .arg(config)
+        .arg("/config.json")
         .arg("--log-path")
-        .arg(log)
+        .arg("/firecracker.log")
         .args(["--level", "Info"]);
     let status =
         crate::process_output::run_status_bounded(&mut launch.build(), START_DEADLINE, None)
@@ -402,6 +447,16 @@ mod tests {
         let expected_hash = Sha256Hash::of(root.path().as_os_str().as_bytes());
         let expected = format!("coop-vmm-{}-{expected_hash}-", unsafe { libc::geteuid() });
         assert_eq!(prefix(&inst).unwrap(), expected);
+        let unit = format!("{expected}{}", "a".repeat(32)) + UNIT_SUFFIX;
+        assert_eq!(
+            jail_id(&inst, &unit).unwrap(),
+            format!(
+                "{}-{}",
+                &expected.split('-').nth(3).unwrap()[..16],
+                "a".repeat(32)
+            )
+        );
+        assert!(jail_id(&inst, "other.service").is_err());
     }
 
     #[test]

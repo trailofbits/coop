@@ -115,6 +115,10 @@ impl VerifiedFirecracker {
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
+
+    pub(crate) fn jailer_path(&self) -> PathBuf {
+        self.0.with_file_name("jailer")
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

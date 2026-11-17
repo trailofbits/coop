@@ -3275,7 +3275,18 @@ impl Instance {
                 )
             },
         )?;
-        ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
+        let vsock_path = self.vsock_path();
+        let staged_placeholder = match fs::symlink_metadata(&vsock_path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0 => {
+                crate::firecracker_jail::has_jailed_log_link(self)?
+            }
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).context("Cannot inspect vsock socket path"),
+        };
+        if !staged_placeholder {
+            ensure_firecracker_socket_stopped(&vsock_path, "base vsock")?;
+        }
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
             && error.kind() != std::io::ErrorKind::NotFound
