@@ -172,12 +172,10 @@ impl Decision {
         cfg: &CoopConfig,
         hint: &RepoHint,
         bound: bool,
-        never: bool,
         ctx: PromptContext,
     ) -> Self {
         if cfg.github_disabled
             || bound
-            || never
             || hint.repo.is_none()
             || ctx.no_prompt
             || ctx.is_ci
@@ -202,6 +200,23 @@ impl Decision {
             Some(GitHubAuth::Off | GitHubAuth::Auto | GitHubAuth::Env) => Self::Skip,
         }
     }
+}
+
+fn decision_for_instance(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    hint: &RepoHint,
+    bound: bool,
+    ctx: PromptContext,
+) -> Result<Decision> {
+    let decision = Decision::resolve(cfg, hint, bound, ctx);
+    if decision == Decision::Skip {
+        return Ok(Decision::Skip);
+    }
+    if prompt_state(inst)?.never {
+        return Ok(Decision::Skip);
+    }
+    Ok(Decision::Prompt)
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -253,14 +268,8 @@ pub(crate) fn maybe_prompt(
         is_ci: std::env::var("CI").is_ok(),
         no_prompt,
     };
-    if Decision::resolve(cfg, hint, bound, false, ctx) == Decision::Skip {
+    if decision_for_instance(cfg, inst, hint, bound, ctx)? == Decision::Skip {
         if matches!(cfg.github, Some(GitHubAuth::Pat(_))) && !bound {
-            eprintln!("{}", unbound_guidance(cfg, inst, hint));
-        }
-        return Ok(());
-    }
-    if prompt_state(inst)?.never {
-        if matches!(cfg.github, Some(GitHubAuth::Pat(_))) {
             eprintln!("{}", unbound_guidance(cfg, inst, hint));
         }
         return Ok(());
@@ -388,7 +397,6 @@ mod tests {
                 },
                 &hint,
                 false,
-                false,
                 ctx
             ),
             Decision::Skip
@@ -398,7 +406,6 @@ mod tests {
                 &CoopConfig::default(),
                 &hint,
                 false,
-                false,
                 PromptContext {
                     is_tty: false,
                     ..ctx
@@ -407,15 +414,32 @@ mod tests {
             Decision::Skip
         );
         assert_eq!(
-            Decision::resolve(&CoopConfig::default(), &hint, false, false, ctx),
+            Decision::resolve(&CoopConfig::default(), &hint, false, ctx),
             Decision::Prompt
         );
         assert_eq!(
-            Decision::resolve(&CoopConfig::default(), &hint, true, false, ctx),
+            Decision::resolve(&CoopConfig::default(), &hint, true, ctx),
             Decision::Skip
         );
         assert_eq!(
-            Decision::resolve(&CoopConfig::default(), &hint, false, true, ctx),
+            Decision::resolve(
+                &CoopConfig::default(),
+                &hint,
+                false,
+                PromptContext { is_ci: true, ..ctx }
+            ),
+            Decision::Skip
+        );
+        assert_eq!(
+            Decision::resolve(
+                &CoopConfig::default(),
+                &hint,
+                false,
+                PromptContext {
+                    no_prompt: true,
+                    ..ctx
+                }
+            ),
             Decision::Skip
         );
         let mut legacy = CoopConfig::default();
@@ -423,7 +447,7 @@ mod tests {
         pat.skip.push(RepoSlug::new("a/b").unwrap());
         legacy.github = Some(GitHubAuth::Pat(pat));
         assert_eq!(
-            Decision::resolve(&legacy, &hint, false, false, ctx),
+            Decision::resolve(&legacy, &hint, false, ctx),
             Decision::Skip
         );
     }
@@ -454,6 +478,20 @@ mod tests {
         save_never(&first).unwrap();
         assert!(prompt_state(&first).unwrap().never);
         assert!(!prompt_state(&second).unwrap().never);
+        let hint = RepoHint::for_start(Some(RepoSlug::new("a/b").unwrap()), None, None);
+        let interactive = PromptContext {
+            is_tty: true,
+            is_ci: false,
+            no_prompt: false,
+        };
+        assert_eq!(
+            decision_for_instance(&cfg, &first, &hint, false, interactive).unwrap(),
+            Decision::Skip
+        );
+        assert_eq!(
+            decision_for_instance(&cfg, &second, &hint, false, interactive).unwrap(),
+            Decision::Prompt
+        );
         let key = RepoSlug::new("a/b").unwrap();
         maybe_prompt(
             &mut cfg,

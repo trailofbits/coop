@@ -1115,6 +1115,7 @@ fn start_instance(
 
     let inputs = FirstBootInputs {
         source: FirstBootSource::from_options(opts.workspace_dir, opts.git_repo),
+        clone_recovery: backend::CloneRecovery::NewVm,
         mounts: &opts.mounts,
         exclude_git: opts.exclude_git,
         no_agents: opts.no_agents,
@@ -1133,6 +1134,7 @@ struct BootPayload {
 /// flags such as disk size and prompt policy cannot be read during provisioning.
 struct FirstBootInputs<'a> {
     source: FirstBootSource<'a>,
+    clone_recovery: backend::CloneRecovery<'a>,
     mounts: &'a [config::Mount],
     exclude_git: bool,
     no_agents: bool,
@@ -1264,7 +1266,13 @@ fn provision_first_boot(
         Some(state)
     } else if let FirstBootSource::GitRepo(repo_url) = inputs.source {
         let selection = crate::github_assignment::select(cfg, inst)?;
-        backend::clone_git_repo(&target, cfg.github.as_ref(), repo_url, &selection)?;
+        backend::clone_git_repo(
+            &target,
+            cfg.github.as_ref(),
+            repo_url,
+            &selection,
+            inputs.clone_recovery,
+        )?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -2801,6 +2809,7 @@ fn reprovision_instance(
             ws_inputs.workspace_dir.as_deref(),
             ws_inputs.git_repo.as_deref(),
         ),
+        clone_recovery: backend::CloneRecovery::Reprovision(&inst.name),
         mounts: &ws_inputs.mounts,
         // No command persists `--exclude-git`, so it cannot be replayed: a
         // workspace originally pushed without `.git/` is re-synced with it.

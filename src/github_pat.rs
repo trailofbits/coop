@@ -306,6 +306,7 @@ pub(crate) enum SelectionSource {
     Assignment,
     MissingAssignment,
     Corrupt,
+    SelectionError,
     Unbound,
     Disabled,
     Auto,
@@ -331,15 +332,17 @@ fn build_vm_status(cfg: &CoopConfig, inst: &crate::config::Instance) -> VmPatSta
         .unwrap_or_else(|_| crate::pat_prompt::RepoHint::unrecorded());
     let assignment = crate::github_assignment::Assignment::load(inst);
     let selection = crate::github_assignment::select(cfg, inst);
-    let (source, effective_entry) = match selection {
-        Ok(GitHubSelection::Disabled) => (SelectionSource::Disabled, None),
-        Ok(GitHubSelection::Off) => (SelectionSource::Off, None),
-        Ok(GitHubSelection::Auto) => (SelectionSource::Auto, None),
-        Ok(GitHubSelection::Env) => (SelectionSource::Env, None),
-        Ok(GitHubSelection::Unbound) => (SelectionSource::Unbound, None),
-        Ok(GitHubSelection::Bound(binding)) => {
-            (SelectionSource::Assignment, Some(binding.repo().clone()))
-        }
+    let (source, effective_entry, selection_guidance) = match selection {
+        Ok(GitHubSelection::Disabled) => (SelectionSource::Disabled, None, None),
+        Ok(GitHubSelection::Off) => (SelectionSource::Off, None, None),
+        Ok(GitHubSelection::Auto) => (SelectionSource::Auto, None, None),
+        Ok(GitHubSelection::Env) => (SelectionSource::Env, None, None),
+        Ok(GitHubSelection::Unbound) => (SelectionSource::Unbound, None, None),
+        Ok(GitHubSelection::Bound(binding)) => (
+            SelectionSource::Assignment,
+            Some(binding.repo().clone()),
+            None,
+        ),
         Err(_)
             if assignment
                 .as_ref()
@@ -347,9 +350,14 @@ fn build_vm_status(cfg: &CoopConfig, inst: &crate::config::Instance) -> VmPatSta
                 .and_then(Option::as_ref)
                 .is_some_and(|a| !a.available(cfg)) =>
         {
-            (SelectionSource::MissingAssignment, None)
+            (SelectionSource::MissingAssignment, None, None)
         }
-        Err(_) => (SelectionSource::Corrupt, None),
+        Err(_) if assignment.is_err() => (SelectionSource::Corrupt, None, None),
+        Err(error) => (
+            SelectionSource::SelectionError,
+            None,
+            Some(format!("PAT selection failed: {error:#}")),
+        ),
     };
     let suggestion_source = hint.source_label().to_string();
     let recorded_target = hint.target().to_string();
@@ -364,6 +372,7 @@ fn build_vm_status(cfg: &CoopConfig, inst: &crate::config::Instance) -> VmPatSta
             "PAT binding is corrupt or unreadable; inspect host-private state, then run coop github unassign-pat --vm {}",
             inst.name
         )),
+        SelectionSource::SelectionError => selection_guidance,
         _ => None,
     };
     VmPatStatus {
@@ -1285,6 +1294,41 @@ mod tests {
         assert_eq!(corrupt.effective_entry, None);
         cfg.github = Some(GitHubAuth::Off);
         assert_eq!(build_vm_status(&cfg, &inst).source, SelectionSource::Off);
+    }
+
+    #[test]
+    fn vm_status_preserves_managed_token_conflict() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let mut cfg: CoopConfig = toml::from_str(
+            "[github]\nmode = 'pat'\n[github.pat.'org/entry']\ntoken = 'github_pat_example'\n",
+        )
+        .unwrap();
+        cfg.data_dir = crate::config::ConfigPath::new(tmp.path());
+        let inst = cfg
+            .allocate_instance(
+                Some(&crate::config::InstanceName::new("status").unwrap()),
+                &crate::config::ImageName::new("default").unwrap(),
+                None,
+            )
+            .unwrap();
+        crate::github_assignment::assign(&cfg, &inst, slug("org/entry")).unwrap();
+        cfg.guest_env.insert(
+            crate::guest_env_state::EnvVarName::new("GH_TOKEN").unwrap(),
+            "managed-override".to_string(),
+        );
+
+        let status = build_vm_status(&cfg, &inst);
+        assert_eq!(status.source, SelectionSource::SelectionError);
+        assert_eq!(
+            status.assigned_entry.as_ref().map(RepoSlug::as_str),
+            Some("org/entry")
+        );
+        assert_eq!(status.effective_entry, None);
+        let guidance = status.guidance.unwrap();
+        assert!(guidance.contains("conflicts with managed GH_TOKEN"));
+        assert!(guidance.contains("remove it from guest_env"));
+        assert!(!guidance.contains("corrupt"));
+        assert!(!guidance.contains("managed-override"));
     }
 
     #[test]

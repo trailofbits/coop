@@ -306,9 +306,11 @@ setup prompt for that invocation, without removing the saved association.
 Under opt-out, clones receive no managed GitHub credential. In PAT mode an
 unbound VM receives no configured PAT, even if the Git origin or clone URL
 matches a configured entry. `auto` and `env` clone credentials follow their
-explicit global mode. A private clone without credentials may fail; bind an
-entry and retry. `coop up --git-repo URL --pat-entry X/Y` binds an existing
-entry before first boot for noninteractive creation.
+explicit global mode. A private clone without credentials may fail. A failed
+new-VM clone normally removes that VM, so rerun `coop up --git-repo URL
+--pat-entry X/Y` with an existing entry. For a retained VM being reprovisioned,
+bind an entry with `assign-pat` and retry reprovisioning. `--pat-entry` binds
+before first boot for noninteractive creation.
 
 Missing entries, unreadable or malformed assignment state, and failed secret
 retrieval fail instead of falling back. Restore a forgotten entry with

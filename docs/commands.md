@@ -1147,7 +1147,9 @@ coop github forget-pat --repo trailofbits/coop
 With `--vm NAME`, status includes `name`, `assigned_entry`, `effective_entry`,
 `suggested_entry`, `suggestion_source`, `recorded_target`, `source`, and
 `guidance`. `source` is `assignment`, `missing_assignment`, `corrupt`,
-`unbound`, `disabled`, `auto`, `env`, or `off`. `effective_entry` is the
+`selection_error`, `unbound`, `disabled`, `auto`, `env`, or `off`. A
+`selection_error` retains the underlying failure, such as a managed token
+override conflict, in `guidance`. `effective_entry` is the
 entry coop would forward now; the suggestion never authorizes a token.
 This replaces the older `repository` and `no_matching_entry` source values;
 scripts should migrate to `effective_entry` and treat `unbound` as no PAT.

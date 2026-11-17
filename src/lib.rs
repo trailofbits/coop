@@ -1784,7 +1784,6 @@ mod tests {
                         &cfg,
                         &crate::pat_prompt::RepoHint::for_start(Some(repo.clone()), None, None),
                         false,
-                        false,
                         PromptContext {
                             is_tty: true,
                             is_ci: false,

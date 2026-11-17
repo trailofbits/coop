@@ -2064,7 +2064,9 @@ fn populate_builtin_credentials(
         } else if let Ok(key) = std::env::var("XAI_API_KEY") {
             env.set("XAI_API_KEY", key)?;
         }
-        if let Some(token) = resolve_github_token(cfg.github.as_ref(), selection)? {
+        if let Some(token) =
+            resolve_github_token(cfg.github.as_ref(), selection, &HostGitHubTokenSources)?
+        {
             env.set("GITHUB_TOKEN", token)?;
         } else {
             tracing::debug!("no GITHUB_TOKEN forwarded to guest");
@@ -2697,6 +2699,23 @@ pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName)
     Ok(())
 }
 
+trait GitHubTokenSources {
+    fn env_token(&self) -> Option<String>;
+    fn cli_token(&self) -> Option<String>;
+}
+
+struct HostGitHubTokenSources;
+
+impl GitHubTokenSources for HostGitHubTokenSources {
+    fn env_token(&self) -> Option<String> {
+        std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty())
+    }
+
+    fn cli_token(&self) -> Option<String> {
+        gh_auth_token()
+    }
+}
+
 /// Resolve a GitHub token for the guest from the VM's effective selection.
 ///
 /// Returns `Ok(None)` when no token should be forwarded; errors when a
@@ -2705,15 +2724,13 @@ pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName)
 fn resolve_github_token(
     strategy: Option<&GitHubAuth>,
     selection: &crate::github_assignment::GitHubSelection,
+    sources: &impl GitHubTokenSources,
 ) -> Result<Option<String>> {
     use crate::github_assignment::GitHubSelection;
     match selection {
-        GitHubSelection::Auto => Ok(std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(gh_auth_token)),
+        GitHubSelection::Auto => Ok(sources.env_token().or_else(|| sources.cli_token())),
         GitHubSelection::Env => {
-            let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+            let token = sources.env_token();
             if token.is_none() {
                 tracing::warn!(
                     "github: \"env\" requires GITHUB_TOKEN to be set. \
@@ -4573,15 +4590,22 @@ fn register_mcp_servers(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CloneRecovery<'a> {
+    NewVm,
+    Reprovision(&'a crate::config::InstanceName),
+}
+
 /// Clone a git repository inside the guest VM via SSH.
 ///
 /// Clone with the same explicit VM credential decision used for sessions.
 /// The token travels through stdin and never appears on argv.
-pub fn clone_git_repo(
+pub(crate) fn clone_git_repo(
     target: &SshTarget,
     github: Option<&GitHubAuth>,
     repo_url: &str,
     selection: &crate::github_assignment::GitHubSelection,
+    recovery: CloneRecovery<'_>,
 ) -> Result<()> {
     validate_clone_url(repo_url)?;
     let display_url = safe_clone_url(repo_url);
@@ -4589,7 +4613,7 @@ pub fn clone_git_repo(
 
     let is_github = is_github_https_url(repo_url);
     let token = if is_github {
-        resolve_clone_token(github, selection)?
+        resolve_clone_token(github, selection, &HostGitHubTokenSources)?
     } else {
         None
     };
@@ -4602,21 +4626,38 @@ pub fn clone_git_repo(
 
     let token_attempted = token.is_some();
     result.with_context(|| {
-        if token_attempted {
-            format!("Failed to clone {display_url} in guest using the selected token")
-        } else if is_github {
-            format!(
-                "Failed to clone {display_url} in guest. If this is a private repo, \
-                 bind a configured entry with `coop github assign-pat --vm <name> \
-                 --repo <owner/repo>` and retry, or choose github = \"auto\"/\"env\"."
-            )
-        } else {
-            format!("Failed to clone {display_url} in guest")
-        }
+        clone_failure_context(&display_url, is_github, token_attempted, recovery)
     })?;
 
     tracing::info!("Repository cloned to /workspace");
     Ok(())
+}
+
+fn clone_failure_context(
+    display_url: &str,
+    is_github: bool,
+    token_attempted: bool,
+    recovery: CloneRecovery<'_>,
+) -> String {
+    if token_attempted {
+        return format!("Failed to clone {display_url} in guest using the selected token");
+    }
+    if !is_github {
+        return format!("Failed to clone {display_url} in guest");
+    }
+    let retry = match recovery {
+        CloneRecovery::NewVm => {
+            "rerun `coop up --git-repo <url> --pat-entry OWNER/REPO` with an existing PAT entry"
+                .to_string()
+        }
+        CloneRecovery::Reprovision(name) => format!(
+            "bind a configured entry with `coop github assign-pat --vm {name} --repo OWNER/REPO`, then retry reprovisioning"
+        ),
+    };
+    format!(
+        "Failed to clone {display_url} in guest. If this is a private repo, {retry}, \
+         or choose github = \"auto\"/\"env\"."
+    )
 }
 
 pub(crate) fn validate_clone_url(repo_url: &str) -> Result<()> {
@@ -4643,8 +4684,9 @@ pub(crate) fn validate_clone_url(repo_url: &str) -> Result<()> {
 fn resolve_clone_token(
     strategy: Option<&GitHubAuth>,
     selection: &crate::github_assignment::GitHubSelection,
+    sources: &impl GitHubTokenSources,
 ) -> Result<Option<String>> {
-    resolve_github_token(strategy, selection)
+    resolve_github_token(strategy, selection, sources)
 }
 
 pub(crate) fn safe_clone_url(raw: &str) -> String {
@@ -7677,6 +7719,23 @@ url = "https://example.com/m"
         validate_clone_url("ssh://git@github.com/owner/repo.git").unwrap();
         assert!(validate_clone_url("https://user:secret@github.com/owner/repo.git").is_err());
         assert!(validate_clone_url("https://github.com/owner/repo.git?token=secret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git#secret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git\nsecret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git\u{0000}secret").is_err());
+    }
+
+    #[test]
+    fn clone_failure_recovery_matches_vm_lifecycle() {
+        let url = "https://github.com/owner/private.git";
+        let creation = clone_failure_context(url, true, false, CloneRecovery::NewVm);
+        assert!(creation.contains("coop up --git-repo <url> --pat-entry OWNER/REPO"));
+        assert!(!creation.contains("assign-pat --vm"));
+
+        let name = crate::config::InstanceName::new("retained").unwrap();
+        let reprovision =
+            clone_failure_context(url, true, false, CloneRecovery::Reprovision(&name));
+        assert!(reprovision.contains("assign-pat --vm retained --repo OWNER/REPO"));
+        assert!(!reprovision.contains("--pat-entry"));
     }
 
     #[test]
@@ -7734,6 +7793,21 @@ url = "https://example.com/m"
         })
     }
 
+    struct FixtureGitHubTokenSources {
+        env: Option<String>,
+        cli: Option<String>,
+    }
+
+    impl GitHubTokenSources for FixtureGitHubTokenSources {
+        fn env_token(&self) -> Option<String> {
+            self.env.clone()
+        }
+
+        fn cli_token(&self) -> Option<String> {
+            self.cli.clone()
+        }
+    }
+
     #[test]
     fn clone_uses_only_vm_selection_and_never_host_fallback() {
         use crate::github_assignment::{GitHubSelection, select};
@@ -7756,17 +7830,52 @@ url = "https://example.com/m"
             .unwrap();
         let unbound = select(&cfg, &inst).unwrap();
         assert!(matches!(unbound, GitHubSelection::Unbound));
+        for sources in [
+            FixtureGitHubTokenSources {
+                env: Some("github_pat_host_env".to_string()),
+                cli: None,
+            },
+            FixtureGitHubTokenSources {
+                env: None,
+                cli: Some("github_pat_host_gh".to_string()),
+            },
+        ] {
+            for selection in [
+                unbound.clone(),
+                GitHubSelection::Off,
+                GitHubSelection::Disabled,
+            ] {
+                assert_eq!(
+                    resolve_clone_token(cfg.github.as_ref(), &selection, &sources).unwrap(),
+                    None
+                );
+            }
+        }
+        let sources = FixtureGitHubTokenSources {
+            env: Some("github_pat_host_env".to_string()),
+            cli: Some("github_pat_host_gh".to_string()),
+        };
         assert_eq!(
-            resolve_clone_token(cfg.github.as_ref(), &unbound).unwrap(),
-            None
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Auto, &sources)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_env")
         );
         assert_eq!(
-            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Off).unwrap(),
-            None
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Env, &sources)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_env")
         );
+        let cli_only = FixtureGitHubTokenSources {
+            env: None,
+            cli: Some("github_pat_host_gh".to_string()),
+        };
         assert_eq!(
-            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Disabled).unwrap(),
-            None
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Auto, &cli_only)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_gh")
         );
         crate::github_assignment::assign(
             &cfg,
@@ -7776,16 +7885,16 @@ url = "https://example.com/m"
         .unwrap();
         let bound = select(&cfg, &inst).unwrap();
         assert_eq!(
-            resolve_clone_token(cfg.github.as_ref(), &bound)
+            resolve_clone_token(cfg.github.as_ref(), &bound, &sources)
                 .unwrap()
                 .as_deref(),
             Some("github_pat_selected")
         );
         cfg.github = Some(pat_auth_with(&[("owner/repo", "github_pat_default")]));
         assert!(select(&cfg, &inst).is_err());
-        assert!(resolve_clone_token(cfg.github.as_ref(), &bound).is_err());
+        assert!(resolve_clone_token(cfg.github.as_ref(), &bound, &sources).is_err());
         cfg.github = Some(pat_auth_with(&[("owner/chosen", "cmd:exit 42")]));
-        assert!(resolve_clone_token(cfg.github.as_ref(), &bound).is_err());
+        assert!(resolve_clone_token(cfg.github.as_ref(), &bound, &sources).is_err());
     }
 
     fn forwarding_session(entries: &[(&str, &str)]) -> SshSession {
