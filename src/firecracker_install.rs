@@ -95,6 +95,7 @@ fn verify_pair_at_with(
     Ok(())
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
     let managed = firecracker_path();
     if path != managed {
@@ -107,6 +108,7 @@ pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
     Ok(managed)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn configured_firecracker(path: &Path) -> Result<PathBuf> {
     let managed = require_managed_path(path)?;
     verify_pair().context(
