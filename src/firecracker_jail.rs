@@ -603,7 +603,6 @@ fn verify_vmm_status(status: &str, uid: u32) -> Result<()> {
     for (key, expected) in [
         ("Groups", ""),
         ("CapEff", "0000000000000000"),
-        ("CapBnd", "0000000000000000"),
         ("NoNewPrivs", "1"),
         ("Seccomp", "2"),
     ] {
@@ -615,6 +614,18 @@ fn verify_vmm_status(status: &str, uid: u32) -> Result<()> {
         if value != expected {
             bail!("Firecracker VMM {key} does not match its jail policy");
         }
+    }
+    let bounding = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapBnd:"))
+        .context("Jailed VMM status lacks a capability bounding set")?
+        .trim();
+    let bounding = u64::from_str_radix(bounding, 16)
+        .context("Jailed VMM capability bounding set is not hexadecimal")?;
+    // The root jailer needs other capabilities to stage mounts. Systemd
+    // removes NET_ADMIN (capability 12) from the whole service before exec.
+    if bounding & (1 << 12) != 0 {
+        bail!("Firecracker VMM retains CAP_NET_ADMIN in its bounding set");
     }
     Ok(())
 }
@@ -768,7 +779,8 @@ fn preserve_log(inst: &Instance, jail_root: &Path, generation: &str) -> Result<(
             )?;
         }
     }
-    fs::remove_file(&link).context("Cannot unlink jailed Firecracker log link")?;
+    // Rename over the link atomically so a killed cleanup never leaves the
+    // instance without either the old link or the saved journal snapshot.
     staged
         .persist(&link)
         .map_err(|error| error.error)
@@ -810,11 +822,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vmm_status_requires_empty_capability_bounding_set() {
-        let status = "Uid:\t123 123 123 123\nGid:\t123 123 123 123\nGroups:\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n";
+    fn vmm_status_excludes_net_admin_from_capability_bounding_set() {
+        let status = "Uid:\t123 123 123 123\nGid:\t123 123 123 123\nGroups:\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000001\nNoNewPrivs:\t1\nSeccomp:\t2\n";
         verify_vmm_status(status, 123).unwrap();
-        let unbounded = status.replace("CapBnd:\t0000000000000000", "CapBnd:\t000001ffffffffff");
+        let unbounded = status.replace("CapBnd:\t0000000000000001", "CapBnd:\t0000000000001001");
         assert!(verify_vmm_status(&unbounded, 123).is_err());
+        assert!(
+            verify_vmm_status(
+                &status.replace("CapBnd:\t0000000000000001", "CapBnd:\tbogus"),
+                123
+            )
+            .is_err()
+        );
         assert!(verify_vmm_status(&status.replace("Seccomp:\t2", "Seccomp:\t0"), 123).is_err());
     }
     use crate::config::{FirecrackerControlMode, ImageName, InstanceIndex, InstanceName};
