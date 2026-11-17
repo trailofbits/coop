@@ -142,45 +142,38 @@ pub(crate) fn probe(inst: &Instance) -> Result<ServiceProbe> {
     let mut active = None;
     let mut uncertain = None;
     for listed in list_units(inst)? {
-        match listed.active.as_str() {
-            "active" => {
-                let observed = inspect_active(&listed.unit)?;
+        if !matches!(
+            listed.active.as_str(),
+            "active" | "activating" | "deactivating" | "reloading" | "inactive" | "failed"
+        ) {
+            bail!(
+                "Unknown systemd state for Firecracker service: {}",
+                listed.active
+            );
+        }
+        // A guest reboot can finish between list-units and show. Use the
+        // later single-unit snapshot rather than treating that normal race as
+        // a service identity failure.
+        match inspect_state(&listed.unit)? {
+            ServiceProbe::Active(observed) => {
                 if active.replace(observed).is_some() {
                     bail!("Multiple active Firecracker services exist for this instance");
                 }
             }
-            "activating" | "deactivating" | "reloading" => {
+            ServiceProbe::Uncertain(reason) => uncertain = Some(reason),
+            ServiceProbe::None if matches!(listed.active.as_str(), "activating" | "reloading") => {
                 uncertain = Some(format!(
-                    "Firecracker service '{}' is {}",
-                    listed.unit, listed.active
+                    "Firecracker service '{}' may still be starting",
+                    listed.unit
                 ));
             }
-            "inactive" | "failed" => {
-                if let ServiceProbe::Uncertain(reason) = inspect_state(&listed.unit)? {
-                    uncertain = Some(reason);
-                }
-            }
-            other => bail!("Unknown systemd state for Firecracker service: {other}"),
+            ServiceProbe::None => {}
         }
     }
     if let Some(reason) = uncertain {
         return Ok(ServiceProbe::Uncertain(reason));
     }
     Ok(active.map_or(ServiceProbe::None, ServiceProbe::Active))
-}
-
-fn inspect_active(unit: &str) -> Result<ActiveService> {
-    let show = systemctl_query()?
-        .args([
-            "--system",
-            "--no-pager",
-            "show",
-            "--property=Id,ActiveState,MainPID,ControlGroup,TasksCurrent",
-        ])
-        .arg(unit)
-        .capture()
-        .with_context(|| format!("Cannot inspect Firecracker service {unit}"))?;
-    parse_active_service(unit, &show)
 }
 
 fn parse_active_service(unit: &str, show: &str) -> Result<ActiveService> {

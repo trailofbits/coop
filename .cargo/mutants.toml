@@ -59,7 +59,6 @@ exclude_re = [
   "src/firecracker_service\\.rs:.*\\blist_units\\b",
   "src/firecracker_service\\.rs:.*\\brequire_system_manager\\b",
   "src/firecracker_service\\.rs:.*\\bprobe\\b",
-  "src/firecracker_service\\.rs:.*\\binspect_active\\b",
   "src/firecracker_service\\.rs:.*\\blaunch\\b",
   "src/firecracker_service\\.rs:.*\\bstop\\b",
   "src/firecracker_service\\.rs:.*\\binspect_state\\b",

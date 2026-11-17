@@ -8763,8 +8763,11 @@ test_guest_files() {
     test_guest_files_reprovision "$inst_name" "$cfg" "$source"
     test_guest_files_symlink "$inst_name" "$cfg"
     unset GUEST_INSTANCE
-    coop destroy "$inst_name"
-    untrack_instance "$inst_name"
+    if coop destroy "$inst_name"; then
+        untrack_instance "$inst_name"
+    else
+        fail "guest_files cleanup destroys the stopped instance" "$HARNESS_ERR"
+    fi
     test_guest_files_live_mount
 }
 
