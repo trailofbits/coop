@@ -99,7 +99,7 @@ pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
     let managed = firecracker_path();
     if path != managed {
         bail!(
-            "Custom firecracker_bin '{}' cannot be launched as root. Remove that override and run `coop setup` to install the verified matching Firecracker/jailer pair at '{}'.",
+            "Custom firecracker_bin '{}' cannot be used for a jailed Firecracker VM. Remove that override and run `coop setup` to install the verified matching Firecracker/jailer pair at '{}'.",
             path.display(),
             managed.display()
         );
@@ -109,7 +109,9 @@ pub(crate) fn require_managed_path(path: &Path) -> Result<PathBuf> {
 
 pub(crate) fn configured_firecracker(path: &Path) -> Result<PathBuf> {
     let managed = require_managed_path(path)?;
-    verify_pair().context("Run `coop setup` to repair the managed Firecracker installation")?;
+    verify_pair().context(
+        "The managed Firecracker installation is incomplete or changed. Stop VMs using it, then ask an administrator to remove its versioned release directory and rerun `coop setup`",
+    )?;
     Ok(managed)
 }
 
