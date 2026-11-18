@@ -1,0 +1,51 @@
+name: macOS Lima feasibility
+
+on:
+  push:
+    branches: [ci/macos-lima-feasibility]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-lima-feasibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install host prerequisites
+        run: brew install lima cmake
+
+      - name: Show host capacity and Lima version
+        run: |
+          df -h /
+          sysctl -n hw.ncpu
+          limactl --version
+
+      - name: Run Lima lifecycle integration shard
+        timeout-minutes: 105
+        env:
+          COOP_TEST_SKIP_BRIDGE: "1"
+        run: |
+          set -o pipefail
+          ./tests/run-integration.sh --full --shard lifecycle 2>&1 \
+            | tee "$RUNNER_TEMP/macos-lima-integration.log"
+
+      - name: Upload integration output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-lima-integration-log
+          path: ${{ runner.temp }}/macos-lima-integration.log
+          if-no-files-found: ignore
+          retention-days: 3
