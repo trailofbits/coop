@@ -26,6 +26,7 @@ set -euo pipefail
 #                            Off by default because it wipes every coop-managed
 #                            instance on the host, including ones not owned by
 #                            this test run. Enable only on clean/CI hosts.
+#   COOP_TEST_BUILDER_TIMEOUT — Pass a longer --builder-timeout to setup on slow hosts.
 
 # ── Defaults ──────────────────────────────────────────────────
 
