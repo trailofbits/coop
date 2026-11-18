@@ -149,10 +149,12 @@ Creating an instance (`coop up`) follows this sequence:
    PID, cgroup, UID/GID, effective and bounding capabilities, seccomp mode, and jail root
    before treating a new launch as running.
    Firecracker logs and guest serial output go to journald through a rate-limited
-   systemd stream. `coop logs` reads the active unit's journal; stopped cleanup
-   saves at most 16 MiB of recent output in the instance directory, available
-   through `coop logs NAME` after a failed boot. A stopped
-   guest cannot block jail removal by changing its writable log placeholder;
+   systemd stream. Users with access to the host's system journal can read guest
+   serial output, which may contain secrets; the previous live log stayed in
+   the owner's private instance directory. `coop logs` reads the active unit's
+   journal; stopped cleanup saves at most 16 MiB of recent output in the
+   instance directory, available through `coop logs NAME` after a failed boot.
+   A stopped guest cannot block jail removal by changing its writable log placeholder;
    cleanup reads the system journal and revokes disk access even if that
    placeholder has been replaced.
 7. Records the systemd main PID for compatibility and waits for SSH to become reachable.

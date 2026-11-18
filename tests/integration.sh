@@ -4168,6 +4168,24 @@ test_stop() {
 
     local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0 vmm_uid=""
     if [[ "$(uname -s)" == Linux ]]; then
+        local serial_marker="COOP_JAILED_LOG_SNAPSHOT_MARKER"
+        if guest_exec sudo sh -c "printf '%s\\n' '$serial_marker' > /dev/ttyS0"; then
+            local marker_seen=false
+            for _ in {1..20}; do
+                if coop logs "$INSTANCE" && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+                    marker_seen=true
+                    break
+                fi
+                sleep 0.25
+            done
+            if [[ "$marker_seen" == true ]]; then
+                pass "active jailed Firecracker logs include guest serial output"
+            else
+                fail "active jailed Firecracker logs include guest serial output" "$HARNESS_ERR"
+            fi
+        else
+            fail "write guest serial marker before stop" "$(guest_stderr)"
+        fi
         ip=$(guest_ip_of "$INSTANCE") || ip=""
         if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
             && (( 10#${BASH_REMATCH[1]} >= 2 && 10#${BASH_REMATCH[1]} <= 254 )); then
@@ -4232,10 +4250,13 @@ test_stop() {
         local saved_log="$HOME/.coop/instances/$INSTANCE/firecracker.log" saved_bytes
         saved_bytes=$(stat -c %s "$saved_log" 2>/dev/null || echo 0)
         if [[ -f "$saved_log" && "$saved_bytes" -gt 0 \
-            && "$saved_bytes" -le 16777216 ]]; then
-            pass "stopped VMM retains a bounded journal snapshot"
+            && "$saved_bytes" -le 16777216 ]] \
+            && grep -Fq -- "$serial_marker" "$saved_log" \
+            && coop logs "$INSTANCE" \
+            && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+            pass "stopped VMM retains guest serial output in its bounded journal snapshot"
         else
-            fail "stopped VMM retains a bounded journal snapshot" \
+            fail "stopped VMM retains guest serial output in its bounded journal snapshot" \
                 "saved log bytes=$saved_bytes"
         fi
     fi

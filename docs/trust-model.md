@@ -395,6 +395,12 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   logs to systemd's journal stream. Coop verifies the unit's journal routing
   and its 30-second interval and 1000-message configured burst after launch;
   journald may multiply the effective burst based on available disk space.
+  A guest can put secrets on its serial console. Host users allowed to read the
+  system journal (for example members of `systemd-journal` or `adm`) can read
+  those messages, including messages from other users' VMs. Previously the
+  live VMM log was confined to its owner's private instance directory and
+  stdout was discarded. This wider readership is a confidentiality trade-off
+  that requires explicit confirmation before merge.
   Coop creates no growing live VMM log file or launcher pipe. `coop logs`
   uses a trusted `journalctl` executable for the active unit, and stopped
   cleanup saves at most 16 MiB of recent output for later `coop logs`

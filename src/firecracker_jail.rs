@@ -842,7 +842,7 @@ fn saved_journal(inst: &Instance, generation: &str, limit: usize) -> Result<Vec<
             "--lines=1000",
         ])
         .build();
-    let output = crate::process_output::run_bounded(
+    let output = crate::process_output::run_bounded_tail(
         &mut command,
         crate::process_output::CapturePolicy {
             stdout_max: limit,

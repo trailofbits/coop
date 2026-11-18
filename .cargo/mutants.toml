@@ -104,6 +104,7 @@ exclude_re = [
   "src/process_output\\.rs:.*\\brun_status_bounded\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_file\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
+  "src/process_output\\.rs:.*\\brun_bounded_tail\\b",
   # Treating every read error as EINTR, or removing O_NONBLOCK, makes other
   # process tests block forever before libtest can report the focused unit-test
   # failure. Exclude only those structurally hanging mutations; the hard-error
