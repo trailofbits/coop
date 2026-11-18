@@ -1278,7 +1278,7 @@ pub struct PatConfig {
     /// [`RepoSlug`](crate::github_repo::RepoSlug).
     #[serde(default, rename = "pat")]
     pub entries: std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
-    /// Repos for which the VM startup auto-prompt is suppressed.
+    /// Legacy per-repo suppression of VM PAT binding prompts.
     #[serde(default)]
     pub skip: Vec<crate::github_repo::RepoSlug>,
 }
@@ -1694,10 +1694,9 @@ pub struct ClaudeConfig {
 /// `[setup]` section: controls one-time UX behaviour at VM startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
-    /// Whether VM startup prompts the user to set up a fine-grained PAT
-    /// when the resolved repo has no entry. Set to `false` to suppress
-    /// globally. The per-repo `skip` list under `[github]` suppresses
-    /// individual repos.
+    /// Whether VM startup prompts for a PAT binding when a repository
+    /// suggestion is available. Set to `false` to suppress globally.
+    /// Legacy `[github].skip` entries suppress matching suggestions.
     #[serde(default = "default_prompt_for_pat")]
     pub prompt_for_pat: bool,
 }

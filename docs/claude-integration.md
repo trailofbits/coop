@@ -98,9 +98,9 @@ The `github` field controls how coop obtains a `GITHUB_TOKEN` for the guest. Thi
 | `"auto"` | Check the `GITHUB_TOKEN` env var first. If unset, run `gh auth token` on the host to extract a token from the GitHub CLI. |
 | `"env"`  | Require `GITHUB_TOKEN` in the host environment. Warns if missing. |
 | `"off"`  | Skip GitHub token forwarding entirely. This is the default when `github` is unset. |
-| `"pat"`  | Use a per-repo fine-grained PAT from `[github.pat]`. GitHub enforces the permissions and repositories selected for that token. Run `coop github setup-pat --repo owner/name` to add an entry; see [configuration.md](configuration.md#fine-grained-pat-github--pat) for the full reference. |
+| `"pat"`  | Forward only the PAT entry explicitly bound to this VM. Run `coop github setup-pat --repo owner/name` to add an entry, then `coop github assign-pat --vm NAME --repo owner/name` to bind it. The entry name does not prove the token's GitHub scope; see [configuration.md](configuration.md#fine-grained-pat-github--pat). |
 
-A [VM PAT assignment](configuration.md#assign-an-existing-pat-to-a-vm) selects an existing entry independently of workspace detection.
+A [VM PAT assignment](configuration.md#assign-an-existing-pat-to-a-vm) is required in PAT mode; workspace Git metadata only supplies an unverified suggestion.
 
 When a token is available, coop runs `gh auth setup-git` in the guest during bootstrap. This configures the git credential helper so `git clone` works against private repositories without further setup.
 

@@ -267,9 +267,9 @@ The `github` field controls how coop resolves a GitHub token for the guest:
 - `"off"` (default): disables GitHub auth forwarding
 - `"auto"`: checks `$GITHUB_TOKEN` env var first, falls back to `gh auth token` if unset
 - `"env"`: requires `GITHUB_TOKEN` in your environment
-- `"pat"`: forwards a per-repo fine-grained PAT recorded under `[github.pat."owner/repo"]`. GitHub enforces the token's scope server-side — see [GitHub auth](configuration.md#fine-grained-pat-github--pat) for the full reference.
+- `"pat"`: forwards only the PAT entry explicitly bound to this VM. The entry key is a label, not a guarantee of the token's GitHub scope. See [GitHub auth](configuration.md#fine-grained-pat-github--pat).
 
-GitHub auth is off by default. Set `github = "auto"` (or run `coop github setup-pat --repo owner/name` for a scoped PAT) to enable it. `coop up` offers to run the PAT wizard inline the first time you bring up a project backed by a GitHub repo without auth configured.
+GitHub auth is off by default. Set `github = "auto"` for global host-token forwarding, or run `coop github setup-pat --repo owner/name` and `coop github assign-pat --vm NAME --repo owner/name` for an explicit VM binding. On an interactive new VM, `coop up` offers to bind a suggested entry before boot; a Git origin is an unverified suggestion. Use `coop up --git-repo URL --pat-entry owner/name` for a headless private first-boot clone. Without a binding, PAT mode forwards no configured PAT.
 
 coop picks up `ANTHROPIC_API_KEY`, `XAI_API_KEY`, and, in the default Codex
 API-key mode, `OPENAI_API_KEY` from your environment automatically. Setting
