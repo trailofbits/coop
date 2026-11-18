@@ -77,8 +77,8 @@ case "$SHARD" in
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
 esac
 
-if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$SHARD" != all && "$SHARD" != config ]]; then
-    echo "--require-proxy requires the all or config shard" >&2
+if [[ "${COOP_TEST_REQUIRE_PROXY:-0}" == 1 && "$SHARD" != all && "$SHARD" != config && "$SHARD" != config-proxy ]]; then
+    echo "--require-proxy requires the all, config, or config-proxy shard" >&2
     exit 1
 fi
 
