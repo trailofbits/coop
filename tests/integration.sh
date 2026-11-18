@@ -5115,6 +5115,13 @@ test_quickstart() {
     echo ""
     echo "=== Phase: quickstart ==="
 
+    # Hosted Lima can spend most of the old 180-second budget restarting a
+    # stopped VM before the SSH/Claude leg runs. Keep Linux's existing bound.
+    local quickstart_timeout=180
+    if [[ "$(uname -s)" == Darwin ]]; then
+        quickstart_timeout=360
+    fi
+
     if ! "$BINARY" exec --help >/dev/null 2>&1; then
         skip "quickstart" "binary missing exec subcommand"
         return
@@ -5131,7 +5138,7 @@ test_quickstart() {
     # First invocation: image is already built (from test_setup) and no
     # instance for this workspace exists, so quickstart must allocate fresh.
     local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout "$quickstart_timeout" "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -5170,7 +5177,7 @@ test_quickstart() {
     pre_list=$("$BINARY" list 2>/dev/null | sort)
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout "$quickstart_timeout" "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -5201,7 +5208,7 @@ test_quickstart() {
     fi
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
+    ( cd "$qs_ws" && _timeout "$quickstart_timeout" "$BINARY" quickstart \
         </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
 
     if [[ $rc -eq 0 ]]; then
