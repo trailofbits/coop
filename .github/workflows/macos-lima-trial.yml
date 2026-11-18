@@ -2,7 +2,7 @@ name: macOS Lima trial
 
 on:
   push:
-    branches: [ci/macos-full-integration-v2]
+    branches: [ci/macos-full-integration-v3]
 
 permissions:
   contents: read

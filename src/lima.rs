@@ -1934,6 +1934,12 @@ fn compose_provision_script(
     s.push_str("export DPKG_OPTIONS='--force-confnew'\n");
     s.push_str("APT_OPTS=(-o Dpkg::Options::=--force-confnew)\n\n");
 
+    // Fail before downloads so the integration test exercises the host's
+    // provisioning error path without building an otherwise complete image.
+    if std::env::var("COOP_TEST_INJECT_PROVISION_FAILURE").is_ok() {
+        s.push_str("echo '  [guest] INJECTED FAILURE FOR TESTING'\nexit 1\n");
+    }
+
     // Add all third-party repos first (curl/gpg available on cloud image)
     s.push_str(SCRIPT_GH_REPO);
     s.push('\n');
@@ -2008,13 +2014,6 @@ fn compose_provision_script(
     // Grok Build (official installer, runs as the guest user)
     s.push_str(SCRIPT_GROK);
     s.push('\n');
-
-    // Test hook: inject a provision failure to exercise error detection.
-    // Only activates when COOP_TEST_INJECT_PROVISION_FAILURE is set.
-    if std::env::var("COOP_TEST_INJECT_PROVISION_FAILURE").is_ok() {
-        s.push_str("\necho '  [guest] INJECTED FAILURE FOR TESTING'\n");
-        s.push_str("exit 1\n");
-    }
 
     // Cleanup
     s.push_str("\necho '  [guest] Cleaning up...'\n");

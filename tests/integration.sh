@@ -36,6 +36,10 @@ INSTANCE="${TEST_INSTANCE:-test-$$}"
 FULL="${TEST_FULL:-0}"
 SHARD=all
 SUITE_CONFIG=""
+SETUP_TIMEOUT_ARGS=()
+if [[ -n "${COOP_TEST_BUILDER_TIMEOUT:-}" ]]; then
+    SETUP_TIMEOUT_ARGS=(--builder-timeout "$COOP_TEST_BUILDER_TIMEOUT")
+fi
 
 # Track all instances we create for cleanup
 STARTED_INSTANCES=()
@@ -671,10 +675,7 @@ test_setup() {
     echo ""
     echo "=== Phase: setup ==="
 
-    local args=(setup -y)
-    if [[ -n "${COOP_TEST_BUILDER_TIMEOUT:-}" ]]; then
-        args+=(--builder-timeout "$COOP_TEST_BUILDER_TIMEOUT")
-    fi
+    local args=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     # The full suite exercises `agent update --codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
@@ -5078,7 +5079,7 @@ test_idempotency() {
     # setup -y when golden image already exists should be a fast no-op
     # Must pass the same profiles as the original setup, otherwise the
     # provision script hash changes and triggers a rebuild.
-    local setup_args=(setup -y)
+    local setup_args=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     if [[ -n "$PROFILES" ]]; then
         setup_args+=(--profile "$PROFILES")
     fi
@@ -6186,7 +6187,7 @@ CFGEOF
 
     # Build an image with the custom profile
     local custom_img="custom-test-$$"
-    if "$BINARY" --config "$cfg_file" setup -y --image "$custom_img" --profile test-custom 2>"$tmpdir/stderr"; then
+    if "$BINARY" --config "$cfg_file" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$custom_img" --profile test-custom 2>"$tmpdir/stderr"; then
         pass "setup --image with custom profile exits 0"
     else
         local err
@@ -6365,7 +6366,7 @@ test_builtin_profile_plugins() {
     local img_name="c-rust-plugins-$$"
     coop images --delete "$img_name" 2>/dev/null || true
 
-    if coop setup -y --image "$img_name" --profile c,rust; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img_name" --profile c,rust; then
         pass "setup fresh c,rust profile image exits 0"
     else
         fail "setup fresh c,rust profile image exits 0" "stderr: $HARNESS_ERR"
@@ -6934,7 +6935,7 @@ CFGEOF
 
     # Build a golden image with the stub claude baked in
     local mp_img="mp-test-$$"
-    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" setup -y --image "$mp_img" --profile stub-claude 2>"$tmpdir/stderr"; then
+    if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$mp_img" --profile stub-claude 2>"$tmpdir/stderr"; then
         pass "setup with stub claude image exits 0"
     else
         local setup_err
@@ -8118,7 +8119,7 @@ test_interrupted_setup() {
     local img="interrupted-$$"
 
     # Start building an image in the background
-    "$BINARY" setup -y --image "$img" --profile python,node \
+    "$BINARY" setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img" --profile python,node \
         >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
     local setup_pid=$!
 
@@ -8154,7 +8155,7 @@ test_interrupted_setup() {
     pass "setup killed mid-build (SIGKILL)"
 
     # Retry — setup should clean up leftover state and succeed
-    if coop setup -y --image "$img" --profile python,node; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img" --profile python,node; then
         pass "setup succeeds after interrupted build"
     else
         fail "setup succeeds after interrupted build" "exit code: $?"
@@ -8785,7 +8786,7 @@ test_provision_failure() {
     # Reuse the exact default-image definition built by test_setup. Omitting
     # the suite profiles here changes the provision hash and legitimately makes
     # the Lima image stale, which cannot be attributed to the named failure.
-    local default_setup=(setup -y)
+    local default_setup=(setup -y "${SETUP_TIMEOUT_ARGS[@]}")
     if [[ -n "$PROFILES" ]]; then
         default_setup+=(--profile "$PROFILES")
     fi
@@ -8800,12 +8801,13 @@ test_provision_failure() {
 
     # Inject a failure into the provision script via env var.
     # The coop checks COOP_TEST_INJECT_PROVISION_FAILURE and
-    # appends 'exit 1' to the provision script before cleanup.
+    # injects 'exit 1' into the provision script.
     # Use a separate image so the already-built default stays available.
     local failed_image="provision-failure-$$"
     local rc=0
     local err
     COOP_TEST_INJECT_PROVISION_FAILURE=1 "$BINARY" --config "$SUITE_CONFIG" setup -y \
+        "${SETUP_TIMEOUT_ARGS[@]}" \
         --image "$failed_image" >/dev/null 2>"$tmpdir/pf-stderr" || rc=$?
     err=$(cat "$tmpdir/pf-stderr")
 
@@ -8820,7 +8822,9 @@ test_provision_failure() {
     # Error message should mention the failure clearly (check stderr
     # separately — stdout can be enormous with apt output, and piping
     # the combined string through echo+grep can lose content)
-    if grep -qi "provision.*fail\|failed\|error" "$tmpdir/pf-stderr"; then
+    if [[ "$(uname -s)" == Darwin ]] && [[ "$err" == *"Lima builder provisioning failed"* ]]; then
+        pass "error message identifies the failed Lima provision script"
+    elif [[ "$(uname -s)" != Darwin ]] && grep -qi "provision.*fail\|failed\|error" "$tmpdir/pf-stderr"; then
         pass "error message mentions failure"
     else
         fail "error message mentions failure" "stderr: $err"
@@ -8938,7 +8942,7 @@ test_guest_user_alt() {
     # Setup a separate image whose `template_config.json` should record
     # guest_user=vscode and whose first boot should create the vscode
     # account at uid 1000.
-    if coop setup -y --image "$img_name" --guest-user "$alt_user"; then
+    if coop setup -y "${SETUP_TIMEOUT_ARGS[@]}" --image "$img_name" --guest-user "$alt_user"; then
         pass "setup --guest-user $alt_user exits 0"
     else
         fail "setup --guest-user $alt_user exits 0" "exit code: $? stderr: $HARNESS_ERR"
