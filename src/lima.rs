@@ -25,6 +25,7 @@ use crate::sha256_hash::Sha256Hash;
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
 const DEFAULT_BUILDER_PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
+const LIMA_SSH_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -153,7 +154,7 @@ pub fn create_and_start(
         &inst.name,
         &mut child,
         cfg,
-        Duration::from_secs(180),
+        LIMA_SSH_READY_TIMEOUT,
         &guest_user,
     ) {
         let _ = child.kill();
@@ -234,7 +235,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         &inst.name,
         &mut child,
         cfg,
-        Duration::from_secs(180),
+        LIMA_SSH_READY_TIMEOUT,
         &guest_user,
     ) {
         let _ = child.kill();
