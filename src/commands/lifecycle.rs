@@ -2320,8 +2320,8 @@ pub(crate) fn cmd_status(
         if json_out {
             return json::render_json(&instance_status(be, cfg, &inst)?);
         }
-        let report = match be.as_running(cfg, inst.clone())? {
-            Some(running) => be.status(cfg, &running)?,
+        let report = match be.status_named(cfg, &inst)? {
+            Some(report) => report,
             None => format!(
                 "Instance '{}' (stopped)\n  Backend: {be}\n  Image: {}\n  Network: {}",
                 inst.name,
