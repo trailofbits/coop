@@ -40,6 +40,7 @@ jobs:
           ./tests/run-integration.sh --full --shard "$SHARD" 2>&1 | tee "$RUNNER_TEMP/macos-lifecycle-split-trial.log"
       - name: Upload integration output
         if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-lifecycle-${{ matrix.shard }}-trial-log
