@@ -144,6 +144,9 @@ Creating an instance (`coop up`) follows this sequence:
    supplies its default seccomp filters, but those filters do not provide
    jailer confinement.
 7. Records the systemd main PID for compatibility and waits for SSH to become reachable.
+8. If `--mount` was specified, rsyncs the host directory into the guest. This
+   is a one-time copy, not a live mount. Use `coop push` to update the guest;
+   use `coop pull --dir <new-directory>` to retrieve guest changes for review.
 
 A running legacy direct-launch VM remains manageable until it stops. Its next
 start uses the system service. A failed start or guest boot timeout retains the
@@ -151,15 +154,13 @@ instance disk. If systemd cannot confirm a service's process state, coop leaves
 the PID, sockets, TAP, and disk for inspection instead of treating the VM as
 stopped. The service unit name appears in `coop status` while a managed VMM is
 running.
-8. If `--mount` was specified, rsyncs the host directory into the guest. This
-   is a one-time copy, not a live mount. Use `coop push` to update the guest;
-   use `coop pull --dir <new-directory>` to retrieve guest changes for review.
 
 The code uses a typestate pattern (`Configured` then `Running`) to enforce valid lifecycle transitions at compile time.
 
 Stopping a VM requests a guest reboot over SSH and waits up to ten seconds for
-Firecracker to exit. If the process does not exit, coop falls back to `SIGTERM`,
-then `SIGKILL`.
+Firecracker to exit. If a managed VMM remains active, coop asks systemd to stop
+its service and waits for the service cgroup to empty. A legacy direct-launch
+VMM instead falls back to `SIGTERM`, then `SIGKILL`.
 
 ### TAP networking (`open` mode)
 

@@ -83,6 +83,15 @@ if [[ -z "$BINARY" ]]; then
     exit 1
 fi
 
+# One KVM shard runs with a literal systemd expansion token in its home path.
+# The default data_dir, generated Firecracker config, and log all inherit it,
+# so a real VM boot checks that systemd-run preserves those path bytes.
+if [[ "${COOP_TEST_LITERAL_DOLLAR_HOME:-0}" == 1 ]]; then
+    test_home_root=$(mktemp -d)
+    export HOME="$test_home_root/coop-\${COOP_SYSTEMD_PATH_LITERAL}"
+    mkdir -m 700 "$HOME"
+fi
+
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
 # on stdin being a TTY. Under CI stdin is already not a TTY, but when the suite runs from an interactive shell (the release
 # preflight) those prompts would read real keystrokes and block. Redirecting the
@@ -298,6 +307,10 @@ cleanup() {
 
     if [[ -d "${ws_tmpdir:-}" ]]; then
         rm -rf "$ws_tmpdir"
+    fi
+
+    if [[ -d "${test_home_root:-}" ]]; then
+        rm -rf "$test_home_root"
     fi
 }
 
@@ -814,6 +827,16 @@ EOF
             fail "Firecracker PID belongs to its systemd service and cgroup" \
                 "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
         fi
+        if [[ "${COOP_TEST_LITERAL_DOLLAR_HOME:-0}" == 1 ]]; then
+            if [[ "$HOME" == *'${COOP_SYSTEMD_PATH_LITERAL}'* \
+                && -f "$HOME/.coop/instances/$INSTANCE/vm_config.json" \
+                && -f "$HOME/.coop/instances/$INSTANCE/firecracker.log" ]]; then
+                pass "Firecracker opens config and log beneath a literal dollar data directory"
+            else
+                fail "Firecracker opens config and log beneath a literal dollar data directory" \
+                    "expected config and log beneath the configured home path"
+            fi
+        fi
     fi
 
     local copied_file="" env_value=""
@@ -836,6 +859,53 @@ EOF
     else
         fail "up ignores discovered devcontainer postStartCommand and postCreateCommand" \
             "marker exists or guest check failed: $(guest_stderr)"
+    fi
+}
+
+test_firecracker_rejects_pid_outside_service_cgroup() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: mismatched Firecracker service cgroup ==="
+
+    local pid unit group child
+    pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+    unit=$(systemctl whoami "$pid" 2>/dev/null || true)
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ || "$unit" != coop-vmm-*.service ]]; then
+        fail "mismatched cgroup fixture has a supervised Firecracker PID"
+        return
+    fi
+    group="/sys/fs/cgroup/system.slice/$unit"
+    child="$group/coop-test-mismatch"
+    if ! sudo -n mkdir "$child"; then
+        fail "create child cgroup for Firecracker identity check"
+        return
+    fi
+    if ! printf '%s\n' "$pid" | sudo -n tee "$child/cgroup.procs" >/dev/null; then
+        fail "move Firecracker PID into child cgroup"
+        sudo -n rmdir "$child" 2>/dev/null || true
+        return
+    fi
+
+    if [[ "$(cat "/proc/$pid/cgroup" 2>/dev/null)" != "0::/system.slice/$unit/coop-test-mismatch" ]]; then
+        fail "mismatched cgroup fixture moved the Firecracker PID"
+    elif coop_fails status "$INSTANCE" \
+        && [[ "$HARNESS_ERR" == *"outside its systemd cgroup"* ]]; then
+        pass "status rejects a Firecracker PID outside its service cgroup"
+    else
+        fail "status rejects a Firecracker PID outside its service cgroup" \
+            "status succeeded or failed for a different reason"
+    fi
+
+    if ! printf '%s\n' "$pid" | sudo -n tee "$group/cgroup.procs" >/dev/null \
+        || ! sudo -n rmdir "$child"; then
+        fail "restore Firecracker PID to its service cgroup"
+        return
+    fi
+    if coop status "$INSTANCE"; then
+        pass "status succeeds after restoring the Firecracker service cgroup"
+    else
+        fail "status succeeds after restoring the Firecracker service cgroup" \
+            "stderr: $HARNESS_ERR"
     fi
 }
 
@@ -9386,6 +9456,7 @@ EOF
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
         run_timed_test test_up_creates_primary_instance
+        run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
         run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
         run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
         run_timed_test test_private_storage

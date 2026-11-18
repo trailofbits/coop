@@ -1,6 +1,9 @@
 //! Systemd's system manager owns the runtime VMM identity and process group.
 
-use std::os::unix::ffi::OsStrExt as _;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::Path;
 use std::time::Duration;
 
@@ -83,6 +86,20 @@ fn new_unit(inst: &Instance) -> Result<String> {
         prefix(inst)?,
         hex::encode(generation)
     ))
+}
+
+// systemd expands $NAME and ${NAME} in ExecStart arguments even when
+// systemd-run receives them as separate argv entries. $$ preserves a literal
+// dollar sign, including in non-UTF-8 path components.
+fn escape_service_argument(argument: &OsStr) -> OsString {
+    let mut escaped = Vec::with_capacity(argument.as_bytes().len());
+    for byte in argument.as_bytes() {
+        escaped.push(*byte);
+        if *byte == b'$' {
+            escaped.push(b'$');
+        }
+    }
+    OsString::from_vec(escaped)
 }
 
 fn systemctl_query() -> Result<Cmd> {
@@ -258,11 +275,11 @@ pub(crate) fn launch(
         ])
         .arg(format!("--unit={unit}"))
         .arg("--")
-        .arg(firecracker.path())
+        .arg(escape_service_argument(firecracker.path().as_os_str()))
         .args(["--no-api", "--config-file"])
-        .arg(config)
+        .arg(escape_service_argument(config.as_os_str()))
         .arg("--log-path")
-        .arg(log)
+        .arg(escape_service_argument(log.as_os_str()))
         .args(["--level", "Info"]);
     let status =
         crate::process_output::run_status_bounded(&mut launch.build(), START_DEADLINE, None)
@@ -314,10 +331,36 @@ fn inspect_state(unit: &str) -> Result<ServiceProbe> {
         .arg(unit)
         .capture()
         .with_context(|| format!("Cannot inspect Firecracker service {unit}"))?;
-    parse_service_state(unit, &show)
+    parse_service_state(unit, &show, || service_cgroup_empty(unit))
 }
 
-fn parse_service_state(unit: &str, show: &str) -> Result<ServiceProbe> {
+fn service_cgroup_empty(unit: &str) -> Result<bool> {
+    service_cgroup_empty_at(Path::new("/sys/fs/cgroup"), unit)
+}
+
+fn service_cgroup_empty_at(root: &Path, unit: &str) -> Result<bool> {
+    // The service ControlGroup is a cgroup-v2 path. On another hierarchy we
+    // cannot infer process death from a missing path under this mount.
+    let system_slice = root.join("system.slice");
+    if !root.join("cgroup.controllers").exists() || !system_slice.is_dir() {
+        return Ok(false);
+    }
+    let group = system_slice.join(unit);
+    match fs::metadata(&group) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).context("Cannot inspect Firecracker service cgroup"),
+        Ok(_) => {}
+    }
+    let events = fs::read_to_string(group.join("cgroup.events"))
+        .context("Cannot read Firecracker service cgroup events")?;
+    Ok(events.lines().any(|line| line == "populated 0"))
+}
+
+fn parse_service_state(
+    unit: &str,
+    show: &str,
+    cgroup_empty: impl FnOnce() -> Result<bool>,
+) -> Result<ServiceProbe> {
     if !show.lines().any(|line| line == format!("Id={unit}")) {
         bail!("Systemd returned a different Firecracker service identity");
     }
@@ -329,10 +372,18 @@ fn parse_service_state(unit: &str, show: &str) -> Result<ServiceProbe> {
         "active" => parse_active_service(unit, show).map(ServiceProbe::Active),
         "inactive" | "failed" => {
             let main_gone = show.lines().any(|line| line == "MainPID=0");
-            let tasks_gone = show
+            let expected_group = format!("ControlGroup=/system.slice/{unit}");
+            let group_matches = show
                 .lines()
-                .any(|line| line == "TasksCurrent=0" || line == "TasksCurrent=[not set]");
-            if !main_gone || !tasks_gone {
+                .any(|line| line == "ControlGroup=" || line == expected_group);
+            let tasks_gone = if show.lines().any(|line| line == "TasksCurrent=0") {
+                true
+            } else if show.lines().any(|line| line == "TasksCurrent=[not set]") {
+                cgroup_empty()?
+            } else {
+                false
+            };
+            if !main_gone || !group_matches || !tasks_gone {
                 return Ok(ServiceProbe::Uncertain(format!(
                     "Firecracker service {unit} is {state} but process death is unconfirmed"
                 )));
@@ -478,21 +529,78 @@ mod tests {
             "Id={unit}\nActiveState=failed\nMainPID=0\nTasksCurrent=[not set]\nControlGroup=\n"
         );
         assert_eq!(
-            parse_service_state(unit, &failed).unwrap(),
+            parse_service_state(unit, &failed, || Ok(true)).unwrap(),
             ServiceProbe::None
         );
         assert!(matches!(
+            parse_service_state(unit, &failed, || Ok(false)).unwrap(),
+            ServiceProbe::Uncertain(_)
+        ));
+        assert!(matches!(
             parse_service_state(
                 unit,
-                &failed.replace("TasksCurrent=[not set]", "TasksCurrent=1")
+                &failed.replace("TasksCurrent=[not set]", "TasksCurrent=1"),
+                || Ok(true)
             )
             .unwrap(),
             ServiceProbe::Uncertain(_)
         ));
         assert!(matches!(
-            parse_service_state(unit, &failed.replace("MainPID=0", "MainPID=123")).unwrap(),
+            parse_service_state(unit, &failed.replace("MainPID=0", "MainPID=123"), || Ok(
+                true
+            ))
+            .unwrap(),
             ServiceProbe::Uncertain(_)
         ));
-        assert!(parse_service_state(unit, &failed.replace(unit, "other.service")).is_err());
+        assert!(matches!(
+            parse_service_state(
+                unit,
+                &failed.replace("ControlGroup=", "ControlGroup=/user.slice/other.service"),
+                || Ok(true)
+            )
+            .unwrap(),
+            ServiceProbe::Uncertain(_)
+        ));
+        assert!(
+            parse_service_state(unit, &failed.replace(unit, "other.service"), || Ok(true)).is_err()
+        );
+        assert_eq!(
+            parse_service_state(
+                unit,
+                &failed.replace("TasksCurrent=[not set]", "TasksCurrent=0"),
+                || Ok(false)
+            )
+            .unwrap(),
+            ServiceProbe::None
+        );
+    }
+
+    #[test]
+    fn service_cgroup_requires_absence_or_unpopulated_v2_group() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let unit = "coop-vmm-test.service";
+        assert!(!service_cgroup_empty_at(root.path(), unit).unwrap());
+        fs::write(root.path().join("cgroup.controllers"), "").unwrap();
+        assert!(!service_cgroup_empty_at(root.path(), unit).unwrap());
+        fs::create_dir(root.path().join("system.slice")).unwrap();
+        assert!(service_cgroup_empty_at(root.path(), unit).unwrap());
+
+        let group = root.path().join("system.slice").join(unit);
+        fs::create_dir_all(&group).unwrap();
+        fs::write(group.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(!service_cgroup_empty_at(root.path(), unit).unwrap());
+        fs::write(group.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(service_cgroup_empty_at(root.path(), unit).unwrap());
+        fs::remove_file(group.join("cgroup.events")).unwrap();
+        assert!(service_cgroup_empty_at(root.path(), unit).is_err());
+    }
+
+    #[test]
+    fn service_argument_keeps_dollar_bytes_literal() {
+        let raw = OsStr::from_bytes(b"/tmp/coop-${NAME}/invalid-\xff-$HOME");
+        assert_eq!(
+            escape_service_argument(raw).as_bytes(),
+            b"/tmp/coop-$${NAME}/invalid-\xff-$$HOME"
+        );
     }
 }
