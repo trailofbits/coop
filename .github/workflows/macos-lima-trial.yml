@@ -34,12 +34,10 @@ jobs:
       - name: Install host prerequisites
         run: |
           brew install cmake
-          mkdir -p "$RUNNER_TEMP/lima"
           curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
           echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
-          tar -xzf "$RUNNER_TEMP/lima.tgz" -C "$RUNNER_TEMP/lima"
-          echo "$RUNNER_TEMP/lima/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/lima/bin/limactl" --version
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+          /usr/local/bin/limactl --version
 
       - name: Full Lima integration
         timeout-minutes: 105
