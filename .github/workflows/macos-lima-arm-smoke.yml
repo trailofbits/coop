@@ -1,0 +1,31 @@
+name: macOS ARM Lima smoke
+
+on:
+  push:
+    branches: [ci/macos-lima-arm-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  lima-vz:
+    runs-on: macos-15
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Lima
+        run: brew install lima
+
+      - name: Boot and contact a VZ guest
+        run: |
+          uname -m
+          limactl --version
+          limactl start --tty=false --timeout=10m --vm-type=vz \
+            --cpus=1 --memory=1 --disk=8 --name=ci-smoke template://ubuntu
+          limactl shell ci-smoke -- uname -s
+
+      - name: Clean up
+        if: ${{ always() }}
+        run: limactl delete -f ci-smoke || true
