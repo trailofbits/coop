@@ -15,15 +15,17 @@ express the preserved behavior and verify they still detect a relevant regressio
 The `VM integration` workflow runs the full suite across twelve disposable
 GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
 four on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
-on manual dispatch. To test a feature branch, run
-`gh workflow run integration.yml --ref BRANCH`. Each runner executes
+on pull requests and manual dispatch. Agents can trigger both backends by
+pushing a pull-request branch; a manual branch run is available with
+`gh workflow run integration.yml --ref BRANCH` when the caller has Actions
+write permission. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
 VM sequence together, `workspace` covers independent workspace phases,
 `config` covers configuration, alternate guest-user, proxy, and setup recovery,
 and `features` covers commit/restore plus independent profile, guest-file, and
 configuration-source phases. The `config`
 shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
-It does not run automatically for pull requests or pushes.
+New pushes to a pull-request branch cancel the previous integration run.
 It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
 integration output per OS and shard as a seven-day artifact. Linux suite steps
 have a 30-minute timeout (35 minutes for the job); macOS suite steps have a
