@@ -98,9 +98,11 @@ exclude_re = [
   # invoke the interactive wizard, or update the config file. Keep the pure
   # prompt-decision logic in mutation scope.
   "src/pat_prompt\\.rs:.*\\bmaybe_prompt\\b",
-  "src/pat_prompt\\.rs:.*\\brefresh_github_from_disk\\b",
-  "src/pat_prompt\\.rs:.*\\brun_wizard_or_recover\\b",
-  "src/pat_prompt\\.rs:.*\\bexplain_probe_failure\\b",
+  "src/pat_prompt\\.rs:.*\\bfinish_choice\\b",
+  "src/pat_prompt\\.rs:.*\\bbind_after_wizard\\b",
+  "src/pat_prompt\\.rs:.*\\bfor_instance\\b",
+  "src/pat_prompt\\.rs:.*\\bprompt_state\\b",
+  "src/pat_prompt\\.rs:.*\\bsave_never\\b",
   # Best-effort fallback for unwinding after an early return. Explicit restore
   # and PTY tests cover the ordinary success/error paths.
   "src/prompt\\.rs:.*<impl Drop for EchoGuard",

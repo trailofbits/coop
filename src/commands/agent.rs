@@ -203,9 +203,8 @@ pub(crate) fn cmd_agent_update(
     // for the confirmation prompt and messages without a second lookup.
     let running = resolve_running(be, cfg, name)?;
     let inst_name = running.instance().name.to_string();
-    let repo = backend::detect_instance_repo(running.instance());
     let (inst, target) = running.into_parts();
-    let session = prepare_session_from_target(cfg, &inst, target, repo.as_ref())?;
+    let session = prepare_session_from_target(cfg, &inst, target)?;
 
     if opts.check {
         return run_check(&session, opts.selection);
