@@ -71,7 +71,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features|workspace-early|workspace-multi|workspace-late|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
+    lifecycle|workspace|config|features|workspace-early|workspace-multi|workspace-late|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9253,7 +9253,7 @@ EOF
         run_timed_test test_port_forwards
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late || "$SHARD" == workspace-sync ) ]]; then
         run_timed_test test_workspace_sync
         run_timed_test test_appledouble_sidecars
     fi
@@ -9262,10 +9262,13 @@ EOF
         run_timed_test test_multi_instance
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late || "$SHARD" == workspace-profiles ) ]]; then
         run_timed_test test_custom_profiles
         run_timed_test test_builtin_profile_plugins
         run_timed_test test_post_start
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late || "$SHARD" == workspace-hooks ) ]]; then
         run_timed_test test_creation_hooks
         run_timed_test test_creation_hook_cancellation
         run_timed_test test_creation_failed_descendants
