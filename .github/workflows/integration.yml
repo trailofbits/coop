@@ -1,4 +1,4 @@
-name: Firecracker integration
+name: VM integration
 
 on:
   schedule:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: firecracker-${{ github.ref }}
+  group: vm-integration-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,14 +17,24 @@ env:
 
 jobs:
   integration:
-    name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
+    name: Full integration (${{ matrix.shard }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
       matrix:
         shard: [lifecycle, workspace, config, features]
-        os: [ubuntu-24.04, ubuntu-26.04]
+        os: [ubuntu-24.04, ubuntu-26.04, macos-15-intel]
+        include:
+          - os: ubuntu-24.04
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-26.04
+            job_timeout: 35
+            suite_timeout: 30
+          - os: macos-15-intel
+            job_timeout: 120
+            suite_timeout: 105
     defaults:
       run:
         shell: bash
@@ -34,6 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Install host prerequisites
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y acl build-essential cmake curl e2fsprogs \
@@ -43,19 +54,25 @@ jobs:
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
       - name: Make room for VM images
+        if: runner.os == 'Linux'
         run: |
           df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           df -h /
           free -h
 
-      - name: Full Firecracker integration
-        timeout-minutes: 30
+      - name: Install macOS host prerequisites
+        if: runner.os == 'macOS'
+        run: brew install lima cmake
+
+      - name: Full VM integration
+        timeout-minutes: ${{ matrix.suite_timeout }}
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
           # Regular CI runs this host-only gate; do not repeat it in each shard.
           COOP_TEST_SKIP_BRIDGE: "1"
+          COOP_TEST_BUILDER_TIMEOUT: ${{ runner.os == 'macOS' && '30m' || '' }}
           SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
@@ -64,13 +81,13 @@ jobs:
             args+=(--require-proxy)
           fi
           ./tests/run-integration.sh "${args[@]}" 2>&1 \
-            | tee "$RUNNER_TEMP/firecracker-integration.log"
+            | tee "$RUNNER_TEMP/vm-integration.log"
 
       - name: Upload integration output
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: firecracker-integration-${{ matrix.os }}-${{ matrix.shard }}-log
-          path: ${{ runner.temp }}/firecracker-integration.log
+          name: vm-integration-${{ matrix.os }}-${{ matrix.shard }}-log
+          path: ${{ runner.temp }}/vm-integration.log
           if-no-files-found: ignore
           retention-days: 7

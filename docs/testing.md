@@ -12,10 +12,11 @@ change the production code. Investigate failures before changing expectations,
 including compiler errors from private interface changes. Update tests to
 express the preserved behavior and verify they still detect a relevant regression.
 
-The `Firecracker integration` workflow runs the full suite across eight
-disposable GitHub-hosted x64 runners: four on Ubuntu 24.04 and four on
-Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
-dispatch. Each runner executes
+The `VM integration` workflow runs the full suite across twelve disposable
+GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
+four on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
+on manual dispatch. To test a feature branch, run
+`gh workflow run integration.yml --ref BRANCH`. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
 VM sequence together, `workspace` covers independent workspace phases,
 `config` covers configuration, alternate guest-user, proxy, and setup recovery,
@@ -23,18 +24,19 @@ and `features` covers commit/restore plus independent profile, guest-file, and
 configuration-source phases. The `config`
 shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
-It enables
-`COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
-timeout (35 minutes for the job including prerequisites and artifact upload).
+It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
+integration output per OS and shard as a seven-day artifact. Linux suite steps
+have a 30-minute timeout (35 minutes for the job); macOS suite steps have a
+105-minute timeout (120 minutes for the job) and allow 30 minutes for golden
+image provisioning.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
-complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
-integration remains a separate platform gate.
+complete sequential suite. The Linux jobs cover Firecracker; the macOS jobs
+cover Lima.
 The runner logs `TIMING build:*` durations, and the suite logs `TIMING test:*`
 durations, so shard logs show which work is on the critical path.
-The KVM matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs that
-host-only gate. Unsharded full runs still include it.
+The matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs the Linux
+host-only bridge gate. Unsharded full runs still include it on Linux.
 
 ## Cross-platform compile and lint checks
 
@@ -312,9 +314,9 @@ native release.
 VM suite on the selected local or remote host. A failure stops the full run;
 macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables it.
 Remote bridge-gate runs copy the tracked working-tree source and require the
-build and namespace prerequisites below on the remote host. The KVM matrix sets
-`COOP_TEST_SKIP_BRIDGE=1` so its four shards do not repeat the gate already
-run by regular Linux CI.
+build and namespace prerequisites below on the remote host. The VM integration
+matrix sets `COOP_TEST_SKIP_BRIDGE=1` so its Linux shards do not repeat the gate
+already run by regular Linux CI.
 
 Run `./tests/integration-network.sh` directly on Linux to test bridge-port
 isolation without KVM or VM images. It builds a library test as the current

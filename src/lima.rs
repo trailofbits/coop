@@ -1196,20 +1196,13 @@ fn build_golden_image(
         tracing::debug!("Failed to remove stale staging image (non-fatal): {e}");
     }
 
-    // Generate builder template with full provisioning
+    // Generate the minimal Lima builder template.
     let builder_template = cfg.data_dir.join("lima-builder.yaml");
     let data_dir = PrivateDir::open_existing(&cfg.data_dir)?;
     let builder_template_name = builder_template
         .file_name()
         .context("Builder template has no name")?;
-    write_builder_template(
-        &data_dir,
-        &builder_template,
-        cfg,
-        pubkey.trim(),
-        profiles,
-        guest_user,
-    )?;
+    write_builder_template(&data_dir, &builder_template, cfg)?;
 
     report_builder_inputs(profiles);
 
@@ -1219,6 +1212,7 @@ fn build_golden_image(
         profiles,
         &staging,
         &builder_template,
+        pubkey.trim(),
         guest_user,
         builder_timeout,
     );
@@ -1310,16 +1304,10 @@ fn cleanup_builder(data_dir: &PrivateDir, template_name: &OsStr) {
     }
 }
 
-fn write_builder_template(
-    dir: &PrivateDir,
-    path: &Path,
-    cfg: &CoopConfig,
-    pubkey: &str,
-    profiles: &[ProfileDef],
-    guest_user: &GuestUser,
-) -> Result<()> {
-    let script = compose_provision_script(pubkey, profiles, guest_user);
-    let yaml = compose_template_yaml(cfg, &script)?;
+fn write_builder_template(dir: &PrivateDir, path: &Path, cfg: &CoopConfig) -> Result<()> {
+    // Keep Lima's cloud-init phase short. Its host agent has a fixed boot
+    // readiness retry limit, so coop provisions after the VM is ready.
+    let yaml = compose_template_yaml(cfg, "#!/bin/bash\ntrue\n")?;
     dir.write_atomic_private(
         path.file_name().context("Builder template has no name")?,
         yaml.as_bytes(),
@@ -1335,10 +1323,11 @@ fn run_builder_vm(
     profiles: &[ProfileDef],
     output_path: &std::path::Path,
     builder_template: &std::path::Path,
+    ssh_pubkey: &str,
     guest_user: &GuestUser,
     builder_timeout: Option<Duration>,
 ) -> Result<BakedLists> {
-    eprintln!("  Starting builder VM and installing packages...");
+    eprintln!("  Starting builder VM...");
     check_writable_mounts(cfg, &[])?;
     let mut command = headless_limactl_start()?;
     if let Some(timeout) = builder_timeout {
@@ -1358,14 +1347,13 @@ fn run_builder_vm(
         bail!("Failed to build golden image — limactl start failed.");
     }
 
-    // limactl start returns exit 0 even when the provision script
-    // fails — it only waits for SSH, not cloud-init completion.
-    // Verify cloud-init finished successfully before proceeding.
+    // Confirm Lima's base cloud-init completed before provisioning through SSH.
     verify_cloud_init_status(builder_timeout)?;
 
+    run_builder_provision_script(cfg, ssh_pubkey, profiles, guest_user, builder_timeout)?;
+
     // Verify critical binaries are installed before extracting the
-    // image. Cloud-init can report "done" even if individual install
-    // steps failed silently (e.g. network timeout during download).
+    // image. Installers can report success while leaving binaries absent.
     verify_builder_binaries(guest_user)?;
 
     // Install marketplaces and plugins into the builder VM so they're
@@ -1437,6 +1425,55 @@ fn run_builder_vm(
             )
         })?;
     Ok(baked)
+}
+
+/// Run coop provisioning through Lima SSH after its base boot has completed.
+fn run_builder_provision_script(
+    cfg: &CoopConfig,
+    ssh_pubkey: &str,
+    profiles: &[ProfileDef],
+    guest_user: &GuestUser,
+    builder_timeout: Option<Duration>,
+) -> Result<()> {
+    eprintln!("  Installing packages and agent CLIs in builder VM...");
+    let mut script_file = tempfile::Builder::new()
+        .prefix("lima-provision-")
+        .tempfile_in(&cfg.data_dir)
+        .context("Failed to stage Lima provision script")?;
+    script_file
+        .write_all(compose_provision_script(ssh_pubkey, profiles, guest_user).as_bytes())
+        .context("Failed to write Lima provision script")?;
+
+    let mut child = private_limactl()?
+        .args(["shell", BUILDER_NAME, "--", "sudo", "bash", "-s"])
+        .stdin(Stdio::from(script_file.reopen()?))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to launch provisioning in Lima builder")?;
+
+    let timeout = builder_timeout.unwrap_or(Duration::from_secs(600));
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => bail!("Lima builder provisioning failed: {status}"),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "Lima builder provisioning timed out after {}",
+                    crate::format_duration(timeout)
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("Failed to wait for Lima builder provisioning");
+            }
+        }
+    }
 }
 
 /// Get an SSH target for the builder VM.
@@ -1602,13 +1639,9 @@ fn dump_builder_logs() {
     eprintln!("  --- End diagnostic logs ---\n");
 }
 
-/// Verify cloud-init completed without errors in the builder VM.
-///
-/// `limactl start` returns exit 0 as soon as SSH is reachable, even
-/// if the provision script failed. `cloud-init status --wait` blocks
-/// until cloud-init finishes and returns exit 1 on error.
+/// Verify Lima's base cloud-init completed without errors in the builder VM.
 fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
-    eprintln!("  Verifying provision script completed...");
+    eprintln!("  Verifying Lima base cloud-init completed...");
     let mut args = vec![
         "shell".to_string(),
         BUILDER_NAME.to_string(),
@@ -1635,7 +1668,7 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     let cloud_init_result = if status == Some(124) {
         match builder_timeout {
             Some(timeout) => Err(anyhow::anyhow!(
-                "Builder provisioning timed out after {}",
+                "Lima base cloud-init timed out after {}",
                 crate::format_duration(timeout),
             )),
             None => check_cloud_init_output(status, &stdout),
@@ -1690,7 +1723,7 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
     Ok(())
 }
 
-/// Check cloud-init status output to determine if provisioning succeeded.
+/// Check whether Lima's base cloud-init succeeded.
 ///
 /// Cloud-init 24.x exit codes:
 ///   0 — status: done (clean)
@@ -1699,12 +1732,12 @@ fn verify_cloud_init_status(builder_timeout: Option<Duration>) -> Result<()> {
 ///
 /// Exit code 2 ("degraded done") is acceptable — Lima's cloud-config
 /// triggers deprecation warnings (e.g., `ssh-authorized-keys` vs
-/// `ssh_authorized_keys`) that don't affect provisioning.
+/// `ssh_authorized_keys`) that don't affect the base boot.
 fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
     // Always fail if stdout explicitly reports an error status
     if stdout.contains("status: error") {
         bail!(
-            "Provision script failed in builder VM.\n\
+            "Lima base cloud-init failed in builder VM.\n\
              cloud-init status: {}",
             stdout.trim(),
         );
@@ -1719,7 +1752,7 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "Provision script failed in builder VM.\n\
+        "Lima base cloud-init failed in builder VM.\n\
          cloud-init status: {}",
         stdout.trim(),
     );
@@ -1727,9 +1760,8 @@ fn check_cloud_init_output(exit_code: Option<i32>, stdout: &str) -> Result<()> {
 
 /// Verify that critical binaries are installed in the builder VM.
 ///
-/// Runs after cloud-init completes but before extracting the disk
-/// image. Catches silent install failures (e.g. network timeouts)
-/// that cloud-init doesn't flag as errors.
+/// Runs after coop provisioning but before extracting the disk image.
+/// Catches installers that exit successfully without installing a binary.
 fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
     crate::guest::verify_required_binaries(
         guest_user,
@@ -1749,41 +1781,8 @@ fn verify_builder_binaries(guest_user: &GuestUser) -> Result<()> {
                 .status()
                 .is_ok_and(|s| s.success()))
         },
-        builder_log_tail,
+        String::new,
     )
-}
-
-/// Tail of the builder's cloud-init log, formatted as a trailing section for
-/// the missing-binaries error. Empty when the log is unavailable or blank.
-fn builder_log_tail() -> String {
-    let log_tail = private_limactl()
-        .ok()
-        .and_then(|mut command| {
-            command
-                .args([
-                    "shell",
-                    BUILDER_NAME,
-                    "--",
-                    "sudo",
-                    "tail",
-                    "-n",
-                    "50",
-                    "/var/log/cloud-init-output.log",
-                ])
-                .output()
-                .ok()
-        })
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    if log_tail.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nLast 50 lines of cloud-init-output.log:\n{}",
-            log_tail.trim()
-        )
-    }
 }
 
 fn generate_start_template(cfg: &CoopConfig, image: &ImageName) -> Result<()> {
@@ -3729,7 +3728,7 @@ mod tests {
         let result = check_cloud_init_output(Some(1), "status: error\n");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Provision script failed"));
+        assert!(msg.contains("Lima base cloud-init failed"));
         assert!(msg.contains("status: error"));
     }
 
@@ -3970,6 +3969,25 @@ mod tests {
             "codex-yolo should route through the account wrapper so keyring \
              mode works from an in-guest shell",
         );
+    }
+
+    #[test]
+    fn builder_boot_template_defers_coop_provisioning() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = PrivateDir::create(root.path()).unwrap();
+        let path = root.path().join("builder.yaml");
+        write_builder_template(&dir, &path, &CoopConfig::default()).unwrap();
+
+        let yaml: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let boot = yaml["provision"][0]["script"].as_str().unwrap();
+        assert!(!boot.contains("apt-get install"));
+        assert!(!boot.contains("Installing Codex CLI"));
+
+        let provision =
+            compose_provision_script("ssh-ed25519 AAAA test@test", &[], &GuestUser::default());
+        assert!(provision.contains("apt-get install"));
+        assert!(provision.contains("Installing Codex CLI"));
     }
 
     #[test]
