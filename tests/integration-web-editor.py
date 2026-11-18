@@ -4,10 +4,12 @@
 import argparse
 import contextlib
 import http.client
+import os
 from pathlib import Path
 import queue
 import re
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -271,6 +273,91 @@ rm -rf -- "$fixture"
                        check=True, capture_output=True, timeout=30)
 
 
+def bounded_guest_probe(command, name, probe):
+    # `coop shell` streams output; `coop exec` buffers guest output without a
+    # limit. Read at most one small status line from the untrusted VM.
+    try:
+        child = subprocess.Popen(command + ["shell", name, "--", "python3", "-c", probe],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    output = bytearray()
+    deadline = time.monotonic() + 15
+    completed = False
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([child.stdout], [], [], max(0, deadline - time.monotonic()))
+            if not readable:
+                break
+            chunk = os.read(child.stdout.fileno(), 257 - len(output))
+            if not chunk:
+                remaining = max(0, deadline - time.monotonic())
+                status = child.wait(timeout=remaining)
+                completed = True
+                return status, bytes(output)
+            output.extend(chunk)
+            if len(output) > 256:
+                break
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        if not completed:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        child.stdout.close()
+    return None
+
+
+def failure_snapshot(command, name):
+    # Only fixed labels and bounded counts reach the public CI log. Guest logs
+    # can include agent output or secrets, so do not print journal text.
+    probe = r'''
+import subprocess
+
+def run(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+service = run(["systemctl", "show", "ssh.service", "--property=ActiveState,Result"])
+fields = dict(line.split("=", 1) for line in service.stdout.splitlines() if "=" in line) if service and service.returncode == 0 else {}
+active = fields.get("ActiveState")
+result = fields.get("Result")
+active = active if active in ("active", "inactive", "failed") else "unknown"
+result = result if result in ("success", "exit-code", "signal", "timeout") else "unknown"
+
+def count(args):
+    found = run(["sudo", "-n", "journalctl", "-q", "-b", "--since=-3min",
+                 "--no-pager", "--output=cat", "-n", "100", *args])
+    if found and found.returncode in (0, 1) and not found.stderr:
+        return str(min(len(found.stdout.splitlines()), 999))
+    return "unknown"
+
+oom = count(["-k", "-g", "Out of memory|Killed process"])
+ssh_warnings = count(["-u", "ssh.service", "-p", "warning"])
+print(f"sshd_active={active} sshd_result={result} kernel_oom_lines={oom} sshd_warning_lines={ssh_warnings}")
+'''
+    result = bounded_guest_probe(command, name, probe)
+    if result is not None:
+        code, output = result
+        line = output.decode("ascii", errors="ignore").strip()
+        if code == 0 and re.fullmatch(r"sshd_active=(active|inactive|failed|unknown) "
+                        r"sshd_result=(success|exit-code|signal|timeout|unknown) "
+                        r"kernel_oom_lines=(unknown|[0-9]{1,3}) "
+                        r"sshd_warning_lines=(unknown|[0-9]{1,3})", line):
+            print(f"EDITOR_FAILURE_SNAPSHOT guest_ssh=reachable {line}", flush=True)
+            return
+    print("EDITOR_FAILURE_SNAPSHOT guest_ssh=unavailable", flush=True)
+
+
 def vm(binary, name, config):
     command = [binary] + (["--config", config] if config else [])
     default_launch = command + ["editor", name, "--web"]
@@ -381,6 +468,11 @@ if __name__ == "__main__":
     parser.add_argument("--config")
     args = parser.parse_args()
     if args.binary and args.name:
-        vm(args.binary, args.name, args.config)
+        try:
+            vm(args.binary, args.name, args.config)
+        except Exception:
+            command = [args.binary] + (["--config", args.config] if args.config else [])
+            failure_snapshot(command, args.name)
+            raise
     else:
         parser.error("supply --binary and --name")

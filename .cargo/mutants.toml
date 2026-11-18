@@ -122,7 +122,10 @@ exclude_re = [
   "src/vsock_proxy\\.rs:.*\\b(read_fd|write_fd)\\b",
   "src/vsock_proxy\\.rs:.*Relay<.*>::(run|poll|read_stdin|write_guest|read_guest|check_guest_error|write_stdout|check_stdio_errors|finish_input)\\b",
   # Web editor orchestration is exercised by direct SSH and real VM fixtures.
-  "src/web_editor\\.rs:.*\\b(control|control_request|load|stop|run|check_project|wait_attached|serve_session|show|ssh_launch|nonblocking_pipe|finish|drop)\\b",
+  "src/web_editor\\.rs:.*\\b(control|control_request|load|stop|run|check_project|wait_attached|serve_session|show|ssh_launch|ssh_process_exit|nonblocking_pipe|finish|drop)\\b",
+  # The stderr reader consumes a live SSH pipe; its bounded category choice
+  # remains mutation-scoped in classify_ssh_diagnostic.
+  "src/web_editor\\.rs:.*SshDiagnostics<.*>::drain",
   # Disk identity flags have disjoint bits; XOR and OR yield identical open flags.
   "fs_util.rs:.*replace \\| with \\^ in PrivateDir::pin_existing_regular",
   # Creation-hook SSH execution and lifecycle orchestration require a guest.

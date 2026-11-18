@@ -59,7 +59,14 @@ lease() {
     else
         read_status=$?
         # EOF cancels immediately; a read timeout still honors the lease.
-        ((read_status > 128 && SECONDS < lease_deadline)) || exit 0
+        if ((read_status <= 128)); then
+            printf 'cancelled lease_stdin_eof\n' || true
+            exit 0
+        fi
+        if ((SECONDS >= lease_deadline)); then
+            printf 'cancelled lease_expired\n' || true
+            exit 0
+        fi
     fi
 }
 observe_launch() {
