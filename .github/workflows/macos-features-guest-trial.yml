@@ -1,0 +1,42 @@
+name: macOS features guest trial
+
+on:
+  push:
+    branches: [ci/macos-features-guest-trial]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install host prerequisites
+        shell: bash
+        run: |
+          brew install cmake
+          curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
+          echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+      - name: Run features-guest shard
+        timeout-minutes: 135
+        shell: bash
+        env:
+          COOP_TEST_DESTRUCTIVE: "1"
+          COOP_TEST_SKIP_BRIDGE: "1"
+          COOP_TEST_BUILDER_TIMEOUT: "30m"
+        run: |
+          set -o pipefail
+          ./tests/run-integration.sh --full --shard features-guest 2>&1 | tee "$RUNNER_TEMP/macos-features-guest-trial.log"
+      - name: Upload integration output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-features-guest-trial-log
+          path: ${{ runner.temp }}/macos-features-guest-trial.log
+          if-no-files-found: ignore
+          retention-days: 7

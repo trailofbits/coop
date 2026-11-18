@@ -1454,7 +1454,7 @@ fn run_builder_provision_script(
         .spawn()
         .context("Failed to launch provisioning in Lima builder")?;
 
-    let timeout = builder_timeout.unwrap_or(Duration::from_secs(600));
+    let timeout = builder_timeout.unwrap_or(Duration::from_secs(1800));
     let started = Instant::now();
     loop {
         match child.try_wait() {
