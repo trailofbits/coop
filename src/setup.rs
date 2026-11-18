@@ -32,6 +32,7 @@ pub(crate) const SETUP_TOOL_DEADLINE: Duration = Duration::from_secs(6 * 60 * 60
 // (`https://spec.ccfc.min.s3.amazonaws.com`) fails TLS wildcard-cert matching.
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
 const GH_RELEASES: &str = "https://github.com/firecracker-microvm/firecracker/releases";
+const FIRECRACKER_ARCHIVE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Monotonic version bumped when the base install script changes
 /// in a way that requires rebuilding templates.
@@ -226,8 +227,9 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     )?;
 
     eprintln!(
-        "\nSetup complete. All artifacts are in {}/",
-        cfg.data_dir.display()
+        "\nSetup complete. VM artifacts are in {}/; the managed Firecracker/jailer pair is in {}/.",
+        cfg.data_dir.display(),
+        crate::firecracker_install::release_dir().display()
     );
     eprintln!("Run `coop up` in a project directory to launch a VM.");
     Ok(())
@@ -1788,7 +1790,9 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     curl_output(
         &SetupTool::Curl
             .command()?
-            .args(["-fSL", "-o"])
+            .args(["-fSL", "--max-filesize"])
+            .arg(FIRECRACKER_ARCHIVE_MAX_BYTES.to_string())
+            .arg("-o")
             .arg(tarball.path())
             .arg(&url),
         Duration::from_secs(3600),
@@ -1828,10 +1832,7 @@ fn extract_firecracker_archive(
     arch: Architecture,
     expected: Sha256Hash,
 ) -> Result<tempfile::TempDir> {
-    let actual = Sha256Hash::of(fs::read(tarball).context("Failed to read Firecracker archive")?);
-    if actual != expected {
-        bail!("Firecracker release archive checksum does not match the pinned digest");
-    }
+    verify_firecracker_archive(tarball, expected, FIRECRACKER_ARCHIVE_MAX_BYTES)?;
     let strip_prefix = format!("release-{latest}-{arch}/firecracker-{latest}-{arch}");
     let gzip = SetupTool::Gzip.resolve()?;
     let extracted_dir = tempfile::Builder::new()
@@ -1879,6 +1880,32 @@ fn extract_firecracker_archive(
             .context("Failed to make Firecracker release component executable")?;
     }
     Ok(extracted_dir)
+}
+
+fn verify_firecracker_archive(tarball: &Path, expected: Sha256Hash, max_bytes: u64) -> Result<()> {
+    use sha2::Digest as _;
+
+    let mut file = fs::File::open(tarball).context("Failed to open Firecracker archive")?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count =
+            io::Read::read(&mut file, &mut buffer).context("Failed to read Firecracker archive")?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        if size > max_bytes {
+            bail!("Firecracker release archive exceeds the download size limit");
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual: Sha256Hash = hex::encode(hasher.finalize()).parse()?;
+    if actual != expected {
+        bail!("Firecracker release archive checksum does not match the pinned digest");
+    }
+    Ok(())
 }
 
 fn publish_managed_firecracker_pair(
@@ -1963,13 +1990,20 @@ fn publish_managed_firecracker_pair(
         crate::firecracker_install::verify_pair_at(&stage)
             .context("Staged Firecracker/jailer pair is not trusted")?;
         let destination = crate::firecracker_install::release_dir();
-        SetupTool::Mv
+        let publish = SetupTool::Mv
             .elevated()?
             .args(["-T", "--"])
             .arg(&stage)
             .arg(&destination)
-            .run_bounded(SETUP_TOOL_DEADLINE)
-            .context("Failed to publish the managed Firecracker/jailer pair")?;
+            .run_bounded(SETUP_TOOL_DEADLINE);
+        if let Err(error) = publish {
+            // A previous coop process may have exited while its privileged
+            // writer was still publishing. Its rename can win this race after
+            // our parent-only lock was acquired. Accept only the verified pair.
+            crate::firecracker_install::verify_pair().with_context(|| {
+                format!("Failed to publish the managed Firecracker/jailer pair: {error:#}")
+            })?;
+        }
         Ok::<(), anyhow::Error>(())
     })();
     if stage.exists() {
@@ -2687,6 +2721,7 @@ fn curl_exit_hint(code: Option<i32>) -> &'static str {
         Some(7) => "could not connect to the download host or proxy",
         Some(22) => "the server returned an HTTP error",
         Some(35) => "the TLS connection failed",
+        Some(63) => "the download exceeded its size limit",
         Some(60 | 77) => "the certificate trust configuration failed",
         _ => "check the host network and certificate configuration",
     }
@@ -3669,6 +3704,21 @@ mod tests {
         assert!(ensure_extracted_regular_file(&link).is_err());
         assert!(open_extracted_regular_file(&binary).is_ok());
         assert!(open_extracted_regular_file(&link).is_err());
+    }
+
+    #[test]
+    fn archive_verification_rejects_oversized_input_before_digest_match() {
+        let fixture = crate::test_support::private_tempdir().unwrap();
+        let tarball = fixture.path().join("release.tgz");
+        fs::write(&tarball, b"123456789").unwrap();
+        let expected = Sha256Hash::of(b"123456789");
+        assert!(verify_firecracker_archive(&tarball, expected, 9).is_ok());
+        assert!(
+            verify_firecracker_archive(&tarball, expected, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the download size limit")
+        );
     }
 
     #[cfg(target_os = "linux")]

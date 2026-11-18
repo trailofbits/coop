@@ -161,7 +161,6 @@ Creating an instance (`coop up`) follows this sequence:
 8. If `--mount` was specified, rsyncs the host directory into the guest. This
    is a one-time copy, not a live mount. Use `coop push` to update the guest;
    use `coop pull --dir <new-directory>` to retrieve guest changes for review.
-
 A running legacy root VMM, whether directly launched or already supervised,
 remains manageable until it stops. Its next start atomically publishes
 `firecracker.runtime.json` version 1 before using the jailer. An interrupted
@@ -182,8 +181,9 @@ is running.
 The code uses a typestate pattern (`Configured` then `Running`) to enforce valid lifecycle transitions at compile time.
 
 Stopping a VM requests a guest reboot over SSH and waits up to ten seconds for
-Firecracker to exit. If the process does not exit, coop falls back to `SIGTERM`,
-then `SIGKILL`.
+Firecracker to exit. If a managed VMM remains active, coop asks systemd to stop
+its service and waits for the service cgroup to empty. A legacy direct-launch
+VMM instead falls back to `SIGTERM`, then `SIGKILL`.
 
 ### TAP networking (`open` mode)
 

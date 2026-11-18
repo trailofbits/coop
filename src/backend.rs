@@ -1215,11 +1215,10 @@ pub trait VmBackend: std::fmt::Display {
     /// to gate operations (like `resize_disk`) that require the VM to
     /// be stopped. Returns `Err` for running, absent, unknown, or failed probes.
     fn as_stopped(&self, inst: Instance) -> Result<StoppedInstance>;
-    /// Render a human-readable status report for a running instance.
-    /// Takes `&RunningInstance` so the precondition is part of the
-    /// signature — status reporting probes the live guest (load,
-    /// memory) and only makes sense while the VM is up.
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String>;
+    /// Probe and render a named human status report. `None` means the instance
+    /// is confirmed stopped; an uncertain state remains an error. Lima shares
+    /// one inventory entry between the state probe and report construction.
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>>;
     /// Stream logs from a running instance.
     ///
     /// Takes `&RunningInstance` so the running precondition is part
@@ -1527,6 +1526,7 @@ impl VmBackend for FirecrackerBackend {
 
     fn destroy_instance(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        let _selection = crate::github_assignment::lock_selection(inst)?;
         if inst.probe_liveness()? {
             crate::web_editor::stop(inst)?;
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
@@ -1678,9 +1678,12 @@ impl VmBackend for FirecrackerBackend {
         Ok(StoppedInstance::new(inst, lock))
     }
 
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>> {
+        let Some(running) = self.as_running(cfg, inst.clone())? else {
+            return Ok(None);
+        };
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
-        vm.status()
+        vm.status().map(Some)
     }
 
     fn stream_logs(
@@ -1802,6 +1805,7 @@ impl VmBackend for LimaBackend {
 
     fn destroy_instance(&self, _cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         let _operation = lock_instance_operation(inst)?;
+        let _selection = crate::github_assignment::lock_selection(inst)?;
         crate::web_editor::stop(inst)?;
         crate::lima::destroy(inst)?;
         if inst.dir.exists()
@@ -1926,8 +1930,8 @@ impl VmBackend for LimaBackend {
         Ok(StoppedInstance::new(inst, lock))
     }
 
-    fn status(&self, cfg: &CoopConfig, running: &RunningInstance) -> Result<String> {
-        crate::lima::status(cfg, running.instance())
+    fn status_named(&self, cfg: &CoopConfig, inst: &Instance) -> Result<Option<String>> {
+        crate::lima::status_named(cfg, inst)
     }
 
     fn stream_logs(
@@ -1971,37 +1975,6 @@ pub type PlatformBackend = FirecrackerBackend;
 
 // ── Shared guest operations ───────────────────────────────────
 
-/// Detect the GitHub `owner/repo` slug for an existing instance, if any.
-///
-/// Looks at the saved workspace state in priority order: a `git-repo`
-/// clone records the original URL (parsed for a slug); a `workspace` /
-/// `mount` source has a host path we can scan for a `.git/config`
-/// `origin`. Returns `None` when no slug can be derived — pat-mode
-/// then falls back to a clear error.
-///
-/// An unreadable or stale-format `workspace.json` (e.g. a pre-#147 file
-/// that no longer deserializes) is logged at `WARN` with the loader's
-/// migration hint before returning `None`, so the lost repo context is
-/// diagnosable rather than silently degrading to "no token forwarded".
-pub fn detect_instance_repo(
-    inst: &crate::config::Instance,
-) -> Option<crate::github_repo::RepoSlug> {
-    use crate::workspace::WorkspaceSource;
-
-    let state = crate::workspace::try_load_or_warn(
-        inst,
-        "GitHub repo detection is disabled (pat-mode tokens will not be forwarded)",
-    )?;
-    match &state.source {
-        WorkspaceSource::GitRepo { url } => url.slug().cloned(),
-        WorkspaceSource::Workspace { host_path } | WorkspaceSource::Mount { host_path } => {
-            crate::github_repo::detect_workspace_repo(host_path)
-                .ok()
-                .flatten()
-        }
-    }
-}
-
 /// Resolve tokens and build env vars to forward via SSH `SendEnv`.
 ///
 /// Collects values from config and the process environment into an
@@ -2012,21 +1985,22 @@ pub fn detect_instance_repo(
 /// policy can forward them. Isolated-only suppressed credentials are never
 /// resolved.
 ///
-/// When `github = "pat"`, `repo` selects the matching entry under
-/// `[github.pat]`. Pass the slug resolved from `--git-repo` or
-/// `git remote get-url origin` of the workspace. Pass `None` when no
-/// repo context is available; pat-mode then yields no token (the start
-/// flow surfaces a clearer error elsewhere).
+/// Test adapter for forwarding unrelated credentials without a VM.
 #[cfg(test)]
 pub fn prepare_env_forwarding(
     cfg: &CoopConfig,
-    repo: Option<&crate::github_repo::RepoSlug>,
+    _repo: Option<&crate::github_repo::RepoSlug>,
     suppress_anthropic_key: bool,
     suppress_openai_key: bool,
 ) -> Result<EnvForward> {
     prepare_env_forwarding_for_network(
         cfg,
-        repo,
+        &match cfg.github.as_ref() {
+            Some(GitHubAuth::Auto) => crate::github_assignment::GitHubSelection::Auto,
+            Some(GitHubAuth::Env) => crate::github_assignment::GitHubSelection::Env,
+            Some(GitHubAuth::Pat(_)) => crate::github_assignment::GitHubSelection::Unbound,
+            _ => crate::github_assignment::GitHubSelection::Off,
+        },
         CredentialForwardingPolicy::new(
             cfg,
             suppress_anthropic_key,
@@ -2107,7 +2081,7 @@ impl CredentialForwardingPolicy {
 
 fn populate_builtin_credentials(
     cfg: &CoopConfig,
-    repo: Option<&crate::github_repo::RepoSlug>,
+    selection: &crate::github_assignment::GitHubSelection,
     policy: CredentialForwardingPolicy,
     env: &mut EnvForward,
 ) -> Result<()> {
@@ -2149,7 +2123,9 @@ fn populate_builtin_credentials(
         } else if let Ok(key) = std::env::var("XAI_API_KEY") {
             env.set("XAI_API_KEY", key)?;
         }
-        if let Some(token) = resolve_github_token(cfg.github.as_ref(), repo)? {
+        if let Some(token) =
+            resolve_github_token(cfg.github.as_ref(), selection, &HostGitHubTokenSources)?
+        {
             env.set("GITHUB_TOKEN", token)?;
         } else {
             tracing::debug!("no GITHUB_TOKEN forwarded to guest");
@@ -2160,14 +2136,14 @@ fn populate_builtin_credentials(
 
 pub(crate) fn prepare_env_forwarding_for_network(
     cfg: &CoopConfig,
-    repo: Option<&crate::github_repo::RepoSlug>,
+    selection: &crate::github_assignment::GitHubSelection,
     policy: CredentialForwardingPolicy,
 ) -> Result<EnvForward> {
     let claude = &cfg.claude;
     let grok = &cfg.grok;
     let codex = &cfg.codex;
     let mut env = EnvForward::default();
-    populate_builtin_credentials(cfg, repo, policy, &mut env)?;
+    populate_builtin_credentials(cfg, selection, policy, &mut env)?;
 
     // User-specified env_forward vars from process environment, plus
     // host names referenced by Grok stdio MCP `env` mappings (those
@@ -2782,26 +2758,38 @@ pub(crate) fn preflight_isolated_first_boot(cfg: &CoopConfig, image: &ImageName)
     Ok(())
 }
 
-/// Resolve a GitHub token for the guest given the configured auth strategy
-/// and the resolved target repo (when known).
+trait GitHubTokenSources {
+    fn env_token(&self) -> Option<String>;
+    fn cli_token(&self) -> Option<String>;
+}
+
+struct HostGitHubTokenSources;
+
+impl GitHubTokenSources for HostGitHubTokenSources {
+    fn env_token(&self) -> Option<String> {
+        std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty())
+    }
+
+    fn cli_token(&self) -> Option<String> {
+        gh_auth_token()
+    }
+}
+
+/// Resolve a GitHub token for the guest from the VM's effective selection.
 ///
 /// Returns `Ok(None)` when no token should be forwarded; errors when a
 /// strategy was selected but the lookup is unrecoverable (e.g. pat-mode
 /// with an entry that fails to resolve).
 fn resolve_github_token(
     strategy: Option<&GitHubAuth>,
-    repo: Option<&crate::github_repo::RepoSlug>,
+    selection: &crate::github_assignment::GitHubSelection,
+    sources: &impl GitHubTokenSources,
 ) -> Result<Option<String>> {
-    // Default to Off — never forward tokens without explicit opt-in.
-    // Users must set `github = "auto"` / `"env"` / `"pat"` in
-    // config.toml to enable GitHub auth in the guest.
-    match strategy.unwrap_or(&GitHubAuth::Off) {
-        GitHubAuth::Auto => Ok(std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(gh_auth_token)),
-        GitHubAuth::Env => {
-            let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    use crate::github_assignment::GitHubSelection;
+    match selection {
+        GitHubSelection::Auto => Ok(sources.env_token().or_else(|| sources.cli_token())),
+        GitHubSelection::Env => {
+            let token = sources.env_token();
             if token.is_none() {
                 tracing::warn!(
                     "github: \"env\" requires GITHUB_TOKEN to be set. \
@@ -2810,38 +2798,18 @@ fn resolve_github_token(
             }
             Ok(token)
         }
-        GitHubAuth::Off => Ok(None),
-        GitHubAuth::Pat(_) => {
-            let Some(slug) = repo else {
-                tracing::warn!(
-                    "github: \"pat\" requires a resolvable repo (via --git-repo or \
-                     workspace origin). No token will be forwarded."
-                );
-                return Ok(None);
-            };
-            // Missing entry is not fatal: follow-up commands (shell / exec /
-            // claude / codex / restart) must still work without a token,
-            // matching the "off" mode shape. The wizard's pre-flight prompt
-            // is the discovery path for missing entries.
-            if strategy.and_then(|s| s.pat_entry(slug)).is_none() {
-                tracing::warn!(
-                    "github: \"pat\" mode has no [github.pat.\"{slug}\"] entry. \
-                     No token forwarded. Run `coop github setup-pat --repo {slug}` \
-                     to add one."
-                );
-                return Ok(None);
-            }
-            resolve_pat_token(strategy, slug).map(Some)
-        }
+        GitHubSelection::Disabled | GitHubSelection::Off | GitHubSelection::Unbound => Ok(None),
+        GitHubSelection::Bound(binding) => resolve_pat_token(strategy, binding).map(Some),
     }
 }
 
 /// Look up a `[github.pat."repo"]` entry and resolve its `token` via
 /// the `cmd:` indirection.
-pub(crate) fn resolve_pat_token(
+fn resolve_pat_token(
     strategy: Option<&GitHubAuth>,
-    repo: &crate::github_repo::RepoSlug,
+    binding: &crate::github_assignment::BoundPatEntry,
 ) -> Result<String> {
+    let repo = binding.repo();
     let entry = strategy
         .and_then(|s| s.pat_entry(repo))
         .with_context(|| crate::github_pat::missing_entry_error(repo))?;
@@ -4681,38 +4649,30 @@ fn register_mcp_servers(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CloneRecovery<'a> {
+    NewVm,
+    Reprovision(&'a crate::config::InstanceName),
+}
+
 /// Clone a git repository inside the guest VM via SSH.
 ///
-/// For GitHub HTTPS URLs, resolves a token on the host and forwards it to
-/// git in the guest via stdin and a one-shot credential helper. Token
-/// resolution honours VM assignment before the configured GitHub strategy:
-///
-/// - An active VM assignment selects its stored entry independently of the
-///   clone URL. Missing entries and retrieval failures return an error.
-/// - `github = "pat"` with a matching `[github.pat."owner/repo"]` entry
-///   uses the configured PAT. This is the user's explicit per-repo intent,
-///   so it takes precedence over the host-side fallback. If the entry's
-///   `cmd:` resolution fails, the error is propagated rather than silently
-///   substituting a broader-scoped host token.
-/// - Every other configuration (`off`, `auto`, `env`, or `pat` with no
-///   matching entry) opportunistically uses `gh auth token` then
-///   `GITHUB_TOKEN` — see [`host_github_token`] for why the non-PAT modes
-///   don't gate this fallback.
-///
-/// The token never appears on argv, so it stays out of `/proc/<pid>/cmdline`
-/// and the ssh debug log. If no token is available, falls back to an
-/// unauthenticated clone (which works for public repos).
-pub fn clone_git_repo(
+/// Clone with the same explicit VM credential decision used for sessions.
+/// The token travels through stdin and never appears on argv.
+pub(crate) fn clone_git_repo(
     target: &SshTarget,
     github: Option<&GitHubAuth>,
     repo_url: &str,
-    assigned: Option<&crate::github_repo::RepoSlug>,
+    selection: &crate::github_assignment::GitHubSelection,
+    recovery: CloneRecovery<'_>,
 ) -> Result<()> {
-    tracing::info!("Cloning {repo_url} into guest /workspace");
+    validate_clone_url(repo_url)?;
+    let display_url = safe_clone_url(repo_url);
+    tracing::info!("Cloning {display_url} into guest /workspace");
 
     let is_github = is_github_https_url(repo_url);
     let token = if is_github {
-        resolve_clone_token(github, repo_url, assigned)?
+        resolve_clone_token(github, selection, &HostGitHubTokenSources)?
     } else {
         None
     };
@@ -4720,66 +4680,84 @@ pub fn clone_git_repo(
     let result = match token.as_deref() {
         Some(t) => clone_with_token(target, repo_url, t),
         None => clone_without_auth(target, repo_url),
-    };
+    }
+    .map_err(|_| anyhow::anyhow!("Guest clone command failed"));
 
     let token_attempted = token.is_some();
     result.with_context(|| {
-        if token_attempted {
-            format!("Failed to clone {repo_url} in guest (host-resolved token rejected)")
-        } else if is_github {
-            format!(
-                "Failed to clone {repo_url} in guest. \
-                 If this is a private repo, configure a PAT with \
-                 `coop github setup-pat --repo <owner/repo>`, run `gh auth login`, \
-                 or set `GITHUB_TOKEN` on the host before starting the VM."
-            )
-        } else {
-            format!("Failed to clone {repo_url} in guest")
-        }
+        clone_failure_context(&display_url, is_github, token_attempted, recovery)
     })?;
 
     tracing::info!("Repository cloned to /workspace");
     Ok(())
 }
 
-/// If `strategy` is `Pat` mode and a `[github.pat."owner/repo"]` entry
-/// exists for `repo_url`, return the matching slug. Otherwise `None`.
-///
-/// Without a VM assignment, this selects a configured PAT for cloning.
-/// Returning `None` directs [`resolve_clone_token`] to fall through to
-/// [`host_github_token`] — preserving the pre-PAT behaviour for `Auto`,
-/// `Env`, `Off`, and `Pat`-without-a-matching-entry.
-fn clone_pat_slug(
-    strategy: Option<&GitHubAuth>,
-    repo_url: &str,
-) -> Option<crate::github_repo::RepoSlug> {
-    let strategy = strategy?;
-    let GitHubAuth::Pat(_) = strategy else {
-        return None;
+fn clone_failure_context(
+    display_url: &str,
+    is_github: bool,
+    token_attempted: bool,
+    recovery: CloneRecovery<'_>,
+) -> String {
+    if token_attempted {
+        return format!("Failed to clone {display_url} in guest using the selected token");
+    }
+    if !is_github {
+        return format!("Failed to clone {display_url} in guest");
+    }
+    let retry = match recovery {
+        CloneRecovery::NewVm => {
+            "rerun `coop up --git-repo <url> --pat-entry OWNER/REPO` with an existing PAT entry"
+                .to_string()
+        }
+        CloneRecovery::Reprovision(name) => format!(
+            "bind a configured entry with `coop github assign-pat --vm {name} --repo OWNER/REPO`, then retry reprovisioning"
+        ),
     };
-    let slug = crate::github_repo::parse_repo_slug_from_url(repo_url)?;
-    strategy.pat_entry(&slug).is_some().then_some(slug)
+    format!(
+        "Failed to clone {display_url} in guest. If this is a private repo, {retry}, \
+         or choose github = \"auto\"/\"env\"."
+    )
 }
 
-/// Resolve the token to use for `git clone` of `repo_url`.
-///
-/// An active VM assignment wins and fails closed on lookup/retrieval errors.
-/// Otherwise PAT mode with a matching entry wins — the user's per-repo intent
-/// overrides the opportunistic host lookup. Every other configuration
-/// (including `Pat` mode without a matching entry) falls back to
-/// [`host_github_token`].
+pub(crate) fn validate_clone_url(repo_url: &str) -> Result<()> {
+    if repo_url.chars().any(char::is_control) {
+        bail!("--git-repo URL contains control characters");
+    }
+    if let Ok(url) = url::Url::parse(repo_url) {
+        let public_ssh_user = matches!(url.scheme(), "ssh" | "git+ssh")
+            && url.username() == "git"
+            && url.password().is_none();
+        if (!url.username().is_empty() || url.password().is_some()) && !public_ssh_user {
+            bail!(
+                "--git-repo URL userinfo is unsupported; use a VM PAT binding or github = \"auto\"/\"env\""
+            );
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("--git-repo URL query and fragment are unsupported");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve only the selected mode. The clone URL is never an authority input.
 fn resolve_clone_token(
     strategy: Option<&GitHubAuth>,
-    repo_url: &str,
-    assigned: Option<&crate::github_repo::RepoSlug>,
+    selection: &crate::github_assignment::GitHubSelection,
+    sources: &impl GitHubTokenSources,
 ) -> Result<Option<String>> {
-    if let Some(repo) = assigned {
-        return resolve_pat_token(strategy, repo).map(Some);
+    resolve_github_token(strategy, selection, sources)
+}
+
+pub(crate) fn safe_clone_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "<clone target>".to_string();
+    };
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return "<clone target>".to_string();
     }
-    if let Some(slug) = clone_pat_slug(strategy, repo_url) {
-        return resolve_pat_token(strategy, &slug).map(Some);
-    }
-    Ok(host_github_token())
+    url.set_query(None);
+    url.set_fragment(None);
+    format!("{:?}", url.as_str())
 }
 
 fn clone_without_auth(target: &SshTarget, repo_url: &str) -> Result<()> {
@@ -4822,7 +4800,7 @@ fn build_clone_with_token_script(repo_url: &str) -> RemoteCommand {
              export GH_TOKEN\n\
              sudo mkdir -p /workspace\n\
              sudo chown \"$(whoami):$(whoami)\" /workspace\n\
-             git -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f' clone ",
+             git -c credential.helper= -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f' clone ",
         )
         .arg(repo_url)
         .literal(
@@ -4832,46 +4810,11 @@ fn build_clone_with_token_script(repo_url: &str) -> RemoteCommand {
 }
 
 /// Returns true when `url` is an `https://github.com/...` URL with no userinfo.
-///
-/// Userinfo (`https://user:pass@github.com/...`) means the caller is supplying
-/// their own credentials, so we leave the URL alone.
 fn is_github_https_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
     matches!(rest.split_once('/'), Some((host, _)) if host == "github.com")
-}
-
-/// Best-effort host-side GitHub token fallback for `git clone`.
-///
-/// Prefers `gh auth token` (uses the user's configured GitHub login),
-/// falls back to `GITHUB_TOKEN`. Returns `None` when neither is available.
-///
-/// Used by [`resolve_clone_token`] when no `[github.pat."owner/repo"]`
-/// entry matches the repo being cloned. The remaining `GitHubAuth` modes
-/// (`Auto`, `Env`, `Off`) intentionally don't gate this fallback: the
-/// token is consumed once via stdin in a one-shot `credential.helper`,
-/// never enters the guest env, and the in-memory copy dies with the ssh
-/// child — so the threat that the [`resolve_github_token`] gate defends
-/// against (a persistent in-guest token visible to every guest process)
-/// doesn't apply. `Pat` mode is the exception, handled upstream in
-/// [`resolve_clone_token`], because a configured PAT entry is an explicit
-/// per-repo intent statement and would be surprising to silently ignore.
-fn host_github_token() -> Option<String> {
-    select_host_token(
-        gh_auth_token().as_deref(),
-        std::env::var("GITHUB_TOKEN").ok().as_deref(),
-    )
-}
-
-/// Pure picker: prefer the `gh` value, fall back to `GITHUB_TOKEN`.
-/// Both inputs are trimmed; an all-whitespace or empty string is absent.
-fn select_host_token(gh: Option<&str>, env: Option<&str>) -> Option<String> {
-    let normalize = |s: &str| {
-        let t = s.trim();
-        (!t.is_empty()).then(|| t.to_string())
-    };
-    gh.and_then(normalize).or_else(|| env.and_then(normalize))
 }
 
 /// Run `gh auth token` and return the trimmed stdout, if any.
@@ -5841,28 +5784,6 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
             image: crate::config::ImageName::new("default").unwrap(),
             firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
         }
-    }
-
-    #[test]
-    fn detect_instance_repo_none_when_state_missing() {
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let inst = temp_instance(dir.path());
-        assert!(detect_instance_repo(&inst).is_none());
-    }
-
-    #[test]
-    fn detect_instance_repo_none_on_stale_format() {
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let inst = temp_instance(dir.path());
-        // Pre-#147 flat shape: `host_path` at the top level and a bare
-        // `source` string. The current loader rejects this; detection must
-        // degrade to `None` rather than panic.
-        std::fs::write(
-            inst.workspace_state_path(),
-            r#"{"host_path":"/x","guest_path":"/workspace","source":"mount"}"#,
-        )
-        .unwrap();
-        assert!(detect_instance_repo(&inst).is_none());
     }
 
     #[test]
@@ -7843,7 +7764,6 @@ url = "https://example.com/m"
 
     #[test]
     fn is_github_https_url_rejects_userinfo() {
-        // Caller is supplying their own credentials — leave URL alone.
         assert!(!is_github_https_url(
             "https://user:pass@github.com/owner/repo"
         ));
@@ -7858,36 +7778,34 @@ url = "https://example.com/m"
     }
 
     #[test]
-    fn select_host_token_prefers_gh_over_env() {
-        let pick = select_host_token(Some("gh-token"), Some("env-token"));
-        assert_eq!(pick.as_deref(), Some("gh-token"));
+    fn clone_url_display_redacts_userinfo_and_controls() {
+        let safe = safe_clone_url(
+            "https://user:secret@github.com/owner/repo%0A.git?token=querysecret#fragmentsecret",
+        );
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("user:"));
+        assert!(safe.contains("repo%0A.git"));
+        assert_eq!(safe_clone_url("not a url\nsecret"), "<clone target>");
+        validate_clone_url("ssh://git@github.com/owner/repo.git").unwrap();
+        assert!(validate_clone_url("https://user:secret@github.com/owner/repo.git").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git?token=secret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git#secret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git\nsecret").is_err());
+        assert!(validate_clone_url("https://github.com/owner/repo.git\u{0000}secret").is_err());
     }
 
     #[test]
-    fn select_host_token_falls_back_to_env_when_gh_absent() {
-        let pick = select_host_token(None, Some("env-token"));
-        assert_eq!(pick.as_deref(), Some("env-token"));
-    }
+    fn clone_failure_recovery_matches_vm_lifecycle() {
+        let url = "https://github.com/owner/private.git";
+        let creation = clone_failure_context(url, true, false, CloneRecovery::NewVm);
+        assert!(creation.contains("coop up --git-repo <url> --pat-entry OWNER/REPO"));
+        assert!(!creation.contains("assign-pat --vm"));
 
-    #[test]
-    fn select_host_token_falls_back_to_env_when_gh_is_blank() {
-        let pick = select_host_token(Some("   \n"), Some("env-token"));
-        assert_eq!(pick.as_deref(), Some("env-token"));
-    }
-
-    #[test]
-    fn select_host_token_trims_both_paths() {
-        let pick = select_host_token(Some("  gh-token\n"), None);
-        assert_eq!(pick.as_deref(), Some("gh-token"));
-        let pick = select_host_token(None, Some("\tenv-token  "));
-        assert_eq!(pick.as_deref(), Some("env-token"));
-    }
-
-    #[test]
-    fn select_host_token_returns_none_when_both_absent_or_blank() {
-        assert_eq!(select_host_token(None, None), None);
-        assert_eq!(select_host_token(Some(""), Some("")), None);
-        assert_eq!(select_host_token(Some(" "), Some("\n")), None);
+        let name = crate::config::InstanceName::new("retained").unwrap();
+        let reprovision =
+            clone_failure_context(url, true, false, CloneRecovery::Reprovision(&name));
+        assert!(reprovision.contains("assign-pat --vm retained --repo OWNER/REPO"));
+        assert!(!reprovision.contains("--pat-entry"));
     }
 
     #[test]
@@ -7905,7 +7823,7 @@ url = "https://example.com/m"
         );
         assert!(
             script.contains(
-                "credential.helper='!f() { echo username=x-access-token; \
+                "credential.helper= -c credential.helper='!f() { echo username=x-access-token; \
                  echo \"password=$GH_TOKEN\"; }; f'"
             ),
             "credential helper malformed: {script}"
@@ -7945,80 +7863,108 @@ url = "https://example.com/m"
         })
     }
 
-    #[test]
-    fn clone_pat_slug_matches_when_entry_exists() {
-        let auth = pat_auth_with(&[("owner/repo", "github_pat_dummy")]);
-        let expected = crate::github_repo::RepoSlug::new("owner/repo").unwrap();
-        assert_eq!(
-            clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git"),
-            Some(expected)
-        );
+    struct FixtureGitHubTokenSources {
+        env: Option<String>,
+        cli: Option<String>,
     }
 
-    #[test]
-    fn clone_pat_slug_none_when_no_matching_entry() {
-        let auth = pat_auth_with(&[("other/repo", "github_pat_dummy")]);
-        assert!(clone_pat_slug(Some(&auth), "https://github.com/owner/repo.git").is_none());
-    }
+    impl GitHubTokenSources for FixtureGitHubTokenSources {
+        fn env_token(&self) -> Option<String> {
+            self.env.clone()
+        }
 
-    #[test]
-    fn clone_pat_slug_none_when_not_pat_mode() {
-        // Even though the URL would parse to a slug, non-Pat modes never
-        // route through the PAT branch — the host fallback handles them.
-        for strategy in [
-            None,
-            Some(GitHubAuth::Auto),
-            Some(GitHubAuth::Env),
-            Some(GitHubAuth::Off),
-        ] {
-            assert!(
-                clone_pat_slug(strategy.as_ref(), "https://github.com/owner/repo.git").is_none(),
-                "expected None for strategy {:?}",
-                strategy.as_ref().map(GitHubAuth::mode_name)
-            );
+        fn cli_token(&self) -> Option<String> {
+            self.cli.clone()
         }
     }
 
     #[test]
-    fn clone_pat_slug_none_for_non_github_url() {
-        let auth = pat_auth_with(&[("owner/repo", "github_pat_dummy")]);
-        // Non-GitHub URLs can't yield a slug, so PAT lookup never fires.
-        assert!(clone_pat_slug(Some(&auth), "https://gitlab.com/owner/repo").is_none());
-    }
-
-    #[test]
-    fn resolve_clone_token_returns_configured_pat_literal() {
-        // Literal (non-`cmd:`) tokens pass through resolve_cmd_value
-        // unchanged. The PAT is returned even if no host gh/env token
-        // exists — the test for "PAT bypassed" is that it survives
-        // independently of the host's environment.
-        let auth = pat_auth_with(&[("owner/repo", "github_pat_literal")]);
-        let token =
-            resolve_clone_token(Some(&auth), "https://github.com/owner/repo.git", None).unwrap();
-        assert_eq!(token.as_deref(), Some("github_pat_literal"));
-    }
-
-    #[test]
-    fn assigned_clone_selection_never_falls_back() {
-        let assigned = crate::github_repo::RepoSlug::new("owner/assigned").unwrap();
-        let url = "https://github.com/owner/repo.git";
+    fn clone_uses_only_vm_selection_and_never_host_fallback() {
+        use crate::github_assignment::{GitHubSelection, select};
+        let tmp = crate::test_support::private_tempdir().unwrap();
         let auth = pat_auth_with(&[
             ("owner/repo", "github_pat_default"),
-            ("owner/assigned", "github_pat_selected"),
+            ("owner/chosen", "github_pat_selected"),
         ]);
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(tmp.path()),
+            github: Some(auth),
+            ..CoopConfig::default()
+        };
+        let inst = cfg
+            .allocate_instance(
+                Some(&crate::config::InstanceName::new("clone").unwrap()),
+                &ImageName::new("default").unwrap(),
+                None,
+            )
+            .unwrap();
+        let unbound = select(&cfg, &inst).unwrap();
+        assert!(matches!(unbound, GitHubSelection::Unbound));
+        for sources in [
+            FixtureGitHubTokenSources {
+                env: Some("github_pat_host_env".to_string()),
+                cli: None,
+            },
+            FixtureGitHubTokenSources {
+                env: None,
+                cli: Some("github_pat_host_gh".to_string()),
+            },
+        ] {
+            for selection in [
+                unbound.clone(),
+                GitHubSelection::Off,
+                GitHubSelection::Disabled,
+            ] {
+                assert_eq!(
+                    resolve_clone_token(cfg.github.as_ref(), &selection, &sources).unwrap(),
+                    None
+                );
+            }
+        }
+        let sources = FixtureGitHubTokenSources {
+            env: Some("github_pat_host_env".to_string()),
+            cli: Some("github_pat_host_gh".to_string()),
+        };
         assert_eq!(
-            resolve_clone_token(Some(&auth), url, Some(&assigned))
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Auto, &sources)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_env")
+        );
+        assert_eq!(
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Env, &sources)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_env")
+        );
+        let cli_only = FixtureGitHubTokenSources {
+            env: None,
+            cli: Some("github_pat_host_gh".to_string()),
+        };
+        assert_eq!(
+            resolve_clone_token(cfg.github.as_ref(), &GitHubSelection::Auto, &cli_only)
+                .unwrap()
+                .as_deref(),
+            Some("github_pat_host_gh")
+        );
+        crate::github_assignment::assign(
+            &cfg,
+            &inst,
+            crate::github_repo::RepoSlug::new("owner/chosen").unwrap(),
+        )
+        .unwrap();
+        let bound = select(&cfg, &inst).unwrap();
+        assert_eq!(
+            resolve_clone_token(cfg.github.as_ref(), &bound, &sources)
                 .unwrap()
                 .as_deref(),
             Some("github_pat_selected")
         );
-        let missing = pat_auth_with(&[("owner/repo", "github_pat_default")]);
-        assert!(resolve_clone_token(Some(&missing), url, Some(&assigned)).is_err());
-        let failed = pat_auth_with(&[
-            ("owner/repo", "github_pat_default"),
-            ("owner/assigned", "cmd:exit 42"),
-        ]);
-        assert!(resolve_clone_token(Some(&failed), url, Some(&assigned)).is_err());
+        cfg.github = Some(pat_auth_with(&[("owner/repo", "github_pat_default")]));
+        assert!(select(&cfg, &inst).is_err());
+        assert!(resolve_clone_token(cfg.github.as_ref(), &bound, &sources).is_err());
+        cfg.github = Some(pat_auth_with(&[("owner/chosen", "cmd:exit 42")]));
+        assert!(resolve_clone_token(cfg.github.as_ref(), &bound, &sources).is_err());
     }
 
     fn forwarding_session(entries: &[(&str, &str)]) -> SshSession {
