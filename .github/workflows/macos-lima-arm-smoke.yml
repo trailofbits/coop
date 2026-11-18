@@ -22,8 +22,11 @@ jobs:
         run: |
           uname -m
           limactl --version
-          limactl start --tty=false --timeout=10m --vm-type=vz \
-            --cpus=1 --memory=1 --disk=8 --name=ci-smoke template://ubuntu
+          if ! limactl start --tty=false --timeout=10m --vm-type=vz \
+              --cpus=1 --memory=1 --disk=8 --name=ci-smoke template://ubuntu; then
+            cat "$HOME/.lima/ci-smoke/ha.stderr.log" || true
+            exit 1
+          fi
           limactl shell ci-smoke -- uname -s
 
       - name: Clean up
