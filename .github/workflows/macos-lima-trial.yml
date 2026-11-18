@@ -1,0 +1,60 @@
+name: macOS Lima trial
+
+on:
+  push:
+    branches: [ci/macos-full-integration]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-lima-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Full integration (${{ matrix.shard }} / macOS / Lima)
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [lifecycle, workspace, config, features]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install host prerequisites
+        run: brew install lima cmake
+
+      - name: Full Lima integration
+        timeout-minutes: 105
+        env:
+          COOP_TEST_DESTRUCTIVE: "1"
+          COOP_TEST_SKIP_BRIDGE: "1"
+          COOP_TEST_BUILDER_TIMEOUT: "30m"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          args=(--full --shard "$SHARD")
+          if [[ "$SHARD" == config ]]; then
+            args+=(--require-proxy)
+          fi
+          ./tests/run-integration.sh "${args[@]}" 2>&1 \
+            | tee "$RUNNER_TEMP/macos-lima-integration.log"
+
+      - name: Upload integration output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-lima-integration-${{ matrix.shard }}-log
+          path: ${{ runner.temp }}/macos-lima-integration.log
+          if-no-files-found: ignore
+          retention-days: 7
