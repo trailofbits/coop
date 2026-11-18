@@ -200,8 +200,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   `ps`/`/proc`. Known exceptions are the macOS `security` and 1Password `op`
   backends, which take the secret on argv because their CLIs offer no stdin
   path; this is documented at the call sites and limited to the store step.
-- **`GITHUB_TOKEN` defaults to Off.** A saved VM PAT assignment is also explicit
-  opt-in; it stores only a validated existing entry key. Invocation-level
+- **`GITHUB_TOKEN` defaults to Off.** PAT mode requires a saved, explicit VM
+  binding containing a validated entry key. Git origin and clone URL are
+  suggestions only. Assignment and destruction share the VM operation lock;
+  credential reads are serialized with sidecar replacement. Invocation-level
   `--no-github` suppresses the assignment before loading it. Active assignments
   reject both managed `GITHUB_TOKEN` and `GH_TOKEN` overrides and fail closed
   on missing references or failed retrieval. It is only forwarded with an explicit
@@ -211,8 +213,10 @@ user `env_forward` entries, and the VM SSH key. The invariants:
   read). A change that forwards it by default, or makes it persistent where it
   wasn't, is a finding. `up --no-github` / `start --no-github` override the
   strategy to Off and disable the PAT wizard for that invocation. This does
-  not scrub existing guest credentials or block explicit environment entries
-  or one-shot clone authentication; see [GitHub auth](configuration.md#github-auth).
+  not scrub existing guest credentials or block explicit environment entries.
+  Clone uses the same VM credential selection; Off, `--no-github`, and unbound
+  PAT mode have no managed or implicit host-token fallback. See
+  [GitHub auth](configuration.md#github-auth).
 - **Private host storage is enforced.** Managed data/image/instance/state
   directories use `0700`; persisted environment overrides, JSON state, tokens,
   SSH private keys, and VM disks use `0600`. Atomic temporary files are private

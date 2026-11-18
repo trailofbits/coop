@@ -60,7 +60,10 @@ The check also applies to saved mounts on later starts. Narrow the mount or
 relocate the protected host state before retrying; inspect state and rotate
 credentials if a previous live mount already exposed it.
 Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
-`/workspace` inside the guest.
+`/workspace` inside the guest. URLs containing credential userinfo, query strings,
+fragments, or control characters are rejected before VM creation (the usual
+`ssh://git@...` form remains accepted); use a VM
+PAT binding or an explicit `auto`/`env` mode for credentials.
 
 | Flag | Description |
 |------|-------------|
@@ -76,10 +79,11 @@ Use `--git-repo <url>` instead of `DIR` to clone a remote repository into
 | `--disk <GiB>` | Instance disk size when creating a new instance |
 | `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM |
 | `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
+| `--pat-entry owner/name` | On a newly created VM, bind this existing PAT entry before first boot and any `--git-repo` clone. Requires `github.mode = "pat"`; useful for headless private clones. |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
 | `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
 | `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
-| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo |
+| `--no-prompt` | Suppress the interactive VM PAT binding prompt; an existing binding remains active. |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable) |
@@ -226,7 +230,7 @@ instances, pass the instance name.
 | `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM |
 | `--no-github` | Use `github = "off"` for this invocation and suppress the PAT setup prompt. See [scope and limitations](configuration.md#github-auth). |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable). Lives for the lifetime of the VM; torn down on `coop stop`. |
-| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT when one is missing for the resolved repo (see [`coop github setup-pat`](#github)). |
+| `--no-prompt` | Suppress the interactive VM PAT binding prompt; an existing binding remains active. |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot. Overrides the `post_start` field in `config.toml`. Failure is logged but does not fail the start. |
 | `--env KEY=VALUE` | Literal env var to set in the guest (repeatable). Overrides `guest_env` config entries and any forwarded values with the same name. |
 
@@ -922,7 +926,7 @@ coop restore [NAME] [--image <name>] [--reprovision] [-y] [--no-agents] [--no-pr
 | `--reprovision` | Provision the new disk as a first boot and leave the instance running (see below) |
 | `-y`, `--yes` | Skip the `--reprovision` confirmation prompt (required when stdin is not a TTY). Requires `--reprovision` |
 | `--no-agents` | Skip injecting Claude Code, Codex, and Grok Build credentials/config into the VM. Requires `--reprovision` |
-| `--no-prompt` | Suppress the interactive prompt to set up a scoped GitHub PAT. Requires `--reprovision` |
+| `--no-prompt` | Suppress the interactive VM PAT binding prompt. Requires `--reprovision`. |
 
 Unlike `destroy` + `up --image`, `restore` keeps the same instance identity (name, index, IP) instead of allocating a new one. The disk is reset to the image's size, so restoring an image built before a `coop resize` returns the instance to the smaller size.
 
@@ -1121,7 +1125,7 @@ coop github <subcommand>
 | `setup-pat [--repo owner/name]` | Run the wizard end-to-end: open the prefilled GitHub PAT-creation form, validate the pasted token against `api.github.com`, store it in a chosen secret manager (Keychain / Secret Service / 1Password / file), and write a `[github.pat."owner/repo"]` entry. The repo is auto-detected from `git remote get-url origin` when `--repo` is omitted. |
 | `rotate-pat --repo owner/name` | Re-run the wizard for an existing entry (FGPATs expire — max 1 year). |
 | `status [--vm NAME] [--probe] [--json]` | List configured entries and their storage backend. By default the cmd-invocation is *not* resolved (so Keychain / 1Password prompts don't fire). Pass `--probe` to also resolve each entry and report whether the secret store still serves it. Pass `--json` for machine-readable output. |
-| `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** add a skip marker — use the auto-prompt's `never` answer if you want coop to stop asking about this repo. Does **not** revoke the PAT on GitHub. |
+| `forget-pat --repo owner/name` | Delete the stored secret from its backend and drop the `[github.pat."owner/repo"]` entry. Does **not** revoke the PAT on GitHub. |
 
 If the suggested read/write permissions suit your needs, only select the repositories under **Repository access** before generating the token. Otherwise, restrict the permissions further. See the [prefilled fields and permissions](configuration.md#fine-grained-pat-github--pat).
 
@@ -1144,13 +1148,17 @@ coop github forget-pat --repo trailofbits/coop
 `file`, or `null` when unparseable) and `probe` (`ok`/`unexpected_format`/
 `resolve_failed`, or `null` unless `--probe`). The token value is never emitted.
 
-With `--vm NAME`, status also includes `vm: { "name", "assigned_entry", "source" }`.
-`assigned_entry` is a stored entry key or `null`; `source` is `assignment`,
-`missing_assignment`, `repository`, `auto`, `env`, `off`, or `no_matching_entry`.
-The configured entry list remains present. `missing_assignment` means restore
-the entry or unassign it; malformed state produces an error. `--probe` tests
-retrieval, not GitHub permissions. See [VM PAT assignments](configuration.md#assign-an-existing-pat-to-a-vm)
-for precedence, opt-out, conflicts, rotation, and bootstrap timing.
+With `--vm NAME`, status includes `name`, `assigned_entry`, `effective_entry`,
+`suggested_entry`, `suggestion_source`, `recorded_target`, `source`, and
+`guidance`. `source` is `assignment`, `missing_assignment`, `corrupt`,
+`selection_error`, `unbound`, `disabled`, `auto`, `env`, or `off`. A
+`selection_error` retains the underlying failure, such as a managed token
+override conflict, in `guidance`. `effective_entry` is the
+entry coop would forward now; the suggestion never authorizes a token.
+This replaces the older `repository` and `no_matching_entry` source values;
+scripts should migrate to `effective_entry` and treat `unbound` as no PAT.
+The configured entry list remains present. `--probe` tests retrieval, not
+GitHub permissions. See [VM PAT assignments](configuration.md#assign-an-existing-pat-to-a-vm).
 
 ### `proxy`
 

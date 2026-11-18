@@ -76,7 +76,7 @@ and `cargo test` select only the root `coop` package.
 
 The central abstraction is the `backend::VmBackend` trait — every VM operation
 (`setup`, `create_and_start`, `start_existing`, `stop`, `destroy_instance`,
-`resize_disk`, `commit_disk`, `status`, `stream_logs`, `ssh_target`, …) goes
+`resize_disk`, `commit_disk`, `status_named`, `stream_logs`, `ssh_target`, …) goes
 through it. Two implementations exist:
 
 - `FirecrackerBackend` — `#[cfg(not(target_os = "macos"))]`; delegates to

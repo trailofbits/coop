@@ -171,7 +171,7 @@ The `github` field determines how coop obtains a `GITHUB_TOKEN` for the guest:
 | `"auto"` | Checks `$GITHUB_TOKEN` first. Falls back to `gh auth token` if unset. |
 | `"env"` | Reads `$GITHUB_TOKEN` from the environment only. Warns if unset. |
 | `"off"` | No GitHub token forwarding. |
-| `"pat"` | Uses a per-repo fine-grained PAT recorded under `[github.pat]`. GitHub enforces the permissions and repositories selected for that token. |
+| `"pat"` | Forwards only the configured PAT entry explicitly bound to this VM. The entry key is a label, not proof of token scope. |
 
 When a token is present, coop runs `gh auth setup-git` inside the guest to wire up git credential helpers.
 
@@ -182,15 +182,15 @@ credentials and other configuration remain in effect, and the config file is
 not changed. `coop up` rejects this flag for an already-running instance;
 stop it first, then repeat `up` with the flag.
 
-This has the same scope as `github = "off"`: it disables strategy-based token
-forwarding, but does not block explicit `env_forward`, `guest_env`, or `--env`
-entries, or the one-shot host-token fallback used for `--git-repo` clones.
+This has the same scope as `github = "off"`: it disables managed GitHub
+credentials for sessions and `--git-repo` clones, but does not block explicit
+`env_forward`, `guest_env`, or `--env` entries.
 It does not erase credentials already stored in the guest. Later invocations
 (including `shell` and `exec`) use the configured strategy again.
 
 ### Fine-grained PAT (`github = "pat"`)
 
-In pat mode coop forwards a *per-repo* fine-grained personal access token: the resolved `owner/repo` at VM startup selects the matching entry in `[github.pat]`. Compared with `"auto"` / `"env"`, the effective reach of a leaked token is bounded by the repos and permissions GitHub recorded when it was created — GitHub rejects out-of-scope operations (REST and GraphQL) server-side, not in coop.
+In PAT mode coop forwards a fine-grained personal access token only when the host user has explicitly bound a `[github.pat]` entry to the VM. The saved entry key identifies the choice; Git origin and clone URL can suggest an entry but cannot authorize one. GitHub enforces the actual repositories and permissions recorded for the token server-side. The entry key alone does not establish that scope.
 
 Configure via the wizard:
 
@@ -220,6 +220,7 @@ The remaining (private) submodules are routed by resource owner:
 - **Non-GitHub URLs** (e.g. GitLab) — listed as a warning; this token can't cover them.
 
 Only depth-1 submodules are inspected. Submodules of submodules are not expanded and need their own `setup-pat` runs.
+Coop forwards one selected `GITHUB_TOKEN` per session. Creating separate cross-owner entries does not route all of them into one VM clone; that requires separate credential setup.
 
 Multi-repo example:
 
@@ -287,25 +288,34 @@ may also authorize `myorg/backend`; assigning it to a VM whose workspace is a
 plain parent directory works without detecting either child repository.
 Different VMs can select different entries for the same workspace.
 
-Assignment is explicit opt-in and takes precedence over workspace detection.
-Only the validated key is saved in owner-only, atomically written
-`<instance>/github_pat.json`; the shared secret is resolved again for each
-subsequent session or clone. Assignment works while the VM is stopped.
+Assignment is explicit opt-in. Only the validated key is saved in owner-only,
+atomically written `<instance>/github_pat.json`;
+the shared secret is resolved again for each subsequent session or clone.
+Assignment and removal use the VM operation lock, so they cannot race with
+destroy. A same-name replacement has no assignment unless it is explicitly
+bound after creation. Credential reads wait for any sidecar replacement.
 Restart/bootstrap, shell, exec, agent sessions, and restore/reprovision use it.
 Existing shells, agents, and background processes are not updated. Restart
 without `--no-agents` to establish the git credential helper on a guest that
 has never had GitHub authentication bootstrapped.
+An in-flight session may finish with the previous binding after a rebind;
+rebind does not revoke credentials already delivered to the guest.
 
 `up --no-github` and `start --no-github` suppress assignment use and the PAT
 setup prompt for that invocation, without removing the saved association.
-The existing separate clone fallback remains: under opt-out, a GitHub HTTPS
-clone may still use host credentials. Without an assignment, normal auth-mode
-and repository selection are unchanged.
+Under opt-out, clones receive no managed GitHub credential. In PAT mode an
+unbound VM receives no configured PAT, even if the Git origin or clone URL
+matches a configured entry. `auto` and `env` clone credentials follow their
+explicit global mode. A private clone without credentials may fail. A failed
+new-VM clone normally removes that VM, so rerun `coop up --git-repo URL
+--pat-entry X/Y` with an existing entry. For a retained VM being reprovisioned,
+bind an entry with `assign-pat` and retry reprovisioning. `--pat-entry` binds
+before first boot for noninteractive creation.
 
 Missing entries, unreadable or malformed assignment state, and failed secret
 retrieval fail instead of falling back. Restore a forgotten entry with
 `setup-pat`, or remove the association with `unassign-pat`. Rotation affects
-subsequent resolutions. Unassigning restores normal selection and neither
+subsequent resolutions. Unassigning leaves the VM unbound and neither
 deletes the shared secret nor revokes it on GitHub. Destroying the VM removes
 its association with the VM state, leaving the shared PAT intact.
 
@@ -318,25 +328,36 @@ keys in `<instance>/guest_env.json`, or unassign the PAT. This controls coop's
 delivery; the guest can still change its own environment. The VM receives the
 token's actual authority over every repository it covers.
 
-#### Auto-prompt at VM startup
+#### VM binding prompt and recovery
 
-When `coop up` or `coop start` runs with a resolvable repo (usually the synced workspace's `origin`) and `github` is `"off"` (or `"pat"` with no matching entry), coop offers to run the wizard inline: `[y/N/never]`. Three answers:
+For an interactive new VM, `coop up` may suggest a PAT entry from the selected
+workspace's Git origin or the host-supplied `--git-repo` URL. For an existing
+VM, its recorded host workspace path identifies it; the current origin is
+labelled **unverified** because project metadata may be guest-writable. The
+prompt names the VM, escaped host path or redacted clone URL, suggestion
+source, and exact entry to forward. You can choose a different entry. A
+single affirmative answer binds an existing entry before VM boot. For a
+missing entry, a further confirmation discloses that the wizard will create
+it and change global `github.mode` to `pat`; binding happens after the wizard
+succeeds. The secret store, config, and VM binding are separate writes.
 
-- `y` — run the wizard, then continue the start.
-- `N` (default) — start unauthenticated, ask again next time.
-- `never` — record a skip marker under `[github.skip]` so coop won't ask again for this repo.
+An ordinary decline leaves the VM unbound and can be revisited on the next
+interactive start. `never` records a **per-VM** prompt preference; it does not
+write `[github.skip]`. Non-TTY/CI and `--no-prompt` suppress questions but
+preserve an existing binding. Explicit `github = "off"`, `"auto"`, or `"env"`
+do not offer PAT onboarding. `--no-agents` skips agent bootstrap but does not
+change clone authorization.
 
-Non-interactive contexts (`CI` is set, stdin is not a TTY) skip the prompt and log a one-line tip pointing at `coop github setup-pat`. The `--no-prompt` flag skips the prompt silently. Set `[setup] prompt_for_pat = false` in `config.toml` to disable the prompt globally.
+For a legacy unbound VM, use `coop github status --vm NAME` to see the recorded
+workspace, an unverified origin suggestion, configured entry keys, and a
+reviewable `assign-pat` command. Coop never runs that command from a hint.
+If setup stores an entry but binding fails, the VM stays unbound; run the
+printed `assign-pat` command. A PAT created on GitHub but not stored locally
+may still need revocation. Rebinding cannot reclaim a token already delivered
+to a guest; rotate or revoke it if exposure is suspected.
 
-#### Skip markers
-
-```toml
-[github]
-mode = "pat"
-skip = ["trailofbits/big-repo"]
-```
-
-`coop github setup-pat --repo X/Y` removes any skip marker for `X/Y` when it adds a new entry.
+Older `[github.skip]` values continue to suppress prompts for matching
+suggestions, but new `never` choices are stored per VM.
 
 ## `vm` section
 
