@@ -1436,17 +1436,19 @@ fn run_builder_provision_script(
     builder_timeout: Option<Duration>,
 ) -> Result<()> {
     eprintln!("  Installing packages and agent CLIs in builder VM...");
-    let mut script_file = tempfile::Builder::new()
-        .prefix("lima-provision-")
-        .tempfile_in(&cfg.data_dir)
-        .context("Failed to stage Lima provision script")?;
+    // Unnamed storage cannot leave provision scripts behind after SIGKILL.
+    let mut script_file =
+        tempfile::tempfile_in(&cfg.data_dir).context("Failed to stage Lima provision script")?;
     script_file
         .write_all(compose_provision_script(ssh_pubkey, profiles, guest_user).as_bytes())
         .context("Failed to write Lima provision script")?;
+    script_file
+        .rewind()
+        .context("Failed to rewind Lima provision script")?;
 
     let mut child = private_limactl()?
         .args(["shell", BUILDER_NAME, "--", "sudo", "bash", "-s"])
-        .stdin(Stdio::from(script_file.reopen()?))
+        .stdin(Stdio::from(script_file))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
