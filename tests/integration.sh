@@ -14,7 +14,8 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, features,
+#                    or a narrower macOS CI shard (see the dispatch below).
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -70,7 +71,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features)
+    lifecycle|workspace|config|features|workspace-early|workspace-multi|workspace-late|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -4193,7 +4194,7 @@ test_reconfigure() {
     if coop resize "$INSTANCE" --vcpus "$want_vcpus" --mem "$want_mem" --start; then
         pass "resize --vcpus/--mem --start exits 0"
     else
-        fail "resize --vcpus/--mem --start exits 0" "exit code: $?"
+        fail "resize --vcpus/--mem --start exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
 
@@ -9230,7 +9231,7 @@ EOF
 
     fi
 
-    if [[ "$SHARD" == features ]]; then
+    if [[ "$SHARD" == features || "$SHARD" == features-restore ]]; then
         # Commit/restore needs a stopped primary instance but none of the
         # preceding lifecycle phases. Keep its image and VM state on this runner.
         run_timed_test test_up_creates_primary_instance
@@ -9242,7 +9243,7 @@ EOF
     fi
 
     # Extended tests (each manages its own instance lifecycle)
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early ) ]]; then
         run_timed_test test_quickstart
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
@@ -9250,9 +9251,18 @@ EOF
         run_timed_test test_lima_mount_state_boundary
         run_timed_test test_host_mount_custom_guest_path
         run_timed_test test_port_forwards
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late ) ]]; then
         run_timed_test test_workspace_sync
         run_timed_test test_appledouble_sidecars
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-multi ) ]]; then
         run_timed_test test_multi_instance
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-late ) ]]; then
         run_timed_test test_custom_profiles
         run_timed_test test_builtin_profile_plugins
         run_timed_test test_post_start
@@ -9263,33 +9273,39 @@ EOF
 
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == features || "$SHARD" == features-guest ) ]]; then
         run_timed_test test_builtin_profiles
         run_timed_test test_guest_files
         run_timed_test test_config_dir
     fi
 
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-users ) ]]; then
         # This image/instance lifecycle is independent of the workspace phases.
         run_timed_test test_guest_user_alt
 
         # Local marketplace directory copy
         run_timed_test test_local_marketplace
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-github ) ]]; then
         # github = "pat" mode + per-repo token forwarding (uses a stub image)
         run_timed_test test_github_pat_forwarding
         run_timed_test test_no_github
 
         # [guest_env] config block + literal-over-forwarded precedence
         run_timed_test test_guest_env_config
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-proxy ) ]]; then
         # coop model local/remote: local-model wiring lands and reverts
         run_timed_test test_local_model
 
         # credential-injecting proxy (#411): guest wiring, key suppression,
         # capability gate, teardown — Anthropic + OpenAI/Codex
         run_timed_test test_proxy
+    fi
 
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == config || "$SHARD" == config-setup ) ]]; then
         # Interrupted setup: SIGKILL mid-build, verify clean recovery
         run_timed_test test_interrupted_setup
 
