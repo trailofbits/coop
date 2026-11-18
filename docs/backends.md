@@ -23,13 +23,15 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 `coop setup` builds a golden disk image that all instances clone from:
 
 1. Generates an ed25519 SSH key pair, stored in the coop data directory.
-2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image. The Lima YAML template includes a cloud-init provision script.
-3. The provision script installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services.
-4. After provisioning completes, cleans cloud-init state so it re-runs on cloned instances.
+2. Creates a temporary builder VM from an Ubuntu 24.04 cloud image and waits for Lima's base cloud-init to finish.
+3. Runs the coop provision script in the builder over Lima SSH. It installs all packages (Docker, GitHub CLI, Claude Code, Codex, Grok Build, and any profile packages), creates the `ubuntu` user with SSH access, and enables services. The script runs after Lima reports the VM ready so slow downloads do not hit Lima's boot-readiness limit.
+4. After provisioning completes, cleans cloud-init state so Lima can initialize cloned instances.
 5. Stops the builder VM and extracts its disk as the golden image.
-6. Generates a fast-start Lima template that references the golden image directly. No cloud-init provisioning runs on instance start.
+6. Generates a fast-start Lima template that references the golden image directly. Coop's package and agent provisioning does not rerun on instance start.
 
 The builder VM is deleted after extraction, whether the build succeeds or fails.
+
+The macOS provision script has a 30-minute default timeout, including when `coop up --profile` builds an image automatically. `coop setup --builder-timeout` can override that limit for an explicit setup.
 
 ### How instances work
 

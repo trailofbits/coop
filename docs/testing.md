@@ -12,29 +12,50 @@ change the production code. Investigate failures before changing expectations,
 including compiler errors from private interface changes. Update tests to
 express the preserved behavior and verify they still detect a relevant regression.
 
-The `Firecracker integration` workflow runs the full suite across eight
-disposable GitHub-hosted x64 runners: four on Ubuntu 24.04 and four on
-Ubuntu 26.04. It runs daily at 03:17 UTC on the default branch and on manual
-dispatch. Each runner executes
-`./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
-VM sequence together, `workspace` covers independent workspace phases,
-`config` covers configuration, alternate guest-user, proxy, and setup recovery,
-and `features` covers commit/restore plus independent profile, guest-file, and
-configuration-source phases. The `config`
-shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
-It does not run automatically for pull requests or pushes.
-It enables
-`COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
-timeout (35 minutes for the job including prerequisites and artifact upload).
+The `VM integration` workflow runs the full suite across twenty-one disposable
+GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
+thirteen on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch,
+on manual dispatch, and when a commit is pushed to a branch named
+`ci/vm-integration/*`. It does not run automatically for pull requests or
+ordinary branch pushes. Agents using a personal access token or GitHub App
+token with repository push access can run the exact committed tree without
+Actions write permission by pushing it to a fresh branch under that prefix,
+for example:
+
+```bash
+git push origin HEAD:refs/heads/ci/vm-integration/my-unique-run
+gh run list --workflow integration.yml --branch ci/vm-integration/my-unique-run --limit 1
+```
+
+Choose a new suffix for each run; pushing the same commit to an unchanged ref
+does not create another push event. A workflow's own `GITHUB_TOKEN` does not
+trigger a new workflow from a push; see [GitHub's trigger rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+Callers with Actions write permission can
+instead use `gh workflow run integration.yml --ref BRANCH`. Each runner executes
+`./tests/run-integration.sh --full --shard NAME`. Linux uses `lifecycle`,
+`workspace`, `config`, and `features`. macOS splits the lifecycle sequence into
+`lifecycle-early` and `lifecycle-late` (each creates its own VM), and the other
+phases into `workspace-early`, `workspace-multi`, `workspace-sync`,
+`workspace-profiles`, `workspace-hooks`, `config-users`, `config-github`,
+`config-proxy`, `config-setup`, `features-restore`, and `features-guest`. These
+groups shorten the macOS jobs while covering the same phases. `config` and
+`config-proxy` pass `--require-proxy`. Matrix failures do not cancel other shards.
+macOS runners install the SHA-256-pinned Lima 2.3.0 release to avoid a
+2.2.x guest-login stall after `/etc/environment` changes.
+New runs on the same ref cancel the previous integration run.
+It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
+integration output per OS and shard as a seven-day artifact. Linux suite steps
+have a 30-minute timeout (35 minutes for the job); macOS shards have
+135-minute suite timeouts (150 minutes for the job). macOS allows 30
+minutes for golden image provisioning, including automatic profile builds.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
-complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
-integration remains a separate platform gate.
+complete sequential suite. The Linux jobs cover Firecracker; the macOS jobs
+cover Lima.
 The runner logs `TIMING build:*` durations, and the suite logs `TIMING test:*`
 durations, so shard logs show which work is on the critical path.
-The KVM matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs that
-host-only gate. Unsharded full runs still include it.
+The matrix sets `COOP_TEST_SKIP_BRIDGE=1` because regular CI runs the Linux
+host-only bridge gate. Unsharded full runs still include it on Linux.
 
 ## Cross-platform compile and lint checks
 
@@ -312,9 +333,9 @@ native release.
 VM suite on the selected local or remote host. A failure stops the full run;
 macOS explicitly skips this Linux-only gate. `TEST_FULL=1` also enables it.
 Remote bridge-gate runs copy the tracked working-tree source and require the
-build and namespace prerequisites below on the remote host. The KVM matrix sets
-`COOP_TEST_SKIP_BRIDGE=1` so its four shards do not repeat the gate already
-run by regular Linux CI.
+build and namespace prerequisites below on the remote host. The VM integration
+matrix sets `COOP_TEST_SKIP_BRIDGE=1` so its Linux shards do not repeat the gate
+already run by regular Linux CI.
 
 Run `./tests/integration-network.sh` directly on Linux to test bridge-port
 isolation without KVM or VM images. It builds a library test as the current
