@@ -14,7 +14,7 @@ Run `coop validate` to surface errors and warnings before anything touches a VM.
 |-------|------|---------|-------------|
 | `data_dir` | string (path) | `~/.coop` | Directory for VM artifacts: images, instances, keys, and kernel. |
 | `ssh_port` | integer | `22` | SSH port for the legacy Firecracker TCP transport. Must be > 0. The opt-in vsock listener proxies fixed guest port 22; Lima uses its dynamically assigned host port. |
-| `firecracker_bin` | string (path) | `/var/lib/coop/firecracker/v1.18.0/firecracker` | Managed root-owned Firecracker path. Linux setup and launch require this exact path and verify the matching jailer; remove an old or custom override and run `coop setup`. Ignored on macOS (Lima backend). |
+| `firecracker_bin` | string (path) | `/var/lib/coop/firecracker/v1.18.0/firecracker` | Managed root-owned Firecracker path. Linux validation, setup, and launch require this exact path; setup and launch verify the matching jailer. Remove an old or custom override and run `coop setup`. Ignored on macOS (Lima backend). |
 | `github` | string or table | unset (treated as `"off"`) | GitHub authentication strategy. See [GitHub auth](#github-auth). |
 | `guest_files` | array of tables | empty | Explicit files or directories copied before agent bootstrap on every boot. See [Guest files](#guest-files). |
 | `post_create` | string | unset | Global shell command run during VM creation, after workspace provisioning. Successful completion is recorded; failures retain the VM and block agent launch. See [Creation hooks](#creation-hooks). |

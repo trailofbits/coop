@@ -238,7 +238,9 @@ mem_size_mib = 8192
 template_size_gib = 20
 ```
 
-All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
+VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/` by
+default. On Linux, the managed Firecracker and jailer binaries live under
+`/var/lib/coop/firecracker/`.
 
 The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
 

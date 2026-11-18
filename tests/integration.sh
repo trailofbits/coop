@@ -735,29 +735,40 @@ PYPAIR
             fail "custom Firecracker binary fails setup preflight" "$HARNESS_ERR"
         fi
 
+        if coop --config "$custom_vmm_cfg" validate; then
+            fail "custom Firecracker binary fails config validation" "validate unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Custom firecracker_bin"* ]]; then
+            pass "custom Firecracker binary fails config validation"
+        else
+            fail "custom Firecracker binary fails config validation" "$HARNESS_ERR"
+        fi
+
         # Shadow only this process's mount namespace, leaving the installed
         # release untouched. The real `coop up` entrypoint must reject a
         # modified pair before it creates an instance or a TAP.
-        local corrupt_jailer="$tmpdir/corrupt-jailer"
+        local corrupt_binary="$tmpdir/corrupt-managed-binary"
         local pair_ws="$tmpdir/pair-rejection-ws"
         local pair_name="${INSTANCE}-pair-rejection"
         mkdir -p "$pair_ws"
-        sudo -n install -m 0755 /bin/false "$corrupt_jailer"
+        sudo -n install -m 0755 /bin/false "$corrupt_binary"
         local pair_output="$tmpdir/pair-rejection-output"
-        if sudo -n unshare -m --propagation private sh -c '
-            mount --bind "$1" /var/lib/coop/firecracker/v1.18.0/jailer
+        local component
+        for component in firecracker jailer; do
+            if sudo -n unshare -m --propagation private sh -c '
+            mount --bind "$1" "/var/lib/coop/firecracker/v1.18.0/$2"
             if [ -n "$5" ]; then
                 exec sudo -n -u "$3" env HOME="$4" "$6" --config "$5" up "$7" --name "$8" --no-agents
             fi
             exec sudo -n -u "$3" env HOME="$4" "$6" up "$7" --name "$8" --no-agents
-        ' sh "$corrupt_jailer" unused "$(id -un)" "$HOME" "$SUITE_CONFIG" "$BINARY" "$pair_ws" "$pair_name" >"$pair_output" 2>&1; then
-            fail "modified managed pair blocks coop up" "up unexpectedly succeeded"
-        elif [[ "$(cat "$pair_output")" == *"Managed jailer differs from the pinned production release"* \
-            && ! -e "$HOME/.coop/instances/$pair_name" ]]; then
-            pass "modified managed pair blocks coop up before instance creation"
-        else
-            fail "modified managed pair blocks coop up" "$(tail -5 "$pair_output")"
-        fi
+        ' sh "$corrupt_binary" "$component" "$(id -un)" "$HOME" "$SUITE_CONFIG" "$BINARY" "$pair_ws" "$pair_name" >"$pair_output" 2>&1; then
+                fail "modified managed $component blocks coop up" "up unexpectedly succeeded"
+            elif [[ "$(cat "$pair_output")" == *"Managed $component differs from the pinned production release"* \
+                && ! -e "$HOME/.coop/instances/$pair_name" ]]; then
+                pass "modified managed $component blocks coop up before instance creation"
+            else
+                fail "modified managed $component blocks coop up" "$(tail -5 "$pair_output")"
+            fi
+        done
     fi
 }
 

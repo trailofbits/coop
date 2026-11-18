@@ -190,6 +190,16 @@ mod tests {
         fs::set_permissions(release.join("jailer"), fs::Permissions::from_mode(0o755)).unwrap();
         verify_pair_at_with(&release, &policy, vmm, jailer).unwrap();
 
+        fs::write(release.join("firecracker"), b"wrong vmm").unwrap();
+        assert!(
+            verify_pair_at_with(&release, &policy, vmm, jailer)
+                .unwrap_err()
+                .to_string()
+                .contains("Managed firecracker differs from the pinned production release")
+        );
+        fs::write(release.join("firecracker"), b"vmm witness").unwrap();
+        verify_pair_at_with(&release, &policy, vmm, jailer).unwrap();
+
         fs::write(release.join("jailer"), b"wrong jailer").unwrap();
         assert!(
             verify_pair_at_with(&release, &policy, vmm, jailer)
