@@ -913,11 +913,13 @@ EOF
         if [[ "${COOP_TEST_LITERAL_DOLLAR_HOME:-0}" == 1 ]]; then
             if [[ "$HOME" == *'${COOP_SYSTEMD_PATH_LITERAL}'* \
                 && -f "$HOME/.coop/instances/$INSTANCE/vm_config.json" \
-                && -f "$HOME/.coop/instances/$INSTANCE/firecracker.log" ]]; then
-                pass "Firecracker opens config and log beneath a literal dollar data directory"
+                && -L "$HOME/.coop/instances/$INSTANCE/firecracker.log" \
+                && "$(readlink "$HOME/.coop/instances/$INSTANCE/firecracker.log")" == "$jail_root/firecracker.log" \
+                && "$service_pid" == "$firecracker_pid" ]]; then
+                pass "jailed Firecracker starts with a literal-dollar instance home and managed log link"
             else
-                fail "Firecracker opens config and log beneath a literal dollar data directory" \
-                    "expected config and log beneath the configured home path"
+                fail "jailed Firecracker starts with a literal-dollar instance home and managed log link" \
+                    "expected running service and managed log link beneath the configured home path"
             fi
         fi
     fi
