@@ -57,9 +57,13 @@ jobs:
             job_timeout: 35
             suite_timeout: 30
           - os: macos-15-intel
-            shard: lifecycle
-            job_timeout: 180
-            suite_timeout: 165
+            shard: lifecycle-early
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: lifecycle-late
+            job_timeout: 150
+            suite_timeout: 135
           - os: macos-15-intel
             shard: workspace-early
             job_timeout: 150
@@ -69,7 +73,15 @@ jobs:
             job_timeout: 150
             suite_timeout: 135
           - os: macos-15-intel
-            shard: workspace-late
+            shard: workspace-sync
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-profiles
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-hooks
             job_timeout: 150
             suite_timeout: 135
           - os: macos-15-intel

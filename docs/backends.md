@@ -31,6 +31,8 @@ Coop resolves `limactl` through the shared host-tool validator and uses a fixed 
 
 The builder VM is deleted after extraction, whether the build succeeds or fails.
 
+The macOS provision script has a 30-minute default timeout, including when `coop up --profile` builds an image automatically. `coop setup --builder-timeout` can override that limit for an explicit setup.
+
 ### How instances work
 
 Each instance is a Lima VM created with `limactl start` using the fast-start template. Lima names are prefixed with `coop-` (e.g., `coop-my-instance`). The instance gets its own disk, a copy-on-write layer over the golden image. Lima handles SSH port allocation automatically; coop reads the assigned port from `limactl list --json`.
