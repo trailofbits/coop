@@ -4193,7 +4193,7 @@ test_reconfigure() {
     if coop resize "$INSTANCE" --vcpus "$want_vcpus" --mem "$want_mem" --start; then
         pass "resize --vcpus/--mem --start exits 0"
     else
-        fail "resize --vcpus/--mem --start exits 0" "exit code: $?"
+        fail "resize --vcpus/--mem --start exits 0" "exit code: $?; stderr: $HARNESS_ERR"
         return
     fi
 
