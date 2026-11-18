@@ -1040,6 +1040,17 @@ mod tests {
 
         let error = drain_available(&mut PermissionDenied, &mut Vec::new(), 8).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut captured = Vec::new();
+        let mut next = 0;
+        assert_eq!(
+            drain_available_tail(&mut InterruptedThenData(0), &mut captured, &mut next, 8).unwrap(),
+            Drain::Eof
+        );
+        assert_eq!(captured, b"x");
+        let error =
+            drain_available_tail(&mut PermissionDenied, &mut captured, &mut next, 8).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
