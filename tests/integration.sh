@@ -671,6 +671,9 @@ test_setup() {
     echo "=== Phase: setup ==="
 
     local args=(setup -y)
+    if [[ -n "${COOP_TEST_BUILDER_TIMEOUT:-}" ]]; then
+        args+=(--builder-timeout "$COOP_TEST_BUILDER_TIMEOUT")
+    fi
     # The full suite exercises `agent update --codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
