@@ -165,6 +165,9 @@ jobs:
 
       - name: Upload integration output
         if: ${{ !cancelled() }}
+        # The full output is also in the job log; artifact-service outages
+        # should not turn a passing integration shard red.
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vm-integration-${{ matrix.os }}-${{ matrix.shard }}-log
