@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for VM integration probes, without booting a VM."""
 import http.server
+import importlib.util
+import io
 import os
 from pathlib import Path
 import re
@@ -9,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 
 SOURCE = (Path(__file__).parent / "integration.sh").read_text()
 
@@ -64,6 +67,49 @@ class ProbeTests(unittest.TestCase):
                                  result.stdout + result.stderr)
                 self.assertEqual("exited before its summary" in result.stderr,
                                  early_exit, result.stderr)
+    def test_web_editor_lease_reports_why_it_ended(self):
+        source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
+        lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        fixture = "set -euo pipefail\nlease_deadline=0\n" + lease + "\nlease\n"
+        eof = subprocess.run(["bash", "-c", fixture], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=3)
+        self.assertEqual(eof.returncode, 0, eof.stderr)
+        self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
+
+        with subprocess.Popen(["bash", "-c", fixture], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as expired:
+            self.assertEqual(expired.wait(timeout=3), 0)
+            self.assertEqual(expired.stdout.read(), "cancelled lease_expired\n")
+
+        alive = subprocess.run(["bash", "-c", fixture.replace("lease_deadline=0", "lease_deadline=15")
+                                + "printf 'continued\\n'\n"], input="alive\n",
+                               capture_output=True, text=True, timeout=3)
+        self.assertEqual(alive.returncode, 0, alive.stderr)
+        self.assertEqual(alive.stdout, "continued\n")
+
+    def test_web_editor_failure_snapshot_does_not_print_guest_text(self):
+        path = Path(__file__).parent / "integration-web-editor.py"
+        spec = importlib.util.spec_from_file_location("integration_web_editor", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        valid = "sshd_active=active sshd_result=success kernel_oom_lines=0 sshd_warning_lines=2\n"
+        for guest_output, expected in [
+            (valid, "guest_ssh=reachable " + valid.strip()),
+            (valid + "secret=do-not-print\n", "guest_ssh=unavailable"),
+            ("secret=do-not-print\n" * 100, "guest_ssh=unavailable"),
+        ]:
+            with self.subTest(guest_output=guest_output), tempfile.TemporaryDirectory() as directory:
+                fake_coop = Path(directory) / "coop"
+                fake_coop.write_text("#!/usr/bin/env python3\nimport sys\n"
+                                     "assert sys.argv[1:5] == ['shell', 'vm', '--', 'python3']\n"
+                                     "sys.stdout.write(" +
+                                     repr(guest_output) + ")\nsys.stderr.write('secret=also-do-not-print')\n")
+                fake_coop.chmod(0o755)
+                with redirect_stdout(io.StringIO()) as output:
+                    module.failure_snapshot([str(fake_coop)], "vm")
+                self.assertEqual(output.getvalue().strip(), "EDITOR_FAILURE_SNAPSHOT " + expected)
+                self.assertNotIn("secret=", output.getvalue())
 
     def test_grok_binary_requirement_tracks_rebuilt_image(self):
         fixture = functions("test_grok_bin_path") + '''

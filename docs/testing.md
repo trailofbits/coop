@@ -158,6 +158,9 @@ Lifecycle and guest-visible changes still require both real backends:
 
 The `coop editor --web` phase checks login, default/custom projects, startup
 failure diagnostics and session cleanup, including mounted workspaces.
+On an unexpected failure, its CI log includes a bounded guest SSH reachability,
+sshd state, and recent kernel OOM/sshd warning count snapshot without journal
+text. A failed guest probe reports only that the snapshot was unavailable.
 For a focused run, use a disposable VM: this fixture stops and restarts it.
 
 ```sh

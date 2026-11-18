@@ -722,9 +722,17 @@ in a browser. The browser still processes guest-controlled content. See
 
 During first use, coop reports installation and download progress. Failures
 identify download, archive verification, systemd launch, or code-server startup
-when the guest supplies a status. SSH transport failures report the last
-observed stage. The guest `~/.local/share/coop-web-editor/editor.log` is relevant
-only after code-server launch has been acknowledged.
+when the guest supplies a status. When the status stream closes without a guest
+report, the error names the last observed stage. The guest
+`~/.local/share/coop-web-editor/editor.log` is relevant only after code-server
+launch has been acknowledged.
+If the SSH status stream closes without a guest report, coop also reports the
+SSH subprocess status or whether it remained running after stdout closed,
+plus a fixed category for recognized SSH stderr text. Raw stderr is neither
+printed nor persisted. Guest stderr can imitate an SSH diagnostic, so the
+category is a hint, not proof of which component ended the session. Lease EOF and
+heartbeat expiry have distinct reports when the guest can still send its final
+status.
 
 Keep the terminal running while you edit. A second invocation joins the same
 session and can open a different `--project` in that session. Ctrl+C in either

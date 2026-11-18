@@ -3,14 +3,14 @@
 //! browser port directly; code-server handles authentication in the guest.
 
 use std::ffi::OsStr;
-use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
+use std::io::{BufRead as _, ErrorKind, IsTerminal as _, Read, Write as _};
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -250,7 +250,7 @@ pub(crate) fn run(
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // OpenSSH closes inherited nonstandard descriptors. The session lock is
     // held by this owner only; each retry gets independent guest socket paths.
     let mut child = OwnedChild(
@@ -260,8 +260,11 @@ pub(crate) fn run(
     );
     let mut input = child.0.stdin.take().context("Missing SSH stdin")?;
     let output = child.0.stdout.take().context("Missing SSH stdout")?;
+    let stderr = child.0.stderr.take().context("Missing SSH stderr")?;
     nonblocking_pipe(&output)?;
+    nonblocking_pipe(&stderr)?;
     let mut events = Reader::new(output);
+    let mut ssh_diagnostics = SshDiagnostics::new(stderr);
     let result = (|| {
         nonblocking_pipe(&input)?;
         writeln!(input, "{password}")?;
@@ -281,6 +284,7 @@ pub(crate) fn run(
             &mut child.0,
             &mut input,
             &mut events,
+            &mut ssh_diagnostics,
         )
     })();
     drop(input);
@@ -349,6 +353,7 @@ fn serve_session(
     child: &mut Child,
     input: &mut ChildStdin,
     events: &mut Reader<std::process::ChildStdout>,
+    ssh_diagnostics: &mut SshDiagnostics<ChildStderr>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let mut heartbeat = started;
@@ -361,6 +366,7 @@ fn serve_session(
         inst.name
     );
     loop {
+        ssh_diagnostics.drain();
         if crate::signal::shutdown_requested() {
             return Ok(());
         }
@@ -372,10 +378,17 @@ fn serve_session(
                 .with_context(|| format!("Reading status during {}", stage.label()))?
             {
                 Poll::Pending => break,
-                Poll::Closed => bail!(
-                    "Editor SSH status stream closed during {}; no guest failure report was received. Check VM SSH access and the local forward on 127.0.0.1:{port}",
-                    stage.label()
-                ),
+                Poll::Closed => {
+                    // A closed stdout alone cannot distinguish a lost SSH
+                    // transport from a guest exit. Reap a terminating child
+                    // briefly so the error preserves the subprocess result.
+                    let exit = ssh_process_exit(child, ssh_diagnostics)?;
+                    let diagnostic = ssh_diagnostics.category;
+                    bail!(
+                        "Editor SSH status stream closed during {}; no guest failure report was received (SSH subprocess: {exit}; SSH diagnostic: {diagnostic}). Check VM SSH access and the local forward on 127.0.0.1:{port}",
+                        stage.label()
+                    );
+                }
                 Poll::Event(event) => match event {
                     Event::Downloaded(bytes)
                         if reported_progress.elapsed() >= Duration::from_secs(2) =>
@@ -484,6 +497,96 @@ fn nonblocking_pipe(input: &impl AsRawFd) -> Result<()> {
     Ok(())
 }
 
+fn ssh_process_exit(
+    child: &mut Child,
+    diagnostics: &mut SshDiagnostics<impl Read>,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        diagnostics.drain();
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok("still running after stdout EOF".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct SshDiagnostics<R> {
+    source: R,
+    tail: Vec<u8>,
+    category: &'static str,
+    closed: bool,
+}
+
+impl<R: Read> SshDiagnostics<R> {
+    fn new(source: R) -> Self {
+        Self {
+            source,
+            tail: Vec::new(),
+            category: "no recognized SSH message",
+            closed: false,
+        }
+    }
+
+    fn drain(&mut self) {
+        if self.closed {
+            return;
+        }
+        let mut chunk = [0; 1024];
+        for _ in 0..16 {
+            match self.source.read(&mut chunk) {
+                Ok(0) => {
+                    self.closed = true;
+                    break;
+                }
+                Ok(count) => {
+                    self.tail.extend_from_slice(&chunk[..count]);
+                    if let Some(category) =
+                        classify_ssh_diagnostic(&String::from_utf8_lossy(&self.tail))
+                    {
+                        self.category = category;
+                    }
+                    if self.tail.len() > 256 {
+                        self.tail.drain(..self.tail.len() - 256);
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    self.category = "SSH stderr unavailable";
+                    self.closed = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Classify fixed phrases; remote stderr may imitate them, so this is a hint.
+fn classify_ssh_diagnostic(log: &str) -> Option<&'static str> {
+    if log.contains("Connection timed out") || log.contains("Operation timed out") {
+        Some("connection timeout")
+    } else if log.contains("Connection reset by peer") {
+        Some("connection reset")
+    } else if log.contains("Connection refused") {
+        Some("connection refused")
+    } else if log.contains("Broken pipe") {
+        Some("broken pipe")
+    } else if log.contains("Address already in use") || log.contains("forwarding failed") {
+        Some("forwarding failed")
+    } else if log.contains("closed by remote host") || log.contains("Connection closed") {
+        Some("connection closed")
+    } else {
+        None
+    }
+}
+
 fn ssh_launch(
     target: &SshTarget,
     port: NonZeroU16,
@@ -552,7 +655,7 @@ impl Drop for OwnedChild {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::web_editor::{Session, clean_stale_directory};
+    use crate::web_editor::{Session, SshDiagnostics, clean_stale_directory, ssh_process_exit};
 
     #[test]
     fn editor_tokens_are_64_hex_characters_and_fresh() {
@@ -799,6 +902,62 @@ mod tests {
         };
         assert!(clean_stale_directory(&invalid_session).is_err());
         assert!(invalid.path().is_file());
+    }
+
+    #[test]
+    fn ssh_diagnostic_reader_bounds_and_classifies_without_exposing_text() {
+        for (message, expected) in [
+            ("Connection timed out", "connection timeout"),
+            ("Operation timed out", "connection timeout"),
+            ("Connection reset by peer", "connection reset"),
+            (
+                "ssh: connect to host example port 22: Connection refused",
+                "connection refused",
+            ),
+            ("client_loop: send disconnect: Broken pipe", "broken pipe"),
+            ("Address already in use", "forwarding failed"),
+            ("forwarding failed", "forwarding failed"),
+            (
+                "Connection to example closed by remote host.",
+                "connection closed",
+            ),
+            ("Connection closed", "connection closed"),
+            ("guest-provided secret text", "no recognized SSH message"),
+        ] {
+            let mut input = b"filler ".repeat(200);
+            input.extend_from_slice(message.as_bytes());
+            let mut reader = SshDiagnostics::new(std::io::Cursor::new(input));
+            reader.drain();
+            assert_eq!(reader.category, expected);
+            assert!(reader.tail.len() <= 256);
+        }
+        let mut early = b"Connection refused".to_vec();
+        early.extend_from_slice(&[b'x'; 4096]);
+        let mut reader = SshDiagnostics::new(std::io::Cursor::new(early));
+        reader.drain();
+        assert_eq!(reader.category, "connection refused");
+        assert!(reader.tail.len() <= 256);
+
+        let mut split = vec![b'x'; 1015];
+        split.extend_from_slice(b"Connection reset by peer");
+        let mut reader = SshDiagnostics::new(std::io::Cursor::new(split));
+        reader.drain();
+        assert_eq!(reader.category, "connection reset");
+    }
+
+    #[test]
+    fn ssh_process_exit_preserves_the_subprocess_result() {
+        for (code, expected) in [(0, "exit status: 0"), (255, "exit status: 255")] {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            let mut diagnostics = SshDiagnostics::new(std::io::Cursor::new(Vec::<u8>::new()));
+            assert_eq!(
+                ssh_process_exit(&mut child, &mut diagnostics).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
