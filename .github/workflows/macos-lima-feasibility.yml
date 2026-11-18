@@ -39,7 +39,7 @@ jobs:
           COOP_TEST_BUILDER_TIMEOUT: "30m"
         run: |
           set -o pipefail
-          ./tests/run-integration.sh --full --shard lifecycle 2>&1 \
+          ./tests/run-integration.sh --full --shard lifecycle --profile "" 2>&1 \
             | tee "$RUNNER_TEMP/macos-lima-integration.log"
 
       - name: Upload integration output
