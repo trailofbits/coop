@@ -6,6 +6,8 @@
 # here are covered by `tests/integration.sh` (external processes, SSH, IO) or
 # by `cargo kani` (the proofs), neither of which a `cargo test` unit test can
 # stand in for. See issue #329 and the mutation-testing section of CLAUDE.md.
+# PAT assignment/selection IO stays in scope: focused lock-contention tests
+# directly observe its ordering and fail when the relevant locks are removed.
 #
 # What is NOT excluded: the pure-logic helpers the #321–#327 triage produced.
 # Those fixes EXTRACTED the testable logic out of shell-out/IO functions into
