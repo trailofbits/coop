@@ -1,0 +1,55 @@
+name: macOS Lima multi-instance trial
+
+on:
+  push:
+    branches: [ci/macos-lima-multi-focus]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-lima-multi-focus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Multi-instance phase (macOS / Lima)
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install host prerequisites
+        run: |
+          brew install cmake
+          curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
+          echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+          /usr/local/bin/limactl --version
+
+      - name: Multi-instance Lima phase
+        timeout-minutes: 105
+        env:
+          COOP_TEST_BUILDER_TIMEOUT: "30m"
+        run: |
+          set -euo pipefail
+          cargo build --release -p coop
+          ./tests/integration.sh --binary "$PWD/target/release/coop" --full --shard multi-only 2>&1 \
+            | tee "$RUNNER_TEMP/macos-lima-integration.log"
+
+      - name: Upload integration output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-lima-multi-focus-log
+          path: ${{ runner.temp }}/macos-lima-integration.log
+          if-no-files-found: ignore
+          retention-days: 7

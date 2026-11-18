@@ -70,7 +70,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features)
+    lifecycle|workspace|config|features|multi-only)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9239,6 +9239,11 @@ EOF
         fi
         run_timed_test test_commit_restore
         run_timed_test test_destroy
+    fi
+
+    # Focused hosted-runner diagnostic: two concurrent Lima VMs.
+    if [[ "$SHARD" == multi-only ]]; then
+        run_timed_test test_multi_instance
     fi
 
     # Extended tests (each manages its own instance lifecycle)
