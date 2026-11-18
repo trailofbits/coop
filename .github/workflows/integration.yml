@@ -24,18 +24,79 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle, workspace, config, features]
-        os: [ubuntu-24.04, ubuntu-26.04, macos-15-intel]
         include:
           - os: ubuntu-24.04
+            shard: lifecycle
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-24.04
+            shard: workspace
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-24.04
+            shard: config
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-24.04
+            shard: features
             job_timeout: 35
             suite_timeout: 30
           - os: ubuntu-26.04
+            shard: lifecycle
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-26.04
+            shard: workspace
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-26.04
+            shard: config
+            job_timeout: 35
+            suite_timeout: 30
+          - os: ubuntu-26.04
+            shard: features
             job_timeout: 35
             suite_timeout: 30
           - os: macos-15-intel
-            job_timeout: 120
-            suite_timeout: 105
+            shard: lifecycle
+            job_timeout: 180
+            suite_timeout: 165
+          - os: macos-15-intel
+            shard: workspace-early
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-multi
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-late
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-users
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-github
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-proxy
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: config-setup
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: features-restore
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: features-guest
+            job_timeout: 150
+            suite_timeout: 135
     defaults:
       run:
         shell: bash
@@ -64,7 +125,14 @@ jobs:
 
       - name: Install macOS host prerequisites
         if: runner.os == 'macOS'
-        run: brew install lima cmake
+        run: |
+          brew install cmake
+          # Lima 2.2 can stall SSH logins after provisioning edits
+          # /etc/environment; pin the upstream release that narrows this race.
+          curl -fsSL https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz -o "$RUNNER_TEMP/lima.tgz"
+          echo 'd58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6  '"$RUNNER_TEMP/lima.tgz" | shasum -a 256 -c -
+          sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
+          /usr/local/bin/limactl --version
 
       - name: Full VM integration
         timeout-minutes: ${{ matrix.suite_timeout }}
@@ -78,7 +146,7 @@ jobs:
         run: |
           set -o pipefail
           args=(--full --shard "$SHARD")
-          if [[ "$SHARD" == config ]]; then
+          if [[ "$SHARD" == config || "$SHARD" == config-proxy ]]; then
             args+=(--require-proxy)
           fi
           ./tests/run-integration.sh "${args[@]}" 2>&1 \

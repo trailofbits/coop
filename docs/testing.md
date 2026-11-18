@@ -12,25 +12,29 @@ change the production code. Investigate failures before changing expectations,
 including compiler errors from private interface changes. Update tests to
 express the preserved behavior and verify they still detect a relevant regression.
 
-The `VM integration` workflow runs the full suite across twelve disposable
+The `VM integration` workflow runs the full suite across eighteen disposable
 GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
-four on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
+ten on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
 on pull requests and manual dispatch. Agents can trigger both backends by
 pushing a pull-request branch; a manual branch run is available with
 `gh workflow run integration.yml --ref BRANCH` when the caller has Actions
 write permission. Each runner executes
-`./tests/run-integration.sh --full --shard NAME`: `lifecycle` keeps the primary
-VM sequence together, `workspace` covers independent workspace phases,
-`config` covers configuration, alternate guest-user, proxy, and setup recovery,
-and `features` covers commit/restore plus independent profile, guest-file, and
-configuration-source phases. The `config`
-shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
+`./tests/run-integration.sh --full --shard NAME`. Linux uses `lifecycle`,
+`workspace`, `config`, and `features`. macOS keeps `lifecycle` together and
+splits the other phases into `workspace-early`, `workspace-multi`,
+`workspace-late`, `config-users`, `config-github`, `config-proxy`,
+`config-setup`, `features-restore`, and `features-guest`. These groups shorten
+the macOS jobs while covering the same phases. `config` and `config-proxy`
+pass `--require-proxy`. Matrix failures do not cancel other shards.
+macOS runners install the SHA-256-pinned Lima 2.3.0 release to avoid a
+2.2.x guest-login stall after `/etc/environment` changes.
 New pushes to a pull-request branch cancel the previous integration run.
 It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
 integration output per OS and shard as a seven-day artifact. Linux suite steps
-have a 30-minute timeout (35 minutes for the job); macOS suite steps have a
-105-minute timeout (120 minutes for the job) and allow 30 minutes for golden
-image provisioning.
+have a 30-minute timeout (35 minutes for the job); macOS lifecycle has a
+165-minute suite timeout (180 minutes for the job), and other macOS shards
+have 135-minute suite timeouts (150 minutes for the job). macOS allows 30
+minutes for golden image provisioning.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. The Linux jobs cover Firecracker; the macOS jobs
