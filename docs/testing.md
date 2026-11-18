@@ -14,11 +14,24 @@ express the preserved behavior and verify they still detect a relevant regressio
 
 The `VM integration` workflow runs the full suite across twenty-one disposable
 GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
-thirteen on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
-on manual dispatch. It does not run automatically for pull requests. Start
-a manual branch run with
-`gh workflow run integration.yml --ref BRANCH` when the caller has Actions
-write permission. Each runner executes
+thirteen on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch,
+on manual dispatch, and when a commit is pushed to a branch named
+`ci/vm-integration/*`. It does not run automatically for pull requests or
+ordinary branch pushes. Agents using a personal access token or GitHub App
+token with repository push access can run the exact committed tree without
+Actions write permission by pushing it to a fresh branch under that prefix,
+for example:
+
+```bash
+git push origin HEAD:refs/heads/ci/vm-integration/my-unique-run
+gh run list --workflow integration.yml --branch ci/vm-integration/my-unique-run --limit 1
+```
+
+Choose a new suffix for each run; pushing the same commit to an unchanged ref
+does not create another push event. A workflow's own `GITHUB_TOKEN` does not
+trigger a new workflow from a push; see [GitHub's trigger rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+Callers with Actions write permission can
+instead use `gh workflow run integration.yml --ref BRANCH`. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`. Linux uses `lifecycle`,
 `workspace`, `config`, and `features`. macOS splits the lifecycle sequence into
 `lifecycle-early` and `lifecycle-late` (each creates its own VM), and the other
