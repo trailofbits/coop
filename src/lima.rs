@@ -152,7 +152,7 @@ pub fn create_and_start(
         &inst.name,
         &mut child,
         cfg,
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         &guest_user,
     ) {
         let _ = child.kill();
@@ -233,7 +233,7 @@ pub fn start_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         &inst.name,
         &mut child,
         cfg,
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         &guest_user,
     ) {
         let _ = child.kill();
