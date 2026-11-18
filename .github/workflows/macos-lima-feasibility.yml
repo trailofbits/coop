@@ -36,6 +36,7 @@ jobs:
         timeout-minutes: 105
         env:
           COOP_TEST_SKIP_BRIDGE: "1"
+          COOP_TEST_BUILDER_TIMEOUT: "30m"
         run: |
           set -o pipefail
           ./tests/run-integration.sh --full --shard lifecycle 2>&1 \
