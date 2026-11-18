@@ -24,6 +24,7 @@ use crate::sha256_hash::Sha256Hash;
 
 const LIMA_PREFIX: &str = "coop-";
 const BUILDER_NAME: &str = "coop-builder";
+const DEFAULT_BUILDER_PROVISION_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Hostname Lima injects into the guest that resolves to the host machine.
 /// Used to rewrite local-model endpoints so the guest can reach a server
@@ -1454,7 +1455,7 @@ fn run_builder_provision_script(
         .spawn()
         .context("Failed to launch provisioning in Lima builder")?;
 
-    let timeout = builder_timeout.unwrap_or(Duration::from_secs(600));
+    let timeout = builder_timeout.unwrap_or(DEFAULT_BUILDER_PROVISION_TIMEOUT);
     let started = Instant::now();
     loop {
         match child.try_wait() {
