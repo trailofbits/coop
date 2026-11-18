@@ -71,7 +71,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features|workspace-early|workspace-multi|workspace-late|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
+    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early|workspace-multi|workspace-late|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9160,74 +9160,80 @@ EOF
 
     # Setup + primary instance
     run_timed_test test_setup
-    # Keep the stateful primary-instance sequence together. Extended phases
-    # below create their own instances and only need the shared golden image.
-    if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
+    # Each lifecycle half uses its own primary VM on macOS; the unsharded and
+    # Linux lifecycle paths retain the complete stateful sequence.
+    if [[ "$SHARD" == all || "$SHARD" == lifecycle || "$SHARD" == lifecycle-early || "$SHARD" == lifecycle-late ]]; then
         run_timed_test test_up_creates_primary_instance
-        run_timed_test test_private_storage
-        run_timed_test test_start_rejects_missing_instance
-        run_timed_test test_duplicate_name
-        run_timed_test test_status_running
-        run_timed_test test_list_running
-        run_timed_test test_running_vm_completions
-        run_timed_test test_auto_resolve_running
-        run_timed_test test_shell_connectivity
-        run_timed_test test_firecracker_vsock_transport
-        run_timed_test test_ssh_alias
-        run_timed_test test_ssh_config
-        run_timed_test test_editor
-        run_timed_test test_web_editor
-        run_timed_test test_exec
-        run_timed_test test_claude_bin_path
-        run_timed_test test_grok_bin_path
-        run_timed_test test_grok_settings_merge
-        run_timed_test test_claude_settings_merge
-        run_timed_test test_claude_onboarding_seed
-        run_timed_test test_codex_bin_path
-        run_timed_test test_codex_account_auth_support
-        run_timed_test test_codex_chatgpt_mode
-        run_timed_test test_codex_sandbox_bypass
-        run_timed_test test_program_status
-        run_timed_test test_agent_update
-        run_timed_test test_github_token_forwarding
-        run_timed_test test_term_handling
-        run_timed_test test_guest_environment
-        run_timed_test test_sudo
-        run_timed_test test_network
-        run_timed_test test_docker
-        run_timed_test test_logs
-        run_timed_test test_profiles
-        run_timed_test test_guest_fingerprint
-        run_timed_test test_vsock_control_without_guest_network
-        run_timed_test test_firecracker_isolated_network_mode
-        run_timed_test test_legacy_firecracker_control_compatibility
-
-        # Stop + restart + stopped-state verification
-        run_timed_test test_stop_preserves_recent_writes
-        run_timed_test test_stop
-        run_timed_test test_stop_idempotency
-        run_timed_test test_auto_resolve_stopped
-        run_timed_test test_status_stopped
-        run_timed_test test_agent_update_stopped
-        run_timed_test test_list_stopped
-        run_timed_test test_stopped_vm_completions
-        run_timed_test test_resize_disk_size
-        run_timed_test test_resize_retry_firecracker
-        run_timed_test test_resize_disk_start
-        run_timed_test test_reconfigure
-        if [[ "$SHARD" == all ]]; then
-            run_timed_test test_commit_restore
+        if [[ "$SHARD" != lifecycle-late ]]; then
+            run_timed_test test_private_storage
+            run_timed_test test_start_rejects_missing_instance
+            run_timed_test test_duplicate_name
+            run_timed_test test_status_running
+            run_timed_test test_list_running
+            run_timed_test test_running_vm_completions
+            run_timed_test test_auto_resolve_running
+            run_timed_test test_shell_connectivity
+            run_timed_test test_firecracker_vsock_transport
+            run_timed_test test_ssh_alias
+            run_timed_test test_ssh_config
+            run_timed_test test_editor
+            run_timed_test test_web_editor
+            run_timed_test test_exec
+            run_timed_test test_claude_bin_path
+            run_timed_test test_grok_bin_path
+            run_timed_test test_grok_settings_merge
+            run_timed_test test_claude_settings_merge
+            run_timed_test test_claude_onboarding_seed
+            run_timed_test test_codex_bin_path
+            run_timed_test test_codex_account_auth_support
+            run_timed_test test_codex_chatgpt_mode
+            run_timed_test test_codex_sandbox_bypass
+            run_timed_test test_program_status
+            run_timed_test test_agent_update
+            run_timed_test test_github_token_forwarding
+            run_timed_test test_term_handling
+            run_timed_test test_guest_environment
+            run_timed_test test_sudo
+            run_timed_test test_network
+            run_timed_test test_docker
+            run_timed_test test_logs
+            run_timed_test test_profiles
+            run_timed_test test_guest_fingerprint
+            run_timed_test test_vsock_control_without_guest_network
+            run_timed_test test_firecracker_isolated_network_mode
+            run_timed_test test_legacy_firecracker_control_compatibility
         fi
-        run_timed_test test_private_storage
-        run_timed_test test_restart_stopped
-        run_timed_test test_restart_rejects_ignored_flags
-        run_timed_test test_restore_reprovision
-        run_timed_test test_destroy
-        run_timed_test test_auto_resolve_no_instances
-        run_timed_test test_list_empty
 
-        # Idempotency: re-run commands that should be safe to repeat
-        run_timed_test test_idempotency
+        if [[ "$SHARD" != lifecycle-early ]]; then
+            # Stop + restart + stopped-state verification
+            run_timed_test test_stop_preserves_recent_writes
+            run_timed_test test_stop
+            run_timed_test test_stop_idempotency
+            run_timed_test test_auto_resolve_stopped
+            run_timed_test test_status_stopped
+            run_timed_test test_agent_update_stopped
+            run_timed_test test_list_stopped
+            run_timed_test test_stopped_vm_completions
+            run_timed_test test_resize_disk_size
+            run_timed_test test_resize_retry_firecracker
+            run_timed_test test_resize_disk_start
+            run_timed_test test_reconfigure
+            if [[ "$SHARD" == all ]]; then
+                run_timed_test test_commit_restore
+            fi
+            run_timed_test test_private_storage
+            run_timed_test test_restart_stopped
+            run_timed_test test_restart_rejects_ignored_flags
+            run_timed_test test_restore_reprovision
+            run_timed_test test_destroy
+            run_timed_test test_auto_resolve_no_instances
+            run_timed_test test_list_empty
+
+            # Idempotency: re-run commands that should be safe to repeat
+            run_timed_test test_idempotency
+        else
+            run_timed_test test_destroy
+        fi
 
     fi
 
