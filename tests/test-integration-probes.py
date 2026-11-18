@@ -76,11 +76,13 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(eof.returncode, 0, eof.stderr)
         self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
 
-        with subprocess.Popen(["bash", "-c", fixture], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True) as expired:
-            self.assertEqual(expired.wait(timeout=3), 0)
-            self.assertEqual(expired.stdout.read(), "cancelled lease_expired\n")
+        # macOS Bash reports a timed read as status 1, like EOF. Inject the
+        # Linux timeout status so this host-only test covers the guest branch.
+        timeout_fixture = fixture.replace("\nlease\n", "\nread() { return 142; }\nlease\n")
+        expired = subprocess.run(["bash", "-c", timeout_fixture], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(expired.returncode, 0, expired.stderr)
+        self.assertEqual(expired.stdout, "cancelled lease_expired\n")
 
         alive = subprocess.run(["bash", "-c", fixture.replace("lease_deadline=0", "lease_deadline=15")
                                 + "printf 'continued\\n'\n"], input="alive\n",
