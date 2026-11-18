@@ -30,11 +30,11 @@ pub(crate) fn cmd_github(
         }
         GithubAction::AssignPat { vm, repo } => {
             let inst = cfg.resolve_instance(Some(&vm))?;
-            crate::github_assignment::Assignment { repo }.save(cfg, &inst)
+            crate::github_assignment::assign(cfg, &inst, repo)
         }
         GithubAction::UnassignPat { vm } => {
             let inst = cfg.resolve_instance(Some(&vm))?;
-            crate::github_assignment::Assignment::remove(&inst)
+            crate::github_assignment::unassign(cfg, &inst)
         }
         GithubAction::Status { probe, json, vm } => {
             let inst = vm

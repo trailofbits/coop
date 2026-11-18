@@ -748,29 +748,40 @@ PYPAIR
             fail "custom Firecracker binary fails setup preflight" "$HARNESS_ERR"
         fi
 
+        if coop --config "$custom_vmm_cfg" validate; then
+            fail "custom Firecracker binary fails config validation" "validate unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Custom firecracker_bin"* ]]; then
+            pass "custom Firecracker binary fails config validation"
+        else
+            fail "custom Firecracker binary fails config validation" "$HARNESS_ERR"
+        fi
+
         # Shadow only this process's mount namespace, leaving the installed
         # release untouched. The real `coop up` entrypoint must reject a
         # modified pair before it creates an instance or a TAP.
-        local corrupt_jailer="$tmpdir/corrupt-jailer"
+        local corrupt_binary="$tmpdir/corrupt-managed-binary"
         local pair_ws="$tmpdir/pair-rejection-ws"
         local pair_name="${INSTANCE}-pair-rejection"
         mkdir -p "$pair_ws"
-        sudo -n install -m 0755 /bin/false "$corrupt_jailer"
+        sudo -n install -m 0755 /bin/false "$corrupt_binary"
         local pair_output="$tmpdir/pair-rejection-output"
-        if sudo -n unshare -m --propagation private sh -c '
-            mount --bind "$1" /var/lib/coop/firecracker/v1.18.0/jailer
+        local component
+        for component in firecracker jailer; do
+            if sudo -n unshare -m --propagation private sh -c '
+            mount --bind "$1" "/var/lib/coop/firecracker/v1.18.0/$2"
             if [ -n "$5" ]; then
                 exec sudo -n -u "$3" env HOME="$4" "$6" --config "$5" up "$7" --name "$8" --no-agents
             fi
             exec sudo -n -u "$3" env HOME="$4" "$6" up "$7" --name "$8" --no-agents
-        ' sh "$corrupt_jailer" unused "$(id -un)" "$HOME" "$SUITE_CONFIG" "$BINARY" "$pair_ws" "$pair_name" >"$pair_output" 2>&1; then
-            fail "modified managed pair blocks coop up" "up unexpectedly succeeded"
-        elif [[ "$(cat "$pair_output")" == *"Managed jailer differs from the pinned production release"* \
-            && ! -e "$HOME/.coop/instances/$pair_name" ]]; then
-            pass "modified managed pair blocks coop up before instance creation"
-        else
-            fail "modified managed pair blocks coop up" "$(tail -5 "$pair_output")"
-        fi
+        ' sh "$corrupt_binary" "$component" "$(id -un)" "$HOME" "$SUITE_CONFIG" "$BINARY" "$pair_ws" "$pair_name" >"$pair_output" 2>&1; then
+                fail "modified managed $component blocks coop up" "up unexpectedly succeeded"
+            elif [[ "$(cat "$pair_output")" == *"Managed $component differs from the pinned production release"* \
+                && ! -e "$HOME/.coop/instances/$pair_name" ]]; then
+                pass "modified managed $component blocks coop up before instance creation"
+            else
+                fail "modified managed $component blocks coop up" "$(tail -5 "$pair_output")"
+            fi
+        done
     fi
 }
 
@@ -2493,13 +2504,8 @@ except Exception:
     fi
 }
 
-# Verify that github = "pat" + a matching [github.pat] entry forwards the
-# configured token (a server-side dummy literal, never a real PAT) into
-# the guest for an instance whose workspace `origin` matches the entry.
-# Uses `--workspace` with a forged origin rather than `--git-repo` so the
-# test avoids a real network clone (post-#119 the clone path actively
-# uses the configured PAT, which a dummy literal can't satisfy). Runs in
-# the --full bucket because it boots a fresh VM.
+# Verify that a matching origin cannot authorize a PAT, while a VM binding
+# selects an entry independently of origin mutations and survives restart.
 test_github_pat_forwarding() {
     echo ""
     echo "=== Phase: github pat-mode token forwarding ==="
@@ -2553,12 +2559,10 @@ CFGEOF
         fail "pat: github status runs cleanly" "$(cat "$tmpdir/pat-status.out")"
     fi
 
-    # Step 3: boot a VM with --workspace pointing at a local repo whose
-    # `origin` is forged to the configured slug. `detect_instance_repo`
-    # runs `git remote get-url origin` against the host workspace path on
-    # follow-up commands, so `exec` resolves the slug, looks up the PAT
-    # entry, and forwards the sentinel as GITHUB_TOKEN — exercising the
-    # post-#119 PAT resolution without a real network clone or a real PAT.
+    # Step 3: a matching origin remains only a suggestion. The post-start
+    # witness exercises the first credential-bearing session, and exec checks
+    # a later one. A live mount lets Lima mutate the host origin from inside
+    # the guest; Firecracker's copy transport is tested with a host edit.
     local ws_dir="$tmpdir/pat-workspace"
     mkdir -p "$ws_dir"
     (
@@ -2573,9 +2577,11 @@ CFGEOF
 
     if env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" up \
             "$ws_dir" \
+            --mount \
             --name "$pat_instance" \
             --no-agents \
             --no-prompt \
+            --post-start 'printf "%s" "${GITHUB_TOKEN:-absent}" > /tmp/pat-unbound-first-boot' \
             >"$tmpdir/pat-start.out" 2>&1; then
         STARTED_INSTANCES+=("$pat_instance")
         pass "pat: up with workspace whose origin matches the configured slug"
@@ -2589,10 +2595,11 @@ CFGEOF
     local pat_token_out
     pat_token_out=$(env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY RUST_LOG=off \
         "$BINARY" --config "$cfg_file" exec "$pat_instance" -- printenv GITHUB_TOKEN 2>/dev/null) || true
-    if [[ "$pat_token_out" == *"$sentinel"* ]]; then
-        pass "pat: configured token forwarded to guest"
+    if [[ "$pat_token_out" == "" ]] && \
+        [[ "$(env -u GITHUB_TOKEN -u ANTHROPIC_API_KEY "$BINARY" --config "$cfg_file" exec "$pat_instance" -- cat /tmp/pat-unbound-first-boot 2>/dev/null)" == absent ]]; then
+        pass "pat: matching origin does not authorize first boot or exec"
     else
-        fail "pat: configured token forwarded to guest" "got: ${pat_token_out:-empty}"
+        fail "pat: matching origin does not authorize first boot or exec" "unexpected token"
     fi
 
     # Select a different existing entry, independent of the workspace origin.
@@ -2620,6 +2627,23 @@ CFGEOF
         pass "pat: assign existing entry while stopped and restart"
     else
         fail "pat: assign existing entry while stopped and restart"
+    fi
+    local changed_origin="https://github.com/other/changed.git"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        if pat_cmd exec "$pat_instance" -- git -C /workspace remote set-url origin "$changed_origin" &&
+            [[ "$(git -C "$ws_dir" remote get-url origin)" == "$changed_origin" ]]; then
+            pass "pat: guest changed mounted host origin"
+        else
+            fail "pat: guest changed mounted host origin"
+        fi
+    else
+        git -C "$ws_dir" remote set-url origin "$changed_origin"
+    fi
+    pat_token_out=$(pat_cmd exec "$pat_instance" -- sh -c 'printf "%s" "${GITHUB_TOKEN:-absent}"') || pat_token_out=failed
+    if [[ "$pat_token_out" == github_pat_ASSIGNED ]]; then
+        pass "pat: origin change cannot switch bound entry"
+    else
+        fail "pat: origin change cannot switch bound entry" "unexpected selection"
     fi
     local stage expected
     for stage in assigned parent-workspace rotated unassigned; do

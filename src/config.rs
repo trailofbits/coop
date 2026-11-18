@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "macos"))]
 use crate::cmd::Cmd;
+#[cfg(target_os = "linux")]
+use crate::firecracker_install::require_managed_path;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -1278,7 +1280,7 @@ pub struct PatConfig {
     /// [`RepoSlug`](crate::github_repo::RepoSlug).
     #[serde(default, rename = "pat")]
     pub entries: std::collections::BTreeMap<crate::github_repo::RepoSlug, PatEntry>,
-    /// Repos for which the VM startup auto-prompt is suppressed.
+    /// Legacy per-repo suppression of VM PAT binding prompts.
     #[serde(default)]
     pub skip: Vec<crate::github_repo::RepoSlug>,
 }
@@ -1694,10 +1696,9 @@ pub struct ClaudeConfig {
 /// `[setup]` section: controls one-time UX behaviour at VM startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
-    /// Whether VM startup prompts the user to set up a fine-grained PAT
-    /// when the resolved repo has no entry. Set to `false` to suppress
-    /// globally. The per-repo `skip` list under `[github]` suppresses
-    /// individual repos.
+    /// Whether VM startup prompts for a PAT binding when a repository
+    /// suggestion is available. Set to `false` to suppress globally.
+    /// Legacy `[github].skip` entries suppress matching suggestions.
     #[serde(default = "default_prompt_for_pat")]
     pub prompt_for_pat: bool,
 }
@@ -2353,6 +2354,9 @@ impl CoopConfig {
 
         #[cfg(target_os = "linux")]
         {
+            if let Err(error) = require_managed_path(&self.firecracker_bin) {
+                errors.push(error.to_string());
+            }
             let policy =
                 crate::host_tool::TrustedToolPolicy::new("/", std::iter::empty::<PathBuf>(), 0);
             for (name, path) in self.network.host_tools.configured() {
@@ -6300,9 +6304,8 @@ rsync = "/run/current-system/sw/bin/rsync"
     // from `cargo mutants -f src/config.rs`. Do not loosen the
     // assertions without re-running mutants first.
 
-    /// Build a `CoopConfig` with all path fields rooted in `data_dir`
-    /// so existence checks are deterministic. By default both
-    /// `kernel_path` and `firecracker_bin` point at non-existent files.
+    /// Build a `CoopConfig` with a non-existent kernel path and the default
+    /// managed Firecracker path.
     fn validate_fixture(data_dir: &Path) -> CoopConfig {
         CoopConfig {
             data_dir: ConfigPath::new(data_dir),
@@ -6310,7 +6313,7 @@ rsync = "/run/current-system/sw/bin/rsync"
                 kernel_path: ConfigPath::new(data_dir.join("nonexistent-kernel")),
                 ..VmConfig::default()
             },
-            firecracker_bin: ConfigPath::new(data_dir.join("nonexistent-firecracker")),
+            firecracker_bin: default_firecracker_bin(),
             ..CoopConfig::default()
         }
     }
@@ -6415,6 +6418,9 @@ rsync = "/run/current-system/sw/bin/rsync"
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
+        if cfg.firecracker_bin.exists() {
+            return;
+        }
         let warnings = cfg.validate().unwrap();
         assert!(
             warnings
@@ -6424,12 +6430,10 @@ rsync = "/run/current-system/sw/bin/rsync"
         );
     }
 
-    // Pins `&&` between firecracker existence and the linux cfg: on
-    // Linux when firecracker IS present, no warning must fire.
-    // Mutation to `||` would always warn on Linux.
+    // An existing custom path must fail static validation before setup or up.
     #[test]
     #[cfg(target_os = "linux")]
-    fn validate_no_firecracker_warning_when_present_on_linux() {
+    fn validate_rejects_custom_firecracker_path_on_linux() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
@@ -6438,11 +6442,8 @@ rsync = "/run/current-system/sw/bin/rsync"
 
         let mut cfg = validate_fixture(&data_dir);
         cfg.firecracker_bin = ConfigPath::new(firecracker);
-        let warnings = cfg.validate().unwrap();
-        assert!(
-            !warnings.iter().any(|w| w.contains("firecracker_bin")),
-            "unexpected firecracker_bin warning, got {warnings:?}"
-        );
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"), "{error}");
     }
 
     // Pins the linux gate on non-linux hosts: a missing firecracker

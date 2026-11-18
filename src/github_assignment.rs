@@ -2,11 +2,12 @@
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::io::Read as _;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CoopConfig, Instance};
+use crate::config::{CoopConfig, FirecrackerNetworkMode, GitHubAuth, Instance};
 use crate::github_repo::RepoSlug;
 use crate::guest_env_state::GuestEnvState;
 
@@ -14,6 +15,48 @@ use crate::guest_env_state::GuestEnvState;
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub repo: RepoSlug,
+}
+
+/// The only PAT key permitted to authorize a VM credential operation.
+/// Neither a Git origin nor a clone URL can construct this value.
+#[derive(Debug, Clone)]
+pub struct BoundPatEntry {
+    repo: RepoSlug,
+}
+
+impl BoundPatEntry {
+    pub fn repo(&self) -> &RepoSlug {
+        &self.repo
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum GitHubSelection {
+    Disabled,
+    Off,
+    Auto,
+    Env,
+    Unbound,
+    Bound(BoundPatEntry),
+}
+
+/// One effective decision for session forwarding, clone, and status.
+/// This never resolves a `cmd:` token; the caller does that only when needed.
+pub fn select(cfg: &CoopConfig, inst: &Instance) -> Result<GitHubSelection> {
+    if cfg.github_disabled || inst.firecracker_network() == FirecrackerNetworkMode::Isolated {
+        return Ok(GitHubSelection::Disabled);
+    }
+    match cfg.github.as_ref() {
+        None | Some(GitHubAuth::Off) => Ok(GitHubSelection::Off),
+        Some(GitHubAuth::Auto) => Ok(GitHubSelection::Auto),
+        Some(GitHubAuth::Env) => Ok(GitHubSelection::Env),
+        Some(GitHubAuth::Pat(_)) => match active(cfg, inst)? {
+            Some(assignment) => Ok(GitHubSelection::Bound(BoundPatEntry {
+                repo: assignment.repo,
+            })),
+            None => Ok(GitHubSelection::Unbound),
+        },
+    }
 }
 
 impl Assignment {
@@ -36,9 +79,9 @@ impl Assignment {
         )
     }
 
-    pub fn save(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    pub(crate) fn save(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         self.validate(cfg)?;
-        crate::fs_util::PrivateDir::create(&inst.dir)?.write_atomic_private(
+        crate::fs_util::PrivateDir::open_existing(&inst.dir)?.write_atomic_private(
             OsStr::new("github_pat.json"),
             serde_json::to_string(self)?.as_bytes(),
             0o600,
@@ -77,6 +120,33 @@ impl Assignment {
     }
 }
 
+/// Serialize assignment with VM destruction. Resolve the name under the
+/// operation lock so a command cannot recreate a directory after destroy.
+pub fn assign(cfg: &CoopConfig, inst: &Instance, repo: RepoSlug) -> Result<()> {
+    let _operation = crate::backend::lock_instance_operation(inst)?;
+    let _selection = lock_selection(inst)?;
+    let current = cfg.resolve_instance(Some(&inst.name))?;
+    Assignment { repo }.save(cfg, &current)
+}
+
+pub fn unassign(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
+    let _operation = crate::backend::lock_instance_operation(inst)?;
+    let _selection = lock_selection(inst)?;
+    let current = cfg.resolve_instance(Some(&inst.name))?;
+    Assignment::remove(&current)
+}
+
+/// Atomic replacement briefly unlinks the old sidecar. `open_regular` rejects
+/// that inode, so serialize credential readers with assignment replacement.
+pub(crate) fn lock_selection(inst: &Instance) -> Result<crate::fs_util::FileLock> {
+    crate::fs_util::lock_sibling_bounded(
+        &inst
+            .dir
+            .with_file_name(format!("{}.github-selection", inst.name)),
+        Duration::from_secs(30),
+    )
+}
+
 fn is_missing(error: &anyhow::Error) -> bool {
     error
         .root_cause()
@@ -89,7 +159,10 @@ pub fn active(cfg: &CoopConfig, inst: &Instance) -> Result<Option<Assignment>> {
     if cfg.github_disabled {
         return Ok(None);
     }
-    let assignment = Assignment::load(inst)?;
+    let assignment = {
+        let _selection = lock_selection(inst)?;
+        Assignment::load(inst)?
+    };
     if let Some(assignment) = &assignment {
         assignment.validate(cfg)?;
         reject_overrides(cfg.guest_env.keys().map(AsRef::as_ref))?;
@@ -125,10 +198,11 @@ pub fn reject_overrides<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
 #[expect(clippy::unwrap_used, clippy::panic, reason = "tests")]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     use crate::backend::{Hostname, SshTarget, SshUser};
     use crate::config::{ConfigPath, CoopConfig, Instance, InstanceName};
-    use crate::github_assignment::{Assignment, active, reject_overrides};
+    use crate::github_assignment::{Assignment, active, lock_selection, reject_overrides};
     use crate::github_repo::RepoSlug;
     use crate::guest_env_state::{EnvVarName, GuestEnvState};
 
@@ -167,7 +241,7 @@ mod tests {
     fn session_token(
         cfg: &CoopConfig,
         inst: &Instance,
-        repo: Option<&RepoSlug>,
+        _repo: Option<&RepoSlug>,
     ) -> anyhow::Result<Option<String>> {
         let target = SshTarget::tcp(
             Hostname::new("127.0.0.1").unwrap(),
@@ -176,7 +250,7 @@ mod tests {
             inst.dir.join("unused"),
             cfg.ssh.host_tools.clone(),
         );
-        let session = crate::commands::prepare_session_from_target(cfg, inst, target, repo)?;
+        let session = crate::commands::prepare_session_from_target(cfg, inst, target)?;
         Ok(session.env.guest_values().get("GITHUB_TOKEN").cloned())
     }
 
@@ -193,7 +267,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             session_token(&cfg, &inst, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         assign(&cfg, &inst);
         for context in [None, Some(&repo)] {
@@ -204,7 +278,7 @@ mod tests {
         }
         assert_eq!(
             session_token(&cfg, &other, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         let crate::config::GitHubAuth::Pat(auth) = cfg.github.as_mut().unwrap() else {
             panic!()
@@ -235,7 +309,7 @@ mod tests {
         assert!(Assignment::load(&inst).unwrap().is_none());
         assert_eq!(
             session_token(&cfg, &inst, Some(&repo)).unwrap().as_deref(),
-            Some("github_pat_default")
+            None
         );
         assert!(
             cfg.github
@@ -385,5 +459,240 @@ mod tests {
                 assert!(!err.contains("not-printed"));
             }
         }
+    }
+
+    #[test]
+    fn assignment_waits_for_destroy_and_does_not_recreate_the_vm() {
+        let (_tmp, cfg, inst) = fixture();
+        let operation = crate::backend::lock_instance_operation(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::assign(
+                        &cfg,
+                        &inst,
+                        RepoSlug::new("org/assigned").unwrap(),
+                    ))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            std::fs::remove_dir_all(&inst.dir).unwrap();
+            drop(operation);
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .is_err()
+            );
+        });
+        assert!(!inst.dir.exists());
+    }
+
+    #[test]
+    fn unassignment_waits_for_the_vm_operation_lock() {
+        let (_tmp, cfg, inst) = fixture();
+        assign(&cfg, &inst);
+        let operation = crate::backend::lock_instance_operation(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::unassign(&cfg, &inst))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+            drop(operation);
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        });
+        assert!(Assignment::load(&inst).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_rebind_reads_complete_atomic_choice() {
+        let (_tmp, cfg, inst) = fixture();
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/assigned").unwrap())
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 0..30 {
+                    let key = if n % 2 == 0 {
+                        "org/workspace"
+                    } else {
+                        "org/assigned"
+                    };
+                    crate::github_assignment::assign(&cfg, &inst, RepoSlug::new(key).unwrap())
+                        .unwrap();
+                }
+            });
+            for _ in 0..30 {
+                let selected = active(&cfg, &inst).unwrap().unwrap();
+                assert!(matches!(
+                    selected.repo.as_str(),
+                    "org/workspace" | "org/assigned"
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn credential_selection_and_rebind_wait_for_selection_lock() {
+        let (_tmp, cfg, inst) = fixture();
+        assign(&cfg, &inst);
+        let held = lock_selection(&inst).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cfg_ref = &cfg;
+            let inst_ref = &inst;
+            let started = started_tx.clone();
+            let done = done_tx.clone();
+            scope.spawn(move || {
+                started.send(()).unwrap();
+                done.send(active(cfg_ref, inst_ref).map(|_| ())).unwrap();
+            });
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(crate::github_assignment::assign(
+                        cfg_ref,
+                        inst_ref,
+                        RepoSlug::new("org/workspace").unwrap(),
+                    ))
+                    .unwrap();
+            });
+            for _ in 0..2 {
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "selection or rebind completed while its selection lock was held"
+            );
+            drop(held);
+            for _ in 0..2 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn changing_workspace_origin_never_changes_pat_authority() {
+        use crate::workspace::{WorkspaceSource, WorkspaceState};
+        let (tmp, cfg, inst) = fixture();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/workspace.git",
+        ]);
+        WorkspaceState {
+            guest_path: crate::workspace::default_workspace_path(),
+            source: WorkspaceSource::Mount {
+                host_path: project.clone(),
+            },
+        }
+        .save(&inst)
+        .unwrap();
+        assert_eq!(session_token(&cfg, &inst, None).unwrap(), None);
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/assigned.git",
+        ]);
+        assert_eq!(session_token(&cfg, &inst, None).unwrap(), None);
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/workspace").unwrap())
+            .unwrap();
+        assert_eq!(
+            session_token(&cfg, &inst, None).unwrap().as_deref(),
+            Some("github_pat_default")
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/org/assigned.git",
+        ]);
+        assert_eq!(
+            session_token(&cfg, &inst, None).unwrap().as_deref(),
+            Some("github_pat_default")
+        );
+    }
+
+    #[test]
+    fn selector_decision_table_suppresses_before_binding_lookup() {
+        use crate::config::{FirecrackerControlMode, GitHubAuth};
+        use crate::github_assignment::{GitHubSelection, select};
+        let (_tmp, mut cfg, mut inst) = fixture();
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Unbound
+        ));
+        crate::github_assignment::assign(&cfg, &inst, RepoSlug::new("org/assigned").unwrap())
+            .unwrap();
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Bound(_)
+        ));
+        cfg.github_disabled = true;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
+        cfg.github_disabled = false;
+        inst.firecracker_control = FirecrackerControlMode::VsockIsolated;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
+        inst.firecracker_control = FirecrackerControlMode::LegacyTcp;
+        let pat = cfg.github.take();
+        for (mode, expected) in [
+            (GitHubAuth::Off, "off"),
+            (GitHubAuth::Auto, "auto"),
+            (GitHubAuth::Env, "env"),
+        ] {
+            cfg.github = Some(mode);
+            let selected = select(&cfg, &inst).unwrap();
+            let label = match selected {
+                GitHubSelection::Off => "off",
+                GitHubSelection::Auto => "auto",
+                GitHubSelection::Env => "env",
+                _ => "wrong",
+            };
+            assert_eq!(label, expected);
+        }
+        cfg.github = pat;
+        std::fs::write(inst.dir.join("github_pat.json"), "{").unwrap();
+        assert!(select(&cfg, &inst).is_err());
+        cfg.github_disabled = true;
+        assert!(matches!(
+            select(&cfg, &inst).unwrap(),
+            GitHubSelection::Disabled
+        ));
     }
 }

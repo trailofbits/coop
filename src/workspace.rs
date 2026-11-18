@@ -375,7 +375,7 @@ pub fn sync_mount_contents(
 /// Persist mount metadata to `workspace.json`.
 ///
 /// Records the first mount's host path as the canonical workspace so
-/// that `push`/`pull` and PAT slug detection (`detect_instance_repo`)
+/// that `push`/`pull` and an unverified Git-origin suggestion
 /// work on follow-up commands. Used by `sync_mounts` after a Firecracker
 /// rsync, and directly on Lima where mounts are live (no sync step).
 pub fn record_mount_state(inst: &Instance, mounts: &[crate::config::Mount]) -> Result<()> {
