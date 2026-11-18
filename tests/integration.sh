@@ -9205,6 +9205,12 @@ EOF
         fi
 
         if [[ "$SHARD" != lifecycle-early ]]; then
+            # Reprovision below checks the token persisted by this phase. The
+            # late shard has a fresh VM, so seed it here as well.
+            if [[ "$SHARD" == lifecycle-late ]]; then
+                run_timed_test test_claude_onboarding_seed
+            fi
+
             # Stop + restart + stopped-state verification
             run_timed_test test_stop_preserves_recent_writes
             run_timed_test test_stop
