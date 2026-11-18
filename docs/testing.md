@@ -15,8 +15,8 @@ express the preserved behavior and verify they still detect a relevant regressio
 The `VM integration` workflow runs the full suite across eighteen disposable
 GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
 ten on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch and
-on pull requests and manual dispatch. Agents can trigger both backends by
-pushing a pull-request branch; a manual branch run is available with
+on manual dispatch. It does not run automatically for pull requests. Start
+a manual branch run with
 `gh workflow run integration.yml --ref BRANCH` when the caller has Actions
 write permission. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`. Linux uses `lifecycle`,
@@ -28,7 +28,7 @@ the macOS jobs while covering the same phases. `config` and `config-proxy`
 pass `--require-proxy`. Matrix failures do not cancel other shards.
 macOS runners install the SHA-256-pinned Lima 2.3.0 release to avoid a
 2.2.x guest-login stall after `/etc/environment` changes.
-New pushes to a pull-request branch cancel the previous integration run.
+New runs on the same ref cancel the previous integration run.
 It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
 integration output per OS and shard as a seven-day artifact. Linux suite steps
 have a 30-minute timeout (35 minutes for the job); macOS lifecycle has a

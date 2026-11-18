@@ -3,7 +3,6 @@ name: VM integration
 on:
   schedule:
     - cron: "17 3 * * *"
-  pull_request:
   workflow_dispatch:
 
 permissions:
