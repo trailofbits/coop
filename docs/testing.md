@@ -25,12 +25,12 @@ shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
-timeout (35 minutes for the job including prerequisites and artifact upload),
-except `features`, which has a 35-minute suite timeout and 40-minute job
-timeout because commit/restore checks have repeatedly remained active at the
-former cap. The Linux setup-recovery fixture requires Python 3, util-linux,
-and procps; the workflow installs them explicitly.
+output per OS and shard as a seven-day artifact. Each suite step has a 45-minute
+timeout (50 minutes for the job including prerequisites and artifact upload).
+Guest package installation has varied by more than 15 minutes between CI
+runners, and otherwise progressing config, workspace, and features shards have
+reached the former 30-minute suite cap. The Linux setup-recovery fixture
+requires Python 3, util-linux, and procps; the workflow installs them explicitly.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima

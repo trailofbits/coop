@@ -19,9 +19,9 @@ jobs:
   integration:
     name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
     runs-on: ${{ matrix.os }}
-    # The features shard has repeatedly reached the 30-minute step cap while commit/restore
-    # checks are still advancing; leave the other shards at their current cap.
-    timeout-minutes: ${{ matrix.shard == 'features' && 40 || 35 }}
+    # Guest package installation has varied by more than 15 minutes between
+    # runners, exhausting the old cap while the suite was still advancing.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +52,7 @@ jobs:
           free -h
 
       - name: Full Firecracker integration
-        timeout-minutes: ${{ matrix.shard == 'features' && 35 || 30 }}
+        timeout-minutes: 45
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
