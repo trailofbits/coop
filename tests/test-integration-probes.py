@@ -20,9 +20,9 @@ def functions(*names):
     )
 
 
-def shell(script, **env):
+def shell(script, *, bash="bash", **env):
     return subprocess.run(
-        ["bash", "-c", script], env={**os.environ, **env},
+        [bash, "-c", script], env={**os.environ, **env},
         capture_output=True, text=True, timeout=45,
     )
 
@@ -38,7 +38,7 @@ class ProbeTests(unittest.TestCase):
             untrack_instance second
             untrack_instance absent
             printf 'untracked\\n'
-        ''')
+        ''', bash="/bin/bash")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "untracked\n")
 
@@ -59,7 +59,7 @@ class ProbeTests(unittest.TestCase):
             ("exit 7", 7, False),
         ]:
             with self.subTest(command=command):
-                result = shell(fixture + command)
+                result = shell(fixture + command, bash="/bin/bash")
                 self.assertEqual(result.returncode, expected_status,
                                  result.stdout + result.stderr)
                 self.assertEqual("exited before its summary" in result.stderr,
