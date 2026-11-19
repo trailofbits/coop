@@ -19,7 +19,9 @@ jobs:
   integration:
     name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    # Guest package installation has varied by more than 30 minutes between
+    # runners, exhausting shorter caps while the suite was still advancing.
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +40,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y acl build-essential cmake curl e2fsprogs \
             iproute2 iptables iputils-ping jq openssh-client openssh-server \
-            pkg-config python3 rsync squashfs-tools util-linux zsh
+            pkg-config procps python3 rsync squashfs-tools util-linux zsh
 
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
@@ -50,7 +52,7 @@ jobs:
           free -h
 
       - name: Full Firecracker integration
-        timeout-minutes: 30
+        timeout-minutes: 60
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
