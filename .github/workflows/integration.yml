@@ -25,8 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [workspace]
-        os: [ubuntu-26.04]
+        shard: [lifecycle, workspace, config, features]
+        os: [ubuntu-24.04, ubuntu-26.04]
     defaults:
       run:
         shell: bash
