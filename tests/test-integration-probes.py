@@ -20,14 +20,51 @@ def functions(*names):
     )
 
 
-def shell(script, **env):
+def shell(script, *, bash="bash", **env):
     return subprocess.run(
-        ["bash", "-c", script], env={**os.environ, **env},
+        [bash, "-c", script], env={**os.environ, **env},
         capture_output=True, text=True, timeout=45,
     )
 
 
 class ProbeTests(unittest.TestCase):
+    def test_untrack_instance_handles_an_empty_array_with_nounset(self):
+        result = shell('set -eu\n' + functions("untrack_instance") + '''
+            STARTED_INSTANCES=()
+            untrack_instance absent
+            STARTED_INSTANCES=(first second)
+            untrack_instance first
+            [[ "${STARTED_INSTANCES[0]}" == second ]]
+            untrack_instance second
+            untrack_instance absent
+            printf 'untracked\\n'
+        ''', bash="/bin/bash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "untracked\n")
+
+    def test_cleanup_requires_a_summary_and_preserves_exit_status(self):
+        fixture = 'set -eu\n' + functions("summary", "cleanup") + '''
+            STARTED_INSTANCES=()
+            SKIPPED=()
+            pass_count=0
+            fail_count=0
+            skip_count=0
+            suite_summary_complete=0
+            trap cleanup EXIT
+        '''
+        for command, expected_status, early_exit in [
+            ("exit 0", 1, True),
+            ("summary", 0, False),
+            ("fail_count=1; summary", 1, False),
+            ("exit 7", 7, False),
+        ]:
+            with self.subTest(command=command):
+                result = shell(fixture + command, bash="/bin/bash")
+                self.assertEqual(result.returncode, expected_status,
+                                 result.stdout + result.stderr)
+                self.assertEqual("exited before its summary" in result.stderr,
+                                 early_exit, result.stderr)
+
     def test_grok_binary_requirement_tracks_rebuilt_image(self):
         fixture = functions("test_grok_bin_path") + '''
             pass() { pass_count=$((pass_count + 1)); }
