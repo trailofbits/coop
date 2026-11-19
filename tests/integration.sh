@@ -9023,6 +9023,8 @@ TOML
     local first=$!
     if ! wait_for_creation_marker "$first"; then
         fail "creation cancellation fixture reaches the running command"
+        echo "  Launcher diagnostic (last 25 lines):" >&2
+        tail -n 25 "$tmpdir/creation-launch.log" >&2
         kill -TERM "$first" 2>/dev/null || true
         wait "$first" || true
         unset GUEST_INSTANCE
