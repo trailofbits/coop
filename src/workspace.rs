@@ -1,10 +1,12 @@
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -624,14 +626,40 @@ fn rsync_pull(
     operation: &PullOperation,
 ) -> Result<()> {
     require_guest_rsync(target)?;
-    let args = rsync_pull_args(target)?;
+    let mut args = rsync_pull_args(target)?;
     // A compromised guest controls the remote rsync sender. Stage its file
     // list away from the destination, then apply the Git-metadata exclusion
     // again with the trusted host rsync during installation.
     let mut staging = operation.staging()?;
 
     let result = (|| {
+        let mut logs = match prepare_pull_file_lists(target, guest_path, &staging, operation) {
+            Ok(logs) => Some(logs),
+            Err(error) => {
+                tracing::warn!("Could not enumerate guest files before pull: {error:#}");
+                None
+            }
+        };
+        let output = match logs
+            .as_ref()
+            .map(|(_, received)| received.reopen())
+            .transpose()
+        {
+            Ok(Some(output)) => {
+                args.push(RSYNC_LIST_FORMAT.to_string());
+                Some(output)
+            }
+            Err(error) => {
+                tracing::warn!("Could not record received file list: {error:#}");
+                logs = None;
+                None
+            }
+            Ok(None) => None,
+        };
         let mut command = locked_rsync_command(target, &args, operation)?;
+        if let Some(output) = output {
+            command.stdout(Stdio::from(output));
+        }
         let status = command
             .arg("--")
             .arg(format!("{}:{guest_path}/", target.addr()))
@@ -642,14 +670,104 @@ fn rsync_pull(
         if !status.success() {
             bail!("rsync pull failed");
         }
+        if let Some((offered, received)) = logs
+            && let Err(error) = report_uncopied_pull_paths(&offered, &received)
+        {
+            tracing::warn!("Could not compare pull file lists: {error:#}");
+        }
         install_staged_pull(target, staging.path()?, dest, operation)
     })();
     staging.finish(result)
 }
 
+const RSYNC_LIST_FORMAT: &str = "--out-format=coop-pull-entry:%n";
+const RSYNC_LIST_PREFIX: &[u8] = b"coop-pull-entry:";
+
+fn prepare_pull_file_lists(
+    target: &SshTarget,
+    guest_path: &GuestPath,
+    staging: &PullStaging,
+    operation: &PullOperation,
+) -> Result<(tempfile::NamedTempFile, tempfile::NamedTempFile)> {
+    let private_dir = staging
+        .root
+        .as_deref()
+        .context("Pull staging directory is no longer available")?;
+    let offered =
+        tempfile::NamedTempFile::new_in(private_dir).context("Failed to create guest file list")?;
+    let received = tempfile::NamedTempFile::new_in(private_dir)
+        .context("Failed to create received file list")?;
+    let args = vec![
+        "-az".to_string(),
+        "-e".to_string(),
+        target.rsync_ssh_cmd()?,
+        "--dry-run".to_string(),
+        RSYNC_LIST_FORMAT.to_string(),
+    ];
+    let mut command = locked_rsync_command(target, &args, operation)?;
+    let status = command
+        .arg("--")
+        .arg(format!("{}:{guest_path}/", target.addr()))
+        .arg(rsync_local_operand(staging.path()?)?)
+        .stdout(Stdio::from(offered.reopen()?))
+        .status()
+        .context("Failed to enumerate guest files with rsync")?;
+    if !status.success() {
+        bail!("Guest file enumeration failed");
+    }
+    Ok((offered, received))
+}
+
+fn escape_untrusted_pull_path(path: &[u8]) -> String {
+    let mut escaped = String::new();
+    for byte in path {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' => {
+                escaped.push(char::from(*byte));
+            }
+            _ => {
+                let _ = write!(escaped, "\\x{byte:02X}");
+            }
+        }
+    }
+    escaped
+}
+
+fn read_rsync_file_list(
+    file: &tempfile::NamedTempFile,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let mut names = std::collections::HashSet::new();
+    for line in BufReader::new(file.reopen()?).split(b'\n') {
+        let line = line.context("Failed to read rsync file list")?;
+        if let Some(name) = line.strip_prefix(RSYNC_LIST_PREFIX) {
+            names.insert(name.to_vec());
+        }
+    }
+    Ok(names)
+}
+
+fn report_uncopied_pull_paths(
+    offered: &tempfile::NamedTempFile,
+    received: &tempfile::NamedTempFile,
+) -> Result<()> {
+    let received_names = read_rsync_file_list(received)?;
+    for line in BufReader::new(offered.reopen()?).split(b'\n') {
+        let line = line.context("Failed to read guest file list")?;
+        let Some(name) = line.strip_prefix(RSYNC_LIST_PREFIX) else {
+            continue;
+        };
+        if name == b"." || name == b"./" || received_names.contains(name) {
+            continue;
+        }
+        tracing::warn!(
+            path = %escape_untrusted_pull_path(name),
+            "Guest file was not copied by the filtered rsync transfer"
+        );
+    }
+    Ok(())
+}
+
 fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
-    // Guest-authored Git administration data is active configuration, not
-    // workspace content. Apply the common-name filter as defense-in-depth.
     rsync_base_args(target, true)
 }
 
@@ -735,7 +853,13 @@ fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPu
             has_commondir |= name.eq_ignore_ascii_case("commondir");
         }
         if has_head && (has_refs || has_objects || has_commondir) {
+            let relative = source_dir
+                .strip_prefix(source)
+                .context("Staged pull path escaped its source directory")?;
             if source_dir.as_path() == source {
+                tracing::warn!(
+                    "Skipped all pulled files because the workspace root resembles Git metadata"
+                );
                 return Ok(StagedPullContents::SkippedAll);
             }
             remove_staging_directory(&source_dir).with_context(|| {
@@ -744,17 +868,12 @@ fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPu
                     source_dir.display()
                 )
             })?;
+            tracing::warn!(path = %escape_untrusted_pull_path(relative.as_os_str().as_bytes()), "Skipped embedded Git repository from pull");
             continue;
         }
 
         for entry in source_entries {
             let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
-            {
-                continue;
-            }
             if entry.file_type()?.is_dir() {
                 pending.push((entry.path(), dest_dir.join(name)));
             }
@@ -2621,6 +2740,39 @@ Host coop-other\n\
     }
 
     #[test]
+    fn pull_receive_excludes_git_entries_from_staging() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(source.join("nested/.GiT")).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(source.join("nested/.GiT/config"), "guest-controlled\n").unwrap();
+        fs::write(source.join("nested/file.txt"), "worktree\n").unwrap();
+
+        let target = fake_ssh_target();
+        let filters = rsync_pull_args(&target).unwrap();
+        let mut rsync = target.rsync_command().unwrap();
+        rsync.arg("-a");
+        for filter in filters
+            .iter()
+            .filter(|arg| arg.starts_with("--filter=") || arg.starts_with("--exclude="))
+        {
+            rsync.arg(filter);
+        }
+        let status = rsync
+            .arg(format!("{}/", source.display()))
+            .arg(format!("{}/", staging.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!staging.join("nested/.GiT").exists());
+        assert_eq!(
+            fs::read_to_string(staging.join("nested/file.txt")).unwrap(),
+            "worktree\n"
+        );
+    }
+
+    #[test]
     fn pull_staging_cleanup_repairs_guest_directory_modes_without_following_symlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
@@ -3006,6 +3158,14 @@ Host coop-other\n\
         install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
         assert!(!dest.join("safe.txt").exists());
         assert!(!dest.join("objects").exists());
+    }
+
+    #[test]
+    fn skipped_pull_paths_escape_terminal_controls() {
+        assert_eq!(
+            escape_untrusted_pull_path(b"nested/\x1b[31m.git\n"),
+            "nested/\\x1B\\x5B31m.git\\x0A"
+        );
     }
 
     #[test]
