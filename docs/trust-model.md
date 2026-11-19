@@ -555,6 +555,13 @@ Code-server's password login restricts access to the editor, and the host
 browser handles guest-controlled content under a fresh, session-specific
 `.localhost` origin.
 
+The host drains editor SSH stderr into a bounded memory buffer and reports only
+fixed diagnostic categories. Remote stderr is guest-controlled and can imitate
+an SSH message, so a category is evidence to investigate, not an authenticated
+cause. The integration failure snapshot accepts only fixed sshd states and
+bounded counts; guest journal text is discarded before CI logging. Snapshot
+fields are guest reports and do not authenticate guest state.
+
 ## `coop update` trust chain
 
 Self-update (`update.rs`) must preserve, in order:
