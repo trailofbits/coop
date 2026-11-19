@@ -38,7 +38,47 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 /// directory depth. This filter reduces accidental transfer; it is not a
 /// security boundary because transport and filesystem name semantics vary.
 const GIT_EXCLUDE: &str = ".[gG][iI][tT]";
-const PULL_ADDITIONAL_EXCLUDES: &[&str] = &[".[hH][gG]", ".[sS][vV][nN]"];
+const PULL_ADDITIONAL_VCS_NAMES: &[&str] = &[".hg", ".svn"];
+const PULL_CONFIG_DIR_NAMES: &[&str] = &[
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".vscode",
+    ".agents",
+    ".gemini",
+    ".opencode",
+    ".continue",
+    ".idea",
+    ".zed",
+    ".devcontainer",
+];
+
+fn ascii_case_glob(name: &str) -> String {
+    let mut pattern = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphabetic() {
+            pattern.push('[');
+            pattern.push(char::from(byte.to_ascii_lowercase()));
+            pattern.push(char::from(byte.to_ascii_uppercase()));
+            pattern.push(']');
+        } else {
+            pattern.push(char::from(byte));
+        }
+    }
+    pattern
+}
+
+fn pull_additional_excludes() -> Vec<String> {
+    PULL_ADDITIONAL_VCS_NAMES
+        .iter()
+        .map(|name| ascii_case_glob(name))
+        .chain(
+            PULL_CONFIG_DIR_NAMES
+                .iter()
+                .map(|name| ascii_case_glob(name)),
+        )
+        .collect()
+}
 
 const PULL_UNTRUSTED_WARNING: &str = "Pull copies files controlled by the untrusted guest. \
 Treat the result as potentially malicious: review it before executing files or interpreting \
@@ -544,7 +584,7 @@ fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
 fn rsync_base_args(
     target: &SshTarget,
     exclude_git: bool,
-    additional_excludes: &[&str],
+    additional_excludes: &[String],
 ) -> Result<Vec<String>> {
     let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()?];
     // `.git/` rule must precede the per-directory `.gitignore` merge: rsync
@@ -776,7 +816,8 @@ fn report_uncopied_pull_paths(
 }
 
 fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
-    rsync_base_args(target, true, PULL_ADDITIONAL_EXCLUDES)
+    let additional = pull_additional_excludes();
+    rsync_base_args(target, true, &additional)
 }
 
 fn locked_rsync_command(
@@ -895,7 +936,7 @@ fn install_staged_pull_args(source: &Path, dest: &Path) -> Result<Vec<OsString>>
         OsString::from("-a"),
         format!("--exclude={GIT_EXCLUDE}").into(),
     ];
-    for exclude in PULL_ADDITIONAL_EXCLUDES {
+    for exclude in pull_additional_excludes() {
         args.push(format!("--exclude={exclude}").into());
     }
     args.push("--".into());
@@ -2733,13 +2774,19 @@ Host coop-other\n\
     fn pull_transports_apply_best_effort_vcs_exclusions() {
         let target = fake_ssh_target();
         let rsync_args = rsync_pull_args(&target).unwrap();
+        assert_eq!(ascii_case_glob(".claude"), ".[cC][lL][aA][uU][dD][eE]");
+        assert!(
+            pull_additional_excludes()
+                .iter()
+                .any(|pattern| pattern == ".[vV][sS][cC][oO][dD][eE]")
+        );
         assert!(
             rsync_args
                 .iter()
                 .any(|arg| arg == "--exclude=.[gG][iI][tT]")
         );
         assert!(!rsync_args.iter().any(|arg| arg == "--filter=+ /.git/***"));
-        for exclude in PULL_ADDITIONAL_EXCLUDES {
+        for exclude in pull_additional_excludes() {
             assert!(
                 rsync_args
                     .iter()
@@ -2757,7 +2804,7 @@ Host coop-other\n\
                 .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
             "{staged_args:?}"
         );
-        for exclude in PULL_ADDITIONAL_EXCLUDES {
+        for exclude in pull_additional_excludes() {
             assert!(
                 staged_args
                     .iter()
@@ -2768,13 +2815,24 @@ Host coop-other\n\
     }
 
     #[test]
-    fn pull_receive_excludes_git_entries_from_staging() {
+    fn pull_receive_excludes_named_entries_from_staging() {
         let temp = crate::test_support::private_tempdir().unwrap();
         let source = temp.path().join("source");
         let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
         fs::create_dir_all(source.join("nested/.GiT")).unwrap();
+        fs::create_dir_all(source.join("nested/.GiT/.GiT")).unwrap();
+        fs::create_dir_all(source.join("nested/.HG")).unwrap();
+        fs::create_dir_all(source.join("nested/.ClAuDe")).unwrap();
+        fs::create_dir_all(source.join("nested/payload")).unwrap();
         fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&dest).unwrap();
         fs::write(source.join("nested/.GiT/config"), "guest-controlled\n").unwrap();
+        fs::write(source.join("nested/.GiT/.GiT/leaf"), "guest-controlled\n").unwrap();
+        fs::write(source.join("nested/.HG/hgrc"), "guest-controlled\n").unwrap();
+        fs::write(source.join("nested/.ClAuDe/settings.json"), "{}\n").unwrap();
+        fs::write(source.join("nested/payload/settings.json"), "{}\n").unwrap();
+        std::os::unix::fs::symlink("payload", source.join("nested/.VSCode")).unwrap();
         fs::write(source.join("nested/file.txt"), "worktree\n").unwrap();
 
         let target = fake_ssh_target();
@@ -2794,10 +2852,29 @@ Host coop-other\n\
             .unwrap();
         assert!(status.success());
         assert!(!staging.join("nested/.GiT").exists());
+        assert!(!staging.join("nested/.HG").exists());
+        assert!(!staging.join("nested/.ClAuDe").exists());
+        assert!(
+            fs::symlink_metadata(staging.join("nested/.VSCode"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
         assert_eq!(
             fs::read_to_string(staging.join("nested/file.txt")).unwrap(),
             "worktree\n"
         );
+
+        let status = target
+            .rsync_command()
+            .unwrap()
+            .args(install_staged_pull_args(&staging, &dest).unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            fs::symlink_metadata(dest.join("nested/.VSCode"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(dest.join("nested/payload/settings.json").is_file());
     }
 
     #[test]
