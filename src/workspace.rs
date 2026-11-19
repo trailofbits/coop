@@ -39,6 +39,8 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 /// security boundary because transport and filesystem name semantics vary.
 const GIT_EXCLUDE: &str = ".[gG][iI][tT]";
 const PULL_ADDITIONAL_VCS_NAMES: &[&str] = &[".hg", ".svn"];
+// Known project-local tool directories, not an exhaustive list of active
+// configuration paths. Pull exclusions are defense-in-depth, not a boundary.
 const PULL_CONFIG_DIR_NAMES: &[&str] = &[
     ".claude",
     ".codex",
@@ -676,8 +678,8 @@ fn rsync_pull(
     require_guest_rsync(target)?;
     let mut args = rsync_pull_args(target)?;
     // A compromised guest controls the remote rsync sender. Stage its file
-    // list away from the destination, then apply the Git-metadata exclusion
-    // again with the trusted host rsync during installation.
+    // list away from the destination, then apply the pull exclusions again
+    // with the trusted host rsync during installation.
     let mut staging = operation.staging()?;
 
     let result = (|| {
@@ -816,6 +818,8 @@ fn report_uncopied_pull_paths(
 }
 
 fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
+    // Exclude common configuration names during receipt and again when
+    // installing from staging. Guest-side path reports are diagnostics only.
     let additional = pull_additional_excludes();
     rsync_base_args(target, true, &additional)
 }
@@ -861,6 +865,9 @@ enum StagedPullContents {
 /// Skip Git directories that would be discovered without a `.git` entry.
 /// Include the destination's existing entries because `--force` may combine
 /// guest and host files into a repository that neither tree contains alone.
+/// This shape check is best-effort, not a security boundary: Git formats,
+/// filesystem aliases, and concurrent host changes can evade it. Pulled files
+/// remain untrusted even when no repository shape is detected.
 fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPullContents> {
     let mut pending = vec![(source.to_path_buf(), dest.to_path_buf())];
     while let Some((source_dir, dest_dir)) = pending.pop() {
