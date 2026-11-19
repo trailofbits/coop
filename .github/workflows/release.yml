@@ -170,3 +170,69 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md coop-*.tar.gz SHA256SUMS attestations.jsonl
+
+  homebrew:
+    name: Open Homebrew formula PR
+    needs: release
+    if: github.repository == 'trailofbits/coop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency: homebrew-formula
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Pin the latest stable source archive
+        id: bump
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A retry of an older run should pick up the current release.
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          formula=Formula/coop.rb
+          current=$(sed -nE 's@^  url "https://github\.com/trailofbits/coop/archive/refs/tags/(v[0-9.]+)\.tar\.gz"$@\1@p' "$formula")
+          number='(0|[1-9][0-9]*)'
+          stable="^v${number}\.${number}\.${number}$"
+          if ! [[ "$tag" =~ $stable && "$current" =~ $stable ]]; then
+            echo "Expected stable vX.Y.Z versions in the release and formula" >&2
+            exit 1
+          fi
+          # The tap already has this release or a newer one.
+          if printf '%s\n' "$tag" "$current" | sort -V -C; then
+            exit 0
+          fi
+
+          archive="$RUNNER_TEMP/source.tar.gz"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --archive tar.gz --output "$archive"
+          digest=$(sha256sum < "$archive")
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$tag.tar.gz"
+          awk -v url="$url" -v sha="${digest%% *}" '
+            /^  url / {
+              if (++pins > 1 || getline != 1 || $0 !~ /^  sha256 "[0-9a-f]{64}"$/) exit 1
+              print "  url \"" url "\""
+              print "  sha256 \"" sha "\""
+              next
+            }
+            { print }
+            END { if (pins != 1) exit 1 }
+          ' "$formula" > "$RUNNER_TEMP/coop.rb"
+          mv "$RUNNER_TEMP/coop.rb" "$formula"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the formula PR
+        if: steps.bump.outputs.tag != ''
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          branch: automation/homebrew-formula
+          add-paths: Formula/coop.rb
+          commit-message: Update the Homebrew formula to ${{ steps.bump.outputs.tag }}
+          title: Update the Homebrew formula to ${{ steps.bump.outputs.tag }}
+          body: |
+            Pin the source archive for ${{ steps.bump.outputs.tag }} and its SHA-256.
+            Approve the workflow runs and check the macOS Homebrew build and test before merging.

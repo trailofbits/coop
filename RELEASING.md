@@ -120,11 +120,18 @@ those remain the preflight's job.
    download, so confirm the asset on the release page (step 9's first bullet)
    before concluding it is missing.
 
+10. **Merge the Homebrew formula PR.** Select **Approve workflows to run**,
+    then merge once the macOS build and tests pass.
+
 ## If the tag run fails
+
+If **Open Homebrew formula PR** fails, fix the error and select **Re-run failed
+jobs**. If GitHub denies PR creation, enable **Allow GitHub Actions to create
+and approve pull requests** under **Settings → Actions → General**.
 
 **Immutable releases are enabled org-wide, so a version cannot be recovered.**
 Once `vX.Y.Z` is pushed, that version is spent: you cannot move or re-tag it and
-re-run the release. A red `release.yml` run means you **bump to the next patch
+re-run the release. A failure before publication means you **bump to the next patch
 version and cut a fresh release** — go back to step 2 with `vX.Y.(Z+1)`.
 
 This is why the preflight matters: `release.yml` re-runs CI and then builds the
