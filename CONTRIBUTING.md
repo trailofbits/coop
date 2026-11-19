@@ -77,14 +77,11 @@ Format the flake with `nix fmt`.
 
 ### Homebrew
 
-After publishing a release, update `url` and the source archive's `sha256` in
-[`Formula/coop.rb`](Formula/coop.rb). The Homebrew workflow builds and tests the
-formula on macOS whenever `Formula/` changes.
+The release workflow opens or updates a PR with the latest stable source URL
+and SHA-256 for [`Formula/coop.rb`](Formula/coop.rb).
 
 Keep `COOP_PACKAGE_MANAGER=homebrew` to mark Homebrew ownership and
 `COOP_FORCE_BUILD_KIND=release` to avoid a `-dev` version in source-archive builds.
-The current formula backports the ownership guards to v0.9.2; remove `patch :DATA`
-and the patch after `__END__` once the pinned release includes them.
 
 ## Pre-commit hooks
 
