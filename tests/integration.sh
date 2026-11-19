@@ -97,6 +97,7 @@ fail_count=0
 skip_count=0
 SKIPPED=()
 proxy_phase_ran=0
+suite_summary_complete=0
 
 pass() {
     pass_count=$((pass_count + 1))
@@ -126,6 +127,7 @@ summary() {
         printf '  Skipped phases/checks:\n'
         printf '    - %s\n' "${SKIPPED[@]}"
     fi
+    suite_summary_complete=1
     if [[ $fail_count -gt 0 ]]; then
         exit 1
     fi
@@ -263,7 +265,7 @@ fi
 untrack_instance() {
     local target="$1"
     local new_list=()
-    for inst in "${STARTED_INSTANCES[@]}"; do
+    for inst in "${STARTED_INSTANCES[@]+"${STARTED_INSTANCES[@]}"}"; do
         if [[ "$inst" != "$target" ]]; then
             new_list+=("$inst")
         fi
@@ -284,6 +286,7 @@ verify_binary() {
 # ── Cleanup trap ──────────────────────────────────────────────
 
 cleanup() {
+    local exit_status=$?
     echo ""
     echo "Cleaning up..."
 
@@ -298,6 +301,11 @@ cleanup() {
 
     if [[ -d "${ws_tmpdir:-}" ]]; then
         rm -rf "$ws_tmpdir"
+    fi
+
+    if [[ "$suite_summary_complete" != 1 && "$exit_status" -eq 0 ]]; then
+        echo "ERROR: integration suite exited before its summary" >&2
+        exit 1
     fi
 }
 
