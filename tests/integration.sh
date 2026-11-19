@@ -5474,135 +5474,78 @@ test_idempotency() {
 
 }
 
-# ── Quickstart (--full only) ──────────────────────────────────
+# ── Project and agent workflow (--full only) ────────────────
 
-# `coop quickstart` chains ensure-image, ensure-instance, launch-claude. The
-# first two steps share code with `coop setup` / `coop up` (covered above);
-# this phase exercises the reconnect/restart logic specific to quickstart and
-# the workspace-affinity lookup that drives it.
-#
-# Claude is interactive — with stdin redirected from /dev/null `ssh` doesn't
-# allocate a PTY and the claude binary fails fast. `run_interactive` only
-# logs (does not error) on non-zero remote status, so quickstart still
-# returns 0 to the host. Each invocation is bounded with `_timeout` defensively
-# so a future claude that hangs on EOF can't wedge the suite.
-test_quickstart() {
+# Setup ran earlier. Exercise the documented `up` then `claude` flow and
+# confirm that `up` reuses a running project VM and restarts a stopped one.
+test_project_agent_workflow() {
     echo ""
-    echo "=== Phase: quickstart ==="
+    echo "=== Phase: project and agent workflow ==="
 
-    if ! "$BINARY" exec --help >/dev/null 2>&1; then
-        skip "quickstart" "binary missing exec subcommand"
+    local agent_ws agent_name rc=0 pre_list post_list
+    local binary_args=("$BINARY")
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        binary_args+=(--config "$SUITE_CONFIG")
+    fi
+    agent_ws=$(mktemp -d "$tmpdir/agent-ws-XXXXXX")
+    agent_name=${agent_ws##*/}
+    agent_name=${agent_name//[!a-zA-Z0-9_-]/-}
+
+    ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up \
+        >"$tmpdir/agent_up_out" 2>"$tmpdir/agent_up_err" ) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        fail "up creates project instance" "exit: $rc; stderr: $(cat "$tmpdir/agent_up_err")"
+        rm -rf "$agent_ws"
+        return
+    fi
+    STARTED_INSTANCES+=("$agent_name")
+    if "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
+        pass "up creates and starts project instance"
+    else
+        fail "up creates and starts project instance" \
+            "status: $("${binary_args[@]}" status "$agent_name" 2>&1)"
         return
     fi
 
-    local qs_ws qs_inst_name
-    qs_ws=$(mktemp -d "$tmpdir/qs-ws-XXXXXX")
-    # The instance name is the sanitised basename of the workspace path.
-    # `basename | tr` would rewrite the trailing newline to a dash; use bash
-    # pattern expansion to mirror `sanitize_basename` in src/config.rs.
-    qs_inst_name=${qs_ws##*/}
-    qs_inst_name=${qs_inst_name//[!a-zA-Z0-9_-]/-}
-
-    # First invocation: image is already built (from test_setup) and no
-    # instance for this workspace exists, so quickstart must allocate fresh.
-    local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "first quickstart exits 0"
-    else
-        fail "first quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs1_err")"
-        rm -rf "$qs_ws"
-        return
-    fi
-
-    # Track for cleanup even if status assertions below fail.
-    STARTED_INSTANCES+=("$qs_inst_name")
-
-    # `ssh::run_interactive` swallows non-zero remote exit, so checking only
-    # `rc=0` would let a quickstart that bailed before the ssh leg slip
-    # through. Grep the tracing output for the connect line to confirm the
-    # claude exec was actually reached.
-    if grep -q "Connecting via SSH" "$tmpdir/qs1_err"; then
-        pass "first quickstart reached SSH/claude exec"
-    else
-        fail "first quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs1_err")"
-    fi
-
-    if "$BINARY" status "$qs_inst_name" >/dev/null 2>&1; then
-        pass "quickstart created and started instance '$qs_inst_name'"
-    else
-        fail "quickstart created and started instance" "no instance '$qs_inst_name'"
-        rm -rf "$qs_ws"
-        return
-    fi
-
-    # Second invocation in the same cwd: must reconnect — same name, no new
-    # instance allocated.
-    local pre_list post_list
-    pre_list=$("$BINARY" list 2>/dev/null | sort)
-
+    # An interactive agent sees EOF without a PTY in this harness. The host
+    # may still return success, so check that the SSH leg was reached.
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "second quickstart exits 0 (reconnect path)"
+    _timeout 180 "${binary_args[@]}" claude "$agent_name" \
+        </dev/null >"$tmpdir/agent_claude_out" 2>"$tmpdir/agent_claude_err" || rc=$?
+    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_claude_err"; then
+        pass "claude connects to project instance"
     else
-        fail "second quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs2_err")"
+        fail "claude connects to project instance" \
+            "exit: $rc; stderr: $(cat "$tmpdir/agent_claude_err")"
     fi
 
-    if grep -q "Connecting via SSH" "$tmpdir/qs2_err"; then
-        pass "second quickstart reached SSH/claude exec"
+    pre_list=$("${binary_args[@]}" list 2>/dev/null | sort)
+    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ); then
+        post_list=$("${binary_args[@]}" list 2>/dev/null | sort)
+        if [[ "$pre_list" == "$post_list" ]]; then
+            pass "up reuses running project instance"
+        else
+            fail "up reuses running project instance" "instance list changed"
+        fi
     else
-        fail "second quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs2_err")"
+        fail "up reuses running project instance" "repeated up failed"
     fi
 
-    post_list=$("$BINARY" list 2>/dev/null | sort)
-    if [[ "$pre_list" == "$post_list" ]]; then
-        pass "second quickstart reuses existing instance for cwd"
-    else
-        fail "second quickstart reuses existing instance for cwd" \
-            "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
-    fi
-
-    # Stop and re-invoke: must restart the same stopped instance.
-    if ! coop stop "$qs_inst_name"; then
-        fail "stop quickstart instance before restart test" "exit code: $?"
+    if ! coop stop "$agent_name"; then
+        fail "stop project instance before restart" "exit code: $?"
         return
     fi
-
-    rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "third quickstart exits 0 (restart path)"
+    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ) \
+        && "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
+        pass "up restarts stopped project instance"
     else
-        fail "third quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs3_err")"
+        fail "up restarts stopped project instance" \
+            "status: $("${binary_args[@]}" status "$agent_name" 2>&1)"
     fi
 
-    if grep -q "Connecting via SSH" "$tmpdir/qs3_err"; then
-        pass "third quickstart reached SSH/claude exec"
-    else
-        fail "third quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs3_err")"
-    fi
-
-    if "$BINARY" status "$qs_inst_name" 2>/dev/null | grep -q -i running; then
-        pass "quickstart restarted stopped instance '$qs_inst_name'"
-    else
-        fail "quickstart restarted stopped instance" \
-            "status: $("$BINARY" status "$qs_inst_name" 2>&1)"
-    fi
-
-    # Cleanup
-    coop destroy "$qs_inst_name" 2>/dev/null || true
-    untrack_instance "$qs_inst_name"
-    rm -rf "$qs_ws"
+    coop destroy "$agent_name" 2>/dev/null || true
+    untrack_instance "$agent_name"
+    rm -rf "$agent_ws"
 }
 
 # ── Project workflow tests (`coop up`, --full only) ───────────
@@ -9621,7 +9564,7 @@ EOF
 
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
-        run_timed_test test_quickstart
+        run_timed_test test_project_agent_workflow
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
         run_timed_test test_host_mount

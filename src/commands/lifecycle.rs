@@ -205,7 +205,7 @@ fn create_up_instance(
         ),
         ProjectTransport::Mount => {
             mounts.insert(0, project_mount.clone());
-            (None, workspace::WorkspaceMountRule::ProjectMountedOrNone)
+            (None, workspace::WorkspaceMountRule::ProjectMounted)
         }
     };
     let mounts = workspace::ValidatedMounts::assemble(rule, mounts)?.into_vec();
@@ -729,8 +729,7 @@ pub(crate) fn cmd_start(
 }
 
 /// Allocate a fresh instance and run the first-boot start, cleaning up any
-/// partial state on error. Used by project-oriented flows that create
-/// instances (`coop up` and `coop quickstart`).
+/// partial state on error. Used by project-oriented `coop up` flows.
 pub(super) fn allocate_and_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,

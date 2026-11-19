@@ -190,11 +190,10 @@ pub(crate) enum WorkspaceMountRule {
     CopyProject,
     /// `coop up --git-repo`: the clone occupies `/workspace`.
     GitRepoClone,
-    /// The project is itself mounted at `/workspace` (`coop up --mount`), or
-    /// there is no project mount (`coop quickstart`). `/workspace` is either
-    /// legitimately in use or absent, so only uniqueness applies (a second
-    /// `/workspace` mount is still caught, as a duplicate guest path).
-    ProjectMountedOrNone,
+    /// The project is itself mounted at `/workspace` (`coop up --mount`).
+    /// Only uniqueness applies (a second `/workspace` mount is caught as a
+    /// duplicate guest path).
+    ProjectMounted,
 }
 
 /// A start-time mount set that has passed collection-level validation: no
@@ -202,8 +201,8 @@ pub(crate) enum WorkspaceMountRule {
 /// — no extra mount collides with the project's `/workspace`.
 ///
 /// [`Self::assemble`] is the single place these invariants are enforced, so
-/// no lifecycle path (`up --copy`, `up --mount`, `up --git-repo`,
-/// `quickstart`) can build a mount set and forget to check it.
+/// no lifecycle path (`up --copy`, `up --mount`, `up --git-repo`) can build a
+/// mount set and forget to check it.
 #[derive(Debug)]
 pub(crate) struct ValidatedMounts(Vec<Mount>);
 
@@ -222,7 +221,7 @@ impl ValidatedMounts {
                 "`coop up --git-repo` clones into /workspace. \
                  Give --extra-mount an explicit non-/workspace guest path.",
             ),
-            WorkspaceMountRule::ProjectMountedOrNone => None,
+            WorkspaceMountRule::ProjectMounted => None,
         };
         if let Some(message) = collision_message {
             let workspace_path = default_workspace_path().to_string();
@@ -1830,11 +1829,11 @@ mod tests {
         let data = tmp.path().join("proj");
         std::fs::create_dir(&data).expect("data");
         // A project legitimately mounted at /workspace (coop up --mount) is
-        // fine; the ProjectMountedOrNone rule skips the collision check.
+        // fine; the ProjectMounted rule skips the collision check.
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
         let validated =
-            ValidatedMounts::assemble(WorkspaceMountRule::ProjectMountedOrNone, mounts.clone())
-                .expect("workspace mount allowed under ProjectMountedOrNone");
+            ValidatedMounts::assemble(WorkspaceMountRule::ProjectMounted, mounts.clone())
+                .expect("workspace mount allowed under ProjectMounted");
         assert_eq!(validated.into_vec().len(), 1);
     }
 
@@ -1846,8 +1845,7 @@ mod tests {
         std::fs::create_dir(&a).expect("a");
         std::fs::create_dir(&b).expect("b");
         // Two distinct hosts, same guest path — a duplicate the uniqueness
-        // check must catch regardless of the workspace rule (this is the
-        // invariant quickstart previously skipped).
+        // check must catch regardless of the workspace rule.
         let dup = || {
             vec![
                 Mount::parse(&format!("{}:/data", a.to_str().unwrap())).expect("a"),
@@ -1857,7 +1855,7 @@ mod tests {
         for rule in [
             WorkspaceMountRule::CopyProject,
             WorkspaceMountRule::GitRepoClone,
-            WorkspaceMountRule::ProjectMountedOrNone,
+            WorkspaceMountRule::ProjectMounted,
         ] {
             let err = ValidatedMounts::assemble(rule, dup()).expect_err("duplicate guest path");
             assert!(format!("{err}").contains("Duplicate mount guest path"));
