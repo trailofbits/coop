@@ -109,10 +109,6 @@ pub(crate) fn cmd_up(
     let transport = opts.transport;
     let project_dir = resolve_project_dir(opts.dir)?;
 
-    let project_mount = config::Mount {
-        host_path: project_dir.clone(),
-        guest_path: workspace::default_workspace_path(),
-    };
     if !opts.new_instance
         && let Some(inst) = find_workspace_instance(cfg, &project_dir)?
     {
@@ -143,7 +139,7 @@ pub(crate) fn cmd_up(
 
     ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
 
-    create_up_instance(be, cfg, config_path, opts, &project_dir, &project_mount)
+    create_up_instance(be, cfg, config_path, opts, &project_dir)
 }
 
 fn cmd_up_git_repo(
@@ -192,23 +188,19 @@ fn create_up_instance(
     config_path: &Path,
     opts: &UpOpts<'_>,
     project_dir: &Path,
-    project_mount: &config::Mount,
 ) -> Result<()> {
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
     let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
-    let mut mounts = opts.extra_mount.clone();
-
-    let (workspace_dir, rule) = match opts.transport {
+    let (workspace_dir, mounts) = match opts.transport {
         ProjectTransport::Copy => (
             Some(project_dir_to_str(project_dir)?),
-            workspace::WorkspaceMountRule::CopyProject,
+            workspace::ValidatedMounts::copied_project(opts.extra_mount.clone())?,
         ),
-        ProjectTransport::Mount => {
-            mounts.insert(0, project_mount.clone());
-            (None, workspace::WorkspaceMountRule::ProjectMounted)
-        }
+        ProjectTransport::Mount => (
+            None,
+            workspace::ValidatedMounts::mounted_project(project_dir, opts.extra_mount.clone())?,
+        ),
     };
-    let mounts = workspace::ValidatedMounts::assemble(rule, mounts)?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -218,7 +210,7 @@ fn create_up_instance(
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
-        mounts,
+        mounts: mounts.into_vec(),
         exclude_git: opts.runtime.exclude_git,
         forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
@@ -246,10 +238,7 @@ fn create_git_repo_instance(
 ) -> Result<()> {
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
     let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
-    let mounts = opts.extra_mount.clone();
-    let mounts =
-        workspace::ValidatedMounts::assemble(workspace::WorkspaceMountRule::GitRepoClone, mounts)?
-            .into_vec();
+    let mounts = workspace::ValidatedMounts::git_repo_clone(opts.extra_mount.clone())?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -4968,11 +4957,8 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err = crate::workspace::ValidatedMounts::assemble(
-            crate::workspace::WorkspaceMountRule::CopyProject,
-            mounts,
-        )
-        .expect_err("expected /workspace collision");
+        let err = crate::workspace::ValidatedMounts::copied_project(mounts)
+            .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
     }
 

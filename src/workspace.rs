@@ -180,58 +180,59 @@ pub(crate) fn default_workspace_path() -> GuestPath {
     GuestPath::absolute(GUEST_WORKSPACE).expect("GUEST_WORKSPACE constant is absolute")
 }
 
-/// Which project-mount policy applies when assembling a start-time mount
-/// set. Only the workspace-collision message differs between rules; every
-/// rule also enforces guest-path uniqueness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceMountRule {
-    /// `coop up --copy`: the project occupies `/workspace` via copy, so an
-    /// extra mount targeting `/workspace` collides.
-    CopyProject,
-    /// `coop up --git-repo`: the clone occupies `/workspace`.
-    GitRepoClone,
-    /// The project is itself mounted at `/workspace` (`coop up --mount`).
-    /// Only uniqueness applies (a second `/workspace` mount is caught as a
-    /// duplicate guest path).
-    ProjectMounted,
-}
-
 /// A start-time mount set that has passed collection-level validation: no
-/// two mounts target the same guest path, and — per [`WorkspaceMountRule`]
-/// — no extra mount collides with the project's `/workspace`.
-///
-/// [`Self::assemble`] is the single place these invariants are enforced, so
-/// no lifecycle path (`up --copy`, `up --mount`, `up --git-repo`) can build a
-/// mount set and forget to check it.
+/// two mounts target the same guest path, and no extra mount collides with a
+/// copied or cloned project's `/workspace`.
 #[derive(Debug)]
 pub(crate) struct ValidatedMounts(Vec<Mount>);
 
 impl ValidatedMounts {
-    /// Validate an assembled mount set under `rule`. `mounts` is the final
-    /// set (project mount already inserted for `--mount`, extra mounts
-    /// appended), so the checks see exactly what boot will use.
-    pub(crate) fn assemble(rule: WorkspaceMountRule, mounts: Vec<Mount>) -> Result<Self> {
-        let collision_message = match rule {
-            WorkspaceMountRule::CopyProject => Some(
-                "`coop up --copy` already uses /workspace for the project. \
-                 Give --extra-mount an explicit non-/workspace guest path, or use \
-                 `coop up --mount` to mount the project itself.",
-            ),
-            WorkspaceMountRule::GitRepoClone => Some(
-                "`coop up --git-repo` clones into /workspace. \
-                 Give --extra-mount an explicit non-/workspace guest path.",
-            ),
-            WorkspaceMountRule::ProjectMounted => None,
-        };
-        if let Some(message) = collision_message {
-            let workspace_path = default_workspace_path().to_string();
-            if mounts
-                .iter()
-                .any(|mount| mount.guest_path.to_string() == workspace_path)
-            {
-                bail!("{message}");
-            }
+    /// Extra mounts for a project copied into `/workspace`.
+    pub(crate) fn copied_project(extra_mounts: Vec<Mount>) -> Result<Self> {
+        Self::with_reserved_workspace(
+            extra_mounts,
+            "`coop up --copy` already uses /workspace for the project. \
+             Give --extra-mount an explicit non-/workspace guest path, or use \
+             `coop up --mount` to mount the project itself.",
+        )
+    }
+
+    /// Extra mounts for a repository cloned into `/workspace`.
+    pub(crate) fn git_repo_clone(extra_mounts: Vec<Mount>) -> Result<Self> {
+        Self::with_reserved_workspace(
+            extra_mounts,
+            "`coop up --git-repo` clones into /workspace. \
+             Give --extra-mount an explicit non-/workspace guest path.",
+        )
+    }
+
+    /// Include the project mount at `/workspace` before validating extras.
+    pub(crate) fn mounted_project(
+        project_dir: &Path,
+        mut extra_mounts: Vec<Mount>,
+    ) -> Result<Self> {
+        extra_mounts.insert(
+            0,
+            Mount {
+                host_path: project_dir.to_path_buf(),
+                guest_path: default_workspace_path(),
+            },
+        );
+        Self::unique(extra_mounts)
+    }
+
+    fn with_reserved_workspace(extra_mounts: Vec<Mount>, message: &str) -> Result<Self> {
+        let workspace_path = default_workspace_path();
+        if extra_mounts
+            .iter()
+            .any(|mount| mount.guest_path == workspace_path)
+        {
+            bail!("{message}");
         }
+        Self::unique(extra_mounts)
+    }
+
+    fn unique(mounts: Vec<Mount>) -> Result<Self> {
         crate::config::validate_unique_guest_paths(&mounts)?;
         Ok(Self(mounts))
     }
@@ -1818,27 +1819,39 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err = ValidatedMounts::assemble(WorkspaceMountRule::GitRepoClone, mounts)
-            .expect_err("expected /workspace collision");
+        let err =
+            ValidatedMounts::git_repo_clone(mounts).expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
     }
 
     #[test]
-    fn project_mounted_rule_allows_workspace_mount() {
+    fn mounted_project_includes_workspace_mount() {
         let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let data = tmp.path().join("proj");
         std::fs::create_dir(&data).expect("data");
-        // A project legitimately mounted at /workspace (coop up --mount) is
-        // fine; the ProjectMounted rule skips the collision check.
-        let mounts = vec![Mount::parse(data.to_str().unwrap()).expect("mount")];
-        let validated =
-            ValidatedMounts::assemble(WorkspaceMountRule::ProjectMounted, mounts.clone())
-                .expect("workspace mount allowed under ProjectMounted");
-        assert_eq!(validated.into_vec().len(), 1);
+        let mounts = ValidatedMounts::mounted_project(&data, Vec::new())
+            .expect("project mount is valid")
+            .into_vec();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].host_path, data);
+        assert_eq!(mounts[0].guest_path, default_workspace_path());
     }
 
     #[test]
-    fn assemble_rejects_duplicate_guest_paths_under_every_rule() {
+    fn mounted_project_rejects_extra_workspace_mount() {
+        let tmp = crate::test_support::private_tempdir().expect("tempdir");
+        let project = tmp.path().join("proj");
+        let extra = tmp.path().join("extra");
+        std::fs::create_dir(&project).expect("project");
+        std::fs::create_dir(&extra).expect("extra");
+        let mounts = vec![Mount::parse(extra.to_str().unwrap()).expect("extra mount")];
+        let err = ValidatedMounts::mounted_project(&project, mounts)
+            .expect_err("duplicate workspace mount");
+        assert!(format!("{err}").contains("Duplicate mount guest path"));
+    }
+
+    #[test]
+    fn constructors_reject_duplicate_guest_paths() {
         let tmp = crate::test_support::private_tempdir().expect("tempdir");
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
@@ -1852,12 +1865,12 @@ mod tests {
                 Mount::parse(&format!("{}:/data", b.to_str().unwrap())).expect("b"),
             ]
         };
-        for rule in [
-            WorkspaceMountRule::CopyProject,
-            WorkspaceMountRule::GitRepoClone,
-            WorkspaceMountRule::ProjectMounted,
+        for result in [
+            ValidatedMounts::copied_project(dup()),
+            ValidatedMounts::git_repo_clone(dup()),
+            ValidatedMounts::mounted_project(&a, dup()),
         ] {
-            let err = ValidatedMounts::assemble(rule, dup()).expect_err("duplicate guest path");
+            let err = result.expect_err("duplicate guest path");
             assert!(format!("{err}").contains("Duplicate mount guest path"));
         }
     }
