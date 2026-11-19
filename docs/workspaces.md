@@ -160,7 +160,8 @@ symlinks remain eligible for transfer, subject to the other filters.
 
 Host-to-guest transfers (`coop up` and `coop push`) include `.git/` by default
 so agents receive full history and branches. Pass `--exclude-git` to skip it.
-Guest-to-host pulls attempt to exclude common `.git` paths as defense-in-depth.
+Guest-to-host pulls attempt to exclude common `.git`, `.hg`, and `.svn` paths
+as defense-in-depth.
 Do not rely on pull to sanitize guest content or make it safe for host Git.
 
 ## .gitignore integration
