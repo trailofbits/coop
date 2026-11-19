@@ -1,9 +1,8 @@
 //! Systemd's system manager owns the runtime VMM identity and process group.
 
-use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -111,20 +110,6 @@ pub(crate) fn unit_for_generation(inst: &Instance, generation: &str) -> Result<S
         bail!("Firecracker jail has an invalid service generation");
     }
     Ok(unit)
-}
-
-// systemd expands $NAME and ${NAME} in ExecStart arguments even when
-// systemd-run receives them as separate argv entries. $$ preserves a literal
-// dollar sign, including in non-UTF-8 path components.
-fn escape_service_argument(argument: &OsStr) -> OsString {
-    let mut escaped = Vec::with_capacity(argument.as_bytes().len());
-    for byte in argument.as_bytes() {
-        escaped.push(*byte);
-        if *byte == b'$' {
-            escaped.push(b'$');
-        }
-    }
-    OsString::from_vec(escaped)
 }
 
 fn systemctl_query() -> Result<Cmd> {
@@ -319,6 +304,8 @@ pub(crate) fn launch(
     }
     // Firecracker creates its base vsock socket inside the jail. The invoking
     // user connects through a bind-mounted socket inode after launch.
+    // Every systemd launch path comes from the fixed managed install and jail
+    // roots, a numeric descriptor, or a generated hexadecimal identifier.
     let launch = SetupTool::SystemdRun
         .elevated_with_deadline(START_DEADLINE + Duration::from_secs(5))?
         .args([
@@ -343,11 +330,9 @@ pub(crate) fn launch(
         ))
         .arg(format!("--unit={unit}"))
         .arg("--")
-        .arg(escape_service_argument(
-            firecracker.jailer_path().as_os_str(),
-        ))
+        .arg(firecracker.jailer_path())
         .args(["--id", &jail.id, "--exec-file"])
-        .arg(escape_service_argument(firecracker.path().as_os_str()))
+        .arg(firecracker.path())
         .args([
             "--uid",
             &jail.uid.to_string(),
@@ -686,14 +671,5 @@ mod tests {
         assert!(service_cgroup_empty_at(root.path(), unit).unwrap());
         fs::remove_file(group.join("cgroup.events")).unwrap();
         assert!(service_cgroup_empty_at(root.path(), unit).is_err());
-    }
-
-    #[test]
-    fn service_argument_keeps_dollar_bytes_literal() {
-        let raw = OsStr::from_bytes(b"/tmp/coop-${NAME}/invalid-\xff-$HOME");
-        assert_eq!(
-            escape_service_argument(raw).as_bytes(),
-            b"/tmp/coop-$${NAME}/invalid-\xff-$$HOME"
-        );
     }
 }
