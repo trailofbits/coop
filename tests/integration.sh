@@ -8507,13 +8507,19 @@ stop_interrupted_setup_session() {
     # session lets the fixture stop every child left after SIGKILLing setup.
     sudo -n pkill -TERM -s "$sid" 2>/dev/null || true
     for _ in {1..5}; do
-        remaining=$(setup_session_live_count "$sid") || return 1
+        remaining=$(setup_session_live_count "$sid") || {
+            echo "  Could not inspect interrupted setup session" >&2
+            return 1
+        }
         [[ $remaining -eq 0 ]] && return 0
         sleep 1
     done
     sudo -n pkill -KILL -s "$sid" 2>/dev/null || true
     for _ in {1..10}; do
-        remaining=$(setup_session_live_count "$sid") || return 1
+        remaining=$(setup_session_live_count "$sid") || {
+            echo "  Could not inspect interrupted setup session" >&2
+            return 1
+        }
         [[ $remaining -eq 0 ]] && return 0
         sleep 1
     done
@@ -8532,13 +8538,31 @@ test_interrupted_setup() {
     # Linux setup tools use separate process groups. Keep them in one session
     # so the fixture can end descendants after crashing the setup parent.
     local linux_session=0
+    local session_file="$tmpdir/int-session"
     if [[ $(uname -s) == Linux ]]; then
         linux_session=1
+        local required_tool
+        for required_tool in python3 ps pkill awk mountpoint; do
+            if ! command -v "$required_tool" >/dev/null 2>&1; then
+                fail "interrupted setup prerequisites" "missing $required_tool"
+                return
+            fi
+        done
         if mountpoint -q "$mount_path"; then
             fail "interrupted setup starts with unmounted rootfs" "mount already active"
             return
         fi
-        setsid "$BINARY" setup -y --image "$img" --profile python,node \
+        # setsid(1) can fork when its caller is a process-group leader. Python
+        # calls setsid(2), records its own PID only after success, and execs
+        # in place; $! stays the setup PID and wait can prove SIGKILL occurred.
+        python3 -c '
+import os
+import sys
+os.setsid()
+with open(sys.argv[1], "x", encoding="ascii") as session_file:
+    session_file.write(f"{os.getpid()}\n")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$session_file" "$BINARY" setup -y --image "$img" --profile python,node \
             >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
     else
         "$BINARY" setup -y --image "$img" --profile python,node \
@@ -8548,18 +8572,20 @@ test_interrupted_setup() {
     local setup_sid=""
 
     if [[ $linux_session -eq 1 ]]; then
-        # The harness may only signal the session it created. Wait briefly
-        # for setsid to exec, then pin the session ID before setup can exit.
+        # The launcher writes this private handoff only after setsid(2)
+        # succeeds. It remains available even if setup exits immediately.
         for _ in {1..20}; do
-            setup_sid=$(ps -o sid= -p "$setup_pid" 2>/dev/null) || true
-            setup_sid=${setup_sid//[[:space:]]/}
-            [[ $setup_sid == "$setup_pid" ]] && break
+            if [[ -s $session_file ]]; then
+                IFS= read -r setup_sid < "$session_file" || true
+                break
+            fi
             sleep 0.1
         done
         if [[ $setup_sid != "$setup_pid" ]]; then
             kill -9 "$setup_pid" 2>/dev/null || true
             wait "$setup_pid" 2>/dev/null || true
             fail "interrupted setup isolated session" "leader PID and session ID differ"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
             return
         fi
     fi
@@ -8593,16 +8619,23 @@ test_interrupted_setup() {
             || [[ $(ps -o stat= -p "$setup_pid" 2>/dev/null) == Z* ]]; then
         # A completed build cannot be interrupted; an early error is a test
         # failure, not a reason to skip the recovery check.
+        local setup_rc=0
+        wait "$setup_pid" 2>/dev/null || setup_rc=$?
         if [[ $linux_session -eq 1 ]] \
                 && ! stop_interrupted_setup_session "$setup_sid"; then
             fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
         fi
-        if wait "$setup_pid" 2>/dev/null; then
+        if [[ $linux_session -eq 1 ]]; then
+            fail "interrupted setup reached build" "setup exited before interruption (status $setup_rc)"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        elif [[ $setup_rc -eq 0 ]]; then
             skip "interrupted setup" "build completed before kill"
         else
             fail "interrupted setup reached build" "setup exited before interruption"
         fi
-        coop images --delete "$img" 2>/dev/null || true
+        [[ $linux_session -eq 0 ]] && coop images --delete "$img" 2>/dev/null || true
         return
     fi
 
@@ -8613,9 +8646,11 @@ test_interrupted_setup() {
         wait "$setup_pid" 2>/dev/null || true
         if ! stop_interrupted_setup_session "$setup_sid"; then
             fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
         fi
         fail "interrupted setup reached its mounted rootfs" "not mounted after ${waited}s"
-        coop images --delete "$img" 2>/dev/null || true
+        echo "  Retaining interrupted setup image $img for inspection" >&2
         return
     fi
 
@@ -8632,9 +8667,15 @@ test_interrupted_setup() {
         if [[ $linux_session -eq 1 ]] \
                 && ! stop_interrupted_setup_session "$setup_sid"; then
             fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
         fi
         fail "setup killed mid-build (SIGKILL)" "signal rc=$kill_rc, wait status=$wait_rc"
-        coop images --delete "$img" 2>/dev/null || true
+        if [[ $linux_session -eq 1 ]]; then
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        else
+            coop images --delete "$img" 2>/dev/null || true
+        fi
         return
     fi
     pass "setup killed mid-build (SIGKILL)"
@@ -8645,7 +8686,7 @@ test_interrupted_setup() {
         # legitimately keep the mount busy beyond recovery's 90s deadline.
         if ! stop_interrupted_setup_session "$setup_sid"; then
             fail "interrupted setup fixture stopped" "live descendants remain"
-            coop images --delete "$img" 2>/dev/null || true
+            echo "  Retaining interrupted setup image $img for inspection" >&2
             return
         fi
         # Recovery must see the mount left by the crash. This trips if the
@@ -8654,7 +8695,7 @@ test_interrupted_setup() {
             pass "interrupted rootfs remains mounted for recovery"
         else
             fail "interrupted rootfs remains mounted for recovery" "mount absent"
-            coop images --delete "$img" 2>/dev/null || true
+            echo "  Retaining interrupted setup image $img for inspection" >&2
             return
         fi
     fi
@@ -8670,7 +8711,11 @@ test_interrupted_setup() {
             mountpoint -q "$mount_path" && mount_state=mounted
             echo "recovery diagnostics: rootfs=$mount_state, fixture session live=$(setup_session_live_count "$setup_sid")"
         fi
-        coop images --delete "$img" 2>/dev/null || true
+        if [[ $linux_session -eq 1 ]]; then
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        else
+            coop images --delete "$img" 2>/dev/null || true
+        fi
         return
     fi
 

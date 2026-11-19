@@ -26,7 +26,11 @@ It does not run automatically for pull requests or pushes.
 It enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
 output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
-timeout (35 minutes for the job including prerequisites and artifact upload).
+timeout (35 minutes for the job including prerequisites and artifact upload),
+except `features`, which has a 35-minute suite timeout and 40-minute job
+timeout because commit/restore checks have repeatedly remained active at the
+former cap. The Linux setup-recovery fixture requires Python 3, util-linux,
+and procps; the workflow installs them explicitly.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
