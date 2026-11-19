@@ -3139,6 +3139,17 @@ impl Instance {
     /// confirmed absence from a failed liveness or identity check.
     #[mutants::skip] // /proc and kill(2) wrapper; Linux process tests cover its effects
     pub fn probe_running(&self) -> Result<bool> {
+        #[cfg(not(target_os = "macos"))]
+        match crate::firecracker_service::probe(self)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                if !crate::firecracker_service::contains_pid(&service)? {
+                    bail!("Firecracker service PID is outside its systemd cgroup");
+                }
+                return Ok(true);
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => {}
+        }
         let pid_path = self.pid_file_path();
         let pid_str = match fs::read_to_string(&pid_path) {
             Ok(value) => value,
@@ -3197,6 +3208,16 @@ impl Instance {
     /// or an orphaned Firecracker socket as a confirmed exit.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        match crate::firecracker_service::probe(self)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                if !crate::firecracker_service::contains_pid(&service)? {
+                    bail!("Firecracker service PID is outside its systemd cgroup");
+                }
+                return Ok(true);
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => {}
+        }
         let pid_path = self.pid_file_path();
         let pid = match fs::read_to_string(&pid_path) {
             Ok(value) => Some(
