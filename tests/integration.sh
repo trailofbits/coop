@@ -850,6 +850,18 @@ EOF
     fi
 }
 
+remove_literal_dollar_fixture() {
+    local data_dir="$1"
+    # Only the generated fixture path may be removed as root. The copied
+    # template can contain root-owned entries that unprivileged rm cannot
+    # traverse or unlink; everything else is removed as the test user.
+    [[ "$data_dir" == "$HOME"/coop-'${COOP_SYSTEMD_PATH_LITERAL}'-?????? \
+        && -d "$data_dir" && ! -L "$data_dir" \
+        && -d "$data_dir/images" && ! -L "$data_dir/images" ]] || return 1
+    sudo -n rm -rf -- "$data_dir/images/default" || return 1
+    rm -rf -- "$data_dir"
+}
+
 test_systemd_preserves_literal_dollar_data_dir() {
     [[ "$(uname -s)" == Linux ]] || return 0
     echo ""
@@ -870,7 +882,9 @@ test_systemd_preserves_literal_dollar_data_dir() {
         "$HOME/.coop/images/default" "$data_dir/images/" \
         || ! cp -p "$HOME/.coop/vm_key" "$HOME/.coop/vm_key.pub" "$data_dir/"; then
         fail "prepare private image for literal-dollar Firecracker path"
-        rm -rf "$data_dir"
+        if ! remove_literal_dollar_fixture "$data_dir"; then
+            fail "clean up partial literal-dollar image copy" "fixture retained for inspection"
+        fi
         return
     fi
     cat > "$cfg" <<EOF
@@ -887,6 +901,8 @@ EOF
         launch_succeeded=1
     fi
     if [[ "$launch_succeeded" == 0 ]]; then
+        # Without systemd dollar escaping the VMM exits before SSH readiness;
+        # require a confirmed running service before the known OpenSSH guard.
         if [[ "$HARNESS_ERR" == *"Firecracker started with PID"* \
             && "$HARNESS_ERR" == *"Firecracker service remains running"* \
             && "$HARNESS_ERR" == *"contains bytes OpenSSH may reinterpret"* ]]; then
@@ -905,10 +921,13 @@ EOF
 
     if [[ -d "$data_dir/instances/$name" ]] \
         && ! coop --config "$cfg" destroy "$name"; then
-        fail "clean up literal-dollar Firecracker fixture" "stderr: $HARNESS_ERR"
+        fail "clean up literal-dollar Firecracker fixture" \
+            "instance and image retained for inspection; stderr: $HARNESS_ERR"
         return
     fi
-    rm -rf "$data_dir"
+    if ! remove_literal_dollar_fixture "$data_dir"; then
+        fail "clean up literal-dollar Firecracker fixture" "fixture retained for inspection"
+    fi
 }
 
 test_firecracker_rejects_pid_outside_service_cgroup() {
