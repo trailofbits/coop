@@ -139,6 +139,12 @@ before installing files on the host. This filtering is best effort. Treat
 pulled files as untrusted. Pull has no `--exclude-git` option; these checks
 apply to every pull.
 
+Pull reports skipped embedded repository paths. It also compares an unfiltered
+rsync dry run with the filtered transfer and reports every path absent from the
+transfer list, including files inside excluded directories. These warnings are
+best effort because the guest may change its files between the two passes.
+Path bytes that could affect terminal output are escaped.
+
 ## Default exclusions
 
 Workspace transfers exclude these reproducible build and cache directories:

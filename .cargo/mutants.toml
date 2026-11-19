@@ -243,8 +243,8 @@ exclude_re = [
   "\\bbuild_status\\b",
 
   # workspace.rs — rsync transfers, SSH-config IO, editor launch.
-  # Shells out to rsync; install_staged_pull_args remains in scope and pins the
-  # security-relevant source, destination, and Git-metadata exclusion.
+  # Shells out to rsync. install_staged_pull_args remains in scope and
+  # pins the security-relevant source, destination, and pull exclusions.
   "\\binstall_staged_pull\\b",
   "\\bsync_mounts\\b",
   "\\bsync_mount_contents\\b",
@@ -255,6 +255,9 @@ exclude_re = [
   "\\brequire_guest_rsync\\b",
   "\\bcopy_workspace\\b",
   "\\brsync_pull\\b",
+  "\\bprepare_pull_file_lists\\b",
+  "\\bread_rsync_file_list\\b",
+  "\\breport_uncopied_pull_paths\\b",
   "\\bcheck_guest_dirty\\b",
   "\\batomic_write\\b",
   "\\bwrite_ssh_config\\b",
