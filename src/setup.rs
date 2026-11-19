@@ -32,6 +32,7 @@ pub(crate) const SETUP_TOOL_DEADLINE: Duration = Duration::from_secs(6 * 60 * 60
 // (`https://spec.ccfc.min.s3.amazonaws.com`) fails TLS wildcard-cert matching.
 const S3_BUCKET: &str = "https://s3.amazonaws.com/spec.ccfc.min";
 const GH_RELEASES: &str = "https://github.com/firecracker-microvm/firecracker/releases";
+const FIRECRACKER_ARCHIVE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Monotonic version bumped when the base install script changes
 /// in a way that requires rebuilding templates.
@@ -211,6 +212,7 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
             for prefix in [
                 ".coop-firecracker-download-",
                 ".coop-firecracker-extract-",
+                ".coop-firecracker-stage-",
                 ".coop-rootfs-download-",
             ] {
                 cleanup_stale_staging(&cfg.data_dir, prefix)?;
@@ -225,8 +227,9 @@ pub fn run(cfg: &CoopConfig, opts: &SetupOptions) -> Result<()> {
     )?;
 
     eprintln!(
-        "\nSetup complete. All artifacts are in {}/",
-        cfg.data_dir.display()
+        "\nSetup complete. VM artifacts are in {}/; the managed Firecracker/jailer pair is in {}/.",
+        cfg.data_dir.display(),
+        crate::firecracker_install::release_dir().display()
     );
     eprintln!("Run `coop up` in a project directory to launch a VM.");
     Ok(())
@@ -270,6 +273,8 @@ const IMAGE_TOOLS: &[SetupTool] = &[
     SetupTool::Unsquashfs,
     SetupTool::SshKeygen,
     SetupTool::Mkdir,
+    SetupTool::Install,
+    SetupTool::Mv,
     SetupTool::Tee,
     SetupTool::Chroot,
     SetupTool::Rmdir,
@@ -280,6 +285,7 @@ const IMAGE_TOOLS: &[SetupTool] = &[
 
 #[cfg(target_os = "linux")]
 pub(crate) fn preflight_bootstrap(cfg: &CoopConfig) -> Result<()> {
+    crate::firecracker_install::require_managed_path(&cfg.firecracker_bin)?;
     for tool in BOOTSTRAP_TOOLS {
         tool.resolve()?;
     }
@@ -1745,10 +1751,12 @@ fn install_system_packages(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 }
 
 fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
-    let fc_path = cfg.data_dir.join("firecracker");
-    if existing_firecracker_ready(&fc_path)? {
+    let fc_path = crate::firecracker_install::firecracker_path();
+    if managed_release_exists()? {
+        crate::firecracker_install::verify_pair()
+            .context("Managed Firecracker installation is incomplete or untrusted")?;
         step(&format!(
-            "Firecracker binary: already at {}",
+            "Firecracker/jailer pair: already at {}",
             fc_path.display()
         ));
         return Ok(());
@@ -1758,9 +1766,8 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
     let arch = Architecture::current()?;
 
-    eprintln!("  Discovering latest Firecracker release...");
-    let latest = discover_latest_fc_version()?;
-    eprintln!("  Latest version: {latest}");
+    let latest = FirecrackerRelease::parse(crate::firecracker_install::RELEASE)?;
+    eprintln!("  Managed version: {latest}");
 
     let tarball_name = format!("firecracker-{latest}-{arch}.tgz");
     let url = format!("{GH_RELEASES}/download/{latest}/{tarball_name}");
@@ -1783,7 +1790,9 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     curl_output(
         &SetupTool::Curl
             .command()?
-            .args(["-fSL", "-o"])
+            .args(["-fSL", "--max-filesize"])
+            .arg(FIRECRACKER_ARCHIVE_MAX_BYTES.to_string())
+            .arg("-o")
             .arg(tarball.path())
             .arg(&url),
         Duration::from_secs(3600),
@@ -1791,7 +1800,12 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     )
     .context("Failed to download Firecracker tarball")?;
 
-    extract_firecracker_archive(tarball.path(), &cfg.data_dir, &latest, arch)?;
+    let expected = crate::firecracker_install::expected_archive_hash()?;
+    let extracted =
+        extract_firecracker_archive(tarball.path(), &cfg.data_dir, &latest, arch, expected)?;
+    publish_managed_firecracker_pair(extracted.path(), &latest, arch)?;
+    crate::firecracker_install::verify_pair()
+        .context("Published Firecracker/jailer pair failed verification")?;
 
     // Do not execute a network artifact merely to print a version string.
     eprintln!("  Installed Firecracker {latest}");
@@ -1799,13 +1813,26 @@ fn install_firecracker(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
+fn managed_release_exists() -> Result<bool> {
+    path_exists_without_following_links(&crate::firecracker_install::release_dir())
+}
+
+fn path_exists_without_following_links(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Cannot inspect {}", path.display())),
+    }
+}
+
 fn extract_firecracker_archive(
     tarball: &Path,
     data_dir: &Path,
     latest: &FirecrackerRelease,
     arch: Architecture,
-) -> Result<()> {
-    let fc_path = data_dir.join("firecracker");
+    expected: Sha256Hash,
+) -> Result<tempfile::TempDir> {
+    verify_firecracker_archive(tarball, expected, FIRECRACKER_ARCHIVE_MAX_BYTES)?;
     let strip_prefix = format!("release-{latest}-{arch}/firecracker-{latest}-{arch}");
     let gzip = SetupTool::Gzip.resolve()?;
     let extracted_dir = tempfile::Builder::new()
@@ -1829,17 +1856,8 @@ fn extract_firecracker_archive(
         .path()
         .join(format!("firecracker-{latest}-{arch}"));
     ensure_extracted_regular_file(&extracted)?;
-    SetupTool::Chmod
-        .command()?
-        .arg("+x")
-        .arg(&extracted)
-        .run_bounded(SETUP_TOOL_DEADLINE)
-        .context("Failed to make Firecracker executable")?;
-    fs::rename(&extracted, &fc_path).context("Failed to publish Firecracker binary")?;
-
-    // Also extract the jailer
     let jailer_prefix = format!("release-{latest}-{arch}/jailer-{latest}-{arch}");
-    if let Err(e) = SetupTool::Tar
+    SetupTool::Tar
         .command()?
         .args(["-xf"])
         .arg(tarball)
@@ -1850,41 +1868,193 @@ fn extract_firecracker_archive(
         .arg("--strip-components=1")
         .arg(&jailer_prefix)
         .run_bounded(SETUP_TOOL_DEADLINE)
-    {
-        tracing::debug!("Failed to extract jailer from tarball (non-fatal): {e}");
-    }
+        .context("Failed to extract matching Firecracker jailer")?;
     let jailer_extracted = extracted_dir.path().join(format!("jailer-{latest}-{arch}"));
-    let jailer_target = data_dir.join("jailer");
-    if jailer_extracted.exists() {
-        let result = (|| {
-            ensure_extracted_regular_file(&jailer_extracted)?;
-            SetupTool::Chmod
-                .command()?
-                .arg("+x")
-                .arg(&jailer_extracted)
-                .run_bounded(SETUP_TOOL_DEADLINE)?;
-            fs::rename(&jailer_extracted, &jailer_target)?;
-            Ok::<(), anyhow::Error>(())
-        })();
-        if let Err(error) = result {
-            tracing::debug!("Failed to publish jailer binary (non-fatal): {error}");
-        }
+    ensure_extracted_regular_file(&jailer_extracted)?;
+    for component in [&extracted, &jailer_extracted] {
+        SetupTool::Chmod
+            .command()?
+            .arg("+x")
+            .arg(component)
+            .run_bounded(SETUP_TOOL_DEADLINE)
+            .context("Failed to make Firecracker release component executable")?;
     }
+    Ok(extracted_dir)
+}
 
+fn verify_firecracker_archive(tarball: &Path, expected: Sha256Hash, max_bytes: u64) -> Result<()> {
+    use sha2::Digest as _;
+
+    let mut file = fs::File::open(tarball).context("Failed to open Firecracker archive")?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count =
+            io::Read::read(&mut file, &mut buffer).context("Failed to read Firecracker archive")?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        if size > max_bytes {
+            bail!("Firecracker release archive exceeds the download size limit");
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual: Sha256Hash = hex::encode(hasher.finalize()).parse()?;
+    if actual != expected {
+        bail!("Firecracker release archive checksum does not match the pinned digest");
+    }
     Ok(())
 }
 
-fn existing_firecracker_ready(path: &Path) -> Result<bool> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).context("Cannot inspect existing Firecracker binary"),
-    };
-    if !metadata.file_type().is_file() {
-        bail!("Existing Firecracker path is not a regular file; repair it before retrying setup");
+fn publish_managed_firecracker_pair(
+    extracted: &Path,
+    release: &FirecrackerRelease,
+    arch: Architecture,
+) -> Result<()> {
+    use crate::host_tool::{TrustedToolPolicy, validate_trusted_path};
+
+    let policy = TrustedToolPolicy::new("/", [], 0);
+    validate_trusted_path(Path::new("/var/lib"), &policy)
+        .map_err(anyhow::Error::msg)
+        .context("Firecracker installation requires a trusted /var/lib")?;
+    if path_exists_without_following_links(Path::new("/var/lib/coop"))? {
+        validate_trusted_path(Path::new("/var/lib/coop"), &policy)
+            .map_err(anyhow::Error::msg)
+            .context("Existing /var/lib/coop is not trusted")?;
     }
-    Ok(metadata.permissions().mode() & 0o111 != 0)
+    let root = crate::firecracker_install::install_root();
+    if path_exists_without_following_links(root)? {
+        validate_trusted_path(root, &policy)
+            .map_err(anyhow::Error::msg)
+            .context("Firecracker installation root is not trusted")?;
+    } else {
+        SetupTool::Mkdir
+            .elevated()?
+            .args(["-p", "-m", "0755"])
+            .arg(root)
+            .run_bounded(SETUP_TOOL_DEADLINE)
+            .context("Failed to create root-owned Firecracker installation root")?;
+        validate_trusted_path(root, &policy)
+            .map_err(anyhow::Error::msg)
+            .context("Created Firecracker installation root is not trusted")?;
+    }
+    let _installation_lock =
+        crate::fs_util::lock_existing_dir_bounded(root, Duration::from_secs(30))?;
+    cleanup_stale_managed_firecracker_staging(root, &policy)?;
+    if managed_release_exists()? {
+        return crate::firecracker_install::verify_pair()
+            .context("Concurrent managed Firecracker installation is not trusted");
+    }
+
+    let parent = extracted
+        .parent()
+        .context("Firecracker extraction has no parent directory")?;
+    let random_name = tempfile::Builder::new()
+        .prefix(".coop-firecracker-stage-")
+        .tempfile_in(parent)
+        .context("Failed to choose Firecracker installation staging name")?;
+    let stage_name = random_name
+        .path()
+        .file_name()
+        .context("Firecracker installation staging name is missing")?;
+    let stage = root.join(stage_name);
+    SetupTool::Mkdir
+        .elevated()?
+        .args(["-m", "0700"])
+        .arg(&stage)
+        .run_bounded(SETUP_TOOL_DEADLINE)
+        .context("Failed to create root-owned Firecracker staging directory")?;
+
+    let result = (|| {
+        for (name, source) in [
+            ("firecracker", format!("firecracker-{release}-{arch}")),
+            ("jailer", format!("jailer-{release}-{arch}")),
+        ] {
+            let source = open_extracted_regular_file(&extracted.join(source))?;
+            SetupTool::Install
+                .elevated()?
+                .args(["-m", "0755"])
+                .arg("/dev/stdin")
+                .arg(stage.join(name))
+                .run_bounded_with_file(source, SETUP_TOOL_DEADLINE)
+                .with_context(|| format!("Failed to stage managed {name}"))?;
+        }
+        SetupTool::Chmod
+            .elevated()?
+            .arg("0755")
+            .arg(&stage)
+            .run_bounded(SETUP_TOOL_DEADLINE)
+            .context("Failed to make Firecracker staging directory readable")?;
+        crate::firecracker_install::verify_pair_at(&stage)
+            .context("Staged Firecracker/jailer pair is not trusted")?;
+        let destination = crate::firecracker_install::release_dir();
+        let publish = SetupTool::Mv
+            .elevated()?
+            .args(["-T", "--"])
+            .arg(&stage)
+            .arg(&destination)
+            .run_bounded(SETUP_TOOL_DEADLINE);
+        if let Err(error) = publish {
+            // A previous coop process may have exited while its privileged
+            // writer was still publishing. Its rename can win this race after
+            // our parent-only lock was acquired. Accept only the verified pair.
+            crate::firecracker_install::verify_pair().with_context(|| {
+                format!("Failed to publish the managed Firecracker/jailer pair: {error:#}")
+            })?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+    if stage.exists() {
+        let cleanup = SetupTool::Rm
+            .elevated()?
+            .args(["-rf", "--"])
+            .arg(&stage)
+            .run_bounded(SETUP_TOOL_DEADLINE);
+        if let Err(error) = cleanup {
+            return Err(error).context("Failed to remove incomplete Firecracker staging directory");
+        }
+    }
+    result
+}
+
+fn cleanup_stale_managed_firecracker_staging(
+    root: &Path,
+    policy: &crate::host_tool::TrustedToolPolicy,
+) -> Result<()> {
+    let safe_age = SETUP_TOOL_DEADLINE + Duration::from_secs(60);
+    for entry in fs::read_dir(root).context("Cannot inspect managed Firecracker staging")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix(".coop-firecracker-stage-") else {
+            continue;
+        };
+        if suffix.len() != 6 || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir()
+            || !metadata
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age >= safe_age)
+        {
+            continue;
+        }
+        crate::host_tool::validate_trusted_path(&path, policy)
+            .map_err(anyhow::Error::msg)
+            .context("Stale Firecracker staging directory is not trusted")?;
+        SetupTool::Rm
+            .elevated()?
+            .args(["-rf", "--"])
+            .arg(&path)
+            .run_bounded(SETUP_TOOL_DEADLINE)
+            .context("Failed to remove stale Firecracker staging directory")?;
+    }
+    Ok(())
 }
 
 fn ensure_extracted_regular_file(path: &Path) -> Result<()> {
@@ -1892,6 +2062,25 @@ fn ensure_extracted_regular_file(path: &Path) -> Result<()> {
         bail!("Extracted Firecracker component is not a regular file");
     }
     Ok(())
+}
+
+fn open_extracted_regular_file(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Cannot open extracted Firecracker component {}",
+                path.display()
+            )
+        })?;
+    if !file.metadata()?.is_file() {
+        bail!("Extracted Firecracker component is not a regular file");
+    }
+    Ok(file)
 }
 
 fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
@@ -1912,10 +2101,10 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
     step("Fetching guest kernel");
 
     let arch = Architecture::current()?;
-    let start = FcVersion::parse(discover_latest_fc_version()?.as_str())?;
+    let start = FcVersion::parse(crate::firecracker_install::RELEASE)?;
 
     eprintln!(
-        "  Looking for kernels in CI bucket (latest: {})...",
+        "  Looking for kernels in CI bucket (managed release: {})...",
         start.ci_dirname()
     );
 
@@ -1976,10 +2165,10 @@ fn fetch_kernel(cfg: &CoopConfig, skip_confirm: bool) -> Result<()> {
 
 fn discover_ci_rootfs() -> Result<String> {
     let arch = Architecture::current()?;
-    let start = FcVersion::parse(discover_latest_fc_version()?.as_str())?;
+    let start = FcVersion::parse(crate::firecracker_install::RELEASE)?;
 
     eprintln!(
-        "  Looking for rootfs in CI bucket (latest: {})...",
+        "  Looking for rootfs in CI bucket (managed release: {})...",
         start.ci_dirname()
     );
 
@@ -2532,6 +2721,7 @@ fn curl_exit_hint(code: Option<i32>) -> &'static str {
         Some(7) => "could not connect to the download host or proxy",
         Some(22) => "the server returned an HTTP error",
         Some(35) => "the TLS connection failed",
+        Some(63) => "the download exceeded its size limit",
         Some(60 | 77) => "the certificate trust configuration failed",
         _ => "check the host network and certificate configuration",
     }
@@ -2561,32 +2751,6 @@ pub fn utc_timestamp() -> String {
         tm.tm_min,
         tm.tm_sec
     )
-}
-
-fn discover_latest_fc_version() -> Result<FirecrackerRelease> {
-    let output = curl_output(
-        &SetupTool::Curl.command()?.args([
-            "-fsSLI",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{url_effective}",
-            &format!("{GH_RELEASES}/latest"),
-        ]),
-        Duration::from_secs(60),
-        16 * 1024,
-    )
-    .context("Failed to discover latest Firecracker version")?;
-
-    let url = String::from_utf8_lossy(&output.stdout);
-    let version = url
-        .trim()
-        .rsplit('/')
-        .next()
-        .context("Could not parse version from redirect URL")?
-        .to_string();
-
-    FirecrackerRelease::parse(&version)
 }
 
 /// Stable release tag safe to use in a URL segment and host filename.
@@ -3405,6 +3569,8 @@ mod tests {
                 SetupTool::Unsquashfs,
                 SetupTool::SshKeygen,
                 SetupTool::Mkdir,
+                SetupTool::Install,
+                SetupTool::Mv,
                 SetupTool::Tee,
                 SetupTool::Chroot,
                 SetupTool::Rmdir,
@@ -3415,6 +3581,18 @@ mod tests {
         );
         assert!(!BOOTSTRAP_TOOLS.contains(&SetupTool::Unsquashfs));
         assert!(IMAGE_TOOLS.contains(&SetupTool::Unsquashfs));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_rejects_custom_vmm_before_host_tool_preflight() {
+        let cfg = CoopConfig {
+            firecracker_bin: crate::config::ConfigPath::new("/tmp/custom-vmm"),
+            ..CoopConfig::default()
+        };
+        let error = preflight_bootstrap(&cfg).unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"));
+        assert!(error.contains("Remove that override"));
     }
 
     #[test]
@@ -3514,24 +3692,33 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_firecracker_install_retries_non_executable_file_and_rejects_symlink() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+    fn extracted_release_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
 
         let fixture = crate::host_tool::trusted_test_tempdir();
         let binary = fixture.path().join("firecracker");
-        assert!(!existing_firecracker_ready(&binary).unwrap());
         fs::write(&binary, "fixture").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(!existing_firecracker_ready(&binary).unwrap());
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(existing_firecracker_ready(&binary).unwrap());
-
         let link = fixture.path().join("firecracker-link");
         symlink(&binary, &link).unwrap();
-        let error = existing_firecracker_ready(&link).unwrap_err().to_string();
-        assert!(error.contains("not a regular file"), "{error}");
         assert!(ensure_extracted_regular_file(&binary).is_ok());
         assert!(ensure_extracted_regular_file(&link).is_err());
+        assert!(open_extracted_regular_file(&binary).is_ok());
+        assert!(open_extracted_regular_file(&link).is_err());
+    }
+
+    #[test]
+    fn archive_verification_rejects_oversized_input_before_digest_match() {
+        let fixture = crate::test_support::private_tempdir().unwrap();
+        let tarball = fixture.path().join("release.tgz");
+        fs::write(&tarball, b"123456789").unwrap();
+        let expected = Sha256Hash::of(b"123456789");
+        assert!(verify_firecracker_archive(&tarball, expected, 9).is_ok());
+        assert!(
+            verify_firecracker_archive(&tarball, expected, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the download size limit")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3546,7 +3733,11 @@ mod tests {
         let latest = FirecrackerRelease::parse("v1.2.3").unwrap();
         let arch = Architecture::current().unwrap();
         fs::write(&tarball, "truncated archive").unwrap();
-        assert!(extract_firecracker_archive(&tarball, &data_dir, &latest, arch).is_err());
+        let truncated_hash = Sha256Hash::of(fs::read(&tarball).unwrap());
+        assert!(
+            extract_firecracker_archive(&tarball, &data_dir, &latest, arch, truncated_hash)
+                .is_err()
+        );
         assert!(!data_dir.join("firecracker").exists());
 
         let release = format!("release-{latest}-{arch}");
@@ -3554,31 +3745,52 @@ mod tests {
         fs::create_dir(&source).unwrap();
         let binary_name = format!("firecracker-{latest}-{arch}");
         fs::write(source.join(&binary_name), "binary witness").unwrap();
+        let archive = |tarball: &Path| {
+            let output = Command::new("/usr/bin/tar")
+                .arg("-czf")
+                .arg(tarball)
+                .arg("-C")
+                .arg(fixture.path())
+                .arg(&release)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        archive(&tarball);
+        let vmm_only_hash = Sha256Hash::of(fs::read(&tarball).unwrap());
+        assert!(
+            extract_firecracker_archive(&tarball, &data_dir, &latest, arch, vmm_only_hash).is_err()
+        );
+        assert!(!data_dir.join("firecracker").exists());
+
         fs::write(
             source.join(format!("jailer-{latest}-{arch}")),
             "jailer witness",
         )
         .unwrap();
-        let output = Command::new("/usr/bin/tar")
-            .arg("-czf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(fixture.path())
-            .arg(&release)
-            .output()
-            .unwrap();
+        archive(&tarball);
+        let archive_hash = Sha256Hash::of(fs::read(&tarball).unwrap());
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            extract_firecracker_archive(&tarball, &data_dir, &latest, arch, vmm_only_hash).is_err()
         );
-        extract_firecracker_archive(&tarball, &data_dir, &latest, arch).unwrap();
-        let published = data_dir.join("firecracker");
-        assert_eq!(fs::read(&published).unwrap(), b"binary witness");
+        assert!(!data_dir.join("firecracker").exists());
+        let extracted =
+            extract_firecracker_archive(&tarball, &data_dir, &latest, arch, archive_hash).unwrap();
+        let staged_vmm = extracted.path().join(&binary_name);
+        assert_eq!(fs::read(&staged_vmm).unwrap(), b"binary witness");
+        assert_eq!(
+            fs::read(extracted.path().join(format!("jailer-{latest}-{arch}"))).unwrap(),
+            b"jailer witness"
+        );
         assert_ne!(
-            fs::metadata(&published).unwrap().permissions().mode() & 0o111,
+            fs::metadata(&staged_vmm).unwrap().permissions().mode() & 0o111,
             0
         );
+        assert!(!data_dir.join("firecracker").exists());
     }
 
     #[test]

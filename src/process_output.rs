@@ -1,5 +1,6 @@
 //! Bounded output capture for host subprocesses.
 
+use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
@@ -56,24 +57,50 @@ pub(crate) fn run_status_bounded(
     input: Option<&[u8]>,
 ) -> Result<ExitStatus, CaptureError> {
     let _signals = crate::signal::install_handlers();
-    run_status_bounded_with_shutdown(command, deadline, input, crate::signal::shutdown_requested)
+    run_status_bounded_with_shutdown(
+        command,
+        deadline,
+        input,
+        None,
+        crate::signal::shutdown_requested,
+    )
+}
+
+/// Run a bounded command with an already-open input file. The child receives
+/// the descriptor, so privileged tools do not reopen a user-controlled path.
+pub(crate) fn run_status_bounded_with_file(
+    command: &mut Command,
+    deadline: Duration,
+    file: File,
+) -> Result<ExitStatus, CaptureError> {
+    let _signals = crate::signal::install_handlers();
+    run_status_bounded_with_shutdown(
+        command,
+        deadline,
+        None,
+        Some(Stdio::from(file)),
+        crate::signal::shutdown_requested,
+    )
 }
 
 fn run_status_bounded_with_shutdown(
     command: &mut Command,
     deadline: Duration,
     input: Option<&[u8]>,
+    stdin: Option<Stdio>,
     shutdown_requested: impl Fn() -> bool,
 ) -> Result<ExitStatus, CaptureError> {
     if input.is_some_and(|bytes| bytes.len() > 4096) {
         return Err(CaptureError::InputLimit);
     }
     command.process_group(0);
-    command.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
+    command.stdin(stdin.unwrap_or_else(|| {
+        if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        }
+    }));
     let mut child = command.spawn().map_err(CaptureError::Spawn)?;
     let Ok(pid) = i32::try_from(child.id()) else {
         let _ = child.kill();
@@ -315,6 +342,7 @@ mod tests {
             &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             None,
+            None,
             || false,
         )
         .unwrap();
@@ -323,6 +351,7 @@ mod tests {
         let exit = run_status_bounded_with_shutdown(
             &mut Command::new("/usr/bin/false"),
             Duration::from_secs(1),
+            None,
             None,
             || false,
         )
@@ -333,6 +362,7 @@ mod tests {
             Command::new("/bin/sleep").arg("2"),
             Duration::from_millis(20),
             None,
+            None,
             || false,
         )
         .unwrap_err();
@@ -341,6 +371,7 @@ mod tests {
         let cancelled = run_status_bounded_with_shutdown(
             Command::new("/bin/sleep").arg("2"),
             Duration::from_secs(1),
+            None,
             None,
             || true,
         )
@@ -358,6 +389,7 @@ mod tests {
                 .stdout(Stdio::null()),
             Duration::from_secs(1),
             Some(b"fixed payload"),
+            None,
             || false,
         )
         .unwrap();
@@ -367,10 +399,33 @@ mod tests {
             &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             Some(&[0; 4097]),
+            None,
             || false,
         )
         .unwrap_err();
         assert!(matches!(too_long, CaptureError::InputLimit));
+    }
+
+    #[test]
+    fn status_runner_reads_pinned_file_after_path_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("installed");
+        let original = vec![b'a'; 8192];
+        std::fs::write(&source, &original).unwrap();
+        let file = File::open(&source).unwrap();
+        std::fs::rename(&source, fixture.path().join("old-source")).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let status = run_status_bounded_with_file(
+            Command::new("/usr/bin/install")
+                .args(["-m", "0755", "/dev/stdin"])
+                .arg(&target),
+            Duration::from_secs(1),
+            file,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
     }
 
     #[cfg(target_os = "linux")]
@@ -402,6 +457,7 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
             Duration::from_secs(5),
+            None,
             None,
             || marker.exists(),
         )

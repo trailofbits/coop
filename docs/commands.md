@@ -400,10 +400,11 @@ Gracefully stop a running VM. The instance disk is preserved. Use `start` to rel
 
 On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
 guest finishes shutting down. coop allows 10 seconds for this request and exit,
-then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
-wait. A guest that cannot shut down within the grace period can lose recent
-writes during forced termination. If termination cannot be confirmed, coop
-retains the PID file and socket so you can retry.
+then stops the systemd service and its cgroup. A legacy direct-launch VM retains
+the SIGTERM/SIGKILL fallback. A guest that cannot shut down within the grace
+period can lose recent writes during forced termination. If process death
+cannot be confirmed, coop retains the service evidence, PID file, socket, and
+TAP so you can inspect and retry.
 
 ```
 coop stop [NAME]
@@ -429,7 +430,7 @@ coop destroy [NAME] [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--all` | Remove all instances, templates, kernel, Firecracker binary, and SSH keys |
+| `--all` | Remove all instances, templates, kernel, legacy data-directory Firecracker copies, and SSH keys; retain the shared root-owned managed pair |
 
 ```
 coop destroy my-project
@@ -1050,6 +1051,10 @@ See also the [`updates` section](configuration.md#updates-section) of the config
 ### `uninstall`
 
 Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
+
+On Linux, uninstall leaves the shared root-owned Firecracker/jailer pair under
+`/var/lib/coop/firecracker/v1.18.0/`. An administrator can remove that release
+directory once no user has a VM depending on it.
 
 ```
 coop uninstall [FLAGS]

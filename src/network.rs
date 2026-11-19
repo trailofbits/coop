@@ -344,7 +344,16 @@ fn host_is_loopback(host: Option<&url::Host<&str>>) -> bool {
 pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let policy = production_network_policy()?;
     let tools = SetupNetworkTools::resolve(cfg, &policy)?;
-    setup_tap_with_tools(cfg, inst, &tools)
+    let result = setup_tap_with_tools(cfg, inst, &tools);
+    if let Err(error) = result {
+        return match teardown_tap(cfg, inst) {
+            Ok(()) => Err(error.context("TAP setup failed; partial network setup was removed")),
+            Err(cleanup) => Err(error.context(format!(
+                "TAP setup failed and cleanup also failed ({cleanup:#}); run `coop stop` before retrying"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,20 +395,29 @@ fn setup_tap_with_tools(
         .args(["tuntap", "add", &tap, "mode", "tap"])
         .run()
         .context("Failed to create TAP device")?;
-    tools
-        .ip()
-        .args(["link", "set", &tap, "master", BRIDGE_NAME])
-        .run()
-        .context("Failed to add TAP to bridge")?;
-    // The L2 half: the bridge never forwards between two isolated ports. Set
-    // before the TAP goes up, so the port is never live and unisolated. The
-    // routed path is closed separately, in ensure_guest_isolation_rule.
-    isolate_tap_port(&tap, tools)?;
-    tools
-        .ip()
-        .args(["link", "set", &tap, "up"])
-        .run()
-        .context("Failed to bring up TAP device")?;
+    let result = (|| {
+        tools
+            .ip()
+            .args(["link", "set", &tap, "master", BRIDGE_NAME])
+            .run()
+            .context("Failed to add TAP to bridge")?;
+        // The L2 half: the bridge never forwards between two isolated ports.
+        // Set before the TAP goes up, so it is never live and unisolated.
+        isolate_tap_port(&tap, tools)?;
+        tools
+            .ip()
+            .args(["link", "set", &tap, "up"])
+            .run()
+            .context("Failed to bring up TAP device")
+    })();
+    if let Err(error) = result {
+        return match tools.ip().args(["link", "del", &tap]).run() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "Cannot remove partially configured TAP {tap}: {cleanup:#}"
+            ))),
+        };
+    }
 
     let guest_ip = inst.guest_ip();
     tracing::info!("Network configured: bridge={BRIDGE_NAME}, tap={tap}, guest={guest_ip}");
@@ -805,8 +823,19 @@ fn bridge_exists(ip: Cmd) -> bool {
 fn bridge_is_empty(ip: Cmd) -> bool {
     let output = ip.args(["link", "show", "master", BRIDGE_NAME]).output();
     match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        Err(_) => true,
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Ok(o) => {
+            tracing::warn!(
+                "Cannot inspect bridge ports before teardown: ip exited with {}",
+                o.status
+            );
+            false
+        }
+        // A failed listing cannot prove that removing a shared bridge is safe.
+        Err(error) => {
+            tracing::warn!("Cannot inspect bridge ports before teardown: {error:#}");
+            false
+        }
     }
 }
 
@@ -848,6 +877,87 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn failed_bridge_port_listing_does_not_remove_shared_bridge() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let ip = temp.path().join("ip");
+        fs::write(&ip, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!bridge_is_empty(Cmd::new(&ip)));
+        fs::write(&ip, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(bridge_is_empty(Cmd::new(&ip)));
+    }
+
+    #[test]
+    fn failed_tap_configuration_removes_the_created_device() {
+        for stage in ["attach", "isolate", "up"] {
+            let temp = crate::test_support::private_tempdir().unwrap();
+            let anchor = temp.path().join("root");
+            let bin = anchor.join("usr/bin");
+            crate::test_support::create_private_dir_all(&bin).unwrap();
+            let tap_state = temp.path().join("tap-present");
+            let ip = bin.join("ip");
+            fs::write(
+                &ip,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n\
+                     'link show br0') exit 0;;\n\
+                     'link show tap0') test -e '{state}'; exit $?;;\n\
+                     'tuntap add tap0 mode tap'*) touch '{state}'; exit 0;;\n\
+                     'link del tap0') rm -f '{state}'; exit 0;;\n\
+                     'link set tap0 master br0') test '{stage}' != attach; exit $?;;\n\
+                     'link set tap0 up') test '{stage}' != up; exit $?;;\n\
+                     esac\nexit 0\n",
+                    state = tap_state.display()
+                ),
+            )
+            .unwrap();
+            fs::write(
+                bin.join("bridge"),
+                format!(
+                    "#!/bin/sh\nif [ \"$*\" = 'link set dev tap0 isolated on' ]; then test '{stage}' != isolate; exit $?; fi\necho 'isolated on'\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                bin.join("iptables"),
+                "#!/bin/sh\nif [ \"$*\" = '-S FORWARD' ]; then echo '-A FORWARD -i br0 -o br0 -j DROP'; fi\n",
+            )
+            .unwrap();
+            fs::write(bin.join("sysctl"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::write(
+                bin.join("sudo"),
+                "#!/bin/sh\n[ \"$1\" = '--' ] || exit 97\nshift\nexec \"$@\"\n",
+            )
+            .unwrap();
+            for name in ["ip", "bridge", "iptables", "sysctl", "sudo"] {
+                fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let cfg: NetworkConfig = toml::from_str(&format!(
+                "host_iface = 'eth0'\n[host_tools]\nsudo = '{0}/sudo'\nip = '{0}/ip'\nbridge = '{0}/bridge'\niptables = '{0}/iptables'\nsysctl = '{0}/sysctl'\n",
+                bin.display()
+            ))
+            .unwrap();
+            let inst = Instance {
+                name: InstanceName::new("tap-rollback").unwrap(),
+                index: InstanceIndex::new(0).unwrap(),
+                dir: temp.path().join("instance"),
+                image: default_image_name(),
+                firecracker_control: crate::config::FirecrackerControlMode::LegacyTcp,
+            };
+            let policy = TrustedToolPolicy::new(
+                &anchor,
+                [bin.clone()],
+                fs::metadata(&anchor).unwrap().uid(),
+            );
+            assert!(
+                setup_tap_with_policy(&cfg, &inst, &policy, |_| Vec::new()).is_err(),
+                "{stage} failure was accepted"
+            );
+            assert!(!tap_state.exists(), "{stage} left a TAP device behind");
+        }
+    }
     use crate::config::{InstanceIndex, InstanceName, default_image_name};
 
     fn rewrite(url: &str, host: &str) -> String {

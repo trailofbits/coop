@@ -17,7 +17,7 @@ use crate::host_tool::{
     resolve_host_tool,
 };
 
-const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const SYSTEM_HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin";
 const ROOT_TIMEOUT_GRACE: &str = "--kill-after=2s";
 const APT_CONFIG_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const APT_CONFIG_ENTRY_LIMIT: usize = 4096;
@@ -463,6 +463,10 @@ pub(crate) enum SetupTool {
     Unsquashfs,
     SshKeygen,
     Mkdir,
+    Install,
+    Mv,
+    Systemctl,
+    SystemdRun,
     Tee,
     Chroot,
     #[cfg_attr(
@@ -501,6 +505,10 @@ impl SetupTool {
             Self::Unsquashfs => "unsquashfs",
             Self::SshKeygen => "ssh-keygen",
             Self::Mkdir => "mkdir",
+            Self::Install => "install",
+            Self::Mv => "mv",
+            Self::Systemctl => "systemctl",
+            Self::SystemdRun => "systemd-run",
             Self::Tee => "tee",
             Self::Chroot => "chroot",
             Self::Rmdir => "rmdir",
@@ -512,7 +520,7 @@ impl SetupTool {
         }
     }
 
-    fn candidates(self) -> [PathBuf; 6] {
+    fn candidates(self) -> [PathBuf; 8] {
         let name = self.name();
         [
             "/usr/bin",
@@ -521,6 +529,8 @@ impl SetupTool {
             "/sbin",
             "/usr/local/bin",
             "/usr/local/sbin",
+            "/run/current-system/sw/bin",
+            "/run/wrappers/bin",
         ]
         .map(|dir| PathBuf::from(dir).join(name))
     }
@@ -539,6 +549,8 @@ impl SetupTool {
                 "sbin",
                 "usr/local/bin",
                 "usr/local/sbin",
+                "run/current-system/sw/bin",
+                "run/wrappers/bin",
             ]
             .map(|relative| anchor.join(relative)),
             uid,
@@ -552,6 +564,8 @@ impl SetupTool {
             | Self::Chmod
             | Self::Rm
             | Self::Mkdir
+            | Self::Install
+            | Self::Mv
             | Self::Tee
             | Self::Chroot
             | Self::Rmdir
@@ -1162,6 +1176,8 @@ mod tests {
             SetupTool::Chmod,
             SetupTool::Rm,
             SetupTool::Mkdir,
+            SetupTool::Install,
+            SetupTool::Mv,
             SetupTool::Tee,
             SetupTool::Chroot,
             SetupTool::Rmdir,
@@ -1211,6 +1227,46 @@ mod tests {
             ),
             Err(SetupToolError::Rejected { .. })
         ));
+    }
+
+    #[test]
+    fn nix_system_profile_install_tool_is_accepted_when_root_owned() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = crate::host_tool::trusted_test_tempdir();
+        let anchor = fixture.path();
+        let store_bin = anchor.join("nix/store/example-system/bin");
+        let run_system = anchor.join("run/current-system");
+        fs::create_dir_all(&store_bin).unwrap();
+        fs::create_dir_all(&run_system).unwrap();
+        for path in [
+            anchor.join("nix"),
+            anchor.join("nix/store"),
+            anchor.join("nix/store/example-system"),
+            store_bin.clone(),
+            anchor.join("run"),
+            run_system.clone(),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let install = store_bin.join("install");
+        fs::write(&install, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&install, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(
+            anchor.join("nix/store/example-system"),
+            run_system.join("sw"),
+        )
+        .unwrap();
+        let candidate = run_system.join("sw/bin/install");
+        let uid = fs::metadata(anchor).unwrap().uid();
+        let resolved = SetupTool::Install
+            .resolve_required_in(
+                std::slice::from_ref(&candidate),
+                &SetupTool::Install.policy_at(anchor, uid),
+            )
+            .unwrap();
+        assert_eq!(resolved.launch_path(), candidate);
+        assert_eq!(resolved.canonical_target(), install);
     }
 
     #[test]
@@ -1316,7 +1372,7 @@ mod tests {
             assert_eq!(built.get_current_dir(), Some(Path::new("/")));
             let vars = built.get_envs().collect::<Vec<_>>();
             assert!(vars.iter().any(|(key, value)| *key == "PATH"
-                && value.is_some_and(|value| value == "/usr/sbin:/usr/bin:/sbin:/bin")));
+                && value.is_some_and(|value| value == SYSTEM_HELPER_PATH)));
             assert!(
                 !vars
                     .iter()

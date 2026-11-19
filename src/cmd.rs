@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -216,6 +217,20 @@ impl Cmd {
         tracing::debug!("Running: {desc}");
         let status = crate::process_output::run_status_bounded(&mut self.build(), deadline, None)
             .with_context(|| format!("Failed to run {desc}"))?;
+        if !status.success() {
+            bail!("{desc} exited with {status}");
+        }
+        Ok(())
+    }
+
+    /// Run with a pre-opened input descriptor, preserving its object identity
+    /// across a privilege boundary.
+    pub(crate) fn run_bounded_with_file(&self, file: File, deadline: Duration) -> Result<()> {
+        let desc = self.describe();
+        tracing::debug!("Running (file stdin): {desc}");
+        let status =
+            crate::process_output::run_status_bounded_with_file(&mut self.build(), deadline, file)
+                .with_context(|| format!("Failed to run {desc}"))?;
         if !status.success() {
             bail!("{desc} exited with {status}");
         }
