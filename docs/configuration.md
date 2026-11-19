@@ -87,7 +87,7 @@ use image profiles for that purpose.
 
 If a creation command fails or is interrupted, coop returns an error and retains
 the VM. `post_start` waits until creation succeeds. `coop claude`, `coop codex`,
-`coop grok`, and `quickstart` do not launch an agent until setup completes.
+and `coop grok` do not launch an agent until setup completes.
 Use `coop shell <name>` or `coop exec <name> -- <command>` to investigate and fix
 guest state. Then repeat `coop up <project>` for a running VM, or stop it and run
 `coop start <name>`. A successful hook is skipped; an unfinished hook retries.

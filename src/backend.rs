@@ -1242,8 +1242,7 @@ pub trait VmBackend: std::fmt::Display {
     ///
     /// On Firecracker this means the template rootfs (`rootfs-template.ext4`).
     /// On Lima it means both the base disk (`lima-base.img`) and the start
-    /// template (`lima-template.yaml`). Used by `coop quickstart` to skip
-    /// `setup` when nothing needs building.
+    /// template (`lima-template.yaml`).
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool;
 }
 
