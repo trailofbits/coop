@@ -19,9 +19,9 @@ jobs:
   integration:
     name: Full integration (${{ matrix.shard }} / ${{ matrix.os }} / KVM)
     runs-on: ${{ matrix.os }}
-    # Guest package installation has varied by more than 15 minutes between
-    # runners, exhausting the old cap while the suite was still advancing.
-    timeout-minutes: 50
+    # Guest package installation has varied by more than 30 minutes between
+    # runners, exhausting shorter caps while the suite was still advancing.
+    timeout-minutes: 65
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +52,7 @@ jobs:
           free -h
 
       - name: Full Firecracker integration
-        timeout-minutes: 45
+        timeout-minutes: 60
         env:
           # Safe only on this disposable runner: exercises destroy --all.
           COOP_TEST_DESTRUCTIVE: "1"
