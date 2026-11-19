@@ -902,9 +902,9 @@ EOF
     fi
     if [[ "$launch_succeeded" == 0 ]]; then
         # Without systemd dollar escaping the VMM exits before SSH readiness;
-        # require a confirmed running service before the known OpenSSH guard.
+        # require a booted guest before the later OpenSSH path guard.
         if [[ "$HARNESS_ERR" == *"Firecracker started with PID"* \
-            && "$HARNESS_ERR" == *"Firecracker service remains running"* \
+            && "$HARNESS_ERR" == *"Guest SSH is reachable"* \
             && "$HARNESS_ERR" == *"contains bytes OpenSSH may reinterpret"* ]]; then
             pass "systemd launches Firecracker with a literal dollar config and log path"
         else
