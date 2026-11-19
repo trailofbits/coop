@@ -134,10 +134,11 @@ build tool, a shell, or another host application. Upgrading coop does not repair
 repositories pulled by an affected older release; recreate their Git metadata
 from a trusted source before using host Git on them.
 
-Pull attempts to exclude common local configuration and repository metadata
-before installing files on the host. This filtering is best effort. Treat
-pulled files as untrusted. Pull has no `--exclude-git` option; these checks
-apply to every pull.
+Pull attempts to exclude common local configuration folders used by development
+tools (such as Git and Visual Studio Code) and embedded repositories before
+installing files on the host. This filtering is best effort. Treat pulled files
+as untrusted. Pull has no `--exclude-git` option; these checks apply to every
+pull.
 
 Pull reports skipped embedded repository paths. It also compares an unfiltered
 rsync dry run with the filtered transfer and reports every path absent from the
