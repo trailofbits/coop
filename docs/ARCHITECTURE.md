@@ -172,7 +172,7 @@ any instance operation lock is acquired.
    (`list`/`status`/`logs`) skip it.
 
 The `commands/` submodules own the domains: `lifecycle.rs` (up/start/shell/
-exec/stop/destroy/status/list/resize/commit/restore), `quickstart.rs`,
+exec/stop/destroy/status/list/resize/commit/restore),
 `profiles.rs` (+ images), `agent.rs` (`coop agent update`),
 `model.rs` (`coop model`), `proxy.rs` (`coop proxy`), `github.rs`,
 `admin.rs` (init/validate/uninstall), and `json.rs` (machine-readable `--json` output types). `commands/mod.rs`

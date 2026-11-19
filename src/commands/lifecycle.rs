@@ -109,10 +109,6 @@ pub(crate) fn cmd_up(
     let transport = opts.transport;
     let project_dir = resolve_project_dir(opts.dir)?;
 
-    let project_mount = config::Mount {
-        host_path: project_dir.clone(),
-        guest_path: workspace::default_workspace_path(),
-    };
     if !opts.new_instance
         && let Some(inst) = find_workspace_instance(cfg, &project_dir)?
     {
@@ -143,7 +139,7 @@ pub(crate) fn cmd_up(
 
     ensure_profile_image(be, cfg, opts.profile_target.as_ref())?;
 
-    create_up_instance(be, cfg, config_path, opts, &project_dir, &project_mount)
+    create_up_instance(be, cfg, config_path, opts, &project_dir)
 }
 
 fn cmd_up_git_repo(
@@ -192,23 +188,19 @@ fn create_up_instance(
     config_path: &Path,
     opts: &UpOpts<'_>,
     project_dir: &Path,
-    project_mount: &config::Mount,
 ) -> Result<()> {
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
     let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
-    let mut mounts = opts.extra_mount.clone();
-
-    let (workspace_dir, rule) = match opts.transport {
+    let (workspace_dir, mounts) = match opts.transport {
         ProjectTransport::Copy => (
             Some(project_dir_to_str(project_dir)?),
-            workspace::WorkspaceMountRule::CopyProject,
+            workspace::ValidatedMounts::copied_project(opts.extra_mount.clone())?,
         ),
-        ProjectTransport::Mount => {
-            mounts.insert(0, project_mount.clone());
-            (None, workspace::WorkspaceMountRule::ProjectMountedOrNone)
-        }
+        ProjectTransport::Mount => (
+            None,
+            workspace::ValidatedMounts::mounted_project(project_dir, opts.extra_mount.clone())?,
+        ),
     };
-    let mounts = workspace::ValidatedMounts::assemble(rule, mounts)?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -218,7 +210,7 @@ fn create_up_instance(
         no_agents: opts.runtime.no_agents,
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
-        mounts,
+        mounts: mounts.into_vec(),
         exclude_git: opts.runtime.exclude_git,
         forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
@@ -246,10 +238,7 @@ fn create_git_repo_instance(
 ) -> Result<()> {
     apply_vm_overrides(cfg, opts.vcpus, opts.mem, None)?;
     let persisted_guest_env = merge_runtime_guest_env(cfg, &opts.runtime.guest_env);
-    let mounts = opts.extra_mount.clone();
-    let mounts =
-        workspace::ValidatedMounts::assemble(workspace::WorkspaceMountRule::GitRepoClone, mounts)?
-            .into_vec();
+    let mounts = workspace::ValidatedMounts::git_repo_clone(opts.extra_mount.clone())?.into_vec();
 
     let start_opts = StartOpts {
         name: None,
@@ -545,7 +534,7 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
 /// matches `workspace` (after canonicalisation). Returns `None` when no
 /// instance has been started for this directory; bails when multiple do
 /// (the caller has to pick one explicitly).
-pub(super) fn find_workspace_instance(
+fn find_workspace_instance(
     cfg: &config::CoopConfig,
     workspace: &Path,
 ) -> Result<Option<config::Instance>> {
@@ -569,7 +558,7 @@ pub(super) fn find_workspace_instance(
             bail!(
                 "Multiple instances share workspace {}:\n  {}\n\
                  Pick one explicitly with `coop start <name>` (for a stopped\n\
-                 instance) or `coop claude <name>` (for a running one).",
+                 instance) or `coop shell <name>` (for a running one).",
                 canonical.display(),
                 names.join(", "),
             )
@@ -602,7 +591,7 @@ fn find_git_repo_instance(
             bail!(
                 "Multiple instances share git repo {}:\n  {}\n\
                  Pick one explicitly with `coop start <name>` (for a stopped\n\
-                 instance) or `coop claude <name>` (for a running one).",
+                 instance) or `coop shell <name>` (for a running one).",
                 backend::safe_clone_url(repo_url),
                 names.join(", "),
             )
@@ -729,9 +718,8 @@ pub(crate) fn cmd_start(
 }
 
 /// Allocate a fresh instance and run the first-boot start, cleaning up any
-/// partial state on error. Used by project-oriented flows that create
-/// instances (`coop up` and `coop quickstart`).
-pub(super) fn allocate_and_start(
+/// partial state on error. Used by project-oriented `coop up` flows.
+fn allocate_and_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     name: Option<&config::InstanceName>,
@@ -1759,7 +1747,7 @@ fn creation_post_start(
     Ok(resume_creation(be, cfg, inst)?.post_start(post_start_override, cfg.post_start.as_deref()))
 }
 
-pub(super) fn resume_running_creation(
+fn resume_running_creation(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,
@@ -4969,11 +4957,8 @@ mod tests {
         std::fs::create_dir(&data).expect("data");
         let mounts = vec![super::config::Mount::parse(data.to_str().unwrap()).expect("mount")];
 
-        let err = crate::workspace::ValidatedMounts::assemble(
-            crate::workspace::WorkspaceMountRule::CopyProject,
-            mounts,
-        )
-        .expect_err("expected /workspace collision");
+        let err = crate::workspace::ValidatedMounts::copied_project(mounts)
+            .expect_err("expected /workspace collision");
         assert!(format!("{err}").contains("/workspace"));
     }
 

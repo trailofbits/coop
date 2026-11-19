@@ -354,7 +354,7 @@ exclude_re = [
   # THOSE is a real coverage gap. NOT a blanket `src/commands/**` exclude.
 
   # All `coop <subcommand>` dispatch entrypoints across the command modules
-  # (lifecycle.rs, admin.rs, github.rs, profiles.rs, quickstart.rs).
+  # (lifecycle.rs, admin.rs, github.rs, profiles.rs).
   # Every `cmd_*` only parses the dispatch and
   # shells out to a backend; whole-body `-> Ok(())` mutants are unobservable.
   "\\bcmd_[a-z_]+\\b",
@@ -458,11 +458,6 @@ exclude_re = [
   "\\bdir_size_bytes\\b",
   "\\bwrite_profiles_list\\b",
   "\\bwrite_profile_show\\b",
-
-  # quickstart.rs — cwd/TTY prompt resolution. is_sensitive_workspace (pure)
-  # stays in scope and is tested. quickstart_fresh_start has an
-  # in-source `#[mutants::skip]` for backend orchestration.
-  "\\bresolve_quickstart_workspace\\b",
 
   # lib.rs shim — tracing-subscriber install. (The `run` dispatch is scoped
   # out via an in-source `#[mutants::skip]`.)

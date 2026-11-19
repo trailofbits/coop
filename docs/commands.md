@@ -50,6 +50,10 @@ URL. That leaves the project with two matching instances, so later `coop up`
 runs report the ambiguity instead of choosing one — address the instances by
 name (`coop start <name>`, `coop shell <name>`) from then on.
 
+`up` uses the selected directory without a confirmation prompt. Check your
+current directory before running bare `coop up`; use a project directory rather
+than your home directory or `/`.
+
 By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
 macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
@@ -110,6 +114,21 @@ recreate it with different creation options. Runtime startup options such as
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.
 
+For an empty guest workspace without copying a project, create a dedicated
+empty host directory and use it as the `up` project directory:
+
+```
+mkdir -p ~/coop-scratch-1
+coop up ~/coop-scratch-1 --name scratch-1
+coop codex scratch-1
+```
+
+`up` records the directory as the instance's project identity and copies its
+contents into `/workspace`; it does not create a VM with no project association.
+Use a new empty directory and name for each separate scratch VM. Reusing the
+same directory makes `up` reconnect to or restart its existing VM. Avoid
+pointing `up` at your home directory or `/` merely to create a scratch VM.
+
 Devcontainer files are ordinary workspace data; coop does not discover,
 translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
 mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
@@ -126,47 +145,6 @@ disk settings, and old mounts. This is especially important on macOS, where a
 mount already recorded in a Lima VM remains a live writable host share when
 that VM restarts. Reprovisioning replaces the guest disk but does not remove
 the Lima VM's persisted mount configuration.
-
-### `quickstart`
-
-One-shot entry point: ensure the default image exists, bring up an instance for
-the current directory, and launch Claude Code inside it. Runs `setup`, `up`, and
-`claude` in sequence, short-circuiting any step that is already done.
-
-```
-coop quickstart [FLAGS]
-```
-
-`quickstart` uses the current directory as the project identity and copies it
-into `/workspace` when creating a new instance, as `coop up` does by default.
-`--no-workspace` skips that copy and project matching. After ensuring the
-default image exists, quickstart takes one of three branches:
-
-- **A running instance exists.** coop resumes any pending creation hook, then
-  connects and launches Claude Code without restarting or recreating the VM.
-- **A stopped instance exists.** coop restarts it (reusing the instance's own
-  image, not necessarily `default`) and launches Claude Code.
-- **No instance exists.** coop creates one for the workspace, then launches
-  Claude Code.
-
-Quickstart checks for the `default` image before looking up an existing VM. If
-the image is missing, it builds it even when the project already has a running
-instance. Setup runs non-interactively (no confirmation prompts).
-
-| Flag | Description |
-|------|-------------|
-| `--no-workspace` | Skip copying the current directory into the VM and skip project matching; quickstart creates a fresh instance. |
-
-```
-coop quickstart
-coop quickstart --no-workspace
-```
-
-`quickstart` takes no instance name or per-instance tuning flags. For control
-over profiles, mounts, image, resources, or named instances, use `coop setup`
-and `coop up` directly. When run from your `$HOME` or `/`, coop prompts before
-using that directory as a workspace (or fails in a non-TTY); pass
-`--no-workspace` to skip the copy.
 
 ### `init`
 

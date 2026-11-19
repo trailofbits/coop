@@ -89,13 +89,13 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
-    ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts,
-    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
-    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
-    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
-    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
-    open_agent_session, preflight_start_target, prepend_binary, resolve_running,
+    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, ReprovisionOpts, ResizeOpts,
+    RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
+    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network, cmd_profiles,
+    cmd_proxy, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall,
+    cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
+    preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -226,17 +226,6 @@ enum Commands {
         /// values with the same name.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         guest_env: Vec<String>,
-    },
-    /// One-shot: ensure default image, start an instance for cwd, launch Claude.
-    ///
-    /// Re-runnable: if an instance already exists for the current workspace it
-    /// is reconnected (running) or restarted (stopped) instead of being
-    /// recreated. For per-instance tuning (profiles, mounts, image, ...) use
-    /// `coop setup` / `coop up` directly.
-    Quickstart {
-        /// Skip mounting the current directory as the workspace.
-        #[arg(long)]
-        no_workspace: bool,
     },
     /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
     Setup {
@@ -1202,9 +1191,6 @@ pub fn run() -> Result<()> {
                 },
             };
             cmd_up(&be, &mut cfg, &cli.config, &opts)
-        }
-        Commands::Quickstart { no_workspace } => {
-            cmd_quickstart(&be, &mut cfg, &cli.config, &QuickstartOpts { no_workspace })
         }
         Commands::Setup {
             yes,
@@ -2838,30 +2824,6 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_subcommand_parses_with_defaults() {
-        let cli = parse(&["quickstart"]);
-        let super::Commands::Quickstart { no_workspace } = cli.command else {
-            panic!("expected Quickstart variant");
-        };
-        assert!(!no_workspace);
-    }
-
-    #[test]
-    fn quickstart_no_workspace_flag_parses() {
-        let cli = parse(&["quickstart", "--no-workspace"]);
-        let super::Commands::Quickstart { no_workspace, .. } = cli.command else {
-            panic!("expected Quickstart variant");
-        };
-        assert!(no_workspace);
-    }
-
-    #[test]
-    fn quickstart_rejects_unknown_flag() {
-        let err = parse_err(&["quickstart", "--name", "foo"]);
-        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    #[test]
     fn devcontainer_interface_is_removed() {
         assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
         for (args, expected) in [
@@ -2899,10 +2861,6 @@ mod tests {
             ),
             (
                 &["setup", "--dry-run"][..],
-                clap::error::ErrorKind::UnknownArgument,
-            ),
-            (
-                &["quickstart", "--no-devcontainer"][..],
                 clap::error::ErrorKind::UnknownArgument,
             ),
             (
