@@ -5476,7 +5476,7 @@ test_idempotency() {
 
 # ── Project and agent workflow (--full only) ────────────────
 
-# Setup ran earlier. Exercise the documented `up` then `claude` flow and
+# Setup ran earlier. Exercise `up` followed by both agent launchers, then
 # confirm that `up` reuses a running project VM and restarts a stopped one.
 test_project_agent_workflow() {
     echo ""
@@ -5517,6 +5517,17 @@ test_project_agent_workflow() {
     else
         fail "claude connects to project instance" \
             "exit: $rc; stderr: $(cat "$tmpdir/agent_claude_err")"
+    fi
+
+    rc=0
+    _timeout 180 "${binary_args[@]}" codex "$agent_name" -- --help \
+        </dev/null >"$tmpdir/agent_codex_out" 2>"$tmpdir/agent_codex_err" || rc=$?
+    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_codex_err" \
+        && grep -q "Usage: codex" "$tmpdir/agent_codex_out"; then
+        pass "codex help runs in project instance"
+    else
+        fail "codex help runs in project instance" \
+            "exit: $rc; stderr: $(cat "$tmpdir/agent_codex_err"); stdout: $(cat "$tmpdir/agent_codex_out")"
     fi
 
     pre_list=$("${binary_args[@]}" list 2>/dev/null | sort)

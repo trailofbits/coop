@@ -297,11 +297,12 @@ run `coop codex -- login --device-auth` once.
 ## First run
 
 Run `coop setup` once to build the default image. Then, from your project
-directory, run `coop up` and `coop claude`. Later `coop up` calls reuse a
-running instance or restart a stopped one for that directory. The steps below
-explain each command and its options. When multiple VMs are running, use
-`coop list` to find the name and run `coop claude <name>`; the agent command
-does not select a VM by the current directory.
+directory, run `coop up` and launch your agent with `coop codex`, `coop claude`,
+or `coop grok`. Later `coop up` calls reuse a running instance or restart a
+stopped one for that directory. The steps below explain each command and its
+options. When multiple VMs are running, use `coop list` to find the name and
+pass it to the agent command (for example, `coop codex <name>`); agent commands
+do not select a VM by the current directory.
 
 ### 1. Setup
 

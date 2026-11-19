@@ -545,7 +545,7 @@ fn reject_running_up_restart_inputs(inst: &config::Instance, opts: &UpOpts<'_>) 
 /// matches `workspace` (after canonicalisation). Returns `None` when no
 /// instance has been started for this directory; bails when multiple do
 /// (the caller has to pick one explicitly).
-pub(super) fn find_workspace_instance(
+fn find_workspace_instance(
     cfg: &config::CoopConfig,
     workspace: &Path,
 ) -> Result<Option<config::Instance>> {
@@ -569,7 +569,7 @@ pub(super) fn find_workspace_instance(
             bail!(
                 "Multiple instances share workspace {}:\n  {}\n\
                  Pick one explicitly with `coop start <name>` (for a stopped\n\
-                 instance) or `coop claude <name>` (for a running one).",
+                 instance) or `coop shell <name>` (for a running one).",
                 canonical.display(),
                 names.join(", "),
             )
@@ -602,7 +602,7 @@ fn find_git_repo_instance(
             bail!(
                 "Multiple instances share git repo {}:\n  {}\n\
                  Pick one explicitly with `coop start <name>` (for a stopped\n\
-                 instance) or `coop claude <name>` (for a running one).",
+                 instance) or `coop shell <name>` (for a running one).",
                 backend::safe_clone_url(repo_url),
                 names.join(", "),
             )
@@ -730,7 +730,7 @@ pub(crate) fn cmd_start(
 
 /// Allocate a fresh instance and run the first-boot start, cleaning up any
 /// partial state on error. Used by project-oriented `coop up` flows.
-pub(super) fn allocate_and_start(
+fn allocate_and_start(
     be: &backend::PlatformBackend,
     cfg: &mut config::CoopConfig,
     name: Option<&config::InstanceName>,
@@ -1758,7 +1758,7 @@ fn creation_post_start(
     Ok(resume_creation(be, cfg, inst)?.post_start(post_start_override, cfg.post_start.as_deref()))
 }
 
-pub(super) fn resume_running_creation(
+fn resume_running_creation(
     be: &backend::PlatformBackend,
     cfg: &config::CoopConfig,
     inst: &config::Instance,

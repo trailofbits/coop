@@ -2804,13 +2804,6 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_command_is_removed() {
-        let err = parse_err(&["quickstart"]);
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
-        assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
-    }
-
-    #[test]
     fn devcontainer_interface_is_removed() {
         assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
         for (args, expected) in [

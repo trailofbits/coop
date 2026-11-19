@@ -534,8 +534,7 @@ parsing, or state composition:
 - `src/update_policy.rs` — updater source, tag, and release-asset identity
   policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
-  byte-to-GiB arithmetic kernels, and predicates such as
-  `is_sensitive_workspace`
+  byte-to-GiB arithmetic kernels, and predicates
 
 **Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
 `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
@@ -578,7 +577,7 @@ The same split applies in `src/commands/`. Kept helpers include
 `find_workspace_instance`, `find_git_repo_instance`,
 `no_stopped_instance_message`, `creation_options_rejected_message`, profile
 summary builders, `reprovision_regrow_target`, `format_dir_size`,
-`project_dir_to_str`, and `is_sensitive_workspace`. Their backend-driving
+and `project_dir_to_str`. Their backend-driving
 wrappers remain excluded. `GiB::from_bytes_ceil` is the shared byte-to-GiB
 conversion kernel in `config.rs`.
 

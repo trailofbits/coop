@@ -50,6 +50,10 @@ URL. That leaves the project with two matching instances, so later `coop up`
 runs report the ambiguity instead of choosing one — address the instances by
 name (`coop start <name>`, `coop shell <name>`) from then on.
 
+`up` uses the selected directory without a confirmation prompt. Check your
+current directory before running bare `coop up`; use a project directory rather
+than your home directory or `/`.
+
 By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
 macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
@@ -116,7 +120,7 @@ empty host directory and use it as the `up` project directory:
 ```
 mkdir -p ~/coop-scratch-1
 coop up ~/coop-scratch-1 --name scratch-1
-coop claude scratch-1
+coop codex scratch-1
 ```
 
 `up` records the directory as the instance's project identity and copies its
