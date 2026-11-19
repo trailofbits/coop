@@ -134,12 +134,10 @@ build tool, a shell, or another host application. Upgrading coop does not repair
 repositories pulled by an affected older release; recreate their Git metadata
 from a trusted source before using host Git on them.
 
-Pull attempts to exclude common `.git` names, including nested ASCII case
-variants. It receives into an empty staging directory and then applies the
-filter again during a trusted host-side installation. This is useful
-defense-in-depth, not a guarantee that every Git-administration alias will be
-recognized across all transport and filesystem implementations. Pull has no `--exclude-git` option;
-the filtering behavior is unconditional and best effort.
+Pull attempts to exclude common local configuration and repository metadata
+before installing files on the host. This filtering is best effort. Treat
+pulled files as untrusted. Pull has no `--exclude-git` option; these checks
+apply to every pull.
 
 ## Default exclusions
 

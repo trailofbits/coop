@@ -657,6 +657,12 @@ fn install_staged_pull(
     dest: &Path,
     operation: &PullOperation,
 ) -> Result<()> {
+    if matches!(
+        skip_embedded_git_repositories(source, dest)?,
+        StagedPullContents::SkippedAll
+    ) {
+        return Ok(());
+    }
     let args = install_staged_pull_args(source, dest);
     let mut command = locked_rsync_command(target, &args, operation)?;
     let status = command.status().context("Failed to install staged pull")?;
@@ -665,6 +671,83 @@ fn install_staged_pull(
         bail!("Failed to install staged pull");
     }
     Ok(())
+}
+
+enum StagedPullContents {
+    Install,
+    SkippedAll,
+}
+
+/// Skip Git directories that would be discovered without a `.git` entry.
+/// Include the destination's existing entries because `--force` may combine
+/// guest and host files into a repository that neither tree contains alone.
+fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPullContents> {
+    let mut pending = vec![(source.to_path_buf(), dest.to_path_buf())];
+    while let Some((source_dir, dest_dir)) = pending.pop() {
+        let source_entries = fs::read_dir(&source_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect staged pull directory {}",
+                    source_dir.display()
+                )
+            })?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let dest_entries = match fs::metadata(&dest_dir) {
+            Ok(metadata) if metadata.is_dir() => fs::read_dir(&dest_dir)
+                .with_context(|| {
+                    format!("Failed to inspect pull destination {}", dest_dir.display())
+                })?
+                .collect::<std::io::Result<Vec<_>>>()?,
+            Ok(_) => Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect pull destination {}", dest_dir.display())
+                });
+            }
+        };
+
+        let mut has_head = false;
+        let mut has_refs = false;
+        let mut has_objects = false;
+        let mut has_commondir = false;
+        for entry in source_entries.iter().chain(dest_entries.iter()) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            has_head |= name.eq_ignore_ascii_case("HEAD");
+            has_refs |= name.eq_ignore_ascii_case("refs");
+            has_objects |= name.eq_ignore_ascii_case("objects");
+            has_commondir |= name.eq_ignore_ascii_case("commondir");
+        }
+        if has_head && (has_refs || has_objects || has_commondir) {
+            if source_dir.as_path() == source {
+                return Ok(StagedPullContents::SkippedAll);
+            }
+            remove_staging_directory(&source_dir).with_context(|| {
+                format!(
+                    "Failed to skip embedded Git directory {}",
+                    source_dir.display()
+                )
+            })?;
+            continue;
+        }
+
+        for entry in source_entries {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+            {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                pending.push((entry.path(), dest_dir.join(name)));
+            }
+        }
+    }
+    Ok(StagedPullContents::Install)
 }
 
 fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
@@ -2773,6 +2856,91 @@ Host coop-other\n\
             fs::read_to_string(dest.join(".git/config")).unwrap(),
             "host-owned\n"
         );
+    }
+
+    #[test]
+    fn staged_pull_skips_embedded_git_repository() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        let repo = staging.join("nested/cache");
+        fs::create_dir_all(repo.join("objects")).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(staging.join("safe.txt"), "safe\n").unwrap();
+        fs::write(staging.join("nested/sibling.txt"), "sibling\n").unwrap();
+        fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            repo.join("config"),
+            "[core]\n\tbare = false\n\tworktree = ..\n\tfsmonitor = ./payload\n",
+        )
+        .unwrap();
+
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
+        assert!(!dest.join("nested/cache").exists());
+        assert_eq!(fs::read_to_string(dest.join("safe.txt")).unwrap(), "safe\n");
+        assert_eq!(
+            fs::read_to_string(dest.join("nested/sibling.txt")).unwrap(),
+            "sibling\n"
+        );
+    }
+
+    #[test]
+    fn staged_pull_skips_repository_assembled_with_destination() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(staging.join("cache/objects")).unwrap();
+        fs::create_dir_all(staging.join("cache/refs")).unwrap();
+        fs::create_dir_all(dest.join("cache")).unwrap();
+        fs::write(staging.join("safe.txt"), "safe\n").unwrap();
+        fs::write(dest.join("cache/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            staging.join("cache/config"),
+            "[core]\n\tfsmonitor = ./payload\n",
+        )
+        .unwrap();
+
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
+        assert!(!dest.join("cache/config").exists());
+        assert_eq!(fs::read_to_string(dest.join("safe.txt")).unwrap(), "safe\n");
+    }
+
+    #[test]
+    fn staged_pull_checks_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let actual_dest = temp.path().join("actual-dest");
+        let dest = temp.path().join("dest-link");
+        fs::create_dir_all(staging.join("objects")).unwrap();
+        fs::create_dir_all(staging.join("refs")).unwrap();
+        fs::create_dir_all(&actual_dest).unwrap();
+        fs::write(actual_dest.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        symlink(&actual_dest, &dest).unwrap();
+
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
+        assert!(!actual_dest.join("refs").exists());
+    }
+
+    #[test]
+    fn staged_pull_skips_all_files_when_destination_root_is_git_shaped() {
+        let temp = crate::test_support::private_tempdir().unwrap();
+        let staging = temp.path().join("staging");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(staging.join("objects")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(staging.join("safe.txt"), "safe\n").unwrap();
+
+        let operation = PullOperation::new(temp.path().join("pull-operation/test")).unwrap();
+        install_staged_pull(&fake_ssh_target(), &staging, &dest, &operation).unwrap();
+        assert!(!dest.join("safe.txt").exists());
+        assert!(!dest.join("objects").exists());
     }
 
     #[test]
