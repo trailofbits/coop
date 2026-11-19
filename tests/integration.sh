@@ -83,15 +83,6 @@ if [[ -z "$BINARY" ]]; then
     exit 1
 fi
 
-# One KVM shard runs with a literal systemd expansion token in its home path.
-# The default data_dir, generated Firecracker config, and log all inherit it,
-# so a real VM boot checks that systemd-run preserves those path bytes.
-if [[ "${COOP_TEST_LITERAL_DOLLAR_HOME:-0}" == 1 ]]; then
-    test_home_root=$(mktemp -d)
-    export HOME="$test_home_root/coop-\${COOP_SYSTEMD_PATH_LITERAL}"
-    mkdir -m 700 "$HOME"
-fi
-
 # Detach from the controlling terminal's stdin. coop gates interactive prompts
 # on stdin being a TTY. Under CI stdin is already not a TTY, but when the suite runs from an interactive shell (the release
 # preflight) those prompts would read real keystrokes and block. Redirecting the
@@ -307,10 +298,6 @@ cleanup() {
 
     if [[ -d "${ws_tmpdir:-}" ]]; then
         rm -rf "$ws_tmpdir"
-    fi
-
-    if [[ -d "${test_home_root:-}" ]]; then
-        rm -rf "$test_home_root"
     fi
 }
 
@@ -838,16 +825,6 @@ EOF
             fail "Firecracker PID belongs to its systemd service and cgroup" \
                 "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
         fi
-        if [[ "${COOP_TEST_LITERAL_DOLLAR_HOME:-0}" == 1 ]]; then
-            if [[ "$HOME" == *'${COOP_SYSTEMD_PATH_LITERAL}'* \
-                && -f "$HOME/.coop/instances/$INSTANCE/vm_config.json" \
-                && -f "$HOME/.coop/instances/$INSTANCE/firecracker.log" ]]; then
-                pass "Firecracker opens config and log beneath a literal dollar data directory"
-            else
-                fail "Firecracker opens config and log beneath a literal dollar data directory" \
-                    "expected config and log beneath the configured home path"
-            fi
-        fi
     fi
 
     local copied_file="" env_value=""
@@ -871,6 +848,67 @@ EOF
         fail "up ignores discovered devcontainer postStartCommand and postCreateCommand" \
             "marker exists or guest check failed: $(guest_stderr)"
     fi
+}
+
+test_systemd_preserves_literal_dollar_data_dir() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: literal dollar in Firecracker service paths ==="
+
+    # Keep the normal suite home untouched. OpenSSH deliberately rejects '$'
+    # in its managed paths, so this instance can prove VMM launch but cannot
+    # complete SSH readiness. Its private image copy does not share inodes
+    # with the golden image and can be discarded after failed-start cleanup.
+    local data_dir cfg workspace name
+    data_dir=$(mktemp -d "$HOME/coop-\${COOP_SYSTEMD_PATH_LITERAL}-XXXXXX")
+    cfg="$tmpdir/literal-dollar-config.toml"
+    workspace="$tmpdir/literal-dollar-ws"
+    name="${INSTANCE}-dollar"
+    mkdir -m 700 "$data_dir/images"
+    mkdir -p "$workspace"
+    if ! sudo -n cp -a --reflink=auto --sparse=always \
+        "$HOME/.coop/images/default" "$data_dir/images/" \
+        || ! cp -p "$HOME/.coop/vm_key" "$HOME/.coop/vm_key.pub" "$data_dir/"; then
+        fail "prepare private image for literal-dollar Firecracker path"
+        rm -rf "$data_dir"
+        return
+    fi
+    cat > "$cfg" <<EOF
+data_dir = "$data_dir"
+[grok]
+config_dir = false
+[vm]
+firecracker_control = "vsock"
+firecracker_network = "isolated"
+EOF
+
+    local launch_succeeded=0
+    if RUST_LOG=info coop --config "$cfg" up "$workspace" --name "$name" --no-agents; then
+        launch_succeeded=1
+    fi
+    if [[ "$launch_succeeded" == 0 ]]; then
+        if [[ "$HARNESS_ERR" == *"Firecracker started with PID"* \
+            && "$HARNESS_ERR" == *"Firecracker service remains running"* \
+            && "$HARNESS_ERR" == *"contains bytes OpenSSH may reinterpret"* ]]; then
+            pass "systemd launches Firecracker with a literal dollar config and log path"
+        else
+            fail "systemd launches Firecracker with a literal dollar config and log path" \
+                "expected post-launch OpenSSH path rejection; stderr: $HARNESS_ERR"
+        fi
+    elif [[ -f "$data_dir/instances/$name/vm_config.json" \
+        && -f "$data_dir/instances/$name/firecracker.log" ]]; then
+        pass "systemd launches Firecracker with a literal dollar config and log path"
+    else
+        fail "systemd launches Firecracker with a literal dollar config and log path" \
+            "config or log missing after successful launch"
+    fi
+
+    if [[ -d "$data_dir/instances/$name" ]] \
+        && ! coop --config "$cfg" destroy "$name"; then
+        fail "clean up literal-dollar Firecracker fixture" "stderr: $HARNESS_ERR"
+        return
+    fi
+    rm -rf "$data_dir"
 }
 
 test_firecracker_rejects_pid_outside_service_cgroup() {
@@ -9480,6 +9518,7 @@ EOF
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
         run_timed_test test_up_creates_primary_instance
+        run_timed_test test_systemd_preserves_literal_dollar_data_dir
         run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
         run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
         run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
