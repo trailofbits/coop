@@ -8493,48 +8493,171 @@ STATEEOF
 
 # ── Interrupted setup test (--full only) ──────────────────────
 
+setup_session_live_count() {
+    ps -eo sid=,stat= | awk -v sid="$1" \
+        '$1 == sid && $2 !~ /^Z/ { count++ } END { print count + 0 }'
+}
+
+stop_interrupted_setup_session() {
+    local sid=$1 remaining
+
+    [[ $sid =~ ^[1-9][0-9]*$ ]] || return 1
+
+    # setup's bounded subprocesses use separate process groups. A dedicated
+    # session lets the fixture stop every child left after SIGKILLing setup.
+    sudo -n pkill -TERM -s "$sid" 2>/dev/null || true
+    for _ in {1..5}; do
+        remaining=$(setup_session_live_count "$sid") || return 1
+        [[ $remaining -eq 0 ]] && return 0
+        sleep 1
+    done
+    sudo -n pkill -KILL -s "$sid" 2>/dev/null || true
+    for _ in {1..10}; do
+        remaining=$(setup_session_live_count "$sid") || return 1
+        [[ $remaining -eq 0 ]] && return 0
+        sleep 1
+    done
+    echo "  Interrupted setup session still has $remaining live process(es)" >&2
+    return 1
+}
+
 test_interrupted_setup() {
     echo ""
     echo "=== Phase: interrupted setup recovery ==="
 
     # Use a separate named image so we don't risk the default image
     local img="interrupted-$$"
+    local mount_path="$HOME/.coop/rootfs-mount"
 
-    # Start building an image in the background
-    "$BINARY" setup -y --image "$img" --profile python,node \
-        >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    # Linux setup tools use separate process groups. Keep them in one session
+    # so the fixture can end descendants after crashing the setup parent.
+    local linux_session=0
+    if [[ $(uname -s) == Linux ]]; then
+        linux_session=1
+        if mountpoint -q "$mount_path"; then
+            fail "interrupted setup starts with unmounted rootfs" "mount already active"
+            return
+        fi
+        setsid "$BINARY" setup -y --image "$img" --profile python,node \
+            >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    else
+        "$BINARY" setup -y --image "$img" --profile python,node \
+            >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    fi
     local setup_pid=$!
+    local setup_sid=""
 
-    # Wait for the build to actually start (poll stderr for build markers)
+    if [[ $linux_session -eq 1 ]]; then
+        # The harness may only signal the session it created. Wait briefly
+        # for setsid to exec, then pin the session ID before setup can exit.
+        for _ in {1..20}; do
+            setup_sid=$(ps -o sid= -p "$setup_pid" 2>/dev/null) || true
+            setup_sid=${setup_sid//[[:space:]]/}
+            [[ $setup_sid == "$setup_pid" ]] && break
+            sleep 0.1
+        done
+        if [[ $setup_sid != "$setup_pid" ]]; then
+            kill -9 "$setup_pid" 2>/dev/null || true
+            wait "$setup_pid" 2>/dev/null || true
+            fail "interrupted setup isolated session" "leader PID and session ID differ"
+            return
+        fi
+    fi
+
+    # On Linux, interrupt while the template mount is active. The old broad
+    # log marker could fire during download, before recovery had any mount to
+    # clean up. The Lima path retains its existing build marker.
     local waited=0
-    while [[ $waited -lt 90 ]]; do
+    local wait_limit=90
+    [[ $linux_session -eq 1 ]] && wait_limit=240
+    while [[ $waited -lt $wait_limit ]]; do
         # Check if process already exited (build finished before we could kill)
-        if ! kill -0 "$setup_pid" 2>/dev/null; then
+        if ! kill -0 "$setup_pid" 2>/dev/null \
+                || [[ $(ps -o stat= -p "$setup_pid" 2>/dev/null) == Z* ]]; then
             break
         fi
-        if grep -qi "building\|installing\|Starting builder\|downloading" \
-                "$tmpdir/int-stderr" 2>/dev/null; then
+        if [[ $linux_session -eq 1 ]] \
+                && mountpoint -q "$mount_path"; then
+            break
+        fi
+        if [[ $linux_session -eq 0 ]] \
+                && grep -qi "building\|installing\|Starting builder\|downloading" \
+                    "$tmpdir/int-stderr" 2>/dev/null; then
             break
         fi
         sleep 1
         waited=$((waited + 1))
     done
 
-    if ! kill -0 "$setup_pid" 2>/dev/null; then
-        # Process already exited — can't test interruption
+    if ! kill -0 "$setup_pid" 2>/dev/null \
+            || [[ $(ps -o stat= -p "$setup_pid" 2>/dev/null) == Z* ]]; then
+        # A completed build cannot be interrupted; an early error is a test
+        # failure, not a reason to skip the recovery check.
+        if [[ $linux_session -eq 1 ]] \
+                && ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+        fi
+        if wait "$setup_pid" 2>/dev/null; then
+            skip "interrupted setup" "build completed before kill"
+        else
+            fail "interrupted setup reached build" "setup exited before interruption"
+        fi
+        coop images --delete "$img" 2>/dev/null || true
+        return
+    fi
+
+    if [[ $linux_session -eq 1 ]] \
+            && { ! mountpoint -q "$mount_path" \
+                || [[ ! -f "$HOME/.coop/images/$img/rootfs-template.ext4.new" ]]; }; then
+        kill -9 "$setup_pid" 2>/dev/null || true
         wait "$setup_pid" 2>/dev/null || true
-        skip "interrupted setup" "build completed before kill"
+        if ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+        fi
+        fail "interrupted setup reached its mounted rootfs" "not mounted after ${waited}s"
         coop images --delete "$img" 2>/dev/null || true
         return
     fi
 
     # Let it get deeper into the build
-    sleep 5
+    [[ $linux_session -eq 0 ]] && sleep 5
 
-    # SIGKILL — bypasses signal handlers, simulates a crash
-    kill -9 "$setup_pid" 2>/dev/null
-    wait "$setup_pid" 2>/dev/null || true
+    # SIGKILL — bypasses signal handlers, simulates a crash. Require the
+    # signal exit status so a process that finished during the race cannot
+    # make this recovery check pass without an actual interruption.
+    local kill_rc=0 wait_rc=0
+    kill -9 "$setup_pid" 2>/dev/null || kill_rc=$?
+    wait "$setup_pid" 2>/dev/null || wait_rc=$?
+    if [[ $kill_rc -ne 0 || $wait_rc -ne 137 ]]; then
+        if [[ $linux_session -eq 1 ]] \
+                && ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+        fi
+        fail "setup killed mid-build (SIGKILL)" "signal rc=$kill_rc, wait status=$wait_rc"
+        coop images --delete "$img" 2>/dev/null || true
+        return
+    fi
     pass "setup killed mid-build (SIGKILL)"
+
+    if [[ $linux_session -eq 1 ]]; then
+        # The parent died without running MountGuard. End the fixture's
+        # orphaned chroot work before checking recovery; a live child can
+        # legitimately keep the mount busy beyond recovery's 90s deadline.
+        if ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+            coop images --delete "$img" 2>/dev/null || true
+            return
+        fi
+        # Recovery must see the mount left by the crash. This trips if the
+        # fixture was killed before mounting or cleanup already removed it.
+        if mountpoint -q "$mount_path"; then
+            pass "interrupted rootfs remains mounted for recovery"
+        else
+            fail "interrupted rootfs remains mounted for recovery" "mount absent"
+            coop images --delete "$img" 2>/dev/null || true
+            return
+        fi
+    fi
 
     # Retry — setup should clean up leftover state and succeed
     if coop setup -y --image "$img" --profile python,node; then
@@ -8542,6 +8665,11 @@ test_interrupted_setup() {
     else
         fail "setup succeeds after interrupted build" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
+        if [[ $linux_session -eq 1 ]]; then
+            local mount_state=unmounted
+            mountpoint -q "$mount_path" && mount_state=mounted
+            echo "recovery diagnostics: rootfs=$mount_state, fixture session live=$(setup_session_live_count "$setup_sid")"
+        fi
         coop images --delete "$img" 2>/dev/null || true
         return
     fi

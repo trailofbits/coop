@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y acl build-essential cmake curl e2fsprogs \
             iproute2 iptables iputils-ping jq openssh-client openssh-server \
-            pkg-config python3 rsync squashfs-tools util-linux zsh
+            pkg-config procps python3 rsync squashfs-tools util-linux zsh
 
       # Image rebuilds and copies need more disk than the standard runner's
       # advertised free space. These SDKs are unused by the Linux VM suite.
