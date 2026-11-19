@@ -2274,7 +2274,7 @@ impl CoopConfig {
 
     /// Fail fast on config errors and surface warnings via `tracing::warn`.
     ///
-    /// Lifecycle commands (`up`/`setup`/`start`/`quickstart`) call this at
+    /// Lifecycle commands (`up`/`setup`/`start`) call this at
     /// the handler boundary so a broken config aborts before any expensive
     /// work (image build, PAT prompt, VM boot). It is *not* the gate: the
     /// authoritative environmental check runs at the boot choke point

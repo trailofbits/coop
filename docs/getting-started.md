@@ -296,12 +296,13 @@ run `coop codex -- login --device-auth` once.
 
 ## First run
 
-In a hurry? From your project directory, `coop quickstart` runs setup, brings up
-an instance, and launches Claude Code in one command — building the default
-image only if it is missing and reconnecting to an existing instance when one is
-already running. The steps below walk through the same flow one command at a
-time and give you per-instance control. See the [`quickstart`
-reference](commands.md#quickstart) for details.
+Run `coop setup` once to build the default image. Then, from your project
+directory, run `coop up` and launch your agent with `coop codex`, `coop claude`,
+or `coop grok`. Later `coop up` calls reuse a running instance or restart a
+stopped one for that directory. The steps below explain each command and its
+options. When multiple VMs are running, use `coop list` to find the name and
+pass it to the agent command (for example, `coop codex <name>`); agent commands
+do not select a VM by the current directory.
 
 ### 1. Setup
 
