@@ -37,10 +37,11 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 /// directory depth. This filter reduces accidental transfer; it is not a
 /// security boundary because transport and filesystem name semantics vary.
 const GIT_EXCLUDE: &str = ".[gG][iI][tT]";
+const PULL_ADDITIONAL_EXCLUDES: &[&str] = &[".[hH][gG]", ".[sS][vV][nN]"];
 
 const PULL_UNTRUSTED_WARNING: &str = "Pull copies files controlled by the untrusted guest. \
 Treat the result as potentially malicious: review it before executing files or interpreting \
-it with Git, editors, build tools, shells, or other host applications. Git metadata filtering \
+it with Git, editors, build tools, shells, or other host applications. VCS metadata filtering \
 is best effort, not a security boundary.";
 
 /// Persisted workspace metadata written during `start`.
@@ -539,7 +540,11 @@ fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
 
 // ── Transport: rsync ──────────────────────────────────────────
 
-fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Result<Vec<String>> {
+fn rsync_base_args(
+    target: &SshTarget,
+    exclude_git: bool,
+    additional_excludes: &[&str],
+) -> Result<Vec<String>> {
     let mut args = vec!["-az".to_string(), "-e".to_string(), target.rsync_ssh_cmd()?];
     // `.git/` rule must precede the per-directory `.gitignore` merge: rsync
     // uses first-match-wins, so without this a repo whose `.gitignore`
@@ -550,6 +555,9 @@ fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Result<Vec<String>>
     } else {
         // `/.git/***` matches the directory itself and everything inside.
         args.push("--filter=+ /.git/***".to_string());
+    }
+    for exclude in additional_excludes {
+        args.push(format!("--exclude={exclude}"));
     }
     args.push("--filter=:- .gitignore".to_string());
     for exc in DEFAULT_EXCLUDES {
@@ -591,7 +599,7 @@ fn rsync_to_guest(
         .rsync_command()
         .context("Workspace transfers require rsync on the host")?;
     require_guest_rsync(target)?;
-    let mut args = rsync_base_args(target, exclude_git)?;
+    let mut args = rsync_base_args(target, exclude_git, &[])?;
     if matches!(mode, SyncMode::Mirror) {
         args.push("--delete".to_string());
     }
@@ -755,7 +763,7 @@ fn report_uncopied_pull_paths(
 }
 
 fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
-    rsync_base_args(target, true)
+    rsync_base_args(target, true, PULL_ADDITIONAL_EXCLUDES)
 }
 
 fn locked_rsync_command(
@@ -870,12 +878,13 @@ fn skip_embedded_git_repositories(source: &Path, dest: &Path) -> Result<StagedPu
 }
 
 fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
-    vec![
-        "-a".to_string(),
-        format!("--exclude={GIT_EXCLUDE}"),
-        format!("{}/", source.display()),
-        format!("{}/", dest.display()),
-    ]
+    let mut args = vec!["-a".to_string(), format!("--exclude={GIT_EXCLUDE}")];
+    for exclude in PULL_ADDITIONAL_EXCLUDES {
+        args.push(format!("--exclude={exclude}"));
+    }
+    args.push(format!("{}/", source.display()));
+    args.push(format!("{}/", dest.display()));
+    args
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1666,7 +1675,7 @@ mod tests {
             assert!(!copied.iter().any(|arg| arg == "--delete"));
             assert_eq!(
                 &copied[..copied.len() - 2],
-                rsync_base_args(&target, exclude_git).unwrap()
+                rsync_base_args(&target, exclude_git, &[]).unwrap()
             );
             rsync_push(&target, &source, &default_workspace_path(), exclude_git).unwrap();
             let mirrored = read_args();
@@ -1713,7 +1722,7 @@ mod tests {
         let status = target
             .rsync_command()
             .unwrap()
-            .args(rsync_base_args(&target, true).unwrap())
+            .args(rsync_base_args(&target, true, &[]).unwrap())
             .arg(format!("{}/", source.display()))
             .arg(format!("{}/", dest.display()))
             .status()
@@ -2617,7 +2626,7 @@ Host coop-other\n\
         /// unchecked.
         #[test]
         fn rsync_base_args_membership_and_git_filter_ordering(exclude_git in any::<bool>()) {
-            let args = rsync_base_args(&fake_ssh_target(), exclude_git).unwrap();
+            let args = rsync_base_args(&fake_ssh_target(), exclude_git, &[]).unwrap();
 
             for exc in DEFAULT_EXCLUDES {
                 let needle = format!("--exclude={exc}");
@@ -2654,7 +2663,7 @@ Host coop-other\n\
     }
 
     #[test]
-    fn pull_transports_apply_best_effort_git_exclusions() {
+    fn pull_transports_apply_best_effort_vcs_exclusions() {
         let target = fake_ssh_target();
         let rsync_args = rsync_pull_args(&target).unwrap();
         assert!(
@@ -2663,6 +2672,14 @@ Host coop-other\n\
                 .any(|arg| arg == "--exclude=.[gG][iI][tT]")
         );
         assert!(!rsync_args.iter().any(|arg| arg == "--filter=+ /.git/***"));
+        for exclude in PULL_ADDITIONAL_EXCLUDES {
+            assert!(
+                rsync_args
+                    .iter()
+                    .any(|arg| arg == &format!("--exclude={exclude}")),
+                "{rsync_args:?}"
+            );
+        }
 
         let staged_args =
             install_staged_pull_args(Path::new("/pull-staging"), Path::new("/host/workspace"));
@@ -2672,6 +2689,14 @@ Host coop-other\n\
                 .any(|arg| arg == "--exclude=.[gG][iI][tT]"),
             "{staged_args:?}"
         );
+        for exclude in PULL_ADDITIONAL_EXCLUDES {
+            assert!(
+                staged_args
+                    .iter()
+                    .any(|arg| arg == &format!("--exclude={exclude}")),
+                "{staged_args:?}"
+            );
+        }
     }
 
     #[test]
