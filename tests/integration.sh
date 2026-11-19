@@ -5516,15 +5516,16 @@ test_project_agent_workflow() {
     fi
 
     # An interactive agent sees EOF without a PTY in this harness. The host
-    # may still return success, so check that the SSH leg was reached.
+    # may still return success after an SSH failure, so require agent output.
     rc=0
-    _timeout 180 "${binary_args[@]}" claude "$agent_name" \
+    _timeout 180 "${binary_args[@]}" claude "$agent_name" -- --help \
         </dev/null >"$tmpdir/agent_claude_out" 2>"$tmpdir/agent_claude_err" || rc=$?
-    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_claude_err"; then
-        pass "claude connects to project instance"
+    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_claude_err" \
+        && grep -qiE '^Usage: claude([[:space:]]|$)' "$tmpdir/agent_claude_out"; then
+        pass "claude help runs in project instance"
     else
-        fail "claude connects to project instance" \
-            "exit: $rc; stderr: $(cat "$tmpdir/agent_claude_err")"
+        fail "claude help runs in project instance" \
+            "exit: $rc; stderr: $(cat "$tmpdir/agent_claude_err"); stdout: $(cat "$tmpdir/agent_claude_out")"
     fi
 
     rc=0
