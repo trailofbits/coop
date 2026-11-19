@@ -563,7 +563,8 @@ mod tests {
                 // A concurrent stop must be able to take this lock while the
                 // guest hook is running.
                 let _concurrent =
-                    crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::ZERO).unwrap();
+                    crate::fs_util::lock_sibling_bounded(&inst.dir, Duration::from_secs(1))
+                        .unwrap();
                 Ok(())
             },
             || {

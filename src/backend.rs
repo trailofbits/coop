@@ -1045,6 +1045,8 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    crate::firecracker_install::require_managed_path(&cfg.firecracker_bin)?;
     cfg.validate().map(drop)
 }
 
@@ -1270,13 +1272,45 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
+    crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+    crate::firecracker_service::require_system_manager()?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
         crate::network::setup_tap(&cfg.network, inst)?;
     }
-    let running = vm.start()?;
-    running.wait_for_boot()
+    start_firecracker_with_cleanup(cfg, inst, vm)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_firecracker_with_cleanup(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    vm: crate::vm::FirecrackerVm<'_, crate::vm::Configured>,
+) -> Result<()> {
+    let result = vm.start().and_then(|running| running.wait_for_boot());
+    let Err(error) = result else { return Ok(()) };
+    match inst.probe_liveness() {
+        Ok(false) => {
+            let runtime = crate::vm::cleanup_runtime_paths(inst);
+            let network = crate::network::teardown_tap(&cfg.network, inst);
+            match (runtime, network) {
+                (Ok(()), Ok(())) => Err(error.context("Firecracker is confirmed stopped")),
+                (Err(cleanup), Ok(())) | (Ok(()), Err(cleanup)) => {
+                    Err(error.context(format!("Stopped Firecracker cleanup failed: {cleanup:#}")))
+                }
+                (Err(runtime), Err(network)) => Err(error.context(format!(
+                    "Stopped Firecracker runtime and TAP cleanup failed: {runtime:#}; {network:#}"
+                ))),
+            }
+        }
+        Ok(true) => Err(error.context(
+            "Firecracker service remains running; inspect it before stopping or retrying",
+        )),
+        Err(probe) => Err(error.context(format!(
+            "Firecracker process state is uncertain ({probe:#}); PID, sockets, TAP, and disk retained"
+        ))),
+    }
 }
 
 /// A failed readiness wait does not prove the VM stopped. Only roll back a
@@ -1406,6 +1440,8 @@ impl VmBackend for FirecrackerBackend {
             bail!("Instance '{}' is already running", inst.name);
         }
         boot_preflight(cfg)?;
+        crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+        crate::firecracker_service::require_system_manager()?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1420,8 +1456,7 @@ impl VmBackend for FirecrackerBackend {
         if inst.firecracker_network() == FirecrackerNetworkMode::Open {
             crate::network::setup_tap(&cfg.network, inst)?;
         }
-        let running = vm.start()?;
-        running.wait_for_boot()
+        start_firecracker_with_cleanup(cfg, inst, vm)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1511,19 +1546,17 @@ impl VmBackend for FirecrackerBackend {
         }
 
         crate::network::teardown_all(&cfg.network);
-        tracing::info!("Removing kernel and Firecracker binary");
-        for path in [cfg.vm.kernel_path.clone(), cfg.firecracker_bin.clone()] {
+        tracing::info!("Removing kernel and legacy data-directory Firecracker binaries");
+        for path in [
+            cfg.vm.kernel_path.to_path_buf(),
+            cfg.data_dir.join("firecracker"),
+            cfg.data_dir.join("jailer"),
+        ] {
             if path.exists()
                 && let Err(e) = Cmd::new("rm").arg("-f").arg(&path).sudo().run()
             {
                 tracing::debug!("Failed to remove {} (non-fatal): {e}", path.display());
             }
-        }
-        let jailer = cfg.data_dir.join("jailer");
-        if jailer.exists()
-            && let Err(e) = Cmd::new("rm").arg("-f").arg(&jailer).sudo().run()
-        {
-            tracing::debug!("Failed to remove jailer (non-fatal): {e}");
         }
     }
 
@@ -5437,6 +5470,17 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn boot_preflight_rejects_custom_vmm_before_instance_mutation() {
+        let cfg = CoopConfig {
+            firecracker_bin: crate::config::ConfigPath::new("/bin/false"),
+            ..CoopConfig::default()
+        };
+        let error = boot_preflight(&cfg).unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"));
     }
 
     #[test]

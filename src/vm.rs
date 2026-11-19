@@ -33,6 +33,7 @@ pub struct Running;
 pub struct FirecrackerVm<'a, S> {
     cfg: &'a CoopConfig,
     inst: &'a Instance,
+    launch_service: Option<crate::firecracker_service::ActiveService>,
     _state: PhantomData<S>,
 }
 
@@ -193,6 +194,7 @@ impl<'a> FirecrackerVm<'a, Configured> {
         Self {
             cfg,
             inst,
+            launch_service: None,
             _state: PhantomData,
         }
     }
@@ -241,6 +243,8 @@ impl<'a> FirecrackerVm<'a, Configured> {
         if self.inst.probe_liveness()? {
             bail!("Instance '{}' is already running", self.inst.name);
         }
+        let firecracker =
+            crate::firecracker_install::configured_firecracker(&self.cfg.firecracker_bin)?;
 
         // The instance directory is a pinned, user-owned 0700 namespace, so
         // its owner can safely unlink root-owned Firecracker entries without
@@ -254,32 +258,20 @@ impl<'a> FirecrackerVm<'a, Configured> {
             })?;
         }
 
-        // Launched through PID_TRAMPOLINE so the recorded PID is the VMM
-        // rather than sudo's wrapper. Paths ride as positional argv ($1,
-        // $@), so nothing is interpolated into the shell string.
-        let fc_cmd = Cmd::new("sh")
-            .args(["-c", PID_TRAMPOLINE, "sh"])
-            .arg(&pid_path)
-            .arg(&self.cfg.firecracker_bin)
-            .arg("--no-api")
-            .arg("--config-file")
-            .arg(&config_path)
-            .arg("--log-path")
-            .arg(&log_path)
-            .args(["--level", "Info"])
-            .sudo();
-        let _child = fc_cmd
-            .build()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context(
-                "Failed to start Firecracker — \
-                 is it installed and in PATH?",
-            )?;
-
-        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(5))?;
+        let service =
+            crate::firecracker_service::launch(self.inst, &firecracker, &config_path, &log_path)?;
+        let pid = service.pid();
+        if let Err(write_error) =
+            crate::fs_util::atomic_write_with_mode(&pid_path, &pid.to_string(), 0o644)
+        {
+            return match crate::firecracker_service::stop(&service) {
+                Ok(()) => Err(write_error).context("Failed to record Firecracker service PID"),
+                Err(stop_error) => Err(write_error).context(format!(
+                    "Failed to record Firecracker service PID; service {} may still run: {stop_error:#}",
+                    service.unit()
+                )),
+            };
+        }
         tracing::info!(
             "Firecracker started with PID {pid} \
              (instance '{}')",
@@ -289,17 +281,28 @@ impl<'a> FirecrackerVm<'a, Configured> {
         let running = FirecrackerVm {
             cfg: self.cfg,
             inst: self.inst,
+            launch_service: Some(service.clone()),
             _state: PhantomData,
         };
 
-        // The PID file only proves the trampoline reached its exec, so
-        // give Firecracker a beat to die before probing — otherwise
-        // check_alive() races an immediate crash.
+        // A successful systemd exec does not prove the VMM survived startup.
         std::thread::sleep(Duration::from_secs(1));
-        running.check_alive().context(
-            "Firecracker exited immediately — \
-             check logs with `coop logs`",
-        )?;
+        match crate::firecracker_service::probe(self.inst)? {
+            crate::firecracker_service::ServiceProbe::Active(observed)
+                if observed.unit() == service.unit()
+                    && observed.pid() == service.pid()
+                    && crate::firecracker_service::contains_pid(&observed)? => {}
+            crate::firecracker_service::ServiceProbe::None => {
+                bail!(
+                    "Firecracker VMM exited immediately in service {}",
+                    service.unit()
+                );
+            }
+            crate::firecracker_service::ServiceProbe::Active(_) => {
+                bail!("Firecracker service identity changed during startup");
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+        }
 
         Ok(running)
     }
@@ -315,6 +318,7 @@ impl<'a> FirecrackerVm<'a, Running> {
         Self {
             cfg,
             inst,
+            launch_service: None,
             _state: PhantomData,
         }
     }
@@ -328,8 +332,25 @@ impl<'a> FirecrackerVm<'a, Running> {
         tracing::info!("Waiting for guest to boot (timeout: {timeout:?})");
 
         while start.elapsed() < timeout {
-            if let Err(e) = self.check_alive() {
-                bail!("Firecracker crashed during boot: {e}");
+            match crate::firecracker_service::probe(self.inst)? {
+                crate::firecracker_service::ServiceProbe::Active(service) => {
+                    if self
+                        .launch_service
+                        .as_ref()
+                        .is_some_and(|expected| expected != &service)
+                    {
+                        bail!("Firecracker service generation changed during guest boot");
+                    }
+                    if !crate::firecracker_service::contains_pid(&service)? {
+                        bail!("Firecracker service PID left its systemd cgroup during boot");
+                    }
+                }
+                crate::firecracker_service::ServiceProbe::None => {
+                    bail!("Firecracker VMM exited during guest boot");
+                }
+                crate::firecracker_service::ServiceProbe::Uncertain(reason) => {
+                    bail!("Firecracker service state is uncertain during boot: {reason}");
+                }
             }
             if target.transport_is_reachable(Duration::from_secs(2))? {
                 tracing::info!("Guest SSH is reachable");
@@ -339,18 +360,41 @@ impl<'a> FirecrackerVm<'a, Running> {
         }
 
         bail!(
-            "Timed out waiting for guest to boot \
-             after {timeout:?}"
+            "Timed out waiting for guest SSH after {timeout:?}; inspect the Firecracker service and logs before stopping or retrying"
         );
     }
 
-    /// Request guest shutdown, then fall back to SIGTERM and SIGKILL.
+    /// Request guest shutdown, then stop the systemd cgroup or legacy PID.
     pub fn stop(self) -> Result<()> {
+        match crate::firecracker_service::probe(self.inst)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                return self.stop_service(&service);
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => {}
+        }
         self.stop_with_timeouts(
             Duration::from_secs(10),
             Duration::from_secs(10),
             Duration::from_secs(5),
         )
+    }
+
+    fn stop_service(self, service: &crate::firecracker_service::ActiveService) -> Result<()> {
+        let mut wait =
+            |_: u32, timeout| crate::firecracker_service::wait_for_exit(self.inst, timeout);
+        if !wait(service.pid(), Duration::ZERO)?
+            && !self.shutdown_gracefully(service.pid(), Duration::from_secs(10), &mut wait)?
+        {
+            crate::firecracker_service::stop(service)?;
+        }
+        if !crate::firecracker_service::wait_for_exit(self.inst, Duration::from_secs(5))? {
+            bail!("Firecracker service {} did not stop", service.unit());
+        }
+        if let Err(error) = cleanup_runtime_paths(self.inst) {
+            tracing::debug!("Failed to remove stopped Firecracker runtime paths: {error:#}");
+        }
+        Ok(())
     }
 
     fn stop_with_timeouts(
@@ -428,9 +472,26 @@ impl<'a> FirecrackerVm<'a, Running> {
 
     /// Return a human-readable status string with resource usage.
     pub fn status(&self) -> Result<String> {
-        let pid_str =
-            fs::read_to_string(self.inst.pid_file_path()).context("Failed to read PID file")?;
-        let pid = pid_str.trim();
+        let service = match crate::firecracker_service::probe(self.inst)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                if !crate::firecracker_service::contains_pid(&service)? {
+                    bail!("Firecracker service PID is outside its systemd cgroup");
+                }
+                Some(service)
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => None,
+        };
+        let legacy_pid = if service.is_none() {
+            Some(fs::read_to_string(self.inst.pid_file_path()).context("Failed to read PID file")?)
+        } else {
+            None
+        };
+        let pid = service
+            .as_ref()
+            .map(|value| value.pid().to_string())
+            .or_else(|| legacy_pid.as_ref().map(|value| value.trim().to_owned()))
+            .context("No Firecracker process identity")?;
 
         // Report the mem/vcpu the VM actually booted with, read from the
         // authoritative per-instance config, not the global default.
@@ -455,6 +516,9 @@ impl<'a> FirecrackerVm<'a, Running> {
             self.inst.firecracker_network(),
             target.connection_description(),
         );
+        if let Some(service) = service {
+            let _ = write!(out, "\n  Service: {}", service.unit());
+        }
 
         if let Some(usage) = crate::backend::query_resource_usage(&target) {
             let _ = write!(out, "\n  {usage}");
@@ -488,30 +552,6 @@ impl<'a> FirecrackerVm<'a, Running> {
                     writeln!(std::io::stdout(), "{line}").context("Failed to write log line")?;
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Verify the Firecracker process is still running.
-    fn check_alive(&self) -> Result<()> {
-        let pid_str =
-            fs::read_to_string(self.inst.pid_file_path()).context("Failed to read PID file")?;
-        let pid = pid_str.trim();
-        if !Cmd::new("kill").args(["-0", pid]).sudo().status_ok() {
-            let log = fs::read_to_string(self.inst.log_path()).unwrap_or_default();
-            let last_lines: String = log
-                .lines()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
-            bail!(
-                "Firecracker process (PID {pid}) is not \
-                 running.\nLog tail:\n{last_lines}"
-            );
         }
         Ok(())
     }
@@ -552,58 +592,6 @@ pub(crate) fn cleanup_runtime_paths(inst: &crate::config::Instance) -> Result<()
             additional_errors.join("; ")
         )))
     }
-}
-
-/// Shell wrapper that makes the recorded PID Firecracker's own.
-///
-/// `sudo` forks rather than execs when `use_pty` is on (its default since
-/// 1.9.14), so the spawned child is the wrapper and `Child::id()` names it
-/// instead of the VMM — `stop()`'s SIGKILL would then hit sudo and leave
-/// the VM running. This shell records its own PID and execs in place, so
-/// the PID file names the process SIGKILL must reach.
-///
-/// A root-owned PID file must be readable by the unprivileged caller despite
-/// root's umask or the instance directory's default ACL. Set the mode before
-/// atomically publishing it, so startup never observes an unreadable file.
-/// Staging beside the destination keeps the rename on the same filesystem.
-const PID_TRAMPOLINE: &str = concat!(
-    r#"rm -f -- "$1" || exit 1; "#,
-    r#"pid_tmp=$(mktemp -- "$1.XXXXXX") || exit 1; "#,
-    r#"trap 'rm -f -- "$pid_tmp"' EXIT; "#,
-    r#"trap 'exit 1' HUP INT TERM; "#,
-    r#"echo $$ > "$pid_tmp" || exit 1; "#,
-    r#"chmod 644 "$pid_tmp" || exit 1; "#,
-    r#"mv -f -- "$pid_tmp" "$1" || exit 1; "#,
-    r#"trap - EXIT HUP INT TERM; "#,
-    // Firecracker creates the base vsock socket as root. Its containing
-    // instance directory is user-owned mode 0700, so mode 0666 grants the
-    // invoking user access without exposing the socket to other users.
-    r#"umask 0111 || exit 1; "#,
-    r#"shift; exec "$@""#,
-);
-
-/// Poll for the PID file until its contents parse as a PID.
-///
-/// Returns an error on timeout, or on the first read error that is
-/// not `NotFound`.
-fn wait_for_pid_file(pid_path: &Path, timeout: Duration) -> Result<u32> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        match fs::read_to_string(pid_path) {
-            Ok(pid_str) => {
-                if let Ok(pid) = pid_str.trim().parse() {
-                    return Ok(pid);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).context("Failed to read PID file"),
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    bail!(
-        "Timed out waiting for valid PID file at {}",
-        pid_path.display()
-    );
 }
 
 /// Poll process liveness until exit or timeout. EPERM means the process is
@@ -673,7 +661,7 @@ fn terminate_firecracker(
 mod tests {
     use super::{
         Duration, FirecrackerVm, Instant, MachineConfig, MiB, NonZeroU8, apply_machine_resources,
-        build_config, cleanup_runtime_paths, read_machine_config, wait_for_exit, wait_for_pid_file,
+        build_config, cleanup_runtime_paths, read_machine_config, wait_for_exit,
     };
     use crate::config::{CoopConfig, ImageName, Instance, InstanceIndex, InstanceName};
 
@@ -1192,194 +1180,5 @@ mod tests {
         let back: MachineConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vcpu_count, 4);
         assert_eq!(back.mem_size_mib, 3072);
-    }
-
-    #[test]
-    fn pid_trampoline_publishes_readable_pid_under_hardened_umask() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let path = dir.path().join("firecracker.pid");
-        // Pause any post-publication chmod in the shell itself. This makes the
-        // old create-then-chmod window deterministic without sudo or a VM.
-        // The replacement process also stays alive until the test reaps it.
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "published=$1; umask 077; chmod() {{ if [ \"$2\" = \"$published\" ]; then kill -STOP $$; fi; command chmod \"$@\"; }}; {}",
-                crate::vm::PID_TRAMPOLINE,
-            ))
-            .arg("sh")
-            .arg(&path)
-            .args(["sleep", "30"])
-            .spawn()
-            .unwrap();
-        let published = wait_for_pid_file(&path, Duration::from_secs(5));
-        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
-        let expected_pid = child.id();
-        // Reap even when an assertion below fails, including the stopped shell.
-        child.kill().unwrap();
-        child.wait().unwrap();
-
-        assert_eq!(published.unwrap(), expected_pid);
-        assert_eq!(mode.unwrap(), 0o644);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pid_trampoline_normalizes_inherited_default_acl() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let directory = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
-        // Linux POSIX default ACL u::rwx,g::---,o::---. Such an ACL replaces
-        // the umask during file creation; changing the umask cannot grant read.
-        let mut acl = 2_u32.to_le_bytes().to_vec();
-        for (tag, permissions) in [(1_u16, 7_u16), (4, 0), (32, 0)] {
-            acl.extend(tag.to_le_bytes());
-            acl.extend(permissions.to_le_bytes());
-            acl.extend(u32::MAX.to_le_bytes());
-        }
-        // SAFETY: both C strings and the ACL buffer live through setxattr;
-        // the buffer length describes its complete initialized contents.
-        let status = unsafe {
-            libc::setxattr(
-                directory.as_ptr(),
-                c"system.posix_acl_default".as_ptr(),
-                acl.as_ptr().cast(),
-                acl.len(),
-                0,
-            )
-        };
-        assert_eq!(
-            status,
-            0,
-            "set default ACL: {}",
-            std::io::Error::last_os_error()
-        );
-
-        // Positive witness that this filesystem applies the restrictive ACL.
-        let witness = dir.path().join("inherited");
-        std::fs::write(&witness, "fixture").unwrap();
-        assert_eq!(
-            std::fs::metadata(&witness).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        let path = dir.path().join("firecracker.pid");
-        let result = std::process::Command::new("sh")
-            .args(["-c", crate::vm::PID_TRAMPOLINE, "sh"])
-            .arg(&path)
-            .arg("true")
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap()
-                > 0
-        );
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-    }
-
-    #[test]
-    fn pid_trampoline_cleans_staging_file_when_chmod_fails() {
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let path = dir.path().join("firecracker.pid");
-        let result = std::process::Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "chmod() {{ echo chmod-refused >&2; return 1; }}; {}",
-                    crate::vm::PID_TRAMPOLINE
-                ),
-                "sh",
-            ])
-            .arg(&path)
-            .arg("true")
-            .output()
-            .unwrap();
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("chmod-refused"));
-        assert!(!path.exists());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn wait_for_pid_file_returns_immediately_when_already_valid() {
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let path = dir.path().join("firecracker.pid");
-        std::fs::write(&path, "4242\n").unwrap();
-
-        let start = Instant::now();
-        let pid = wait_for_pid_file(&path, Duration::from_secs(5)).unwrap();
-
-        assert_eq!(pid, 4242);
-        assert!(
-            start.elapsed() < Duration::from_millis(150),
-            "a ready PID file must not cost a poll interval"
-        );
-    }
-
-    #[test]
-    fn wait_for_pid_file_retries_past_the_empty_write_window() {
-        // The trampoline's `echo $$ > "$1"` truncates before it writes, so a
-        // reader can legitimately observe a zero-byte file. That must retry,
-        // not fail.
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let path = dir.path().join("firecracker.pid");
-        std::fs::write(&path, "").unwrap();
-
-        let writer = path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            std::fs::write(&writer, "777\n").unwrap();
-        });
-
-        assert_eq!(
-            wait_for_pid_file(&path, Duration::from_secs(5)).unwrap(),
-            777
-        );
-    }
-
-    #[test]
-    fn wait_for_pid_file_times_out_when_never_written() {
-        let dir = crate::test_support::private_tempdir().unwrap();
-        let path = dir.path().join("never-written.pid");
-
-        let err = wait_for_pid_file(&path, Duration::from_millis(300)).unwrap_err();
-
-        assert!(err.to_string().contains("Timed out"), "got: {err}");
-    }
-
-    #[test]
-    fn wait_for_pid_file_propagates_errors_other_than_not_found() {
-        // A directory reads as EISDIR, not NotFound: abort rather than spin
-        // until the timeout. This is the arm an unreadable root-owned PID
-        // file also takes.
-        let dir = crate::test_support::private_tempdir().unwrap();
-
-        let start = Instant::now();
-        let err = wait_for_pid_file(dir.path(), Duration::from_secs(30)).unwrap_err();
-
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "a non-NotFound error must return at once, not poll to timeout"
-        );
-        assert!(
-            err.to_string().contains("Failed to read PID file"),
-            "got: {err}"
-        );
     }
 }

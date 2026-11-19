@@ -54,10 +54,29 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # Systemd queries and mutations are host IO. Parsers and unit-name guards
+  # remain in scope.
+  "src/firecracker_service\\.rs:.*\\bnew_unit\\b",
+  "src/firecracker_service\\.rs:.*\\bsystemctl_query\\b",
+  "src/firecracker_service\\.rs:.*\\blist_units\\b",
+  "src/firecracker_service\\.rs:.*\\brequire_system_manager\\b",
+  "src/firecracker_service\\.rs:.*\\bprobe\\b",
+  "src/firecracker_service\\.rs:.*\\blaunch\\b",
+  "src/firecracker_service\\.rs:.*\\bstop\\b",
+  "src/firecracker_service\\.rs:.*\\binspect_state\\b",
+  "src/firecracker_service\\.rs:.*\\bwait_for_exit\\b",
+  "src/firecracker_service\\.rs:.*\\bcontains_pid\\b",
+  # Root-owned binary verification is an IO boundary. Keep release identity
+  # and configured-path decisions in mutation scope.
+  "src/firecracker_install\\.rs:.*\\bverify_pair\\b",
+  "src/firecracker_install\\.rs:.*\\bverify_pair_at\\b",
+  "src/firecracker_install\\.rs:.*\\bverify_pair_at_with\\b",
+  "src/firecracker_install\\.rs:.*\\bconfigured_firecracker\\b",
   # process_output.rs — status runner spawns and reaps real process groups.
   # Its exit, timeout, cancellation, and stdin paths have direct process tests;
   # pure capture/limit decisions remain in mutation scope.
   "src/process_output\\.rs:.*\\brun_status_bounded\\b",
+  "src/process_output\\.rs:.*\\brun_status_bounded_with_file\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
   # Treating every read error as EINTR, or removing O_NONBLOCK, makes other
   # process tests block forever before libtest can report the focused unit-test
@@ -257,6 +276,7 @@ exclude_re = [
   # fs_util.rs — flock syscall wrapper; callers always target existing dirs.
   "\\block_sibling\\b",
   "\\block_sibling_bounded\\b",
+  "\\block_existing_dir_bounded\\b",
 
   # network.rs — the guest-to-guest isolation shell-outs. Each drives `bridge`
   # or `iptables` against a live br0, so a `--lib` test cannot observe whether

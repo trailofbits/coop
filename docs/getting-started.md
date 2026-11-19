@@ -22,7 +22,13 @@ credentials on the host.
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
-- `sudo` privileges (Firecracker uses jailer and TAP networking)
+- `sudo` privileges (coop starts the Firecracker VMM as root in a systemd
+  system service and uses privileged host operations for networking and disk
+  setup; it does not launch the VMM through the jailer)
+- A running systemd system manager version 252 or newer with trusted `systemd-run` and `systemctl`
+  executables for VM startup
+- A root-owned `/var/lib/coop` installation area for the verified Firecracker
+  and jailer pair; `coop setup` creates it with `sudo`
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
 - Setup also checks trusted system paths for `setfacl` and `unsquashfs`, plus resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires a trusted system `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
@@ -234,7 +240,9 @@ mem_size_mib = 8192
 template_size_gib = 20
 ```
 
-All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
+VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/` by
+default. On Linux, the managed Firecracker and jailer binaries live under
+`/var/lib/coop/firecracker/`.
 
 The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
 
@@ -297,7 +305,10 @@ reference](commands.md#quickstart) for details.
 
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
+`coop setup` installs the verified Firecracker/jailer pair under `/var/lib/coop`
+and downloads the kernel (Linux), or configures Lima (macOS), then builds a
+template rootfs image. The template ships with base packages (git, curl,
+build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
 
 ```
 coop setup
@@ -545,11 +556,16 @@ Destroy an instance (deletes its disk and resources):
 coop destroy my-project
 ```
 
-Remove everything, including all instances, images, kernel, and Firecracker binary:
+Remove all user data, including instances, images, kernel, and legacy
+Firecracker copies:
 
 ```
 coop destroy --all
 ```
+
+On Linux, the root-owned managed Firecracker/jailer pair remains because other
+users may share it. An administrator may remove its versioned directory after
+all dependent VMs are stopped.
 
 ## Named images
 

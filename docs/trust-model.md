@@ -40,7 +40,7 @@ launched it.
 |------|-------|-------|
 | Host user + `config.toml` | Trusted | `config.toml` `cmd:` values run arbitrary `sh -c` on the host (`config.rs:resolve_cmd_value`). The config file is a host code-execution surface; only the owner should write it. |
 | Project files (local or fetched) | **Untrusted** | Opting into project configuration authorizes guest configuration, not host code execution. |
-| coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs `iptables`/`firecracker` via `sudo`. |
+| coop process (host) | Trusted | Holds/relays secrets, constructs guest commands, runs privileged host tools via `sudo`. Linux launch requires the pinned root-owned Firecracker/jailer pair and supervises the VMM in a systemd system service, but the VMM still runs as root without the upstream jailer; Firecracker's default production seccomp does not change that host identity. |
 | The guest VM | **Untrusted** | Agent-controlled. Anything it emits — file contents, paths, archive members, command output — is a taint source once it crosses back to the host. |
 | GitHub API / model endpoints / DNS | External | `api.github.com` (PAT probe, release metadata), the model endpoint, `8.8.8.8`. Reached over the network; authenticated where applicable. |
 

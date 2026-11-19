@@ -23,6 +23,8 @@ coop/
 │   ├── vm.rs               # Firecracker process management (typestate machine)
 │   ├── lima.rs             # macOS/Lima backend implementation
 │   ├── setup.rs            # Firecracker host setup + golden-image builder
+│   ├── firecracker_install.rs # pinned, root-owned Firecracker/jailer pair
+│   ├── firecracker_service.rs # systemd VMM service identity and lifecycle
 │   ├── setup_tool.rs       # Firecracker setup-tool roles and launch policy
 │   ├── network.rs          # Firecracker TAP/bridge/NAT networking
 │   ├── config.rs           # config model + loading (the type-safe core)
