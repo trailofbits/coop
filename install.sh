@@ -81,7 +81,7 @@ download_asset() {
     local filename="$1" dest="$2"
     if has gh; then
         info "Downloading ${filename} (via gh)..."
-        if gh release download "$VERSION" --repo "$REPO" --pattern "$filename" --dir "$(dirname "$dest")" 2>/dev/null; then
+        if gh release download --repo "$REPO" --pattern "$filename" --dir "$(dirname "$dest")" -- "$VERSION" 2>/dev/null; then
             return
         fi
         warn "gh download failed; trying curl."
@@ -245,20 +245,20 @@ info "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 info "Installing to ${INSTALL_DIR}..."
-mkdir -p "$INSTALL_DIR"
+mkdir -p -- "$INSTALL_DIR"
 EXTRACTED_DIR="${TMPDIR}/${BINARY}-${VERSION}-${TRIPLE}"
 EXTRACTED="${EXTRACTED_DIR}/${BINARY}"
 [ -f "$EXTRACTED" ] || die "Binary not found in tarball"
-mv "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
-chmod +x "${INSTALL_DIR}/${BINARY}"
+mv -- "$EXTRACTED" "${INSTALL_DIR}/${BINARY}"
+chmod -- +x "${INSTALL_DIR}/${BINARY}"
 
 # coop-proxy (issue #411) ships in the same tarball and must land next to
 # coop — the CLI locates it via its own directory. Present from the version
 # that introduced it; tolerate its absence when installing older releases.
 PROXY_EXTRACTED="${EXTRACTED_DIR}/${BINARY}-proxy"
 if [ -f "$PROXY_EXTRACTED" ]; then
-    mv "$PROXY_EXTRACTED" "${INSTALL_DIR}/${BINARY}-proxy"
-    chmod +x "${INSTALL_DIR}/${BINARY}-proxy"
+    mv -- "$PROXY_EXTRACTED" "${INSTALL_DIR}/${BINARY}-proxy"
+    chmod -- +x "${INSTALL_DIR}/${BINARY}-proxy"
 fi
 
 printf '\n  %s %s installed to %s/%s\n' "$BINARY" "$VERSION" "$INSTALL_DIR" "$BINARY"
