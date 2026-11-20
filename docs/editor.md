@@ -1,6 +1,6 @@
 # Editor integration
 
-`coop editor` connects VS Code or Zed to a running guest VM over SSH. The same SSH config entry works with JetBrains IDEs, Cursor, and any editor that supports SSH remote development. `coop vscode` remains as an alias.
+`coop editor` connects VS Code or Zed to a running guest VM over SSH. The same SSH config entry works with JetBrains IDEs, Cursor, and any editor that supports SSH remote development.
 
 To reduce your host's exposure to an untrusted guest, prefer `coop editor --web`.
 Code-server, its extensions, and terminals run inside the VM; your host runs a
@@ -49,6 +49,7 @@ when omitted, coop selects a free port.
 
 ```bash
 coop editor my-instance --project /workspace/frontend
+coop editor my-instance --editor code
 coop editor my-instance --editor zed
 coop editor my-instance --web --project /workspace/frontend --port 8080
 ```

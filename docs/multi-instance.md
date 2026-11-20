@@ -57,7 +57,7 @@ coop shell another-project
 ```
 
 This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`,
-`pull`, `exec`, `editor` (including `--web` and the `vscode` alias), `resize`,
+`pull`, `exec`, `editor` (including `--web`), `resize`,
 `model`, `claude`, and `codex`.
 
 `coop editor --web` resolves the optional name using all registered instances,

@@ -1515,7 +1515,7 @@ test_ssh_config() {
 
 # Exercises the host-side half of `coop editor` against a live VM. Stub editor
 # CLIs make the phase hermetic (no GUI is opened) while still pinning the argv
-# contract, Zed URL encoding, the legacy `vscode` alias, and SSH-config setup.
+# contract for VS Code and Zed, URL encoding, and SSH-config setup.
 test_editor() {
     echo ""
     echo "=== Phase: editor launch ==="
@@ -1576,22 +1576,19 @@ STUB
         fail "editor auto-detection tries VS Code first" "got: $editor_argv"
     fi
 
-    # `vscode` remains a public compatibility alias for `editor`. Pin the real
-    # dispatch path, not only clap parsing, and check the VS Code Remote-SSH
-    # argv shape expected by the extension.
     : >"$editor_log"
     if COOP_TEST_EDITOR_LOG="$editor_log" PATH="$editor_dir:$PATH" \
-        coop vscode "$INSTANCE" --editor code --project /workspace/legacy; then
-        pass "vscode compatibility alias exits 0"
+        coop editor "$INSTANCE" --editor code --project /workspace/code; then
+        pass "editor --editor code exits 0"
     else
-        fail "vscode compatibility alias exits 0" "stderr: $HARNESS_ERR"
+        fail "editor --editor code exits 0" "stderr: $HARNESS_ERR"
     fi
 
     editor_argv=$(cat "$editor_log" 2>/dev/null)
-    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/legacy' ]]; then
-        pass "vscode alias passes the VS Code Remote-SSH arguments"
+    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/code' ]]; then
+        pass "editor --editor code passes the VS Code Remote-SSH arguments"
     else
-        fail "vscode alias passes the VS Code Remote-SSH arguments" "got: $editor_argv"
+        fail "editor --editor code passes the VS Code Remote-SSH arguments" "got: $editor_argv"
     fi
 
     # Leave the SSH config in the same clean state this phase inherited from
