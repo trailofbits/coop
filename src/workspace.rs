@@ -199,12 +199,12 @@ pub fn try_load_or_warn(inst: &Instance, consequence: &str) -> Option<WorkspaceS
 }
 
 /// Copy a local workspace to the guest without deleting existing guest files.
-pub fn copy_workspace(target: &SshTarget, source_dir: &Path, exclude_git: bool) -> Result<()> {
+pub fn copy_workspace(target: &SshTarget, source_dir: &Path, filters: PushFilters) -> Result<()> {
     rsync_to_guest(
         target,
         source_dir,
         &default_workspace_path(),
-        exclude_git,
+        filters,
         SyncMode::Copy,
     )
 }
@@ -312,7 +312,7 @@ pub fn push(
     running: &RunningInstance,
     dir: Option<&str>,
     force: bool,
-    exclude_git: bool,
+    filters: PushFilters,
 ) -> Result<()> {
     let inst = running.instance();
     let target = running.target();
@@ -333,7 +333,7 @@ pub fn push(
         state.guest_path
     );
 
-    rsync_push(target, &source_dir, &state.guest_path, exclude_git)?;
+    rsync_push(target, &source_dir, &state.guest_path, filters)?;
 
     tracing::info!("Push complete");
     Ok(())
@@ -385,9 +385,9 @@ pub fn sync_mounts(
     target: &SshTarget,
     inst: &Instance,
     mounts: &[crate::config::Mount],
-    exclude_git: bool,
+    filters: PushFilters,
 ) -> Result<()> {
-    sync_mount_contents(target, mounts, exclude_git)?;
+    sync_mount_contents(target, mounts, filters)?;
     record_mount_state(inst, mounts)
 }
 
@@ -395,7 +395,7 @@ pub fn sync_mounts(
 pub fn sync_mount_contents(
     target: &SshTarget,
     mounts: &[crate::config::Mount],
-    exclude_git: bool,
+    filters: PushFilters,
 ) -> Result<()> {
     for m in mounts {
         let guest = &m.guest_path;
@@ -409,7 +409,7 @@ pub fn sync_mount_contents(
 
         tracing::info!("Syncing {} -> guest:{guest}", m.host_path.display(),);
 
-        rsync_push(target, &m.host_path, guest, exclude_git)?;
+        rsync_push(target, &m.host_path, guest, filters)?;
     }
     Ok(())
 }
@@ -579,10 +579,26 @@ fn remove_ssh_config_at(ssh_config: &Path, inst: &Instance) -> Result<()> {
 
 // ── Transport: rsync ──────────────────────────────────────────
 
+/// Selection for host-to-guest rsync transfers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushFilters {
+    Default,
+    ExcludeLocalConfig,
+}
+
+impl PushFilters {
+    pub(crate) fn from_flag(exclude_local_config: bool) -> Self {
+        if exclude_local_config {
+            Self::ExcludeLocalConfig
+        } else {
+            Self::Default
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TransferFilters {
-    PushWithGit,
-    PushWithoutGit,
+    Push(PushFilters),
     Pull,
 }
 
@@ -592,14 +608,11 @@ fn rsync_base_args(target: &SshTarget, filters: TransferFilters) -> Result<Vec<S
     // Rsync uses first-match-wins; a push that includes Git must protect it
     // from a repository's own `.gitignore` rules.
     match filters {
-        TransferFilters::PushWithGit => {
+        TransferFilters::Push(PushFilters::Default) => {
             // `/.git/***` matches the directory itself and everything inside.
             args.push("--filter=+ /.git/***".to_string());
         }
-        TransferFilters::PushWithoutGit => {
-            args.push(format!("--exclude={}", ascii_case_glob(".git")));
-        }
-        TransferFilters::Pull => {
+        TransferFilters::Push(PushFilters::ExcludeLocalConfig) | TransferFilters::Pull => {
             args.extend(
                 pull_excludes()
                     .into_iter()
@@ -618,9 +631,9 @@ pub(crate) fn rsync_push(
     target: &SshTarget,
     source: &Path,
     guest_path: &GuestPath,
-    exclude_git: bool,
+    filters: PushFilters,
 ) -> Result<()> {
-    rsync_to_guest(target, source, guest_path, exclude_git, SyncMode::Mirror)
+    rsync_to_guest(target, source, guest_path, filters, SyncMode::Mirror)
 }
 
 #[derive(Clone, Copy)]
@@ -640,19 +653,14 @@ fn rsync_to_guest(
     target: &SshTarget,
     source: &Path,
     guest_path: &GuestPath,
-    exclude_git: bool,
+    filters: PushFilters,
     mode: SyncMode,
 ) -> Result<()> {
     let mut command = target
         .rsync_command()
         .context("Workspace transfers require rsync on the host")?;
     require_guest_rsync(target)?;
-    let filters = if exclude_git {
-        TransferFilters::PushWithoutGit
-    } else {
-        TransferFilters::PushWithGit
-    };
-    let mut args = rsync_base_args(target, filters)?;
+    let mut args = rsync_base_args(target, TransferFilters::Push(filters))?;
     if matches!(mode, SyncMode::Mirror) {
         args.push("--delete".to_string());
     }
@@ -1654,8 +1662,8 @@ mod tests {
         );
         let running = RunningInstance::new(inst, target);
         let result = match operation {
-            "copy" => copy_workspace(running.target(), &source, false),
-            "push" => push(&running, None, true, false),
+            "copy" => copy_workspace(running.target(), &source, PushFilters::Default),
+            "push" => push(&running, None, true, PushFilters::Default),
             "pull" => pull(&running, Some(root.join("dest").to_str().unwrap()), true),
             "mount" => sync_mount_contents(
                 running.target(),
@@ -1663,7 +1671,7 @@ mod tests {
                     host_path: source,
                     guest_path: guest,
                 }],
-                false,
+                PushFilters::Default,
             ),
             _ => unreachable!(),
         };
@@ -1727,23 +1735,15 @@ mod tests {
                 .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
                 .collect::<Vec<_>>()
         };
-        for exclude_git in [false, true] {
-            copy_workspace(&target, &source, exclude_git).unwrap();
+        for filters in [PushFilters::Default, PushFilters::ExcludeLocalConfig] {
+            copy_workspace(&target, &source, filters).unwrap();
             let copied = read_args();
             assert!(!copied.iter().any(|arg| arg == "--delete"));
             assert_eq!(
                 &copied[..copied.len() - 2],
-                rsync_base_args(
-                    &target,
-                    if exclude_git {
-                        TransferFilters::PushWithoutGit
-                    } else {
-                        TransferFilters::PushWithGit
-                    },
-                )
-                .unwrap()
+                rsync_base_args(&target, TransferFilters::Push(filters)).unwrap()
             );
-            rsync_push(&target, &source, &default_workspace_path(), exclude_git).unwrap();
+            rsync_push(&target, &source, &default_workspace_path(), filters).unwrap();
             let mirrored = read_args();
             assert!(mirrored.iter().any(|arg| arg == "--delete"));
             assert_eq!(
@@ -1755,7 +1755,7 @@ mod tests {
             );
         }
         let custom = GuestPath::absolute("/custom workspace").unwrap();
-        rsync_push(&target, &source, &custom, true).unwrap();
+        rsync_push(&target, &source, &custom, PushFilters::ExcludeLocalConfig).unwrap();
         assert_eq!(
             read_args().last().unwrap(),
             &format!("{}:{custom}/", target.addr())
@@ -1788,7 +1788,13 @@ mod tests {
         let status = target
             .rsync_command()
             .unwrap()
-            .args(rsync_base_args(&target, TransferFilters::PushWithoutGit).unwrap())
+            .args(
+                rsync_base_args(
+                    &target,
+                    TransferFilters::Push(PushFilters::ExcludeLocalConfig),
+                )
+                .unwrap(),
+            )
             .arg(format!("{}/", source.display()))
             .arg(format!("{}/", dest.display()))
             .status()
@@ -1920,7 +1926,7 @@ mod tests {
             .unwrap(),
         );
         let running = RunningInstance::new(inst, target);
-        let result = push(&running, None, mode == "force", false);
+        let result = push(&running, None, mode == "force", PushFilters::Default);
         match mode {
             "clean" | "force" => assert!(result.is_ok(), "{result:?}"),
             "guest_git_failure" | "guest_git_file_failure" => assert!(
@@ -2683,21 +2689,12 @@ Host coop-other\n\
     }
 
     proptest! {
-        /// For either `exclude_git` value, `rsync_base_args` must emit every
-        /// `DEFAULT_EXCLUDES` member, choose exactly one git rule keyed on the
-        /// flag, and place that rule before the `.gitignore` merge so
-        /// rsync's first-match-wins ordering can't let a user's `.gitignore`
-        /// strip git state. Replaces the two earlier per-flag example tests
-        /// and closes the gap where membership of every exclude went
-        /// unchecked.
+        /// Both push modes include the default exclusions and select a Git
+        /// rule before the per-directory `.gitignore` merge.
         #[test]
-        fn rsync_base_args_membership_and_git_filter_ordering(exclude_git in any::<bool>()) {
-            let filters = if exclude_git {
-                TransferFilters::PushWithoutGit
-            } else {
-                TransferFilters::PushWithGit
-            };
-            let args = rsync_base_args(&fake_ssh_target(), filters).unwrap();
+        fn rsync_base_args_membership_and_git_filter_ordering(exclude_local_config in any::<bool>()) {
+            let filters = PushFilters::from_flag(exclude_local_config);
+            let args = rsync_base_args(&fake_ssh_target(), TransferFilters::Push(filters)).unwrap();
 
             for exc in DEFAULT_EXCLUDES {
                 let needle = format!("--exclude={exc}");
@@ -2708,12 +2705,12 @@ Host coop-other\n\
             }
 
             let has_protect = args.iter().any(|a| a == "--filter=+ /.git/***");
-            let has_exclude_git = args
+            let has_git_exclude = args
                 .iter()
                 .any(|a| a == "--exclude=.[gG][iI][tT]");
             // Exactly one git rule, selected by the flag.
-            prop_assert_eq!(has_protect, !exclude_git);
-            prop_assert_eq!(has_exclude_git, exclude_git);
+            prop_assert_eq!(has_protect, !exclude_local_config);
+            prop_assert_eq!(has_git_exclude, exclude_local_config);
 
             let gitignore_idx = args
                 .iter()
@@ -2737,6 +2734,12 @@ Host coop-other\n\
     fn pull_transports_apply_common_exclusions() {
         let target = fake_ssh_target();
         let rsync_args = rsync_pull_args(&target).unwrap();
+        let broad_push = rsync_base_args(
+            &target,
+            TransferFilters::Push(PushFilters::ExcludeLocalConfig),
+        )
+        .unwrap();
+        assert_eq!(broad_push, rsync_args);
         assert_eq!(ascii_case_glob(".claude"), ".[cC][lL][aA][uU][dD][eE]");
         let excludes = pull_excludes();
         assert!(excludes.iter().any(|pattern| pattern == ".[gG][iI][tT]"));

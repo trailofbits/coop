@@ -5082,9 +5082,9 @@ test_restart_rejects_ignored_flags() {
 
     # Creation-time flags no longer exist on `coop start`; clap rejects them as
     # unknown arguments. (`--mount`, `--git-repo`, `--vcpus`, `--mem`, `--disk`,
-    # `--image`, `--exclude-git`, `--profile` all live on `coop up`.)
+    # `--image`, `--exclude-local-config`, `--profile` all live on `coop up`.)
     local flag
-    for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-git; do
+    for flag in "--mount $mount_dir" "--disk 20" "--vcpus 4" --exclude-local-config; do
         # shellcheck disable=SC2086
         if coop_fails start "$INSTANCE" --no-agents $flag; then
             pass "start ${flag%% *} rejected by clap"
@@ -9509,15 +9509,29 @@ test_pull_cli_validation() {
     echo ""
     echo "=== Phase: pull CLI validation ==="
 
-    if coop_fails pull --exclude-git; then
-        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
-            pass "pull --exclude-git is rejected as an unknown flag"
+    local command
+    for command in up push pull; do
+        if coop_fails "$command" --exclude-git; then
+            if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
+                pass "$command --exclude-git is rejected as an unknown flag"
+            else
+                fail "$command --exclude-git is rejected as an unknown flag" \
+                    "unexpected error: $HARNESS_ERR"
+            fi
         else
-            fail "pull --exclude-git is rejected as an unknown flag" \
+            fail "$command --exclude-git is rejected as an unknown flag" \
+                "command unexpectedly accepted the removed flag"
+        fi
+    done
+    if coop_fails pull --exclude-local-config; then
+        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-local-config" <<< "$HARNESS_ERR"; then
+            pass "pull --exclude-local-config is rejected as an unknown flag"
+        else
+            fail "pull --exclude-local-config is rejected as an unknown flag" \
                 "unexpected error: $HARNESS_ERR"
         fi
     else
-        fail "pull --exclude-git is rejected as an unknown flag" \
+        fail "pull --exclude-local-config is rejected as an unknown flag" \
             "pull unexpectedly accepted a no-op flag"
     fi
 }

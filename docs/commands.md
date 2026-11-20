@@ -86,7 +86,7 @@ PAT binding or an explicit `auto`/`env` mode for credentials.
 | `--pat-entry owner/name` | On a newly created VM, bind this existing PAT entry before first boot and any `--git-repo` clone. Requires `github.mode = "pat"`; useful for headless private clones. |
 | `--image <name>` | Named image to use when creating a new instance (default: `default`) |
 | `--profile <list>` | Build or reuse a profile-derived image when creating a new instance, named from the sorted profiles (for example `node-python`) |
-| `--exclude-git` | Skip `.git/` when copying/syncing local directories; does not strip `.git` from a `--git-repo` clone |
+| `--exclude-local-config` | Skip common VCS metadata (including Git) and project-local tool settings during rsync copies and Firecracker mount sync; does not affect live mounts or `--git-repo` clones |
 | `--no-prompt` | Suppress the interactive VM PAT binding prompt; an existing binding remains active. |
 | `--forward-port <spec>` | Forward a guest port to the host (`GUEST[:HOST]`, repeatable) |
 | `--post-start <cmd>` | Shell command to run inside the guest after boot and workspace/mount provisioning |
@@ -102,7 +102,7 @@ coop up --git-repo https://github.com/trailofbits/coop.git
 ```
 
 Creation options such as `--vcpus`, `--mem`, `--disk`, `--image`,
-`--profile`, `--extra-mount`, `--git-repo`, and `--exclude-git` apply only
+`--profile`, `--extra-mount`, `--git-repo`, and `--exclude-local-config` apply only
 when `up` creates a new instance. `coop up --profile <list>`
 derives an image name from the sorted profile list, runs the same stale-image
 check as `coop setup`, and builds or rebuilds that image if needed. Explicit
@@ -647,7 +647,7 @@ coop push [NAME] [FLAGS]
 | `NAME` | Instance name (required if multiple instances exist) |
 | `--dir <dir>` | Local directory to push (defaults to the workspace host path) |
 | `--force` | Overwrite guest changes without confirmation |
-| `--exclude-git` | Skip the `.git/` directory in this transfer |
+| `--exclude-local-config` | Skip common VCS metadata (including Git) and project-local tool settings in this transfer |
 
 Without `--force`, push refuses to transfer if the guest Git status check fails
 or reports changes.
@@ -951,7 +951,8 @@ disk is proven unchanged.
 **Not replayed**, because coop does not persist them:
 
 - Extra `--extra-mount` directories. Only the *primary* workspace source is recorded in `workspace.json`, so coop replays none of them. What that costs depends on the backend: on Firecracker, where a mount is a one-time sync into the rootfs, the data goes with the disk and the guest path comes back empty; on Lima the mount is declared in the backend's own `lima.yaml`, which the disk swap does not touch, so it may be served again after the reboot — coop does not guarantee it either way. There is no way to re-add a mount to an existing instance — `--extra-mount` is creation-only, and `coop push` writes to the recorded workspace path — so recovering one means `coop destroy` and a fresh `coop up`.
-- `--exclude-git`. A workspace originally pushed without `.git/` is re-synced with it.
+- `--exclude-local-config`. Reprovisioning re-syncs the
+  workspace using the default filters, so previously excluded entries may be copied.
 - An invocation-level `--post-start` command when no creation hook was selected.
   When a creation hook was selected, its saved startup command runs after the
   reset hook completes. Ordinary boots use the current `post_start` selection.
