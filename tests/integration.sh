@@ -8513,6 +8513,19 @@ setup_session_live_count() {
         '$1 == sid && $2 !~ /^Z/ { count++ } END { print count + 0 }'
 }
 
+setup_chroot_child_live() {
+    local sid=$1 mount_path=$2 pid root
+
+    # The mount appears before setup launches chroot. Require a process whose
+    # actual root is that mount, not just another setup tool in the session.
+    while IFS= read -r pid; do
+        root=$(sudo -n readlink -- "/proc/$pid/root" 2>/dev/null) || continue
+        [[ $root == "$mount_path" ]] && return 0
+    done < <(ps -eo sid=,pid=,stat= | awk -v sid="$sid" \
+        '$1 == sid && $3 !~ /^Z/ { print $2 }')
+    return 1
+}
+
 stop_interrupted_setup_session() {
     local sid=$1 remaining
 
@@ -8557,7 +8570,7 @@ test_interrupted_setup() {
     if [[ $(uname -s) == Linux ]]; then
         linux_session=1
         local required_tool
-        for required_tool in python3 ps pkill awk mountpoint; do
+        for required_tool in python3 ps pkill awk mountpoint readlink; do
             if ! command -v "$required_tool" >/dev/null 2>&1; then
                 fail "interrupted setup prerequisites" "missing $required_tool"
                 return
@@ -8618,7 +8631,8 @@ os.execvp(sys.argv[2], sys.argv[2:])
             break
         fi
         if [[ $linux_session -eq 1 ]] \
-                && mountpoint -q "$mount_path"; then
+                && mountpoint -q "$mount_path" \
+                && setup_chroot_child_live "$setup_sid" "$mount_path"; then
             break
         fi
         if [[ $linux_session -eq 0 ]] \
@@ -8656,7 +8670,8 @@ os.execvp(sys.argv[2], sys.argv[2:])
 
     if [[ $linux_session -eq 1 ]] \
             && { ! mountpoint -q "$mount_path" \
-                || [[ ! -f "$HOME/.coop/images/$img/rootfs-template.ext4.new" ]]; }; then
+                || [[ ! -f "$HOME/.coop/images/$img/rootfs-template.ext4.new" ]] \
+                || ! setup_chroot_child_live "$setup_sid" "$mount_path"; }; then
         kill -9 "$setup_pid" 2>/dev/null || true
         wait "$setup_pid" 2>/dev/null || true
         if ! stop_interrupted_setup_session "$setup_sid"; then
@@ -8664,10 +8679,11 @@ os.execvp(sys.argv[2], sys.argv[2:])
             echo "  Retaining interrupted setup image $img for inspection" >&2
             return
         fi
-        fail "interrupted setup reached its mounted rootfs" "not mounted after ${waited}s"
+        fail "interrupted setup reached its chroot child" "no live chroot child after ${waited}s"
         echo "  Retaining interrupted setup image $img for inspection" >&2
         return
     fi
+    [[ $linux_session -eq 1 ]] && pass "interrupted setup entered chroot"
 
     # Let it get deeper into the build
     [[ $linux_session -eq 0 ]] && sleep 5
@@ -8696,6 +8712,16 @@ os.execvp(sys.argv[2], sys.argv[2:])
     pass "setup killed mid-build (SIGKILL)"
 
     if [[ $linux_session -eq 1 ]]; then
+        if ! setup_chroot_child_live "$setup_sid" "$mount_path"; then
+            if ! stop_interrupted_setup_session "$setup_sid"; then
+                fail "interrupted setup fixture stopped" "live descendants remain"
+            fi
+            fail "interrupted setup left an orphaned chroot child" "none remained after SIGKILL"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        pass "interrupted setup left an orphaned chroot child"
+
         # The parent died without running MountGuard. End the fixture's
         # orphaned chroot work before checking recovery; a live child can
         # legitimately keep the mount busy beyond recovery's 90s deadline.
