@@ -137,8 +137,8 @@ from a trusted source before using host Git on them.
 Pull attempts to exclude common local configuration folders used by development
 tools (such as Git and Visual Studio Code) and embedded repositories before
 installing files on the host. This filtering is best effort. Treat pulled files
-as untrusted. Pull has no `--exclude-git` option; these checks apply to every
-pull.
+as untrusted. Pull has no `--exclude-git` option; its broader exclusions apply
+to every pull.
 
 Pull reports skipped embedded repository paths. It also compares an unfiltered
 rsync dry run with the filtered transfer and reports every path absent from the
@@ -161,8 +161,8 @@ symlinks remain eligible for transfer, subject to the other filters.
 
 Host-to-guest transfers (`coop up` and `coop push`) include `.git/` by default
 so agents receive full history and branches. Pass `--exclude-git` to skip it.
-Guest-to-host pulls attempt to exclude common `.git`, `.hg`, and `.svn` paths
-as defense-in-depth.
+Guest-to-host pulls attempt to exclude common VCS metadata and project-local
+tool settings, including `.git`, `.hg`, `.svn`, and `.vscode` paths.
 Do not rely on pull to sanitize guest content or make it safe for host Git.
 
 ## .gitignore integration
