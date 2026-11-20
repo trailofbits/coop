@@ -1,9 +1,8 @@
 //! Systemd's system manager owns the runtime VMM identity and process group.
 
-use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -88,18 +87,29 @@ fn new_unit(inst: &Instance) -> Result<String> {
     ))
 }
 
-// systemd expands $NAME and ${NAME} in ExecStart arguments even when
-// systemd-run receives them as separate argv entries. $$ preserves a literal
-// dollar sign, including in non-UTF-8 path components.
-fn escape_service_argument(argument: &OsStr) -> OsString {
-    let mut escaped = Vec::with_capacity(argument.as_bytes().len());
-    for byte in argument.as_bytes() {
-        escaped.push(*byte);
-        if *byte == b'$' {
-            escaped.push(b'$');
-        }
+pub(crate) fn jail_id(inst: &Instance, unit: &str) -> Result<String> {
+    let namespace = prefix(inst)?;
+    if !valid_unit(unit, &namespace) {
+        bail!("Firecracker service does not belong to this instance");
     }
-    OsString::from_vec(escaped)
+    let generation = unit
+        .strip_prefix(&namespace)
+        .and_then(|value| value.strip_suffix(UNIT_SUFFIX))
+        .context("Firecracker service generation is missing")?;
+    let digest = namespace
+        .strip_prefix(&format!("coop-vmm-{}-", unsafe { libc::geteuid() }))
+        .and_then(|value| value.strip_suffix('-'))
+        .context("Firecracker service namespace is malformed")?;
+    Ok(format!("{}-{generation}", &digest[..16]))
+}
+
+pub(crate) fn unit_for_generation(inst: &Instance, generation: &str) -> Result<String> {
+    let namespace = prefix(inst)?;
+    let unit = format!("{namespace}{generation}{UNIT_SUFFIX}");
+    if !valid_unit(&unit, &namespace) {
+        bail!("Firecracker jail has an invalid service generation");
+    }
+    Ok(unit)
 }
 
 fn systemctl_query() -> Result<Cmd> {
@@ -234,11 +244,36 @@ fn parse_active_service(unit: &str, show: &str) -> Result<ActiveService> {
     })
 }
 
+fn verify_journal_policy(unit: &str) -> Result<()> {
+    let show = systemctl_query()?
+        .args([
+            "--system",
+            "--no-pager",
+            "show",
+            "--property=Id,StandardOutput,StandardError,LogRateLimitIntervalUSec,LogRateLimitBurst",
+        ])
+        .arg(unit)
+        .capture_bounded(Duration::from_secs(5), 1024)
+        .context("Cannot inspect Firecracker service output limits")?;
+    for expected in [
+        format!("Id={unit}"),
+        "StandardOutput=journal".to_owned(),
+        "StandardError=journal".to_owned(),
+        "LogRateLimitIntervalUSec=30s".to_owned(),
+        "LogRateLimitBurst=1000".to_owned(),
+    ] {
+        if !show.lines().any(|line| line == expected) {
+            bail!("Firecracker service did not apply its bounded journal output policy");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn launch(
     inst: &Instance,
     firecracker: &VerifiedFirecracker,
-    config: &Path,
-    log: &Path,
+    kernel: &Path,
+    config: &[u8],
 ) -> Result<ActiveService> {
     require_system_manager()?;
     if !matches!(probe(inst)?, ServiceProbe::None) {
@@ -258,8 +293,19 @@ pub(crate) fn launch(
         }
     }
     let unit = new_unit(inst)?;
-    // Firecracker creates its vsock socket as root in the user's private
-    // instance directory. The invoking user needs write access to connect.
+    let jail = crate::firecracker_jail::PreparedJail::new(inst, &unit, kernel)?;
+    if let Err(error) = jail.prepare(inst, config) {
+        return match jail.cleanup_unstarted(inst) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "Unstarted Firecracker jail rollback also failed: {cleanup:#}"
+            ))),
+        };
+    }
+    // Firecracker creates its base vsock socket inside the jail. The invoking
+    // user connects through a bind-mounted socket inode after launch.
+    // Every systemd launch path comes from the fixed managed install and jail
+    // roots, a numeric descriptor, or a generated hexadecimal identifier.
     let launch = SetupTool::SystemdRun
         .elevated_with_deadline(START_DEADLINE + Duration::from_secs(5))?
         .args([
@@ -269,18 +315,35 @@ pub(crate) fn launch(
             "--property=TimeoutStopSec=15s",
             "--property=Restart=no",
             "--property=UMask=0111",
-            "--property=StandardOutput=null",
+            "--property=StandardOutput=journal",
             "--property=StandardError=journal",
+            "--property=LogRateLimitIntervalSec=30s",
+            "--property=LogRateLimitBurst=1000",
+            "--property=NoNewPrivileges=yes",
+            "--property=CapabilityBoundingSet=~CAP_NET_ADMIN",
             "--working-directory=/",
         ])
+        .arg(format!(
+            "--property=BindPaths=\"{}\":\"{}\"",
+            jail.disk_descriptor_path(),
+            jail.root.join("rootfs.ext4").display()
+        ))
         .arg(format!("--unit={unit}"))
         .arg("--")
-        .arg(escape_service_argument(firecracker.path().as_os_str()))
+        .arg(firecracker.jailer_path())
+        .args(["--id", &jail.id, "--exec-file"])
+        .arg(firecracker.path())
+        .args([
+            "--uid",
+            &jail.uid.to_string(),
+            "--gid",
+            &jail.gid.to_string(),
+            "--chroot-base-dir",
+        ])
+        .arg(&jail.base)
+        .arg("--")
         .args(["--no-api", "--config-file"])
-        .arg(escape_service_argument(config.as_os_str()))
-        .arg("--log-path")
-        .arg(escape_service_argument(log.as_os_str()))
-        .args(["--level", "Info"]);
+        .arg("/config.json");
     let status =
         crate::process_output::run_status_bounded(&mut launch.build(), START_DEADLINE, None)
             .with_context(|| format!("Firecracker service {unit} launch outcome is uncertain"))?;
@@ -290,7 +353,10 @@ pub(crate) fn launch(
         );
     }
     match inspect_state(&unit)? {
-        ServiceProbe::Active(service) => Ok(service),
+        ServiceProbe::Active(service) => {
+            verify_journal_policy(service.unit())?;
+            Ok(service)
+        }
         ServiceProbe::None => {
             bail!(
                 "Firecracker VMM exited after systemd exec in service {unit}; inspect `sudo journalctl -u {unit}`"
@@ -453,6 +519,18 @@ mod tests {
         let expected_hash = Sha256Hash::of(root.path().as_os_str().as_bytes());
         let expected = format!("coop-vmm-{}-{expected_hash}-", unsafe { libc::geteuid() });
         assert_eq!(prefix(&inst).unwrap(), expected);
+        let unit = format!("{expected}{}", "a".repeat(32)) + UNIT_SUFFIX;
+        assert_eq!(
+            jail_id(&inst, &unit).unwrap(),
+            format!(
+                "{}-{}",
+                &expected.split('-').nth(3).unwrap()[..16],
+                "a".repeat(32)
+            )
+        );
+        assert!(jail_id(&inst, "other.service").is_err());
+        assert_eq!(unit_for_generation(&inst, &"a".repeat(32)).unwrap(), unit);
+        assert!(unit_for_generation(&inst, "not-a-generation").is_err());
     }
 
     #[test]
@@ -593,14 +671,5 @@ mod tests {
         assert!(service_cgroup_empty_at(root.path(), unit).unwrap());
         fs::remove_file(group.join("cgroup.events")).unwrap();
         assert!(service_cgroup_empty_at(root.path(), unit).is_err());
-    }
-
-    #[test]
-    fn service_argument_keeps_dollar_bytes_literal() {
-        let raw = OsStr::from_bytes(b"/tmp/coop-${NAME}/invalid-\xff-$HOME");
-        assert_eq!(
-            escape_service_argument(raw).as_bytes(),
-            b"/tmp/coop-$${NAME}/invalid-\xff-$$HOME"
-        );
     }
 }

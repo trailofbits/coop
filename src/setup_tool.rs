@@ -455,6 +455,7 @@ pub(crate) enum SetupTool {
     Tar,
     Gzip,
     Cat,
+    Stat,
     Chmod,
     Rm,
     Setfacl,
@@ -465,8 +466,12 @@ pub(crate) enum SetupTool {
     Mkdir,
     Install,
     Mv,
+    Ln,
+    Mount,
+    Umount,
     Systemctl,
     SystemdRun,
+    Journalctl,
     Tee,
     Chroot,
     #[cfg_attr(
@@ -497,6 +502,7 @@ impl SetupTool {
             Self::Tar => "tar",
             Self::Gzip => "gzip",
             Self::Cat => "cat",
+            Self::Stat => "stat",
             Self::Chmod => "chmod",
             Self::Rm => "rm",
             Self::Setfacl => "setfacl",
@@ -507,8 +513,12 @@ impl SetupTool {
             Self::Mkdir => "mkdir",
             Self::Install => "install",
             Self::Mv => "mv",
+            Self::Ln => "ln",
+            Self::Mount => "mount",
+            Self::Umount => "umount",
             Self::Systemctl => "systemctl",
             Self::SystemdRun => "systemd-run",
+            Self::Journalctl => "journalctl",
             Self::Tee => "tee",
             Self::Chroot => "chroot",
             Self::Rmdir => "rmdir",
@@ -561,11 +571,15 @@ impl SetupTool {
             // the conventional /usr/bin links. The resolver still checks every
             // traversed component for root ownership and writability.
             Self::Cat
+            | Self::Stat
             | Self::Chmod
             | Self::Rm
             | Self::Mkdir
             | Self::Install
             | Self::Mv
+            | Self::Ln
+            | Self::Mount
+            | Self::Umount
             | Self::Tee
             | Self::Chroot
             | Self::Rmdir
@@ -1173,11 +1187,15 @@ mod tests {
         assert!(sudo_result.is_ok(), "{sudo_result:?}");
         for tool in [
             SetupTool::Cat,
+            SetupTool::Stat,
             SetupTool::Chmod,
             SetupTool::Rm,
             SetupTool::Mkdir,
             SetupTool::Install,
             SetupTool::Mv,
+            SetupTool::Ln,
+            SetupTool::Mount,
+            SetupTool::Umount,
             SetupTool::Tee,
             SetupTool::Chroot,
             SetupTool::Rmdir,

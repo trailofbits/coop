@@ -344,7 +344,12 @@ fn host_is_loopback(host: Option<&url::Host<&str>>) -> bool {
 pub fn setup_tap(cfg: &NetworkConfig, inst: &Instance) -> Result<()> {
     let policy = production_network_policy()?;
     let tools = SetupNetworkTools::resolve(cfg, &policy)?;
-    let result = setup_tap_with_tools(cfg, inst, &tools);
+    let result = setup_tap_with_tools(
+        cfg,
+        inst,
+        &tools,
+        crate::firecracker_jail::PreparedJail::uid_for_instance,
+    );
     if let Err(error) = result {
         return match teardown_tap(cfg, inst) {
             Ok(()) => Err(error.context("TAP setup failed; partial network setup was removed")),
@@ -364,13 +369,14 @@ fn setup_tap_with_policy(
     candidates: impl Fn(NetworkTool) -> Vec<PathBuf>,
 ) -> Result<()> {
     let tools = SetupNetworkTools::resolve_with(cfg, policy, candidates)?;
-    setup_tap_with_tools(cfg, inst, &tools)
+    setup_tap_with_tools(cfg, inst, &tools, |_| Ok(200_000))
 }
 
 fn setup_tap_with_tools(
     cfg: &NetworkConfig,
     inst: &Instance,
     tools: &SetupNetworkTools,
+    tap_owner: impl FnOnce(&Instance) -> Result<u32>,
 ) -> Result<()> {
     let host_iface = resolve_host_iface(&cfg.host_iface, tools.ip_probe())?;
     let tap = inst.tap_device();
@@ -392,7 +398,15 @@ fn setup_tap_with_tools(
 
     tools
         .ip()
-        .args(["tuntap", "add", &tap, "mode", "tap"])
+        .args([
+            "tuntap",
+            "add",
+            &tap,
+            "mode",
+            "tap",
+            "user",
+            &tap_owner(inst)?.to_string(),
+        ])
         .run()
         .context("Failed to create TAP device")?;
     let result = (|| {
