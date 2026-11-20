@@ -690,7 +690,6 @@ older vulnerable release.
 
 Open VS Code or Zed connected to the guest VM over SSH, or use `--web` to run
 a browser editor inside the VM.
-`coop vscode` remains as an alias.
 
 ```
 coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
@@ -709,6 +708,7 @@ coop editor [NAME] --web [--project PATH] [--port PORT]
 ```
 coop editor
 coop editor my-project --project /workspace/subdir
+coop editor my-project --editor code
 coop editor my-project --editor zed
 coop editor my-project --clean
 coop editor my-project --web
