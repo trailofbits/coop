@@ -100,14 +100,14 @@ BRANCH=""
 candidate=$(head_flag_value "$COMMAND")
 candidate="${candidate##*:}"
 if [ -n "$candidate" ] &&
-  git -C "$WORKDIR" rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null 2>&1; then
+  git -C "$WORKDIR" rev-parse --verify --quiet --end-of-options "${candidate}^{commit}" >/dev/null 2>&1; then
   BRANCH="$candidate"
 fi
 if [ -z "$BRANCH" ]; then
   BRANCH=$(git -C "$WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
 fi
 
-HEAD_SHA=$(git -C "$WORKDIR" rev-parse --verify "${BRANCH}^{commit}" 2>/dev/null) || exit 0
+HEAD_SHA=$(git -C "$WORKDIR" rev-parse --verify --end-of-options "${BRANCH}^{commit}" 2>/dev/null) || exit 0
 
 # Markers live under the shared git common dir so one written from any linked
 # worktree is found from every other worktree (and the main checkout).
