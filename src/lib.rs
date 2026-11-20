@@ -526,7 +526,6 @@ enum Commands {
         command: Vec<String>,
     },
     /// Open a host editor over SSH, or a browser editor with --web
-    #[command(alias = "vscode")]
     Editor {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -1694,20 +1693,19 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(std::iter::once("coop").chain(args)).is_err());
         }
-        for command in ["editor", "vscode"] {
-            assert!(matches!(
-                parse(&[command]).command,
-                crate::Commands::Editor {
-                    web: false,
-                    port: None,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                parse(&[command, "--web"]).command,
-                crate::Commands::Editor { web: true, .. }
-            ));
-        }
+        assert!(matches!(
+            parse(&["editor"]).command,
+            crate::Commands::Editor {
+                editor: None,
+                web: false,
+                port: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["editor", "--web"]).command,
+            crate::Commands::Editor { web: true, .. }
+        ));
     }
 
     #[test]
@@ -1975,18 +1973,25 @@ mod tests {
     }
 
     #[test]
-    fn vscode_alias_parses_as_editor() {
-        let cli = parse(&["vscode"]);
-        assert!(matches!(cli.command, super::Commands::Editor { .. }));
+    fn vscode_alias_is_removed() {
+        assert_eq!(
+            parse_err(&["vscode"]).kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
     }
 
     #[test]
     fn editor_kind_values_parse() {
-        let cli = parse(&["editor", "--editor", "zed"]);
-        let super::Commands::Editor { editor, .. } = cli.command else {
-            panic!("expected Editor variant");
-        };
-        assert_eq!(editor, Some(super::workspace::EditorKind::Zed));
+        for (value, kind) in [
+            ("code", super::workspace::EditorKind::Code),
+            ("zed", super::workspace::EditorKind::Zed),
+        ] {
+            let cli = parse(&["editor", "--editor", value]);
+            let super::Commands::Editor { editor, .. } = cli.command else {
+                panic!("expected Editor variant");
+            };
+            assert_eq!(editor, Some(kind));
+        }
     }
 
     #[test]
