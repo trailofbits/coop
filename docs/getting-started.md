@@ -22,11 +22,13 @@ credentials on the host.
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
-- `sudo` privileges (coop starts the Firecracker VMM as root in a systemd
-  system service and uses privileged host operations for networking and disk
-  setup; it does not launch the VMM through the jailer)
-- A running systemd system manager version 252 or newer with trusted `systemd-run` and `systemctl`
-  executables for VM startup
+- `sudo` privileges (coop uses privileged host operations for networking,
+  jail staging, and disk setup; the matching jailer drops the systemd-managed
+  Firecracker VMM to its own unprivileged UID/GID)
+- A running systemd system manager version 252 or newer and journal with trusted `systemd-run`,
+  `systemctl`, and `journalctl` executables for VM startup and logs
+- `setfacl` from the host ACL package and trusted `mount`/`umount` utilities
+  for jail staging and stopped-VM cleanup
 - A root-owned `/var/lib/coop` installation area for the verified Firecracker
   and jailer pair; `coop setup` creates it with `sudo`
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
@@ -600,7 +602,7 @@ coop images --delete python-dev
 | Command | Description |
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
-| `coop logs` | Stream VM serial console logs (`-f` to follow) |
+| `coop logs` | Show VM console logs, including saved logs from a stopped Firecracker VM (`-f` follows a running VM) |
 | `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |

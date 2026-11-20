@@ -14,6 +14,10 @@ pub mod config;
 mod creation_hooks;
 mod firecracker_install;
 #[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
+mod firecracker_jail;
+#[cfg(target_os = "linux")]
+mod firecracker_runtime;
+#[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
 mod firecracker_service;
 mod fs_util;
 mod github_assignment;
@@ -457,7 +461,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ModelAction>,
     },
-    /// Stream VM serial console logs
+    /// Show VM console logs
     Logs {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -465,7 +469,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Follow log output
+        /// Follow log output (requires a running VM)
         #[arg(short, long)]
         follow: bool,
     },
@@ -1362,13 +1366,29 @@ pub fn run() -> Result<()> {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
         Commands::Logs { name, follow } => {
-            let running = resolve_running(&be, &cfg, name.as_ref())?;
-            let mode = if follow {
-                backend::LogMode::Follow
+            if follow {
+                let running = resolve_running(&be, &cfg, name.as_ref())?;
+                be.stream_logs(&cfg, &running, backend::LogMode::Follow)
             } else {
-                backend::LogMode::Snapshot
-            };
-            be.stream_logs(&cfg, &running, mode)
+                let mut instances = cfg.list_instances()?;
+                let selected = if let Some(name) = name.as_ref() {
+                    instances.into_iter().find(|inst| &inst.name == name)
+                } else if instances.len() == 1 {
+                    instances.pop()
+                } else {
+                    None
+                };
+                if let Some(inst) = selected {
+                    if let Some(running) = be.as_running(&cfg, inst.clone())? {
+                        be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                    } else {
+                        be.snapshot_stopped_logs(&inst)
+                    }
+                } else {
+                    let running = resolve_running(&be, &cfg, name.as_ref())?;
+                    be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                }
+            }
         }
         Commands::Push {
             name,

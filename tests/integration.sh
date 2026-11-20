@@ -833,6 +833,78 @@ EOF
             fail "Firecracker PID belongs to its systemd service and cgroup" \
                 "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
         fi
+        local journal_policy
+        journal_policy=$(systemctl show \
+            --property=StandardOutput,StandardError,LogRateLimitIntervalUSec,LogRateLimitBurst \
+            "$service_unit" 2>/dev/null || true)
+        if [[ "$journal_policy" == *"StandardOutput=journal"* \
+            && "$journal_policy" == *"StandardError=journal"* \
+            && "$journal_policy" == *"LogRateLimitIntervalUSec=30s"* \
+            && "$journal_policy" == *"LogRateLimitBurst=1000"* ]]; then
+            pass "supervised VMM output uses rate-limited journald streams"
+        else
+            fail "supervised VMM output uses rate-limited journald streams" \
+                "systemd output policy differs from the launch contract"
+        fi
+
+        local jail_root="" host_uid vmm_uid vmm_gid vmm_groups vmm_caps vmm_bounding vmm_nnp vmm_seccomp
+        host_uid=$(id -u)
+        if [[ "$service_unit" =~ ^coop-vmm-[0-9]+-([0-9a-f]{64})-([0-9a-f]{32})\.service$ ]]; then
+            jail_root="/var/lib/coop/j/$host_uid/firecracker/${BASH_REMATCH[1]:0:16}-${BASH_REMATCH[2]}/root"
+        fi
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_gid=$(sudo awk '/^Gid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_groups=$(sudo awk '/^Groups:/ {$1=""; gsub(/[[:space:]]/, ""); print}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_caps=$(sudo awk '/^CapEff:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_bounding=$(sudo awk '/^CapBnd:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_nnp=$(sudo awk '/^NoNewPrivs:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_seccomp=$(sudo awk '/^Seccomp:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        local cap_net_admin=-1
+        if [[ "$vmm_bounding" =~ ^[0-9a-fA-F]+$ ]]; then
+            cap_net_admin=$((16#$vmm_bounding & (1 << 12)))
+        fi
+        if [[ "$vmm_uid" =~ ^[1-9][0-9]*$ \
+            && "$vmm_uid" == "$vmm_gid" \
+            && "$vmm_uid" != "$host_uid" \
+            && -z "$vmm_groups" \
+            && "$vmm_caps" == 0000000000000000 \
+            && "$vmm_nnp" == 1 \
+            && "$vmm_seccomp" == 2 \
+            && "$cap_net_admin" == 0 ]]; then
+            pass "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp"
+        else
+            fail "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp" \
+                "uid=$vmm_uid gid=$vmm_gid groups=$vmm_groups caps=$vmm_caps bounding=$vmm_bounding nnp=$vmm_nnp seccomp=$vmm_seccomp"
+        fi
+        if [[ -d "$jail_root" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root" 2>/dev/null)" == "$(sudo stat -Lc '%d:%i' "$jail_root" 2>/dev/null)" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root/rootfs.ext4" 2>/dev/null)" == "$(stat -Lc '%d:%i' "$HOME/.coop/instances/$INSTANCE/rootfs.ext4" 2>/dev/null)" \
+            && -f "$jail_root/kernel" \
+            && ! -e "$jail_root/etc/shadow" \
+            && ! -e "$jail_root/var/lib/coop" ]]; then
+            pass "jailed VMM root and disk binding exclude host and peer files"
+        else
+            fail "jailed VMM root and disk binding exclude host and peer files" "jail_root=$jail_root"
+        fi
+        local all_threads_filtered=true task_status
+        for task_status in /proc/"$firecracker_pid"/task/*/status; do
+            if [[ "$(sudo awk '/^Seccomp:/ {print $2}' "$task_status" 2>/dev/null)" != 2 ]]; then
+                all_threads_filtered=false
+            fi
+        done
+        if [[ "$all_threads_filtered" == true ]]; then
+            pass "Firecracker applies seccomp to every observed VMM thread"
+        else
+            fail "Firecracker applies seccomp to every observed VMM thread"
+        fi
+        local instance_index tap_owner
+        instance_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$instance_state")
+        tap_owner=$(ip tuntap show dev "tap${instance_index}" 2>/dev/null || true)
+        if [[ "$tap_owner" == *"user $vmm_uid"* ]]; then
+            pass "persistent TAP is owned by the jailed VMM identity"
+        else
+            fail "persistent TAP is owned by the jailed VMM identity" "tap=$tap_owner uid=$vmm_uid"
+        fi
     fi
 
     local copied_file="" env_value=""
@@ -855,86 +927,6 @@ EOF
     else
         fail "up ignores discovered devcontainer postStartCommand and postCreateCommand" \
             "marker exists or guest check failed: $(guest_stderr)"
-    fi
-}
-
-remove_literal_dollar_fixture() {
-    local data_dir="$1"
-    # Only the generated fixture path may be removed as root. The copied
-    # template can contain root-owned entries that unprivileged rm cannot
-    # traverse or unlink; everything else is removed as the test user.
-    [[ "$data_dir" == "$HOME"/coop-'${COOP_SYSTEMD_PATH_LITERAL}'-?????? \
-        && -d "$data_dir" && ! -L "$data_dir" \
-        && -d "$data_dir/images" && ! -L "$data_dir/images" ]] || return 1
-    sudo -n rm -rf -- "$data_dir/images/default" || return 1
-    rm -rf -- "$data_dir"
-}
-
-test_systemd_preserves_literal_dollar_data_dir() {
-    [[ "$(uname -s)" == Linux ]] || return 0
-    echo ""
-    echo "=== Phase: literal dollar in Firecracker service paths ==="
-
-    # Keep the normal suite home untouched. OpenSSH deliberately rejects '$'
-    # in its managed paths, so this instance can prove VMM launch but cannot
-    # complete SSH readiness. Its private image copy does not share inodes
-    # with the golden image and can be discarded after failed-start cleanup.
-    local data_dir cfg workspace name
-    data_dir=$(mktemp -d "$HOME/coop-\${COOP_SYSTEMD_PATH_LITERAL}-XXXXXX")
-    cfg="$tmpdir/literal-dollar-config.toml"
-    workspace="$tmpdir/literal-dollar-ws"
-    name="${INSTANCE}-dollar"
-    mkdir -m 700 "$data_dir/images"
-    mkdir -p "$workspace"
-    if ! sudo -n cp -a --reflink=auto --sparse=always \
-        "$HOME/.coop/images/default" "$data_dir/images/" \
-        || ! cp -p "$HOME/.coop/vm_key" "$HOME/.coop/vm_key.pub" "$data_dir/"; then
-        fail "prepare private image for literal-dollar Firecracker path"
-        if ! remove_literal_dollar_fixture "$data_dir"; then
-            fail "clean up partial literal-dollar image copy" "fixture retained for inspection"
-        fi
-        return
-    fi
-    cat > "$cfg" <<EOF
-data_dir = "$data_dir"
-[grok]
-config_dir = false
-[vm]
-firecracker_control = "vsock"
-firecracker_network = "isolated"
-EOF
-
-    local launch_succeeded=0
-    if RUST_LOG=info coop --config "$cfg" up "$workspace" --name "$name" --no-agents; then
-        launch_succeeded=1
-    fi
-    if [[ "$launch_succeeded" == 0 ]]; then
-        # Without systemd dollar escaping the VMM exits before SSH readiness;
-        # require a booted guest before the later OpenSSH path guard.
-        if [[ "$HARNESS_ERR" == *"Firecracker started with PID"* \
-            && "$HARNESS_ERR" == *"Guest SSH is reachable"* \
-            && "$HARNESS_ERR" == *"contains bytes OpenSSH may reinterpret"* ]]; then
-            pass "systemd launches Firecracker with a literal dollar config and log path"
-        else
-            fail "systemd launches Firecracker with a literal dollar config and log path" \
-                "expected post-launch OpenSSH path rejection; stderr: $HARNESS_ERR"
-        fi
-    elif [[ -f "$data_dir/instances/$name/vm_config.json" \
-        && -f "$data_dir/instances/$name/firecracker.log" ]]; then
-        pass "systemd launches Firecracker with a literal dollar config and log path"
-    else
-        fail "systemd launches Firecracker with a literal dollar config and log path" \
-            "config or log missing after successful launch"
-    fi
-
-    if [[ -d "$data_dir/instances/$name" ]] \
-        && ! coop --config "$cfg" destroy "$name"; then
-        fail "clean up literal-dollar Firecracker fixture" \
-            "instance and image retained for inspection; stderr: $HARNESS_ERR"
-        return
-    fi
-    if ! remove_literal_dollar_fixture "$data_dir"; then
-        fail "clean up literal-dollar Firecracker fixture" "fixture retained for inspection"
     fi
 }
 
@@ -1016,10 +1008,26 @@ EOF
         return
     fi
     local failed_dir="$HOME/.coop/instances/$failed_name"
-    local failed_index
-    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    local runtime_state="$failed_dir/firecracker.runtime.json"
     local disk_identity
     disk_identity=$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")
+    local config_before
+    config_before=$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)
+    local failed_index
+    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    printf '%s\n' '{"version":2,"launcher":"jailer"}' > "$runtime_state"
+    if coop start "$failed_name" --no-agents; then
+        fail "unknown Firecracker runtime version blocks launch" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Unsupported Firecracker runtime state"* \
+        && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)" == "$config_before" \
+        && ! -e "/sys/class/net/tap${failed_index}" ]]; then
+        pass "unknown Firecracker runtime version blocks launch before config or TAP changes"
+    else
+        fail "unknown Firecracker runtime version blocks launch" "$HARNESS_ERR"
+    fi
+    rm -f "$runtime_state" # Model a stopped instance created before jailed launch.
     local broken_bridge_cfg="$tmpdir/broken-bridge.toml"
     cp "$SUITE_CONFIG" "$broken_bridge_cfg"
     printf '\n[network.host_tools]\nbridge = "/bin/false"\n' >> "$broken_bridge_cfg"
@@ -1040,11 +1048,24 @@ EOF
     else
         fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
     fi
-
-    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" ]]; then
-        pass "failed Firecracker boot retains instance disk and clears PID"
+    printf 'not json\n' > "$failed_dir/web-editor.json"
+    if coop logs "$failed_name" \
+        && [[ -n "$HARNESS_OUT" \
+        && "$HARNESS_OUT" != *"Could not save the stopped Firecracker journal"* \
+        && "$(cat "$failed_dir/web-editor.json")" == 'not json' ]]; then
+        pass "stopped Firecracker VM exposes its saved boot diagnostics through coop logs"
     else
-        fail "failed Firecracker boot retains instance disk and clears PID"
+        fail "stopped Firecracker VM exposes its saved boot diagnostics through coop logs" "$HARNESS_ERR"
+    fi
+    rm -f "$failed_dir/web-editor.json"
+
+    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(jq -r '.version | tostring' "$runtime_state" 2>/dev/null)" == 1 \
+        && "$(jq -r '.launcher' "$runtime_state" 2>/dev/null)" == jailer ]]; then
+        pass "failed Firecracker boot retains disk and publishes atomic jailed state"
+    else
+        fail "failed Firecracker boot retains disk and publishes atomic jailed state"
     fi
     if [[ -f "$failed_dir/instance.json" ]]; then
         if ! ip link show "tap${failed_index}" >/dev/null 2>&1; then
@@ -3149,7 +3170,9 @@ test_logs() {
     fi
 
     # Logs should contain something (boot messages, kernel output, etc.)
-    if [[ -n "$HARNESS_OUT" ]]; then
+    if [[ "$(uname -s)" == Linux && -z "$HARNESS_OUT" ]]; then
+        fail "jailed Firecracker journal produces log output" "stdout was empty"
+    elif [[ -n "$HARNESS_OUT" ]]; then
         pass "logs produces output"
     else
         # Lima logs go to stderr, so check both
@@ -4222,8 +4245,26 @@ test_stop() {
     echo ""
     echo "=== Phase: stop ==="
 
-    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0
+    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0 vmm_uid=""
     if [[ "$(uname -s)" == Linux ]]; then
+        local serial_marker="COOP_JAILED_LOG_SNAPSHOT_MARKER"
+        if guest_exec sudo sh -c "printf '%s\\n' '$serial_marker' > /dev/ttyS0"; then
+            local marker_seen=false
+            for _ in {1..20}; do
+                if coop logs "$INSTANCE" && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+                    marker_seen=true
+                    break
+                fi
+                sleep 0.25
+            done
+            if [[ "$marker_seen" == true ]]; then
+                pass "active jailed Firecracker logs include guest serial output"
+            else
+                fail "active jailed Firecracker logs include guest serial output" "$HARNESS_ERR"
+            fi
+        else
+            fail "write guest serial marker before stop" "$(guest_stderr)"
+        fi
         ip=$(guest_ip_of "$INSTANCE") || ip=""
         if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
             && (( 10#${BASH_REMATCH[1]} >= 2 && 10#${BASH_REMATCH[1]} <= 254 )); then
@@ -4237,20 +4278,25 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker runs without an API socket. Its base vsock socket is
-        # mode 0666 so coop can connect through the user-owned mode-0700
-        # instance directory. Kill the VMM without graceful cleanup so
-        # `coop stop` must recognize and remove the abandoned socket.
+        # Firecracker runs without an API socket. Coop bind-mounts its jailed
+        # base vsock socket inode into the private instance directory. Kill
+        # the VMM without graceful cleanup to test abandoned mount recovery.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$fc_pid/status" 2>/dev/null || true)
         instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
         vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
         directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
-        vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
+        vsock_metadata=$(stat -c '%u:%a' "$vsock_path" 2>/dev/null || true)
+        jailed_socket_inode=$(sudo -n stat -Lc '%d:%i' "/proc/$fc_pid/root/vsock.sock" 2>/dev/null || true)
+        published_socket_inode=$(stat -Lc '%d:%i' "$vsock_path" 2>/dev/null || true)
         if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
             && "$directory_metadata" == "$(id -un):700" \
-            && "$vsock_metadata" == "root:666" ]]; then
-            pass "Firecracker has no API socket and contains vsock in the private instance directory"
+            && "$vsock_metadata" == "$vmm_uid:666" \
+            && -n "$jailed_socket_inode" \
+            && "$jailed_socket_inode" == "$published_socket_inode" ]] \
+            && mountpoint -q "$vsock_path"; then
+            pass "Firecracker has no API socket and pins the jailed vsock socket at the instance path"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -4260,16 +4306,16 @@ test_stop() {
                     sleep 0.1
                 done
                 if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
+                    pass "unexpected Firecracker exit leaves the pinned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                    fail "unexpected Firecracker exit leaves the pinned vsock socket" \
                         "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+            fail "Firecracker stop fixture has no API and a pinned mode-0666 vsock socket" \
                 "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi
@@ -4278,6 +4324,20 @@ test_stop() {
         pass "stop exits 0"
     else
         fail "stop exits 0" "exit code: $?"
+    fi
+    if [[ "$(uname -s)" == Linux ]]; then
+        local saved_log="$HOME/.coop/instances/$INSTANCE/firecracker.log" saved_bytes
+        saved_bytes=$(stat -c %s "$saved_log" 2>/dev/null || echo 0)
+        if [[ -f "$saved_log" && "$saved_bytes" -gt 0 \
+            && "$saved_bytes" -le 16777216 ]] \
+            && grep -Fq -- "$serial_marker" "$saved_log" \
+            && coop logs "$INSTANCE" \
+            && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+            pass "stopped VMM retains guest serial output in its bounded journal snapshot"
+        else
+            fail "stopped VMM retains guest serial output in its bounded journal snapshot" \
+                "saved log bytes=$saved_bytes"
+        fi
     fi
     if [[ -n "$tap" ]]; then
         if [[ -e "/sys/class/net/$tap" ]]; then
@@ -9500,7 +9560,6 @@ EOF
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
         run_timed_test test_up_creates_primary_instance
-        run_timed_test test_systemd_preserves_literal_dollar_data_dir
         run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
         run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
         run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable

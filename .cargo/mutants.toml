@@ -54,9 +54,37 @@ exclude_globs = [
 # operator/value mutants inside that function, without catching longer names
 # that share a prefix (e.g. \bprobe_user\b leaves probe_user_login alone).
 exclude_re = [
+  # Jail staging, root subprocesses, and NSS are host IO. Candidate UID and
+  # jailed-log path rules remain in mutation scope.
+  "src/firecracker_jail\\.rs:.*\\brequire_jail_tools\\b",
+  "src/firecracker_jail\\.rs:.*\\buid_for_instance\\b",
+  "src/firecracker_jail\\.rs:.*\\bnew\\b",
+  "src/firecracker_jail\\.rs:.*\\bdisk_descriptor_path\\b",
+  "src/firecracker_jail\\.rs:.*\\bprepare\\b",
+  "src/firecracker_jail\\.rs:.*\\bcleanup_unstarted\\b",
+  "src/firecracker_jail\\.rs:.*\\bassigned_uid\\b",
+  "src/firecracker_jail\\.rs:.*\\bregistered_uid\\b",
+  "src/firecracker_jail\\.rs:.*\\bexisting_uid\\b",
+  "src/firecracker_jail\\.rs:.*\\brelease_identity\\b",
+  "src/firecracker_jail\\.rs:.*\\bhas_jailed_log_link\\b",
+  "src/firecracker_jail\\.rs:.*\\bopen_log\\b",
+  "src/firecracker_jail\\.rs:.*\\bsnapshot_stopped_log\\b",
+  "src/firecracker_jail\\.rs:.*\\bpublish_vsock_mount\\b",
+  "src/firecracker_jail\\.rs:.*\\bunmount_vsock\\b",
+  "src/firecracker_jail\\.rs:.*\\bis_mountpoint\\b",
+  "src/firecracker_jail\\.rs:.*\\bverify_vmm\\b",
+  "src/firecracker_jail\\.rs:.*\\bgrant_owner_access\\b",
+  "src/firecracker_jail\\.rs:.*\\bgrant_owner_root_access\\b",
+  "src/firecracker_jail\\.rs:.*\\bcleanup_stopped\\b",
+  "src/firecracker_jail\\.rs:.*\\brevoke_disk_acl\\b",
+  "src/firecracker_jail\\.rs:.*\\bpreserve_log\\b",
+  "src/firecracker_jail\\.rs:.*\\bsaved_journal\\b",
+  # Migration state publication is host IO; its version parser stays in scope.
+  "src/firecracker_runtime\\.rs:.*\\bensure_jailed\\b",
   # Systemd queries and mutations are host IO. Parsers and unit-name guards
   # remain in scope.
   "src/firecracker_service\\.rs:.*\\bnew_unit\\b",
+  "src/firecracker_service\\.rs:.*\\bverify_journal_policy\\b",
   "src/firecracker_service\\.rs:.*\\bsystemctl_query\\b",
   "src/firecracker_service\\.rs:.*\\blist_units\\b",
   "src/firecracker_service\\.rs:.*\\brequire_system_manager\\b",
@@ -78,6 +106,7 @@ exclude_re = [
   "src/process_output\\.rs:.*\\brun_status_bounded\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_file\\b",
   "src/process_output\\.rs:.*\\brun_status_bounded_with_shutdown\\b",
+  "src/process_output\\.rs:.*\\brun_bounded_tail\\b",
   # Treating every read error as EINTR, or removing O_NONBLOCK, makes other
   # process tests block forever before libtest can report the focused unit-test
   # failure. Exclude only those structurally hanging mutations; the hard-error
