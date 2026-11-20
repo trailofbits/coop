@@ -207,9 +207,9 @@ enum Commands {
             add = ArgValueCandidates::new(completions::profile_candidates),
         )]
         profile: Vec<String>,
-        /// Skip `.git/` when copying/syncing local directories
+        /// Skip common VCS metadata and project-local tool settings when copying/syncing
         #[arg(long)]
-        exclude_git: bool,
+        exclude_local_config: bool,
         /// Suppress the interactive VM PAT binding prompt; keep an existing binding
         #[arg(long)]
         no_prompt: bool,
@@ -487,9 +487,9 @@ enum Commands {
         /// Overwrite guest changes without confirmation
         #[arg(long)]
         force: bool,
-        /// Skip the `.git` directory in this transfer
+        /// Skip common VCS metadata and project-local tool settings in this transfer
         #[arg(long)]
-        exclude_git: bool,
+        exclude_local_config: bool,
     },
     /// Pull the untrusted guest workspace to a local directory
     ///
@@ -1143,7 +1143,7 @@ pub fn run() -> Result<()> {
             no_github,
             image,
             profile,
-            exclude_git,
+            exclude_local_config,
             no_prompt,
             forward_port,
             post_start,
@@ -1182,7 +1182,7 @@ pub fn run() -> Result<()> {
                 runtime: UpRuntimeOpts {
                     no_agents,
                     no_github,
-                    exclude_git,
+                    push_filters: workspace::PushFilters::from_flag(exclude_local_config),
                     no_prompt,
                     forward_ports: forward_port,
                     post_start,
@@ -1249,7 +1249,7 @@ pub fn run() -> Result<()> {
                 no_prompt,
                 disk: None,
                 mounts: Vec::new(),
-                exclude_git: false,
+                push_filters: workspace::PushFilters::Default,
                 forward_ports,
                 config_path: &cli.config,
                 post_start_override: post_start.as_deref(),
@@ -1393,10 +1393,15 @@ pub fn run() -> Result<()> {
             name,
             dir,
             force,
-            exclude_git,
+            exclude_local_config,
         } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
-            workspace::push(&running, dir.as_deref(), force, exclude_git)
+            workspace::push(
+                &running,
+                dir.as_deref(),
+                force,
+                workspace::PushFilters::from_flag(exclude_local_config),
+            )
         }
         Commands::Pull { name, dir, force } => {
             let running = resolve_running(&be, &cfg, name.as_ref())?;
@@ -2300,10 +2305,6 @@ mod tests {
                 flag[0],
             );
         }
-        assert!(
-            super::Cli::try_parse_from(["coop", "start", "--exclude-git"]).is_err(),
-            "`coop start --exclude-git` should be rejected by clap",
-        );
     }
 
     #[test]
@@ -2451,9 +2452,39 @@ mod tests {
     }
 
     #[test]
-    fn pull_rejects_exclude_git_flag() {
-        let result = super::Cli::try_parse_from(["coop", "pull", "--exclude-git"]);
-        assert!(result.is_err(), "pull must reject its removed no-op flag");
+    fn removed_exclude_git_flag_is_rejected() {
+        for command in ["up", "push", "start", "pull"] {
+            assert!(
+                super::Cli::try_parse_from(["coop", command, "--exclude-git"]).is_err(),
+                "{command} accepted removed --exclude-git flag"
+            );
+        }
+    }
+
+    #[test]
+    fn exclude_local_config_is_available_only_for_up_and_push() {
+        let up = parse(&["up", "--exclude-local-config"]);
+        assert!(matches!(
+            up.command,
+            super::Commands::Up {
+                exclude_local_config: true,
+                ..
+            }
+        ));
+        let push = parse(&["push", "--exclude-local-config"]);
+        assert!(matches!(
+            push.command,
+            super::Commands::Push {
+                exclude_local_config: true,
+                ..
+            }
+        ));
+        for command in ["start", "pull"] {
+            assert!(
+                super::Cli::try_parse_from(["coop", command, "--exclude-local-config"]).is_err(),
+                "{command} accepted --exclude-local-config"
+            );
+        }
     }
 
     #[test]
@@ -2468,6 +2499,7 @@ mod tests {
         assert!(help.contains("may be malicious"), "{help}");
         assert!(help.contains("non-empty destination"), "{help}");
         assert!(!help.contains("--exclude-git"), "{help}");
+        assert!(!help.contains("--exclude-local-config"), "{help}");
     }
 
     #[test]

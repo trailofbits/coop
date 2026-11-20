@@ -134,12 +134,16 @@ build tool, a shell, or another host application. Upgrading coop does not repair
 repositories pulled by an affected older release; recreate their Git metadata
 from a trusted source before using host Git on them.
 
-Pull attempts to exclude common `.git` names, including nested ASCII case
-variants. It receives into an empty staging directory and then applies the
-filter again during a trusted host-side installation. This is useful
-defense-in-depth, not a guarantee that every Git-administration alias will be
-recognized across all transport and filesystem implementations. Pull has no `--exclude-git` option;
-the filtering behavior is unconditional and best effort.
+Pull attempts to exclude common local configuration folders used by development
+tools (such as Git and Visual Studio Code) and embedded repositories before
+installing files on the host. This filtering is best effort. Treat pulled files
+as untrusted. Pull applies these exclusions to every transfer.
+
+Pull reports skipped embedded repository paths. It also compares an unfiltered
+rsync dry run with the filtered transfer and reports every path absent from the
+transfer list, including files inside excluded directories. These warnings are
+best effort because the guest may change its files between the two passes.
+Path bytes that could affect terminal output are escaped.
 
 ## Default exclusions
 
@@ -155,8 +159,12 @@ These directory-only rules apply at every depth. Same-named regular files and
 symlinks remain eligible for transfer, subject to the other filters.
 
 Host-to-guest transfers (`coop up` and `coop push`) include `.git/` by default
-so agents receive full history and branches. Pass `--exclude-git` to skip it.
-Guest-to-host pulls attempt to exclude common `.git` paths as defense-in-depth.
+so agents receive full history and branches. Pass `--exclude-local-config` to
+skip Git metadata and the other VCS and tool-setting names that pull excludes.
+These filters apply to rsync copies and Firecracker's one-time mount sync, not
+Lima's live mounts or guest-side `--git-repo` clones.
+Guest-to-host pulls attempt to exclude common VCS metadata and project-local
+tool settings, including `.git`, `.hg`, `.svn`, and `.vscode` paths.
 Do not rely on pull to sanitize guest content or make it safe for host Git.
 
 ## .gitignore integration
@@ -167,7 +175,7 @@ Transfers pass `--filter=':- .gitignore'`. Rsync reads `.gitignore` files at eac
 
 A repo whose `.gitignore` lists `.git/` (rare, but legal — sometimes seen in dotfile repos or repos vendoring other repos) gets special handling on host-to-guest transfers so the include-by-default behaviour is not silently undone:
 
-- **Host-to-guest transfers**: a protective `--filter=+ /.git/***` is prepended before the per-directory `.gitignore` merge, so `.git/` and its contents are transferred unless `--exclude-git` is passed.
+- **Host-to-guest transfers**: a protective `--filter=+ /.git/***` is prepended before the per-directory `.gitignore` merge, so `.git/` and its contents are transferred unless `--exclude-local-config` is passed.
 - **Pulls**: rsync attempts to exclude common `.git` entries independently
   of `.gitignore`; this is not a security guarantee.
 

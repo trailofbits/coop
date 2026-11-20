@@ -44,14 +44,10 @@ impl UpOpts<'_> {
     }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent CLI switches, not mutually exclusive lifecycle states"
-)]
 pub(crate) struct UpRuntimeOpts {
     pub(crate) no_agents: bool,
     pub(crate) no_github: bool,
-    pub(crate) exclude_git: bool,
+    pub(crate) push_filters: workspace::PushFilters,
     pub(crate) no_prompt: bool,
     pub(crate) forward_ports: Vec<config::PortForward>,
     pub(crate) post_start: Option<String>,
@@ -211,7 +207,7 @@ fn create_up_instance(
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
         mounts: mounts.into_vec(),
-        exclude_git: opts.runtime.exclude_git,
+        push_filters: opts.runtime.push_filters,
         forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
         post_start_override: opts.runtime.post_start.as_deref(),
@@ -249,7 +245,7 @@ fn create_git_repo_instance(
         no_prompt: opts.runtime.no_prompt,
         disk: opts.disk,
         mounts,
-        exclude_git: opts.runtime.exclude_git,
+        push_filters: opts.runtime.push_filters,
         forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
         post_start_override: opts.runtime.post_start.as_deref(),
@@ -329,7 +325,7 @@ fn runtime_start_opts_from_up<'a>(opts: &'a UpOpts<'_>, config_path: &'a Path) -
         no_prompt: opts.runtime.no_prompt,
         disk: None,
         mounts: Vec::new(),
-        exclude_git: false,
+        push_filters: workspace::PushFilters::Default,
         forward_ports: opts.runtime.forward_ports.clone(),
         config_path,
         post_start_override: opts.runtime.post_start.as_deref(),
@@ -381,11 +377,12 @@ fn ensure_up_existing_inputs_are_compatible(
         || opts.vcpus.is_some()
         || opts.mem.is_some()
         || !opts.extra_mount.is_empty()
-        || opts.runtime.exclude_git
+        || opts.runtime.push_filters != workspace::PushFilters::Default
     {
         bail!(
             "Instance '{}' already exists for this project. \
-             --vcpus, --mem, --disk, --extra-mount, and --exclude-git only apply when creating a new instance.\n\
+             --vcpus, --mem, --disk, --extra-mount, and --exclude-local-config \
+             only apply when creating a new instance.\n\
              To change memory, vCPUs, or disk on the existing instance, \
              stop it and run `coop resize`. Otherwise `coop destroy {}` \
              first to recreate it with those options.",
@@ -627,7 +624,7 @@ pub(crate) struct StartOpts<'a> {
     pub(crate) no_prompt: bool,
     pub(crate) disk: Option<config::GiB>,
     pub(crate) mounts: Vec<config::Mount>,
-    pub(crate) exclude_git: bool,
+    pub(crate) push_filters: workspace::PushFilters,
     /// Per-start forwards from `--forward-port`. Merged with
     /// `cfg.forward_ports` at start time (CLI overrides on guest-port
     /// collision).
@@ -1105,7 +1102,7 @@ fn start_instance(
         source: FirstBootSource::from_options(opts.workspace_dir, opts.git_repo),
         clone_recovery: backend::CloneRecovery::NewVm,
         mounts: &opts.mounts,
-        exclude_git: opts.exclude_git,
+        push_filters: opts.push_filters,
         no_agents: opts.no_agents,
         post_start_override: opts.post_start_override,
         persisted_guest_env: &opts.persisted_guest_env,
@@ -1124,7 +1121,7 @@ struct FirstBootInputs<'a> {
     source: FirstBootSource<'a>,
     clone_recovery: backend::CloneRecovery<'a>,
     mounts: &'a [config::Mount],
-    exclude_git: bool,
+    push_filters: workspace::PushFilters,
     no_agents: bool,
     post_start_override: Option<&'a str>,
     persisted_guest_env: &'a std::collections::BTreeMap<guest_env_state::EnvVarName, String>,
@@ -1242,7 +1239,7 @@ fn provision_first_boot(
             .canonicalize()
             .with_context(|| format!("Failed to resolve {ws_dir}"))?;
 
-        workspace::copy_workspace(&target, &abs_path, inputs.exclude_git)?;
+        workspace::copy_workspace(&target, &abs_path, inputs.push_filters)?;
 
         let state = workspace::WorkspaceState {
             guest_path: workspace::default_workspace_path(),
@@ -1285,9 +1282,9 @@ fn provision_first_boot(
             warn_on_live_git_mounts(inputs.mounts);
         } else {
             if workspace_state.is_some() {
-                workspace::sync_mount_contents(&target, inputs.mounts, inputs.exclude_git)?;
+                workspace::sync_mount_contents(&target, inputs.mounts, inputs.push_filters)?;
             } else {
-                workspace::sync_mounts(&target, inst, inputs.mounts, inputs.exclude_git)?;
+                workspace::sync_mounts(&target, inst, inputs.mounts, inputs.push_filters)?;
             }
             tracing::warn!(
                 "Firecracker mounts use one-time sync, not live filesystem sharing. \
@@ -2158,7 +2155,7 @@ fn network_restart_options<'a>(
         no_prompt: false,
         disk: None,
         mounts: Vec::new(),
-        exclude_git: false,
+        push_filters: workspace::PushFilters::Default,
         forward_ports: Vec::new(),
         config_path,
         post_start_override: None,
@@ -2641,7 +2638,7 @@ pub(crate) fn cmd_restore(
 /// Only persisted settings can be replayed. The saved creation recipe is reset
 /// and runs again after workspace provisioning, followed by its deferred startup
 /// command when a creation hook was selected. Extra `--extra-mount` directories
-/// and `--exclude-git` are not persisted.
+/// and `--exclude-local-config` are not persisted.
 ///
 /// The plain [`cmd_restore`] path replaces the disk but leaves the follow-up
 /// `coop start` on the [`backend::BootMode::Restart`] path, which skips
@@ -2799,9 +2796,9 @@ fn reprovision_instance(
         ),
         clone_recovery: backend::CloneRecovery::Reprovision(&inst.name),
         mounts: &ws_inputs.mounts,
-        // No command persists `--exclude-git`, so it cannot be replayed: a
-        // workspace originally pushed without `.git/` is re-synced with it.
-        exclude_git: false,
+        // Transfer exclusions are not persisted, so reprovisioning re-syncs
+        // the workspace and mounts using the default policy.
+        push_filters: workspace::PushFilters::Default,
         no_agents: opts.no_agents,
         post_start_override: None,
         persisted_guest_env: &saved_guest_env,
@@ -3309,7 +3306,7 @@ mod tests {
             assert!(!opts.no_prompt);
             assert!(opts.disk.is_none());
             assert!(opts.mounts.is_empty());
-            assert!(!opts.exclude_git);
+            assert_eq!(opts.push_filters, super::workspace::PushFilters::Default);
             assert!(opts.forward_ports.is_empty());
             assert!(opts.post_start_override.is_none());
             assert!(opts.persisted_guest_env.is_empty());
@@ -3787,7 +3784,7 @@ mod tests {
             no_prompt: true,
             disk: None,
             mounts,
-            exclude_git: false,
+            push_filters: super::workspace::PushFilters::Default,
             forward_ports: Vec::new(),
             config_path,
             post_start_override: None,
@@ -3812,7 +3809,7 @@ mod tests {
             runtime: super::UpRuntimeOpts {
                 no_agents: false,
                 no_github: false,
-                exclude_git: false,
+                push_filters: super::workspace::PushFilters::Default,
                 no_prompt: true,
                 forward_ports: Vec::new(),
                 post_start: None,
@@ -5315,8 +5312,8 @@ mod tests {
         reject(&opts).expect_err("--vcpus must be rejected");
 
         let mut opts = up_opts_for_tests(project.to_str());
-        opts.runtime.exclude_git = true;
-        reject(&opts).expect_err("--exclude-git must be rejected");
+        opts.runtime.push_filters = super::workspace::PushFilters::ExcludeLocalConfig;
+        reject(&opts).expect_err("--exclude-local-config must be rejected");
 
         let mut opts = up_opts_for_tests(project.to_str());
         opts.extra_mount =
