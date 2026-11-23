@@ -426,10 +426,7 @@ Print every instance with its state (`running` or `stopped`) and selected networ
 
 ```
 coop list
-coop ls
 ```
-
-Alias: `ls`.
 
 | Flag | Description |
 |------|-------------|

@@ -312,7 +312,6 @@ enum Commands {
         guest_env: Vec<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
-    #[command(alias = "ssh")]
     Shell {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -407,7 +406,6 @@ enum Commands {
         all: bool,
     },
     /// List instances by name, state, and network mode
-    #[command(alias = "ls")]
     List {
         /// Emit machine-readable JSON instead of the text table
         #[arg(long)]
@@ -1967,9 +1965,11 @@ mod tests {
     }
 
     #[test]
-    fn ssh_alias_parses_as_shell() {
-        let cli = parse(&["ssh"]);
-        assert!(matches!(cli.command, super::Commands::Shell { .. }));
+    fn removed_ssh_alias_does_not_parse_as_shell() {
+        assert_eq!(
+            parse_err(&["ssh"]).kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
     }
 
     #[test]
@@ -2012,19 +2012,6 @@ mod tests {
         };
         assert!(name.is_none());
         assert!(clean);
-    }
-
-    #[test]
-    fn ssh_config_does_not_collide_with_ssh_shell_alias() {
-        // `ssh` is an alias for `shell`; `ssh-config` is its own command.
-        assert!(matches!(
-            parse(&["ssh"]).command,
-            super::Commands::Shell { .. }
-        ));
-        assert!(matches!(
-            parse(&["ssh-config"]).command,
-            super::Commands::SshConfig { .. }
-        ));
     }
 
     #[test]
@@ -2512,9 +2499,11 @@ mod tests {
     }
 
     #[test]
-    fn ls_alias_parses_as_list() {
-        let cli = parse(&["ls"]);
-        assert!(matches!(cli.command, super::Commands::List { .. }));
+    fn removed_ls_alias_does_not_parse_as_list() {
+        assert_eq!(
+            parse_err(&["ls"]).kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
     }
 
     #[test]
