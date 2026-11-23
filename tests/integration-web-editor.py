@@ -378,7 +378,7 @@ roots = [p for p in Path("/tmp").glob("coop-we-*")
          if p.is_dir() and (p / "config.yaml").exists()]
 if len(roots) != 1:
     print("dir=" + ("none" if not roots else "multiple") +
-          " marker=unknown load=unknown active=unknown")
+          " marker=unknown load=unknown active=unknown shell=unknown state=unknown wait=unknown")
 else:
     root = roots[0]
     try:
@@ -394,7 +394,32 @@ else:
     load = load if load in ("loaded", "not-found", "masked", "error") else "unknown"
     active = active if active in ("active", "activating", "inactive", "failed", "deactivating") else "unknown"
     marker = "present" if (root / "launched").is_file() else "missing"
-    print(f"dir=one marker={marker} load={load} active={active}")
+    needle = f"session_socket={root}/session.sock".encode()
+    shells = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            with (proc / "cmdline").open("rb") as command_line:
+                args = command_line.read(4096).split(b"\0")
+            if args and args[0].endswith(b"bash") and needle in b"\0".join(args):
+                shells.append(proc)
+                if len(shells) > 1:
+                    break
+        except OSError:
+            pass
+    shell = "one" if len(shells) == 1 else ("none" if not shells else "multiple")
+    state = wait = "unknown"
+    if shell == "one":
+        try:
+            state = (shells[0] / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            state = state if state in ("R", "S", "D", "T", "Z", "I") else "unknown"
+            wchan = (shells[0] / "wchan").read_text().strip()
+            wait = next((label for text, label in (("pipe", "pipe"), ("poll", "poll"),
+                         ("select", "select"), ("futex", "futex"), ("wait", "wait"))
+                         if text in wchan), "other")
+        except (OSError, IndexError):
+            state = wait = "unknown"
+    print(f"dir=one marker={marker} load={load} active={active} "
+          f"shell={shell} state={state} wait={wait}")
 '''
     result = bounded_guest_probe(command, name, probe)
     if result is not None:
@@ -403,7 +428,9 @@ else:
         if code == 0 and re.fullmatch(
             r"dir=(none|one|multiple) marker=(unknown|missing|present) "
             r"load=(unknown|loaded|not-found|masked|error) "
-            r"active=(unknown|active|activating|inactive|failed|deactivating)", line
+            r"active=(unknown|active|activating|inactive|failed|deactivating) "
+            r"shell=(unknown|none|one|multiple) state=(unknown|R|S|D|T|Z|I) "
+            r"wait=(unknown|pipe|poll|select|futex|wait|other)", line
         ):
             print(f"EDITOR_LAUNCH_PROBE guest_ssh=reachable {line}", flush=True)
             return
