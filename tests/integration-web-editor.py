@@ -56,7 +56,7 @@ def reader(pipe):
 
 
 @contextlib.contextmanager
-def editor(command):
+def editor(command, launch_probe=None):
     child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
     try:
@@ -64,13 +64,23 @@ def editor(command):
         diagnostics = []
         url = password_path = None
         deadline = time.monotonic() + 2120
+        launch_waiting = False
+        launch_probes = 0
         while time.monotonic() < deadline:
-            line = lines.get(timeout=2130)
+            try:
+                line = lines.get(timeout=min(30, max(0.1, deadline - time.monotonic())))
+            except queue.Empty:
+                if launch_waiting and launch_probe is not None and launch_probes < 5:
+                    launch_probe()
+                    launch_probes += 1
+                continue
             if line is None:
                 raise AssertionError(f"editor exited before ready: {child.wait()}\n{''.join(diagnostics)}")
             diagnostics.append(line)
             diagnostics = diagnostics[-10:]
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
+            if "Starting code-server through guest systemd" in clean:
+                launch_waiting = True
             if "Open: " in clean:
                 url = clean.split("Open: ", 1)[1].strip()
             if "Password file: " in clean:
@@ -358,6 +368,48 @@ print(f"sshd_active={active} sshd_result={result} kernel_oom_lines={oom} sshd_wa
     print("EDITOR_FAILURE_SNAPSHOT guest_ssh=unavailable", flush=True)
 
 
+def launch_state_probe(command, name):
+    # Only allowlisted systemd state and marker presence reach the CI log.
+    probe = r'''
+from pathlib import Path
+import subprocess
+
+roots = [p for p in Path("/tmp").glob("coop-we-*")
+         if p.is_dir() and (p / "config.yaml").exists()]
+if len(roots) != 1:
+    print("dir=" + ("none" if not roots else "multiple") +
+          " marker=unknown load=unknown active=unknown")
+else:
+    root = roots[0]
+    try:
+        shown = subprocess.run(["systemctl", "show", root.name + ".service",
+                                "--property=LoadState,ActiveState"],
+                               capture_output=True, text=True, timeout=4)
+        fields = dict(line.split("=", 1) for line in shown.stdout.splitlines()
+                      if "=" in line) if shown.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired):
+        fields = {}
+    load = fields.get("LoadState")
+    active = fields.get("ActiveState")
+    load = load if load in ("loaded", "not-found", "masked", "error") else "unknown"
+    active = active if active in ("active", "activating", "inactive", "failed", "deactivating") else "unknown"
+    marker = "present" if (root / "launched").is_file() else "missing"
+    print(f"dir=one marker={marker} load={load} active={active}")
+'''
+    result = bounded_guest_probe(command, name, probe)
+    if result is not None:
+        code, output = result
+        line = output.decode("ascii", errors="ignore").strip()
+        if code == 0 and re.fullmatch(
+            r"dir=(none|one|multiple) marker=(unknown|missing|present) "
+            r"load=(unknown|loaded|not-found|masked|error) "
+            r"active=(unknown|active|activating|inactive|failed|deactivating)", line
+        ):
+            print(f"EDITOR_LAUNCH_PROBE guest_ssh=reachable {line}", flush=True)
+            return
+    print("EDITOR_LAUNCH_PROBE guest_ssh=unavailable", flush=True)
+
+
 def vm(binary, name, config):
     command = [binary] + (["--config", config] if config else [])
     default_launch = command + ["editor", name, "--web"]
@@ -376,7 +428,7 @@ def vm(binary, name, config):
         assert "Cannot bind editor SSH forward" in failed.stderr
         assert "editor.log" not in failed.stderr
     download_failure(command, name, launch)
-    with editor(launch) as (child, url, path):
+    with editor(launch, launch_probe=lambda: launch_state_probe(command, name)) as (child, url, path):
         assert parse_qs(urlsplit(url).query) == {"folder": [project]}
         password = path.read_text()
         assert request(url)[0] == 302

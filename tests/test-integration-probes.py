@@ -92,6 +92,23 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(output.getvalue().strip(), "EDITOR_FAILURE_SNAPSHOT " + expected)
                 self.assertNotIn("secret=", output.getvalue())
 
+        for guest_output, expected in [
+            ("dir=one marker=missing load=not-found active=inactive\n",
+             "guest_ssh=reachable dir=one marker=missing load=not-found active=inactive"),
+            ("dir=one marker=missing load=not-found active=inactive\nsecret=do-not-print\n",
+             "guest_ssh=unavailable"),
+        ]:
+            with self.subTest(guest_output=guest_output), tempfile.TemporaryDirectory() as directory:
+                fake_coop = Path(directory) / "coop"
+                fake_coop.write_text("#!/usr/bin/env python3\nimport sys\n"
+                                     "assert sys.argv[1:5] == ['shell', 'vm', '--', 'python3']\n"
+                                     "sys.stdout.write(" + repr(guest_output) + ")\n")
+                fake_coop.chmod(0o755)
+                with redirect_stdout(io.StringIO()) as output:
+                    module.launch_state_probe([str(fake_coop)], "vm")
+                self.assertEqual(output.getvalue().strip(), "EDITOR_LAUNCH_PROBE " + expected)
+                self.assertNotIn("secret=", output.getvalue())
+
     def test_grok_binary_requirement_tracks_rebuilt_image(self):
         fixture = functions("test_grok_bin_path") + '''
             pass() { pass_count=$((pass_count + 1)); }
