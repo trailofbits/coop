@@ -34,7 +34,7 @@ class ProbeTests(unittest.TestCase):
     def test_web_editor_lease_reports_why_it_ended(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
-        fixture = "set -euo pipefail\nlease_deadline=0\n" + lease + "\nlease\n"
+        fixture = "set -euo pipefail\nlease_deadline=0\nlease_fragment=\n" + lease + "\nlease\n"
         eof = subprocess.run(["bash", "-c", fixture], stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, timeout=3)
         self.assertEqual(eof.returncode, 0, eof.stderr)
@@ -58,6 +58,16 @@ class ProbeTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=3)
         self.assertEqual(unexpected.returncode, 0, unexpected.stderr)
         self.assertEqual(unexpected.stdout, "cancelled lease_bad_heartbeat\n")
+
+        partial = fixture.replace("lease_deadline=0", "lease_deadline=15").replace(
+            "\nlease\n", "\nread() {\n"
+            "    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=ali; return 142; fi\n"
+            "    heartbeat=ve; return 0\n"
+            "}\nlease\nlease\n[[ -z $lease_fragment ]]\nprintf 'continued\\n'\n")
+        resumed = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout, "continued\n")
 
     def test_web_editor_failure_snapshot_does_not_print_guest_text(self):
         path = Path(__file__).parent / "integration-web-editor.py"
