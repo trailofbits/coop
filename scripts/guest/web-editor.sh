@@ -54,7 +54,10 @@ IFS= read -r -t 15 password
 lease_deadline=$((SECONDS + 15))
 lease() {
     if IFS= read -r -t 1 heartbeat; then
-        [[ $heartbeat == alive ]] || exit 0
+        if [[ $heartbeat != alive ]]; then
+            printf 'cancelled lease_bad_heartbeat\n' || true
+            exit 0
+        fi
         lease_deadline=$((SECONDS + 15))
     else
         read_status=$?

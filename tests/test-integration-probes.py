@@ -54,6 +54,11 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(alive.returncode, 0, alive.stderr)
         self.assertEqual(alive.stdout, "continued\n")
 
+        unexpected = subprocess.run(["bash", "-c", fixture], input="invalid\n",
+                                    capture_output=True, text=True, timeout=3)
+        self.assertEqual(unexpected.returncode, 0, unexpected.stderr)
+        self.assertEqual(unexpected.stdout, "cancelled lease_bad_heartbeat\n")
+
     def test_web_editor_failure_snapshot_does_not_print_guest_text(self):
         path = Path(__file__).parent / "integration-web-editor.py"
         spec = importlib.util.spec_from_file_location("integration_web_editor", path)
