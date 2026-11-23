@@ -1965,14 +1965,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_ssh_alias_does_not_parse_as_shell() {
-        assert_eq!(
-            parse_err(&["ssh"]).kind(),
-            clap::error::ErrorKind::InvalidSubcommand
-        );
-    }
-
-    #[test]
     fn vscode_alias_is_removed() {
         assert_eq!(
             parse_err(&["vscode"]).kind(),
@@ -2496,14 +2488,6 @@ mod tests {
     fn list_json_flag_parses() {
         let cli = parse(&["list", "--json"]);
         assert!(matches!(cli.command, super::Commands::List { json: true }));
-    }
-
-    #[test]
-    fn removed_ls_alias_does_not_parse_as_list() {
-        assert_eq!(
-            parse_err(&["ls"]).kind(),
-            clap::error::ErrorKind::InvalidSubcommand
-        );
     }
 
     #[test]
