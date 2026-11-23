@@ -5552,6 +5552,12 @@ test_project_agent_workflow() {
     echo "=== Phase: project and agent workflow ==="
 
     local agent_ws agent_name rc=0 pre_list post_list
+    # Hosted Lima can spend most of 180 seconds restarting a stopped VM
+    # before `up` reaches agent bootstrap. Keep the existing Linux bound.
+    local up_timeout=180
+    if [[ "$(uname -s)" == Darwin ]]; then
+        up_timeout=360
+    fi
     local binary_args=("$BINARY")
     if [[ -n "${SUITE_CONFIG:-}" ]]; then
         binary_args+=(--config "$SUITE_CONFIG")
@@ -5560,7 +5566,7 @@ test_project_agent_workflow() {
     agent_name=${agent_ws##*/}
     agent_name=${agent_name//[!a-zA-Z0-9_-]/-}
 
-    ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up \
+    ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up \
         >"$tmpdir/agent_up_out" 2>"$tmpdir/agent_up_err" ) || rc=$?
     if [[ $rc -ne 0 ]]; then
         fail "up creates project instance" "exit: $rc; stderr: $(cat "$tmpdir/agent_up_err")"
@@ -5601,7 +5607,7 @@ test_project_agent_workflow() {
     fi
 
     pre_list=$("${binary_args[@]}" list 2>/dev/null | sort)
-    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ); then
+    if ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up >/dev/null 2>&1 ); then
         post_list=$("${binary_args[@]}" list 2>/dev/null | sort)
         if [[ "$pre_list" == "$post_list" ]]; then
             pass "up reuses running project instance"
@@ -5616,7 +5622,7 @@ test_project_agent_workflow() {
         fail "stop project instance before restart" "exit code: $?"
         return
     fi
-    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ) \
+    if ( cd "$agent_ws" && _timeout "$up_timeout" "${binary_args[@]}" up >/dev/null 2>&1 ) \
         && "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
         pass "up restarts stopped project instance"
     else
