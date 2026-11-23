@@ -45,9 +45,10 @@ macOS runners install the SHA-256-pinned Lima 2.3.0 release to avoid a
 New runs on the same ref cancel the previous integration run.
 It enables `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the
 integration output per OS and shard as a seven-day artifact. Linux suite steps
-have a 30-minute timeout (35 minutes for the job); macOS shards have
-135-minute suite timeouts (150 minutes for the job). macOS allows 30
-minutes for golden image provisioning, including automatic profile builds.
+have a 60-minute timeout (65 minutes for the job): guest package
+installation can vary substantially between CI runners. macOS shards have
+135-minute suite timeouts (150 minutes for the job). macOS allows 30 minutes for
+golden image provisioning, including automatic profile builds.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. The Linux jobs cover Firecracker; the macOS jobs
