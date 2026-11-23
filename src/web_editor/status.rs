@@ -106,6 +106,21 @@ fn parse(line: &[u8]) -> Result<Event> {
                 "failed systemd_launch launch_failed" => {
                     "Guest systemd could not launch code-server; check passwordless sudo, systemd and guest storage"
                 }
+                "failed systemd_launch unit_missing" => {
+                    "Guest editor systemd unit was not created before the launch deadline"
+                }
+                "failed systemd_launch unit_failed" => {
+                    "Guest editor systemd unit failed before the launch marker appeared"
+                }
+                "failed systemd_launch unit_active_no_marker" => {
+                    "Guest editor systemd unit was active without its launch marker"
+                }
+                "failed systemd_launch unit_activating" => {
+                    "Guest editor systemd unit remained activating past the launch deadline"
+                }
+                "failed systemd_launch launch_timeout" => {
+                    "Guest editor systemd launch did not complete before the deadline"
+                }
                 "failed code_server exited" => {
                     "Guest editor service exited; inspect ~/.local/share/coop-web-editor/editor.log in the VM"
                 }
@@ -265,6 +280,26 @@ mod tests {
             (
                 "failed systemd_launch launch_failed",
                 "Guest systemd could not launch code-server; check passwordless sudo, systemd and guest storage",
+            ),
+            (
+                "failed systemd_launch unit_missing",
+                "Guest editor systemd unit was not created before the launch deadline",
+            ),
+            (
+                "failed systemd_launch unit_failed",
+                "Guest editor systemd unit failed before the launch marker appeared",
+            ),
+            (
+                "failed systemd_launch unit_active_no_marker",
+                "Guest editor systemd unit was active without its launch marker",
+            ),
+            (
+                "failed systemd_launch unit_activating",
+                "Guest editor systemd unit remained activating past the launch deadline",
+            ),
+            (
+                "failed systemd_launch launch_timeout",
+                "Guest editor systemd launch did not complete before the deadline",
             ),
             (
                 "failed code_server exited",

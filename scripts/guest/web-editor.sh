@@ -212,9 +212,27 @@ setsid sudo -n systemd-run --quiet --collect --wait --pipe --service-type=exec \
     --disable-workspace-trust --disable-proxy --disable-telemetry --disable-update-check "$project_arg" \
     </dev/null >/dev/null 2>&1 9>&- &
 child=$!
+launch_started=$SECONDS
 ready=0
 while kill -0 "$child" 2>/dev/null; do
     observe_launch
+    if (( !service_started && SECONDS - launch_started >= 120 )); then
+        # Report only a fixed category. systemctl output is guest-authored and
+        # must not be copied into the host status stream.
+        load_state=$(timeout 5 systemctl show "$unit" --property=LoadState --value 2>/dev/null) || load_state=unknown
+        active_state=$(timeout 5 systemctl show "$unit" --property=ActiveState --value 2>/dev/null) || active_state=unknown
+        if [[ $load_state == not-found ]]; then
+            reason=unit_missing
+        else
+            case $active_state in
+                failed) reason=unit_failed ;;
+                active) reason=unit_active_no_marker ;;
+                activating) reason=unit_activating ;;
+                *) reason=launch_timeout ;;
+            esac
+        fi
+        exit 1
+    fi
     if [[ $service_started == 1 && $ready == 0 ]] && curl -q --silent --fail --max-time 1 \
         --unix-socket "$socket" http://localhost/healthz >/dev/null; then
         printf 'ready\n'
