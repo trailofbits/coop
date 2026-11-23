@@ -162,8 +162,13 @@ On an unexpected failure, its CI log includes a bounded guest SSH reachability,
 sshd state, and recent kernel OOM/sshd warning count snapshot without journal
 text. A failed guest probe reports only that the snapshot was unavailable.
 For a focused run, use a disposable VM: this fixture stops and restarts it.
+The `--full --shard editor` suite path builds a fresh image, creates the primary
+VM, and runs this fixture without the other lifecycle phases. The focused
+macOS Intel diagnostic workflow uses this shard; it does not replace the full
+Lima integration gate.
 
 ```sh
+./tests/run-integration.sh --full --shard editor
 python3 tests/integration-web-editor.py --binary target/debug/coop --name TEST_VM --config TEST_CONFIG
 ```
 

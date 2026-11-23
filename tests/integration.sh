@@ -14,7 +14,8 @@ set -euo pipefail
 #   --profile LIST   Comma-separated profiles to install (default: none)
 #   --name NAME      Instance name prefix (default: test-<pid>)
 #   --full           Run extended tests (workspace sync, multi-instance)
-#   --shard NAME     Run all (default), lifecycle, workspace, config, or features phases.
+#   --shard NAME     Run all (default), lifecycle, workspace, config, features,
+#                    or the focused editor phase.
 #                    Named shards require --full and separate disposable hosts.
 #
 # Environment variables (override flags):
@@ -26,6 +27,7 @@ set -euo pipefail
 #                            Off by default because it wipes every coop-managed
 #                            instance on the host, including ones not owned by
 #                            this test run. Enable only on clean/CI hosts.
+#   COOP_TEST_BUILDER_TIMEOUT — Optional setup timeout for slow VM builders.
 
 # ── Defaults ──────────────────────────────────────────────────
 
@@ -65,7 +67,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|workspace|config|features)
+    lifecycle|workspace|config|features|editor)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -671,6 +673,9 @@ test_setup() {
     echo "=== Phase: setup ==="
 
     local args=(setup -y)
+    if [[ -n "${COOP_TEST_BUILDER_TIMEOUT:-}" ]]; then
+        args+=(--builder-timeout "$COOP_TEST_BUILDER_TIMEOUT")
+    fi
     # The full suite exercises `agent update --codex`; force the initial image
     # build so that test cannot silently reuse a pre-fix local template.
     if [[ "$FULL" == "1" ]]; then
@@ -9151,6 +9156,12 @@ EOF
 
     # Setup + primary instance
     run_timed_test test_setup
+    if [[ "$SHARD" == editor ]]; then
+        run_timed_test test_up_creates_primary_instance
+        run_timed_test test_web_editor
+        summary
+        return
+    fi
     # Keep the stateful primary-instance sequence together. Extended phases
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
