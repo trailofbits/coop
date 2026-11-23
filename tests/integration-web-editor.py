@@ -437,6 +437,29 @@ else:
     print("EDITOR_LAUNCH_PROBE guest_ssh=unavailable", flush=True)
 
 
+def restart_vm(command, name):
+    # Lima allows up to 300 seconds for SSH readiness on a cold restart.
+    # Leave a small margin for coop's cleanup and report only fixed categories.
+    try:
+        subprocess.run(command + ["start", name, "--no-agents"], check=True,
+                       capture_output=True, timeout=330)
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace") if error.stderr else ""
+        if "Timeout waiting for Lima to assign SSH port" in stderr:
+            reason = "ssh_port_timeout"
+        elif "Timeout waiting for SSH auth on port" in stderr:
+            reason = "ssh_auth_timeout"
+        elif "limactl start failed" in stderr:
+            reason = "limactl_start_failed"
+        else:
+            reason = "other_failure"
+        print(f"EDITOR_RESTART_FAILURE reason={reason}", flush=True)
+        raise
+    except subprocess.TimeoutExpired:
+        print("EDITOR_RESTART_FAILURE reason=host_command_timeout", flush=True)
+        raise
+
+
 def vm(binary, name, config):
     command = [binary] + (["--config", config] if config else [])
     default_launch = command + ["editor", name, "--web"]
@@ -505,7 +528,7 @@ def vm(binary, name, config):
                        check=True, capture_output=True, timeout=30)
         assert_guest_editor_stopped(command, name, guest_config, cgroup)
     subprocess.run(command + ["stop", name], check=True, capture_output=True, timeout=60)
-    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True, timeout=120)
+    restart_vm(command, name)
     with editor(launch) as (child, new_url, path):
         assert new_url != url
         assert request(new_url, "/", headers={"Cookie": cookie})[0] == 302
@@ -514,7 +537,7 @@ def vm(binary, name, config):
         assert request(new_url, "/healthz", headers={"Cookie": cookie})[0] == 200
         subprocess.run(command + ["stop", name], check=True, capture_output=True, timeout=60)
         assert child.wait(timeout=15) == 0
-    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True, timeout=120)
+    restart_vm(command, name)
     owner_death_before_ready(command, name, launch, project)
     # Abrupt owner death closes stdin; the cooperative guest stops its service
     # and exits SSH. A retry cleans stale private state and starts afresh.
