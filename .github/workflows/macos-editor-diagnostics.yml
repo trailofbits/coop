@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release -p coop
-          ./tests/integration.sh --binary "$GITHUB_WORKSPACE/target/release/coop" --full --shard editor 2>&1 \
+          ./tests/integration.sh --binary "$GITHUB_WORKSPACE/target/release/coop" --full --shard editor --profile '' 2>&1 \
             | tee "$RUNNER_TEMP/macos-editor-diagnostics.log"
 
       - name: Upload integration output
