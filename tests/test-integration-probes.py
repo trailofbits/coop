@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 SOURCE = (Path(__file__).parent / "integration.sh").read_text()
 
@@ -31,6 +32,23 @@ def shell(script, *, bash="bash", **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_editor_diagnostic_launch_deadline_stops_waiting(self):
+        path = Path(__file__).parent / "integration-web-editor.py"
+        spec = importlib.util.spec_from_file_location("integration_web_editor", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        command = [sys.executable, "-u", "-c",
+                   "import sys,time; print('Starting code-server through guest systemd', "
+                   "file=sys.stderr, flush=True); time.sleep(30)"]
+        probes = []
+        with patch.dict(os.environ, {"COOP_TEST_EDITOR_LAUNCH_TIMEOUT": "1"}):
+            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(
+                AssertionError, "guest systemd launch diagnostic deadline exceeded"
+            ):
+                with module.editor(command, launch_probe=lambda: probes.append(True)):
+                    self.fail("editor unexpectedly became ready")
+        self.assertEqual(probes, [True])
+
     def test_web_editor_lease_preserves_split_heartbeat(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]

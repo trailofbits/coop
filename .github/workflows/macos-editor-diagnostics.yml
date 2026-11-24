@@ -35,6 +35,7 @@ jobs:
         shell: bash
         env:
           COOP_TEST_BUILDER_TIMEOUT: 30m
+          COOP_TEST_EDITOR_LAUNCH_TIMEOUT: '180'
         run: |
           set -euo pipefail
           cargo build --release -p coop

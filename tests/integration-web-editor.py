@@ -64,15 +64,23 @@ def editor(command, launch_probe=None):
         diagnostics = []
         url = password_path = None
         deadline = time.monotonic() + 2120
+        diagnostic_limit = int(os.environ.get("COOP_TEST_EDITOR_LAUNCH_TIMEOUT", "0"))
         launch_waiting = False
+        launch_started = None
         launch_probes = 0
         while time.monotonic() < deadline:
+            wait_time = min(30, max(0.1, deadline - time.monotonic()))
+            if launch_started is not None and diagnostic_limit > 0:
+                wait_time = min(wait_time, max(0.1, launch_started + diagnostic_limit - time.monotonic()))
             try:
-                line = lines.get(timeout=min(30, max(0.1, deadline - time.monotonic())))
+                line = lines.get(timeout=wait_time)
             except queue.Empty:
                 if launch_waiting and launch_probe is not None and launch_probes < 5:
                     launch_probe()
                     launch_probes += 1
+                if launch_started is not None and diagnostic_limit > 0:
+                    if time.monotonic() - launch_started >= diagnostic_limit:
+                        raise AssertionError("guest systemd launch diagnostic deadline exceeded")
                 continue
             if line is None:
                 raise AssertionError(f"editor exited before ready: {child.wait()}\n{''.join(diagnostics)}")
@@ -81,6 +89,7 @@ def editor(command, launch_probe=None):
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
             if "Starting code-server through guest systemd" in clean:
                 launch_waiting = True
+                launch_started = time.monotonic()
             if "Open: " in clean:
                 url = clean.split("Open: ", 1)[1].strip()
             if "Password file: " in clean:
@@ -91,9 +100,13 @@ def editor(command, launch_probe=None):
                 return
         raise AssertionError("editor readiness timed out")
     finally:
-        if child.poll() is None:
-            child.send_signal(signal.SIGINT)
-            child.wait(timeout=20)
+        try:
+            if child.poll() is None:
+                child.send_signal(signal.SIGINT)
+                child.wait(timeout=20)
+        finally:
+            child.stdout.close()
+            child.stderr.close()
 
 
 def inspect_guest_editor(command, name, url, project):
