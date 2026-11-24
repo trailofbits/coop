@@ -352,10 +352,8 @@ impl CmdToken {
     /// `security find-generic-password …` entry seen by a Linux binary — its
     /// secret is unreachable from this host anyway).
     ///
-    /// The match is the exact inverse of [`Display`](fmt::Display): a command
-    /// that does not follow the canonical shape coop writes (including a
-    /// `cat` path not of the form `…/<name>.txt`) falls through to
-    /// `None` rather than being misattributed to a backend.
+    /// Recognizes commands written by [`Display`](fmt::Display) and older
+    /// file lookups written as `cat <path>` without the option terminator.
     pub fn parse(cmd: &str) -> Option<Self> {
         let body = cmd.strip_prefix("cmd:").map_or(cmd, str::trim_start);
         let words = shell_split(body)?;
@@ -400,7 +398,7 @@ impl CmdToken {
                     },
                 })
             }
-            ["cat", path] => {
+            ["cat", "--", path] | ["cat", path] => {
                 parse_file(Path::new(path)).map(|(dir, account)| Self::File { dir, account })
             }
             _ => None,
@@ -432,7 +430,7 @@ impl fmt::Display for CmdToken {
             ),
             Self::File { dir, account } => {
                 let path = file_backend_path(dir, account);
-                write!(f, "cmd:cat {}", shell_quote(&path.to_string_lossy()))
+                write!(f, "cmd:cat -- {}", shell_quote(&path.to_string_lossy()))
             }
         }
     }
@@ -786,7 +784,7 @@ mod tests {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let acc = account("trailofbits/coop");
         let cmd = store_file(SERVICE, &acc, "github_pat_xyz", tmp.path()).unwrap();
-        assert!(cmd.to_string().starts_with("cmd:cat "));
+        assert!(cmd.to_string().starts_with("cmd:cat -- "));
         assert_eq!(cmd.backend(), Backend::File);
         // Verify the file exists with the right contents and mode.
         let path = file_backend_path(&tmp.path().join(secret_subdir(SERVICE)), &acc);
@@ -1035,7 +1033,7 @@ esac
             Some(Backend::File)
         );
         assert_eq!(
-            backend_of("cmd:cat ~/.coop/state/anthropic/anthropic.txt"),
+            backend_of("cmd:cat -- ~/.coop/state/anthropic/anthropic.txt"),
             Some(Backend::File)
         );
         // A non-`.txt` suffix is still not a form coop writes.

@@ -194,7 +194,12 @@ run_mutants() {
   lasttag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
   if [[ -n "$lasttag" ]]; then
     printf 'Mutating src/*.rs lines changed since %s\n' "$lasttag"
-    cargo mutants --in-diff <(git diff "$lasttag" -- 'src/*.rs') -- --lib
+    (
+      diff_file="$(mktemp)" || exit 1
+      trap 'rm -f -- "$diff_file"' EXIT
+      git diff "refs/tags/$lasttag" -- 'src/*.rs' >"$diff_file" || exit 1
+      cargo mutants --in-diff "$diff_file" -- --lib
+    )
   else
     printf 'No prior tag found; mutating the logic-dense modules\n'
     cargo mutants \
