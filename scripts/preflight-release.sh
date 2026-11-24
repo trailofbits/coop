@@ -6,7 +6,8 @@ set -euo pipefail
 # Runs every check that gates a release from one machine, mirroring the CI
 # jobs (fmt, clippy, test, deny, the lightweight integration scripts) so a
 # doomed tag is never pushed, and adds the checks CI does not perform:
-#   - Cargo.toml / Cargo.lock / CHANGELOG / git-tag version agreement
+#   - committed Cargo.lock resolution and Cargo.toml / Cargo.lock /
+#     CHANGELOG / git-tag version agreement
 #   - release builds of all three target binaries (CI builds only the native
 #     target; a cross-compile break otherwise first surfaces on the tag, which
 #     burns the version under immutable releases)
@@ -101,6 +102,10 @@ check_worktree() {
     warn "Untracked files present — confirm they are not meant for the release"
   fi
   return "$dirty"
+}
+
+check_lockfile() {
+  cargo metadata --locked --format-version 1 >/dev/null
 }
 
 check_versions() {
@@ -392,6 +397,13 @@ prompt_for_remote() {
 # ── Run ──────────────────────────────────────────────────────────
 
 step "Working tree clean" check_worktree
+section "Cargo.lock consistency"
+if check_lockfile; then
+  printf 'PASS: Cargo.lock consistency\n'
+else
+  printf 'FAIL: Cargo.lock consistency — refresh and commit Cargo.lock before preflight.\n'
+  exit 1
+fi
 step "Version consistency" check_versions
 step "Format (cargo fmt --check)" cargo fmt -- --check
 step "Clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
