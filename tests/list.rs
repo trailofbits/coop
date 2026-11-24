@@ -56,13 +56,10 @@ fn list_is_sorted_without_path_limactl() {
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
                 format!(
-                    "{:<16} {:<10} NETWORK\n{:<16} {:<10} {network}\n{:<16} {:<10} {network}\n",
+                    "Stopped\n{:<16} NETWORK\n{:<16} {network}\n{:<16} {network}\n",
                     "NAME",
-                    "STATE",
                     "alpha",
-                    alpha_state,
                     "beta",
-                    "stopped",
                     network = if cfg!(target_os = "linux") {
                         "open"
                     } else {

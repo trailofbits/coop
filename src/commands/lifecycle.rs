@@ -2240,24 +2240,42 @@ pub(crate) fn cmd_list(
         return json::render_json(&summaries);
     }
 
+    write_instance_list(std::io::stdout().lock(), &summaries)
+        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))
+}
+
+fn write_instance_list(
+    mut out: impl std::io::Write,
+    summaries: &[json::InstanceSummary<'_>],
+) -> std::io::Result<()> {
     if summaries.is_empty() {
-        writeln!(std::io::stdout(), "No instances found")
-            .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
-        return Ok(());
+        return writeln!(out, "No instances found");
     }
-    writeln!(std::io::stdout(), "{:<16} {:<10} NETWORK", "NAME", "STATE")
-        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
-    for summary in &summaries {
-        writeln!(
-            std::io::stdout(),
-            "{:<16} {:<10} {}",
-            summary.name.as_str(),
-            summary.state.label(),
-            summary
-                .network
-                .map_or("n/a", config::FirecrackerNetworkMode::as_str),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to write list: {e}"))?;
+
+    let mut separator = "";
+    for (state, heading) in [
+        (json::InstanceState::Running, "Running"),
+        (json::InstanceState::Stopped, "Stopped"),
+    ] {
+        let mut group = summaries
+            .iter()
+            .filter(|summary| summary.state == state)
+            .peekable();
+        if group.peek().is_none() {
+            continue;
+        }
+        writeln!(out, "{separator}{heading}\n{:<16} NETWORK", "NAME")?;
+        for summary in group {
+            writeln!(
+                out,
+                "{:<16} {}",
+                summary.name.as_str(),
+                summary
+                    .network
+                    .map_or("n/a", config::FirecrackerNetworkMode::as_str),
+            )?;
+        }
+        separator = "\n";
     }
     Ok(())
 }
@@ -3138,6 +3156,52 @@ mod proofs {
 #[expect(clippy::expect_used, reason = "test code — panics are assertions")]
 mod tests {
     use crate::backend::VmBackend as _;
+
+    #[test]
+    fn instance_list_groups_running_before_stopped() {
+        use crate::commands::json::{InstanceState, InstanceSummary};
+        use crate::config::{FirecrackerNetworkMode, InstanceName};
+
+        let alpha = InstanceName::new("alpha").unwrap();
+        let beta = InstanceName::new("beta").unwrap();
+        let gamma = InstanceName::new("gamma").unwrap();
+        let summaries = [
+            InstanceSummary {
+                name: &alpha,
+                state: InstanceState::Stopped,
+                network: None,
+            },
+            InstanceSummary {
+                name: &beta,
+                state: InstanceState::Running,
+                network: Some(FirecrackerNetworkMode::Open),
+            },
+            InstanceSummary {
+                name: &gamma,
+                state: InstanceState::Running,
+                network: Some(FirecrackerNetworkMode::Isolated),
+            },
+        ];
+        let mut out = Vec::new();
+        super::write_instance_list(&mut out, &summaries).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Running\n\
+             NAME             NETWORK\n\
+             beta             open\n\
+             gamma            isolated\n\n\
+             Stopped\n\
+             NAME             NETWORK\n\
+             alpha            n/a\n"
+        );
+    }
+
+    #[test]
+    fn instance_list_reports_empty_inventory() {
+        let mut out = Vec::new();
+        super::write_instance_list(&mut out, &[]).unwrap();
+        assert_eq!(out, b"No instances found\n");
+    }
 
     #[test]
     fn restore_image_preflight_distinguishes_a_missing_image() {

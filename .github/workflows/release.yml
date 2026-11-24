@@ -62,7 +62,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: cargo build --locked --release --workspace --target ${{ matrix.target }}
 
       - name: Verify release binaries
         env:
