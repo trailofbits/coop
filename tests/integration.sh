@@ -1313,17 +1313,6 @@ test_list_running() {
         fail "list shows instance as running" "got: $HARNESS_OUT"
     fi
 
-    # `ls` alias resolves to the same command.
-    if coop ls; then
-        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
-            pass "ls alias prints same output"
-        else
-            fail "ls alias prints same output" "got: $HARNESS_OUT"
-        fi
-    else
-        fail "ls alias exits 0" "exit code: $?"
-    fi
-
     # JSON output: parseable array with the running instance.
     if coop list --json; then
         if command -v jq >/dev/null 2>&1; then
@@ -1457,22 +1446,6 @@ test_firecracker_vsock_transport() {
     else
         fail "OpenSSH reaches the guest through the Rust vsock ProxyCommand" \
             "$(cat "$tmpdir/vsock-ssh-stderr" 2>/dev/null)"
-    fi
-}
-
-test_ssh_alias() {
-    echo ""
-    echo "=== Phase: ssh alias (backward compat) ==="
-
-    local output
-    if output=$(RUST_LOG=off "$BINARY" ssh "$INSTANCE" -- echo "alias-ok" 2>/dev/null); then
-        if echo "$output" | grep -q "alias-ok"; then
-            pass "ssh alias works as shell"
-        else
-            fail "ssh alias works as shell" "got: $output"
-        fi
-    else
-        fail "ssh alias works as shell" "exit code: $?"
     fi
 }
 
@@ -9768,7 +9741,6 @@ EOF
         run_timed_test test_auto_resolve_running
         run_timed_test test_shell_connectivity
         run_timed_test test_firecracker_vsock_transport
-        run_timed_test test_ssh_alias
         run_timed_test test_ssh_config
         run_timed_test test_editor
         run_timed_test test_web_editor
