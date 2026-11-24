@@ -746,29 +746,24 @@ fn allocate_and_start(
         start_instance(be, &mut *cfg, &inst, opts, Some(image))
     })();
 
-    if let Err(error) = &result
-        && error.is::<crate::creation_hooks::CreationIncomplete>()
-    {
-        return result.map(|()| inst);
-    }
-    if let Err(e) = &result {
-        tracing::error!("Failed to start instance '{}': {e}", inst.name);
-        if let Ok(target) = be.ssh_target(cfg, &inst) {
-            port_forward::teardown_ssh_forwards(&inst, &target);
-        }
-        crate::proxy::stop(&inst);
-        if let Err(cleanup_err) = be.destroy_instance(cfg, &inst) {
-            tracing::warn!(
-                "Failed-start cleanup retained instance '{}': {cleanup_err}",
-                inst.name
-            );
-        }
-        if let Err(ssh_err) = workspace::remove_ssh_config(&inst) {
-            tracing::debug!("SSH config cleanup failed (non-fatal): {ssh_err}");
+    match result {
+        Ok(()) => Ok(inst),
+        Err(error) if error.is::<crate::creation_hooks::CreationIncomplete>() => Err(error),
+        Err(error) => {
+            tracing::error!("Failed to start instance '{}': {error}", inst.name);
+            if let Err(cleanup) = super::destroy_instance_with_host_cleanup(be, cfg, &inst) {
+                // The lock-held cleanup transaction retains the instance
+                // directory whenever helper identity cannot be verified.
+                return Err(error).context(format!(
+                    "Instance start failed and serialized host cleanup also failed; instance state was retained: {cleanup:#}"
+                ));
+            }
+            if let Err(ssh_err) = workspace::remove_ssh_config(&inst) {
+                tracing::debug!("SSH config cleanup failed (non-fatal): {ssh_err}");
+            }
+            Err(error)
         }
     }
-
-    result.map(|()| inst)
 }
 
 /// Find a stopped instance to restart, if applicable.
@@ -1098,7 +1093,7 @@ fn start_instance(
     }
     let payload = BootPayload::prepare(be, cfg, &inst.image, &opts.mounts, forwards)?;
     crate::creation_hooks::CreationState::select(cfg, opts.post_start_override)?.save(inst)?;
-    be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
+    let operation = be.create_and_start(cfg, inst, opts.disk, &opts.mounts)?;
     drop(image_lock);
 
     let inputs = FirstBootInputs {
@@ -1110,7 +1105,7 @@ fn start_instance(
         post_start_override: opts.post_start_override,
         persisted_guest_env: &opts.persisted_guest_env,
     };
-    provision_first_boot(be, cfg, inst, &inputs, &payload)
+    provision_first_boot(be, cfg, inst, &inputs, &payload, operation)
 }
 
 struct BootPayload {
@@ -1186,6 +1181,7 @@ fn provision_first_boot(
     inst: &config::Instance,
     inputs: &FirstBootInputs<'_>,
     payload: &BootPayload,
+    operation: backend::InstanceOperationGuard,
 ) -> Result<()> {
     let forwards = payload.forwards.as_slice();
     signal::check_shutdown()?;
@@ -1217,14 +1213,16 @@ fn provision_first_boot(
     }
     .save(inst)?;
     payload.files.install(&target)?;
-    bootstrap_on_boot(
-        be,
-        cfg,
-        inst,
-        &target,
-        inputs.no_agents,
-        backend::BootMode::FirstBoot,
-    )?;
+    publish_first_boot_helpers(operation, || {
+        bootstrap_on_boot(
+            be,
+            cfg,
+            inst,
+            &target,
+            inputs.no_agents,
+            backend::BootMode::FirstBoot,
+        )
+    })?;
 
     signal::check_shutdown()?;
 
@@ -1306,6 +1304,17 @@ fn provision_first_boot(
         target.connection_description(),
     );
     Ok(())
+}
+
+/// Run first-boot helper publication while retaining lifecycle serialization,
+/// then release it before later workspace sync and user hooks can block.
+fn publish_first_boot_helpers(
+    operation: backend::InstanceOperationGuard,
+    publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let result = publish();
+    drop(operation);
+    result
 }
 
 /// Emit a warning for each live-mounted host directory that contains a
@@ -1984,11 +1993,17 @@ fn stop_confirmed(
     // `be.stop` rechecks under the backend operation lock before mutating.
     let (stopped, outcome) = if allow_running {
         if let Some(running) = be.as_running(cfg, inst.clone())? {
-            // Tear down forwards before shutting down the VM so the
-            // control master can exit cleanly while SSH is still
-            // reachable.
-            port_forward::teardown_ssh_forwards(running.instance(), running.target());
-            be.stop(cfg, running)?
+            let helper_inst = running.instance().clone();
+            let helper_target = running.target().clone();
+            let mut cleanup = || {
+                // Reverse tunnels normally exit with their guest SSH
+                // transport. The backend invokes this callback under its
+                // operation lock before shutdown, preserving stable helper
+                // authority and excluding a concurrent restart.
+                port_forward::teardown_ssh_forwards(&helper_inst, &helper_target);
+                crate::proxy::stop(&helper_inst)
+            };
+            be.stop_with_cleanup(cfg, running, &mut cleanup)?
         } else {
             tracing::debug!("Instance '{}' is not running", inst.name);
             let stopped = be.as_stopped(inst.clone())?;
@@ -2004,9 +2019,10 @@ fn stop_confirmed(
         }
         (stopped, backend::StopOutcome::AlreadyStopped)
     };
-    // Tear down the credential proxy (issue #411) — best-effort, no-op when
-    // proxy mode was never on. Do this only after confirmed exit, but before
-    // backend cleanup so TAP deletion errors do not leave stale credentials.
+    // Reconcile credential-proxy state after confirmed exit. This is a no-op
+    // after the running path's pre-shutdown teardown, and handles helpers
+    // retained beside a VM that was already stopped. Do this before backend
+    // cleanup so TAP deletion errors do not leave stale credentials.
     cleanup_confirmed_stop(&stopped, |stopped| be.cleanup_stopped(cfg, stopped))?;
     // The `coop-<name>` SSH alias is left in place across stop: a stale
     // entry has no effect while the VM is down, and `coop start` refreshes
@@ -2189,7 +2205,7 @@ fn cleanup_confirmed_stop(
     stopped: &backend::StoppedInstance,
     cleanup: impl FnOnce(&backend::StoppedInstance) -> Result<()>,
 ) -> Result<()> {
-    crate::proxy::stop(stopped.instance());
+    crate::proxy::stop(stopped.instance())?;
     cleanup(stopped)
 }
 
@@ -2205,11 +2221,7 @@ pub(crate) fn cmd_destroy(
     } else {
         let inst = cfg.resolve_instance(name)?;
         tracing::info!("Destroying instance '{}'", inst.name);
-        if let Ok(target) = be.ssh_target(cfg, &inst) {
-            port_forward::teardown_ssh_forwards(&inst, &target);
-        }
-        crate::proxy::stop(&inst);
-        be.destroy_instance(cfg, &inst)?;
+        super::destroy_instance_with_host_cleanup(be, cfg, &inst)?;
         workspace::remove_ssh_config(&inst)?;
         tracing::info!("Instance '{}' destroyed", inst.name);
     }
@@ -2715,9 +2727,10 @@ fn reprovision_instance(
     // live guest would keep writing to the disk about to be replaced.
     // `cmd_stop` already does the whole sequence — forwards down before the
     // VM so the SSH control master exits while the guest is reachable, the
-    // stale-forward teardown for an already-stopped VM, and the best-effort
-    // `proxy::stop` (the guest's copy of the capability token dies with the
-    // disk; the first-boot bootstrap reissues it).
+    // stale-forward teardown for an already-stopped VM, and fail-closed proxy
+    // cleanup. Unverifiable helper identity aborts reprovision and retains the
+    // host state; the guest's copy of the capability token dies with the disk
+    // only after cleanup succeeds and first-boot bootstrap reissues it.
     //
     // It swallows a failed `as_running` probe, which is fine here: the
     // `as_stopped` proof below is what actually gates the disk swap.
@@ -2753,7 +2766,7 @@ fn reprovision_instance(
     // The name is copied out first: `as_stopped` consumes `inst`, and the
     // post-swap error context below needs it.
     let reprovisioned_name = inst.name.clone();
-    let stopped = be.as_stopped(inst)?;
+    let mut stopped = be.as_stopped(inst)?;
 
     // The replacement can be smaller than a previously resized disk. Record
     // the exact old length before the swap so no partial GiB is lost.
@@ -2800,8 +2813,6 @@ fn reprovision_instance(
             .with_context(partial)?;
     }
 
-    drop(stopped);
-
     signal::check_shutdown().with_context(partial)?;
 
     // The bootstrap pass reads `cfg.guest_env`, so fold the persisted set in
@@ -2825,8 +2836,11 @@ fn reprovision_instance(
         persisted_guest_env: &saved_guest_env,
     };
 
-    be.start_existing(cfg, &inst).with_context(partial)?;
-    provision_first_boot(be, cfg, &inst, &inputs, &payload).with_context(partial)?;
+    *stopped.instance_mut() = inst.clone();
+    let operation = be
+        .start_confirmed_stopped(cfg, stopped)
+        .with_context(partial)?;
+    provision_first_boot(be, cfg, &inst, &inputs, &payload, operation).with_context(partial)?;
 
     tracing::info!("Instance '{}' reprovisioned", inst.name);
     Ok(())
@@ -3193,6 +3207,50 @@ mod tests {
              Stopped\n\
              NAME             NETWORK\n\
              alpha            n/a\n"
+        );
+    }
+
+    #[test]
+    fn first_boot_helper_publication_retains_operation_lock() {
+        let root = crate::test_support::private_tempdir().unwrap();
+        let inst = super::config::Instance {
+            name: super::config::InstanceName::new("test").unwrap(),
+            index: super::config::InstanceIndex::new(0).unwrap(),
+            dir: root.path().join("instance"),
+            image: super::config::ImageName::new("default").unwrap(),
+            firecracker_control: super::config::FirecrackerControlMode::LegacyTcp,
+        };
+        std::fs::create_dir(&inst.dir).unwrap();
+        let operation = super::backend::InstanceOperationGuard::acquire(&inst).unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter_inst = inst.clone();
+        let waiter = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let _operation = super::backend::InstanceOperationGuard::acquire(&waiter_inst).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        attempt_rx.recv().unwrap();
+
+        super::publish_first_boot_helpers(operation, || {
+            assert!(
+                acquired_rx
+                    .recv_timeout(std::time::Duration::from_millis(150))
+                    .is_err(),
+                "concurrent destroy acquired the lock before helper publication"
+            );
+            std::fs::write(inst.dir.join("proxy-openai.pid"), "identity").unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inst.dir.join("proxy-openai.pid")).unwrap(),
+            "identity"
         );
     }
 
