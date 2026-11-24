@@ -312,7 +312,6 @@ enum Commands {
         guest_env: Vec<String>,
     },
     /// Open an interactive shell in the VM (or run a command non-interactively)
-    #[command(alias = "ssh")]
     Shell {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -336,22 +335,6 @@ enum Commands {
         #[arg(long)]
         ask: bool,
         /// Extra arguments passed to `claude`
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Open the Claude Code agent view inside the VM (`claude agents`)
-    #[command(
-        alias = "ca",
-        after_help = "If the remote TUI stops responding, type Enter, then ~. to disconnect. If your terminal remains broken afterward, run `stty sane`."
-    )]
-    ClaudeAgents {
-        /// Instance name (required if multiple instances exist)
-        #[arg(
-            value_parser = config::InstanceName::new,
-            add = ArgValueCandidates::new(completions::running_instance_candidates),
-        )]
-        name: Option<config::InstanceName>,
-        /// Extra arguments passed to `claude agents`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -407,7 +390,6 @@ enum Commands {
         all: bool,
     },
     /// List instances by name, state, and network mode
-    #[command(alias = "ls")]
     List {
         /// Emit machine-readable JSON instead of the text table
         #[arg(long)]
@@ -1279,12 +1261,6 @@ pub fn run() -> Result<()> {
                 ssh::AgentProgram::Claude,
             )
         }
-        Commands::ClaudeAgents { name, mut args } => {
-            let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Claude)?;
-            args.insert(0, "agents".to_string());
-            let claude_bin = guest::GuestUser::new(sess.target.user().as_ref())?.claude_bin();
-            ssh::run_interactive(&sess, &prepend_binary(claude_bin.as_ref(), args))
-        }
         Commands::Codex { name, ask, args } => {
             let sess = open_agent_session(&be, &cfg, name.as_ref(), AgentKind::Codex)?;
             let args = codex_launch_args(ask, args);
@@ -1967,12 +1943,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_alias_parses_as_shell() {
-        let cli = parse(&["ssh"]);
-        assert!(matches!(cli.command, super::Commands::Shell { .. }));
-    }
-
-    #[test]
     fn vscode_alias_is_removed() {
         assert_eq!(
             parse_err(&["vscode"]).kind(),
@@ -2012,19 +1982,6 @@ mod tests {
         };
         assert!(name.is_none());
         assert!(clean);
-    }
-
-    #[test]
-    fn ssh_config_does_not_collide_with_ssh_shell_alias() {
-        // `ssh` is an alias for `shell`; `ssh-config` is its own command.
-        assert!(matches!(
-            parse(&["ssh"]).command,
-            super::Commands::Shell { .. }
-        ));
-        assert!(matches!(
-            parse(&["ssh-config"]).command,
-            super::Commands::SshConfig { .. }
-        ));
     }
 
     #[test]
@@ -2191,28 +2148,31 @@ mod tests {
     }
 
     #[test]
-    fn claude_agents_subcommand_parses() {
-        let cli = parse(&["claude-agents"]);
-        assert!(matches!(cli.command, super::Commands::ClaudeAgents { .. }));
-    }
+    fn claude_agent_view_name_and_trailing_args_parse() {
+        let cli = parse(&["claude", "myvm", "--", "agents", "--cwd", "/workspace"]);
+        let super::Commands::Claude {
+            name, ask, args, ..
+        } = cli.command
+        else {
+            panic!("expected Claude variant");
+        };
+        assert!(!ask);
+        assert_eq!(
+            name.as_ref().map(super::config::InstanceName::as_str),
+            Some("myvm")
+        );
+        assert_eq!(args, vec!["agents", "--cwd", "/workspace"]);
 
-    #[test]
-    fn claude_agents_ca_alias_parses() {
-        let cli = parse(&["ca"]);
-        assert!(matches!(cli.command, super::Commands::ClaudeAgents { .. }));
-    }
-
-    #[test]
-    fn claude_agents_name_and_trailing_args_parse() {
-        let cli = parse(&["ca", "myvm", "--", "--cwd", "/workspace"]);
-        let super::Commands::ClaudeAgents { name, args, .. } = cli.command else {
-            panic!("expected ClaudeAgents variant");
+        let cli = parse(&["claude", "myvm", "--ask", "--", "agents"]);
+        let super::Commands::Claude { name, ask, args } = cli.command else {
+            panic!("expected Claude variant");
         };
         assert_eq!(
             name.as_ref().map(super::config::InstanceName::as_str),
             Some("myvm")
         );
-        assert_eq!(args, vec!["--cwd", "/workspace"]);
+        assert!(ask);
+        assert_eq!(args, vec!["agents"]);
     }
 
     #[test]
@@ -2509,12 +2469,6 @@ mod tests {
     fn list_json_flag_parses() {
         let cli = parse(&["list", "--json"]);
         assert!(matches!(cli.command, super::Commands::List { json: true }));
-    }
-
-    #[test]
-    fn ls_alias_parses_as_list() {
-        let cli = parse(&["ls"]);
-        assert!(matches!(cli.command, super::Commands::List { .. }));
     }
 
     #[test]

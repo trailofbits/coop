@@ -11,8 +11,13 @@
 
 ### Removed
 
+- Remove the `coop ssh` and `coop ls` aliases. Use `coop shell` and `coop list`,
+  respectively.
 - Remove the `coop vscode` alias. Update scripts to use `coop editor` for
   automatic editor selection or `coop editor --editor code` to select VS Code.
+- Remove `coop claude-agents` and `coop ca`. Open `coop claude` and press Left
+  Arrow for Agent View. Scripts can use `coop claude NAME -- agents` for direct
+  launch; this requires an explicit running instance name.
 
 ## v0.10.0
 

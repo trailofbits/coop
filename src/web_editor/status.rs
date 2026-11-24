@@ -109,6 +109,11 @@ fn parse(line: &[u8]) -> Result<Event> {
                 "failed code_server exited" => {
                     "Guest editor service exited; inspect ~/.local/share/coop-web-editor/editor.log in the VM"
                 }
+                "cancelled lease_stdin_eof" => "Guest editor lease ended because SSH stdin closed",
+                "cancelled lease_expired" => "Guest editor lease expired without a heartbeat",
+                "cancelled lease_bad_heartbeat" => {
+                    "Guest editor lease received an unexpected heartbeat"
+                }
                 _ => bail!("Invalid editor status line"),
             };
             return Ok(Event::Failed(message));
@@ -264,6 +269,18 @@ mod tests {
             (
                 "failed code_server exited",
                 "Guest editor service exited; inspect ~/.local/share/coop-web-editor/editor.log in the VM",
+            ),
+            (
+                "cancelled lease_stdin_eof",
+                "Guest editor lease ended because SSH stdin closed",
+            ),
+            (
+                "cancelled lease_expired",
+                "Guest editor lease expired without a heartbeat",
+            ),
+            (
+                "cancelled lease_bad_heartbeat",
+                "Guest editor lease received an unexpected heartbeat",
             ),
         ] {
             assert!(

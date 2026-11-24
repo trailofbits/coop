@@ -67,7 +67,7 @@ then requires the selected VM to be running.
 
 ### Just the names
 
-`coop list` (alias `ls`) groups instances by state and shows the selected network mode. It checks local backend state without probing over SSH.
+`coop list` groups instances by state and shows the selected network mode. It checks local backend state without probing over SSH.
 
 ```
 $ coop list

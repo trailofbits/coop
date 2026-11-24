@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
 
 #[test]
-fn list_and_ls_share_sorted_output_without_path_limactl() {
+fn list_is_sorted_without_path_limactl() {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let data = root.path().join("data");
@@ -29,47 +29,45 @@ fn list_and_ls_share_sorted_output_without_path_limactl() {
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
     let alpha_state = "stopped";
-    for command in ["list", "ls"] {
-        for json in [false, true] {
-            fs::write(&count, "").unwrap();
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_coop"));
-            cmd.args(["--config", config.to_str().unwrap(), command])
-                .env("LIMA_HOME", root.path())
-                .env("PATH", root.path());
-            if json {
-                cmd.arg("--json");
-            }
-            let output = cmd.output().unwrap();
-            assert!(output.status.success(), "{output:?}");
-            if json {
-                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                let mut expected = serde_json::json!([
-                    {"name": "alpha", "state": alpha_state, "network": null},
-                    {"name": "beta", "state": "stopped", "network": null},
-                ]);
-                if cfg!(target_os = "linux") {
-                    for entry in expected.as_array_mut().unwrap() {
-                        entry["network"] = serde_json::json!("open");
-                    }
-                }
-                assert_eq!(value, expected);
-            } else {
-                assert_eq!(
-                    String::from_utf8(output.stdout).unwrap(),
-                    format!(
-                        "Stopped\n{:<16} NETWORK\n{:<16} {network}\n{:<16} {network}\n",
-                        "NAME",
-                        "alpha",
-                        "beta",
-                        network = if cfg!(target_os = "linux") {
-                            "open"
-                        } else {
-                            "n/a"
-                        },
-                    ),
-                );
-            }
-            assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 0);
+    for json in [false, true] {
+        fs::write(&count, "").unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coop"));
+        cmd.args(["--config", config.to_str().unwrap(), "list"])
+            .env("LIMA_HOME", root.path())
+            .env("PATH", root.path());
+        if json {
+            cmd.arg("--json");
         }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let mut expected = serde_json::json!([
+                {"name": "alpha", "state": alpha_state, "network": null},
+                {"name": "beta", "state": "stopped", "network": null},
+            ]);
+            if cfg!(target_os = "linux") {
+                for entry in expected.as_array_mut().unwrap() {
+                    entry["network"] = serde_json::json!("open");
+                }
+            }
+            assert_eq!(value, expected);
+        } else {
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "Stopped\n{:<16} NETWORK\n{:<16} {network}\n{:<16} {network}\n",
+                    "NAME",
+                    "alpha",
+                    "beta",
+                    network = if cfg!(target_os = "linux") {
+                        "open"
+                    } else {
+                        "n/a"
+                    },
+                ),
+            );
+        }
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 0);
     }
 }

@@ -547,6 +547,7 @@ fn reverse_forward_master_args(control_path: &Path, target: &SshTarget) -> Resul
         "ForkAfterAuthentication=no".into(),
         "-S".into(),
         crate::openssh::literal_path(control_path, "proxy SSH control socket path")?,
+        "--".into(),
         target.addr(),
     ])
 }
@@ -563,6 +564,7 @@ fn reverse_forward_request_args(
         "forward".into(),
         "-R".into(),
         format!("127.0.0.1:{port}:127.0.0.1:{port}"),
+        "--".into(),
         target.addr(),
     ])
 }
@@ -904,6 +906,7 @@ mod tests {
                 "ForkAfterAuthentication=no",
                 "-S",
                 "/tmp/proxy-control.sock",
+                "--",
                 "ubuntu@192.0.2.2",
             ]
         );
@@ -916,6 +919,7 @@ mod tests {
                 "forward",
                 "-R",
                 "127.0.0.1:8788:127.0.0.1:8788",
+                "--",
                 "ubuntu@192.0.2.2",
             ]
         );
