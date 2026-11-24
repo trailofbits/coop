@@ -99,9 +99,14 @@ lease
                 self.assertNotIn("secret=", output.getvalue())
 
         for guest_output, expected in [
-            ("dir=one marker=missing load=not-found active=inactive shell=one state=S wait=pipe\n",
-             "guest_ssh=reachable dir=one marker=missing load=not-found active=inactive shell=one state=S wait=pipe"),
-            ("dir=one marker=missing load=not-found active=inactive shell=one state=S wait=pipe\nsecret=do-not-print\n",
+            ("dir=one marker=missing loop=present reported=missing load=not-found active=inactive "
+             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no\n",
+             "guest_ssh=reachable dir=one marker=missing loop=present reported=missing "
+             "load=not-found active=inactive shell=one state=S wait=wait children=2 "
+             "launch=yes curl=yes timeout=no other=no"),
+            ("dir=one marker=missing loop=present reported=missing load=not-found active=inactive "
+             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no\n"
+             "secret=do-not-print\n",
              "guest_ssh=unavailable"),
         ]:
             with self.subTest(guest_output=guest_output), tempfile.TemporaryDirectory() as directory:

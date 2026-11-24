@@ -378,7 +378,9 @@ roots = [p for p in Path("/tmp").glob("coop-we-*")
          if p.is_dir() and (p / "config.yaml").exists()]
 if len(roots) != 1:
     print("dir=" + ("none" if not roots else "multiple") +
-          " marker=unknown load=unknown active=unknown shell=unknown state=unknown wait=unknown")
+          " marker=unknown loop=unknown reported=unknown load=unknown active=unknown"
+          " shell=unknown state=unknown wait=unknown children=unknown"
+          " launch=unknown curl=unknown timeout=unknown other=unknown")
 else:
     root = roots[0]
     try:
@@ -394,6 +396,8 @@ else:
     load = load if load in ("loaded", "not-found", "masked", "error") else "unknown"
     active = active if active in ("active", "activating", "inactive", "failed", "deactivating") else "unknown"
     marker = "present" if (root / "launched").is_file() else "missing"
+    loop = "present" if (root / "launch-loop").is_file() else "missing"
+    reported = "present" if (root / "launch-reported").is_file() else "missing"
     needle = f"session_socket={root}/session.sock".encode()
     shells = []
     for proc in Path("/proc").glob("[0-9]*"):
@@ -407,7 +411,7 @@ else:
         except OSError:
             pass
     shell = "one" if len(shells) == 1 else ("none" if not shells else "multiple")
-    state = wait = "unknown"
+    state = wait = children = launch = curl = timeout = other = "unknown"
     if shell == "one":
         try:
             state = (shells[0] / "stat").read_text().rsplit(")", 1)[1].split()[0]
@@ -418,8 +422,27 @@ else:
                          if text in wchan), "other")
         except (OSError, IndexError):
             state = wait = "unknown"
-    print(f"dir=one marker={marker} load={load} active={active} "
-          f"shell={shell} state={state} wait={wait}")
+        try:
+            with (shells[0] / "task" / shells[0].name / "children").open("rb") as child_file:
+                child_ids = child_file.read(513)
+            if len(child_ids) <= 512:
+                ids = child_ids.split()
+                if len(ids) <= 8 and all(pid.isdigit() for pid in ids):
+                    kinds = []
+                    for pid in ids:
+                        with (Path("/proc") / pid.decode("ascii") / "comm").open("rb") as child_file:
+                            kinds.append(child_file.read(32).strip())
+                    children = str(len(ids)) if len(ids) < 3 else "3plus"
+                    launch = "yes" if any(k in (b"setsid", b"sudo", b"systemd-run") for k in kinds) else "no"
+                    curl = "yes" if b"curl" in kinds else "no"
+                    timeout = "yes" if b"timeout" in kinds else "no"
+                    other = "yes" if any(k not in (b"setsid", b"sudo", b"systemd-run",
+                                                   b"curl", b"timeout") for k in kinds) else "no"
+        except OSError:
+            pass
+    print(f"dir=one marker={marker} loop={loop} reported={reported} load={load} active={active} "
+          f"shell={shell} state={state} wait={wait} children={children} "
+          f"launch={launch} curl={curl} timeout={timeout} other={other}")
 '''
     result = bounded_guest_probe(command, name, probe)
     if result is not None:
@@ -427,10 +450,14 @@ else:
         line = output.decode("ascii", errors="ignore").strip()
         if code == 0 and re.fullmatch(
             r"dir=(none|one|multiple) marker=(unknown|missing|present) "
+            r"loop=(unknown|missing|present) reported=(unknown|missing|present) "
             r"load=(unknown|loaded|not-found|masked|error) "
             r"active=(unknown|active|activating|inactive|failed|deactivating) "
             r"shell=(unknown|none|one|multiple) state=(unknown|R|S|D|T|Z|I) "
-            r"wait=(unknown|pipe|poll|select|futex|wait|other)", line
+            r"wait=(unknown|pipe|poll|select|futex|wait|other) "
+            r"children=(unknown|0|1|2|3plus) "
+            r"launch=(unknown|yes|no) curl=(unknown|yes|no) "
+            r"timeout=(unknown|yes|no) other=(unknown|yes|no)", line
         ):
             print(f"EDITOR_LAUNCH_PROBE guest_ssh=reachable {line}", flush=True)
             return

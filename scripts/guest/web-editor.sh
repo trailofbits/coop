@@ -13,6 +13,9 @@ service_attempt=0
 service_started=0
 config="${socket%/*}/config.yaml"
 launch_marker="${socket%/*}/launched"
+# Distinguish a stalled launcher from a status line lost across SSH.
+loop_marker="${socket%/*}/launch-loop"
+reported_marker="${socket%/*}/launch-reported"
 unit="${socket%/*}"
 unit="${unit##*/}.service"
 cleanup() {
@@ -40,7 +43,8 @@ cleanup() {
         wait "$child" 2>/dev/null || true
     fi
     [[ -z $staging ]] || rm -rf -- "$staging"
-    rm -f -- "$socket" "$session_socket" "$config" "$launch_marker"
+    rm -f -- "$socket" "$session_socket" "$config" "$launch_marker" \
+        "$loop_marker" "$reported_marker"
     rmdir -- "${socket%/*}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -91,6 +95,7 @@ observe_launch() {
         stage=code_server
         reason=exited
         printf 'launched\n'
+        : > "$reported_marker" || true
     fi
 }
 
@@ -212,6 +217,7 @@ setsid sudo -n systemd-run --quiet --collect --wait --pipe --service-type=exec \
     --disable-workspace-trust --disable-proxy --disable-telemetry --disable-update-check "$project_arg" \
     </dev/null >/dev/null 2>&1 9>&- &
 child=$!
+: > "$loop_marker" || true
 launch_started=$SECONDS
 ready=0
 while kill -0 "$child" 2>/dev/null; do
