@@ -49,6 +49,36 @@ printf 'continued\n'
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout, "continued\n")
 
+        repeated = fixture + '''
+read() {
+    case ${reads:-0} in
+        0) reads=1; heartbeat=a; return 142 ;;
+        1) reads=2; heartbeat=li; return 142 ;;
+        *) heartbeat=ve; return 0 ;;
+    esac
+}
+lease
+lease
+lease
+[[ -z $lease_fragment ]]
+printf 'continued\n'
+'''
+        resumed = subprocess.run(["bash", "-c", repeated], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout, "continued\n")
+
+        for fragment in ("oops", "aliveX"):
+            with self.subTest(fragment=fragment):
+                partial = fixture + f'''
+read() {{ heartbeat={fragment}; return 142; }}
+lease
+'''
+                rejected = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
+                                          capture_output=True, text=True, timeout=3)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+
         invalid = fixture + '''
 read() { heartbeat=oops; return 0; }
 lease
