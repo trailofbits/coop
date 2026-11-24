@@ -2264,17 +2264,12 @@ fn write_instance_list(
         if group.peek().is_none() {
             continue;
         }
-        writeln!(
-            out,
-            "{separator}{heading}\n{:<16} {:<10} NETWORK",
-            "NAME", "STATE",
-        )?;
+        writeln!(out, "{separator}{heading}\n{:<16} NETWORK", "NAME")?;
         for summary in group {
             writeln!(
                 out,
-                "{:<16} {:<10} {}",
+                "{:<16} {}",
                 summary.name.as_str(),
-                summary.state.label(),
                 summary
                     .network
                     .map_or("n/a", config::FirecrackerNetworkMode::as_str),
@@ -3192,12 +3187,12 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "Running\n\
-             NAME             STATE      NETWORK\n\
-             beta             running    open\n\
-             gamma            running    isolated\n\n\
+             NAME             NETWORK\n\
+             beta             open\n\
+             gamma            isolated\n\n\
              Stopped\n\
-             NAME             STATE      NETWORK\n\
-             alpha            stopped    n/a\n"
+             NAME             NETWORK\n\
+             alpha            n/a\n"
         );
     }
 

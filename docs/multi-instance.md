@@ -72,12 +72,12 @@ then requires the selected VM to be running.
 ```
 $ coop list
 Running
-NAME             STATE      NETWORK
-my-project       running    n/a
+NAME             NETWORK
+my-project       n/a
 
 Stopped
-NAME             STATE      NETWORK
-another-project  stopped    n/a
+NAME             NETWORK
+another-project  n/a
 ```
 
 ### All instances

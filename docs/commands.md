@@ -422,7 +422,7 @@ coop destroy --all
 
 ### `list`
 
-Print running instances first, followed by stopped instances, with names sorted alphabetically within each section. Each row shows the state and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). The command checks local backend state without probing over SSH. Use `status` for resource usage or per-instance detail.
+Print running instances first, followed by stopped instances, with names sorted alphabetically within each section. Each row shows the name and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). The command checks local backend state without probing over SSH. Use `status` for resource usage or per-instance detail.
 
 ```
 coop list

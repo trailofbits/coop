@@ -1297,17 +1297,17 @@ test_list_running() {
         fail "list exits 0" "exit code: $?"
     fi
 
-    if echo "$HARNESS_OUT" | grep -q "^NAME *STATE"; then
-        pass "list prints NAME/STATE header"
+    if echo "$HARNESS_OUT" | grep -qE "^NAME +NETWORK\$"; then
+        pass "list prints NAME/NETWORK header"
     else
-        fail "list prints NAME/STATE header" "got: $HARNESS_OUT"
+        fail "list prints NAME/NETWORK header" "got: $HARNESS_OUT"
     fi
 
     local expected_network="open"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         expected_network="n/a"
     fi
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
+    if echo "$HARNESS_OUT" | sed -n '/^Running$/,/^Stopped$/p' | grep -qE "^${INSTANCE} +${expected_network}\$"; then
         pass "list shows instance as running"
     else
         fail "list shows instance as running" "got: $HARNESS_OUT"
@@ -1315,7 +1315,7 @@ test_list_running() {
 
     # `ls` alias resolves to the same command.
     if coop ls; then
-        if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +running +${expected_network}\$"; then
+        if echo "$HARNESS_OUT" | sed -n '/^Running$/,/^Stopped$/p' | grep -qE "^${INSTANCE} +${expected_network}\$"; then
             pass "ls alias prints same output"
         else
             fail "ls alias prints same output" "got: $HARNESS_OUT"
@@ -4413,7 +4413,7 @@ test_list_stopped() {
     if [[ "$(uname -s)" == "Darwin" ]]; then
         expected_network="n/a"
     fi
-    if echo "$HARNESS_OUT" | grep -qE "^${INSTANCE} +stopped +${expected_network}\$"; then
+    if echo "$HARNESS_OUT" | sed -n '/^Stopped$/,$p' | grep -qE "^${INSTANCE} +${expected_network}\$"; then
         pass "list shows instance as stopped"
     else
         fail "list shows instance as stopped" "got: $HARNESS_OUT"
