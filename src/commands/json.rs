@@ -23,8 +23,7 @@ pub(crate) fn render_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Instance run state — the closed set the human path prints as
-/// `"running"` / `"stopped"`.
+/// Instance run state serialized as `"running"` or `"stopped"`.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstanceState {
@@ -39,14 +38,6 @@ impl InstanceState {
             Self::Running
         } else {
             Self::Stopped
-        }
-    }
-
-    /// Human-readable label — the same tokens the text output prints.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Stopped => "stopped",
         }
     }
 }
@@ -157,8 +148,6 @@ mod tests {
         assert_eq!(to_value(&InstanceState::Stopped), json!("stopped"));
         assert_eq!(InstanceState::from_running(true), InstanceState::Running);
         assert_eq!(InstanceState::from_running(false), InstanceState::Stopped);
-        assert_eq!(InstanceState::Running.label(), "running");
-        assert_eq!(InstanceState::Stopped.label(), "stopped");
     }
 
     /// The backend token for the host — the only variant that exists in
