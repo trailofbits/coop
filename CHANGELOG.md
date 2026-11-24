@@ -11,6 +11,8 @@
 
 ### Removed
 
+- Remove the `coop ssh` and `coop ls` aliases. Use `coop shell` and `coop list`,
+  respectively.
 - Remove the `coop vscode` alias. Update scripts to use `coop editor` for
   automatic editor selection or `coop editor --editor code` to select VS Code.
 
