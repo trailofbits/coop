@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -556,6 +557,15 @@ fn rsync_base_args(target: &SshTarget, exclude_git: bool) -> Result<Vec<String>>
     Ok(args)
 }
 
+fn rsync_local_operand(path: &Path) -> Result<OsString> {
+    // A colon before the first slash selects a remote rsync endpoint.
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("Failed to resolve local rsync path {}", path.display()))?;
+    let mut operand = absolute.into_os_string();
+    operand.push("/");
+    Ok(operand)
+}
+
 pub(crate) fn rsync_push(
     target: &SshTarget,
     source: &Path,
@@ -593,11 +603,11 @@ fn rsync_to_guest(
     if matches!(mode, SyncMode::Mirror) {
         args.push("--delete".to_string());
     }
-    args.push(format!("{}/", source.display()));
-    args.push(format!("{}:{guest_path}/", target.addr()));
-
     let status = command
-        .args(&args)
+        .args(args)
+        .arg("--")
+        .arg(rsync_local_operand(source)?)
+        .arg(format!("{}:{guest_path}/", target.addr()))
         .status()
         .context("Failed to run rsync")?;
 
@@ -614,17 +624,20 @@ fn rsync_pull(
     operation: &PullOperation,
 ) -> Result<()> {
     require_guest_rsync(target)?;
-    let mut args = rsync_pull_args(target)?;
-    args.push(format!("{}:{guest_path}/", target.addr()));
+    let args = rsync_pull_args(target)?;
     // A compromised guest controls the remote rsync sender. Stage its file
     // list away from the destination, then apply the Git-metadata exclusion
     // again with the trusted host rsync during installation.
     let mut staging = operation.staging()?;
-    args.push(format!("{}/", staging.path()?.display()));
 
     let result = (|| {
         let mut command = locked_rsync_command(target, &args, operation)?;
-        let status = command.status().context("Failed to run rsync")?;
+        let status = command
+            .arg("--")
+            .arg(format!("{}:{guest_path}/", target.addr()))
+            .arg(rsync_local_operand(staging.path()?)?)
+            .status()
+            .context("Failed to run rsync")?;
 
         if !status.success() {
             bail!("rsync pull failed");
@@ -642,7 +655,7 @@ fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {
 
 fn locked_rsync_command(
     target: &SshTarget,
-    args: &[String],
+    args: &[impl AsRef<OsStr>],
     operation: &PullOperation,
 ) -> Result<Command> {
     let mut command = target.rsync_command()?;
@@ -657,7 +670,7 @@ fn install_staged_pull(
     dest: &Path,
     operation: &PullOperation,
 ) -> Result<()> {
-    let args = install_staged_pull_args(source, dest);
+    let args = install_staged_pull_args(source, dest)?;
     let mut command = locked_rsync_command(target, &args, operation)?;
     let status = command.status().context("Failed to install staged pull")?;
 
@@ -667,13 +680,14 @@ fn install_staged_pull(
     Ok(())
 }
 
-fn install_staged_pull_args(source: &Path, dest: &Path) -> Vec<String> {
-    vec![
-        "-a".to_string(),
-        format!("--exclude={GIT_EXCLUDE}"),
-        format!("{}/", source.display()),
-        format!("{}/", dest.display()),
-    ]
+fn install_staged_pull_args(source: &Path, dest: &Path) -> Result<Vec<OsString>> {
+    Ok(vec![
+        "-a".into(),
+        format!("--exclude={GIT_EXCLUDE}").into(),
+        "--".into(),
+        rsync_local_operand(source)?,
+        rsync_local_operand(dest)?,
+    ])
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -920,6 +934,7 @@ fn check_guest_dirty(target: &SshTarget, guest_path: &GuestPath) -> Result<()> {
 
     let output = target
         .ssh_command()?
+        .arg("--")
         .arg(target.addr())
         .arg(check_cmd.into_string())
         .output()
@@ -1463,9 +1478,10 @@ mod tests {
             let copied = read_args();
             assert!(!copied.iter().any(|arg| arg == "--delete"));
             assert_eq!(
-                &copied[..copied.len() - 2],
+                &copied[..copied.len() - 3],
                 rsync_base_args(&target, exclude_git).unwrap()
             );
+            assert_eq!(copied[copied.len() - 3], "--");
             rsync_push(&target, &source, &default_workspace_path(), exclude_git).unwrap();
             let mirrored = read_args();
             assert!(mirrored.iter().any(|arg| arg == "--delete"));
@@ -1810,6 +1826,54 @@ mod tests {
         };
         let err = resolve_host_dir(None, &state, "push").expect_err("no host_path");
         assert!(format!("{err}").contains("No host_path"));
+    }
+
+    #[test]
+    fn rsync_local_operands_keep_special_relative_names_local() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let cwd = std::env::current_dir().unwrap();
+        for name in [
+            OsStr::new("-workspace"),
+            OsStr::new("host:workspace"),
+            OsStr::new("workspace with spaces"),
+            OsStr::from_bytes(b"workspace-\xff"),
+        ] {
+            let operand = rsync_local_operand(Path::new(name)).unwrap();
+            assert_eq!(operand, cwd.join(name).join("").into_os_string());
+        }
+        assert_eq!(
+            rsync_local_operand(Path::new("/already/absolute")).unwrap(),
+            "/already/absolute/"
+        );
+        assert_eq!(
+            rsync_local_operand(Path::new("/already/link/../workspace")).unwrap(),
+            "/already/link/../workspace/"
+        );
+        assert!(rsync_local_operand(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn staged_pull_operands_follow_rsync_option_terminator() {
+        let args = install_staged_pull_args(Path::new("-source"), Path::new("host:dest")).unwrap();
+        let boundary = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args.len() - boundary, 3);
+        assert!(args[..boundary].iter().any(|arg| arg == "-a"));
+        assert!(
+            args[..boundary]
+                .iter()
+                .any(|arg| arg == "--exclude=.[gG][iI][tT]")
+        );
+        assert_eq!(
+            args[boundary + 1],
+            rsync_local_operand(Path::new("-source")).unwrap()
+        );
+        assert_eq!(
+            args[boundary + 2],
+            rsync_local_operand(Path::new("host:dest")).unwrap()
+        );
+        assert!(install_staged_pull_args(Path::new(""), Path::new("dest")).is_err());
+        assert!(install_staged_pull_args(Path::new("source"), Path::new("")).is_err());
     }
 
     #[test]
@@ -2463,7 +2527,8 @@ Host coop-other\n\
         assert!(!rsync_args.iter().any(|arg| arg == "--filter=+ /.git/***"));
 
         let staged_args =
-            install_staged_pull_args(Path::new("/pull-staging"), Path::new("/host/workspace"));
+            install_staged_pull_args(Path::new("/pull-staging"), Path::new("/host/workspace"))
+                .unwrap();
         assert!(
             staged_args
                 .iter()

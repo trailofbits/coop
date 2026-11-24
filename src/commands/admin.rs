@@ -237,7 +237,13 @@ fn wipe_data_dir(data_dir: &Path) {
     }
     if let Err(e) = std::fs::remove_dir_all(data_dir) {
         tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
-        if let Err(e) = Cmd::new("rm").arg("-rf").arg(data_dir).sudo().run() {
+        if let Err(e) = Cmd::new("rm")
+            .arg("-rf")
+            .arg("--")
+            .arg(data_dir)
+            .sudo()
+            .run()
+        {
             tracing::warn!(
                 "Failed to remove data dir {} (non-fatal): {e}",
                 data_dir.display()

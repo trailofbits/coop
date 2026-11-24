@@ -406,7 +406,7 @@ coop destroy --all
 
 ### `list`
 
-Print every instance with its state (`running` or `stopped`) and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). Reads from local on-disk state only — no SSH probing, so it returns instantly even when VMs are unreachable. Use `status` instead when you need resource usage or per-instance detail.
+Print running instances first, followed by stopped instances, with names sorted alphabetically within each section. Each row shows the name and selected network mode (`open`/`isolated` for Firecracker, `n/a` for Lima). The command checks local backend state without probing over SSH. Use `status` for resource usage or per-instance detail.
 
 ```
 coop list
@@ -414,7 +414,7 @@ coop list
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Emit a JSON array (`[{ "name", "state", "network" }, …]`) instead of the text table; `network` is `open`/`isolated` for Firecracker and `null` for Lima |
+| `--json` | Emit a JSON array (`[{ "name", "state", "network" }, …]`) sorted by name. The `network` value is `open`/`isolated` for Firecracker and `null` for Lima. |
 
 ### `status`
 
