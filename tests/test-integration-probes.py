@@ -96,7 +96,8 @@ printf 'continued\n'
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout, "continued\n")
 
-        for fragment in ("oops", "aliveX"):
+        for fragment, reason in (("oops", "lease_bad_fragment_prefix"),
+                                 ("aliveX", "lease_bad_fragment_long")):
             with self.subTest(fragment=fragment):
                 partial = fixture + f'''
 read() {{ heartbeat={fragment}; return 142; }}
@@ -105,7 +106,7 @@ lease
                 rejected = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
                                           capture_output=True, text=True, timeout=3)
                 self.assertEqual(rejected.returncode, 0, rejected.stderr)
-                self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+                self.assertEqual(rejected.stdout, f"cancelled {reason}\n")
 
         invalid = fixture + '''
 read() { heartbeat=oops; return 0; }
@@ -114,7 +115,28 @@ lease
         rejected = subprocess.run(["bash", "-c", invalid], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=3)
         self.assertEqual(rejected.returncode, 0, rejected.stderr)
-        self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+        self.assertEqual(rejected.stdout, "cancelled lease_bad_line_direct\n")
+
+        for prefix, suffix, reason in (("a", "oops", "lease_bad_line_after_fragment"),
+                                       ("", "", "lease_bad_line_empty")):
+            with self.subTest(reason=reason):
+                if prefix:
+                    reads = f'''read() {{
+    if [[ ${{reads:-0}} == 0 ]]; then reads=1; heartbeat={prefix}; return 142; fi
+    heartbeat={suffix}; return 0
+}}
+lease
+lease
+'''
+                else:
+                    reads = '''read() { heartbeat=; return 0; }
+lease
+'''
+                rejected = subprocess.run(["bash", "-c", fixture + "\n" + reads],
+                                          stdin=subprocess.DEVNULL, capture_output=True,
+                                          text=True, timeout=3)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout, f"cancelled {reason}\n")
 
         eof = subprocess.run(["bash", "-c", fixture + "\nlease\n"],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)

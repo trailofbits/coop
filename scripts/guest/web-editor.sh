@@ -56,10 +56,18 @@ lease_fragment=
 lease() {
     local heartbeat= read_status
     if IFS= read -r -t 1 heartbeat; then
+        local had_fragment=0
+        [[ -z $lease_fragment ]] || had_fragment=1
         heartbeat=$lease_fragment$heartbeat
         lease_fragment=
         if [[ $heartbeat != alive ]]; then
-            printf 'cancelled lease_bad_heartbeat\n' || true
+            if [[ -z $heartbeat ]]; then
+                printf 'cancelled lease_bad_line_empty\n' || true
+            elif ((had_fragment)); then
+                printf 'cancelled lease_bad_line_after_fragment\n' || true
+            else
+                printf 'cancelled lease_bad_line_direct\n' || true
+            fi
             exit 0
         fi
         lease_deadline=$((SECONDS + 15))
@@ -74,8 +82,12 @@ lease() {
         # incomplete line so its suffix is not mistaken for a new heartbeat.
         if [[ -n $heartbeat ]]; then
             lease_fragment+=$heartbeat
-            if [[ ${#lease_fragment} -gt 5 || alive != "$lease_fragment"* ]]; then
-                printf 'cancelled lease_bad_heartbeat\n' || true
+            if [[ ${#lease_fragment} -gt 5 ]]; then
+                printf 'cancelled lease_bad_fragment_long\n' || true
+                exit 0
+            fi
+            if [[ alive != "$lease_fragment"* ]]; then
+                printf 'cancelled lease_bad_fragment_prefix\n' || true
                 exit 0
             fi
         fi

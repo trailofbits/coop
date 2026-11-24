@@ -114,6 +114,21 @@ fn parse(line: &[u8]) -> Result<Event> {
                 "cancelled lease_bad_heartbeat" => {
                     "Guest editor lease received an unexpected heartbeat"
                 }
+                "cancelled lease_bad_line_empty" => {
+                    "Guest editor lease received an empty heartbeat line"
+                }
+                "cancelled lease_bad_line_after_fragment" => {
+                    "Guest editor lease received an unexpected heartbeat line after a partial read"
+                }
+                "cancelled lease_bad_line_direct" => {
+                    "Guest editor lease received an unexpected heartbeat line"
+                }
+                "cancelled lease_bad_fragment_long" => {
+                    "Guest editor lease received a heartbeat fragment longer than expected"
+                }
+                "cancelled lease_bad_fragment_prefix" => {
+                    "Guest editor lease received a heartbeat fragment with an unexpected prefix"
+                }
                 _ => bail!("Invalid editor status line"),
             };
             return Ok(Event::Failed(message));
@@ -281,6 +296,26 @@ mod tests {
             (
                 "cancelled lease_bad_heartbeat",
                 "Guest editor lease received an unexpected heartbeat",
+            ),
+            (
+                "cancelled lease_bad_line_empty",
+                "Guest editor lease received an empty heartbeat line",
+            ),
+            (
+                "cancelled lease_bad_line_after_fragment",
+                "Guest editor lease received an unexpected heartbeat line after a partial read",
+            ),
+            (
+                "cancelled lease_bad_line_direct",
+                "Guest editor lease received an unexpected heartbeat line",
+            ),
+            (
+                "cancelled lease_bad_fragment_long",
+                "Guest editor lease received a heartbeat fragment longer than expected",
+            ),
+            (
+                "cancelled lease_bad_fragment_prefix",
+                "Guest editor lease received a heartbeat fragment with an unexpected prefix",
             ),
         ] {
             assert!(
