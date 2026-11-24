@@ -57,7 +57,7 @@ fn list_and_ls_share_sorted_output_without_path_limactl() {
                 assert_eq!(
                     String::from_utf8(output.stdout).unwrap(),
                     format!(
-                        "{:<16} {:<10} NETWORK\n{:<16} {:<10} {network}\n{:<16} {:<10} {network}\n",
+                        "Stopped\n{:<16} {:<10} NETWORK\n{:<16} {:<10} {network}\n{:<16} {:<10} {network}\n",
                         "NAME",
                         "STATE",
                         "alpha",

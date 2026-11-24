@@ -67,13 +67,17 @@ then requires the selected VM to be running.
 
 ### Just the names
 
-`coop list` (alias `ls`) prints a minimal name/state table. It reads from local on-disk state only, so it's fast and works even when VMs are unreachable. Use it when you just need to remember what's available:
+`coop list` (alias `ls`) groups instances by state and shows the selected network mode. It checks local backend state without probing over SSH.
 
 ```
 $ coop list
-NAME             STATE
-another-project  stopped
-my-project       running
+Running
+NAME             STATE      NETWORK
+my-project       running    n/a
+
+Stopped
+NAME             STATE      NETWORK
+another-project  stopped    n/a
 ```
 
 ### All instances
