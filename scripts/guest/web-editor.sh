@@ -101,6 +101,17 @@ observe_launch() {
         : > "$reported_marker" || true
     fi
 }
+launch_child_running() {
+    local job
+    # The shell's job table tracks its child independently of its credentials.
+    # The previous kill -0 poll exited this loop while the child still ran.
+    while IFS= read -r job; do
+        if [[ $job == "$1" ]]; then
+            return 0
+        fi
+    done < <(jobs -pr)
+    return 1
+}
 
 version=4.146.0
 reason=unsupported_architecture
@@ -223,7 +234,7 @@ child=$!
 : > "$loop_marker" || true
 launch_started=$SECONDS
 ready=0
-while kill -0 "$child" 2>/dev/null; do
+while launch_child_running "$child"; do
     observe_launch
     if (( !service_started && SECONDS - launch_started >= 120 )); then
         # Report only a fixed category. systemctl output is guest-authored and

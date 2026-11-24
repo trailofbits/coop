@@ -32,6 +32,23 @@ def shell(script, *, bash="bash", **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_web_editor_tracks_running_launch_job_when_kill_probe_fails(self):
+        source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
+        running = re.search(r"^launch_child_running\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        result = shell("set -euo pipefail\n" + running + '''
+sleep 10 & other=$!
+sleep 10 & child=$!
+trap 'builtin kill "$other" "$child" 2>/dev/null || true' EXIT
+kill() { return 1; }
+! kill -0 "$child"
+launch_child_running "$child"
+builtin kill "$child"
+wait "$child" || true
+! launch_child_running "$child"
+launch_child_running "$other"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_editor_diagnostic_launch_deadline_stops_waiting(self):
         path = Path(__file__).parent / "integration-web-editor.py"
         spec = importlib.util.spec_from_file_location("integration_web_editor", path)
