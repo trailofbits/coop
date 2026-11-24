@@ -71,7 +71,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early|workspace-multi|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
+    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early|workspace-multi|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest|editor-primary|editor-mounted)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9778,6 +9778,32 @@ EOF
 
     # Setup + primary instance
     run_timed_test test_setup
+    if [[ "$SHARD" == editor-primary ]]; then
+        run_timed_test test_up_creates_primary_instance
+        run_timed_test test_web_editor
+        summary
+        return
+    fi
+    if [[ "$SHARD" == editor-mounted ]]; then
+        local mount_instance="${INSTANCE}-mnt"
+        local mount_dir="$tmpdir/editor-mount"
+        mkdir -p "$mount_dir"
+        printf 'mount-ready\n' > "$mount_dir/sentinel.txt"
+        if coop up "$mount_dir" --name "$mount_instance" --no-agents --mount; then
+            STARTED_INSTANCES+=("$mount_instance")
+            GUEST_INSTANCE="$mount_instance"
+            if guest_exec test -f /workspace/sentinel.txt; then
+                pass "mounted workspace visible in guest"
+                run_timed_test test_web_editor "$mount_instance"
+            else
+                fail "mounted workspace visible in guest"
+            fi
+        else
+            fail "up --mount exits 0"
+        fi
+        summary
+        return
+    fi
     # Each lifecycle half uses its own primary VM on macOS; the unsharded and
     # Linux lifecycle paths retain the complete stateful sequence.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle || "$SHARD" == lifecycle-early || "$SHARD" == lifecycle-late ]]; then

@@ -13,13 +13,13 @@ concurrency:
 
 jobs:
   editor:
-    name: Editor in ${{ matrix.shard }} (macos-15-intel / Lima)
+    name: Browser editor (${{ matrix.shard }} / macos-15-intel / Lima)
     runs-on: macos-15-intel
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        shard: [lifecycle-early, workspace-early]
+        shard: [editor-primary, editor-mounted]
     defaults:
       run:
         shell: bash
@@ -36,16 +36,16 @@ jobs:
           sudo tar -xzf "$RUNNER_TEMP/lima.tgz" -C /usr/local
           /usr/local/bin/limactl --version
 
-      - name: Run failing macOS shard
+      - name: Run focused editor fixture
         timeout-minutes: 135
         env:
-          COOP_TEST_DESTRUCTIVE: "1"
-          COOP_TEST_SKIP_BRIDGE: "1"
           COOP_TEST_BUILDER_TIMEOUT: 30m
           SHARD: ${{ matrix.shard }}
         run: |
-          set -o pipefail
-          ./tests/run-integration.sh --full --shard "$SHARD" 2>&1 \
+          set -euo pipefail
+          cargo build --release -p coop
+          ./tests/integration.sh --binary "$GITHUB_WORKSPACE/target/release/coop" \
+            --full --shard "$SHARD" --profile '' 2>&1 \
             | tee "$RUNNER_TEMP/macos-editor-diagnostics.log"
 
       - name: Upload integration output
