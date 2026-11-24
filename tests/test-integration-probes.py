@@ -43,7 +43,7 @@ ready=1
 launch_started=$SECONDS
 lease() { builtin kill "$child" 2>/dev/null || true; }
 # Simulate the service marker appearing as the launcher is polled.
-jobs() { builtin jobs "$@"; : > "$launch_marker"; }
+jobs() { : > "$launch_marker"; builtin jobs "$@"; }
 kill() { return 1; }
 sleep 10 & child=$!
 trap 'builtin kill "$child" 2>/dev/null || true' EXIT
