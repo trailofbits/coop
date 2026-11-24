@@ -161,6 +161,27 @@ pub(crate) enum Decision {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum BindingRecovery {
+    NewVm,
+    ExistingVm,
+}
+
+impl BindingRecovery {
+    fn instruction(self, inst: &Instance, entry: &RepoSlug) -> String {
+        match self {
+            Self::NewVm => format!(
+                "After the failed VM is cleaned up, rerun your original `coop up` command with `--pat-entry {entry}`. If cleanup retained VM {}, run `coop github assign-pat --vm {} --repo {entry}` instead",
+                inst.name, inst.name
+            ),
+            Self::ExistingVm => format!(
+                "Run `coop github assign-pat --vm {} --repo {entry}`",
+                inst.name
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PromptContext {
     pub(crate) is_tty: bool,
     pub(crate) is_ci: bool,
@@ -241,14 +262,52 @@ fn save_never(inst: &Instance) -> Result<()> {
     )
 }
 
-/// Bind before the VM boots. `--pat-entry` is a non-interactive, explicit choice.
-pub(crate) fn maybe_prompt(
+/// Bind before a new VM boots. `--pat-entry` is a non-interactive, explicit choice.
+pub(crate) fn maybe_prompt_new_vm(
     cfg: &mut CoopConfig,
     config_path: &Path,
     inst: &Instance,
     hint: &RepoHint,
     no_prompt: bool,
     pat_entry: Option<&RepoSlug>,
+) -> Result<()> {
+    maybe_prompt(
+        cfg,
+        config_path,
+        inst,
+        hint,
+        no_prompt,
+        pat_entry,
+        BindingRecovery::NewVm,
+    )
+}
+
+pub(crate) fn maybe_prompt_existing_vm(
+    cfg: &mut CoopConfig,
+    config_path: &Path,
+    inst: &Instance,
+    hint: &RepoHint,
+    no_prompt: bool,
+) -> Result<()> {
+    maybe_prompt(
+        cfg,
+        config_path,
+        inst,
+        hint,
+        no_prompt,
+        None,
+        BindingRecovery::ExistingVm,
+    )
+}
+
+fn maybe_prompt(
+    cfg: &mut CoopConfig,
+    config_path: &Path,
+    inst: &Instance,
+    hint: &RepoHint,
+    no_prompt: bool,
+    pat_entry: Option<&RepoSlug>,
+    recovery: BindingRecovery,
 ) -> Result<()> {
     if let Some(key) = pat_entry {
         if !matches!(cfg.github, Some(GitHubAuth::Pat(_))) {
@@ -320,7 +379,7 @@ pub(crate) fn maybe_prompt(
             return Ok(());
         }
     };
-    finish_choice(cfg, config_path, inst, selected)
+    finish_choice(cfg, config_path, inst, selected, recovery)
 }
 
 fn finish_choice(
@@ -328,6 +387,7 @@ fn finish_choice(
     config_path: &Path,
     inst: &Instance,
     selected: RepoSlug,
+    recovery: BindingRecovery,
 ) -> Result<()> {
     if cfg
         .github
@@ -354,7 +414,7 @@ fn finish_choice(
         config_path,
     };
     github_pat::run_setup_pat(cfg, &opts)?;
-    bind_after_wizard(cfg, config_path, inst, &selected)
+    bind_after_wizard(cfg, config_path, inst, &selected, recovery)
 }
 
 fn bind_after_wizard(
@@ -362,12 +422,17 @@ fn bind_after_wizard(
     config_path: &Path,
     inst: &Instance,
     selected: &RepoSlug,
+    recovery: BindingRecovery,
 ) -> Result<()> {
+    let instruction = recovery.instruction(inst, selected);
     cfg.github = CoopConfig::load(config_path)
-        .with_context(|| format!("PAT entry {selected} was stored, but VM {} remains unbound. After repairing config, run coop github assign-pat --vm {} --repo {selected}", inst.name, inst.name))?
+        .with_context(|| format!("PAT entry {selected} was stored, but VM {} remains unbound. After repairing config: {instruction}", inst.name))?
         .github;
     if let Err(error) = crate::github_assignment::assign(cfg, inst, selected.clone()) {
-        return Err(error.context(format!("PAT entry {selected} exists, but VM {} remains unbound. Retry: coop github assign-pat --vm {} --repo {selected}", inst.name, inst.name)));
+        return Err(error.context(format!(
+            "PAT entry {selected} exists, but VM {} remains unbound. {instruction}",
+            inst.name
+        )));
     }
     Ok(())
 }
@@ -493,7 +558,7 @@ mod tests {
             Decision::Prompt
         );
         let key = RepoSlug::new("a/b").unwrap();
-        maybe_prompt(
+        maybe_prompt_new_vm(
             &mut cfg,
             &tmp.path().join("unused.toml"),
             &first,
@@ -512,7 +577,7 @@ mod tests {
         ));
         std::fs::write(second.dir.join("github_pat_prompt.json"), "{").unwrap();
         cfg.github_disabled = true;
-        maybe_prompt(
+        maybe_prompt_new_vm(
             &mut cfg,
             &tmp.path().join("unused.toml"),
             &second,
@@ -524,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_wizard_without_binding_reports_exact_recovery() {
+    fn completed_wizard_without_binding_reports_recovery_for_new_and_existing_vms() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(
@@ -542,16 +607,65 @@ mod tests {
             )
             .unwrap();
         std::fs::remove_dir_all(&inst.dir).unwrap();
+        let entry = RepoSlug::new("a/b").unwrap();
+        let new_vm_error = bind_after_wizard(
+            &mut cfg,
+            &config_path,
+            &inst,
+            &entry,
+            BindingRecovery::NewVm,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(new_vm_error.contains("VM lost remains unbound"));
+        assert!(
+            new_vm_error.contains("rerun your original `coop up` command with `--pat-entry a/b`")
+        );
+        assert!(new_vm_error.contains(
+            "If cleanup retained VM lost, run `coop github assign-pat --vm lost --repo a/b` instead"
+        ));
+
+        let existing_vm_error = bind_after_wizard(
+            &mut cfg,
+            &config_path,
+            &inst,
+            &entry,
+            BindingRecovery::ExistingVm,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(existing_vm_error.contains("VM lost remains unbound"));
+        assert!(existing_vm_error.contains("Run `coop github assign-pat --vm lost --repo a/b`"));
+        assert!(!existing_vm_error.contains("--pat-entry"));
+        assert!(!inst.dir.exists());
+    }
+
+    #[test]
+    fn invalid_config_after_wizard_reports_repair_before_retry() {
+        let tmp = crate::test_support::private_tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "not valid toml = [").unwrap();
+        let mut cfg = CoopConfig {
+            data_dir: crate::config::ConfigPath::new(tmp.path()),
+            ..CoopConfig::default()
+        };
+        let inst = cfg
+            .allocate_instance(
+                Some(&crate::config::InstanceName::new("lost").unwrap()),
+                &crate::config::ImageName::new("default").unwrap(),
+                None,
+            )
+            .unwrap();
         let error = bind_after_wizard(
             &mut cfg,
             &config_path,
             &inst,
             &RepoSlug::new("a/b").unwrap(),
+            BindingRecovery::NewVm,
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("VM lost remains unbound"));
-        assert!(error.contains("coop github assign-pat --vm lost --repo a/b"));
-        assert!(!inst.dir.exists());
+        assert!(error.contains("After repairing config:"));
+        assert!(error.contains("--pat-entry a/b"));
     }
 }
