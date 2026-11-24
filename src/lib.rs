@@ -12,6 +12,13 @@ mod commands;
 mod completions;
 pub mod config;
 mod creation_hooks;
+mod firecracker_install;
+#[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
+mod firecracker_jail;
+#[cfg(target_os = "linux")]
+mod firecracker_runtime;
+#[cfg_attr(target_os = "macos", expect(dead_code, reason = "Firecracker-only"))]
+mod firecracker_service;
 mod fs_util;
 mod github_assignment;
 mod github_pat;
@@ -82,13 +89,13 @@ use clap_complete::engine::ArgValueCandidates;
 
 use backend::VmBackend as _;
 use commands::{
-    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, QuickstartOpts,
-    ReprovisionOpts, ResizeOpts, RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts,
-    UpRuntimeOpts, apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit,
-    cmd_destroy, cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network,
-    cmd_profiles, cmd_proxy, cmd_quickstart, cmd_resize, cmd_restore, cmd_shell, cmd_start,
-    cmd_status, cmd_stop, cmd_uninstall, cmd_up, cmd_validate, codex_launch_args, grok_launch_args,
-    open_agent_session, preflight_start_target, prepend_binary, resolve_running,
+    AgentKind, AgentUpdateOpts, ProfileImageTarget, ProjectTransport, ReprovisionOpts, ResizeOpts,
+    RestoreMode, RestoreOpts, StartOpts, UninstallOpts, UpOpts, UpRuntimeOpts,
+    apply_runtime_guest_env, apply_vm_overrides, cmd_agent_update, cmd_commit, cmd_destroy,
+    cmd_exec, cmd_github, cmd_images, cmd_init, cmd_list, cmd_model, cmd_network, cmd_profiles,
+    cmd_proxy, cmd_resize, cmd_restore, cmd_shell, cmd_start, cmd_status, cmd_stop, cmd_uninstall,
+    cmd_up, cmd_validate, codex_launch_args, grok_launch_args, open_agent_session,
+    preflight_start_target, prepend_binary, resolve_running,
 };
 
 #[derive(Parser)]
@@ -219,17 +226,6 @@ enum Commands {
         /// values with the same name.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         guest_env: Vec<String>,
-    },
-    /// One-shot: ensure default image, start an instance for cwd, launch Claude.
-    ///
-    /// Re-runnable: if an instance already exists for the current workspace it
-    /// is reconnected (running) or restarted (stopped) instead of being
-    /// recreated. For per-instance tuning (profiles, mounts, image, ...) use
-    /// `coop setup` / `coop up` directly.
-    Quickstart {
-        /// Skip mounting the current directory as the workspace.
-        #[arg(long)]
-        no_workspace: bool,
     },
     /// Check prerequisites, install Firecracker, fetch kernel and build template rootfs
     Setup {
@@ -465,7 +461,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ModelAction>,
     },
-    /// Stream VM serial console logs
+    /// Show VM console logs
     Logs {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -473,7 +469,7 @@ enum Commands {
             add = ArgValueCandidates::new(completions::instance_candidates),
         )]
         name: Option<config::InstanceName>,
-        /// Follow log output
+        /// Follow log output (requires a running VM)
         #[arg(short, long)]
         follow: bool,
     },
@@ -530,7 +526,6 @@ enum Commands {
         command: Vec<String>,
     },
     /// Open a host editor over SSH, or a browser editor with --web
-    #[command(alias = "vscode")]
     Editor {
         /// Instance name (required if multiple instances exist)
         #[arg(
@@ -1196,9 +1191,6 @@ pub fn run() -> Result<()> {
             };
             cmd_up(&be, &mut cfg, &cli.config, &opts)
         }
-        Commands::Quickstart { no_workspace } => {
-            cmd_quickstart(&be, &mut cfg, &cli.config, &QuickstartOpts { no_workspace })
-        }
         Commands::Setup {
             yes,
             vcpus,
@@ -1373,13 +1365,29 @@ pub fn run() -> Result<()> {
             cmd_model(&be, &cfg, name.as_ref(), action.map(Into::into))
         }
         Commands::Logs { name, follow } => {
-            let running = resolve_running(&be, &cfg, name.as_ref())?;
-            let mode = if follow {
-                backend::LogMode::Follow
+            if follow {
+                let running = resolve_running(&be, &cfg, name.as_ref())?;
+                be.stream_logs(&cfg, &running, backend::LogMode::Follow)
             } else {
-                backend::LogMode::Snapshot
-            };
-            be.stream_logs(&cfg, &running, mode)
+                let mut instances = cfg.list_instances()?;
+                let selected = if let Some(name) = name.as_ref() {
+                    instances.into_iter().find(|inst| &inst.name == name)
+                } else if instances.len() == 1 {
+                    instances.pop()
+                } else {
+                    None
+                };
+                if let Some(inst) = selected {
+                    if let Some(running) = be.as_running(&cfg, inst.clone())? {
+                        be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                    } else {
+                        be.snapshot_stopped_logs(&inst)
+                    }
+                } else {
+                    let running = resolve_running(&be, &cfg, name.as_ref())?;
+                    be.stream_logs(&cfg, &running, backend::LogMode::Snapshot)
+                }
+            }
         }
         Commands::Push {
             name,
@@ -1685,20 +1693,19 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(std::iter::once("coop").chain(args)).is_err());
         }
-        for command in ["editor", "vscode"] {
-            assert!(matches!(
-                parse(&[command]).command,
-                crate::Commands::Editor {
-                    web: false,
-                    port: None,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                parse(&[command, "--web"]).command,
-                crate::Commands::Editor { web: true, .. }
-            ));
-        }
+        assert!(matches!(
+            parse(&["editor"]).command,
+            crate::Commands::Editor {
+                editor: None,
+                web: false,
+                port: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["editor", "--web"]).command,
+            crate::Commands::Editor { web: true, .. }
+        ));
     }
 
     #[test]
@@ -1966,18 +1973,25 @@ mod tests {
     }
 
     #[test]
-    fn vscode_alias_parses_as_editor() {
-        let cli = parse(&["vscode"]);
-        assert!(matches!(cli.command, super::Commands::Editor { .. }));
+    fn vscode_alias_is_removed() {
+        assert_eq!(
+            parse_err(&["vscode"]).kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
     }
 
     #[test]
     fn editor_kind_values_parse() {
-        let cli = parse(&["editor", "--editor", "zed"]);
-        let super::Commands::Editor { editor, .. } = cli.command else {
-            panic!("expected Editor variant");
-        };
-        assert_eq!(editor, Some(super::workspace::EditorKind::Zed));
+        for (value, kind) in [
+            ("code", super::workspace::EditorKind::Code),
+            ("zed", super::workspace::EditorKind::Zed),
+        ] {
+            let cli = parse(&["editor", "--editor", value]);
+            let super::Commands::Editor { editor, .. } = cli.command else {
+                panic!("expected Editor variant");
+            };
+            assert_eq!(editor, Some(kind));
+        }
     }
 
     #[test]
@@ -2815,30 +2829,6 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_subcommand_parses_with_defaults() {
-        let cli = parse(&["quickstart"]);
-        let super::Commands::Quickstart { no_workspace } = cli.command else {
-            panic!("expected Quickstart variant");
-        };
-        assert!(!no_workspace);
-    }
-
-    #[test]
-    fn quickstart_no_workspace_flag_parses() {
-        let cli = parse(&["quickstart", "--no-workspace"]);
-        let super::Commands::Quickstart { no_workspace, .. } = cli.command else {
-            panic!("expected Quickstart variant");
-        };
-        assert!(no_workspace);
-    }
-
-    #[test]
-    fn quickstart_rejects_unknown_flag() {
-        let err = parse_err(&["quickstart", "--name", "foo"]);
-        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    #[test]
     fn devcontainer_interface_is_removed() {
         assert!(matches!(parse(&["up"]).command, super::Commands::Up { .. }));
         for (args, expected) in [
@@ -2876,10 +2866,6 @@ mod tests {
             ),
             (
                 &["setup", "--dry-run"][..],
-                clap::error::ErrorKind::UnknownArgument,
-            ),
-            (
-                &["quickstart", "--no-devcontainer"][..],
                 clap::error::ErrorKind::UnknownArgument,
             ),
             (

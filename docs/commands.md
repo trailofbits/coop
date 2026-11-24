@@ -50,6 +50,10 @@ URL. That leaves the project with two matching instances, so later `coop up`
 runs report the ambiguity instead of choosing one — address the instances by
 name (`coop start <name>`, `coop shell <name>`) from then on.
 
+`up` uses the selected directory without a confirmation prompt. Check your
+current directory before running bare `coop up`; use a project directory rather
+than your home directory or `/`.
+
 By default, `up` copies/syncs the project into `/workspace`. Pass `--mount`
 to use the mount transport for the project at `/workspace` instead. On
 macOS/Lima this is a live virtiofs mount; on Linux/Firecracker it is a
@@ -110,6 +114,21 @@ recreate it with different creation options. Runtime startup options such as
 restarts an instance; if the matching instance is already running, stop it
 first so those options can take effect.
 
+For an empty guest workspace without copying a project, create a dedicated
+empty host directory and use it as the `up` project directory:
+
+```
+mkdir -p ~/coop-scratch-1
+coop up ~/coop-scratch-1 --name scratch-1
+coop codex scratch-1
+```
+
+`up` records the directory as the instance's project identity and copies its
+contents into `/workspace`; it does not create a VM with no project association.
+Use a new empty directory and name for each separate scratch VM. Reusing the
+same directory makes `up` reconnect to or restart its existing VM. Avoid
+pointing `up` at your home directory or `/` merely to create a scratch VM.
+
 Devcontainer files are ordinary workspace data; coop does not discover,
 translate, or execute them. Use coop profiles, `--env`, `--forward-port`,
 mounts, and `--post-start` explicitly. On first boot, `--post-start` runs after
@@ -126,47 +145,6 @@ disk settings, and old mounts. This is especially important on macOS, where a
 mount already recorded in a Lima VM remains a live writable host share when
 that VM restarts. Reprovisioning replaces the guest disk but does not remove
 the Lima VM's persisted mount configuration.
-
-### `quickstart`
-
-One-shot entry point: ensure the default image exists, bring up an instance for
-the current directory, and launch Claude Code inside it. Runs `setup`, `up`, and
-`claude` in sequence, short-circuiting any step that is already done.
-
-```
-coop quickstart [FLAGS]
-```
-
-`quickstart` uses the current directory as the project identity and copies it
-into `/workspace` when creating a new instance, as `coop up` does by default.
-`--no-workspace` skips that copy and project matching. After ensuring the
-default image exists, quickstart takes one of three branches:
-
-- **A running instance exists.** coop resumes any pending creation hook, then
-  connects and launches Claude Code without restarting or recreating the VM.
-- **A stopped instance exists.** coop restarts it (reusing the instance's own
-  image, not necessarily `default`) and launches Claude Code.
-- **No instance exists.** coop creates one for the workspace, then launches
-  Claude Code.
-
-Quickstart checks for the `default` image before looking up an existing VM. If
-the image is missing, it builds it even when the project already has a running
-instance. Setup runs non-interactively (no confirmation prompts).
-
-| Flag | Description |
-|------|-------------|
-| `--no-workspace` | Skip copying the current directory into the VM and skip project matching; quickstart creates a fresh instance. |
-
-```
-coop quickstart
-coop quickstart --no-workspace
-```
-
-`quickstart` takes no instance name or per-instance tuning flags. For control
-over profiles, mounts, image, resources, or named instances, use `coop setup`
-and `coop up` directly. When run from your `$HOME` or `/`, coop prompts before
-using that directory as a workspace (or fails in a non-TTY); pass
-`--no-workspace` to skip the copy.
 
 ### `init`
 
@@ -222,6 +200,9 @@ coop start [NAME] [FLAGS]
 create or reconnect to a project environment. Without `NAME`, `start` restarts
 the only stopped instance if exactly one exists; with multiple stopped
 instances, pass the instance name.
+On Linux, the first start after upgrading a stopped legacy Firecracker instance
+records the jailed launch version without replacing its disk. An unsupported
+runtime version blocks startup and retains the disk for inspection.
 
 | Flag | Description |
 |------|-------------|
@@ -400,10 +381,11 @@ Gracefully stop a running VM. The instance disk is preserved. Use `start` to rel
 
 On Linux, coop requests a guest reboot over SSH. Firecracker exits when the
 guest finishes shutting down. coop allows 10 seconds for this request and exit,
-then falls back to SIGTERM with a 10-second wait and SIGKILL with a 5-second
-wait. A guest that cannot shut down within the grace period can lose recent
-writes during forced termination. If termination cannot be confirmed, coop
-retains the PID file and socket so you can retry.
+then stops the systemd service and its cgroup. A legacy direct-launch VM retains
+the SIGTERM/SIGKILL fallback. A guest that cannot shut down within the grace
+period can lose recent writes during forced termination. If process death
+cannot be confirmed, coop retains the service evidence, PID file, socket, and
+TAP so you can inspect and retry.
 
 ```
 coop stop [NAME]
@@ -420,7 +402,9 @@ coop stop my-project
 
 ### `destroy`
 
-Stop the VM and remove its resources: disk, config, and SSH entries. Templates and the kernel are preserved unless you pass `--all`.
+Stop the VM and remove its resources: disk, config, SSH entries, and any stopped
+Firecracker jail generations and per-instance VMM identity. Templates and the
+kernel are preserved unless you pass `--all`.
 
 ```
 coop destroy [NAME] [FLAGS]
@@ -429,7 +413,7 @@ coop destroy [NAME] [FLAGS]
 | Flag | Description |
 |------|-------------|
 | `NAME` | Instance name (required if multiple instances exist) |
-| `--all` | Remove all instances, templates, kernel, Firecracker binary, and SSH keys |
+| `--all` | Remove all instances, templates, kernel, legacy data-directory Firecracker copies, and SSH keys; retain the shared root-owned managed pair |
 
 ```
 coop destroy my-project
@@ -630,7 +614,9 @@ supported agent paths, maintenance, persistence, and limitations.
 
 ### `logs`
 
-Stream the VM serial console output.
+Show the VM serial console output. On Linux, a stopped Firecracker VM can
+show its saved recent log with `coop logs NAME`; use this after a failed boot
+without restarting the VM. `--follow` requires a running VM.
 
 ```
 coop logs [NAME] [FLAGS]
@@ -704,7 +690,6 @@ older vulnerable release.
 
 Open VS Code or Zed connected to the guest VM over SSH, or use `--web` to run
 a browser editor inside the VM.
-`coop vscode` remains as an alias.
 
 ```
 coop editor [NAME] [--project PATH] [--editor code|zed] [--clean]
@@ -723,6 +708,7 @@ coop editor [NAME] --web [--project PATH] [--port PORT]
 ```
 coop editor
 coop editor my-project --project /workspace/subdir
+coop editor my-project --editor code
 coop editor my-project --editor zed
 coop editor my-project --clean
 coop editor my-project --web
@@ -1058,6 +1044,11 @@ See also the [`updates` section](configuration.md#updates-section) of the config
 ### `uninstall`
 
 Remove the coop binary and, optionally, its data directories (`~/.coop` and the update-check state). Refuses to remove the binary when it lives under `target/debug/` or `target/release/` so `cargo run -- uninstall` does not delete your build artifact.
+
+On Linux, removing data also reaps each instance's stopped Firecracker jail and
+VMM identity. Uninstall leaves the shared root-owned Firecracker/jailer pair
+under `/var/lib/coop/firecracker/v1.18.0/`. An administrator can remove that
+release directory once no user has a VM depending on it.
 
 ```
 coop uninstall [FLAGS]

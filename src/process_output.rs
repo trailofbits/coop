@@ -1,5 +1,6 @@
 //! Bounded output capture for host subprocesses.
 
+use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
@@ -56,24 +57,50 @@ pub(crate) fn run_status_bounded(
     input: Option<&[u8]>,
 ) -> Result<ExitStatus, CaptureError> {
     let _signals = crate::signal::install_handlers();
-    run_status_bounded_with_shutdown(command, deadline, input, crate::signal::shutdown_requested)
+    run_status_bounded_with_shutdown(
+        command,
+        deadline,
+        input,
+        None,
+        crate::signal::shutdown_requested,
+    )
+}
+
+/// Run a bounded command with an already-open input file. The child receives
+/// the descriptor, so privileged tools do not reopen a user-controlled path.
+pub(crate) fn run_status_bounded_with_file(
+    command: &mut Command,
+    deadline: Duration,
+    file: File,
+) -> Result<ExitStatus, CaptureError> {
+    let _signals = crate::signal::install_handlers();
+    run_status_bounded_with_shutdown(
+        command,
+        deadline,
+        None,
+        Some(Stdio::from(file)),
+        crate::signal::shutdown_requested,
+    )
 }
 
 fn run_status_bounded_with_shutdown(
     command: &mut Command,
     deadline: Duration,
     input: Option<&[u8]>,
+    stdin: Option<Stdio>,
     shutdown_requested: impl Fn() -> bool,
 ) -> Result<ExitStatus, CaptureError> {
     if input.is_some_and(|bytes| bytes.len() > 4096) {
         return Err(CaptureError::InputLimit);
     }
     command.process_group(0);
-    command.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
+    command.stdin(stdin.unwrap_or_else(|| {
+        if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        }
+    }));
     let mut child = command.spawn().map_err(CaptureError::Spawn)?;
     let Ok(pid) = i32::try_from(child.id()) else {
         let _ = child.kill();
@@ -133,12 +160,39 @@ pub(crate) fn run_bounded(
     policy: CapturePolicy,
 ) -> Result<BoundedOutput, CaptureError> {
     let _signals = crate::signal::install_handlers();
-    run_bounded_with_shutdown(command, policy, crate::signal::shutdown_requested)
+    run_bounded_with_shutdown(
+        command,
+        policy,
+        StdoutMode::Head,
+        crate::signal::shutdown_requested,
+    )
+}
+
+/// Drain all stdout while retaining only its last `stdout_max` bytes. The
+/// child still runs to completion, so a large journal cannot erase its tail.
+pub(crate) fn run_bounded_tail(
+    command: &mut Command,
+    policy: CapturePolicy,
+) -> Result<BoundedOutput, CaptureError> {
+    let _signals = crate::signal::install_handlers();
+    run_bounded_with_shutdown(
+        command,
+        policy,
+        StdoutMode::Tail,
+        crate::signal::shutdown_requested,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StdoutMode {
+    Head,
+    Tail,
 }
 
 fn run_bounded_with_shutdown(
     command: &mut Command,
     policy: CapturePolicy,
+    stdout_mode: StdoutMode,
     shutdown_requested: impl Fn() -> bool,
 ) -> Result<BoundedOutput, CaptureError> {
     let mut child = command
@@ -176,13 +230,20 @@ fn run_bounded_with_shutdown(
         return Err(CaptureError::Io(error));
     }
     let mut stdout_bytes = Vec::with_capacity(policy.stdout_max.min(8192));
+    let mut stdout_next = 0;
     let mut stderr_bytes = Vec::with_capacity(policy.stderr_max.min(8192));
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     let started = Instant::now();
     let mut status = None;
     let failure = loop {
-        match drain_available(&mut stdout, &mut stdout_bytes, policy.stdout_max) {
+        match drain_stdout(
+            &mut stdout,
+            &mut stdout_bytes,
+            &mut stdout_next,
+            policy.stdout_max,
+            stdout_mode,
+        ) {
             Ok(Drain::Eof) => stdout_eof = true,
             Ok(Drain::Pending) => {}
             Ok(Drain::Overflow) => {
@@ -231,15 +292,64 @@ fn run_bounded_with_shutdown(
         return Err(error);
     }
 
-    let status = match status {
-        Some(status) => status,
-        None => child.wait().map_err(CaptureError::Io)?,
-    };
+    let status = status.map_or_else(|| child.wait().map_err(CaptureError::Io), Ok)?;
+    let stdout_bytes = finish_stdout(stdout_bytes, stdout_next, stdout_mode);
     Ok(BoundedOutput {
         status,
         stdout: stdout_bytes,
         stderr: stderr_bytes,
     })
+}
+
+fn finish_stdout(mut captured: Vec<u8>, next: usize, mode: StdoutMode) -> Vec<u8> {
+    if matches!(mode, StdoutMode::Tail) {
+        captured.rotate_left(next);
+    }
+    captured
+}
+
+fn drain_stdout(
+    stream: &mut impl std::io::Read,
+    captured: &mut Vec<u8>,
+    next: &mut usize,
+    limit: usize,
+    mode: StdoutMode,
+) -> std::io::Result<Drain> {
+    match mode {
+        StdoutMode::Head => drain_available(stream, captured, limit),
+        StdoutMode::Tail => drain_available_tail(stream, captured, next, limit),
+    }
+}
+
+fn drain_available_tail(
+    stream: &mut impl std::io::Read,
+    captured: &mut Vec<u8>,
+    next: &mut usize,
+    limit: usize,
+) -> std::io::Result<Drain> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(Drain::Eof),
+            Ok(read) => {
+                if limit == 0 {
+                    continue;
+                }
+                let remaining = limit - captured.len();
+                let appended = read.min(remaining);
+                captured.extend_from_slice(&chunk[..appended]);
+                for &byte in &chunk[appended..read] {
+                    captured[*next] = byte;
+                    *next = (*next + 1) % limit;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(Drain::Pending);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +425,7 @@ mod tests {
             &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             None,
+            None,
             || false,
         )
         .unwrap();
@@ -323,6 +434,7 @@ mod tests {
         let exit = run_status_bounded_with_shutdown(
             &mut Command::new("/usr/bin/false"),
             Duration::from_secs(1),
+            None,
             None,
             || false,
         )
@@ -333,6 +445,7 @@ mod tests {
             Command::new("/bin/sleep").arg("2"),
             Duration::from_millis(20),
             None,
+            None,
             || false,
         )
         .unwrap_err();
@@ -341,6 +454,7 @@ mod tests {
         let cancelled = run_status_bounded_with_shutdown(
             Command::new("/bin/sleep").arg("2"),
             Duration::from_secs(1),
+            None,
             None,
             || true,
         )
@@ -358,6 +472,7 @@ mod tests {
                 .stdout(Stdio::null()),
             Duration::from_secs(1),
             Some(b"fixed payload"),
+            None,
             || false,
         )
         .unwrap();
@@ -367,10 +482,33 @@ mod tests {
             &mut Command::new("/usr/bin/true"),
             Duration::from_secs(1),
             Some(&[0; 4097]),
+            None,
             || false,
         )
         .unwrap_err();
         assert!(matches!(too_long, CaptureError::InputLimit));
+    }
+
+    #[test]
+    fn status_runner_reads_pinned_file_after_path_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("installed");
+        let original = vec![b'a'; 8192];
+        std::fs::write(&source, &original).unwrap();
+        let file = File::open(&source).unwrap();
+        std::fs::rename(&source, fixture.path().join("old-source")).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let status = run_status_bounded_with_file(
+            Command::new("/usr/bin/install")
+                .args(["-m", "0755", "/dev/stdin"])
+                .arg(&target),
+            Duration::from_secs(1),
+            file,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
     }
 
     #[cfg(target_os = "linux")]
@@ -402,6 +540,7 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
             Duration::from_secs(5),
+            None,
             None,
             || marker.exists(),
         )
@@ -574,6 +713,26 @@ mod tests {
     }
 
     #[test]
+    fn retains_recent_stdout_after_the_capture_limit() {
+        let mut command = shell("printf 'discarded-'; printf 'latest-diagnostics'");
+        let output = run_bounded_tail(&mut command, policy(18)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"latest-diagnostics");
+
+        let mut command = shell("printf 'small'");
+        let output = run_bounded_tail(&mut command, policy(18)).unwrap();
+        assert_eq!(output.stdout, b"small");
+
+        let mut command = shell("head -c 20000 /dev/zero; printf 'recent'");
+        let output = run_bounded_tail(&mut command, policy(6)).unwrap();
+        assert_eq!(output.stdout, b"recent");
+
+        let mut command = shell("printf 'discarded'");
+        let output = run_bounded_tail(&mut command, policy(0)).unwrap();
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
     fn timeout_kills_a_descendant_that_keeps_the_pipes_open() {
         let temp = crate::test_support::private_tempdir().unwrap();
         let pid_file = temp.path().join("descendant-pid");
@@ -626,7 +785,7 @@ mod tests {
         let leader_reaped_early = std::cell::Cell::new(false);
         let started = Instant::now();
 
-        let output = run_bounded_with_shutdown(&mut command, policy(64), || {
+        let output = run_bounded_with_shutdown(&mut command, policy(64), StdoutMode::Head, || {
             let Ok(pid) = std::fs::read_to_string(&pid_file) else {
                 return false;
             };
@@ -669,9 +828,12 @@ mod tests {
             crate::shell::shell_escape(&pid_file.to_string_lossy())
         ));
         let started = Instant::now();
-        let error = run_bounded_with_shutdown(&mut command, until_exit_policy(64), || {
-            pid_file.exists() && started.elapsed() >= Duration::from_millis(100)
-        })
+        let error = run_bounded_with_shutdown(
+            &mut command,
+            until_exit_policy(64),
+            StdoutMode::Head,
+            || pid_file.exists() && started.elapsed() >= Duration::from_millis(100),
+        )
         .unwrap_err();
         assert!(matches!(error, CaptureError::Interrupted));
         let pid = std::fs::read_to_string(pid_file)
@@ -877,6 +1039,17 @@ mod tests {
         assert_eq!(captured, b"x");
 
         let error = drain_available(&mut PermissionDenied, &mut Vec::new(), 8).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut captured = Vec::new();
+        let mut next = 0;
+        assert_eq!(
+            drain_available_tail(&mut InterruptedThenData(0), &mut captured, &mut next, 8).unwrap(),
+            Drain::Eof
+        );
+        assert_eq!(captured, b"x");
+        let error =
+            drain_available_tail(&mut PermissionDenied, &mut captured, &mut next, 8).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 

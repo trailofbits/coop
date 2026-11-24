@@ -22,7 +22,15 @@ credentials on the host.
 
 - KVM access (`/dev/kvm` must exist and be writable by your user)
 - x86_64 or arm64 architecture (x86_64 is the primary test target; arm64 builds are available but untested)
-- `sudo` privileges (Firecracker uses jailer and TAP networking)
+- `sudo` privileges (coop uses privileged host operations for networking,
+  jail staging, and disk setup; the matching jailer drops the systemd-managed
+  Firecracker VMM to its own unprivileged UID/GID)
+- A running systemd system manager version 252 or newer and journal with trusted `systemd-run`,
+  `systemctl`, and `journalctl` executables for VM startup and logs
+- `setfacl` from the host ACL package and trusted `mount`/`umount` utilities
+  for jail staging and stopped-VM cleanup
+- A root-owned `/var/lib/coop` installation area for the verified Firecracker
+  and jailer pair; `coop setup` creates it with `sudo`
 - `curl`, `tar`, `e2fsprogs` (for `mkfs.ext4`, `resize2fs`)
 - Setup also checks trusted system paths for `setfacl` and `unsquashfs`, plus resolved `ssh`, `scp`, and `rsync` clients. Automatic installation of missing tools requires a trusted system `apt-get`; on non-FHS hosts, configure exact OpenSSH/rsync paths under `[ssh.host_tools]`. See [backend prerequisites](backends.md#prerequisites-1).
 
@@ -234,7 +242,9 @@ mem_size_mib = 8192
 template_size_gib = 20
 ```
 
-All VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/`.
+VM artifacts (kernel, rootfs images, instance disks) live under `~/.coop/` by
+default. On Linux, the managed Firecracker and jailer binaries live under
+`/var/lib/coop/firecracker/`.
 
 The guest runs as an unprivileged user (`ubuntu`, uid 1000, by default) with `~/.local/bin` on `PATH` for every session. Override the username at setup with `coop setup --guest-user <name>`; see [Guest user](configuration.md#guest-user) for details.
 
@@ -288,16 +298,20 @@ run `coop codex -- login --device-auth` once.
 
 ## First run
 
-In a hurry? From your project directory, `coop quickstart` runs setup, brings up
-an instance, and launches Claude Code in one command — building the default
-image only if it is missing and reconnecting to an existing instance when one is
-already running. The steps below walk through the same flow one command at a
-time and give you per-instance control. See the [`quickstart`
-reference](commands.md#quickstart) for details.
+Run `coop setup` once to build the default image. Then, from your project
+directory, run `coop up` and launch your agent with `coop codex`, `coop claude`,
+or `coop grok`. Later `coop up` calls reuse a running instance or restart a
+stopped one for that directory. The steps below explain each command and its
+options. When multiple VMs are running, use `coop list` to find the name and
+pass it to the agent command (for example, `coop codex <name>`); agent commands
+do not select a VM by the current directory.
 
 ### 1. Setup
 
-`coop setup` downloads the Firecracker binary and kernel (Linux) or configures Lima (macOS), then builds a template rootfs image. The template ships with base packages (git, curl, build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
+`coop setup` installs the verified Firecracker/jailer pair under `/var/lib/coop`
+and downloads the kernel (Linux), or configures Lima (macOS), then builds a
+template rootfs image. The template ships with base packages (git, curl,
+build-essential, Docker, and others), the GitHub CLI, Claude Code, and Codex.
 
 ```
 coop setup
@@ -545,11 +559,16 @@ Destroy an instance (deletes its disk and resources):
 coop destroy my-project
 ```
 
-Remove everything, including all instances, images, kernel, and Firecracker binary:
+Remove all user data, including instances, images, kernel, and legacy
+Firecracker copies:
 
 ```
 coop destroy --all
 ```
+
+On Linux, the root-owned managed Firecracker/jailer pair remains because other
+users may share it. An administrator may remove its versioned directory after
+all dependent VMs are stopped.
 
 ## Named images
 
@@ -583,7 +602,7 @@ coop images --delete python-dev
 | Command | Description |
 |---------|-------------|
 | `coop validate` | Check config and prerequisites without changing anything |
-| `coop logs` | Stream VM serial console logs (`-f` to follow) |
+| `coop logs` | Show VM console logs, including saved logs from a stopped Firecracker VM (`-f` follows a running VM) |
 | `coop editor` | Open VS Code/Zed over SSH, or a browser editor with `--web` |
 | `coop ssh-config` | Install a `coop-<name>` SSH alias for ad-hoc `ssh`/`scp`/`rsync` |
 | `coop resize --size +20` | Grow a stopped instance's disk by 20 GiB |

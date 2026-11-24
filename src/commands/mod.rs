@@ -12,7 +12,6 @@ mod lifecycle;
 mod model;
 mod profiles;
 mod proxy;
-mod quickstart;
 
 pub(crate) use admin::{UninstallOpts, cmd_init, cmd_uninstall, cmd_validate};
 pub(crate) use agent::{AgentSelection, AgentUpdateOpts, cmd_agent_update};
@@ -28,7 +27,6 @@ pub(crate) use lifecycle::{
 pub(crate) use model::cmd_model;
 pub(crate) use profiles::{cmd_images, cmd_profiles};
 pub(crate) use proxy::cmd_proxy;
-pub(crate) use quickstart::{QuickstartOpts, cmd_quickstart};
 
 use std::collections::BTreeMap;
 

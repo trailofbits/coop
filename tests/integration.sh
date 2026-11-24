@@ -99,6 +99,7 @@ fail_count=0
 skip_count=0
 SKIPPED=()
 proxy_phase_ran=0
+suite_summary_complete=0
 
 pass() {
     pass_count=$((pass_count + 1))
@@ -128,6 +129,7 @@ summary() {
         printf '  Skipped phases/checks:\n'
         printf '    - %s\n' "${SKIPPED[@]}"
     fi
+    suite_summary_complete=1
     if [[ $fail_count -gt 0 ]]; then
         exit 1
     fi
@@ -265,7 +267,7 @@ fi
 untrack_instance() {
     local target="$1"
     local new_list=()
-    for inst in "${STARTED_INSTANCES[@]}"; do
+    for inst in "${STARTED_INSTANCES[@]+"${STARTED_INSTANCES[@]}"}"; do
         if [[ "$inst" != "$target" ]]; then
             new_list+=("$inst")
         fi
@@ -286,6 +288,7 @@ verify_binary() {
 # ── Cleanup trap ──────────────────────────────────────────────
 
 cleanup() {
+    local exit_status=$?
     echo ""
     echo "Cleaning up..."
 
@@ -300,6 +303,11 @@ cleanup() {
 
     if [[ -d "${ws_tmpdir:-}" ]]; then
         rm -rf "$ws_tmpdir"
+    fi
+
+    if [[ "$suite_summary_complete" != 1 && "$exit_status" -eq 0 ]]; then
+        echo "ERROR: integration suite exited before its summary" >&2
+        exit 1
     fi
 }
 
@@ -693,6 +701,88 @@ test_setup() {
         echo "FATAL: setup failed, cannot continue"
         exit 1
     fi
+
+    if [[ "$(uname -s)" == Linux ]]; then
+        if python3 - <<'PYPAIR'
+import hashlib
+import os
+import pathlib
+import stat
+
+root = pathlib.Path('/var/lib/coop/firecracker/v1.18.0')
+expected = {
+    'x86_64': (
+        'b33f46cd6d88834cf6a4f8d184f08f219809c636236bffd286d233a60602a2ba',
+        'ddadbaa15b5c942271a83b7040ca7259c8ccf92a9e08d44cce0b86fa407ba460',
+    ),
+    'aarch64': (
+        '6f9e08df0a0072e3e7086c51ff434c034d705845e349175a01beb3f9cc025ce3',
+        '7ea8f46abdc6f1d1a0b58ce89ce6ca38be8a292a43d7e61cf88275318263c540',
+    ),
+}[os.uname().machine]
+for path in [pathlib.Path('/var/lib/coop'), root.parent, root]:
+    info = path.lstat()
+    assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o022 == 0, path
+for name, digest in zip(('firecracker', 'jailer'), expected):
+    path = root / name
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o111 != 0, path
+    assert stat.S_IMODE(info.st_mode) & 0o022 == 0, path
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
+PYPAIR
+        then
+            pass "managed Firecracker and jailer are a root-owned matching pair"
+        else
+            fail "managed Firecracker and jailer are a root-owned matching pair"
+        fi
+
+        local custom_vmm_cfg="$tmpdir/custom-vmm-config.toml"
+        printf 'firecracker_bin = "/bin/false"\n' > "$custom_vmm_cfg"
+        if coop --config "$custom_vmm_cfg" setup -y; then
+            fail "custom Firecracker binary fails setup preflight" "setup unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Custom firecracker_bin"* ]]; then
+            pass "custom Firecracker binary fails setup preflight"
+        else
+            fail "custom Firecracker binary fails setup preflight" "$HARNESS_ERR"
+        fi
+
+        if coop --config "$custom_vmm_cfg" validate; then
+            fail "custom Firecracker binary fails config validation" "validate unexpectedly succeeded"
+        elif [[ "$HARNESS_ERR" == *"Custom firecracker_bin"* ]]; then
+            pass "custom Firecracker binary fails config validation"
+        else
+            fail "custom Firecracker binary fails config validation" "$HARNESS_ERR"
+        fi
+
+        # Shadow only this process's mount namespace, leaving the installed
+        # release untouched. The real `coop up` entrypoint must reject a
+        # modified pair before it creates an instance or a TAP.
+        local corrupt_binary="$tmpdir/corrupt-managed-binary"
+        local pair_ws="$tmpdir/pair-rejection-ws"
+        local pair_name="${INSTANCE}-pair-rejection"
+        mkdir -p "$pair_ws"
+        sudo -n install -m 0755 /bin/false "$corrupt_binary"
+        local pair_output="$tmpdir/pair-rejection-output"
+        local component
+        for component in firecracker jailer; do
+            if sudo -n unshare -m --propagation private sh -c '
+            mount --bind "$1" "/var/lib/coop/firecracker/v1.18.0/$2"
+            if [ -n "$5" ]; then
+                exec sudo -n -u "$3" env HOME="$4" "$6" --config "$5" up "$7" --name "$8" --no-agents
+            fi
+            exec sudo -n -u "$3" env HOME="$4" "$6" up "$7" --name "$8" --no-agents
+        ' sh "$corrupt_binary" "$component" "$(id -un)" "$HOME" "$SUITE_CONFIG" "$BINARY" "$pair_ws" "$pair_name" >"$pair_output" 2>&1; then
+                fail "modified managed $component blocks coop up" "up unexpectedly succeeded"
+            elif [[ "$(cat "$pair_output")" == *"Managed $component differs from the pinned production release"* \
+                && ! -e "$HOME/.coop/instances/$pair_name" ]]; then
+                pass "modified managed $component blocks coop up before instance creation"
+            else
+                fail "modified managed $component blocks coop up" "$(tail -5 "$pair_output")"
+            fi
+        done
+    fi
 }
 
 # ── Primary instance lifecycle ────────────────────────────────
@@ -732,6 +822,94 @@ EOF
             fail "new opt-in Firecracker instance persists vsock control mode" \
                 "state: $(cat "$instance_state" 2>/dev/null)"
         fi
+
+        local firecracker_pid service_unit service_pid service_cgroup
+        firecracker_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        service_unit=$(systemctl whoami "$firecracker_pid" 2>/dev/null || true)
+        service_pid=$(systemctl show --property=MainPID --value "$service_unit" 2>/dev/null || true)
+        service_cgroup=$(systemctl show --property=ControlGroup --value "$service_unit" 2>/dev/null || true)
+        if [[ "$firecracker_pid" =~ ^[1-9][0-9]*$ \
+            && "$service_unit" == coop-vmm-*.service \
+            && "$service_pid" == "$firecracker_pid" \
+            && "$service_cgroup" == "/system.slice/$service_unit" ]] \
+            && grep -Fq "$service_cgroup" "/proc/$firecracker_pid/cgroup"; then
+            pass "Firecracker PID belongs to its systemd service and cgroup"
+        else
+            fail "Firecracker PID belongs to its systemd service and cgroup" \
+                "unit=$service_unit pid=$service_pid cgroup=$service_cgroup"
+        fi
+        local journal_policy
+        journal_policy=$(systemctl show \
+            --property=StandardOutput,StandardError,LogRateLimitIntervalUSec,LogRateLimitBurst \
+            "$service_unit" 2>/dev/null || true)
+        if [[ "$journal_policy" == *"StandardOutput=journal"* \
+            && "$journal_policy" == *"StandardError=journal"* \
+            && "$journal_policy" == *"LogRateLimitIntervalUSec=30s"* \
+            && "$journal_policy" == *"LogRateLimitBurst=1000"* ]]; then
+            pass "supervised VMM output uses rate-limited journald streams"
+        else
+            fail "supervised VMM output uses rate-limited journald streams" \
+                "systemd output policy differs from the launch contract"
+        fi
+
+        local jail_root="" host_uid vmm_uid vmm_gid vmm_groups vmm_caps vmm_bounding vmm_nnp vmm_seccomp
+        host_uid=$(id -u)
+        if [[ "$service_unit" =~ ^coop-vmm-[0-9]+-([0-9a-f]{64})-([0-9a-f]{32})\.service$ ]]; then
+            jail_root="/var/lib/coop/j/$host_uid/firecracker/${BASH_REMATCH[1]:0:16}-${BASH_REMATCH[2]}/root"
+        fi
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_gid=$(sudo awk '/^Gid:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_groups=$(sudo awk '/^Groups:/ {$1=""; gsub(/[[:space:]]/, ""); print}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_caps=$(sudo awk '/^CapEff:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_bounding=$(sudo awk '/^CapBnd:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_nnp=$(sudo awk '/^NoNewPrivs:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        vmm_seccomp=$(sudo awk '/^Seccomp:/ {print $2}' "/proc/$firecracker_pid/status" 2>/dev/null || true)
+        local cap_net_admin=-1
+        if [[ "$vmm_bounding" =~ ^[0-9a-fA-F]+$ ]]; then
+            cap_net_admin=$((16#$vmm_bounding & (1 << 12)))
+        fi
+        if [[ "$vmm_uid" =~ ^[1-9][0-9]*$ \
+            && "$vmm_uid" == "$vmm_gid" \
+            && "$vmm_uid" != "$host_uid" \
+            && -z "$vmm_groups" \
+            && "$vmm_caps" == 0000000000000000 \
+            && "$vmm_nnp" == 1 \
+            && "$vmm_seccomp" == 2 \
+            && "$cap_net_admin" == 0 ]]; then
+            pass "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp"
+        else
+            fail "jailed VMM runs as an unprivileged identity without groups or capabilities and with seccomp" \
+                "uid=$vmm_uid gid=$vmm_gid groups=$vmm_groups caps=$vmm_caps bounding=$vmm_bounding nnp=$vmm_nnp seccomp=$vmm_seccomp"
+        fi
+        if [[ -d "$jail_root" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root" 2>/dev/null)" == "$(sudo stat -Lc '%d:%i' "$jail_root" 2>/dev/null)" \
+            && "$(sudo stat -Lc '%d:%i' "/proc/$firecracker_pid/root/rootfs.ext4" 2>/dev/null)" == "$(stat -Lc '%d:%i' "$HOME/.coop/instances/$INSTANCE/rootfs.ext4" 2>/dev/null)" \
+            && -f "$jail_root/kernel" \
+            && ! -e "$jail_root/etc/shadow" \
+            && ! -e "$jail_root/var/lib/coop" ]]; then
+            pass "jailed VMM root and disk binding exclude host and peer files"
+        else
+            fail "jailed VMM root and disk binding exclude host and peer files" "jail_root=$jail_root"
+        fi
+        local all_threads_filtered=true task_status
+        for task_status in /proc/"$firecracker_pid"/task/*/status; do
+            if [[ "$(sudo awk '/^Seccomp:/ {print $2}' "$task_status" 2>/dev/null)" != 2 ]]; then
+                all_threads_filtered=false
+            fi
+        done
+        if [[ "$all_threads_filtered" == true ]]; then
+            pass "Firecracker applies seccomp to every observed VMM thread"
+        else
+            fail "Firecracker applies seccomp to every observed VMM thread"
+        fi
+        local instance_index tap_owner
+        instance_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$instance_state")
+        tap_owner=$(ip tuntap show dev "tap${instance_index}" 2>/dev/null || true)
+        if [[ "$tap_owner" == *"user $vmm_uid"* ]]; then
+            pass "persistent TAP is owned by the jailed VMM identity"
+        else
+            fail "persistent TAP is owned by the jailed VMM identity" "tap=$tap_owner uid=$vmm_uid"
+        fi
     fi
 
     local copied_file="" env_value=""
@@ -754,6 +932,214 @@ EOF
     else
         fail "up ignores discovered devcontainer postStartCommand and postCreateCommand" \
             "marker exists or guest check failed: $(guest_stderr)"
+    fi
+}
+
+test_firecracker_rejects_pid_outside_service_cgroup() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: mismatched Firecracker service cgroup ==="
+
+    local pid unit group child
+    pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+    unit=$(systemctl whoami "$pid" 2>/dev/null || true)
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ || "$unit" != coop-vmm-*.service ]]; then
+        fail "mismatched cgroup fixture has a supervised Firecracker PID"
+        return
+    fi
+    group="/sys/fs/cgroup/system.slice/$unit"
+    child="$group/coop-test-mismatch"
+    if ! sudo -n mkdir "$child"; then
+        fail "create child cgroup for Firecracker identity check"
+        return
+    fi
+    if ! printf '%s\n' "$pid" | sudo -n tee "$child/cgroup.procs" >/dev/null; then
+        fail "move Firecracker PID into child cgroup"
+        sudo -n rmdir "$child" 2>/dev/null || true
+        return
+    fi
+
+    if [[ "$(cat "/proc/$pid/cgroup" 2>/dev/null)" != "0::/system.slice/$unit/coop-test-mismatch" ]]; then
+        fail "mismatched cgroup fixture moved the Firecracker PID"
+    elif coop_fails status "$INSTANCE" \
+        && [[ "$HARNESS_ERR" == *"outside its systemd cgroup"* ]]; then
+        pass "status rejects a Firecracker PID outside its service cgroup"
+    else
+        fail "status rejects a Firecracker PID outside its service cgroup" \
+            "status succeeded or failed for a different reason"
+    fi
+
+    if ! printf '%s\n' "$pid" | sudo -n tee "$group/cgroup.procs" >/dev/null \
+        || ! sudo -n rmdir "$child"; then
+        fail "restore Firecracker PID to its service cgroup"
+        return
+    fi
+    if coop status "$INSTANCE"; then
+        pass "status succeeds after restoring the Firecracker service cgroup"
+    else
+        fail "status succeeds after restoring the Firecracker service cgroup" \
+            "stderr: $HARNESS_ERR"
+    fi
+}
+
+test_failed_firecracker_exec_preserves_disk_and_cleans_tap() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: failed Firecracker boot cleanup ==="
+
+    local failed_name="${INSTANCE}-bad-kernel"
+    local failed_ws="$tmpdir/bad-kernel-ws"
+    local failed_cfg="$tmpdir/bad-kernel.toml"
+    local bad_kernel="$tmpdir/not-a-kernel"
+    mkdir -p "$failed_ws"
+    printf 'not a kernel\n' > "$bad_kernel"
+    cat > "$failed_cfg" <<EOF
+[grok]
+config_dir = false
+[vm]
+firecracker_control = "vsock"
+kernel_path = "$bad_kernel"
+EOF
+    if ! coop up "$failed_ws" --name "$failed_name" --no-agents; then
+        fail "prepare stopped instance for failed boot" "$HARNESS_ERR"
+        if [[ -d "$HOME/.coop/instances/$failed_name" ]]; then
+            STARTED_INSTANCES+=("$failed_name")
+        fi
+        return
+    fi
+    STARTED_INSTANCES+=("$failed_name")
+    if ! coop stop "$failed_name"; then
+        fail "prepare stopped instance for failed boot" "$HARNESS_ERR"
+        return
+    fi
+    local failed_dir="$HOME/.coop/instances/$failed_name"
+    local runtime_state="$failed_dir/firecracker.runtime.json"
+    local disk_identity
+    disk_identity=$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")
+    local config_before
+    config_before=$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)
+    local failed_index
+    failed_index=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["index"])' "$failed_dir/instance.json")
+    printf '%s\n' '{"version":2,"launcher":"jailer"}' > "$runtime_state"
+    if coop start "$failed_name" --no-agents; then
+        fail "unknown Firecracker runtime version blocks launch" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Unsupported Firecracker runtime state"* \
+        && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(sha256sum "$failed_dir/vm_config.json" | cut -d' ' -f1)" == "$config_before" \
+        && ! -e "/sys/class/net/tap${failed_index}" ]]; then
+        pass "unknown Firecracker runtime version blocks launch before config or TAP changes"
+    else
+        fail "unknown Firecracker runtime version blocks launch" "$HARNESS_ERR"
+    fi
+    rm -f "$runtime_state" # Model a stopped instance created before jailed launch.
+    local broken_bridge_cfg="$tmpdir/broken-bridge.toml"
+    cp "$SUITE_CONFIG" "$broken_bridge_cfg"
+    printf '\n[network.host_tools]\nbridge = "/bin/false"\n' >> "$broken_bridge_cfg"
+    if coop --config "$broken_bridge_cfg" start "$failed_name" --no-agents; then
+        fail "partial TAP setup rolls back on stopped restart" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Failed to isolate TAP"* \
+        && ! -e "/sys/class/net/tap${failed_index}" \
+        && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" ]]; then
+        pass "partial TAP setup rolls back on stopped restart"
+    else
+        fail "partial TAP setup rolls back on stopped restart" "$HARNESS_ERR"
+    fi
+    if coop --config "$failed_cfg" start "$failed_name" --no-agents; then
+        fail "invalid kernel fails after Firecracker service exec" "start unexpectedly succeeded"
+    elif [[ "$HARNESS_ERR" == *"Firecracker VMM exited"* ]]; then
+        pass "invalid kernel fails after Firecracker service exec"
+    else
+        fail "invalid kernel fails after Firecracker service exec" "$HARNESS_ERR"
+    fi
+    printf 'not json\n' > "$failed_dir/web-editor.json"
+    if coop logs "$failed_name" \
+        && [[ -n "$HARNESS_OUT" \
+        && "$HARNESS_OUT" != *"Could not save the stopped Firecracker journal"* \
+        && "$(cat "$failed_dir/web-editor.json")" == 'not json' ]]; then
+        pass "stopped Firecracker VM exposes its saved boot diagnostics through coop logs"
+    else
+        fail "stopped Firecracker VM exposes its saved boot diagnostics through coop logs" "$HARNESS_ERR"
+    fi
+    rm -f "$failed_dir/web-editor.json"
+
+    if [[ -f "$failed_dir/rootfs.ext4" && ! -e "$failed_dir/firecracker.pid" \
+        && "$(stat -Lc '%d:%i' "$failed_dir/rootfs.ext4")" == "$disk_identity" \
+        && "$(jq -r '.version | tostring' "$runtime_state" 2>/dev/null)" == 1 \
+        && "$(jq -r '.launcher' "$runtime_state" 2>/dev/null)" == jailer ]]; then
+        pass "failed Firecracker boot retains disk and publishes atomic jailed state"
+    else
+        fail "failed Firecracker boot retains disk and publishes atomic jailed state"
+    fi
+    if [[ -f "$failed_dir/instance.json" ]]; then
+        if ! ip link show "tap${failed_index}" >/dev/null 2>&1; then
+            pass "failed Firecracker boot removes its TAP after confirmed exit"
+        else
+            fail "failed Firecracker boot removes its TAP after confirmed exit"
+        fi
+    fi
+
+    if coop start "$failed_name" --no-agents; then
+        pass "failed Firecracker boot retries with the preserved disk"
+        if ! coop stop "$failed_name"; then
+            fail "stop retried Firecracker instance" "$HARNESS_ERR"
+        fi
+    else
+        fail "failed Firecracker boot retries with the preserved disk" "$HARNESS_ERR"
+    fi
+    if coop destroy "$failed_name"; then
+        untrack_instance "$failed_name"
+    else
+        fail "destroy failed-boot instance" "$HARNESS_ERR"
+    fi
+}
+
+test_abrupt_launcher_exit_keeps_supervised_vm_manageable() {
+    [[ "$(uname -s)" == Linux ]] || return 0
+    echo ""
+    echo "=== Phase: abrupt launcher exit ==="
+
+    local abrupt_name="${INSTANCE}-abrupt"
+    local abrupt_ws="$tmpdir/abrupt-ws"
+    local abrupt_dir="$HOME/.coop/instances/$abrupt_name"
+    mkdir -p "$abrupt_ws"
+    "$BINARY" --config "$SUITE_CONFIG" up "$abrupt_ws" --name "$abrupt_name" --no-agents \
+        > "$tmpdir/abrupt-launch.log" 2>&1 &
+    local launcher_pid=$!
+    local vmm_pid="" service_unit=""
+    for _ in {1..600}; do
+        vmm_pid=$(cat "$abrupt_dir/firecracker.pid" 2>/dev/null || true)
+        if [[ "$vmm_pid" =~ ^[1-9][0-9]*$ ]]; then
+            service_unit=$(systemctl whoami "$vmm_pid" 2>/dev/null || true)
+            [[ "$service_unit" == coop-vmm-*.service ]] && break
+        fi
+        if ! kill -0 "$launcher_pid" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+    if [[ "$service_unit" != coop-vmm-*.service ]]; then
+        fail "launcher reaches a supervised Firecracker service" "service=$service_unit"
+        kill -TERM "$launcher_pid" 2>/dev/null || true
+        wait "$launcher_pid" 2>/dev/null || true
+        coop destroy "$abrupt_name" || true
+        return
+    fi
+    kill -KILL "$launcher_pid" 2>/dev/null || true
+    wait "$launcher_pid" 2>/dev/null || true
+    STARTED_INSTANCES+=("$abrupt_name")
+    if coop status "$abrupt_name" \
+        && [[ "$HARNESS_OUT" == *"Service: $service_unit"* ]] \
+        && [[ -f "$abrupt_dir/rootfs.ext4" ]]; then
+        pass "supervised VMM survives launcher SIGKILL with its disk"
+    else
+        fail "supervised VMM survives launcher SIGKILL with its disk" \
+            "status=$HARNESS_OUT stderr=$HARNESS_ERR"
+    fi
+    if coop stop "$abrupt_name" && coop destroy "$abrupt_name"; then
+        pass "coop stops and destroys VMM after launcher SIGKILL"
+        untrack_instance "$abrupt_name"
+    else
+        fail "coop stops and destroys VMM after launcher SIGKILL" "$HARNESS_ERR"
     fi
 }
 
@@ -1155,7 +1541,7 @@ test_ssh_config() {
 
 # Exercises the host-side half of `coop editor` against a live VM. Stub editor
 # CLIs make the phase hermetic (no GUI is opened) while still pinning the argv
-# contract, Zed URL encoding, the legacy `vscode` alias, and SSH-config setup.
+# contract for VS Code and Zed, URL encoding, and SSH-config setup.
 test_editor() {
     echo ""
     echo "=== Phase: editor launch ==="
@@ -1216,22 +1602,19 @@ STUB
         fail "editor auto-detection tries VS Code first" "got: $editor_argv"
     fi
 
-    # `vscode` remains a public compatibility alias for `editor`. Pin the real
-    # dispatch path, not only clap parsing, and check the VS Code Remote-SSH
-    # argv shape expected by the extension.
     : >"$editor_log"
     if COOP_TEST_EDITOR_LOG="$editor_log" PATH="$editor_dir:$PATH" \
-        coop vscode "$INSTANCE" --editor code --project /workspace/legacy; then
-        pass "vscode compatibility alias exits 0"
+        coop editor "$INSTANCE" --editor code --project /workspace/code; then
+        pass "editor --editor code exits 0"
     else
-        fail "vscode compatibility alias exits 0" "stderr: $HARNESS_ERR"
+        fail "editor --editor code exits 0" "stderr: $HARNESS_ERR"
     fi
 
     editor_argv=$(cat "$editor_log" 2>/dev/null)
-    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/legacy' ]]; then
-        pass "vscode alias passes the VS Code Remote-SSH arguments"
+    if [[ "$editor_argv" == $'--remote\nssh-remote+coop-'"$INSTANCE"$'\n/workspace/code' ]]; then
+        pass "editor --editor code passes the VS Code Remote-SSH arguments"
     else
-        fail "vscode alias passes the VS Code Remote-SSH arguments" "got: $editor_argv"
+        fail "editor --editor code passes the VS Code Remote-SSH arguments" "got: $editor_argv"
     fi
 
     # Leave the SSH config in the same clean state this phase inherited from
@@ -2789,7 +3172,9 @@ test_logs() {
     fi
 
     # Logs should contain something (boot messages, kernel output, etc.)
-    if [[ -n "$HARNESS_OUT" ]]; then
+    if [[ "$(uname -s)" == Linux && -z "$HARNESS_OUT" ]]; then
+        fail "jailed Firecracker journal produces log output" "stdout was empty"
+    elif [[ -n "$HARNESS_OUT" ]]; then
         pass "logs produces output"
     else
         # Lima logs go to stderr, so check both
@@ -3412,13 +3797,14 @@ CFGEOF
 
         local boot_fail_cfg="$tmpdir/isolated-boot-fail-config.toml"
         cp "$new_cfg" "$boot_fail_cfg"
-        sed -i.bak '1i\
-firecracker_bin = "/bin/false"\
-' "$boot_fail_cfg"
+        local bad_kernel="$tmpdir/isolated-not-a-kernel"
+        printf 'not a kernel\n' > "$bad_kernel"
+        printf 'kernel_path = "%s"\n' "$bad_kernel" >> "$boot_fail_cfg"
         if coop --config "$boot_fail_cfg" network "$new_name" open --restart --no-agents; then
             fail "target VMM boot failure leaves requested mode stopped and cleaned" \
                 "transition unexpectedly succeeded"
-        elif grep -q '"firecracker_control": "vsock"' "$new_state" \
+        elif [[ "$HARNESS_ERR" == *"Firecracker"* && "$HARNESS_ERR" == *"exited"* ]] \
+            && grep -q '"firecracker_control": "vsock"' "$new_state" \
             && ! test -f "$HOME/.coop/instances/$new_name/firecracker.pid" \
             && ! ip link show "$new_tap" >/dev/null 2>&1; then
             pass "target VMM boot failure leaves requested mode stopped and cleaned"
@@ -3813,9 +4199,30 @@ os.sync()
         fail "write guest disk changes before stop" "stderr: $(guest_stderr)"
         return
     fi
+    local service_unit=""
+    if [[ "$(uname -s)" == Linux ]]; then
+        local before_pid
+        before_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        service_unit=$(systemctl whoami "$before_pid" 2>/dev/null || true)
+        if [[ "$service_unit" != coop-vmm-*.service ]]; then
+            fail "stop fixture has a supervised Firecracker VMM" "unit=$service_unit"
+            return
+        fi
+    fi
     if ! coop stop "$INSTANCE"; then
         fail "stop after recent writes" "stderr: $HARNESS_ERR"
         return
+    fi
+    if [[ -n "$service_unit" ]]; then
+        local stopped_pid stopped_tasks
+        stopped_pid=$(systemctl show --property=MainPID --value "$service_unit" 2>/dev/null || true)
+        stopped_tasks=$(systemctl show --property=TasksCurrent --value "$service_unit" 2>/dev/null || true)
+        if [[ "$stopped_pid" == 0 && ( "$stopped_tasks" == 0 || "$stopped_tasks" == "[not set]" ) ]]; then
+            pass "stop reaps the Firecracker systemd service and cgroup"
+        else
+            fail "stop reaps the Firecracker systemd service and cgroup" \
+                "unit=$service_unit main_pid=$stopped_pid tasks=$stopped_tasks"
+        fi
     fi
     if ! coop start "$INSTANCE" --no-agents; then
         fail "restart after recent writes" "stderr: $HARNESS_ERR"
@@ -3840,8 +4247,26 @@ test_stop() {
     echo ""
     echo "=== Phase: stop ==="
 
-    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0
+    local ip tap="" fc_pid="" socket_path="" socket_metadata="" exited=0 vmm_uid=""
     if [[ "$(uname -s)" == Linux ]]; then
+        local serial_marker="COOP_JAILED_LOG_SNAPSHOT_MARKER"
+        if guest_exec sudo sh -c "printf '%s\\n' '$serial_marker' > /dev/ttyS0"; then
+            local marker_seen=false
+            for _ in {1..20}; do
+                if coop logs "$INSTANCE" && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+                    marker_seen=true
+                    break
+                fi
+                sleep 0.25
+            done
+            if [[ "$marker_seen" == true ]]; then
+                pass "active jailed Firecracker logs include guest serial output"
+            else
+                fail "active jailed Firecracker logs include guest serial output" "$HARNESS_ERR"
+            fi
+        else
+            fail "write guest serial marker before stop" "$(guest_stderr)"
+        fi
         ip=$(guest_ip_of "$INSTANCE") || ip=""
         if [[ "$ip" =~ ^172\.16\.0\.([0-9]{1,3})$ ]] \
             && (( 10#${BASH_REMATCH[1]} >= 2 && 10#${BASH_REMATCH[1]} <= 254 )); then
@@ -3855,20 +4280,25 @@ test_stop() {
             fail "guest address identifies stop TAP" "unexpected guest IPv4 address: $ip"
         fi
 
-        # Firecracker runs without an API socket. Its base vsock socket is
-        # mode 0666 so coop can connect through the user-owned mode-0700
-        # instance directory. Kill the VMM without graceful cleanup so
-        # `coop stop` must recognize and remove the abandoned socket.
+        # Firecracker runs without an API socket. Coop bind-mounts its jailed
+        # base vsock socket inode into the private instance directory. Kill
+        # the VMM without graceful cleanup to test abandoned mount recovery.
         fc_pid=$(cat "$HOME/.coop/instances/$INSTANCE/firecracker.pid" 2>/dev/null || true)
+        vmm_uid=$(sudo awk '/^Uid:/ {print $2}' "/proc/$fc_pid/status" 2>/dev/null || true)
         instance_dir="$HOME/.coop/instances/$INSTANCE"
         socket_path="$HOME/.coop/instances/$INSTANCE/firecracker.socket"
         vsock_path="$HOME/.coop/instances/$INSTANCE/vsock.sock"
         directory_metadata=$(stat -c '%U:%a' "$instance_dir" 2>/dev/null || true)
-        vsock_metadata=$(stat -c '%U:%a' "$vsock_path" 2>/dev/null || true)
+        vsock_metadata=$(stat -c '%u:%a' "$vsock_path" 2>/dev/null || true)
+        jailed_socket_inode=$(sudo -n stat -Lc '%d:%i' "/proc/$fc_pid/root/vsock.sock" 2>/dev/null || true)
+        published_socket_inode=$(stat -Lc '%d:%i' "$vsock_path" 2>/dev/null || true)
         if [[ -n "$fc_pid" && ! -e "$socket_path" && -S "$vsock_path" \
             && "$directory_metadata" == "$(id -un):700" \
-            && "$vsock_metadata" == "root:666" ]]; then
-            pass "Firecracker has no API socket and contains vsock in the private instance directory"
+            && "$vsock_metadata" == "$vmm_uid:666" \
+            && -n "$jailed_socket_inode" \
+            && "$jailed_socket_inode" == "$published_socket_inode" ]] \
+            && mountpoint -q "$vsock_path"; then
+            pass "Firecracker has no API socket and pins the jailed vsock socket at the instance path"
             if sudo -n kill -9 "$fc_pid"; then
                 for _ in {1..50}; do
                     if ! sudo -n kill -0 "$fc_pid" 2>/dev/null; then
@@ -3878,16 +4308,16 @@ test_stop() {
                     sleep 0.1
                 done
                 if [[ "$exited" -eq 1 && -S "$vsock_path" ]]; then
-                    pass "unexpected Firecracker exit leaves a root-owned vsock socket"
+                    pass "unexpected Firecracker exit leaves the pinned vsock socket"
                 else
-                    fail "unexpected Firecracker exit leaves a root-owned vsock socket" \
+                    fail "unexpected Firecracker exit leaves the pinned vsock socket" \
                         "pid_alive=$(( 1 - exited )) socket_exists=$( [[ -S "$vsock_path" ]] && echo yes || echo no )"
                 fi
             else
                 fail "simulate unexpected Firecracker exit" "could not kill PID $fc_pid"
             fi
         else
-            fail "Firecracker stop fixture has no API and a private mode-0666 vsock socket" \
+            fail "Firecracker stop fixture has no API and a pinned mode-0666 vsock socket" \
                 "pid=${fc_pid:-<missing>} dir=${directory_metadata:-missing} api=$( [[ -e "$socket_path" ]] && echo present || echo absent ) vsock=${vsock_metadata:-missing}"
         fi
     fi
@@ -3896,6 +4326,20 @@ test_stop() {
         pass "stop exits 0"
     else
         fail "stop exits 0" "exit code: $?"
+    fi
+    if [[ "$(uname -s)" == Linux ]]; then
+        local saved_log="$HOME/.coop/instances/$INSTANCE/firecracker.log" saved_bytes
+        saved_bytes=$(stat -c %s "$saved_log" 2>/dev/null || echo 0)
+        if [[ -f "$saved_log" && "$saved_bytes" -gt 0 \
+            && "$saved_bytes" -le 16777216 ]] \
+            && grep -Fq -- "$serial_marker" "$saved_log" \
+            && coop logs "$INSTANCE" \
+            && [[ "$HARNESS_OUT" == *"$serial_marker"* ]]; then
+            pass "stopped VMM retains guest serial output in its bounded journal snapshot"
+        else
+            fail "stopped VMM retains guest serial output in its bounded journal snapshot" \
+                "saved log bytes=$saved_bytes"
+        fi
     fi
     if [[ -n "$tap" ]]; then
         if [[ -e "/sys/class/net/$tap" ]]; then
@@ -5100,135 +5544,90 @@ test_idempotency() {
 
 }
 
-# ── Quickstart (--full only) ──────────────────────────────────
+# ── Project and agent workflow (--full only) ────────────────
 
-# `coop quickstart` chains ensure-image, ensure-instance, launch-claude. The
-# first two steps share code with `coop setup` / `coop up` (covered above);
-# this phase exercises the reconnect/restart logic specific to quickstart and
-# the workspace-affinity lookup that drives it.
-#
-# Claude is interactive — with stdin redirected from /dev/null `ssh` doesn't
-# allocate a PTY and the claude binary fails fast. `run_interactive` only
-# logs (does not error) on non-zero remote status, so quickstart still
-# returns 0 to the host. Each invocation is bounded with `_timeout` defensively
-# so a future claude that hangs on EOF can't wedge the suite.
-test_quickstart() {
+# Setup ran earlier. Exercise `up` followed by both agent launchers, then
+# confirm that `up` reuses a running project VM and restarts a stopped one.
+test_project_agent_workflow() {
     echo ""
-    echo "=== Phase: quickstart ==="
+    echo "=== Phase: project and agent workflow ==="
 
-    if ! "$BINARY" exec --help >/dev/null 2>&1; then
-        skip "quickstart" "binary missing exec subcommand"
+    local agent_ws agent_name rc=0 pre_list post_list
+    local binary_args=("$BINARY")
+    if [[ -n "${SUITE_CONFIG:-}" ]]; then
+        binary_args+=(--config "$SUITE_CONFIG")
+    fi
+    agent_ws=$(mktemp -d "$tmpdir/agent-ws-XXXXXX")
+    agent_name=${agent_ws##*/}
+    agent_name=${agent_name//[!a-zA-Z0-9_-]/-}
+
+    ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up \
+        >"$tmpdir/agent_up_out" 2>"$tmpdir/agent_up_err" ) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        fail "up creates project instance" "exit: $rc; stderr: $(cat "$tmpdir/agent_up_err")"
+        rm -rf "$agent_ws"
+        return
+    fi
+    STARTED_INSTANCES+=("$agent_name")
+    if "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
+        pass "up creates and starts project instance"
+    else
+        fail "up creates and starts project instance" \
+            "status: $("${binary_args[@]}" status "$agent_name" 2>&1)"
         return
     fi
 
-    local qs_ws qs_inst_name
-    qs_ws=$(mktemp -d "$tmpdir/qs-ws-XXXXXX")
-    # The instance name is the sanitised basename of the workspace path.
-    # `basename | tr` would rewrite the trailing newline to a dash; use bash
-    # pattern expansion to mirror `sanitize_basename` in src/config.rs.
-    qs_inst_name=${qs_ws##*/}
-    qs_inst_name=${qs_inst_name//[!a-zA-Z0-9_-]/-}
-
-    # First invocation: image is already built (from test_setup) and no
-    # instance for this workspace exists, so quickstart must allocate fresh.
-    local rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs1_out" 2>"$tmpdir/qs1_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "first quickstart exits 0"
-    else
-        fail "first quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs1_err")"
-        rm -rf "$qs_ws"
-        return
-    fi
-
-    # Track for cleanup even if status assertions below fail.
-    STARTED_INSTANCES+=("$qs_inst_name")
-
-    # `ssh::run_interactive` swallows non-zero remote exit, so checking only
-    # `rc=0` would let a quickstart that bailed before the ssh leg slip
-    # through. Grep the tracing output for the connect line to confirm the
-    # claude exec was actually reached.
-    if grep -q "Connecting via SSH" "$tmpdir/qs1_err"; then
-        pass "first quickstart reached SSH/claude exec"
-    else
-        fail "first quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs1_err")"
-    fi
-
-    if "$BINARY" status "$qs_inst_name" >/dev/null 2>&1; then
-        pass "quickstart created and started instance '$qs_inst_name'"
-    else
-        fail "quickstart created and started instance" "no instance '$qs_inst_name'"
-        rm -rf "$qs_ws"
-        return
-    fi
-
-    # Second invocation in the same cwd: must reconnect — same name, no new
-    # instance allocated.
-    local pre_list post_list
-    pre_list=$("$BINARY" list 2>/dev/null | sort)
-
+    # An interactive agent sees EOF without a PTY in this harness. The host
+    # may still return success after an SSH failure, so require agent output.
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs2_out" 2>"$tmpdir/qs2_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "second quickstart exits 0 (reconnect path)"
+    _timeout 180 "${binary_args[@]}" claude "$agent_name" -- --help \
+        </dev/null >"$tmpdir/agent_claude_out" 2>"$tmpdir/agent_claude_err" || rc=$?
+    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_claude_err" \
+        && grep -qiE '^Usage: claude([[:space:]]|$)' "$tmpdir/agent_claude_out"; then
+        pass "claude help runs in project instance"
     else
-        fail "second quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs2_err")"
-    fi
-
-    if grep -q "Connecting via SSH" "$tmpdir/qs2_err"; then
-        pass "second quickstart reached SSH/claude exec"
-    else
-        fail "second quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs2_err")"
-    fi
-
-    post_list=$("$BINARY" list 2>/dev/null | sort)
-    if [[ "$pre_list" == "$post_list" ]]; then
-        pass "second quickstart reuses existing instance for cwd"
-    else
-        fail "second quickstart reuses existing instance for cwd" \
-            "list changed (diff): $(diff <(echo "$pre_list") <(echo "$post_list"))"
-    fi
-
-    # Stop and re-invoke: must restart the same stopped instance.
-    if ! coop stop "$qs_inst_name"; then
-        fail "stop quickstart instance before restart test" "exit code: $?"
-        return
+        fail "claude help runs in project instance" \
+            "exit: $rc; stderr: $(cat "$tmpdir/agent_claude_err"); stdout: $(cat "$tmpdir/agent_claude_out")"
     fi
 
     rc=0
-    ( cd "$qs_ws" && _timeout 180 "$BINARY" quickstart \
-        </dev/null >"$tmpdir/qs3_out" 2>"$tmpdir/qs3_err" ) || rc=$?
-
-    if [[ $rc -eq 0 ]]; then
-        pass "third quickstart exits 0 (restart path)"
+    _timeout 180 "${binary_args[@]}" codex "$agent_name" -- --help \
+        </dev/null >"$tmpdir/agent_codex_out" 2>"$tmpdir/agent_codex_err" || rc=$?
+    if [[ $rc -eq 0 ]] && grep -q "Connecting via SSH" "$tmpdir/agent_codex_err" \
+        && grep -q "Usage: codex" "$tmpdir/agent_codex_out"; then
+        pass "codex help runs in project instance"
     else
-        fail "third quickstart exits 0" "exit: $rc; stderr: $(cat "$tmpdir/qs3_err")"
+        fail "codex help runs in project instance" \
+            "exit: $rc; stderr: $(cat "$tmpdir/agent_codex_err"); stdout: $(cat "$tmpdir/agent_codex_out")"
     fi
 
-    if grep -q "Connecting via SSH" "$tmpdir/qs3_err"; then
-        pass "third quickstart reached SSH/claude exec"
+    pre_list=$("${binary_args[@]}" list 2>/dev/null | sort)
+    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ); then
+        post_list=$("${binary_args[@]}" list 2>/dev/null | sort)
+        if [[ "$pre_list" == "$post_list" ]]; then
+            pass "up reuses running project instance"
+        else
+            fail "up reuses running project instance" "instance list changed"
+        fi
     else
-        fail "third quickstart reached SSH/claude exec" \
-            "stderr: $(cat "$tmpdir/qs3_err")"
+        fail "up reuses running project instance" "repeated up failed"
     fi
 
-    if "$BINARY" status "$qs_inst_name" 2>/dev/null | grep -q -i running; then
-        pass "quickstart restarted stopped instance '$qs_inst_name'"
+    if ! coop stop "$agent_name"; then
+        fail "stop project instance before restart" "exit code: $?"
+        return
+    fi
+    if ( cd "$agent_ws" && _timeout 180 "${binary_args[@]}" up >/dev/null 2>&1 ) \
+        && "${binary_args[@]}" status "$agent_name" 2>/dev/null | grep -q -i running; then
+        pass "up restarts stopped project instance"
     else
-        fail "quickstart restarted stopped instance" \
-            "status: $("$BINARY" status "$qs_inst_name" 2>&1)"
+        fail "up restarts stopped project instance" \
+            "status: $("${binary_args[@]}" status "$agent_name" 2>&1)"
     fi
 
-    # Cleanup
-    coop destroy "$qs_inst_name" 2>/dev/null || true
-    untrack_instance "$qs_inst_name"
-    rm -rf "$qs_ws"
+    coop destroy "$agent_name" 2>/dev/null || true
+    untrack_instance "$agent_name"
+    rm -rf "$agent_ws"
 }
 
 # ── Project workflow tests (`coop up`, --full only) ───────────
@@ -8111,48 +8510,238 @@ STATEEOF
 
 # ── Interrupted setup test (--full only) ──────────────────────
 
+setup_session_live_count() {
+    ps -eo sid=,stat= | awk -v sid="$1" \
+        '$1 == sid && $2 !~ /^Z/ { count++ } END { print count + 0 }'
+}
+
+setup_chroot_child_live() {
+    local sid=$1 mount_path=$2 pid root
+
+    # The mount appears before setup launches chroot. Require a process whose
+    # actual root is that mount, not just another setup tool in the session.
+    while IFS= read -r pid; do
+        root=$(sudo -n readlink -- "/proc/$pid/root" 2>/dev/null) || continue
+        [[ $root == "$mount_path" ]] && return 0
+    done < <(ps -eo sid=,pid=,stat= | awk -v sid="$sid" \
+        '$1 == sid && $3 !~ /^Z/ { print $2 }')
+    return 1
+}
+
+stop_interrupted_setup_session() {
+    local sid=$1 remaining
+
+    [[ $sid =~ ^[1-9][0-9]*$ ]] || return 1
+
+    # setup's bounded subprocesses use separate process groups. A dedicated
+    # session lets the fixture stop every child left after SIGKILLing setup.
+    sudo -n pkill -TERM -s "$sid" 2>/dev/null || true
+    for _ in {1..5}; do
+        remaining=$(setup_session_live_count "$sid") || {
+            echo "  Could not inspect interrupted setup session" >&2
+            return 1
+        }
+        [[ $remaining -eq 0 ]] && return 0
+        sleep 1
+    done
+    sudo -n pkill -KILL -s "$sid" 2>/dev/null || true
+    for _ in {1..10}; do
+        remaining=$(setup_session_live_count "$sid") || {
+            echo "  Could not inspect interrupted setup session" >&2
+            return 1
+        }
+        [[ $remaining -eq 0 ]] && return 0
+        sleep 1
+    done
+    echo "  Interrupted setup session still has $remaining live process(es)" >&2
+    return 1
+}
+
 test_interrupted_setup() {
     echo ""
     echo "=== Phase: interrupted setup recovery ==="
 
     # Use a separate named image so we don't risk the default image
     local img="interrupted-$$"
+    local mount_path="$HOME/.coop/rootfs-mount"
 
-    # Start building an image in the background
-    "$BINARY" setup -y --image "$img" --profile python,node \
-        >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    # Linux setup tools use separate process groups. Keep them in one session
+    # so the fixture can end descendants after crashing the setup parent.
+    local linux_session=0
+    local session_file="$tmpdir/int-session"
+    if [[ $(uname -s) == Linux ]]; then
+        linux_session=1
+        local required_tool
+        for required_tool in python3 ps pkill awk mountpoint readlink; do
+            if ! command -v "$required_tool" >/dev/null 2>&1; then
+                fail "interrupted setup prerequisites" "missing $required_tool"
+                return
+            fi
+        done
+        if mountpoint -q "$mount_path"; then
+            fail "interrupted setup starts with unmounted rootfs" "mount already active"
+            return
+        fi
+        # setsid(1) can fork when its caller is a process-group leader. Python
+        # calls setsid(2), records its own PID only after success, and execs
+        # in place; $! stays the setup PID and wait can prove SIGKILL occurred.
+        python3 -c '
+import os
+import sys
+os.setsid()
+with open(sys.argv[1], "x", encoding="ascii") as session_file:
+    session_file.write(f"{os.getpid()}\n")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$session_file" "$BINARY" setup -y --image "$img" --profile python,node \
+            >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    else
+        "$BINARY" setup -y --image "$img" --profile python,node \
+            >"$tmpdir/int-stdout" 2>"$tmpdir/int-stderr" &
+    fi
     local setup_pid=$!
+    local setup_sid=""
 
-    # Wait for the build to actually start (poll stderr for build markers)
+    if [[ $linux_session -eq 1 ]]; then
+        # The launcher writes this private handoff only after setsid(2)
+        # succeeds. It remains available even if setup exits immediately.
+        for _ in {1..20}; do
+            if [[ -s $session_file ]]; then
+                IFS= read -r setup_sid < "$session_file" || true
+                break
+            fi
+            sleep 0.1
+        done
+        if [[ $setup_sid != "$setup_pid" ]]; then
+            kill -9 "$setup_pid" 2>/dev/null || true
+            wait "$setup_pid" 2>/dev/null || true
+            fail "interrupted setup isolated session" "leader PID and session ID differ"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+    fi
+
+    # On Linux, interrupt while the template mount is active. The old broad
+    # log marker could fire during download, before recovery had any mount to
+    # clean up. The Lima path retains its existing build marker.
     local waited=0
-    while [[ $waited -lt 90 ]]; do
+    local wait_limit=90
+    [[ $linux_session -eq 1 ]] && wait_limit=240
+    while [[ $waited -lt $wait_limit ]]; do
         # Check if process already exited (build finished before we could kill)
-        if ! kill -0 "$setup_pid" 2>/dev/null; then
+        if ! kill -0 "$setup_pid" 2>/dev/null \
+                || [[ $(ps -o stat= -p "$setup_pid" 2>/dev/null) == Z* ]]; then
             break
         fi
-        if grep -qi "building\|installing\|Starting builder\|downloading" \
-                "$tmpdir/int-stderr" 2>/dev/null; then
+        if [[ $linux_session -eq 1 ]] \
+                && mountpoint -q "$mount_path" \
+                && setup_chroot_child_live "$setup_sid" "$mount_path"; then
+            break
+        fi
+        if [[ $linux_session -eq 0 ]] \
+                && grep -qi "building\|installing\|Starting builder\|downloading" \
+                    "$tmpdir/int-stderr" 2>/dev/null; then
             break
         fi
         sleep 1
         waited=$((waited + 1))
     done
 
-    if ! kill -0 "$setup_pid" 2>/dev/null; then
-        # Process already exited — can't test interruption
-        wait "$setup_pid" 2>/dev/null || true
-        skip "interrupted setup" "build completed before kill"
-        coop images --delete "$img" 2>/dev/null || true
+    if ! kill -0 "$setup_pid" 2>/dev/null \
+            || [[ $(ps -o stat= -p "$setup_pid" 2>/dev/null) == Z* ]]; then
+        # A completed build cannot be interrupted; an early error is a test
+        # failure, not a reason to skip the recovery check.
+        local setup_rc=0
+        wait "$setup_pid" 2>/dev/null || setup_rc=$?
+        if [[ $linux_session -eq 1 ]] \
+                && ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        if [[ $linux_session -eq 1 ]]; then
+            fail "interrupted setup reached build" "setup exited before interruption (status $setup_rc)"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        elif [[ $setup_rc -eq 0 ]]; then
+            skip "interrupted setup" "build completed before kill"
+        else
+            fail "interrupted setup reached build" "setup exited before interruption"
+        fi
+        [[ $linux_session -eq 0 ]] && coop images --delete "$img" 2>/dev/null || true
         return
     fi
 
-    # Let it get deeper into the build
-    sleep 5
+    if [[ $linux_session -eq 1 ]] \
+            && { ! mountpoint -q "$mount_path" \
+                || [[ ! -f "$HOME/.coop/images/$img/rootfs-template.ext4.new" ]] \
+                || ! setup_chroot_child_live "$setup_sid" "$mount_path"; }; then
+        kill -9 "$setup_pid" 2>/dev/null || true
+        wait "$setup_pid" 2>/dev/null || true
+        if ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        fail "interrupted setup reached its chroot child" "no live chroot child after ${waited}s"
+        echo "  Retaining interrupted setup image $img for inspection" >&2
+        return
+    fi
+    [[ $linux_session -eq 1 ]] && pass "interrupted setup entered chroot"
 
-    # SIGKILL — bypasses signal handlers, simulates a crash
-    kill -9 "$setup_pid" 2>/dev/null
-    wait "$setup_pid" 2>/dev/null || true
+    # Let it get deeper into the build
+    [[ $linux_session -eq 0 ]] && sleep 5
+
+    # SIGKILL — bypasses signal handlers, simulates a crash. Require the
+    # signal exit status so a process that finished during the race cannot
+    # make this recovery check pass without an actual interruption.
+    local kill_rc=0 wait_rc=0
+    kill -9 "$setup_pid" 2>/dev/null || kill_rc=$?
+    wait "$setup_pid" 2>/dev/null || wait_rc=$?
+    if [[ $kill_rc -ne 0 || $wait_rc -ne 137 ]]; then
+        if [[ $linux_session -eq 1 ]] \
+                && ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        fail "setup killed mid-build (SIGKILL)" "signal rc=$kill_rc, wait status=$wait_rc"
+        if [[ $linux_session -eq 1 ]]; then
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        else
+            coop images --delete "$img" 2>/dev/null || true
+        fi
+        return
+    fi
     pass "setup killed mid-build (SIGKILL)"
+
+    if [[ $linux_session -eq 1 ]]; then
+        if ! setup_chroot_child_live "$setup_sid" "$mount_path"; then
+            if ! stop_interrupted_setup_session "$setup_sid"; then
+                fail "interrupted setup fixture stopped" "live descendants remain"
+            fi
+            fail "interrupted setup left an orphaned chroot child" "none remained after SIGKILL"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        pass "interrupted setup left an orphaned chroot child"
+
+        # The parent died without running MountGuard. End the fixture's
+        # orphaned chroot work before checking recovery; a live child can
+        # legitimately keep the mount busy beyond recovery's 90s deadline.
+        if ! stop_interrupted_setup_session "$setup_sid"; then
+            fail "interrupted setup fixture stopped" "live descendants remain"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+        # Recovery must see the mount left by the crash. This trips if the
+        # fixture was killed before mounting or cleanup already removed it.
+        if mountpoint -q "$mount_path"; then
+            pass "interrupted rootfs remains mounted for recovery"
+        else
+            fail "interrupted rootfs remains mounted for recovery" "mount absent"
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+            return
+        fi
+    fi
 
     # Retry — setup should clean up leftover state and succeed
     if coop setup -y --image "$img" --profile python,node; then
@@ -8160,7 +8749,16 @@ test_interrupted_setup() {
     else
         fail "setup succeeds after interrupted build" "exit code: $?"
         echo "stderr: $HARNESS_ERR"
-        coop images --delete "$img" 2>/dev/null || true
+        if [[ $linux_session -eq 1 ]]; then
+            local mount_state=unmounted
+            mountpoint -q "$mount_path" && mount_state=mounted
+            echo "recovery diagnostics: rootfs=$mount_state, fixture session live=$(setup_session_live_count "$setup_sid")"
+        fi
+        if [[ $linux_session -eq 1 ]]; then
+            echo "  Retaining interrupted setup image $img for inspection" >&2
+        else
+            coop images --delete "$img" 2>/dev/null || true
+        fi
         return
     fi
 
@@ -8555,8 +9153,11 @@ test_guest_files() {
     test_guest_files_reprovision "$inst_name" "$cfg" "$source"
     test_guest_files_symlink "$inst_name" "$cfg"
     unset GUEST_INSTANCE
-    coop destroy "$inst_name"
-    untrack_instance "$inst_name"
+    if coop destroy "$inst_name"; then
+        untrack_instance "$inst_name"
+    else
+        fail "guest_files cleanup destroys the stopped instance" "$HARNESS_ERR"
+    fi
     test_guest_files_live_mount
 }
 
@@ -9166,6 +9767,9 @@ EOF
     # below create their own instances and only need the shared golden image.
     if [[ "$SHARD" == all || "$SHARD" == lifecycle ]]; then
         run_timed_test test_up_creates_primary_instance
+        run_timed_test test_firecracker_rejects_pid_outside_service_cgroup
+        run_timed_test test_failed_firecracker_exec_preserves_disk_and_cleans_tap
+        run_timed_test test_abrupt_launcher_exit_keeps_supervised_vm_manageable
         run_timed_test test_private_storage
         run_timed_test test_start_rejects_missing_instance
         run_timed_test test_duplicate_name
@@ -9246,7 +9850,7 @@ EOF
 
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace ) ]]; then
-        run_timed_test test_quickstart
+        run_timed_test test_project_agent_workflow
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
         run_timed_test test_host_mount

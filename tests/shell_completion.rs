@@ -34,6 +34,7 @@ fn completion_protocol_returns_live_candidates_for_every_shell() -> anyhow::Resu
     for (shell, _) in SHELLS {
         for (words, index, candidate) in [
             (vec!["coop", ""], "1", "stop"),
+            (vec!["coop", "ed"], "1", "editor"),
             (vec!["coop", "profiles", "show", "py"], "3", "python"),
             (vec!["coop", "editor", "--w"], "2", "--web"),
         ] {

@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "macos"))]
 use crate::cmd::Cmd;
+#[cfg(target_os = "linux")]
+use crate::firecracker_install::require_managed_path;
 use crate::guest_env_state::EnvVarName;
 use crate::naming::validate_safe_chars;
 use crate::paths::GuestPath;
@@ -2272,7 +2274,7 @@ impl CoopConfig {
 
     /// Fail fast on config errors and surface warnings via `tracing::warn`.
     ///
-    /// Lifecycle commands (`up`/`setup`/`start`/`quickstart`) call this at
+    /// Lifecycle commands (`up`/`setup`/`start`) call this at
     /// the handler boundary so a broken config aborts before any expensive
     /// work (image build, PAT prompt, VM boot). It is *not* the gate: the
     /// authoritative environmental check runs at the boot choke point
@@ -2352,6 +2354,9 @@ impl CoopConfig {
 
         #[cfg(target_os = "linux")]
         {
+            if let Err(error) = require_managed_path(&self.firecracker_bin) {
+                errors.push(error.to_string());
+            }
             let policy =
                 crate::host_tool::TrustedToolPolicy::new("/", std::iter::empty::<PathBuf>(), 0);
             for (name, path) in self.network.host_tools.configured() {
@@ -3134,6 +3139,17 @@ impl Instance {
     /// confirmed absence from a failed liveness or identity check.
     #[mutants::skip] // /proc and kill(2) wrapper; Linux process tests cover its effects
     pub fn probe_running(&self) -> Result<bool> {
+        #[cfg(not(target_os = "macos"))]
+        match crate::firecracker_service::probe(self)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                if !crate::firecracker_service::contains_pid(&service)? {
+                    bail!("Firecracker service PID is outside its systemd cgroup");
+                }
+                return Ok(true);
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => {}
+        }
         let pid_path = self.pid_file_path();
         let pid_str = match fs::read_to_string(&pid_path) {
             Ok(value) => value,
@@ -3192,6 +3208,16 @@ impl Instance {
     /// or an orphaned Firecracker socket as a confirmed exit.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn probe_liveness(&self) -> Result<bool> {
+        match crate::firecracker_service::probe(self)? {
+            crate::firecracker_service::ServiceProbe::Active(service) => {
+                if !crate::firecracker_service::contains_pid(&service)? {
+                    bail!("Firecracker service PID is outside its systemd cgroup");
+                }
+                return Ok(true);
+            }
+            crate::firecracker_service::ServiceProbe::Uncertain(reason) => bail!("{reason}"),
+            crate::firecracker_service::ServiceProbe::None => {}
+        }
         let pid_path = self.pid_file_path();
         let pid = match fs::read_to_string(&pid_path) {
             Ok(value) => Some(
@@ -3253,7 +3279,18 @@ impl Instance {
                 )
             },
         )?;
-        ensure_firecracker_socket_stopped(&self.vsock_path(), "base vsock")?;
+        let vsock_path = self.vsock_path();
+        let staged_placeholder = match fs::symlink_metadata(&vsock_path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0 => {
+                crate::firecracker_jail::has_jailed_log_link(self)?
+            }
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).context("Cannot inspect vsock socket path"),
+        };
+        if !staged_placeholder {
+            ensure_firecracker_socket_stopped(&vsock_path, "base vsock")?;
+        }
         if pid.is_some()
             && let Err(error) = fs::remove_file(&pid_path)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -3267,8 +3304,8 @@ impl Instance {
     }
 }
 
-/// Identify the VMM by its instance-specific launch argument, not its binary
-/// name: `firecracker_bin` may point to a custom-named executable.
+/// Identify the VMM by its instance-specific launch argument. A stale process
+/// may predate the managed-binary requirement and use another executable name.
 /// `/proc/<pid>/cmdline` is NUL-delimited and paths need not be UTF-8, so compare
 /// raw argument bytes and reject ambiguous duplicate `--config-file` flags.
 fn firecracker_cmdline_matches_instance(cmdline: &[u8], config_path: &Path) -> bool {
@@ -3469,7 +3506,7 @@ fn default_ssh_port() -> NonZeroU16 {
 }
 
 fn default_firecracker_bin() -> ConfigPath {
-    ConfigPath::new(default_data_dir().join("firecracker"))
+    ConfigPath::new(crate::firecracker_install::firecracker_path())
 }
 
 /// Bounded no-panic proofs (Kani), gated so normal `cargo build`/`test`/
@@ -6006,7 +6043,7 @@ rsync = "/run/current-system/sw/bin/rsync"
         assert_eq!(default_kernel_path(), ConfigPath::new(data.join("vmlinux")));
         assert_eq!(
             default_firecracker_bin(),
-            ConfigPath::new(data.join("firecracker"))
+            ConfigPath::new(crate::firecracker_install::firecracker_path())
         );
     }
 
@@ -6278,9 +6315,8 @@ rsync = "/run/current-system/sw/bin/rsync"
     // from `cargo mutants -f src/config.rs`. Do not loosen the
     // assertions without re-running mutants first.
 
-    /// Build a `CoopConfig` with all path fields rooted in `data_dir`
-    /// so existence checks are deterministic. By default both
-    /// `kernel_path` and `firecracker_bin` point at non-existent files.
+    /// Build a `CoopConfig` with a non-existent kernel path and the default
+    /// managed Firecracker path.
     fn validate_fixture(data_dir: &Path) -> CoopConfig {
         CoopConfig {
             data_dir: ConfigPath::new(data_dir),
@@ -6288,7 +6324,7 @@ rsync = "/run/current-system/sw/bin/rsync"
                 kernel_path: ConfigPath::new(data_dir.join("nonexistent-kernel")),
                 ..VmConfig::default()
             },
-            firecracker_bin: ConfigPath::new(data_dir.join("nonexistent-firecracker")),
+            firecracker_bin: default_firecracker_bin(),
             ..CoopConfig::default()
         }
     }
@@ -6393,6 +6429,9 @@ rsync = "/run/current-system/sw/bin/rsync"
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
         let cfg = validate_fixture(&data_dir);
+        if cfg.firecracker_bin.exists() {
+            return;
+        }
         let warnings = cfg.validate().unwrap();
         assert!(
             warnings
@@ -6402,12 +6441,10 @@ rsync = "/run/current-system/sw/bin/rsync"
         );
     }
 
-    // Pins `&&` between firecracker existence and the linux cfg: on
-    // Linux when firecracker IS present, no warning must fire.
-    // Mutation to `||` would always warn on Linux.
+    // An existing custom path must fail static validation before setup or up.
     #[test]
     #[cfg(target_os = "linux")]
-    fn validate_no_firecracker_warning_when_present_on_linux() {
+    fn validate_rejects_custom_firecracker_path_on_linux() {
         let tmp = crate::test_support::private_tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir(&data_dir).unwrap();
@@ -6416,11 +6453,8 @@ rsync = "/run/current-system/sw/bin/rsync"
 
         let mut cfg = validate_fixture(&data_dir);
         cfg.firecracker_bin = ConfigPath::new(firecracker);
-        let warnings = cfg.validate().unwrap();
-        assert!(
-            !warnings.iter().any(|w| w.contains("firecracker_bin")),
-            "unexpected firecracker_bin warning, got {warnings:?}"
-        );
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"), "{error}");
     }
 
     // Pins the linux gate on non-linux hosts: a missing firecracker

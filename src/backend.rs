@@ -1045,6 +1045,8 @@ fn parse_meminfo_kib(value: &str) -> Option<u64> {
 /// Warnings are dropped here; they are surfaced once at the handler via
 /// [`CoopConfig::validate_and_warn`].
 pub fn boot_preflight(cfg: &CoopConfig) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    crate::firecracker_install::require_managed_path(&cfg.firecracker_bin)?;
     cfg.validate().map(drop)
 }
 
@@ -1225,6 +1227,11 @@ pub trait VmBackend: std::fmt::Display {
     /// is producing new output.
     fn stream_logs(&self, cfg: &CoopConfig, running: &RunningInstance, mode: LogMode)
     -> Result<()>;
+    /// Show a bounded snapshot after a confirmed stop. Following a stopped VM
+    /// has no meaning, so this path has no `LogMode` parameter.
+    fn snapshot_stopped_logs(&self, _inst: &Instance) -> Result<()> {
+        bail!("This VM is stopped and has no saved logs; run `coop logs` while it is running")
+    }
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget>;
     fn disk_path(&self, inst: &Instance) -> Result<PathBuf>;
     /// The address the guest uses to reach a server running on the host,
@@ -1240,8 +1247,7 @@ pub trait VmBackend: std::fmt::Display {
     ///
     /// On Firecracker this means the template rootfs (`rootfs-template.ext4`).
     /// On Lima it means both the base disk (`lima-base.img`) and the start
-    /// template (`lima-template.yaml`). Used by `coop quickstart` to skip
-    /// `setup` when nothing needs building.
+    /// template (`lima-template.yaml`).
     fn image_is_built(&self, cfg: &CoopConfig, image: &ImageName) -> bool;
 }
 
@@ -1270,13 +1276,48 @@ fn start_firecracker_existing(cfg: &CoopConfig, inst: &Instance) -> Result<()> {
         bail!("Instance '{}' is already running", inst.name);
     }
     boot_preflight(cfg)?;
+    crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+    crate::firecracker_service::require_system_manager()?;
+    crate::firecracker_jail::require_jail_tools()?;
+    crate::firecracker_runtime::ensure_jailed(inst)?;
     let vm = crate::vm::FirecrackerVm::new(cfg, inst);
     vm.configure()?;
     if inst.firecracker_network() == FirecrackerNetworkMode::Open {
         crate::network::setup_tap(&cfg.network, inst)?;
     }
-    let running = vm.start()?;
-    running.wait_for_boot()
+    start_firecracker_with_cleanup(cfg, inst, vm)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_firecracker_with_cleanup(
+    cfg: &CoopConfig,
+    inst: &Instance,
+    vm: crate::vm::FirecrackerVm<'_, crate::vm::Configured>,
+) -> Result<()> {
+    let result = vm.start().and_then(|running| running.wait_for_boot());
+    let Err(error) = result else { return Ok(()) };
+    match inst.probe_liveness() {
+        Ok(false) => {
+            let runtime = crate::vm::cleanup_runtime_paths(inst)
+                .and_then(|()| crate::firecracker_jail::cleanup_stopped(inst));
+            let network = crate::network::teardown_tap(&cfg.network, inst);
+            match (runtime, network) {
+                (Ok(()), Ok(())) => Err(error.context("Firecracker is confirmed stopped")),
+                (Err(cleanup), Ok(())) | (Ok(()), Err(cleanup)) => {
+                    Err(error.context(format!("Stopped Firecracker cleanup failed: {cleanup:#}")))
+                }
+                (Err(runtime), Err(network)) => Err(error.context(format!(
+                    "Stopped Firecracker runtime and TAP cleanup failed: {runtime:#}; {network:#}"
+                ))),
+            }
+        }
+        Ok(true) => Err(error.context(
+            "Firecracker service remains running; inspect it before stopping or retrying",
+        )),
+        Err(probe) => Err(error.context(format!(
+            "Firecracker process state is uncertain ({probe:#}); PID, sockets, TAP, and disk retained"
+        ))),
+    }
 }
 
 /// A failed readiness wait does not prove the VM stopped. Only roll back a
@@ -1406,6 +1447,9 @@ impl VmBackend for FirecrackerBackend {
             bail!("Instance '{}' is already running", inst.name);
         }
         boot_preflight(cfg)?;
+        crate::firecracker_install::configured_firecracker(&cfg.firecracker_bin)?;
+        crate::firecracker_service::require_system_manager()?;
+        crate::firecracker_jail::require_jail_tools()?;
         crate::config::validate_firecracker_modes(
             inst.firecracker_control(),
             inst.firecracker_network(),
@@ -1420,8 +1464,7 @@ impl VmBackend for FirecrackerBackend {
         if inst.firecracker_network() == FirecrackerNetworkMode::Open {
             crate::network::setup_tap(&cfg.network, inst)?;
         }
-        let running = vm.start()?;
-        running.wait_for_boot()
+        start_firecracker_with_cleanup(cfg, inst, vm)
     }
 
     fn start_existing(&self, cfg: &CoopConfig, inst: &Instance) -> Result<()> {
@@ -1468,7 +1511,8 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn cleanup_stopped(&self, cfg: &CoopConfig, stopped: &StoppedInstance) -> Result<()> {
-        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance());
+        let runtime = crate::vm::cleanup_runtime_paths(stopped.instance())
+            .and_then(|()| crate::firecracker_jail::cleanup_stopped(stopped.instance()));
         let network = crate::network::teardown_tap(&cfg.network, stopped.instance());
         match (runtime, network) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1487,18 +1531,21 @@ impl VmBackend for FirecrackerBackend {
             let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, inst);
             vm.stop()?;
         }
+        crate::vm::cleanup_runtime_paths(inst)?;
+        crate::firecracker_jail::cleanup_stopped(inst)?;
         crate::network::teardown_tap(&cfg.network, inst)?;
         if inst.dir.exists() {
             // A failed patch-time unmount must not let rm descend into the
             // guest filesystem or unlink its still-mounted backing file.
             crate::privileged_disk::ensure_disk_unmounted(&inst.rootfs_path())?;
-            if let Err(e) = Cmd::new("rm").args(["-rf"]).arg(&inst.dir).sudo().run() {
-                tracing::debug!(
-                    "Failed to remove instance dir {} (non-fatal): {e}",
-                    inst.dir.display()
-                );
-            }
+            Cmd::new("rm")
+                .args(["-rf"])
+                .arg(&inst.dir)
+                .sudo()
+                .run()
+                .context("Cannot remove destroyed Firecracker instance data")?;
         }
+        crate::firecracker_jail::release_identity(inst)?;
         Ok(())
     }
 
@@ -1511,19 +1558,17 @@ impl VmBackend for FirecrackerBackend {
         }
 
         crate::network::teardown_all(&cfg.network);
-        tracing::info!("Removing kernel and Firecracker binary");
-        for path in [cfg.vm.kernel_path.clone(), cfg.firecracker_bin.clone()] {
+        tracing::info!("Removing kernel and legacy data-directory Firecracker binaries");
+        for path in [
+            cfg.vm.kernel_path.to_path_buf(),
+            cfg.data_dir.join("firecracker"),
+            cfg.data_dir.join("jailer"),
+        ] {
             if path.exists()
                 && let Err(e) = Cmd::new("rm").arg("-f").arg(&path).sudo().run()
             {
                 tracing::debug!("Failed to remove {} (non-fatal): {e}", path.display());
             }
-        }
-        let jailer = cfg.data_dir.join("jailer");
-        if jailer.exists()
-            && let Err(e) = Cmd::new("rm").arg("-f").arg(&jailer).sudo().run()
-        {
-            tracing::debug!("Failed to remove jailer (non-fatal): {e}");
         }
     }
 
@@ -1648,6 +1693,17 @@ impl VmBackend for FirecrackerBackend {
     ) -> Result<()> {
         let vm = crate::vm::FirecrackerVm::from_running_unchecked(cfg, running.instance());
         vm.stream_logs(mode)
+    }
+
+    fn snapshot_stopped_logs(&self, inst: &Instance) -> Result<()> {
+        let _operation = lock_instance_operation(inst)?;
+        if inst.probe_liveness()? {
+            bail!(
+                "Instance '{}' started while reading its saved logs; retry `coop logs`",
+                inst.name
+            );
+        }
+        crate::firecracker_jail::snapshot_stopped_log(inst)
     }
 
     fn ssh_target(&self, cfg: &CoopConfig, inst: &Instance) -> Result<SshTarget> {
@@ -5437,6 +5493,17 @@ Filesystem     1M-blocks  Used Available Use% Mounted on
         // Default config has no custom config dirs or marketplace paths, so
         // the environmental (errors-only) check passes; warnings are dropped.
         boot_preflight(&CoopConfig::default()).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn boot_preflight_rejects_custom_vmm_before_instance_mutation() {
+        let cfg = CoopConfig {
+            firecracker_bin: crate::config::ConfigPath::new("/bin/false"),
+            ..CoopConfig::default()
+        };
+        let error = boot_preflight(&cfg).unwrap_err().to_string();
+        assert!(error.contains("Custom firecracker_bin"));
     }
 
     #[test]

@@ -25,8 +25,13 @@ shard also passes `--require-proxy`. Matrix failures do not cancel other shards.
 It does not run automatically for pull requests or pushes.
 It enables
 `COOP_TEST_DESTRUCTIVE=1` to cover `destroy --all`, and uploads the integration
-output per OS and shard as a seven-day artifact. Each suite step has a 30-minute
-timeout (35 minutes for the job including prerequisites and artifact upload).
+output per OS and shard as a seven-day artifact. Each suite step has a 60-minute
+timeout (65 minutes for the job including prerequisites and artifact upload).
+Guest package installation has varied by more than 30 minutes between CI
+runners, and otherwise progressing config, workspace, and features shards have
+reached both the former 30-minute and 45-minute suite caps. The Linux
+setup-recovery fixture requires Python 3, util-linux, and procps; the workflow
+installs them explicitly.
 Shards must run on separate hosts: they share image names and destructive
 cleanup affects host-wide state. Unsharded local and release runs retain the
 complete sequential suite. These jobs cover Linux/Firecracker; macOS/Lima
@@ -542,8 +547,7 @@ parsing, or state composition:
 - `src/update_policy.rs` — updater source, tag, and release-asset identity
   policy (the shell-out orchestration remains in excluded `src/update.rs`)
 - `src/commands/` — pure input-compatibility guards, summary/message builders,
-  byte-to-GiB arithmetic kernels, and predicates such as
-  `is_sensitive_workspace`
+  byte-to-GiB arithmetic kernels, and predicates
 
 **Don't bother with:** `backend.rs`, `completions.rs`, `lima.rs`, `setup.rs`,
 `update.rs`, `shell.rs`, `port_forward.rs`, `cmd.rs`, `ssh.rs`, `vm.rs`,
@@ -586,7 +590,7 @@ The same split applies in `src/commands/`. Kept helpers include
 `find_workspace_instance`, `find_git_repo_instance`,
 `no_stopped_instance_message`, `creation_options_rejected_message`, profile
 summary builders, `reprovision_regrow_target`, `format_dir_size`,
-`project_dir_to_str`, and `is_sensitive_workspace`. Their backend-driving
+and `project_dir_to_str`. Their backend-driving
 wrappers remain excluded. `GiB::from_bytes_ceil` is the shared byte-to-GiB
 conversion kernel in `config.rs`.
 

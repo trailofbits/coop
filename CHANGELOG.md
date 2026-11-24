@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- Remove `coop quickstart`. Run `coop setup` once, then `coop up` from the
+  project directory and launch an agent with `coop codex`, `coop claude`, or
+  `coop grok` (pass the VM name when several are running). For a scratch VM,
+  use a dedicated empty directory with `coop up` so no project files are copied.
+
+### Removed
+
+- Remove the `coop vscode` alias. Update scripts to use `coop editor` for
+  automatic editor selection or `coop editor --editor code` to select VS Code.
+
 ## v0.10.0
 
 ### Upgrading from v0.9.2

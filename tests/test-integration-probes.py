@@ -23,51 +23,57 @@ def functions(*names):
     )
 
 
-def shell(script, **env):
+def shell(script, *, bash="bash", **env):
     return subprocess.run(
-        ["bash", "-c", script], env={**os.environ, **env},
+        [bash, "-c", script], env={**os.environ, **env},
         capture_output=True, text=True, timeout=45,
     )
 
 
 class ProbeTests(unittest.TestCase):
-    def test_web_editor_lease_reports_why_it_ended(self):
+    def test_web_editor_lease_preserves_split_heartbeat(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
-        fixture = "set -euo pipefail\nlease_deadline=0\nlease_fragment=\n" + lease + "\nlease\n"
-        eof = subprocess.run(["bash", "-c", fixture], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, timeout=3)
-        self.assertEqual(eof.returncode, 0, eof.stderr)
-        self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
-
-        # macOS Bash reports a timed read as status 1, like EOF. Inject the
-        # Linux timeout status so this host-only test covers the guest branch.
-        timeout_fixture = fixture.replace("\nlease\n", "\nread() { return 142; }\nlease\n")
-        expired = subprocess.run(["bash", "-c", timeout_fixture], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=3)
-        self.assertEqual(expired.returncode, 0, expired.stderr)
-        self.assertEqual(expired.stdout, "cancelled lease_expired\n")
-
-        alive = subprocess.run(["bash", "-c", fixture.replace("lease_deadline=0", "lease_deadline=15")
-                                + "printf 'continued\\n'\n"], input="alive\n",
-                               capture_output=True, text=True, timeout=3)
-        self.assertEqual(alive.returncode, 0, alive.stderr)
-        self.assertEqual(alive.stdout, "continued\n")
-
-        unexpected = subprocess.run(["bash", "-c", fixture], input="invalid\n",
-                                    capture_output=True, text=True, timeout=3)
-        self.assertEqual(unexpected.returncode, 0, unexpected.stderr)
-        self.assertEqual(unexpected.stdout, "cancelled lease_bad_heartbeat\n")
-
-        partial = fixture.replace("lease_deadline=0", "lease_deadline=15").replace(
-            "\nlease\n", "\nread() {\n"
-            "    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=ali; return 142; fi\n"
-            "    heartbeat=ve; return 0\n"
-            "}\nlease\nlease\n[[ -z $lease_fragment ]]\nprintf 'continued\\n'\n")
-        resumed = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
+        fixture = "set -euo pipefail\nlease_deadline=15\nlease_fragment=\n" + lease
+        # Inject the Linux timed-read status. macOS Bash reports timeouts as
+        # status 1, so an actual timed pipe cannot cover this guest branch.
+        split = fixture + '''
+read() {
+    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=ali; return 142; fi
+    heartbeat=ve; return 0
+}
+lease
+lease
+[[ -z $lease_fragment ]]
+printf 'continued\n'
+'''
+        resumed = subprocess.run(["bash", "-c", split], stdin=subprocess.DEVNULL,
                                  capture_output=True, text=True, timeout=3)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout, "continued\n")
+
+        invalid = fixture + '''
+read() { heartbeat=oops; return 0; }
+lease
+'''
+        rejected = subprocess.run(["bash", "-c", invalid], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=3)
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+
+        eof = subprocess.run(["bash", "-c", fixture + "\nlease\n"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
+        self.assertEqual(eof.returncode, 0, eof.stderr)
+        self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
+
+        expired = fixture.replace("lease_deadline=15", "lease_deadline=0") + '''
+read() { return 142; }
+lease
+'''
+        stopped = subprocess.run(["bash", "-c", expired], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(stopped.stdout, "cancelled lease_expired\n")
 
     def test_web_editor_failure_snapshot_does_not_print_guest_text(self):
         path = Path(__file__).parent / "integration-web-editor.py"
@@ -108,6 +114,43 @@ class ProbeTests(unittest.TestCase):
                     module.launch_state_probe([str(fake_coop)], "vm")
                 self.assertEqual(output.getvalue().strip(), "EDITOR_LAUNCH_PROBE " + expected)
                 self.assertNotIn("secret=", output.getvalue())
+
+    def test_untrack_instance_handles_an_empty_array_with_nounset(self):
+        result = shell('set -eu\n' + functions("untrack_instance") + '''
+            STARTED_INSTANCES=()
+            untrack_instance absent
+            STARTED_INSTANCES=(first second)
+            untrack_instance first
+            [[ "${STARTED_INSTANCES[0]}" == second ]]
+            untrack_instance second
+            untrack_instance absent
+            printf 'untracked\\n'
+        ''', bash="/bin/bash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "untracked\n")
+
+    def test_cleanup_requires_a_summary_and_preserves_exit_status(self):
+        fixture = 'set -eu\n' + functions("summary", "cleanup") + '''
+            STARTED_INSTANCES=()
+            SKIPPED=()
+            pass_count=0
+            fail_count=0
+            skip_count=0
+            suite_summary_complete=0
+            trap cleanup EXIT
+        '''
+        for command, expected_status, early_exit in [
+            ("exit 0", 1, True),
+            ("summary", 0, False),
+            ("fail_count=1; summary", 1, False),
+            ("exit 7", 7, False),
+        ]:
+            with self.subTest(command=command):
+                result = shell(fixture + command, bash="/bin/bash")
+                self.assertEqual(result.returncode, expected_status,
+                                 result.stdout + result.stderr)
+                self.assertEqual("exited before its summary" in result.stderr,
+                                 early_exit, result.stderr)
 
     def test_grok_binary_requirement_tracks_rebuilt_image(self):
         fixture = functions("test_grok_bin_path") + '''

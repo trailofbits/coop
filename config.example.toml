@@ -5,7 +5,7 @@
 
 # data_dir = "~/.coop"          # VM artifacts: images, instances, keys
 # ssh_port = 22                 # Legacy TCP guest SSH port (vsock proxies fixed port 22)
-# firecracker_bin = "~/.coop/firecracker"  # Linux only
+# firecracker_bin = "/var/lib/coop/firecracker/v1.18.0/firecracker"  # Linux only; custom paths are rejected
 # post_create = "sudo apt-get update && sudo apt-get install -y htop"
 # Creation commands run once per VM creation, after workspace setup.
 # post_start = "echo guest ready"         # Every boot, after creation/workspace setup

@@ -958,6 +958,30 @@ pub fn lock_sibling_bounded(target: &Path, timeout: Duration) -> Result<FileLock
     }
 }
 
+/// Lock an existing directory without creating a writable lock file beneath
+/// a root-owned installation root. The caller validates the directory first.
+pub(crate) fn lock_existing_dir_bounded(path: &Path, timeout: Duration) -> Result<FileLock> {
+    let file = normalize_lock_file(
+        File::open(path)
+            .with_context(|| format!("Failed to open lock directory {}", path.display()))?,
+    )?;
+    let start = Instant::now();
+    loop {
+        // SAFETY: the File owns this valid descriptor throughout the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(FileLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error).with_context(|| format!("Failed to lock {}", path.display()));
+        }
+        if start.elapsed() >= timeout {
+            bail!("Timed out waiting for installation lock {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Write `content` to `path` atomically with permissions `mode`.
 ///
 /// If the target file already exists with stricter permissions (any
@@ -1443,6 +1467,19 @@ mod tests {
         assert!(error.to_string().contains("Timed out"));
         drop(first);
         assert!(lock_sibling_bounded(&target, Duration::from_millis(100)).is_ok());
+    }
+
+    #[test]
+    fn existing_directory_lock_serializes_without_creating_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let first = lock_existing_dir_bounded(root.path(), Duration::from_millis(100)).unwrap();
+        let error = lock_existing_dir_bounded(root.path(), Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Timed out"));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        drop(first);
+        assert!(lock_existing_dir_bounded(root.path(), Duration::from_millis(100)).is_ok());
     }
 
     #[test]

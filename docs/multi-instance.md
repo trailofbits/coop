@@ -57,7 +57,7 @@ coop shell another-project
 ```
 
 This applies to `shell`, `stop`, `destroy`, `status <name>`, `logs`, `push`,
-`pull`, `exec`, `editor` (including `--web` and the `vscode` alias), `resize`,
+`pull`, `exec`, `editor` (including `--web`), `resize`,
 `model`, `claude`, and `codex`.
 
 `coop editor --web` resolves the optional name using all registered instances,
@@ -172,14 +172,17 @@ All instance data lives under `~/.coop/instances/<name>/`. Each instance directo
 | `rootfs.ext4` | Instance root filesystem (Firecracker) |
 | `firecracker.pid` | PID of the running Firecracker process |
 | `firecracker.socket` | Legacy Firecracker API socket (only for VMs started by older versions) |
-| `firecracker.log` | Serial console log |
+| `firecracker.log` | Active jail marker; a bounded recent journal copy after stop (legacy VMs retain their file log) |
+| `firecracker.runtime.json` | Versioned jailed-launch selection, atomically published on the first stopped start with this version of coop |
 | `vm_config.json` | Firecracker VM configuration |
 | `workspace.json` | Workspace sync state (host path, guest path, source) |
-| `vsock.sock` | Firecracker base vsock socket (inside the private instance directory) |
+| `vsock.sock` | Bind mount of the pinned Firecracker base vsock socket inode in the current jail generation |
 
 Older stopped Firecracker VMs can retain root-owned API and base vsock socket
-entries after their PID file is removed. Coop checks both with a privileged,
-nonblocking connection probe. It removes them on the next start or stopped-VM
+entries after their PID file is removed. Coop checks systemd service state and
+both sockets with a privileged, nonblocking connection probe. For jailed VMs,
+the instance's socket mount pins the active jail generation's socket inode.
+Coop removes stale socket entries on the next start or stopped-VM
 cleanup only when neither socket is listening. A live listener, a non-socket
 entry, or an uncertain probe blocks the operation. In that case, inspect the
 path from the error with `sudo lsof -nP <socket-path>` and verify and stop any
