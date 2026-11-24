@@ -67,7 +67,7 @@ then requires the selected VM to be running.
 
 ### Just the names
 
-`coop list` (alias `ls`) prints a minimal name/state table. It reads from local on-disk state only, so it's fast and works even when VMs are unreachable. Use it when you just need to remember what's available:
+`coop list` prints a minimal name/state table. It reads from local on-disk state only, so it's fast and works even when VMs are unreachable. Use it when you just need to remember what's available:
 
 ```
 $ coop list
