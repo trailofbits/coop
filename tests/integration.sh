@@ -1999,6 +1999,65 @@ test_claude_onboarding_seed() {
     fi
 }
 
+check_codex_code_mode_host() {
+    local probe_output
+
+    if probe_output=$(coop_exec bash -o pipefail -c '
+        host=/usr/local/bin/codex-code-mode-host
+        err_file=$(mktemp) || exit 1
+        trap "rm -f \"$err_file\"" EXIT
+
+        # Codex 0.172 speaks HTTP/2 over stdio. Require an ACK to our SETTINGS;
+        # the initial server SETTINGS alone only proves that the host started.
+        http2_output=$(printf "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\4\0\0\0\0\0" |
+            timeout 10 "$host" --listen stdio 2>"$err_file" | od -An -v -tu1)
+        http2_status=$?
+        http2_error=$(head -c 500 "$err_file")
+        if (( http2_status == 0 )); then
+            bytes=($http2_output)
+            offset=0 settings=0 acknowledged=0 count=${#bytes[@]}
+            while (( offset + 9 <= count )); do
+                length=$((bytes[offset] * 65536 + bytes[offset + 1] * 256 + bytes[offset + 2]))
+                kind=${bytes[offset + 3]}
+                flags=${bytes[offset + 4]}
+                stream=$((bytes[offset + 5] + bytes[offset + 6] + bytes[offset + 7] + bytes[offset + 8]))
+                offset=$((offset + 9))
+                (( offset + length <= count )) || break
+                if (( kind == 4 && stream == 0 )); then
+                    if (( flags == 0 && length % 6 == 0 )); then
+                        settings=1
+                    elif (( flags == 1 && length == 0 && settings == 1 )); then
+                        acknowledged=1
+                    fi
+                fi
+                offset=$((offset + length))
+            done
+            if (( offset == count && settings == 1 && acknowledged == 1 )); then
+                exit 0
+            fi
+        fi
+
+        # Older installed images use a length-prefixed JSON hello.
+        : > "$err_file"
+        hello="{\"type\":\"connection/hello\",\"supportedVersions\":[1],\"requiredCapabilities\":[],\"optionalCapabilities\":[]}"
+        if printf "\147\000\000\000%s" "$hello" |
+            timeout 10 "$host" --listen stdio 2>"$err_file" |
+            dd bs=1 skip=4 status=none |
+            grep -Eq "\"type\"[[:space:]]*:[[:space:]]*\"connection/ready\""; then
+            exit 0
+        fi
+
+        printf "HTTP/2 probe status %s; host stderr: %s\n" "$http2_status" "$http2_error"
+        printf "legacy host stderr: %s\n" "$(head -c 500 "$err_file")"
+        exit 1
+'); then
+        pass "Codex Code Mode host completes a stdio handshake"
+    else
+        fail "Codex Code Mode host completes a stdio handshake" \
+            "${probe_output:-no probe output}; stderr: $(guest_stderr)"
+    fi
+}
+
 check_native_codex() {
     local guest_home launcher native_host version codex_path host_path
     guest_home=$(guest_exec printenv HOME)
@@ -2026,19 +2085,7 @@ check_native_codex() {
             "output: $version; stderr: $(guest_stderr)"
     fi
 
-    # The Code Mode protocol uses a little-endian length-prefixed JSON frame.
-    # A successful hello must return connection/ready; an exit-zero stub cannot.
-    if coop_exec bash -o pipefail -c '
-        hello='"'"'{"type":"connection/hello","supportedVersions":[1],"requiredCapabilities":[],"optionalCapabilities":[]}'"'"'
-        printf "\147\000\000\000%s" "$hello" |
-            timeout 10 /usr/local/bin/codex-code-mode-host --listen stdio |
-            dd bs=1 skip=4 status=none |
-            grep -Eq '"'"'"type"[[:space:]]*:[[:space:]]*"connection/ready"'"'"'
-    '; then
-        pass "Codex Code Mode host responds to stdio hello"
-    else
-        fail "Codex Code Mode host responds to stdio hello" "stderr: $(guest_stderr)"
-    fi
+    check_codex_code_mode_host
 
     codex_path=$(guest_exec readlink -f /usr/local/bin/codex)
     host_path=$(guest_exec readlink -f /usr/local/bin/codex-code-mode-host)
