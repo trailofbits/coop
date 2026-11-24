@@ -139,22 +139,28 @@ elif mode == "exit-error":
             fragment = functions("check_codex_code_mode_host").replace(
                 "host=/usr/local/bin/codex-code-mode-host", 'host="$FIXTURE_HOST"')
             fixture = fragment + '''
-                coop_exec() { "$@" 2>/dev/null; }
+                coop_exec() {
+                    [[ ${TRANSPORT_FAIL:-0} == 1 ]] && return 1
+                    "$@" 2>/dev/null
+                }
                 pass() { echo "PASS $*"; }
                 fail() { echo "FAIL $*"; }
                 check_codex_code_mode_host
             '''
             for mode in ("http2-ready", "legacy-ready", "http2-no-ack",
                          "http2-truncated",
-                         "legacy-error", "exit-zero", "exit-error"):
+                         "legacy-error", "exit-zero", "exit-error", "transport-error"):
                 with self.subTest(mode=mode):
                     result = shell(fixture, HOST_MODE=mode, FIXTURE_HOST=str(host),
+                                   TRANSPORT_FAIL="1" if mode == "transport-error" else "0",
                                    PATH=directory + os.pathsep + os.environ["PATH"])
                     self.assertEqual(result.returncode, 0, result.stderr)
                     expected = "PASS" if mode.endswith("ready") else "FAIL"
                     self.assertTrue(result.stdout.startswith(expected), result.stdout)
+                    if expected == "FAIL":
+                        self.assertIn("Neither HTTP/2 nor legacy handshake probe succeeded",
+                                      result.stdout)
                     if mode == "exit-error":
-                        self.assertIn("HTTP/2 probe exit status:", result.stdout)
                         self.assertNotIn("fixture-host-error", result.stdout + result.stderr)
 
     def test_untrack_instance_handles_an_empty_array_with_nounset(self):

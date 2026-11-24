@@ -1995,8 +1995,6 @@ test_claude_onboarding_seed() {
 }
 
 check_codex_code_mode_host() {
-    local http2_status legacy_status
-
     if coop_exec bash -o pipefail -c '
         host=/usr/local/bin/codex-code-mode-host
 
@@ -2026,8 +2024,6 @@ check_codex_code_mode_host() {
     ' >/dev/null; then
         pass "Codex Code Mode host completes a stdio handshake"
         return
-    else
-        http2_status=$?
     fi
 
     # Older installed images use a length-prefixed JSON hello.
@@ -2044,12 +2040,10 @@ check_codex_code_mode_host() {
     ' >/dev/null; then
         pass "Codex Code Mode host completes a stdio handshake"
         return
-    else
-        legacy_status=$?
     fi
 
     fail "Codex Code Mode host completes a stdio handshake" \
-        "HTTP/2 probe exit status: $http2_status; legacy probe exit status: $legacy_status"
+        "Neither HTTP/2 nor legacy handshake probe succeeded"
 }
 
 check_native_codex() {
