@@ -290,11 +290,12 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-F", "none"]));
         assert!(args.contains(&std::ffi::OsStr::new("ClearAllForwardings=yes")));
         assert_eq!(
-            &args[args.len() - 5..],
+            &args[args.len() - 6..],
             [
                 std::ffi::OsStr::new("-e"),
                 std::ffi::OsStr::new("~"),
                 std::ffi::OsStr::new("-t"),
+                std::ffi::OsStr::new("--"),
                 std::ffi::OsStr::new("ubuntu@127.0.0.1"),
                 std::ffi::OsStr::new("cd /workspace && 'claude' 'agents'"),
             ]

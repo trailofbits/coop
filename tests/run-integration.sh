@@ -72,8 +72,8 @@ fi
 
 # ── Remote mode ──────────────────────────────────────────────────
 
-REMOTE_OS=$(ssh "$REMOTE_HOST" uname -s)
-REMOTE_ARCH=$(ssh "$REMOTE_HOST" uname -m)
+REMOTE_OS=$(ssh -- "$REMOTE_HOST" uname -s)
+REMOTE_ARCH=$(ssh -- "$REMOTE_HOST" uname -m)
 
 case "$REMOTE_OS-$REMOTE_ARCH" in
     Linux-x86_64)   TARGET="x86_64-unknown-linux-musl" ;;
@@ -109,13 +109,13 @@ else
 fi
 printf 'TIMING build:coop-proxy-local %ds\n' "$((SECONDS - build_started))"
 
-REMOTE_DIR=$(ssh "$REMOTE_HOST" mktemp -d)
+REMOTE_DIR=$(ssh -- "$REMOTE_HOST" mktemp -d)
 source_archive=""
-trap '[[ -z "$source_archive" ]] || rm -f "$source_archive"; ssh "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
+trap '[[ -z "$source_archive" ]] || rm -f "$source_archive"; ssh -- "$REMOTE_HOST" rm -rf "$REMOTE_DIR"' EXIT
 
 echo "Copying binary and test script to $REMOTE_HOST:$REMOTE_DIR..."
-scp -q "$LOCAL_BINARY" "$TEST_SCRIPT" "$PROJECT_DIR/src/seatbelt-proxy.sb" "$REMOTE_HOST:$REMOTE_DIR/"
-scp -q "$PROJECT_DIR/tests/integration-web-editor.py" "$REMOTE_HOST:$REMOTE_DIR/"
+scp -q -- "$LOCAL_BINARY" "$TEST_SCRIPT" "$PROJECT_DIR/src/seatbelt-proxy.sb" "$REMOTE_HOST:$REMOTE_DIR/"
+scp -q -- "$PROJECT_DIR/tests/integration-web-editor.py" "$REMOTE_HOST:$REMOTE_DIR/"
 
 # The full network gate and proxy fallback build on the remote. Include tracked
 # working-tree edits so those gates test the same code as coop.
@@ -125,17 +125,17 @@ if [[ "$build_proxy_on_remote" == "1" || ( "$FULL" == "1" && "${COOP_TEST_SKIP_B
         cd "$PROJECT_DIR"
         git ls-files -z | tar --null -czf "$source_archive" -T -
     )
-    scp -q "$source_archive" "$REMOTE_HOST:$REMOTE_DIR/coop-src.tar.gz"
+    scp -q -- "$source_archive" "$REMOTE_HOST:$REMOTE_DIR/coop-src.tar.gz"
     rm -f "$source_archive"
     source_archive=""
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
-    ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR/src' && tar xzf '$REMOTE_DIR/coop-src.tar.gz' -C '$REMOTE_DIR/src'"
+    ssh -- "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR/src' && tar xzf '$REMOTE_DIR/coop-src.tar.gz' -C '$REMOTE_DIR/src'"
 fi
 
 if [[ "$FULL" == "1" && "${COOP_TEST_SKIP_BRIDGE:-0}" != 1 ]]; then
     echo "Running bridge isolation integration test on $REMOTE_HOST..."
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path
-    ssh "$REMOTE_HOST" "
+    ssh -- "$REMOTE_HOST" "
         set -e
         . \"\$HOME/.cargo/env\" 2>/dev/null || true
         cd '$REMOTE_DIR/src'
@@ -144,13 +144,13 @@ if [[ "$FULL" == "1" && "${COOP_TEST_SKIP_BRIDGE:-0}" != 1 ]]; then
 fi
 
 if [[ "$build_proxy_on_remote" == "0" ]]; then
-    scp -q "$LOCAL_PROXY" "$REMOTE_HOST:$REMOTE_DIR/"
+    scp -q -- "$LOCAL_PROXY" "$REMOTE_HOST:$REMOTE_DIR/"
 else
     # The proxy fallback requires cargo + cmake + a C compiler.
     echo "Building coop-proxy natively on $REMOTE_HOST..."
     build_started=$SECONDS
     # shellcheck disable=SC2029 # $REMOTE_DIR is a mktemp path; expand client-side
-    ssh "$REMOTE_HOST" "
+    ssh -- "$REMOTE_HOST" "
         set -e
         . \"\$HOME/.cargo/env\" 2>/dev/null || true
         cd '$REMOTE_DIR/src'
@@ -184,4 +184,4 @@ REMOTE_CMD+=("$REMOTE_DIR/integration.sh" --binary "$REMOTE_DIR/coop"
 echo "Running tests on $REMOTE_HOST..."
 echo ""
 # shellcheck disable=SC2029 # client-side expansion is intentional (printf %q handles quoting)
-ssh "$REMOTE_HOST" "$(printf '%q ' "${REMOTE_CMD[@]}")"
+ssh -- "$REMOTE_HOST" "$(printf '%q ' "${REMOTE_CMD[@]}")"

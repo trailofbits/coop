@@ -167,6 +167,7 @@ fn local_forward_args(
         args.push(spec.clone());
         specs.push(spec);
     }
+    args.push("--".into());
     args.push(target.addr());
     Ok((args, specs))
 }
@@ -267,7 +268,7 @@ pub fn teardown_ssh_forwards(inst: &Instance, target: &SshTarget) {
             "ControlPath={}",
             crate::openssh::config_path(&control_path, "SSH forward control socket path")?
         );
-        ssh.args(["-O", "exit", "-o", &control_arg, &target.addr()])
+        ssh.args(["-O", "exit", "-o", &control_arg, "--", &target.addr()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -403,8 +404,13 @@ mod tests {
         assert!(command.contains(&"ClearAllForwardings=no".to_string()));
         assert_eq!(specs, ["127.0.0.1:10001:127.0.0.1:3000"]);
         assert_eq!(
-            &command[command.len() - 3..],
-            ["-L", "127.0.0.1:10001:127.0.0.1:3000", "ubuntu@127.0.0.1",]
+            &command[command.len() - 4..],
+            [
+                "-L",
+                "127.0.0.1:10001:127.0.0.1:3000",
+                "--",
+                "ubuntu@127.0.0.1",
+            ]
         );
     }
 

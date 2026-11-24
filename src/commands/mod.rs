@@ -81,7 +81,13 @@ fn purge_all_data(be: &backend::PlatformBackend, cfg: &config::CoopConfig) -> Re
         // Instance dirs may be root-owned (Firecracker) or user-owned (Lima)
         if let Err(e) = std::fs::remove_dir_all(&instances_dir) {
             tracing::debug!("User remove_dir_all failed, trying sudo: {e}");
-            if let Err(e) = Cmd::new("rm").arg("-rf").arg(&instances_dir).sudo().run() {
+            if let Err(e) = Cmd::new("rm")
+                .arg("-rf")
+                .arg("--")
+                .arg(&instances_dir)
+                .sudo()
+                .run()
+            {
                 tracing::debug!(
                     "Failed to remove instances dir {} (non-fatal): {e}",
                     instances_dir.display()
