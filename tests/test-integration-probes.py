@@ -28,6 +28,80 @@ def shell(script, *, bash="bash", **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_web_editor_lease_preserves_split_heartbeat(self):
+        source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
+        lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        fixture = "set -euo pipefail\nlease_deadline=15\nlease_fragment=\n" + lease
+        # Inject the Linux timed-read status. macOS Bash reports timeouts as
+        # status 1, so an actual timed pipe cannot cover this guest branch.
+        split = fixture + '''
+read() {
+    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=ali; return 142; fi
+    heartbeat=ve; return 0
+}
+lease
+lease
+[[ -z $lease_fragment ]]
+printf 'continued\n'
+'''
+        resumed = subprocess.run(["bash", "-c", split], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout, "continued\n")
+
+        repeated = fixture + '''
+read() {
+    case ${reads:-0} in
+        0) reads=1; heartbeat=a; return 142 ;;
+        1) reads=2; heartbeat=li; return 142 ;;
+        *) heartbeat=ve; return 0 ;;
+    esac
+}
+lease
+lease
+lease
+[[ -z $lease_fragment ]]
+printf 'continued\n'
+'''
+        resumed = subprocess.run(["bash", "-c", repeated], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(resumed.stdout, "continued\n")
+
+        for fragment in ("oops", "aliveX"):
+            with self.subTest(fragment=fragment):
+                partial = fixture + f'''
+read() {{ heartbeat={fragment}; return 142; }}
+lease
+'''
+                rejected = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
+                                          capture_output=True, text=True, timeout=3)
+                self.assertEqual(rejected.returncode, 0, rejected.stderr)
+                self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+
+        invalid = fixture + '''
+read() { heartbeat=oops; return 0; }
+lease
+'''
+        rejected = subprocess.run(["bash", "-c", invalid], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=3)
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
+
+        eof = subprocess.run(["bash", "-c", fixture + "\nlease\n"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
+        self.assertEqual(eof.returncode, 0, eof.stderr)
+        self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
+
+        expired = fixture.replace("lease_deadline=15", "lease_deadline=0") + '''
+read() { return 142; }
+lease
+'''
+        stopped = subprocess.run(["bash", "-c", expired], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=3)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(stopped.stdout, "cancelled lease_expired\n")
+
     def test_untrack_instance_handles_an_empty_array_with_nounset(self):
         result = shell('set -eu\n' + functions("untrack_instance") + '''
             STARTED_INSTANCES=()

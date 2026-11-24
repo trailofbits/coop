@@ -2286,8 +2286,8 @@ fn bootstrap_claude(
     // Overlay customizations and refresh their narrow preferences before any Claude invocation.
     let staged_config = prepare_claude_config_import(&session.target, &claude.config_dir)?;
 
-    // Managed permissions: pre-accept bypass mode so `coop ca` and
-    // `coop claude` skip prompts without an interactive acceptance step.
+    // Managed permissions: pre-accept bypass mode so `coop claude`
+    // skips prompts without an interactive acceptance step.
     // The same file carries the local-model `env` block when this VM is
     // in local mode, so the routing is refreshed on every boot and
     // survives stop/start.
@@ -3588,7 +3588,7 @@ fn merge_managed_claude_settings(
 /// replaced with managed defaults, then the import snapshot is reapplied.
 ///
 /// The write is staged to a temp file and renamed into place so a
-/// `claude`/`coop ca` session reading the file concurrently (during a
+/// `claude` session reading the file concurrently (during a
 /// live `coop model` switch) never observes a truncated file. The rename
 /// is atomic because the temp file is in the same directory.
 fn write_managed_claude_settings(

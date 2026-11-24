@@ -447,10 +447,10 @@ During VM startup, coop writes `~/.claude/settings.json` in the guest with `defa
 coop claude --ask
 ```
 
-Pass extra arguments through to `claude`:
+Pass extra arguments through to `claude` by naming the instance:
 
 ```
-coop claude -- --model opus
+coop claude my-project -- --model opus
 ```
 
 **Launch Codex inside the VM:**

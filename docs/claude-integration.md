@@ -5,7 +5,8 @@ coop sets up Claude Code inside guest VMs and gives you a single command to laun
 ## Launching Claude Code
 
 ```bash
-coop claude [instance-name] [-- extra-args...]
+coop claude [instance-name]
+coop claude instance-name -- extra-args...
 ```
 
 This SSHes into the guest and runs the `claude` CLI. The guest's managed `~/.claude/settings.json` (written during VM startup) sets `defaultMode: bypassPermissions` and `skipDangerousModePermissionPrompt: true`, so Claude operates without confirmation prompts. The VM is the isolation boundary; permission prompts inside it are redundant.
@@ -16,23 +17,26 @@ To restore permission prompts for a single session, pass `--ask`. coop then laun
 coop claude --ask
 ```
 
-Trailing arguments go straight through to the `claude` CLI:
+Trailing arguments go straight through to the `claude` CLI when you specify
+the instance name:
 
 ```bash
-coop claude -- --model sonnet --verbose
+coop claude my-project -- --model sonnet --verbose
 ```
 
 ## Managing background agents
 
 ```bash
-coop claude-agents [instance-name] [-- extra-args...]
-# or the short alias:
-coop ca
+coop claude
 ```
 
-This runs `claude agents` in the guest, which opens the agent view — an interactive TUI for monitoring background agent sessions. Background sessions are managed by Claude Code (not by coop), so closing the TUI and reconnecting later with `coop ca` keeps you in sync with whatever is still running.
+Press Left Arrow in Claude Code to open [Agent View](https://code.claude.com/docs/en/agent-view).
+Background sessions are managed by Claude Code, so closing the view and
+reopening it from a later `coop claude` session shows sessions that are still
+running. To launch Agent View directly with a named running instance, use
+`coop claude my-project -- agents`.
 
-The agent view itself has no sign-in prompt, but it forwards a `/login` command to a new Claude Code session. If you haven't signed Claude in with `coop claude` (and aren't forwarding an `ANTHROPIC_API_KEY`), run `/login` at the start of your `coop ca` session to start the sign-in flow.
+The agent view itself has no sign-in prompt, but it forwards a `/login` command to a new Claude Code session. If you haven't signed Claude in with `coop claude` (and aren't forwarding an `ANTHROPIC_API_KEY`), run `/login` at the start of the session to start the sign-in flow.
 
 If the remote TUI appears stuck or stops responding, use OpenSSH's local escape: type Enter, then `~.` to disconnect. coop forces the interactive SSH escape character to `~`, so the escape path is available even if your user SSH config changes or disables `EscapeChar`. If your terminal remains in raw/no-echo mode after the disconnect, run:
 
@@ -45,10 +49,8 @@ This is separate from SSH startup failures that exit with code 255. coop already
 `claude agents` accepts `--cwd <path>` (filter sessions by working directory) and `--setting-sources <sources>`; pass them after `--`:
 
 ```bash
-coop ca -- --cwd /workspace
+coop claude my-project -- agents --cwd /workspace
 ```
-
-Closing the TUI does not stop background sessions; reopening `coop ca` reattaches to whatever Claude Code's daemon is still running.
 
 ## Configuration
 

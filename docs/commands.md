@@ -268,35 +268,19 @@ coop claude [NAME] [FLAGS] [ARGS...]
 | `--ask` | Prompt for permissions instead of skipping them |
 | `ARGS...` | Extra arguments passed through to `claude` |
 
+When passing `ARGS...`, specify `NAME` before `--`.
+
 ```
 coop claude
 coop claude my-project --ask
 coop claude my-project -- --model sonnet
+coop claude my-project -- agents
 ```
 
-### `claude-agents`
-
-Open the Claude Code agent view (`claude agents`) inside the VM. Claude Code's background agents are managed by its own daemon, so closing the terminal does not stop in-flight sessions; reconnect with `coop claude-agents` to see them again.
-
-If the remote TUI stops responding, type Enter, then `~.` to disconnect the SSH session. coop forces OpenSSH's interactive escape character to `~`, so this works even if your user SSH config disables or changes `EscapeChar`. If the terminal remains in a broken raw/no-echo state afterward, run `stty sane`.
-
-```
-coop claude-agents [NAME] [FLAGS] [ARGS...]
-coop ca [NAME] [FLAGS] [ARGS...]
-```
-
-| Flag | Description |
-|------|-------------|
-| `NAME` | Instance name (required if multiple instances exist) |
-| `ARGS...` | Extra arguments passed through to `claude agents` |
-
-Alias: `ca`.
-
-```
-coop claude-agents
-coop ca my-project
-coop ca my-project -- --cwd /workspace
-```
+To open Claude Code's Agent View, run `coop claude` and press Left Arrow. With
+a running instance name, `coop claude NAME -- agents` opens it directly. See
+[Managing background agents](claude-integration.md#managing-background-agents)
+for reconnecting and terminal recovery.
 
 ### `codex`
 
@@ -426,10 +410,7 @@ Print every instance with its state (`running` or `stopped`) and selected networ
 
 ```
 coop list
-coop ls
 ```
-
-Alias: `ls`.
 
 | Flag | Description |
 |------|-------------|
