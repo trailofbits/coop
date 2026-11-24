@@ -129,8 +129,9 @@ lease
                                  capture_output=True, text=True, timeout=3)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(stopped.stdout, "cancelled lease_expired\n")
+
     def test_codex_code_mode_host_requires_a_completed_handshake(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="codex probe ") as directory:
             host = Path(directory) / "codex-code-mode-host"
             host.write_text('''#!/usr/bin/env python3
 import json
@@ -145,35 +146,44 @@ ack = bytes.fromhex("000000040100000000")
 preface = bytes.fromhex("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a")
 if mode.startswith("http2") and request.startswith(preface):
     sys.stdout.buffer.write(settings)
-    if mode == "http2-ready" and request.endswith(settings):
+    if mode in ("http2-ready", "http2-truncated") and request.endswith(settings):
         sys.stdout.buffer.write(ack)
-elif mode.startswith("legacy") and b"connection/hello" in request:
-    kind = "connection/ready" if mode == "legacy-ready" else "connection/error"
-    response = json.dumps({"type": kind, "selectedVersion": 1}).encode()
-    sys.stdout.buffer.write(struct.pack("<I", len(response)) + response)
+        if mode == "http2-truncated":
+            sys.stdout.buffer.write(bytes.fromhex("000001000000000000"))
+elif mode.startswith("legacy") and len(request) >= 4:
+    length = struct.unpack("<I", request[:4])[0]
+    if length == len(request) - 4 and b"connection/hello" in request[4:]:
+        kind = "connection/ready" if mode == "legacy-ready" else "connection/error"
+        response = json.dumps({"type": kind, "selectedVersion": 1}).encode()
+        sys.stdout.buffer.write(struct.pack("<I", len(response)) + response)
 elif mode == "exit-error":
     print("fixture-host-error", file=sys.stderr)
     sys.exit(1)
 ''')
             host.chmod(0o755)
+            timeout = Path(directory) / "timeout"
+            timeout.write_text('#!/bin/sh\nshift\nexec "$@"\n')
+            timeout.chmod(0o755)
             fragment = functions("check_codex_code_mode_host").replace(
-                "/usr/local/bin/codex-code-mode-host", str(host))
+                "host=/usr/local/bin/codex-code-mode-host", 'host="$FIXTURE_HOST"')
             fixture = fragment + '''
-                coop_exec() { "$@"; }
-                guest_stderr() { echo fixture-error; }
+                coop_exec() { "$@" 2>/dev/null; }
                 pass() { echo "PASS $*"; }
                 fail() { echo "FAIL $*"; }
                 check_codex_code_mode_host
             '''
             for mode in ("http2-ready", "legacy-ready", "http2-no-ack",
+                         "http2-truncated",
                          "legacy-error", "exit-zero", "exit-error"):
                 with self.subTest(mode=mode):
-                    result = shell(fixture, HOST_MODE=mode)
+                    result = shell(fixture, HOST_MODE=mode, FIXTURE_HOST=str(host),
+                                   PATH=directory + os.pathsep + os.environ["PATH"])
                     self.assertEqual(result.returncode, 0, result.stderr)
                     expected = "PASS" if mode.endswith("ready") else "FAIL"
                     self.assertTrue(result.stdout.startswith(expected), result.stdout)
                     if mode == "exit-error":
-                        self.assertIn("fixture-host-error", result.stdout)
+                        self.assertIn("HTTP/2 probe exit status:", result.stdout)
+                        self.assertNotIn("fixture-host-error", result.stdout + result.stderr)
 
     def test_untrack_instance_handles_an_empty_array_with_nounset(self):
         result = shell('set -eu\n' + functions("untrack_instance") + '''
