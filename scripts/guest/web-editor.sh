@@ -16,6 +16,8 @@ launch_marker="${socket%/*}/launched"
 # Distinguish a stalled launcher from a status line lost across SSH.
 loop_marker="${socket%/*}/launch-loop"
 reported_marker="${socket%/*}/launch-reported"
+postloop_marker="${socket%/*}/launch-postloop"
+cleanup_wait_marker="${socket%/*}/launch-cleanup-wait"
 unit="${socket%/*}"
 unit="${unit##*/}.service"
 cleanup() {
@@ -40,11 +42,12 @@ cleanup() {
             sleep 0.05
         done
         kill -KILL -- "-$child" 2>/dev/null || true
+        : > "$cleanup_wait_marker" || true
         wait "$child" 2>/dev/null || true
     fi
     [[ -z $staging ]] || rm -rf -- "$staging"
     rm -f -- "$socket" "$session_socket" "$config" "$launch_marker" \
-        "$loop_marker" "$reported_marker"
+        "$loop_marker" "$reported_marker" "$postloop_marker" "$cleanup_wait_marker"
     rmdir -- "${socket%/*}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -247,6 +250,7 @@ while kill -0 "$child" 2>/dev/null; do
     lease
 done
 # A fast code-server exit can happen before the first liveness poll.
+: > "$postloop_marker" || true
 observe_launch
 wait "$child" || true
 child=

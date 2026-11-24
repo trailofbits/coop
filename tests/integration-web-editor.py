@@ -385,6 +385,7 @@ def launch_state_probe(command, name):
     # Only allowlisted systemd state and marker presence reach the CI log.
     probe = r'''
 from pathlib import Path
+import os
 import subprocess
 
 roots = [p for p in Path("/tmp").glob("coop-we-*")
@@ -393,7 +394,8 @@ if len(roots) != 1:
     print("dir=" + ("none" if not roots else "multiple") +
           " marker=unknown loop=unknown reported=unknown load=unknown active=unknown"
           " shell=unknown state=unknown wait=unknown children=unknown"
-          " launch=unknown curl=unknown timeout=unknown other=unknown")
+          " launch=unknown curl=unknown timeout=unknown other=unknown"
+          " post=unknown cleanup=unknown k0=unknown")
 else:
     root = roots[0]
     try:
@@ -411,6 +413,8 @@ else:
     marker = "present" if (root / "launched").is_file() else "missing"
     loop = "present" if (root / "launch-loop").is_file() else "missing"
     reported = "present" if (root / "launch-reported").is_file() else "missing"
+    post = "present" if (root / "launch-postloop").is_file() else "missing"
+    cleanup = "present" if (root / "launch-cleanup-wait").is_file() else "missing"
     needle = f"session_socket={root}/session.sock".encode()
     shells = []
     for proc in Path("/proc").glob("[0-9]*"):
@@ -424,7 +428,7 @@ else:
         except OSError:
             pass
     shell = "one" if len(shells) == 1 else ("none" if not shells else "multiple")
-    state = wait = children = launch = curl = timeout = other = "unknown"
+    state = wait = children = launch = curl = timeout = other = k0 = "unknown"
     if shell == "one":
         try:
             state = (shells[0] / "stat").read_text().rsplit(")", 1)[1].split()[0]
@@ -451,11 +455,22 @@ else:
                     timeout = "yes" if b"timeout" in kinds else "no"
                     other = "yes" if any(k not in (b"setsid", b"sudo", b"systemd-run",
                                                    b"curl", b"timeout") for k in kinds) else "no"
+                    launch_ids = [pid for pid, kind in zip(ids, kinds)
+                                  if kind in (b"setsid", b"sudo", b"systemd-run")]
+                    if len(launch_ids) == 1:
+                        try:
+                            os.kill(int(launch_ids[0]), 0)
+                            k0 = "ok"
+                        except PermissionError:
+                            k0 = "eperm"
+                        except ProcessLookupError:
+                            k0 = "gone"
         except OSError:
             pass
     print(f"dir=one marker={marker} loop={loop} reported={reported} load={load} active={active} "
           f"shell={shell} state={state} wait={wait} children={children} "
-          f"launch={launch} curl={curl} timeout={timeout} other={other}")
+          f"launch={launch} curl={curl} timeout={timeout} other={other} "
+          f"post={post} cleanup={cleanup} k0={k0}")
 '''
     result = bounded_guest_probe(command, name, probe)
     if result is not None:
@@ -470,7 +485,9 @@ else:
             r"wait=(unknown|pipe|poll|select|futex|wait|other) "
             r"children=(unknown|0|1|2|3plus) "
             r"launch=(unknown|yes|no) curl=(unknown|yes|no) "
-            r"timeout=(unknown|yes|no) other=(unknown|yes|no)", line
+            r"timeout=(unknown|yes|no) other=(unknown|yes|no) "
+            r"post=(unknown|missing|present) cleanup=(unknown|missing|present) "
+            r"k0=(unknown|ok|eperm|gone)", line
         ):
             print(f"EDITOR_LAUNCH_PROBE guest_ssh=reachable {line}", flush=True)
             return

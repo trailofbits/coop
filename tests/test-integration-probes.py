@@ -118,12 +118,14 @@ lease
 
         for guest_output, expected in [
             ("dir=one marker=missing loop=present reported=missing load=not-found active=inactive "
-             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no\n",
+             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no "
+             "post=missing cleanup=missing k0=ok\n",
              "guest_ssh=reachable dir=one marker=missing loop=present reported=missing "
              "load=not-found active=inactive shell=one state=S wait=wait children=2 "
-             "launch=yes curl=yes timeout=no other=no"),
+             "launch=yes curl=yes timeout=no other=no post=missing cleanup=missing k0=ok"),
             ("dir=one marker=missing loop=present reported=missing load=not-found active=inactive "
-             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no\n"
+             "shell=one state=S wait=wait children=2 launch=yes curl=yes timeout=no other=no "
+             "post=missing cleanup=missing k0=ok\n"
              "secret=do-not-print\n",
              "guest_ssh=unavailable"),
         ]:
