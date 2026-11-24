@@ -55,8 +55,9 @@ those remain the preflight's job.
    `CHANGELOG.md`. The text under it becomes the GitHub release notes verbatim,
    so read it as release notes. Start a fresh empty `## Unreleased` above it.
 
-5. **Run the preflight.** It refuses to pass until the version sources agree and
-   the tag is free, then runs the full gate:
+5. **Run the preflight.** It checks the committed `Cargo.lock` before running
+   Cargo, then checks that the version sources agree and the tag is free before
+   running the full gate:
 
    ```bash
    ./scripts/preflight-release.sh
