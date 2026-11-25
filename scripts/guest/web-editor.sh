@@ -52,37 +52,35 @@ mkdir -- "${socket%/*}"
 IFS= read -r -t 15 password
 [[ $password =~ ^[a-f0-9]{64}$ ]]
 lease_deadline=$((SECONDS + 15))
-lease_fragment=
 lease() {
     local heartbeat= read_status
-    if IFS= read -r -t 1 heartbeat; then
-        heartbeat=$lease_fragment$heartbeat
-        lease_fragment=
-        if [[ $heartbeat != alive ]]; then
+    # Each heartbeat is one byte, so a timed read cannot leave a partial
+    # line that must be joined to the next read. -n works in guest Bash.
+    if IFS= read -r -n 1 -t 1 heartbeat; then
+        if [[ $heartbeat != a ]]; then
             printf 'cancelled lease_bad_heartbeat\n' || true
             exit 0
         fi
         lease_deadline=$((SECONDS + 15))
+        return
     else
         read_status=$?
-        # EOF cancels immediately; a read timeout still honors the lease.
-        if ((read_status <= 128)); then
-            printf 'cancelled lease_stdin_eof\n' || true
+    fi
+    # EOF cancels immediately; a read timeout still honors the lease.
+    if ((read_status <= 128)); then
+        printf 'cancelled lease_stdin_eof\n' || true
+        exit 0
+    fi
+    # Keep a valid byte if Bash reports it while a timed read completes.
+    if [[ -n $heartbeat ]]; then
+        if [[ $heartbeat != a ]]; then
+            printf 'cancelled lease_bad_heartbeat\n' || true
             exit 0
         fi
-        # Bash keeps bytes read before a timeout in heartbeat. Preserve the
-        # incomplete line so its suffix is not mistaken for a new heartbeat.
-        if [[ -n $heartbeat ]]; then
-            lease_fragment+=$heartbeat
-            if [[ ${#lease_fragment} -gt 5 || alive != "$lease_fragment"* ]]; then
-                printf 'cancelled lease_bad_heartbeat\n' || true
-                exit 0
-            fi
-        fi
-        if ((SECONDS >= lease_deadline)); then
-            printf 'cancelled lease_expired\n' || true
-            exit 0
-        fi
+        lease_deadline=$((SECONDS + 15))
+    elif ((SECONDS >= lease_deadline)); then
+        printf 'cancelled lease_expired\n' || true
+        exit 0
     fi
 }
 observe_launch() {
