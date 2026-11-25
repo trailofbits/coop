@@ -30,6 +30,9 @@ for the lifetime of the VM:
   credential (`x-api-key`, or `Authorization: Bearer`), and streams the request
   to the pinned upstream (`api.anthropic.com`, `api.openai.com`, or the
   Codex backend on `chatgpt.com`) over TLS.
+- The guest-facing listener accepts HTTP/1.1. HTTP/2 prior-knowledge requests
+  are rejected before HTTP/2 parsing; the proxy still forwards supported
+  operations to the upstream over HTTP/1.1.
 - The raw `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is no longer forwarded, and in
   proxy mode Codex's `~/.codex/auth.json` is **not** staged onto the guest disk
   (it holds a refreshable subscription token — the exact at-rest exposure #411

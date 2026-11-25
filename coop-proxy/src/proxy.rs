@@ -27,10 +27,10 @@ use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
+use hyper::server::conn::http1::Builder as ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ServerBuilder;
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -192,7 +192,10 @@ async fn accept_loop(
                         let ctx = ctx.clone();
                         async move { handle(req, ctx).await }
                     });
-                    if let Err(e) = ServerBuilder::new(TokioExecutor::new())
+                    // The guest-facing protocol is HTTP/1.1. The auto builder
+                    // also accepted HTTP/2 prior knowledge, exposing its H2
+                    // parser before the capability-token check.
+                    if let Err(e) = ServerBuilder::new()
                         .serve_connection(io, service)
                         .await
                     {
