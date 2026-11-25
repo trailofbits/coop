@@ -56,94 +56,63 @@ wait "$child" || true
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "launched\n")
 
-    def test_web_editor_lease_preserves_split_heartbeat(self):
+    def test_web_editor_lease_reads_single_byte_without_line_framing(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]
-        fixture = "set -euo pipefail\nlease_deadline=15\nlease_fragment=\n" + lease
-        # Inject the Linux timed-read status. macOS Bash reports timeouts as
-        # status 1, so an actual timed pipe cannot cover this guest branch.
-        split = fixture + '''
+        fixture = "set -euo pipefail\nlease_deadline=$((SECONDS + 15))\n" + lease
+        # A real pipe carrying a byte without a newline must renew the lease.
+        received = subprocess.run(["bash", "-c", fixture + "\nlease\nprintf 'continued\\n'\n"],
+                                  input="a", capture_output=True, text=True, timeout=3)
+        self.assertEqual(received.returncode, 0, received.stderr)
+        self.assertEqual(received.stdout, "continued\n")
+
+        # Inject the Linux timed-read status. macOS Bash reports timeout as 1.
+        timeout_then_byte = fixture + '''
 read() {
-    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=ali; return 142; fi
-    heartbeat=ve; return 0
+    [[ $1 == -r && $2 == -n && $3 == 1 && $4 == -t && $5 == 1 && $6 == heartbeat ]] || exit 90
+    if [[ ${reads:-0} == 0 ]]; then reads=1; heartbeat=; return 142; fi
+    heartbeat=a; return 0
 }
 lease
 lease
-[[ -z $lease_fragment ]]
 printf 'continued\n'
 '''
-        resumed = subprocess.run(["bash", "-c", split], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=3)
+        resumed = shell(timeout_then_byte)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(resumed.stdout, "continued\n")
 
-        repeated = fixture + '''
-read() {
-    case ${reads:-0} in
-        0) reads=1; heartbeat=a; return 142 ;;
-        1) reads=2; heartbeat=li; return 142 ;;
-        *) heartbeat=ve; return 0 ;;
-    esac
-}
+        for status in (0, 142):
+            with self.subTest(status=status):
+                valid = shell(fixture + f'''
+read() {{ heartbeat=a; return {status}; }}
 lease
-lease
-lease
-[[ -z $lease_fragment ]]
 printf 'continued\n'
-'''
-        resumed = subprocess.run(["bash", "-c", repeated], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=3)
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(resumed.stdout, "continued\n")
+''')
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                self.assertEqual(valid.stdout, "continued\n")
 
-        for fragment, reason in (("oops", "lease_bad_fragment_prefix"),
-                                 ("aliveX", "lease_bad_fragment_long")):
-            with self.subTest(fragment=fragment):
-                partial = fixture + f'''
-read() {{ heartbeat={fragment}; return 142; }}
+        for heartbeat in ("x", "", "alive"):
+            with self.subTest(heartbeat=heartbeat):
+                rejected = shell(fixture + f'''
+read() {{ heartbeat={heartbeat}; return 0; }}
 lease
-'''
-                rejected = subprocess.run(["bash", "-c", partial], stdin=subprocess.DEVNULL,
-                                          capture_output=True, text=True, timeout=3)
+''')
                 self.assertEqual(rejected.returncode, 0, rejected.stderr)
-                self.assertEqual(rejected.stdout, f"cancelled {reason}\n")
+                self.assertEqual(rejected.stdout, "cancelled lease_bad_heartbeat\n")
 
-        invalid = fixture + '''
-read() { heartbeat=oops; return 0; }
+        invalid_timeout = shell(fixture + '''
+read() { heartbeat=x; return 142; }
 lease
-'''
-        rejected = subprocess.run(["bash", "-c", invalid], stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, timeout=3)
-        self.assertEqual(rejected.returncode, 0, rejected.stderr)
-        self.assertEqual(rejected.stdout, "cancelled lease_bad_line_direct\n")
-
-        for prefix, suffix, reason in (("a", "oops", "lease_bad_line_after_fragment"),
-                                       ("", "", "lease_bad_line_empty")):
-            with self.subTest(reason=reason):
-                if prefix:
-                    reads = f'''read() {{
-    if [[ ${{reads:-0}} == 0 ]]; then reads=1; heartbeat={prefix}; return 142; fi
-    heartbeat={suffix}; return 0
-}}
-lease
-lease
-'''
-                else:
-                    reads = '''read() { heartbeat=; return 0; }
-lease
-'''
-                rejected = subprocess.run(["bash", "-c", fixture + "\n" + reads],
-                                          stdin=subprocess.DEVNULL, capture_output=True,
-                                          text=True, timeout=3)
-                self.assertEqual(rejected.returncode, 0, rejected.stderr)
-                self.assertEqual(rejected.stdout, f"cancelled {reason}\n")
+''')
+        self.assertEqual(invalid_timeout.returncode, 0, invalid_timeout.stderr)
+        self.assertEqual(invalid_timeout.stdout, "cancelled lease_bad_heartbeat\n")
 
         eof = subprocess.run(["bash", "-c", fixture + "\nlease\n"],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3)
         self.assertEqual(eof.returncode, 0, eof.stderr)
         self.assertEqual(eof.stdout, "cancelled lease_stdin_eof\n")
 
-        expired = fixture.replace("lease_deadline=15", "lease_deadline=0") + '''
+        expired = fixture.replace("lease_deadline=$((SECONDS + 15))", "lease_deadline=0") + '''
 read() { return 142; }
 lease
 '''
