@@ -9069,6 +9069,7 @@ TOML
     local first=$!
     if ! wait_for_creation_marker "$first"; then
         fail "creation cancellation fixture reaches the running command"
+        cat "$tmpdir/creation-launch.log"
         kill -TERM "$first" 2>/dev/null || true
         wait "$first" || true
         unset GUEST_INSTANCE
