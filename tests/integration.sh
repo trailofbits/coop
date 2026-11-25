@@ -9518,35 +9518,31 @@ test_guest_user_validation() {
     fi
 }
 
-test_pull_cli_validation() {
+test_workspace_filter_cli() {
     echo ""
-    echo "=== Phase: pull CLI validation ==="
+    echo "=== Phase: workspace filter CLI validation ==="
 
+    # Invalid config stops both commands before they can start or contact a VM.
+    local config="$tmpdir/invalid-workspace-filter-config.toml"
+    printf '[incomplete\n' > "$config"
     local command
-    for command in up push pull; do
-        if coop_fails "$command" --exclude-git; then
-            if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-git" <<< "$HARNESS_ERR"; then
-                pass "$command --exclude-git is rejected as an unknown flag"
-            else
-                fail "$command --exclude-git is rejected as an unknown flag" \
-                    "unexpected error: $HARNESS_ERR"
-            fi
+    for command in up push; do
+        if RUST_LOG=coop=warn coop_fails --config "$config" "$command" --exclude-git &&
+            [[ "$HARNESS_ERR" == *"--exclude-git is deprecated and will be removed"* ]]; then
+            pass "$command accepts --exclude-git and warns about its removal"
         else
-            fail "$command --exclude-git is rejected as an unknown flag" \
-                "command unexpectedly accepted the removed flag"
+            fail "$command accepts --exclude-git and warns about its removal" "stderr: $HARNESS_ERR"
         fi
     done
-    if coop_fails pull --exclude-local-config; then
-        if grep -qi "unexpected\|unknown\|unrecognized\|--exclude-local-config" <<< "$HARNESS_ERR"; then
-            pass "pull --exclude-local-config is rejected as an unknown flag"
+
+    local flag
+    for flag in --exclude-git --exclude-local-config; do
+        if coop_fails pull "$flag" && [[ "$HARNESS_ERR" == *"unexpected argument '$flag'"* ]]; then
+            pass "pull $flag is rejected as an unknown flag"
         else
-            fail "pull --exclude-local-config is rejected as an unknown flag" \
-                "unexpected error: $HARNESS_ERR"
+            fail "pull $flag is rejected as an unknown flag" "stderr: $HARNESS_ERR"
         fi
-    else
-        fail "pull --exclude-local-config is rejected as an unknown flag" \
-            "pull unexpectedly accepted a no-op flag"
-    fi
+    done
 }
 
 # ── Alternate guest user lifecycle (--full only) ──────────────
@@ -9775,7 +9771,7 @@ EOF
     run_timed_test test_completions
     run_timed_test test_removed_devcontainer_cli
     run_timed_test test_guest_user_validation
-    run_timed_test test_pull_cli_validation
+    run_timed_test test_workspace_filter_cli
 
     # Setup + primary instance
     run_timed_test test_setup

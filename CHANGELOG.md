@@ -9,6 +9,15 @@
   `coop grok` (pass the VM name when several are running). For a scratch VM,
   use a dedicated empty directory with `coop up` so no project files are copied.
 
+### Deprecated
+
+- `--exclude-git` on `coop up` and `coop push` now warns that it will be
+  removed in a future release. Update scripts to use `--exclude-local-config`.
+  Both spellings now skip common VCS metadata and project-local tool settings
+  such as `.claude/` and `.vscode/`. See the
+  [workspace migration guide](docs/workspaces.md#migrating-from-the-git-only-exclusion)
+  if your VM still needs some of those settings.
+
 ### Removed
 
 - Remove the `coop ssh` and `coop ls` aliases. Use `coop shell` and `coop list`,

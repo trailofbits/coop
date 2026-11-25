@@ -170,6 +170,24 @@ Guest-to-host pulls attempt to exclude common VCS metadata and project-local
 tool settings, including `.git`, `.hg`, `.svn`, and `.vscode` paths.
 Do not rely on pull to sanitize guest content or make it safe for host Git.
 
+### Migrating from the Git-only exclusion
+
+`coop up` and `coop push` still accept `--exclude-git` and warn that it will
+be removed in a future release. Replace it with `--exclude-local-config` in
+scripts. Both spellings now skip other VCS metadata and project-local settings
+such as `.claude/` and `.vscode/` along with Git metadata. The default transfer
+includes Git history and allows tool settings subject to `.gitignore`.
+
+If your VM needs specific tool settings without a copy of the host's Git
+history, use `--exclude-local-config` and copy those settings separately.
+For example, from the project directory for a running instance named
+`my-project`:
+
+```bash
+coop ssh-config my-project
+scp -r .claude coop-my-project:/workspace/
+```
+
 ## .gitignore integration
 
 Transfers pass `--filter=':- .gitignore'`. Rsync reads `.gitignore` files at each directory level and skips matching paths.
