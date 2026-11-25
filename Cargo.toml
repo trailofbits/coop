@@ -39,7 +39,8 @@ serde-saphyr = { version = "2.0.0", default-features = false, features = [
 toml = "1.1.2"
 tracing = "0.1"
 semver = "1"
-sha2 = "0.11"
+# Only concrete SHA-256 digests are used.
+sha2 = { version = "0.11", default-features = false }
 socket2 = "0.6"
 tempfile = "3"
 thiserror = "2"
