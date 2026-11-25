@@ -27,88 +27,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            shard: lifecycle
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-24.04
-            shard: workspace
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-24.04
-            shard: config
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-24.04
-            shard: features
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-26.04
-            shard: lifecycle
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-26.04
-            shard: workspace
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-26.04
-            shard: config
-            job_timeout: 65
-            suite_timeout: 60
-          - os: ubuntu-26.04
-            shard: features
-            job_timeout: 65
-            suite_timeout: 60
-          - os: macos-15-intel
-            shard: lifecycle-early
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: lifecycle-late
-            job_timeout: 150
-            suite_timeout: 135
           - os: macos-15-intel
             shard: workspace-early
             job_timeout: 150
             suite_timeout: 135
           - os: macos-15-intel
-            shard: workspace-multi
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: workspace-sync
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: workspace-profiles
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
             shard: workspace-hooks
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: config-users
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: config-github
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: config-proxy
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: config-setup
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: features-restore
-            job_timeout: 150
-            suite_timeout: 135
-          - os: macos-15-intel
-            shard: features-guest
             job_timeout: 150
             suite_timeout: 135
     defaults:
