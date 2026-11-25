@@ -39,6 +39,16 @@ mkdir -m 0700 "$data_dir/instances/test" "$data_dir/instances/sparse"
 sudo -n "$coop_bin" __disk-op format "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op fsck-read "$data_dir" "$stage" >/dev/null
 sudo -n "$coop_bin" __disk-op mount "$data_dir" "$stage"
+if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then
+    echo 'mounted source disk was copied' >&2
+    exit 1
+fi
+[[ ! -e $instance ]]
+if sudo -n "$coop_bin" __disk-op truncate "$data_dir" "$stage" 1 2>/dev/null; then
+    echo 'mounted source disk was truncated' >&2
+    exit 1
+fi
+[[ $(stat -c %s "$stage") == 33554432 ]]
 # Holding cwd inside the mount reproduces an EBUSY unmount. A failed cleanup
 # must retain both the mounted filesystem and its backing file.
 if (cd "$data_dir/rootfs-mount" && sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$stage") 2>/dev/null; then
@@ -81,6 +91,32 @@ sudo -n "$coop_bin" __disk-op recover-template-mount "$data_dir" "$stage"
 wait "$holder"
 sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage"
 
+# The source is detached, but a mounted destination must still block copy.
+sudo -n cp "$stage" "$instance"
+sudo -n "$coop_bin" __disk-op mount "$data_dir" "$instance"
+if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then
+    echo 'mounted destination disk was replaced' >&2
+    exit 1
+fi
+[[ -f $instance ]]
+sudo -n "$coop_bin" __disk-op unmount "$data_dir" "$instance"
+sudo -n "$coop_bin" __disk-op remove "$data_dir" "$instance"
+
+# A loop mount at another path is invisible to the managed mountpoint check.
+mkdir -m 0700 "$data_dir/foreign-mount"
+sudo -n mount -o loop "$stage" "$data_dir/foreign-mount"
+if sudo -n "$coop_bin" __disk-op remove "$data_dir" "$stage" 2>/dev/null; then
+    echo 'disk mounted at another path was removed' >&2
+    exit 1
+fi
+if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then
+    echo 'disk mounted at another path was copied' >&2
+    exit 1
+fi
+[[ -f $stage && ! -e $instance ]]
+sudo -n umount "$data_dir/foreign-mount"
+sudo -n "$coop_bin" __disk-op ensure-unmounted "$data_dir" "$stage"
+
 ln -s "$data_dir/sentinel" "$instance"
 if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance" 2>/dev/null; then
     echo 'symlink disk destination was accepted' >&2
@@ -96,6 +132,21 @@ sparse_target="$data_dir/instances/sparse/rootfs.ext4"
 truncate -s 64M "$sparse_source"
 printf begin | dd of="$sparse_source" conv=notrunc status=none
 printf end | dd of="$sparse_source" bs=1 seek=$((64 * 1024 * 1024 - 3)) conv=notrunc status=none
+# A process holding the source inode models a VM drive descriptor. Copy must
+# refuse until it closes, then succeed with the identical input.
+bash -c 'exec 9<"$1"; touch "$2"; sleep 30' _ "$sparse_source" "$data_dir/held-ready" &
+holder=$!
+for _ in $(seq 1 100); do
+    [[ -e $data_dir/held-ready ]] && break
+    sleep 0.01
+done
+[[ -e $data_dir/held-ready ]]
+if sudo -n "$coop_bin" __disk-op copy "$data_dir" "$sparse_source" "$sparse_target" 2>/dev/null; then
+    echo 'disk held by a process was copied' >&2
+    exit 1
+fi
+kill "$holder"
+wait "$holder" 2>/dev/null || true
 sudo -n dd if=/dev/zero of="$data_dir/instances/sparse/.coop-disk-copy.tmp" bs=1M count=1 status=none
 sudo -n "$coop_bin" __disk-op copy "$data_dir" "$sparse_source" "$sparse_target"
 sudo -n cmp "$sparse_source" "$sparse_target"
@@ -135,6 +186,22 @@ done
 
 sudo -n "$coop_bin" __disk-op copy "$data_dir" "$stage" "$instance"
 [[ $(stat -c %a "$instance") == 600 ]]
+sudo -n chmod 0644 "$instance"
+bash -c 'exec 9<"$1"; touch "$2"; sleep 30' _ "$instance" "$data_dir/instance-holder-ready" &
+instance_holder=$!
+for _ in $(seq 1 100); do
+    [[ -e $data_dir/instance-holder-ready ]] && break
+    sleep 0.01
+done
+[[ -e $data_dir/instance-holder-ready ]]
+if sudo -n "$coop_bin" __disk-op truncate "$data_dir" "$instance" 1 2>/dev/null; then
+    echo 'disk with an open process handle was truncated' >&2
+    exit 1
+fi
+kill "$instance_holder"
+wait "$instance_holder" 2>/dev/null || true
+sudo -n chmod 0600 "$instance"
+[[ $(stat -c %s "$instance") == 33554432 ]]
 sudo -n "$coop_bin" __disk-op truncate "$data_dir" "$instance" 1
 if sudo -n "$coop_bin" __disk-op truncate "$data_dir" "$instance" 0 2>/dev/null; then
     echo 'disk shrink was accepted' >&2

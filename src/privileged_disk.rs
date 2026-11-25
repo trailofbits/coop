@@ -68,6 +68,7 @@ const LOOP_CTL_GET_FREE: libc::Ioctl = libc::_IO(0x4c, 0x82);
 const LOOP_SET_FD: libc::Ioctl = libc::_IO(0x4c, 0x00);
 const LOOP_CLR_FD: libc::Ioctl = libc::_IO(0x4c, 0x01);
 const LOOP_SET_STATUS64: libc::Ioctl = libc::_IO(0x4c, 0x04);
+const LOOP_GET_STATUS64: libc::Ioctl = libc::_IO(0x4c, 0x05);
 
 fn invoking_uid() -> Result<u32> {
     // A direct invocation is useful for rootless tests. Under sudo the real
@@ -260,6 +261,7 @@ fn is_root_owned_symlink(parent: &File, name: &CStr) -> bool {
 }
 
 fn copy(src: &DiskPath, dst: &DiskPath, uid: u32) -> Result<()> {
+    ensure_unmounted(src)?;
     let source = src.file(false, uid)?;
     ensure_unmounted(dst)?;
     // Refuse to replace a symlink, hardlink, foreign-owned file, or directory.
@@ -375,6 +377,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
             uid,
         ),
         "truncate" => {
+            ensure_unmounted(&disk)?;
             let file = disk.file(true, uid)?;
             let target = size_bytes(argument.context("Missing disk size")?)?;
             if target < file.metadata()?.len() {
@@ -412,6 +415,7 @@ pub(crate) fn run(operation: &str, root: &Path, path: &Path, argument: Option<&s
                 bail!("Only a template staging disk may be swapped");
             }
             let _staging = disk.file(false, uid)?;
+            ensure_unmounted(&disk)?;
             let final_name = c"rootfs-template.ext4";
             let final_disk = DiskPath {
                 root: disk.root.try_clone()?,
@@ -499,11 +503,104 @@ fn ensure_unmounted(disk: &DiskPath) -> Result<()> {
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
     ) {
         Ok(mount) => mount,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ensure_backing_inode_detached(disk);
+        }
         Err(error) => return Err(error.into()),
     };
     if mount_id(&mount)? != mount_id(base)? {
         bail!("Rootfs mount is still active; unmount it before changing the disk");
+    }
+    ensure_backing_inode_detached(disk)
+}
+
+/// Check the currently named disk inode against loop devices and process
+/// descriptors. A previously renamed disk needs separate operator inspection.
+fn ensure_backing_inode_detached(disk: &DiskPath) -> Result<()> {
+    let file = match disk.file(false, invoking_uid()?) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let identity = file.metadata()?;
+    for entry in fs::read_dir("/sys/block").context("Cannot inspect loop devices")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if !bytes.starts_with(b"loop") || !bytes[4..].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        // A free loop device has no backing_file entry. A configured device
+        // must be inspected with LOOP_GET_STATUS64: the sysfs path is not an
+        // inode identity and can become stale after rename or unlink.
+        match fs::metadata(entry.path().join("loop/backing_file")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect loop backing file"),
+        }
+        let loop_file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(Path::new("/dev").join(&name))
+            .with_context(|| format!("Cannot inspect loop device {}", name.to_string_lossy()))?;
+        if !loop_file.metadata()?.file_type().is_block_device() {
+            bail!(
+                "Loop device is not a block device: {}",
+                name.to_string_lossy()
+            );
+        }
+        let mut info: LoopInfo64 = unsafe { std::mem::zeroed() }; // SAFETY: all-zero is valid loop_info64.
+        // SAFETY: the descriptor is a checked block device and info is writable.
+        if unsafe { libc::ioctl(loop_file.as_raw_fd(), LOOP_GET_STATUS64, &raw mut info) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                continue;
+            }
+            return Err(error).context("Cannot inspect loop backing identity");
+        }
+        if info.lo_device == identity.dev() && info.lo_inode == identity.ino() {
+            bail!("Managed disk is still attached to a host loop device");
+        }
+    }
+    let own_pid = std::process::id();
+    for entry in fs::read_dir("/proc").context("Cannot inspect process disk handles")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let descriptors = match fs::read_dir(entry.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect process disk handles"),
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("Cannot inspect process disk handles"),
+            };
+            let held = match fs::metadata(descriptor.path()) {
+                Ok(held) => held,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("Cannot inspect process disk handle"),
+            };
+            if held.dev() == identity.dev() && held.ino() == identity.ino() {
+                bail!("Managed disk is still open by process {pid}");
+            }
+        }
     }
     Ok(())
 }
@@ -839,6 +936,7 @@ fn run_on_descriptors(tool: DiskTool, args: &[&str], descriptors: &[&File]) -> R
 }
 
 fn disk_tool(disk: &DiskPath, uid: u32, tool: DiskTool, flags: &[&str], write: bool) -> Result<()> {
+    ensure_unmounted(disk)?;
     let file = disk.file(write, uid)?;
     let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     let mut args = flags.to_vec();
@@ -850,6 +948,7 @@ fn format_disk(disk: &DiskPath, uid: u32) -> Result<()> {
     if disk.name.as_bytes() != b"rootfs-template.ext4.new" {
         bail!("Only a template staging disk may be formatted");
     }
+    ensure_unmounted(disk)?;
     let file = disk.file(true, uid)?;
     let unpack = open_at(
         &disk.root,
