@@ -123,6 +123,7 @@ impl PrivateDir {
         Ok(file)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn open_regular_with_mode(&self, name: &OsStr, maximum_mode: u32) -> Result<File> {
         let file = self.open_checked_regular(name, libc::O_RDONLY)?;
         let existing = file.metadata()?.mode() & 0o777;
@@ -131,6 +132,7 @@ impl PrivateDir {
         Ok(file)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn open_regular_for_update(&self, name: &OsStr) -> Result<File> {
         let checked = self.open_regular(name)?;
         let writable = self.open_checked_regular(name, libc::O_RDWR)?;
@@ -217,6 +219,7 @@ impl PrivateDir {
 
     /// Remove a regular child from the pinned directory. This assumes the
     /// private namespace remains under the caller's control between checks.
+    #[cfg(any(target_os = "macos", test))]
     pub fn remove_child(&self, name: &OsStr) -> Result<()> {
         self.open_regular(name)?;
         unlink_child_at(&self.file, &child_name(name)?)?;
@@ -234,6 +237,7 @@ impl PrivateDir {
     }
 
     /// Rename a regular child within the pinned private directory.
+    #[cfg(any(target_os = "macos", test))]
     pub fn rename_child(&self, source: &OsStr, target: &OsStr) -> Result<()> {
         self.open_regular(source)?;
         if let Err(error) = self.open_regular(target)
@@ -259,6 +263,7 @@ impl PrivateDir {
     }
 
     /// Copy an opened disk while retaining large holes in sparse images.
+    #[cfg(any(target_os = "macos", test))]
     pub fn copy_atomic_sparse(&self, name: &OsStr, source: &File, mode: u32) -> Result<()> {
         self.atomic_with_writer(name, mode, |temporary| copy_sparse_file(source, temporary))
     }
@@ -360,6 +365,7 @@ impl PrivateDir {
         Ok(names)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn read_link(&self, name: &OsStr) -> Result<std::path::PathBuf> {
         let name = child_name(name)?;
         if self.entry_type(OsStr::from_bytes(name.as_bytes()))? != PrivateEntryType::Symlink {
