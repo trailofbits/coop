@@ -351,14 +351,20 @@ change clone authorization.
 For a legacy unbound VM, use `coop github status --vm NAME` to see the recorded
 workspace, an unverified origin suggestion, configured entry keys, and a
 reviewable `assign-pat` command. Coop never runs that command from a hint.
-If the wizard stores an entry but binding fails during creation, the failed VM
-is normally removed. Rerun the original `coop up` command with
-`--pat-entry owner/name` to bind the stored entry before boot. If cleanup
-retains the VM, or binding fails while starting or reprovisioning an existing
-VM, run the printed `assign-pat` command instead. Repair invalid config first
-if the error calls for it. A PAT created on GitHub but not stored locally may
-still need revocation. Rebinding cannot reclaim a token already delivered to
-a guest; rotate or revoke it if exposure is suspected.
+If the wizard stores an entry but binding fails during creation, repair invalid
+config first if the error calls for it. The failed VM is normally removed. If
+`coop list` still shows the incomplete instance, run `coop destroy NAME` and
+confirm that it disappears. If it remains, fix the cleanup problem and retry
+`coop destroy NAME`. Then rerun the original `coop up` command with
+`--pat-entry owner/name` to bind the stored entry before boot. Binding the
+incomplete record with `assign-pat` does not create a VM.
+
+If binding fails while starting or reprovisioning an existing VM, use the
+printed `assign-pat` command instead.
+
+A PAT created on GitHub but not stored locally may still need revocation.
+Rebinding cannot reclaim a token already delivered to a guest; rotate or
+revoke it if exposure is suspected.
 
 Older `[github.skip]` values continue to suppress prompts for matching
 suggestions, but new `never` choices are stored per VM.
