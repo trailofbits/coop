@@ -11,9 +11,13 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
+
+# Lima allows five minutes for SSH auth after restart; include command overhead.
+START_TIMEOUT = 360 if sys.platform == "darwin" else 120
 
 
 def request(url, path="/", method="GET", headers=None, body=None):
@@ -339,7 +343,8 @@ def vm(binary, name, config):
                        check=True, capture_output=True, timeout=30)
         assert_guest_editor_stopped(command, name, guest_config, cgroup)
     subprocess.run(command + ["stop", name], check=True, capture_output=True, timeout=60)
-    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True, timeout=120)
+    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True,
+                   timeout=START_TIMEOUT)
     with editor(launch) as (child, new_url, path):
         assert new_url != url
         assert request(new_url, "/", headers={"Cookie": cookie})[0] == 302
@@ -348,7 +353,8 @@ def vm(binary, name, config):
         assert request(new_url, "/healthz", headers={"Cookie": cookie})[0] == 200
         subprocess.run(command + ["stop", name], check=True, capture_output=True, timeout=60)
         assert child.wait(timeout=15) == 0
-    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True, timeout=120)
+    subprocess.run(command + ["start", name, "--no-agents"], check=True, capture_output=True,
+                   timeout=START_TIMEOUT)
     owner_death_before_ready(command, name, launch, project)
     # Abrupt owner death closes stdin; the cooperative guest stops its service
     # and exits SSH. A retry cleans stale private state and starts afresh.
