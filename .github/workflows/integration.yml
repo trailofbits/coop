@@ -27,6 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-24.04
+            shard: workspace
+            job_timeout: 65
+            suite_timeout: 60
           - os: ubuntu-26.04
             shard: workspace
             job_timeout: 65
