@@ -31,10 +31,6 @@ jobs:
             shard: workspace-early
             job_timeout: 150
             suite_timeout: 135
-          - os: macos-15-intel
-            shard: workspace-hooks
-            job_timeout: 150
-            suite_timeout: 135
     defaults:
       run:
         shell: bash
