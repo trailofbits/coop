@@ -12,9 +12,9 @@ change the production code. Investigate failures before changing expectations,
 including compiler errors from private interface changes. Update tests to
 express the preserved behavior and verify they still detect a relevant regression.
 
-The `VM integration` workflow runs the full suite across twenty-one disposable
+The `VM integration` workflow runs the full suite across twenty-two disposable
 GitHub-hosted x64 runners: four on Ubuntu 24.04, four on Ubuntu 26.04, and
-thirteen on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch,
+fourteen on macOS 15 Intel. It runs daily at 03:17 UTC on the default branch,
 on manual dispatch, and when a commit is pushed to a branch named
 `ci/vm-integration/*`. It does not run automatically for pull requests or
 ordinary branch pushes. Agents using a personal access token or GitHub App
@@ -35,7 +35,8 @@ instead use `gh workflow run integration.yml --ref BRANCH`. Each runner executes
 `./tests/run-integration.sh --full --shard NAME`. Linux uses `lifecycle`,
 `workspace`, `config`, and `features`. macOS splits the lifecycle sequence into
 `lifecycle-early` and `lifecycle-late` (each creates its own VM), and the other
-phases into `workspace-early`, `workspace-multi`, `workspace-sync`,
+phases into `workspace-early-project`, `workspace-early-mount`,
+`workspace-multi`, `workspace-sync`,
 `workspace-profiles`, `workspace-hooks`, `config-users`, `config-github`,
 `config-proxy`, `config-setup`, `features-restore`, and `features-guest`. These
 groups shorten the macOS jobs while covering the same phases. `config` and
