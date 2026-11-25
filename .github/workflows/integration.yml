@@ -68,7 +68,11 @@ jobs:
             job_timeout: 150
             suite_timeout: 135
           - os: macos-15-intel
-            shard: workspace-early
+            shard: workspace-early-project
+            job_timeout: 150
+            suite_timeout: 135
+          - os: macos-15-intel
+            shard: workspace-early-mount
             job_timeout: 150
             suite_timeout: 135
           - os: macos-15-intel

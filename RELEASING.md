@@ -32,12 +32,13 @@ push succeeds and ships something correct.
 | Version ↔ lock ↔ CHANGELOG ↔ tag agreement | | ✓ | |
 | Release builds (3 targets) | native only | ✓ (per installed toolchain) | |
 | Formal verification (`cargo kani`) | ✓ (PR/main) | ✓ (if installed) | |
-| Full VM integration, both platforms | | ✓ (local + 1 remote) | pick remote host |
+| Full VM integration, both platforms | nightly / on demand | ✓ (local + 1 remote) | pick remote host |
 | Mutation testing (`--mutants`) | | opt-in | when logic changed |
 | Fuzzing (`--fuzz`) | | opt-in | when a parser changed |
 
-CI can't run the full VM integration suite or the mutation/fuzzing checks;
-those remain the preflight's job.
+CI runs the full VM integration suite nightly and on demand. Release preflight
+also runs it against the selected hosts. Mutation and fuzzing checks remain
+opt-in during preflight.
 
 ## Release checklist
 

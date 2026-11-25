@@ -71,7 +71,7 @@ done
 
 case "$SHARD" in
     all) ;;
-    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early|workspace-multi|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
+    lifecycle|lifecycle-early|lifecycle-late|workspace|config|features|workspace-early-project|workspace-early-mount|workspace-multi|workspace-sync|workspace-profiles|workspace-hooks|config-users|config-github|config-proxy|config-setup|features-restore|features-guest)
         [[ "$FULL" == 1 ]] || { echo "--shard requires --full" >&2; exit 1; }
         ;;
     *) echo "Unknown shard: $SHARD" >&2; exit 1 ;;
@@ -9875,13 +9875,19 @@ EOF
     fi
 
     # Extended tests (each manages its own instance lifecycle)
-    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early ) ]]; then
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-project ) ]]; then
         run_timed_test test_project_agent_workflow
         run_timed_test test_up_project_workflow
         run_timed_test test_git_repo
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-mount ) ]]; then
         run_timed_test test_host_mount
         run_timed_test test_lima_mount_state_boundary
         run_timed_test test_host_mount_custom_guest_path
+    fi
+
+    if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early-project ) ]]; then
         run_timed_test test_port_forwards
     fi
 
