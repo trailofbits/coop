@@ -439,6 +439,7 @@ fn serve_session(
             Err(error) => return Err(error.into()),
         }
         if heartbeat.elapsed() >= Duration::from_secs(2) && lease_error.is_none() {
+            // A live SSH child does not prove the host owner is responsive.
             // The guest consumes one byte per lease renewal without line framing.
             if let Err(error) = input.write_all(b"a") {
                 // A remote failure may close stdin just after our stdout poll.

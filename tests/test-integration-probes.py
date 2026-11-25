@@ -56,8 +56,10 @@ printf 'continued\n'
         for status in (0, 142):
             with self.subTest(status=status):
                 valid = shell(fixture + f'''
+lease_deadline=0
 read() {{ heartbeat=a; return {status}; }}
 lease
+((lease_deadline > SECONDS))
 printf 'continued\n'
 ''')
                 self.assertEqual(valid.returncode, 0, valid.stderr)
