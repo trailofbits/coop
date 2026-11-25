@@ -2945,6 +2945,63 @@ Host coop-other\n\
     }
 
     #[test]
+    fn rsync_pull_reports_truncated_exclusions_and_copies_kept_file() {
+        let temp = crate::host_tool::trusted_test_tempdir();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        let excluded = source.join("nested/node_modules");
+        fs::create_dir_all(&excluded).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("nested/keep.txt"), "worktree\n").unwrap();
+        for index in 0..12 {
+            fs::write(excluded.join(format!("entry-{index:02}")), "excluded\n").unwrap();
+        }
+
+        let target = fake_ssh_target();
+        let rsync = target.rsync_command().unwrap();
+        let rsync_path = Path::new(rsync.get_program());
+        let ssh = temp.path().join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                     case \"$1\" in\n\
+                         rsync) shift; exec {} \"$@\" ;;\n\
+                         *'command -v rsync'*) exit 0 ;;\n\
+                     esac\n\
+                     shift\n\
+                 done\n\
+                 exit 1\n",
+                crate::shell::shell_escape(rsync_path.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = target.with_host_tools(
+            crate::config::SshHostToolsConfig::with_exact_paths(Some(&ssh), None, None).unwrap(),
+        );
+        let operation = test_pull_operation(temp.path());
+        let guest_path = GuestPath::absolute(source.to_str().unwrap()).unwrap();
+
+        let (result, logs) = capture_warn(|| rsync_pull(&target, &guest_path, &dest, &operation));
+
+        result.unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("nested/keep.txt")).unwrap(),
+            "worktree\n"
+        );
+        assert!(!dest.join("nested/node_modules").exists());
+        assert_eq!(logs.matches("Pull skipped ").count(), 1, "{logs}");
+        assert!(logs.contains("Pull skipped nested/node_modules"), "{logs}");
+        assert_eq!(logs.matches("nested/node_modules/entry-").count(), 10);
+        assert!(
+            logs.contains("Showing the first 10 of 12 skipped entries."),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn pull_staging_cleanup_repairs_guest_directory_modes_without_following_symlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
