@@ -1,12 +1,14 @@
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -15,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{RunningInstance, SshTarget};
 use crate::config::{Instance, Mount};
 use crate::paths::GuestPath;
+use crate::process_output::{CapturePolicy, CompletionPolicy, run_bounded};
 use crate::remote_command::RemoteCommand;
 
 const GUEST_WORKSPACE: &str = "/workspace";
@@ -695,54 +698,40 @@ fn rsync_pull(
     operation: &PullOperation,
 ) -> Result<()> {
     require_guest_rsync(target)?;
-    let mut args = rsync_pull_args(target)?;
+    let args = rsync_pull_args(target)?;
     // A compromised guest controls the remote rsync sender. Stage its file
     // list away from the destination, then apply the pull exclusions again
     // with the trusted host rsync during installation.
     let mut staging = operation.staging()?;
 
     let result = (|| {
-        let mut logs = match prepare_pull_file_lists(target, guest_path, &staging, operation) {
-            Ok(logs) => Some(logs),
+        let inventory = enumerate_pull_paths(target, guest_path, staging.path()?, operation);
+        crate::signal::check_shutdown()?;
+        let offered = match inventory {
+            Ok(paths) => Some(paths),
             Err(error) => {
-                tracing::warn!("Could not enumerate guest files before pull: {error:#}");
+                tracing::warn!("Skipped-path report unavailable: {error:#}");
                 None
             }
-        };
-        let output = match logs
-            .as_ref()
-            .map(|(_, received)| received.reopen())
-            .transpose()
-        {
-            Ok(Some(output)) => {
-                args.push(RSYNC_LIST_FORMAT.to_string());
-                Some(output)
-            }
-            Err(error) => {
-                tracing::warn!("Could not record received file list: {error:#}");
-                logs = None;
-                None
-            }
-            Ok(None) => None,
         };
         let mut command = locked_rsync_command(target, &args, operation)?;
-        if let Some(output) = output {
-            command.stdout(Stdio::from(output));
+        if offered.is_some() {
+            command.arg(RSYNC_LIST_FORMAT).stdout(Stdio::piped());
         }
-        let status = command
+        command
             .arg("--")
             .arg(format!("{}:{guest_path}/", target.addr()))
-            .arg(rsync_local_operand(staging.path()?)?)
-            .status()
-            .context("Failed to run rsync")?;
+            .arg(rsync_local_operand(staging.path()?)?);
+        let mut child = command.spawn().context("Failed to run rsync")?;
+        let received = child.stdout.take().map(read_received_pull_paths);
 
-        if !status.success() {
+        if !child.wait().context("Failed to wait for rsync")?.success() {
             bail!("rsync pull failed");
         }
-        if let Some((offered, received)) = logs
-            && let Err(error) = report_uncopied_pull_paths(&offered, &received)
-        {
-            tracing::warn!("Could not compare pull file lists: {error:#}");
+        match (offered, received) {
+            (Some(offered), Some(Ok(received))) => report_uncopied_pull_paths(&offered, &received),
+            (_, Some(Err(error))) => tracing::warn!("Skipped-path report unavailable: {error:#}"),
+            _ => {}
         }
         install_staged_pull(target, staging.path()?, dest, operation)
     })();
@@ -751,21 +740,17 @@ fn rsync_pull(
 
 const RSYNC_LIST_FORMAT: &str = "--out-format=coop-pull-entry:%n";
 const RSYNC_LIST_PREFIX: &[u8] = b"coop-pull-entry:";
+const PULL_FILE_LIST_LIMIT: usize = 4 * 1024 * 1024;
+const MAX_REPORTED_PULL_ROOTS: usize = 20;
+const MAX_REPORTED_PULL_ENTRIES: usize = 10;
+const MAX_REPORTED_PULL_PATH_BYTES: usize = 512;
 
-fn prepare_pull_file_lists(
+fn enumerate_pull_paths(
     target: &SshTarget,
     guest_path: &GuestPath,
-    staging: &PullStaging,
+    staging: &Path,
     operation: &PullOperation,
-) -> Result<(tempfile::NamedTempFile, tempfile::NamedTempFile)> {
-    let private_dir = staging
-        .root
-        .as_deref()
-        .context("Pull staging directory is no longer available")?;
-    let offered =
-        tempfile::NamedTempFile::new_in(private_dir).context("Failed to create guest file list")?;
-    let received = tempfile::NamedTempFile::new_in(private_dir)
-        .context("Failed to create received file list")?;
+) -> Result<Vec<u8>> {
     let args = vec![
         "-az".to_string(),
         "-e".to_string(),
@@ -774,17 +759,37 @@ fn prepare_pull_file_lists(
         RSYNC_LIST_FORMAT.to_string(),
     ];
     let mut command = locked_rsync_command(target, &args, operation)?;
-    let status = command
+    command
         .arg("--")
         .arg(format!("{}:{guest_path}/", target.addr()))
-        .arg(rsync_local_operand(staging.path()?)?)
-        .stdout(Stdio::from(offered.reopen()?))
-        .status()
-        .context("Failed to enumerate guest files with rsync")?;
-    if !status.success() {
-        bail!("Guest file enumeration failed");
+        .arg(rsync_local_operand(staging)?);
+    let output = run_bounded(
+        &mut command,
+        CapturePolicy {
+            stdout_max: PULL_FILE_LIST_LIMIT,
+            stderr_max: 64 * 1024,
+            completion: CompletionPolicy::Deadline(Duration::from_secs(15)),
+        },
+    )
+    .context("Could not enumerate guest files before pull")?;
+    if !output.status.success() {
+        bail!("Guest file enumeration failed ({})", output.status);
     }
-    Ok((offered, received))
+    Ok(output.stdout)
+}
+
+fn read_received_pull_paths(mut stdout: impl std::io::Read) -> Result<Vec<u8>> {
+    let mut paths = Vec::new();
+    (&mut stdout)
+        .take(PULL_FILE_LIST_LIMIT as u64 + 1)
+        .read_to_end(&mut paths)
+        .context("Could not read received file list")?;
+    if paths.len() > PULL_FILE_LIST_LIMIT {
+        // Keep draining stdout so the transfer can finish after reporting hits its limit.
+        std::io::copy(&mut stdout, &mut std::io::sink()).context("Could not drain rsync output")?;
+        bail!("Received file list exceeded the {PULL_FILE_LIST_LIMIT}-byte limit");
+    }
+    Ok(paths)
 }
 
 fn escape_untrusted_pull_path(path: &[u8]) -> String {
@@ -802,38 +807,80 @@ fn escape_untrusted_pull_path(path: &[u8]) -> String {
     escaped
 }
 
-fn read_rsync_file_list(
-    file: &tempfile::NamedTempFile,
-) -> Result<std::collections::HashSet<Vec<u8>>> {
-    let mut names = std::collections::HashSet::new();
-    for line in BufReader::new(file.reopen()?).split(b'\n') {
-        let line = line.context("Failed to read rsync file list")?;
-        if let Some(name) = line.strip_prefix(RSYNC_LIST_PREFIX) {
-            names.insert(name.to_vec());
-        }
-    }
-    Ok(names)
+fn rsync_list_paths(output: &[u8]) -> impl Iterator<Item = &[u8]> {
+    output
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| line.strip_prefix(RSYNC_LIST_PREFIX))
+        .map(|name| name.strip_prefix(b"./").unwrap_or(name))
+        .map(|name| name.strip_suffix(b"/").unwrap_or(name))
+        .filter(|name| !name.is_empty() && *name != b".")
 }
 
-fn report_uncopied_pull_paths(
-    offered: &tempfile::NamedTempFile,
-    received: &tempfile::NamedTempFile,
-) -> Result<()> {
-    let received_names = read_rsync_file_list(received)?;
-    for line in BufReader::new(offered.reopen()?).split(b'\n') {
-        let line = line.context("Failed to read guest file list")?;
-        let Some(name) = line.strip_prefix(RSYNC_LIST_PREFIX) else {
-            continue;
-        };
-        if name == b"." || name == b"./" || received_names.contains(name) {
+fn display_skipped_pull_path(path: &[u8]) -> String {
+    let mut escaped =
+        escape_untrusted_pull_path(&path[..path.len().min(MAX_REPORTED_PULL_PATH_BYTES)]);
+    if path.len() > MAX_REPORTED_PULL_PATH_BYTES {
+        escaped.push_str("...");
+    }
+    escaped
+}
+
+#[derive(Default)]
+struct SkippedPullRoot<'a> {
+    entries: Vec<&'a [u8]>,
+    entry_count: usize,
+}
+
+fn report_uncopied_pull_paths(offered: &[u8], received: &[u8]) {
+    let received_paths: HashSet<_> = rsync_list_paths(received).collect();
+    let mut skipped = BTreeMap::<_, SkippedPullRoot<'_>>::new();
+    let mut more_roots = false;
+    let mut skipped_count = 0;
+    for path in rsync_list_paths(offered) {
+        if received_paths.contains(path) {
             continue;
         }
+        skipped_count += 1;
+        // Group each skipped entry under the first ancestor rsync omitted.
+        let root = path
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == b'/')
+            .map(|(index, _)| &path[..index])
+            .find(|ancestor| !received_paths.contains(ancestor))
+            .unwrap_or(path);
+        if skipped.len() == MAX_REPORTED_PULL_ROOTS && !skipped.contains_key(root) {
+            more_roots = true;
+            continue;
+        }
+        let summary = skipped.entry(root).or_default();
+        if path != root {
+            summary.entry_count += 1;
+            if summary.entries.len() < MAX_REPORTED_PULL_ENTRIES {
+                summary.entries.push(path);
+            }
+        }
+    }
+    for (root, summary) in skipped {
+        let mut message = format!("Pull skipped {}", display_skipped_pull_path(root));
+        for path in &summary.entries {
+            let _ = write!(message, "\n  {}", display_skipped_pull_path(path));
+        }
+        let shown = summary.entries.len();
+        if shown < summary.entry_count {
+            let _ = write!(
+                message,
+                "\n  Showing the first {shown} of {} skipped entries.",
+                summary.entry_count
+            );
+        }
+        tracing::warn!("{message}");
+    }
+    if more_roots {
         tracing::warn!(
-            path = %escape_untrusted_pull_path(name),
-            "Guest file was not copied by the filtered rsync transfer"
+            "Showing the first {MAX_REPORTED_PULL_ROOTS} groups. Pull skipped {skipped_count} paths in total."
         );
     }
-    Ok(())
 }
 
 fn rsync_pull_args(target: &SshTarget) -> Result<Vec<String>> {

@@ -139,11 +139,14 @@ tools (such as Git and Visual Studio Code) and embedded repositories before
 installing files on the host. This filtering is best effort. Treat pulled files
 as untrusted. Pull applies these exclusions to every transfer.
 
-Pull reports skipped embedded repository paths. It also compares an unfiltered
-rsync dry run with the filtered transfer and reports every path absent from the
-transfer list, including files inside excluded directories. These warnings are
-best effort because the guest may change its files between the two passes.
-Path bytes that could affect terminal output are escaped.
+Pull reports skipped embedded repository paths. It also compares a bounded
+rsync dry run with the filtered transfer and groups omitted paths under the
+first skipped directory. Pull shows up to ten entries per group and twenty
+groups. When it shortens the report, it gives the total for the affected group
+or for all groups. If the dry run times out or a file list exceeds its size
+limit, the transfer can still proceed without the report. The guest may change
+its files between the two passes. Pull escapes path bytes that could affect
+terminal output.
 
 ## Default exclusions
 
