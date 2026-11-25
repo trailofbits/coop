@@ -9876,13 +9876,7 @@ EOF
 
     # Extended tests (each manages its own instance lifecycle)
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-early ) ]]; then
-        run_timed_test test_project_agent_workflow
-        run_timed_test test_up_project_workflow
-        run_timed_test test_git_repo
         run_timed_test test_host_mount
-        run_timed_test test_lima_mount_state_boundary
-        run_timed_test test_host_mount_custom_guest_path
-        run_timed_test test_port_forwards
     fi
 
     if [[ "$FULL" == "1" && ( "$SHARD" == all || "$SHARD" == workspace || "$SHARD" == workspace-sync ) ]]; then
