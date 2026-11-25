@@ -217,6 +217,29 @@ async fn request_status(addr: SocketAddr, auth_header: Option<&str>) -> String {
 }
 
 #[tokio::test]
+async fn http2_preface_is_rejected_before_http2_processing() {
+    let server = spawn_serving().await;
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    // A complete prior-knowledge preface and empty SETTINGS frame would trigger
+    // an HTTP/2 SETTINGS response before the capability-token check.
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+        .await
+        .unwrap();
+    let mut response = [0_u8; 64];
+    let count = tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        count,
+        0,
+        "HTTP/2 parser responded to an unauthenticated preface: {:?}",
+        &response[..count]
+    );
+}
+
+#[tokio::test]
 async fn rejects_missing_token_with_401() {
     let server = spawn_serving().await;
     let status = request_status(server.addr, None).await;
