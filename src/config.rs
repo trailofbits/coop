@@ -1991,6 +1991,9 @@ fn validate_instance_name(name: &str) -> Result<()> {
         }
         bail!(msg);
     }
+    if !name.as_bytes()[0].is_ascii_alphanumeric() {
+        bail!("Instance name must start with a letter or digit (a-z, A-Z, 0-9)");
+    }
     Ok(())
 }
 
@@ -2002,7 +2005,7 @@ fn looks_like_path(name: &str) -> bool {
 }
 
 /// Validated instance name. Construction guarantees the name matches
-/// `[a-zA-Z0-9_-]{1,64}`, so downstream code (path construction,
+/// `[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}`, so downstream code (path construction,
 /// shell commands, SSH config blocks) can use it without re-checking.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceName(String);
@@ -2147,8 +2150,8 @@ fn lock_dir(dir: &Path) -> Result<File> {
 
 /// Sanitize a directory basename for use as an instance name.
 ///
-/// Replaces characters outside `[a-zA-Z0-9_-]` with `-`.
-/// Returns `"workspace"` if the result would be empty.
+/// Replaces characters outside `[a-zA-Z0-9_-]` with `-` and removes leading
+/// `-` and `_` characters. Returns `"workspace"` if the result would be empty.
 /// Truncates to 60 characters to leave room for collision suffixes.
 fn sanitize_basename(name: &str) -> String {
     let sanitized: String = name
@@ -2161,6 +2164,7 @@ fn sanitize_basename(name: &str) -> String {
             }
         })
         .collect();
+    let sanitized = sanitized.trim_start_matches(['-', '_']);
     if sanitized.is_empty() {
         return "workspace".to_string();
     }
@@ -4406,8 +4410,16 @@ mod tests {
 
     #[test]
     fn validate_name_accepts_valid() {
-        for name in ["foo", "my-project", "test_vm", "Dev-Box_01", "a", "A"] {
+        for name in ["foo", "my-project", "test_vm", "Dev-Box_01", "a", "A", "0"] {
             validate_instance_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_leading_hyphen_or_underscore() {
+        for name in ["--all", "-vm", "_vm", "_"] {
+            let err = InstanceName::new(name).unwrap_err().to_string();
+            assert!(err.contains("must start with a letter or digit"), "{err}");
         }
     }
 
@@ -5410,8 +5422,9 @@ skip = ["not-a-slug"]
 
     #[test]
     fn instance_name_rejects_invalid_on_deserialize() {
-        let json = r#""../evil""#;
-        assert!(serde_json::from_str::<InstanceName>(json).is_err());
+        for json in [r#""../evil""#, r#""--all""#] {
+            assert!(serde_json::from_str::<InstanceName>(json).is_err());
+        }
     }
 
     #[test]
@@ -7302,8 +7315,15 @@ rsync = "/run/current-system/sw/bin/rsync"
     }
 
     #[test]
-    fn sanitize_basename_all_invalid_returns_dashes() {
-        assert_eq!(sanitize_basename("..."), "---");
+    fn sanitize_basename_all_invalid_returns_workspace() {
+        assert_eq!(sanitize_basename("..."), "workspace");
+        assert_eq!(sanitize_basename("--_"), "workspace");
+    }
+
+    #[test]
+    fn sanitize_basename_removes_invalid_leading_characters() {
+        assert_eq!(sanitize_basename(".hidden-project"), "hidden-project");
+        assert_eq!(sanitize_basename("_-project"), "project");
     }
 
     #[test]

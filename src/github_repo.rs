@@ -170,7 +170,9 @@ pub(crate) fn git_repo_default_instance_name(repo_url: &str) -> Option<InstanceN
             }
         })
         .collect();
-    let sanitized = sanitized.trim_matches('-');
+    let sanitized = sanitized
+        .trim_start_matches(['-', '_'])
+        .trim_end_matches('-');
     if sanitized.is_empty() {
         return None;
     }
@@ -314,6 +316,13 @@ mod tests {
         // A basename that sanitizes to nothing has no usable instance name.
         assert!(git_repo_default_instance_name("https://example.com/org/.git").is_none());
         assert!(git_repo_default_instance_name("https://example.com/org/---").is_none());
+        assert!(git_repo_default_instance_name("https://example.com/org/_--").is_none());
+    }
+
+    #[test]
+    fn git_repo_default_instance_name_removes_invalid_leading_characters() {
+        let name = git_repo_default_instance_name("https://example.com/org/_-widget").unwrap();
+        assert_eq!(name.as_str(), "widget");
     }
 
     #[test]

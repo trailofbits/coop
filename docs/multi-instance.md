@@ -34,9 +34,10 @@ Once a directory has more than one instance, `coop up ./my-project` can no longe
 Instance names must satisfy all of the following:
 
 - 1 to 64 characters long
-- Characters limited to `a-z`, `A-Z`, `0-9`, `-`, `_`
+- Starts with `a-z`, `A-Z`, or `0-9`
+- Remaining characters limited to `a-z`, `A-Z`, `0-9`, `-`, `_`
 
-Names that violate these rules are rejected at creation time.
+Names that violate these rules are rejected when provided or loaded.
 
 ## Addressing instances
 

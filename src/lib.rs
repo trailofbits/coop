@@ -2715,6 +2715,16 @@ mod tests {
     }
 
     #[test]
+    fn up_rejects_option_shaped_instance_name() {
+        let err = parse_err(&["up", "--name=--all"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            err.to_string()
+                .contains("must start with a letter or digit")
+        );
+    }
+
+    #[test]
     fn up_new_instance_requires_explicit_name() {
         let err = parse_err(&["up", "--new-instance"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
