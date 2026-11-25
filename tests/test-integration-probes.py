@@ -28,6 +28,34 @@ def shell(script, *, bash="bash", **env):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_web_editor_reports_launch_when_kill_probe_fails(self):
+        source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
+        observe = re.search(r"^observe_launch\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        running = re.search(r"^launch_child_running\(\) \{\n.*?^\}", source, re.M | re.S)[0]
+        launch_loop = re.search(r'^while .*"\$child".*; do\n.*?^done$', source, re.M | re.S)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            script = "set -euo pipefail\n" + observe + "\n" + running + '''
+launch_marker=$LAUNCH_MARKER
+service_started=0
+stage=systemd_launch
+reason=launch_failed
+ready=1
+launch_started=$SECONDS
+lease() { builtin kill "$child" 2>/dev/null || true; }
+# Simulate the service marker appearing as the launcher is polled.
+jobs() { : > "$launch_marker"; builtin jobs "$@"; }
+kill() { return 1; }
+sleep 10 & child=$!
+trap 'builtin kill "$child" 2>/dev/null || true' EXIT
+! kill -0 "$child"
+''' + launch_loop + '''
+[[ $service_started == 1 && $stage == code_server ]]
+wait "$child" || true
+'''
+            result = shell(script, LAUNCH_MARKER=str(Path(directory) / "launched"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "launched\n")
+
     def test_web_editor_lease_preserves_split_heartbeat(self):
         source = (Path(__file__).parent.parent / "scripts/guest/web-editor.sh").read_text()
         lease = re.search(r"^lease\(\) \{\n.*?^\}", source, re.M | re.S)[0]

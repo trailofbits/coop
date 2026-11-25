@@ -93,6 +93,17 @@ observe_launch() {
         printf 'launched\n'
     fi
 }
+launch_child_running() {
+    local job
+    # The shell tracks its background child independently of signal permission.
+    # A kill -0 check can fail while the privileged launcher is still running.
+    while IFS= read -r job; do
+        if [[ $job == "$1" ]]; then
+            return 0
+        fi
+    done < <(jobs -pr)
+    return 1
+}
 
 version=4.146.0
 reason=unsupported_architecture
@@ -213,7 +224,7 @@ setsid sudo -n systemd-run --quiet --collect --wait --pipe --service-type=exec \
     </dev/null >/dev/null 2>&1 9>&- &
 child=$!
 ready=0
-while kill -0 "$child" 2>/dev/null; do
+while launch_child_running "$child"; do
     observe_launch
     if [[ $service_started == 1 && $ready == 0 ]] && curl -q --silent --fail --max-time 1 \
         --unix-socket "$socket" http://localhost/healthz >/dev/null; then
