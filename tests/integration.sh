@@ -6240,6 +6240,47 @@ EOF
     ws_tmpdir=""
 }
 
+test_workspace_exclude_local_config() {
+    echo ""
+    echo "=== Phase: workspace transfer without local config ==="
+
+    local inst_name="${INSTANCE}-exclude-local-config"
+    local workspace="$tmpdir/$inst_name-ws"
+    mkdir -p "$workspace/.claude"
+    git init -q "$workspace"
+    printf '{}\n' > "$workspace/.claude/settings.json"
+    printf 'initial\n' > "$workspace/keep.txt"
+
+    if ! coop up "$workspace" --name "$inst_name" --copy --no-agents --exclude-local-config; then
+        fail "up --exclude-local-config copies the workspace" "stderr: $HARNESS_ERR"
+        return
+    fi
+    STARTED_INSTANCES+=("$inst_name")
+    local GUEST_INSTANCE="$inst_name"
+    local check_transfer='test "$(cat /workspace/keep.txt)" = "$1" &&
+        test ! -e /workspace/.git && test ! -e /workspace/.claude'
+
+    if guest_exec sh -c "$check_transfer" sh initial; then
+        pass "up --exclude-local-config copies ordinary files and omits .git and .claude"
+    else
+        fail "up --exclude-local-config copies ordinary files and omits .git and .claude" \
+            "unexpected guest contents: $(guest_stderr)"
+    fi
+
+    printf 'pushed\n' > "$workspace/keep.txt"
+    if ! coop push "$inst_name" --dir "$workspace" --force --exclude-local-config; then
+        fail "push --exclude-local-config copies the workspace" "stderr: $HARNESS_ERR"
+    elif guest_exec sh -c "$check_transfer" sh pushed; then
+        pass "push --exclude-local-config updates ordinary files and omits .git and .claude"
+    else
+        fail "push --exclude-local-config updates ordinary files and omits .git and .claude" \
+            "unexpected guest contents: $(guest_stderr)"
+    fi
+
+    coop destroy "$inst_name" 2>/dev/null || true
+    untrack_instance "$inst_name"
+}
+
 # Copy/pull must not synthesize AppleDouble sidecars from macOS metadata.
 # Exercise xattr-bearing source files against the Linux guest.
 test_appledouble_sidecars() {
@@ -9869,6 +9910,7 @@ EOF
         run_timed_test test_host_mount_custom_guest_path
         run_timed_test test_port_forwards
         run_timed_test test_workspace_sync
+        run_timed_test test_workspace_exclude_local_config
         run_timed_test test_appledouble_sidecars
         run_timed_test test_multi_instance
         run_timed_test test_custom_profiles
